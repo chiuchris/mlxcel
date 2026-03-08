@@ -6,7 +6,7 @@
 //! - Attention/MLP bias enabled
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedLinear, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;

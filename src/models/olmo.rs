@@ -233,18 +233,10 @@ impl OlmoMLP {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let ff_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.ff_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let ff_out = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.ff_out", prefix),
-            group_size,
-            bits,
-        )?;
+        let ff_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.ff_proj", prefix), group_size, bits)?;
+        let ff_out =
+            UnifiedLinear::from_weights(weights, &format!("{}.ff_out", prefix), group_size, bits)?;
 
         Ok(Self { ff_proj, ff_out })
     }

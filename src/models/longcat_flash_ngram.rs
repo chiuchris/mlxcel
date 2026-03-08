@@ -13,7 +13,7 @@ use crate::models::switch_layers::SwitchGLU;
 use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{
-    Embedding, KVCache, MultiLinear, UnifiedLinear, RMSNorm, UnifiedEmbedding,
+    Embedding, KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear,
 };
 use mlxcel_core::utils::{create_causal_mask, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
@@ -410,12 +410,7 @@ impl LongcatFlashMLP {
                 gs,
                 bits,
             )?,
-            up_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{prefix}.up_proj"),
-                gs,
-                bits,
-            )?,
+            up_proj: UnifiedLinear::from_weights(weights, &format!("{prefix}.up_proj"), gs, bits)?,
             down_proj: UnifiedLinear::from_weights(
                 weights,
                 &format!("{prefix}.down_proj"),

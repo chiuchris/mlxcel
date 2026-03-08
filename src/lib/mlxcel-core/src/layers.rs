@@ -52,10 +52,7 @@ impl Embedding {
     }
 
     /// Load from weight map
-    pub fn from_weights(
-        weights: &crate::weights::WeightMap,
-        prefix: &str,
-    ) -> Result<Self, String> {
+    pub fn from_weights(weights: &crate::weights::WeightMap, prefix: &str) -> Result<Self, String> {
         let weight_name = format!("{}.weight", prefix);
         let weight = weights
             .get(&weight_name)
@@ -260,7 +257,11 @@ impl KVCache {
         match &self.keys {
             Some(k) => {
                 let shape = ffi::array_shape(k);
-                if shape.len() >= 3 { shape[2] } else { 0 }
+                if shape.len() >= 3 {
+                    shape[2]
+                } else {
+                    0
+                }
             }
             None => 0,
         }
@@ -518,16 +519,22 @@ impl RotatingKVCache {
                 let start = buffer_size - self.max_size;
                 let ks = ffi::array_shape(self.keys.as_ref().unwrap());
                 let vs = ffi::array_shape(self.values.as_ref().unwrap());
-                self.keys = Some(ffi::contiguous(&ffi::slice(
-                    self.keys.as_ref().unwrap(),
-                    &[0, 0, start, 0],
-                    &[ks[0], ks[1], buffer_size, ks[3]],
-                ), false));
-                self.values = Some(ffi::contiguous(&ffi::slice(
-                    self.values.as_ref().unwrap(),
-                    &[0, 0, start, 0],
-                    &[vs[0], vs[1], buffer_size, vs[3]],
-                ), false));
+                self.keys = Some(ffi::contiguous(
+                    &ffi::slice(
+                        self.keys.as_ref().unwrap(),
+                        &[0, 0, start, 0],
+                        &[ks[0], ks[1], buffer_size, ks[3]],
+                    ),
+                    false,
+                ));
+                self.values = Some(ffi::contiguous(
+                    &ffi::slice(
+                        self.values.as_ref().unwrap(),
+                        &[0, 0, start, 0],
+                        &[vs[0], vs[1], buffer_size, vs[3]],
+                    ),
+                    false,
+                ));
                 // Buffer is now linearized to max_size; idx should wrap to 0
                 self.idx = self.max_size;
             }
@@ -540,11 +547,27 @@ impl RotatingKVCache {
             let heads = shape[1];
             let head_dim = shape[3];
 
-            let k_zeros = ffi::zeros(&[batch, heads, self.max_size, head_dim], ffi::array_dtype(&new_keys));
-            let v_zeros = ffi::zeros(&[batch, heads, self.max_size, head_dim], ffi::array_dtype(&new_values));
+            let k_zeros = ffi::zeros(
+                &[batch, heads, self.max_size, head_dim],
+                ffi::array_dtype(&new_keys),
+            );
+            let v_zeros = ffi::zeros(
+                &[batch, heads, self.max_size, head_dim],
+                ffi::array_dtype(&new_values),
+            );
 
-            let k = ffi::slice_update(&k_zeros, &new_keys, &[0, 0, 0, 0], &[batch, heads, 1, head_dim]);
-            let v = ffi::slice_update(&v_zeros, &new_values, &[0, 0, 0, 0], &[batch, heads, 1, head_dim]);
+            let k = ffi::slice_update(
+                &k_zeros,
+                &new_keys,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, head_dim],
+            );
+            let v = ffi::slice_update(
+                &v_zeros,
+                &new_values,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, head_dim],
+            );
 
             self.offset = 1;
             self.idx = 1;
@@ -602,8 +625,16 @@ impl RotatingKVCache {
 
         // Return the valid portion of the cache
         if self.offset < self.max_size {
-            let k_out = ffi::slice(&k_buffer, &[0, 0, 0, 0], &[batch, heads, self.offset, head_dim]);
-            let v_out = ffi::slice(&v_buffer, &[0, 0, 0, 0], &[batch, heads, self.offset, head_dim]);
+            let k_out = ffi::slice(
+                &k_buffer,
+                &[0, 0, 0, 0],
+                &[batch, heads, self.offset, head_dim],
+            );
+            let v_out = ffi::slice(
+                &v_buffer,
+                &[0, 0, 0, 0],
+                &[batch, heads, self.offset, head_dim],
+            );
             self.keys = Some(k_buffer);
             self.values = Some(v_buffer);
             (k_out, v_out)
@@ -795,9 +826,16 @@ impl ChunkedKVCache {
                     &[0, 0, end, 0],
                     &[v_shape[0], v_shape[1], v_shape[2], v_shape[3]],
                 );
-                self.keys = Some(concatenate(&concatenate(&k_before, &new_keys, 2), &k_after, 2));
-                self.values =
-                    Some(concatenate(&concatenate(&v_before, &new_values, 2), &v_after, 2));
+                self.keys = Some(concatenate(
+                    &concatenate(&k_before, &new_keys, 2),
+                    &k_after,
+                    2,
+                ));
+                self.values = Some(concatenate(
+                    &concatenate(&v_before, &new_values, 2),
+                    &v_after,
+                    2,
+                ));
             } else {
                 self.keys = Some(concatenate(&k_before, &new_keys, 2));
                 self.values = Some(concatenate(&v_before, &new_values, 2));
@@ -888,7 +926,10 @@ impl GemmaRMSNorm {
     /// Forward pass using fast RMS norm kernel with (1 + weight)
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // Gemma models use (1 + weight) instead of just weight
-        let ones = ffi::ones(&[ffi::array_shape(&self.weight)[0]], ffi::array_dtype(&self.weight));
+        let ones = ffi::ones(
+            &[ffi::array_shape(&self.weight)[0]],
+            ffi::array_dtype(&self.weight),
+        );
         let adjusted_weight = ffi::add(&ones, &self.weight);
         ffi::fast_rms_norm(x, &adjusted_weight, self.eps)
     }
@@ -933,10 +974,7 @@ impl Linear {
     }
 
     /// Load from weight map
-    pub fn from_weights(
-        weights: &crate::weights::WeightMap,
-        prefix: &str,
-    ) -> Result<Self, String> {
+    pub fn from_weights(weights: &crate::weights::WeightMap, prefix: &str) -> Result<Self, String> {
         let weight_name = format!("{}.weight", prefix);
 
         let weight = weights
@@ -1182,7 +1220,13 @@ impl QuantizedMultiLinear {
             .map(|b| ffi::copy(b))
             .unwrap_or_else(|| ffi::zeros(&[1], crate::dtype::FLOAT16));
 
-        ffi::dequantize(&self.weight, &self.scales, &biases, self.group_size, self.bits)
+        ffi::dequantize(
+            &self.weight,
+            &self.scales,
+            &biases,
+            self.group_size,
+            self.bits,
+        )
     }
 }
 

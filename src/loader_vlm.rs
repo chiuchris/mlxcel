@@ -1,10 +1,288 @@
 use anyhow::Result;
+use mlxcel_core::weights::WeightMap;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 use std::path::Path;
 
 use crate::LoadedModel;
 use crate::models;
 use crate::vision;
 use models::sanitize_config_json;
+
+fn read_sanitized_vlm_config(model_path: &Path) -> Result<(String, Value)> {
+    let config_path = model_path.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
+    let config_str = sanitize_config_json(&config_str);
+    let full_config: Value = parse_vlm_config(&config_str, "config")?;
+    Ok((config_str, full_config))
+}
+
+fn parse_vlm_config<T: DeserializeOwned>(config_str: &str, label: &str) -> Result<T> {
+    serde_json::from_str(config_str)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", label, e))
+}
+
+fn parse_required_vlm_subconfig<T: DeserializeOwned>(
+    full_config: &Value,
+    key: &str,
+    label: &str,
+) -> Result<T> {
+    let value = full_config
+        .get(key)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("Missing {} in config.json", key))?;
+    serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", label, e))
+}
+
+fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
+    mlxcel_core::weights::load_weights_from_dir(model_path).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+fn strip_language_model_prefix(raw_weights: WeightMap) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for (key, value) in raw_weights {
+        let new_key = if let Some(stripped) = key.strip_prefix("language_model.") {
+            stripped.to_string()
+        } else {
+            key
+        };
+        weights.insert(new_key, value);
+    }
+    weights
+}
+
+trait QwenVisionConfigExt {
+    fn quant_group_size(&self) -> i32;
+    fn quant_bits(&self) -> i32;
+    fn set_quant_group_size(&mut self, value: i32);
+    fn set_quant_bits(&mut self, value: i32);
+    fn patch_size(&self) -> usize;
+    fn temporal_patch_size(&self) -> usize;
+    fn spatial_merge_size(&self) -> usize;
+}
+
+impl QwenVisionConfigExt for vision::encoders::qwen2_vl::Qwen2VLVisionConfig {
+    fn quant_group_size(&self) -> i32 {
+        self.quant_group_size
+    }
+
+    fn quant_bits(&self) -> i32 {
+        self.quant_bits
+    }
+
+    fn set_quant_group_size(&mut self, value: i32) {
+        self.quant_group_size = value;
+    }
+
+    fn set_quant_bits(&mut self, value: i32) {
+        self.quant_bits = value;
+    }
+
+    fn patch_size(&self) -> usize {
+        self.patch_size
+    }
+
+    fn temporal_patch_size(&self) -> usize {
+        self.temporal_patch_size
+    }
+
+    fn spatial_merge_size(&self) -> usize {
+        self.spatial_merge_size
+    }
+}
+
+impl QwenVisionConfigExt for vision::encoders::qwen2_5_vl::Qwen25VLVisionConfig {
+    fn quant_group_size(&self) -> i32 {
+        self.quant_group_size
+    }
+
+    fn quant_bits(&self) -> i32 {
+        self.quant_bits
+    }
+
+    fn set_quant_group_size(&mut self, value: i32) {
+        self.quant_group_size = value;
+    }
+
+    fn set_quant_bits(&mut self, value: i32) {
+        self.quant_bits = value;
+    }
+
+    fn patch_size(&self) -> usize {
+        self.patch_size
+    }
+
+    fn temporal_patch_size(&self) -> usize {
+        self.temporal_patch_size
+    }
+
+    fn spatial_merge_size(&self) -> usize {
+        self.spatial_merge_size
+    }
+}
+
+impl QwenVisionConfigExt for vision::encoders::qwen3_vl::Qwen3VLVisionConfig {
+    fn quant_group_size(&self) -> i32 {
+        self.quant_group_size
+    }
+
+    fn quant_bits(&self) -> i32 {
+        self.quant_bits
+    }
+
+    fn set_quant_group_size(&mut self, value: i32) {
+        self.quant_group_size = value;
+    }
+
+    fn set_quant_bits(&mut self, value: i32) {
+        self.quant_bits = value;
+    }
+
+    fn patch_size(&self) -> usize {
+        self.patch_size
+    }
+
+    fn temporal_patch_size(&self) -> usize {
+        self.temporal_patch_size
+    }
+
+    fn spatial_merge_size(&self) -> usize {
+        self.spatial_merge_size
+    }
+}
+
+fn inherit_qwen_vision_quantization<T: QwenVisionConfigExt>(
+    vision_config: &mut T,
+    full_config: &Value,
+) {
+    if (vision_config.quant_group_size() == 0 || vision_config.quant_bits() == 0)
+        && let Some(q) = full_config.get("quantization")
+    {
+        vision_config.set_quant_group_size(
+            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32,
+        );
+        vision_config.set_quant_bits(q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32);
+    }
+}
+
+trait QwenTextQuantizationExt {
+    fn has_quantization(&self) -> bool;
+    fn set_quantization_from_value(&mut self, value: &Value);
+}
+
+impl QwenTextQuantizationExt for models::qwen3_vl::Qwen3VLConfig {
+    fn has_quantization(&self) -> bool {
+        self.quantization.is_some()
+    }
+
+    fn set_quantization_from_value(&mut self, value: &Value) {
+        self.quantization = serde_json::from_value(value.clone()).ok();
+    }
+}
+
+impl QwenTextQuantizationExt for models::qwen3_vl_moe::Qwen3VLMoeConfig {
+    fn has_quantization(&self) -> bool {
+        self.quantization.is_some()
+    }
+
+    fn set_quantization_from_value(&mut self, value: &Value) {
+        self.quantization = serde_json::from_value(value.clone()).ok();
+    }
+}
+
+fn inherit_qwen_text_quantization<T: QwenTextQuantizationExt>(
+    text_config: &mut T,
+    full_config: &Value,
+) {
+    if !text_config.has_quantization()
+        && let Some(q) = full_config.get("quantization")
+    {
+        text_config.set_quantization_from_value(q);
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QwenVisionTokenIds {
+    image_token_id: i32,
+    video_token_id: i32,
+    vision_start_token_id: i32,
+}
+
+fn qwen_vl_token_ids(full_config: &Value, defaults: QwenVisionTokenIds) -> QwenVisionTokenIds {
+    QwenVisionTokenIds {
+        image_token_id: full_config
+            .get("image_token_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(defaults.image_token_id as i64) as i32,
+        video_token_id: full_config
+            .get("video_token_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(defaults.video_token_id as i64) as i32,
+        vision_start_token_id: full_config
+            .get("vision_start_token_id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(defaults.vision_start_token_id as i64) as i32,
+    }
+}
+
+fn qwen_vl_processor<T: QwenVisionConfigExt>(
+    vision_config: &T,
+) -> vision::processors::qwen2_vl::Qwen2VLProcessor {
+    vision::processors::qwen2_vl::Qwen2VLProcessor::new(
+        vision_config.patch_size(),
+        vision_config.temporal_patch_size(),
+        vision_config.spatial_merge_size(),
+    )
+}
+
+fn qwen_vl_processor_with_norm<T: QwenVisionConfigExt>(
+    vision_config: &T,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> vision::processors::qwen2_vl::Qwen2VLProcessor {
+    vision::processors::qwen2_vl::Qwen2VLProcessor::new_with_norm(
+        vision_config.patch_size(),
+        vision_config.temporal_patch_size(),
+        vision_config.spatial_merge_size(),
+        mean,
+        std,
+    )
+}
+
+fn rewrite_qwen3_vl_weight_key(key: String, moe_experts: bool) -> String {
+    let new_key = if key.starts_with("model.language_model.") {
+        key.replacen("model.language_model.", "model.", 1)
+    } else if key.starts_with("model.visual.") {
+        key.replacen("model.visual.", "vision_tower.", 1)
+    } else if key.starts_with("language_model.") {
+        key.replacen("language_model.", "", 1)
+    } else {
+        key
+    };
+
+    if moe_experts && new_key.contains(".mlp.experts.") {
+        let after_experts = new_key.rsplit_once(".mlp.experts.").unwrap().1;
+        if !after_experts.contains('.') {
+            format!(
+                "{}.weight",
+                new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
+            )
+        } else {
+            new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
+        }
+    } else {
+        new_key
+    }
+}
+
+fn remap_qwen3_vl_weights(raw_weights: WeightMap, moe_experts: bool) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for (key, value) in raw_weights {
+        weights.insert(rewrite_qwen3_vl_weight_key(key, moe_experts), value);
+    }
+    weights
+}
 
 /// Load a Gemma3 VLM model (text + vision tower + projector)
 pub(crate) fn load_gemma3_vlm(model_path: &Path) -> Result<LoadedModel> {
@@ -1939,8 +2217,9 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
     } else {
         "vision_tower"
     };
-    let vision_encoder = Llama4VisionModel::from_weights(&weights, &vision_config, vision_prefix)
-        .map_err(|e| anyhow::anyhow!("Failed to load Llama4 vision encoder: {}", e))?;
+    let vision_encoder =
+        Llama4VisionModel::from_weights(&weights, &vision_config, vision_prefix)
+            .map_err(|e| anyhow::anyhow!("Failed to load Llama4 vision encoder: {}", e))?;
 
     // Build connector (single linear projector, no activation, no bias)
     let quant_group_size = full_config
@@ -2011,54 +2290,20 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
 /// Load a Qwen2-VL model (custom ViT + Qwen2 language model with MRoPE)
 pub(crate) fn load_qwen2_vl(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen2_vl::{Qwen2VLVisionConfig, Qwen2VLVisionEncoder};
-    use vision::processors::qwen2_vl::Qwen2VLProcessor;
 
-    // Parse config
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let config_str = sanitize_config_json(&config_str);
-    let full_config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
     // Text config is at root level for Qwen2-VL (not inside text_config sub-object)
-    let text_config: models::qwen2_vl::Qwen2VLConfig = serde_json::from_str(&config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Qwen2VL text config: {}", e))?;
+    let text_config: models::qwen2_vl::Qwen2VLConfig =
+        parse_vlm_config(&config_str, "Qwen2VL text config")?;
 
     // Vision config is in vision_config sub-object
-    let mut vision_config: Qwen2VLVisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
+    let mut vision_config: Qwen2VLVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen2VL vision config")?;
 
-    // Inherit quantization params from top-level config
-    if (vision_config.quant_group_size == 0 || vision_config.quant_bits == 0)
-        && let Some(q) = full_config.get("quantization")
-    {
-        vision_config.quant_group_size =
-            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        vision_config.quant_bits = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-    }
+    inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    // Load all weights
-    let raw_weights = mlxcel_core::weights::load_weights_from_dir(model_path)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    // Remap weight keys:
-    // "language_model.model.*" -> "model.*" (for text model)
-    // "language_model.lm_head.*" -> "lm_head.*" (for output projection)
-    // "vision_tower.*" -> keep as-is (vision encoder loads with prefix)
-    let mut weights = mlxcel_core::weights::WeightMap::new();
-    for (key, value) in raw_weights {
-        let new_key = if let Some(stripped) = key.strip_prefix("language_model.") {
-            stripped.to_string()
-        } else {
-            key
-        };
-        weights.insert(new_key, value);
-    }
+    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
 
     // Sanitize tied embeddings
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -2073,34 +2318,26 @@ pub(crate) fn load_qwen2_vl(model_path: &Path) -> Result<LoadedModel> {
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen2VL vision encoder: {}", e))?;
 
     // Build image processor
-    let processor = Qwen2VLProcessor::new(
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-    );
+    let processor = qwen_vl_processor(&vision_config);
 
     // Get token IDs from config
-    let image_token_id = full_config
-        .get("image_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151655) as i32;
-    let video_token_id = full_config
-        .get("video_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151656) as i32;
-    let vision_start_token_id = full_config
-        .get("vision_start_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151652) as i32;
+    let token_ids = qwen_vl_token_ids(
+        &full_config,
+        QwenVisionTokenIds {
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+        },
+    );
 
     // Assemble Qwen2VLModel
     let vlm = vision::Qwen2VLModel {
         text_model,
         vision_encoder,
         processor,
-        image_token_id,
-        video_token_id,
-        vision_start_token_id,
+        image_token_id: token_ids.image_token_id,
+        video_token_id: token_ids.video_token_id,
+        vision_start_token_id: token_ids.vision_start_token_id,
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
@@ -2110,49 +2347,20 @@ pub(crate) fn load_qwen2_vl(model_path: &Path) -> Result<LoadedModel> {
 /// Load a Qwen2.5-VL model (windowed ViT + Qwen2 language model with MRoPE)
 pub(crate) fn load_qwen2_5_vl(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen2_5_vl::{Qwen25VLVisionConfig, Qwen25VLVisionEncoder};
-    use vision::processors::qwen2_vl::Qwen2VLProcessor;
 
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let config_str = sanitize_config_json(&config_str);
-    let full_config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
     // Text config is at root level (same as Qwen2-VL)
-    let text_config: models::qwen2_vl::Qwen2VLConfig = serde_json::from_str(&config_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Qwen2.5VL text config: {}", e))?;
+    let text_config: models::qwen2_vl::Qwen2VLConfig =
+        parse_vlm_config(&config_str, "Qwen2.5VL text config")?;
 
     // Vision config
-    let mut vision_config: Qwen25VLVisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
+    let mut vision_config: Qwen25VLVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen2.5VL vision config")?;
 
-    // Inherit quantization params
-    if (vision_config.quant_group_size == 0 || vision_config.quant_bits == 0)
-        && let Some(q) = full_config.get("quantization")
-    {
-        vision_config.quant_group_size =
-            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        vision_config.quant_bits = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-    }
+    inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    // Load weights with key remapping
-    let raw_weights = mlxcel_core::weights::load_weights_from_dir(model_path)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let mut weights = mlxcel_core::weights::WeightMap::new();
-    for (key, value) in raw_weights {
-        let new_key = if let Some(stripped) = key.strip_prefix("language_model.") {
-            stripped.to_string()
-        } else {
-            key
-        };
-        weights.insert(new_key, value);
-    }
+    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
 
     // Sanitize tied embeddings
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -2167,33 +2375,25 @@ pub(crate) fn load_qwen2_5_vl(model_path: &Path) -> Result<LoadedModel> {
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen2.5VL vision encoder: {}", e))?;
 
     // Build image processor (same as Qwen2-VL)
-    let processor = Qwen2VLProcessor::new(
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-    );
+    let processor = qwen_vl_processor(&vision_config);
 
     // Token IDs (same as Qwen2-VL)
-    let image_token_id = full_config
-        .get("image_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151655) as i32;
-    let video_token_id = full_config
-        .get("video_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151656) as i32;
-    let vision_start_token_id = full_config
-        .get("vision_start_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151652) as i32;
+    let token_ids = qwen_vl_token_ids(
+        &full_config,
+        QwenVisionTokenIds {
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+        },
+    );
 
     let vlm = vision::Qwen25VLModel {
         text_model,
         vision_encoder,
         processor,
-        image_token_id,
-        video_token_id,
-        vision_start_token_id,
+        image_token_id: token_ids.image_token_id,
+        video_token_id: token_ids.video_token_id,
+        vision_start_token_id: token_ids.vision_start_token_id,
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
@@ -2203,72 +2403,22 @@ pub(crate) fn load_qwen2_5_vl(model_path: &Path) -> Result<LoadedModel> {
 /// Load a Qwen3-VL model (ViT + interleaved MRoPE + DeepStack)
 pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
-    use vision::processors::qwen2_vl::Qwen2VLProcessor;
 
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let config_str = sanitize_config_json(&config_str);
-    let full_config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
     // Text config is nested under "text_config" (unlike Qwen2-VL/2.5-VL which is at root)
-    let mut text_config: models::qwen3_vl::Qwen3VLConfig = serde_json::from_value(
-        full_config
-            .get("text_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing text_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse Qwen3VL text config: {}", e))?;
+    let mut text_config: models::qwen3_vl::Qwen3VLConfig =
+        parse_required_vlm_subconfig(&full_config, "text_config", "Qwen3VL text config")?;
 
-    // Inherit quantization from top-level if not in text_config
-    if text_config.quantization.is_none()
-        && let Some(q) = full_config.get("quantization")
-    {
-        text_config.quantization = serde_json::from_value(q.clone()).ok();
-    }
+    inherit_qwen_text_quantization(&mut text_config, &full_config);
 
     // Vision config
-    let mut vision_config: Qwen3VLVisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
+    let mut vision_config: Qwen3VLVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3VL vision config")?;
 
-    // Inherit quantization params
-    if (vision_config.quant_group_size == 0 || vision_config.quant_bits == 0)
-        && let Some(q) = full_config.get("quantization")
-    {
-        vision_config.quant_group_size =
-            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        vision_config.quant_bits = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-    }
+    inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    // Load weights with key remapping
-    // Qwen3-VL sanitize:
-    // "model.language_model.xxx" -> "model.xxx" (text model prefix)
-    // "model.visual.xxx" -> "vision_tower.xxx" (vision encoder prefix)
-    // "lm_head.xxx" -> "lm_head.xxx" (output projection)
-    let raw_weights = mlxcel_core::weights::load_weights_from_dir(model_path)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let mut weights = mlxcel_core::weights::WeightMap::new();
-    for (key, value) in raw_weights {
-        let new_key = if key.starts_with("model.language_model.") {
-            // model.language_model.xxx -> model.xxx (keep "model." prefix for text model)
-            key.replacen("model.language_model.", "model.", 1)
-        } else if key.starts_with("model.visual.") {
-            key.replacen("model.visual.", "vision_tower.", 1)
-        } else if key.starts_with("language_model.") {
-            // Also handle already-sanitized keys (language_model.model.xxx -> model.xxx)
-            key.replacen("language_model.", "", 1)
-        } else {
-            // lm_head.* and other keys are kept unchanged
-            key
-        };
-        weights.insert(new_key, value);
-    }
+    let mut weights = remap_qwen3_vl_weights(load_vlm_weights(model_path)?, false);
 
     // Sanitize tied embeddings
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -2283,35 +2433,25 @@ pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VL vision encoder: {}", e))?;
 
     // Build image processor (Qwen3-VL uses 0.5/0.5 normalization, not CLIP values)
-    let processor = Qwen2VLProcessor::new_with_norm(
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5],
-    );
+    let processor = qwen_vl_processor_with_norm(&vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
 
     // Token IDs (same defaults as Qwen2-VL)
-    let image_token_id = full_config
-        .get("image_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151655) as i32;
-    let video_token_id = full_config
-        .get("video_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151656) as i32;
-    let vision_start_token_id = full_config
-        .get("vision_start_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151652) as i32;
+    let token_ids = qwen_vl_token_ids(
+        &full_config,
+        QwenVisionTokenIds {
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+        },
+    );
 
     let vlm = vision::Qwen3VLModel {
         text_model,
         vision_encoder,
         processor,
-        image_token_id,
-        video_token_id,
-        vision_start_token_id,
+        image_token_id: token_ids.image_token_id,
+        video_token_id: token_ids.video_token_id,
+        vision_start_token_id: token_ids.vision_start_token_id,
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
@@ -2320,88 +2460,22 @@ pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
 
 pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
-    use vision::processors::qwen2_vl::Qwen2VLProcessor;
 
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let config_str = sanitize_config_json(&config_str);
-    let full_config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
     // Text config is nested under "text_config"
-    let mut text_config: models::qwen3_vl_moe::Qwen3VLMoeConfig = serde_json::from_value(
-        full_config
-            .get("text_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing text_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse Qwen3VLMoe text config: {}", e))?;
+    let mut text_config: models::qwen3_vl_moe::Qwen3VLMoeConfig =
+        parse_required_vlm_subconfig(&full_config, "text_config", "Qwen3VLMoe text config")?;
 
-    // Inherit quantization from top-level if not in text_config
-    if text_config.quantization.is_none()
-        && let Some(q) = full_config.get("quantization")
-    {
-        text_config.quantization = serde_json::from_value(q.clone()).ok();
-    }
+    inherit_qwen_text_quantization(&mut text_config, &full_config);
 
     // Vision config (same as Qwen3-VL)
-    let mut vision_config: Qwen3VLVisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
+    let mut vision_config: Qwen3VLVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3VLMoe vision config")?;
 
-    // Inherit quantization params
-    if (vision_config.quant_group_size == 0 || vision_config.quant_bits == 0)
-        && let Some(q) = full_config.get("quantization")
-    {
-        vision_config.quant_group_size =
-            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        vision_config.quant_bits = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-    }
+    inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    // Load weights with key remapping
-    let raw_weights = mlxcel_core::weights::load_weights_from_dir(model_path)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
-
-    let mut weights = mlxcel_core::weights::WeightMap::new();
-    for (key, value) in raw_weights {
-        let new_key = if key.starts_with("model.language_model.") {
-            // model.language_model.xxx -> model.xxx
-            key.replacen("model.language_model.", "model.", 1)
-        } else if key.starts_with("model.visual.") {
-            key.replacen("model.visual.", "vision_tower.", 1)
-        } else if key.starts_with("language_model.") {
-            key.replacen("language_model.", "", 1)
-        } else {
-            // lm_head.* and other keys are kept unchanged
-            key
-        };
-
-        // MoE weight sanitization: experts.{n} -> switch_mlp.{n}.weight
-        let new_key = if new_key.contains(".mlp.experts.") {
-            // Check if it's a bare expert weight (no .weight/.scales/.biases suffix)
-            let after_experts = new_key.rsplit_once(".mlp.experts.").unwrap().1;
-            if !after_experts.contains('.') {
-                // Non-quantized: e.g., "model.layers.0.mlp.experts.up_proj"
-                // -> "model.layers.0.mlp.switch_mlp.up_proj.weight"
-                format!(
-                    "{}.weight",
-                    new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
-                )
-            } else {
-                // Quantized: e.g., "model.layers.0.mlp.experts.up_proj.weight"
-                // -> "model.layers.0.mlp.switch_mlp.up_proj.weight"
-                new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
-            }
-        } else {
-            new_key
-        };
-
-        weights.insert(new_key, value);
-    }
+    let mut weights = remap_qwen3_vl_weights(load_vlm_weights(model_path)?, true);
 
     // Sanitize tied embeddings
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -2416,35 +2490,25 @@ pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3VLMoe vision encoder: {}", e))?;
 
     // Build image processor (Qwen3-VL uses 0.5/0.5 normalization)
-    let processor = Qwen2VLProcessor::new_with_norm(
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5],
-    );
+    let processor = qwen_vl_processor_with_norm(&vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
 
     // Token IDs (same defaults as Qwen3-VL)
-    let image_token_id = full_config
-        .get("image_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151655) as i32;
-    let video_token_id = full_config
-        .get("video_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151656) as i32;
-    let vision_start_token_id = full_config
-        .get("vision_start_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(151652) as i32;
+    let token_ids = qwen_vl_token_ids(
+        &full_config,
+        QwenVisionTokenIds {
+            image_token_id: 151655,
+            video_token_id: 151656,
+            vision_start_token_id: 151652,
+        },
+    );
 
     let vlm = vision::Qwen3VLMoeModel {
         text_model,
         vision_encoder,
         processor,
-        image_token_id,
-        video_token_id,
-        vision_start_token_id,
+        image_token_id: token_ids.image_token_id,
+        video_token_id: token_ids.video_token_id,
+        vision_start_token_id: token_ids.vision_start_token_id,
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
@@ -2454,35 +2518,17 @@ pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
 /// Load a Qwen3.5 VLM (Qwen3-VL vision encoder + Qwen3.5 hybrid text backbone)
 pub(crate) fn load_qwen3_5_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
-    use vision::processors::qwen2_vl::Qwen2VLProcessor;
 
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(&config_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read config.json: {}", e))?;
-    let config_str = sanitize_config_json(&config_str);
-    let full_config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
     // Vision config (same encoder as Qwen3-VL)
-    let mut vision_config: Qwen3VLVisionConfig = serde_json::from_value(
-        full_config
-            .get("vision_config")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("Missing vision_config in config.json"))?,
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
+    let mut vision_config: Qwen3VLVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3.5 vision config")?;
 
-    // Inherit quantization params
-    if (vision_config.quant_group_size == 0 || vision_config.quant_bits == 0)
-        && let Some(q) = full_config.get("quantization")
-    {
-        vision_config.quant_group_size =
-            q.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        vision_config.quant_bits = q.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-    }
+    inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
     // Load all weights
-    let raw_weights = mlxcel_core::weights::load_weights_from_dir(model_path)
-        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    let raw_weights = load_vlm_weights(model_path)?;
 
     // Remap keys: Qwen3.5 VLM weight structure
     // "model.language_model.xxx" -> "model.xxx"
@@ -2568,37 +2614,31 @@ pub(crate) fn load_qwen3_5_vlm(model_path: &Path) -> Result<LoadedModel> {
             .map_err(|e| anyhow::anyhow!("Failed to load Qwen3.5 vision encoder: {}", e))?;
 
     // Build image processor (Qwen3-VL uses 0.5/0.5 normalization)
-    let processor = Qwen2VLProcessor::new_with_norm(
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-        [0.5, 0.5, 0.5],
-        [0.5, 0.5, 0.5],
-    );
+    let processor = qwen_vl_processor_with_norm(&vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
 
     // Token IDs (Qwen3.5 uses different defaults than Qwen3-VL)
-    let image_token_id = full_config
-        .get("image_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(248056) as i32;
-    let video_token_id = full_config
-        .get("video_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(248057) as i32;
-    let vision_start_token_id = full_config
-        .get("vision_start_token_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(248053) as i32;
+    let token_ids = qwen_vl_token_ids(
+        &full_config,
+        QwenVisionTokenIds {
+            image_token_id: 248056,
+            video_token_id: 248057,
+            vision_start_token_id: 248053,
+        },
+    );
 
     let vlm = vision::Qwen35VLModel {
         text_model,
         vision_encoder,
         processor,
-        image_token_id,
-        video_token_id,
-        vision_start_token_id,
+        image_token_id: token_ids.image_token_id,
+        video_token_id: token_ids.video_token_id,
+        vision_start_token_id: token_ids.vision_start_token_id,
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
     Ok(LoadedModel::Qwen35VLM(vlm))
 }
+
+#[cfg(test)]
+#[path = "loader_vlm_tests.rs"]
+mod tests;

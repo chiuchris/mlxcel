@@ -33,11 +33,7 @@ pub fn slice_axis(x: &MlxArray, axis: i32, start: i32, end: i32) -> UniquePtr<Ml
     let ndim = shape.len();
 
     // Handle negative axis
-    let axis = if axis < 0 {
-        ndim as i32 + axis
-    } else {
-        axis
-    } as usize;
+    let axis = if axis < 0 { ndim as i32 + axis } else { axis } as usize;
 
     let dim_size = shape[axis];
 
@@ -95,7 +91,7 @@ pub fn create_causal_mask(size: i32, offset: i32) -> UniquePtr<MlxArray> {
     // Use where_cond to avoid NaN from 0 * -inf
     let zeros = ffi::zeros(&[size, total_len], dtype::FLOAT32);
     let neg_inf = ffi::full_f32(&[size, total_len], f32::NEG_INFINITY, dtype::FLOAT32);
-    let bool_mask = ffi::greater(&mask, &zeros);  // mask > 0 gives bool mask
+    let bool_mask = ffi::greater(&mask, &zeros); // mask > 0 gives bool mask
 
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
 }
@@ -131,7 +127,7 @@ pub fn create_causal_mask_with_window(
     // Use where_cond to avoid NaN from 0 * -inf
     let zeros = ffi::zeros(&[size, total_len], dtype::FLOAT32);
     let neg_inf = ffi::full_f32(&[size, total_len], f32::NEG_INFINITY, dtype::FLOAT32);
-    let bool_mask = ffi::greater(&mask, &zeros);  // mask > 0 gives bool mask
+    let bool_mask = ffi::greater(&mask, &zeros); // mask > 0 gives bool mask
 
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
 }

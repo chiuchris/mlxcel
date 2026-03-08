@@ -9,7 +9,7 @@
 //! - Sigmoid routing with e_score_correction_bias
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, MultiLinear, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, slice_axis};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
@@ -320,12 +320,8 @@ impl MlaAttention {
         )?;
 
         // Output projection
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let q_head_dim = args.q_head_dim() as i32;
         let scale = 1.0 / (q_head_dim as f32).sqrt();

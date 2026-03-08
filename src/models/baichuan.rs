@@ -6,7 +6,7 @@
 //! - RMSNorm + SiLU (standard Llama style)
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;

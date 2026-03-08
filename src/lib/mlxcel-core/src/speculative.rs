@@ -16,7 +16,7 @@
 
 use crate::ffi;
 use crate::ffi::MlxStream;
-use crate::generate::{GenerationStats, LanguageModel, SamplingConfig, sample_token_optimized};
+use crate::generate::{sample_token_optimized, GenerationStats, LanguageModel, SamplingConfig};
 use crate::layers::KVCache;
 use cxx::UniquePtr;
 use std::time::Instant;
@@ -146,10 +146,8 @@ impl SpeculativeGenerator {
 
             for _ in 0..num_draft {
                 let draft_input = ffi::from_slice_i32(&[draft_token], &[1, 1]);
-                let draft_logits =
-                    draft_model.forward(&draft_input, &mut self.draft_caches, None);
-                let (tok_arr, _) =
-                    sample_token_optimized(&draft_logits, sampling, &token_history);
+                let draft_logits = draft_model.forward(&draft_input, &mut self.draft_caches, None);
+                let (tok_arr, _) = sample_token_optimized(&draft_logits, sampling, &token_history);
                 ffi::eval(&tok_arr);
                 draft_token = ffi::item_i32(&tok_arr);
                 draft_tokens.push(draft_token);
@@ -167,12 +165,9 @@ impl SpeculativeGenerator {
             // Forward [current_token, draft_token_0, ..., draft_token_n-1] through main model
             let mut verify_tokens = vec![current_token];
             verify_tokens.extend_from_slice(&draft_tokens);
-            let verify_input = ffi::from_slice_i32(
-                &verify_tokens,
-                &[1, verify_tokens.len() as i32],
-            );
-            let main_logits =
-                main_model.forward(&verify_input, &mut self.main_caches, None);
+            let verify_input =
+                ffi::from_slice_i32(&verify_tokens, &[1, verify_tokens.len() as i32]);
+            let main_logits = main_model.forward(&verify_input, &mut self.main_caches, None);
 
             // The main model returns logits for each position:
             // - Position 0 (current_token): logits that would produce draft_tokens[0]
@@ -237,8 +232,7 @@ impl SpeculativeGenerator {
 
             // If all draft tokens were accepted and we're not done,
             // sample one more token from the main model's last logit position
-            if accepted == draft_tokens.len() && !done && self.generated_tokens.len() < max_tokens
-            {
+            if accepted == draft_tokens.len() && !done && self.generated_tokens.len() < max_tokens {
                 let last_pos = seq_len - 1;
                 let last_logits = ffi::slice(
                     &main_logits,
@@ -279,7 +273,10 @@ impl SpeculativeGenerator {
                 // Rewind draft model caches: drafted all draft_tokens
                 // Need to trim all rejected + 1 (because draft went past accepted)
                 let draft_trim = (rejected + 1) as i32;
-                trim_caches(&mut self.draft_caches, draft_trim.min(draft_tokens.len() as i32));
+                trim_caches(
+                    &mut self.draft_caches,
+                    draft_trim.min(draft_tokens.len() as i32),
+                );
             }
 
             // Periodic cache clearing

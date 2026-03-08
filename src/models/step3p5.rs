@@ -10,7 +10,7 @@
 //! - SwitchGLU experts with shared expert
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
@@ -368,30 +368,14 @@ impl Step3p5Attention {
         let bits = args.bits();
         let (num_heads, num_kv_heads) = args.attention_heads_for_layer(layer_idx);
 
-        let q_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.q_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let k_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.k_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let v_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.v_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let q_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
+        let k_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
+        let v_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let q_norm_weight = get_weight_copy(weights, &format!("{}.q_norm.weight", prefix))?;
         let k_norm_weight = get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?;
@@ -472,12 +456,8 @@ impl Step3p5MLP {
             group_size,
             bits,
         )?;
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),

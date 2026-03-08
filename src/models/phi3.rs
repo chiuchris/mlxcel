@@ -5,7 +5,7 @@
 //! - Fused gate_up projection in MLP (single linear outputs gate, up concatenated)
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -194,12 +194,8 @@ impl Phi3Attention {
             group_size,
             bits,
         )?;
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim() as i32;
 

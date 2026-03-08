@@ -2,7 +2,7 @@
 // Reference: mlx-lm/mlx_lm/models/rwkv7.py
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -278,12 +278,8 @@ impl Rwkv7ChannelMixing {
         let value_prefix = format!("{}.value", prefix);
         let x_k_name = format!("{}.x_k", prefix);
 
-        let key = UnifiedLinear::from_weights(
-            weights,
-            &key_prefix,
-            config.group_size(),
-            config.bits(),
-        )?;
+        let key =
+            UnifiedLinear::from_weights(weights, &key_prefix, config.group_size(), config.bits())?;
         let value = UnifiedLinear::from_weights(
             weights,
             &value_prefix,

@@ -11,7 +11,7 @@
 //! - Embedding scaling: h *= sqrt(hidden_size)
 
 use mlxcel_core::layers::{
-    GemmaRMSNorm, KVCache, UnifiedLinear, RotatingKVCache, UnifiedEmbedding,
+    GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
 use mlxcel_core::utils::{clip_residual_f16, create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
@@ -193,30 +193,14 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.q_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let k_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.k_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let v_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.v_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let q_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
+        let k_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
+        let v_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim as i32;
         let scale = 1.0 / args.query_pre_attn_scalar.sqrt();
@@ -295,12 +279,8 @@ impl MLP {
             group_size,
             bits,
         )?;
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),

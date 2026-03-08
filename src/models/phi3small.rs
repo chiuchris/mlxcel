@@ -10,7 +10,7 @@
 //! - Tied word embeddings
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedLinear, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -290,12 +290,8 @@ impl MLP {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),

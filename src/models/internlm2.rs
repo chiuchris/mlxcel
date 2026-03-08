@@ -4,7 +4,7 @@
 //! - Fused wqkv projection (single linear layer for Q, K, V)
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -184,8 +184,7 @@ impl Attention {
 
         let wqkv =
             UnifiedLinear::from_weights(weights, &format!("{}.wqkv", prefix), group_size, bits)?;
-        let wo =
-            UnifiedLinear::from_weights(weights, &format!("{}.wo", prefix), group_size, bits)?;
+        let wo = UnifiedLinear::from_weights(weights, &format!("{}.wo", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim() as i32;
 
@@ -228,12 +227,9 @@ impl MLP {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let w1 =
-            UnifiedLinear::from_weights(weights, &format!("{}.w1", prefix), group_size, bits)?;
-        let w2 =
-            UnifiedLinear::from_weights(weights, &format!("{}.w2", prefix), group_size, bits)?;
-        let w3 =
-            UnifiedLinear::from_weights(weights, &format!("{}.w3", prefix), group_size, bits)?;
+        let w1 = UnifiedLinear::from_weights(weights, &format!("{}.w1", prefix), group_size, bits)?;
+        let w2 = UnifiedLinear::from_weights(weights, &format!("{}.w2", prefix), group_size, bits)?;
+        let w3 = UnifiedLinear::from_weights(weights, &format!("{}.w3", prefix), group_size, bits)?;
 
         Ok(Self { w1, w2, w3 })
     }

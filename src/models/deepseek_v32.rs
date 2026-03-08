@@ -14,7 +14,7 @@
 //! select relevant KV entries instead of creating sparse masks (~40% speedup).
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, MultiLinear, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};

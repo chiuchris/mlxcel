@@ -8,7 +8,7 @@
 //! - Cross-Layer Attention (CLA) support (optional KV sharing)
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -440,12 +440,8 @@ impl MLP {
             group_size,
             bits,
         )?;
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),
@@ -480,8 +476,7 @@ impl Gate {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
-        let wg =
-            UnifiedLinear::from_weights(weights, &format!("{}.wg", prefix), group_size, bits)?;
+        let wg = UnifiedLinear::from_weights(weights, &format!("{}.wg", prefix), group_size, bits)?;
         Ok(Self { wg })
     }
 }
@@ -725,12 +720,8 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.q_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let q_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
 
         // Only load K/V projections if this layer has them
         let (k_proj, v_proj) = if args.has_kv_proj(layer_idx) {
@@ -751,12 +742,8 @@ impl Attention {
             (None, None)
         };
 
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim() as i32;
         let scale = 1.0 / (head_dim as f32).sqrt();

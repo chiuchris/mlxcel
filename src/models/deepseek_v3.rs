@@ -7,7 +7,7 @@
 //! - First k layers are dense (no MoE)
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, MultiLinear, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
@@ -351,12 +351,8 @@ impl DeepSeekV3Attention {
             group_size,
             bits,
         )?;
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         // Load embed_q and unembed_out (decomposed from kv_b_proj by sanitize_weights)
         let embed_q =
@@ -429,12 +425,8 @@ impl DenseMLP {
             group_size,
             bits,
         )?;
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),

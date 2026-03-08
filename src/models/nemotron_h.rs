@@ -9,7 +9,7 @@
 // - relu^2 activation for MLP/MoE
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, Linear, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{
     create_causal_mask, relu_squared, repeat_kv, silu, slice_axis, stack_arrays,
 };

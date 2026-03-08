@@ -10,7 +10,7 @@
 //! - RMSNorm normalization
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -378,12 +378,8 @@ impl MLP {
             group_size,
             bits,
         )?;
-        let up_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.up_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let up_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.up_proj", prefix), group_size, bits)?;
         let down_proj = UnifiedLinear::from_weights(
             weights,
             &format!("{}.down_proj", prefix),
@@ -487,30 +483,14 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.q_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let k_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.k_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let v_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.v_proj", prefix),
-            group_size,
-            bits,
-        )?;
-        let o_proj = UnifiedLinear::from_weights(
-            weights,
-            &format!("{}.o_proj", prefix),
-            group_size,
-            bits,
-        )?;
+        let q_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
+        let k_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
+        let v_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         // Load Q/K normalization weights
         let q_norm_weight = get_weight_copy(weights, &format!("{}.q_norm.weight", prefix))?;

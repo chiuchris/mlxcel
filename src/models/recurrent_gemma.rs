@@ -12,7 +12,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{
-    GemmaRMSNorm, KVCache, UnifiedLinear, RotatingKVCache, UnifiedEmbedding,
+    GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
 use mlxcel_core::utils::{create_causal_mask, repeat_kv, slice_axis, softcap};
 use mlxcel_core::weights::WeightMap;

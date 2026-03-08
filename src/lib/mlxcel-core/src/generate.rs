@@ -172,10 +172,14 @@ impl GenerationStats {
     pub fn print(&self) {
         println!("  Prompt tokens:    {}", self.prompt_tokens);
         println!("  Generated tokens: {}", self.generated_tokens);
-        println!("  Prefill:          {:.2} ms ({:.2} tok/s)",
-            self.prefill_time_ms, self.prefill_tok_per_sec);
-        println!("  Decode:           {:.2} ms ({:.2} tok/s)",
-            self.decode_time_ms, self.decode_tok_per_sec);
+        println!(
+            "  Prefill:          {:.2} ms ({:.2} tok/s)",
+            self.prefill_time_ms, self.prefill_tok_per_sec
+        );
+        println!(
+            "  Decode:           {:.2} ms ({:.2} tok/s)",
+            self.decode_time_ms, self.decode_tok_per_sec
+        );
     }
 }
 
@@ -313,7 +317,8 @@ impl CxxGenerator {
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
-                let (next_tok, next_log) = sample_token_optimized(&next_logits, sampling, &token_history);
+                let (next_tok, next_log) =
+                    sample_token_optimized(&next_logits, sampling, &token_history);
                 ffi::async_eval_pair(&next_tok, &next_log);
                 (Some(next_tok), Some(next_log))
             } else {
@@ -408,12 +413,8 @@ impl CxxGenerator {
 
         // Prefill: use forward_with_embeddings for merged vision+text embeddings
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits = model.forward_with_embeddings(
-            &input,
-            input_embeddings,
-            &mut self.caches,
-            mask,
-        );
+        let logits =
+            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
 
         ffi::clear_memory_cache();
 
@@ -424,8 +425,7 @@ impl CxxGenerator {
             Vec::new()
         };
 
-        let (mut y, mut _logprobs) =
-            sample_token_optimized(&logits, sampling, &token_history);
+        let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::async_eval(&y);
 
         // Decode loop — identical to standard generation (no embeddings needed)
@@ -524,14 +524,9 @@ impl CxxGenerator {
         // Prefill with embeddings
         let prefill_start = Instant::now();
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits = model.forward_with_embeddings(
-            &input,
-            input_embeddings,
-            &mut self.caches,
-            mask,
-        );
-        let (mut y, mut _logprobs) =
-            sample_token_optimized(&logits, sampling, &token_history);
+        let logits =
+            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
+        let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::eval(&y);
         let prefill_time = prefill_start.elapsed();
         ffi::clear_memory_cache();
@@ -789,19 +784,18 @@ pub(crate) fn sample_token_optimized(
     };
 
     // Apply frequency and presence penalties (before temperature)
-    let last_logits =
-        if (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0)
-            && !token_history.is_empty()
-        {
-            apply_frequency_presence_penalty(
-                &last_logits,
-                token_history,
-                config.frequency_penalty,
-                config.presence_penalty,
-            )
-        } else {
-            last_logits
-        };
+    let last_logits = if (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0)
+        && !token_history.is_empty()
+    {
+        apply_frequency_presence_penalty(
+            &last_logits,
+            token_history,
+            config.frequency_penalty,
+            config.presence_penalty,
+        )
+    } else {
+        last_logits
+    };
 
     // Fused C++ path: temperature + top-k + top-p + min-p + categorical
     // in a single FFI call (handles greedy argmax internally too)
@@ -886,8 +880,7 @@ fn apply_frequency_presence_penalty(
     let mut penalties = vec![0.0f32; vocab_size];
     for (&token_id, &count) in &token_counts {
         if token_id >= 0 && (token_id as usize) < vocab_size {
-            penalties[token_id as usize] =
-                frequency_penalty * count as f32 + presence_penalty;
+            penalties[token_id as usize] = frequency_penalty * count as f32 + presence_penalty;
         }
     }
 
@@ -976,7 +969,9 @@ fn apply_dry_penalty(
                 if next_pos < window_len {
                     let next_token = window[next_pos];
                     let penalty = config.dry_multiplier
-                        * config.dry_base.powi((match_len - config.dry_allowed_length) as i32);
+                        * config
+                            .dry_base
+                            .powi((match_len - config.dry_allowed_length) as i32);
                     // Keep the maximum penalty for each token
                     let entry = penalties.entry(next_token).or_insert(0.0);
                     if penalty > *entry {
@@ -994,7 +989,11 @@ fn apply_dry_penalty(
     // Build a full-size penalty array (zeros except at penalized positions)
     let logits_shape = ffi::array_shape(logits);
     let vocab_size = *logits_shape.last().unwrap();
-    let batch_size = if logits_shape.len() > 1 { logits_shape[0] } else { 1 };
+    let batch_size = if logits_shape.len() > 1 {
+        logits_shape[0]
+    } else {
+        1
+    };
     let total = (batch_size * vocab_size) as usize;
     let mut penalty_data = vec![0.0f32; total];
 

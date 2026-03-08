@@ -12,7 +12,7 @@ use crate::models::gated_delta::gated_delta_update;
 use crate::models::switch_layers::SwitchGLU;
 use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
@@ -489,8 +489,7 @@ impl KimiMLAAttention {
         let gs = config.group_size();
         let bits = config.bits();
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), gs, bits)?;
+        let q_proj = UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), gs, bits)?;
         let kv_a_proj_with_mqa = UnifiedLinear::from_weights(
             weights,
             &format!("{}.kv_a_proj_with_mqa", prefix),
@@ -506,8 +505,7 @@ impl KimiMLAAttention {
         let embed_q = MultiLinear::from_weights(weights, &format!("{}.embed_q", prefix), gs, bits)?;
         let unembed_out =
             MultiLinear::from_weights(weights, &format!("{}.unembed_out", prefix), gs, bits)?;
-        let o_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), gs, bits)?;
+        let o_proj = UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), gs, bits)?;
 
         Ok(Self {
             q_proj,
@@ -646,12 +644,9 @@ impl KimiDeltaAttention {
         let gs = config.group_size();
         let bits = config.bits();
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), gs, bits)?;
-        let k_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), gs, bits)?;
-        let v_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), gs, bits)?;
+        let q_proj = UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), gs, bits)?;
+        let k_proj = UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), gs, bits)?;
+        let v_proj = UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), gs, bits)?;
 
         let q_conv = ShortConv1d::from_weights(weights, &format!("{}.q_conv", prefix), config)?;
         let k_conv = ShortConv1d::from_weights(weights, &format!("{}.k_conv", prefix), config)?;
@@ -661,8 +656,7 @@ impl KimiDeltaAttention {
             UnifiedLinear::from_weights(weights, &format!("{}.f_a_proj", prefix), gs, bits)?;
         let f_b_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.f_b_proj", prefix), gs, bits)?;
-        let b_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.b_proj", prefix), gs, bits)?;
+        let b_proj = UnifiedLinear::from_weights(weights, &format!("{}.b_proj", prefix), gs, bits)?;
         let g_a_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.g_a_proj", prefix), gs, bits)?;
         let g_b_proj =
@@ -695,8 +689,7 @@ impl KimiDeltaAttention {
             .map(|w| mlxcel_core::copy(w))
             .ok_or_else(|| format!("Missing o_norm weight: {}", prefix))?;
 
-        let o_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), gs, bits)?;
+        let o_proj = UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), gs, bits)?;
 
         let num_heads = config.delta_num_heads() as i32;
         let head_dim = config.delta_head_dim() as i32;

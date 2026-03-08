@@ -9,7 +9,7 @@
 //! - RotatingKVCache for sliding window layers
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, RotatingKVCache, UnifiedEmbedding};
+use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};

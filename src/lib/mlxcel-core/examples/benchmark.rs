@@ -268,15 +268,17 @@ fn benchmark_attention_high_level(iterations: usize) -> f64 {
 
     // Warmup
     for _ in 0..5 {
-        let out =
-            unsafe { mlxcel_core::scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null()) };
+        let out = unsafe {
+            mlxcel_core::scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null())
+        };
         mlxcel_core::eval(&out);
     }
 
     let start = Instant::now();
     for _ in 0..iterations {
-        let out =
-            unsafe { mlxcel_core::scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null()) };
+        let out = unsafe {
+            mlxcel_core::scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null())
+        };
         mlxcel_core::eval(&out);
     }
     let elapsed = start.elapsed();
