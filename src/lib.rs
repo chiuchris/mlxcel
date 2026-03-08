@@ -5,6 +5,7 @@
 
 pub mod lora;
 pub mod models;
+pub mod qwen_vl;
 pub mod server;
 pub mod tokenizer;
 pub mod vision;

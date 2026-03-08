@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use mlxcel::qwen_vl::insert_qwen_vl_image_tokens;
 use mlxcel::vision::processors::ImageProcessor;
 use mlxcel::{LoadedModel, vision::merge::InputEmbeddings};
 
@@ -20,61 +21,7 @@ pub(crate) fn prepare_vlm_tokens(
     image_paths: &[PathBuf],
     tokenizer: &MlxcelTokenizer,
 ) -> Result<()> {
-    // Get Qwen2-VL/2.5-VL/3-VL/3.5-VL token info (shared logic)
-    let qwen_vl_info = model
-        .qwen2_vl_model()
-        .map(|m| {
-            (
-                &m.processor,
-                m.spatial_merge_size,
-                m.vision_start_token_id,
-                m.image_token_id,
-            )
-        })
-        .or_else(|| {
-            model.qwen2_5_vl_model().map(|m| {
-                (
-                    &m.processor,
-                    m.spatial_merge_size,
-                    m.vision_start_token_id,
-                    m.image_token_id,
-                )
-            })
-        })
-        .or_else(|| {
-            model.qwen3_vl_model().map(|m| {
-                (
-                    &m.processor,
-                    m.spatial_merge_size,
-                    m.vision_start_token_id,
-                    m.image_token_id,
-                )
-            })
-        })
-        .or_else(|| {
-            model.qwen3_vl_moe_model().map(|m| {
-                (
-                    &m.processor,
-                    m.spatial_merge_size,
-                    m.vision_start_token_id,
-                    m.image_token_id,
-                )
-            })
-        })
-        .or_else(|| {
-            model.qwen3_5_vl_model().map(|m| {
-                (
-                    &m.processor,
-                    m.spatial_merge_size,
-                    m.vision_start_token_id,
-                    m.image_token_id,
-                )
-            })
-        });
-
-    if let Some((processor, spatial_merge_size, vision_start_token_id, image_token_id)) =
-        qwen_vl_info
-    {
+    if let Some(info) = model.qwen_vl_prompt_info() {
         // Qwen2-VL/2.5-VL: load images first to compute grid_thw and token counts
         let images: Vec<image::DynamicImage> = image_paths
             .iter()
@@ -84,43 +31,17 @@ pub(crate) fn prepare_vlm_tokens(
             })
             .collect::<Result<Vec<_>>>()?;
 
-        let grid_thw = processor.compute_grid_thw(&images);
-        let merge = spatial_merge_size as i32;
-
-        // Qwen2-VL format: <|vision_start|> <|image_pad|>*N <|vision_end|>
-        let vision_end_token_id = vision_start_token_id + 1; // 151653
-
-        // Check if prompt already has image tokens
-        let existing = prompt_tokens
-            .iter()
-            .filter(|&&t| t == image_token_id)
-            .count();
-        if existing == 0 {
-            // Insert image tokens after BOS
-            let mut image_tokens = Vec::new();
-            for &(t, h, w) in &grid_thw {
-                let tokens_per_image = t * (h / merge) * (w / merge);
-                image_tokens.push(vision_start_token_id);
-                for _ in 0..tokens_per_image {
-                    image_tokens.push(image_token_id);
-                }
-                image_tokens.push(vision_end_token_id);
-            }
-            if !prompt_tokens.is_empty() {
-                let bos = prompt_tokens[0];
-                let rest = prompt_tokens[1..].to_vec();
-                *prompt_tokens = vec![bos];
-                prompt_tokens.extend(image_tokens);
-                prompt_tokens.extend(rest);
-            }
-            let total_img_tokens: i32 = grid_thw
-                .iter()
-                .map(|(t, h, w)| t * (h / merge) * (w / merge))
-                .sum();
+        let grid_thw = info.processor.compute_grid_thw(&images);
+        if let Some(stats) = insert_qwen_vl_image_tokens(
+            prompt_tokens,
+            &grid_thw,
+            info.spatial_merge_size,
+            info.vision_start_token_id,
+            info.image_token_id,
+        ) {
             println!(
                 "Inserted {} Qwen VL image token blocks ({} total image tokens)",
-                grid_thw.len(),
-                total_img_tokens
+                stats.image_blocks, stats.total_image_tokens
             );
         }
     } else if let Some(molmo2) = model.molmo2_vl_model() {
@@ -352,40 +273,13 @@ pub(crate) fn compute_vlm_embeddings(
             .collect::<Result<Vec<_>>>()?;
         println!("Loaded {} image(s).", images.len());
 
-        if let Some(qwen2vl) = model.qwen2_vl_model() {
-            // Qwen2-VL: preprocess with grid_thw
-            let (pixel_values, grid_thw) = qwen2vl.processor.preprocess_with_grid(&images);
+        if let Some(info) = model.qwen_vl_prompt_info() {
+            let (pixel_values, grid_thw) = info.processor.preprocess_with_grid(&images);
             let input_ids_arr =
                 mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-            let merged = qwen2vl.get_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
-            Ok(Some(merged))
-        } else if let Some(qwen25vl) = model.qwen2_5_vl_model() {
-            // Qwen2.5-VL: same preprocessing as Qwen2-VL
-            let (pixel_values, grid_thw) = qwen25vl.processor.preprocess_with_grid(&images);
-            let input_ids_arr =
-                mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-            let merged = qwen25vl.get_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
-            Ok(Some(merged))
-        } else if let Some(qwen3vl) = model.qwen3_vl_model() {
-            // Qwen3-VL: same preprocessing as Qwen2-VL
-            let (pixel_values, grid_thw) = qwen3vl.processor.preprocess_with_grid(&images);
-            let input_ids_arr =
-                mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-            let merged = qwen3vl.get_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
-            Ok(Some(merged))
-        } else if let Some(qwen3vl_moe) = model.qwen3_vl_moe_model() {
-            // Qwen3-VL-MoE: same preprocessing as Qwen3-VL
-            let (pixel_values, grid_thw) = qwen3vl_moe.processor.preprocess_with_grid(&images);
-            let input_ids_arr =
-                mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-            let merged = qwen3vl_moe.get_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
-            Ok(Some(merged))
-        } else if let Some(qwen35vl) = model.qwen3_5_vl_model() {
-            // Qwen3.5 VLM: same vision preprocessing as Qwen3-VL
-            let (pixel_values, grid_thw) = qwen35vl.processor.preprocess_with_grid(&images);
-            let input_ids_arr =
-                mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-            let merged = qwen35vl.get_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
+            let merged = model
+                .qwen_vl_input_embeddings(&input_ids_arr, &pixel_values, &grid_thw)
+                .ok_or_else(|| anyhow::anyhow!("Qwen-VL prompt info without matching model"))?;
             Ok(Some(merged))
         } else if let Some(gemma3n_vl) = model.gemma3n_vl_model() {
             // Gemma3n VLM: MobileNetV5 + per_layer_inputs

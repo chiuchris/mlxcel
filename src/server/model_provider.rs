@@ -10,6 +10,7 @@ use std::thread;
 
 use anyhow::Result;
 
+use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::server::ServerGenerateOptions;
 use crate::vision::processors::ImageProcessor;
 
@@ -174,129 +175,28 @@ impl ModelProvider {
                                 continue;
                             }
 
-                            // Get Qwen VL info (shared for 2-VL and 2.5-VL)
-                            let qwen_vl_info = model
-                                .qwen2_vl_model()
-                                .map(|m| {
-                                    (
-                                        &m.processor,
-                                        m.spatial_merge_size,
-                                        m.vision_start_token_id,
-                                        m.image_token_id,
-                                    )
-                                })
-                                .or_else(|| {
-                                    model.qwen2_5_vl_model().map(|m| {
-                                        (
-                                            &m.processor,
-                                            m.spatial_merge_size,
-                                            m.vision_start_token_id,
-                                            m.image_token_id,
-                                        )
-                                    })
-                                })
-                                .or_else(|| {
-                                    model.qwen3_vl_model().map(|m| {
-                                        (
-                                            &m.processor,
-                                            m.spatial_merge_size,
-                                            m.vision_start_token_id,
-                                            m.image_token_id,
-                                        )
-                                    })
-                                })
-                                .or_else(|| {
-                                    model.qwen3_vl_moe_model().map(|m| {
-                                        (
-                                            &m.processor,
-                                            m.spatial_merge_size,
-                                            m.vision_start_token_id,
-                                            m.image_token_id,
-                                        )
-                                    })
-                                })
-                                .or_else(|| {
-                                    model.qwen3_5_vl_model().map(|m| {
-                                        (
-                                            &m.processor,
-                                            m.spatial_merge_size,
-                                            m.vision_start_token_id,
-                                            m.image_token_id,
-                                        )
-                                    })
-                                });
-
-                            if let Some((
-                                processor,
-                                spatial_merge_size,
-                                vision_start_token_id,
-                                image_token_id,
-                            )) = qwen_vl_info
-                            {
+                            if let Some(info) = model.qwen_vl_prompt_info() {
                                 let (pixel_values, grid_thw) =
-                                    processor.preprocess_with_grid(&decoded_images);
-                                let merge = spatial_merge_size as i32;
-                                let vision_end_token_id = vision_start_token_id + 1;
-
-                                let existing = prompt_tokens
-                                    .iter()
-                                    .filter(|&&t| t == image_token_id)
-                                    .count();
-                                if existing == 0 {
-                                    let mut image_tokens = Vec::new();
-                                    for &(t, h, w) in &grid_thw {
-                                        let tokens_per_image = t * (h / merge) * (w / merge);
-                                        image_tokens.push(vision_start_token_id);
-                                        for _ in 0..tokens_per_image {
-                                            image_tokens.push(image_token_id);
-                                        }
-                                        image_tokens.push(vision_end_token_id);
-                                    }
-                                    if !prompt_tokens.is_empty() {
-                                        let bos = prompt_tokens[0];
-                                        let rest = prompt_tokens[1..].to_vec();
-                                        prompt_tokens = vec![bos];
-                                        prompt_tokens.extend(image_tokens);
-                                        prompt_tokens.extend(rest);
-                                    }
-                                }
+                                    info.processor.preprocess_with_grid(&decoded_images);
+                                let _ = insert_qwen_vl_image_tokens(
+                                    &mut prompt_tokens,
+                                    &grid_thw,
+                                    info.spatial_merge_size,
+                                    info.vision_start_token_id,
+                                    info.image_token_id,
+                                );
 
                                 let input_ids_arr = mlxcel_core::from_slice_i32(
                                     &prompt_tokens,
                                     &[1, prompt_tokens.len() as i32],
                                 );
-                                // Dispatch to the right model's get_input_embeddings
-                                let merged = if let Some(qwen2vl) = model.qwen2_vl_model() {
-                                    qwen2vl.get_input_embeddings(
+                                let merged = model
+                                    .qwen_vl_input_embeddings(
                                         &input_ids_arr,
                                         &pixel_values,
                                         &grid_thw,
                                     )
-                                } else if let Some(qwen25vl) = model.qwen2_5_vl_model() {
-                                    qwen25vl.get_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &grid_thw,
-                                    )
-                                } else if let Some(qwen3vl) = model.qwen3_vl_model() {
-                                    qwen3vl.get_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &grid_thw,
-                                    )
-                                } else if let Some(qwen35vl) = model.qwen3_5_vl_model() {
-                                    qwen35vl.get_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &grid_thw,
-                                    )
-                                } else {
-                                    model.qwen3_vl_moe_model().unwrap().get_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &grid_thw,
-                                    )
-                                };
+                                    .expect("Qwen-VL prompt info without matching model");
                                 Some(merged)
                             } else if let Some(gemma3n_vl) = model.gemma3n_vl_model() {
                                 // Gemma3n VLM dispatch

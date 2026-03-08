@@ -1,4 +1,4 @@
-use crate::{models, vision};
+use crate::{models, qwen_vl, vision};
 use mlxcel_core::UniquePtr;
 use mlxcel_core::generate::LanguageModel;
 
@@ -234,6 +234,60 @@ impl LoadedModel {
     pub fn qwen3_5_vl_model(&self) -> Option<&vision::Qwen35VLModel> {
         match self {
             Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => Some(m),
+            _ => None,
+        }
+    }
+
+    pub fn qwen_vl_prompt_info(&self) -> Option<qwen_vl::QwenVlmPromptInfo<'_>> {
+        match self {
+            Self::Qwen2VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &m.processor,
+                spatial_merge_size: m.spatial_merge_size,
+                vision_start_token_id: m.vision_start_token_id,
+                image_token_id: m.image_token_id,
+            }),
+            Self::Qwen25VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &m.processor,
+                spatial_merge_size: m.spatial_merge_size,
+                vision_start_token_id: m.vision_start_token_id,
+                image_token_id: m.image_token_id,
+            }),
+            Self::Qwen3VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &m.processor,
+                spatial_merge_size: m.spatial_merge_size,
+                vision_start_token_id: m.vision_start_token_id,
+                image_token_id: m.image_token_id,
+            }),
+            Self::Qwen3VLMoe(m) => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &m.processor,
+                spatial_merge_size: m.spatial_merge_size,
+                vision_start_token_id: m.vision_start_token_id,
+                image_token_id: m.image_token_id,
+            }),
+            Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &m.processor,
+                spatial_merge_size: m.spatial_merge_size,
+                vision_start_token_id: m.vision_start_token_id,
+                image_token_id: m.image_token_id,
+            }),
+            _ => None,
+        }
+    }
+
+    pub fn qwen_vl_input_embeddings(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        pixel_values: &mlxcel_core::MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+    ) -> Option<vision::merge::InputEmbeddings> {
+        match self {
+            Self::Qwen2VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
+            Self::Qwen25VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
+            Self::Qwen3VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
+            Self::Qwen3VLMoe(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
+            Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => {
+                Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw))
+            }
             _ => None,
         }
     }
