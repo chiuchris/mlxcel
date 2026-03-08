@@ -3,21 +3,28 @@ use std::io::{self, Write as IoWrite};
 use std::time::Instant;
 
 use mlxcel::{
-    CxxGenerator, GenerationStats, LanguageModel, SamplingConfig, SpeculativeGenerator, load_model,
-    load_model_with_adapter,
+    CxxGenerator, GenerationStats, LanguageModel, SamplingConfig, SpeculativeGenerator,
+    initialize_runtime, load_model, load_model_with_adapter,
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
 };
 
 use super::{GenerateArgs, generate_vlm};
 
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
-    // Set wired memory limit for GPU
-    let max_memory = mlxcel_core::gpu_max_memory_size();
-    mlxcel_core::set_wired_limit(max_memory);
-    println!(
-        "Wired memory limit: {:.1} GB",
-        max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
+    let runtime = initialize_runtime();
+    if let Some(invalid) = runtime.invalid_device_override.as_deref() {
+        eprintln!(
+            "Ignoring invalid MLXCEL_DEVICE value {:?}; using gpu.",
+            invalid
+        );
+    }
+    println!("Runtime device: {}", runtime.device);
+    if let Some(max_memory) = runtime.wired_limit_bytes {
+        println!(
+            "Wired memory limit: {:.1} GB",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
 
     println!("Loading model from {:?}...", args.model.model);
     let (model, tokenizer) = if let Some(ref adapter_path) = args.model.adapter {

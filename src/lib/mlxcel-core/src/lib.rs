@@ -938,6 +938,9 @@ mod ffi {
         /// Synchronize default stream
         fn synchronize_default();
 
+        /// Set default device for subsequent operations
+        fn set_default_device(gpu: bool);
+
         /// Set wired memory limit, returns previous limit
         fn set_wired_limit(limit: usize) -> usize;
 
@@ -975,7 +978,7 @@ mod ffi {
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
 
-        /// Check if GPU is available
+        /// Check whether the current default device is GPU
         fn is_gpu_available() -> bool;
 
         /// Fused sampling: temperature + top-k + top-p + min-p + categorical
@@ -1039,13 +1042,21 @@ mod ffi {
         fn unflatten(a: &MlxArray, axis: i32, shape: &[i32]) -> UniquePtr<MlxArray>;
 
         /// View array with given shape and strides
-        fn as_strided(a: &MlxArray, shape: &[i32], strides: &[i64], offset: usize) -> UniquePtr<MlxArray>;
+        fn as_strided(
+            a: &MlxArray,
+            shape: &[i32],
+            strides: &[i64],
+            offset: usize,
+        ) -> UniquePtr<MlxArray>;
 
         /// Ensure the array memory is contiguous
         fn contiguous(a: &MlxArray, allow_col_major: bool) -> UniquePtr<MlxArray>;
 
         /// Broadcast a list of arrays against one another (returns i-th result)
-        unsafe fn broadcast_arrays_get(arrays: &[*const MlxArray], index: usize) -> UniquePtr<MlxArray>;
+        unsafe fn broadcast_arrays_get(
+            arrays: &[*const MlxArray],
+            index: usize,
+        ) -> UniquePtr<MlxArray>;
 
         /// Number of results from broadcast_arrays
         unsafe fn broadcast_arrays_count(arrays: &[*const MlxArray]) -> usize;
@@ -1069,7 +1080,12 @@ mod ffi {
         fn median_axis(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
         /// Cumulative log-sum-exp along axis
-        fn logcumsumexp(a: &MlxArray, axis: i32, reverse: bool, inclusive: bool) -> UniquePtr<MlxArray>;
+        fn logcumsumexp(
+            a: &MlxArray,
+            axis: i32,
+            reverse: bool,
+            inclusive: bool,
+        ) -> UniquePtr<MlxArray>;
 
         /// Bitwise invert
         fn bitwise_invert(a: &MlxArray) -> UniquePtr<MlxArray>;
@@ -1090,7 +1106,13 @@ mod ffi {
         fn kron(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// addmm: beta * c + alpha * (a @ b)
-        fn addmm(c: &MlxArray, a: &MlxArray, b: &MlxArray, alpha: f32, beta: f32) -> UniquePtr<MlxArray>;
+        fn addmm(
+            c: &MlxArray,
+            a: &MlxArray,
+            b: &MlxArray,
+            alpha: f32,
+            beta: f32,
+        ) -> UniquePtr<MlxArray>;
 
         /// Block-sparse masked matrix multiply
         unsafe fn block_masked_mm(
@@ -1109,7 +1131,12 @@ mod ffi {
         fn hadamard_transform(a: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// Number of elements along axes as scalar array
-        fn number_of_elements(a: &MlxArray, axes: &[i32], inverted: bool, dtype: i32) -> UniquePtr<MlxArray>;
+        fn number_of_elements(
+            a: &MlxArray,
+            axes: &[i32],
+            inverted: bool,
+            dtype: i32,
+        ) -> UniquePtr<MlxArray>;
 
         // ====================================================================
         // Convolution additions
@@ -1191,10 +1218,20 @@ mod ffi {
         fn linalg_norm(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
         /// Vector/matrix norm with numeric ord along axis
-        fn linalg_norm_ord(a: &MlxArray, ord: f64, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
+        fn linalg_norm_ord(
+            a: &MlxArray,
+            ord: f64,
+            axis: i32,
+            keepdims: bool,
+        ) -> UniquePtr<MlxArray>;
 
         /// Vector/matrix norm with string ord (e.g. "fro", "nuc") along axis
-        fn linalg_norm_str(a: &MlxArray, ord: &str, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
+        fn linalg_norm_str(
+            a: &MlxArray,
+            ord: &str,
+            axis: i32,
+            keepdims: bool,
+        ) -> UniquePtr<MlxArray>;
 
         /// QR decomposition — Q matrix
         fn linalg_qr_q(a: &MlxArray) -> UniquePtr<MlxArray>;
@@ -1325,31 +1362,69 @@ mod ffi {
         fn random_split_key(key: &MlxArray, num: i32) -> UniquePtr<MlxArray>;
 
         /// Uniform random in [low, high)
-        unsafe fn random_uniform(low: f32, high: f32, shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_uniform(
+            low: f32,
+            high: f32,
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Standard normal random samples
-        unsafe fn random_normal(shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_normal(
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Bernoulli random samples with probability p
-        unsafe fn random_bernoulli_p(p: f32, shape: &[i32], key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_bernoulli_p(
+            p: f32,
+            shape: &[i32],
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Random integers in [low, high)
-        unsafe fn random_randint(low: i32, high: i32, shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_randint(
+            low: i32,
+            high: i32,
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Truncated normal random samples
-        unsafe fn random_truncated_normal(lower: f32, upper: f32, shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_truncated_normal(
+            lower: f32,
+            upper: f32,
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Gumbel random samples
-        unsafe fn random_gumbel(shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_gumbel(
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Laplace random samples
-        unsafe fn random_laplace(shape: &[i32], dtype: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_laplace(
+            shape: &[i32],
+            dtype: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Random permutation of integers 0..x
         unsafe fn random_permutation(x: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
 
         /// Random permutation of array along axis
-        unsafe fn random_permutation_array(a: &MlxArray, axis: i32, key: *const MlxArray) -> UniquePtr<MlxArray>;
+        unsafe fn random_permutation_array(
+            a: &MlxArray,
+            axis: i32,
+            key: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
 
         /// Multivariate normal random samples
         unsafe fn random_multivariate_normal(
@@ -1368,10 +1443,12 @@ mod ffi {
         fn quantize_weights_w(w: &MlxArray, group_size: i32, bits: i32) -> UniquePtr<MlxArray>;
 
         /// Quantize weights — scales
-        fn quantize_weights_scales(w: &MlxArray, group_size: i32, bits: i32) -> UniquePtr<MlxArray>;
+        fn quantize_weights_scales(w: &MlxArray, group_size: i32, bits: i32)
+            -> UniquePtr<MlxArray>;
 
         /// Quantize weights — biases
-        fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32) -> UniquePtr<MlxArray>;
+        fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
+            -> UniquePtr<MlxArray>;
     }
 }
 
@@ -1393,10 +1470,7 @@ pub fn concatenate(
 
 /// Stack arrays along a new axis (low-level, takes raw pointers)
 /// Use stack_owned for UniquePtr inputs
-pub fn stack(
-    ptrs: &[*const ffi::MlxArray],
-    axis: i32,
-) -> cxx::UniquePtr<ffi::MlxArray> {
+pub fn stack(ptrs: &[*const ffi::MlxArray], axis: i32) -> cxx::UniquePtr<ffi::MlxArray> {
     unsafe { ffi::stack(ptrs, axis) }
 }
 

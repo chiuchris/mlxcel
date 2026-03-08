@@ -1784,6 +1784,10 @@ void synchronize_default() {
     mlx::core::synchronize();
 }
 
+void set_default_device(bool gpu) {
+    mlx::core::set_default_device(gpu ? mlx::core::Device::gpu : mlx::core::Device::cpu);
+}
+
 size_t set_wired_limit(size_t limit) {
     return mlx::core::set_wired_limit(limit);
 }
@@ -1885,7 +1889,7 @@ void set_default_stream(const MlxStream& stream) {
     mlx::core::set_default_stream(stream.inner);
 }
 
-// Get default device (needed for stream creation)
+// Check whether the current default device is GPU
 bool is_gpu_available() {
     return mlx::core::default_device() == mlx::core::Device::gpu;
 }

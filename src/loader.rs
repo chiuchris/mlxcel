@@ -1,4 +1,6 @@
 use anyhow::Result;
+use serde::de::DeserializeOwned;
+use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
@@ -20,18 +22,7 @@ fn resolve_model_dir(model_path: &Path) -> PathBuf {
     }
 }
 
-/// Read EOS token IDs from generation_config.json
-///
-/// Returns the token IDs from the `eos_token_id` field, which can be either
-/// a single integer or an array of integers. Returns empty vec if not found.
-pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
-    let config_path = model_dir.join("generation_config.json");
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return Vec::new();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
+fn parse_eos_token_ids(config: &serde_json::Value) -> Vec<i32> {
     match config.get("eos_token_id") {
         Some(serde_json::Value::Number(n)) => {
             if let Some(id) = n.as_i64() {
@@ -48,6 +39,50 @@ pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
     }
 }
 
+fn parse_model_config<T: DeserializeOwned>(config_str: &str) -> Result<T> {
+    serde_json::from_str(config_str).map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))
+}
+
+fn load_pair_from_dir<T, U, E, F>(path_str: &str, load: F) -> Result<T>
+where
+    F: FnOnce(String) -> std::result::Result<(T, U), E>,
+    E: Display,
+{
+    let (model, _) = load(path_str.to_owned()).map_err(|e| anyhow::anyhow!("{}", e))?;
+    Ok(model)
+}
+
+fn load_from_dir<T, E, F>(path_str: &str, load: F) -> Result<T>
+where
+    F: FnOnce(String) -> std::result::Result<T, E>,
+    E: Display,
+{
+    load(path_str.to_owned()).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+fn load_from_path<T, E, F>(path: &Path, load: F) -> Result<T>
+where
+    F: FnOnce(&Path) -> std::result::Result<T, E>,
+    E: Display,
+{
+    load(path).map_err(|e| anyhow::anyhow!("{}", e))
+}
+
+/// Read EOS token IDs from generation_config.json
+///
+/// Returns the token IDs from the `eos_token_id` field, which can be either
+/// a single integer or an array of integers. Returns empty vec if not found.
+pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
+    let config_path = model_dir.join("generation_config.json");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return Vec::new();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return Vec::new();
+    };
+    parse_eos_token_ids(&config)
+}
+
 /// Load a model from a directory (or file — parent directory will be used)
 pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_path = resolve_model_dir(model_path);
@@ -57,9 +92,7 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
 
     let model = match model_type {
         ModelType::Llama => {
-            let (m, _) =
-                models::Llama3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Llama(m)
+            LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
         }
         ModelType::Mistral3 => {
             // Mistral3 is a VLM wrapper - check text_config for inner model type
@@ -77,46 +110,34 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
 
             if is_ministral3 {
                 // Load as Ministral3 with text_config extracted
-                let (m, _) = models::Ministral3Model::load_from_text_config(path_str)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
+                LoadedModel::Ministral3(models::Ministral3Wrapper::new(load_pair_from_dir(
+                    path_str,
+                    models::Ministral3Model::load_from_text_config,
+                )?))
             } else {
                 // Load as standard Llama
-                let (m, _) =
-                    models::Llama3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-                LoadedModel::Llama(m)
+                LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
             }
         }
-        ModelType::Llama4 => {
-            let (m, _) =
-                models::Llama4CxxModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Llama4(models::Llama4Wrapper::new(m))
-        }
+        ModelType::Llama4 => LoadedModel::Llama4(models::Llama4Wrapper::new(load_pair_from_dir(
+            path_str,
+            models::Llama4CxxModel::load,
+        )?)),
         ModelType::Llama4VLM => load_llama4_vlm(model_path)?,
         ModelType::Qwen2 => {
-            let (m, _) =
-                models::Qwen2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen2(m)
+            LoadedModel::Qwen2(load_pair_from_dir(path_str, models::Qwen2Model::load)?)
         }
         ModelType::Qwen3 => {
-            let (m, _) =
-                models::Qwen3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3(m)
+            LoadedModel::Qwen3(load_pair_from_dir(path_str, models::Qwen3Model::load)?)
         }
         ModelType::Qwen3Moe => {
-            let (m, _) =
-                models::Qwen3MoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3Moe(m)
+            LoadedModel::Qwen3Moe(load_pair_from_dir(path_str, models::Qwen3MoeModel::load)?)
         }
         ModelType::Qwen3Next => {
-            let (m, _) =
-                models::Qwen3NextModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3Next(m)
+            LoadedModel::Qwen3Next(load_pair_from_dir(path_str, models::Qwen3NextModel::load)?)
         }
         ModelType::Qwen35 => {
-            let (m, _) =
-                models::Qwen35Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen35(m)
+            LoadedModel::Qwen35(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
         }
         ModelType::Qwen35VLM => {
             return Ok((
@@ -125,10 +146,7 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
             ));
         }
         ModelType::Qwen35Moe => {
-            // MoE wrapper: same load path as Qwen35 (both handle text_config)
-            let (m, _) =
-                models::Qwen35Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen35Moe(m)
+            LoadedModel::Qwen35Moe(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
         }
         ModelType::Qwen35MoeVLM => {
             return Ok((
@@ -137,25 +155,18 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
             ));
         }
         ModelType::Qwen2Moe => {
-            let (m, _) =
-                models::Qwen2MoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen2Moe(m)
+            LoadedModel::Qwen2Moe(load_pair_from_dir(path_str, models::Qwen2MoeModel::load)?)
         }
         ModelType::Gemma => {
-            let (m, _) =
-                models::GemmaModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma(m)
+            LoadedModel::Gemma(load_pair_from_dir(path_str, models::GemmaModel::load)?)
         }
         ModelType::Gemma2 => {
-            let (m, _) =
-                models::Gemma2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma2(m)
+            LoadedModel::Gemma2(load_pair_from_dir(path_str, models::Gemma2Model::load)?)
         }
-        ModelType::Gemma3 => {
-            let (m, _) =
-                models::Gemma3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma3(models::Gemma3Wrapper::new(m))
-        }
+        ModelType::Gemma3 => LoadedModel::Gemma3(models::Gemma3Wrapper::new(load_pair_from_dir(
+            path_str,
+            models::Gemma3Model::load,
+        )?)),
         ModelType::Gemma3VLM => load_gemma3_vlm(model_path)?,
         ModelType::LlavaVLM => load_llava_vlm(model_path)?,
         ModelType::LlavaBunnyVLM => load_llava_bunny_vlm(model_path)?,
@@ -168,17 +179,12 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
         ModelType::Qwen3VL => load_qwen3_vl(model_path)?,
         ModelType::Qwen3VLMoe => load_qwen3_vl_moe(model_path)?,
         ModelType::Gemma3n => {
-            let m = models::Gemma3nModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma3n(m)
+            LoadedModel::Gemma3n(load_from_dir(path_str, models::Gemma3nModel::load)?)
         }
         ModelType::Gemma3nVLM => load_gemma3n_vlm(model_path)?,
-        ModelType::Phi => {
-            let (m, _) = models::PhiModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi(m)
-        }
+        ModelType::Phi => LoadedModel::Phi(load_pair_from_dir(path_str, models::PhiModel::load)?),
         ModelType::Phi3 => {
-            let (m, _) = models::Phi3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi3(m)
+            LoadedModel::Phi3(load_pair_from_dir(path_str, models::Phi3Model::load)?)
         }
         ModelType::Phi3VLM => {
             return Ok((
@@ -193,230 +199,149 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
             ));
         }
         ModelType::Phi3Small => {
-            let (m, _) =
-                models::Phi3SmallModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi3Small(m)
+            LoadedModel::Phi3Small(load_pair_from_dir(path_str, models::Phi3SmallModel::load)?)
         }
         ModelType::PhiMoe => {
-            let (m, _) =
-                models::PhiMoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::PhiMoe(m)
+            LoadedModel::PhiMoe(load_pair_from_dir(path_str, models::PhiMoeModel::load)?)
         }
         ModelType::Mixtral => {
-            let (m, _) =
-                models::MixtralModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mixtral(m)
+            LoadedModel::Mixtral(load_pair_from_dir(path_str, models::MixtralModel::load)?)
         }
         ModelType::OLMoE => {
-            let (m, _) =
-                models::OlmoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::OLMoE(m)
+            LoadedModel::OLMoE(load_pair_from_dir(path_str, models::OlmoeModel::load)?)
         }
         ModelType::DeepSeek => {
-            let (m, _) =
-                models::DeepSeekModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeek(m)
+            LoadedModel::DeepSeek(load_pair_from_dir(path_str, models::DeepSeekModel::load)?)
         }
         ModelType::DeepSeekV2 => {
-            let (m, _) =
-                models::DeepSeekV2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV2(m)
+            LoadedModel::DeepSeekV2(load_pair_from_dir(path_str, models::DeepSeekV2Model::load)?)
         }
         ModelType::DeepSeekV3 => {
-            let (m, _) =
-                models::DeepSeekV3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV3(m)
+            LoadedModel::DeepSeekV3(load_pair_from_dir(path_str, models::DeepSeekV3Model::load)?)
         }
-        ModelType::DeepSeekV32 => {
-            let (m, _) =
-                models::DeepSeekV32Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV32(m)
-        }
+        ModelType::DeepSeekV32 => LoadedModel::DeepSeekV32(load_pair_from_dir(
+            path_str,
+            models::DeepSeekV32Model::load,
+        )?),
         ModelType::Cohere => {
-            let (m, _) =
-                models::CohereModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Cohere(m)
+            LoadedModel::Cohere(load_pair_from_dir(path_str, models::CohereModel::load)?)
         }
         ModelType::Cohere2 => {
-            let (m, _) =
-                models::Cohere2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Cohere2(m)
+            LoadedModel::Cohere2(load_pair_from_dir(path_str, models::Cohere2Model::load)?)
         }
         ModelType::InternLM2 => {
-            let (m, _) =
-                models::InternLM2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::InternLM2(m)
+            LoadedModel::InternLM2(load_pair_from_dir(path_str, models::InternLM2Model::load)?)
         }
         ModelType::InternLM3 => {
-            let (m, _) =
-                models::InternLM3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::InternLM3(m)
+            LoadedModel::InternLM3(load_pair_from_dir(path_str, models::InternLM3Model::load)?)
         }
         ModelType::Baichuan => {
-            let (m, _) =
-                models::BaichuanModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Baichuan(m)
+            LoadedModel::Baichuan(load_pair_from_dir(path_str, models::BaichuanModel::load)?)
         }
         ModelType::Glm4 => {
-            let (m, _) = models::Glm4Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4(m)
+            LoadedModel::Glm4(load_pair_from_dir(path_str, models::Glm4Model::load)?)
         }
         ModelType::Glm4Moe => {
-            let (m, _) =
-                models::Glm4MoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4Moe(m)
+            LoadedModel::Glm4Moe(load_pair_from_dir(path_str, models::Glm4MoeModel::load)?)
         }
-        ModelType::Glm4MoeLite => {
-            let (m, _) =
-                models::Glm4MoeLiteModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4MoeLite(m)
-        }
+        ModelType::Glm4MoeLite => LoadedModel::Glm4MoeLite(load_pair_from_dir(
+            path_str,
+            models::Glm4MoeLiteModel::load,
+        )?),
         ModelType::GlmMoeDsa => {
-            let (m, _) =
-                models::GlmMoeDsaModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::GlmMoeDsa(m)
+            LoadedModel::GlmMoeDsa(load_pair_from_dir(path_str, models::GlmMoeDsaModel::load)?)
         }
         ModelType::Ernie45 => {
-            let (m, _) =
-                models::Ernie45Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ernie45(m)
+            LoadedModel::Ernie45(load_pair_from_dir(path_str, models::Ernie45Model::load)?)
         }
         ModelType::Ernie45Moe => {
-            let (m, _) =
-                models::Ernie45MoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ernie45Moe(m)
+            LoadedModel::Ernie45Moe(load_pair_from_dir(path_str, models::Ernie45MoeModel::load)?)
         }
         ModelType::HunyuanMoe => {
-            let (m, _) =
-                models::HunyuanMoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::HunyuanMoe(m)
+            LoadedModel::HunyuanMoe(load_pair_from_dir(path_str, models::HunyuanMoeModel::load)?)
         }
-        ModelType::HunyuanV1Dense => {
-            let (m, _) = models::HunyuanV1DenseModel::load(path_str)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::HunyuanV1Dense(m)
-        }
+        ModelType::HunyuanV1Dense => LoadedModel::HunyuanV1Dense(load_pair_from_dir(
+            path_str,
+            models::HunyuanV1DenseModel::load,
+        )?),
         ModelType::MiMo => {
-            let (m, _) = models::MiMoModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiMo(m)
+            LoadedModel::MiMo(load_pair_from_dir(path_str, models::MiMoModel::load)?)
         }
         ModelType::ExaOne => {
-            let (m, _) =
-                models::ExaOneModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOne(m)
+            LoadedModel::ExaOne(load_pair_from_dir(path_str, models::ExaOneModel::load)?)
         }
-        ModelType::ExaOne4 => {
-            let (m, _) =
-                models::ExaOne4Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m))
-        }
+        ModelType::ExaOne4 => LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(
+            load_pair_from_dir(path_str, models::ExaOne4Model::load)?,
+        )),
         ModelType::ExaOneMoe => {
-            let (m, _) =
-                models::ExaoneMoeModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOneMoe(m)
+            LoadedModel::ExaOneMoe(load_pair_from_dir(path_str, models::ExaoneMoeModel::load)?)
         }
         ModelType::Olmo => {
-            let (m, _) = models::OlmoModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo(m)
+            LoadedModel::Olmo(load_pair_from_dir(path_str, models::OlmoModel::load)?)
         }
         ModelType::Olmo2 => {
-            let (m, _) =
-                models::OLMo2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo2(m)
+            LoadedModel::Olmo2(load_pair_from_dir(path_str, models::OLMo2Model::load)?)
         }
         ModelType::Olmo3 => {
-            let (m, _) =
-                models::OLMo3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo3(m)
+            LoadedModel::Olmo3(load_pair_from_dir(path_str, models::OLMo3Model::load)?)
         }
         ModelType::StarCoder2 => {
-            let (m, _) =
-                models::StarCoder2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::StarCoder2(m)
+            LoadedModel::StarCoder2(load_pair_from_dir(path_str, models::StarCoder2Model::load)?)
         }
         ModelType::MiniCPM => {
-            let (m, _) =
-                models::MiniCPMModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiniCPM(m)
+            LoadedModel::MiniCPM(load_pair_from_dir(path_str, models::MiniCPMModel::load)?)
         }
         ModelType::MiniCPM3 => {
-            let (m, _) =
-                models::MiniCPM3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiniCPM3(m)
+            LoadedModel::MiniCPM3(load_pair_from_dir(path_str, models::MiniCPM3Model::load)?)
         }
         ModelType::StableLM => {
-            let (m, _) =
-                models::StableLMModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::StableLM(m)
+            LoadedModel::StableLM(load_pair_from_dir(path_str, models::StableLMModel::load)?)
         }
         ModelType::SmolLM3 => {
-            let (m, _) =
-                models::SmolLM3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::SmolLM3(m)
+            LoadedModel::SmolLM3(load_pair_from_dir(path_str, models::SmolLM3Model::load)?)
         }
-        ModelType::Ministral3 => {
-            let (m, _) =
-                models::Ministral3Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
-        }
+        ModelType::Ministral3 => LoadedModel::Ministral3(models::Ministral3Wrapper::new(
+            load_pair_from_dir(path_str, models::Ministral3Model::load)?,
+        )),
         ModelType::Nemotron => {
-            let (m, _) =
-                models::NemotronModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Nemotron(m)
+            LoadedModel::Nemotron(load_pair_from_dir(path_str, models::NemotronModel::load)?)
         }
-        ModelType::Mamba => {
-            let (m, _) =
-                models::MambaModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mamba(m)
-        }
-        ModelType::Mamba2 => {
-            let (m, _) =
-                models::Mamba2Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mamba2(m)
-        }
-        ModelType::Jamba => {
-            let (m, _) =
-                models::JambaModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Jamba(m)
-        }
-        ModelType::NemotronH => {
-            let (m, _) =
-                models::NemotronHModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::NemotronH(m)
-        }
-        ModelType::NemotronNAS => {
-            let (m, _) =
-                models::NemotronNASModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::NemotronNAS(m)
-        }
+        ModelType::Mamba => LoadedModel::Mamba(load_pair_from_dir(path_str, |path| {
+            models::MambaModel::load(&path)
+        })?),
+        ModelType::Mamba2 => LoadedModel::Mamba2(load_pair_from_dir(path_str, |path| {
+            models::Mamba2Model::load(&path)
+        })?),
+        ModelType::Jamba => LoadedModel::Jamba(load_pair_from_dir(path_str, |path| {
+            models::JambaModel::load(&path)
+        })?),
+        ModelType::NemotronH => LoadedModel::NemotronH(load_pair_from_dir(path_str, |path| {
+            models::NemotronHModel::load(&path)
+        })?),
+        ModelType::NemotronNAS => LoadedModel::NemotronNAS(load_pair_from_dir(path_str, |path| {
+            models::NemotronNASModel::load(&path)
+        })?),
         ModelType::Step3p5 => {
-            let (m, _) =
-                models::Step3p5Model::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Step3p5(m)
+            LoadedModel::Step3p5(load_pair_from_dir(path_str, models::Step3p5Model::load)?)
         }
         ModelType::KimiLinear => {
-            let (m, _) =
-                models::KimiLinearModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::KimiLinear(m)
+            LoadedModel::KimiLinear(load_pair_from_dir(path_str, models::KimiLinearModel::load)?)
         }
         ModelType::LongcatFlash => {
-            let (m, _) = models::LongcatFlashNgramModel::load(path_str)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::LongcatFlash(m)
+            LoadedModel::LongcatFlash(load_pair_from_dir(path_str, |path| {
+                models::LongcatFlashNgramModel::load(&path)
+            })?)
         }
         ModelType::LongcatFlashNgram => {
-            let (m, _) = models::LongcatFlashNgramModel::load(path_str)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::LongcatFlashNgram(m)
+            LoadedModel::LongcatFlashNgram(load_pair_from_dir(path_str, |path| {
+                models::LongcatFlashNgramModel::load(&path)
+            })?)
         }
-        ModelType::Rwkv7 => {
-            let m = models::Rwkv7::load(model_path).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Rwkv7(m)
-        }
+        ModelType::Rwkv7 => LoadedModel::Rwkv7(load_from_path(model_path, models::Rwkv7::load)?),
         ModelType::RecurrentGemma => {
-            let (m, _) =
-                models::GriffinModel::load(path_str).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::RecurrentGemma(m)
+            LoadedModel::RecurrentGemma(load_pair_from_dir(path_str, |path| {
+                models::GriffinModel::load(&path)
+            })?)
         }
     };
 
@@ -456,13 +381,13 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
     let config_str = sanitize_config_json(&config_str);
 
     // Sanitize tied embeddings: copy embed_tokens → lm_head if needed
-    let config_value: serde_json::Value = serde_json::from_str(&config_str)?;
+    let config_value: serde_json::Value = parse_model_config(&config_str)?;
     models::sanitize_tied_embeddings(weights, &config_value);
 
     let model = match model_type {
         ModelType::Llama | ModelType::Mistral3 => {
             // Check for ministral3 sub-type
-            let config: serde_json::Value = serde_json::from_str(&config_str)?;
+            let config: serde_json::Value = parse_model_config(&config_str)?;
             let is_ministral3 = config
                 .get("text_config")
                 .and_then(|tc| tc.get("model_type"))
@@ -482,16 +407,14 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
             } else {
-                let args: models::llama3::ModelArgs = serde_json::from_str(&config_str)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+                let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
                 let m = models::Llama3Model::from_weights(weights, &args)
                     .map_err(|e| anyhow::anyhow!("{}", e))?;
                 LoadedModel::Llama(m)
             }
         }
         ModelType::Llama4 => {
-            let args: models::llama4::TextArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::llama4::TextArgs = parse_model_config(&config_str)?;
             let m = models::Llama4CxxModel::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Llama4(models::Llama4Wrapper::new(m))
@@ -502,29 +425,25 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Qwen2 => {
-            let args: models::llama3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
             let m = models::Qwen2Model::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Qwen2(m)
         }
         ModelType::Qwen3 => {
-            let args: models::qwen3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::qwen3::ModelArgs = parse_model_config(&config_str)?;
             let m = models::Qwen3Model::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Qwen3(m)
         }
         ModelType::Qwen3Moe => {
-            let args: models::qwen3_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::qwen3_moe::ModelArgs = parse_model_config(&config_str)?;
             let m = models::Qwen3MoeModel::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Qwen3Moe(m)
         }
         ModelType::Qwen3Next => {
-            let args: models::qwen3_next::Qwen3NextConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::qwen3_next::Qwen3NextConfig = parse_model_config(&config_str)?;
             let m = models::Qwen3NextModel::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Qwen3Next(m)
@@ -1036,3 +955,7 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
 
     Ok(model)
 }
+
+#[cfg(test)]
+#[path = "loader_tests.rs"]
+mod tests;

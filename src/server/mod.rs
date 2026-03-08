@@ -369,13 +369,21 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         }
     }
 
-    // 2. Set wired memory limit for GPU
-    let max_memory = mlxcel_core::gpu_max_memory_size();
-    mlxcel_core::set_wired_limit(max_memory);
-    tracing::info!(
-        "Wired memory limit: {:.1} GB",
-        max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
-    );
+    // 2. Initialize runtime device before the first MLX call
+    let runtime = crate::initialize_runtime();
+    if let Some(invalid) = runtime.invalid_device_override.as_deref() {
+        tracing::warn!(
+            value = invalid,
+            "Ignoring invalid MLXCEL_DEVICE override; using gpu"
+        );
+    }
+    tracing::info!("Runtime device: {}", runtime.device);
+    if let Some(max_memory) = runtime.wired_limit_bytes {
+        tracing::info!(
+            "Wired memory limit: {:.1} GB",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
 
     // 3. Resolve API key
     let api_key = resolve_api_key(startup.api_key, startup.api_key_file.as_deref())?;
@@ -509,9 +517,8 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
             let app = app.clone();
             tokio::spawn(async move {
                 let socket = hyper_util::rt::TokioIo::new(socket);
-                let hyper_service = hyper::service::service_fn(move |request| {
-                    app.clone().call(request)
-                });
+                let hyper_service =
+                    hyper::service::service_fn(move |request| app.clone().call(request));
                 if let Err(e) = hyper_util::server::conn::auto::Builder::new(
                     hyper_util::rt::TokioExecutor::new(),
                 )

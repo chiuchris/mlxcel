@@ -683,6 +683,9 @@ void async_eval_all(rust::Slice<const MlxArray* const> arrays);
 // Synchronize stream
 void synchronize_default();
 
+// Set default device for subsequent operations
+void set_default_device(bool gpu);
+
 // Memory limits
 size_t set_wired_limit(size_t limit);
 size_t get_wired_limit();

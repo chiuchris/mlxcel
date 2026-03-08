@@ -88,6 +88,8 @@ fn main() {
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.cpp");
     println!("cargo:rerun-if-changed=../mlx-cpp/CMakeLists.txt");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
+    println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
+    println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");
 }
 
 fn build_mlx() -> PathBuf {
@@ -103,10 +105,13 @@ fn build_mlx() -> PathBuf {
 
     #[cfg(target_os = "macos")]
     {
-        // On macOS, always enable Metal and Accelerate unless explicitly building
-        // with only the cuda feature (which doesn't apply to macOS anyway)
-        config.define("MLX_BUILD_METAL", "ON");
-        config.define("MLX_BUILD_ACCELERATE", "ON");
+        let build_metal = cmake_bool_from_env("MLXCEL_BUILD_METAL").unwrap_or("ON");
+        let build_accelerate = cmake_bool_from_env("MLXCEL_BUILD_ACCELERATE").unwrap_or("ON");
+
+        // Default to Metal + Accelerate on macOS, but allow CPU-only rebuilds
+        // for environments where Metal device enumeration is unavailable.
+        config.define("MLX_BUILD_METAL", build_metal);
+        config.define("MLX_BUILD_ACCELERATE", build_accelerate);
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -123,21 +128,28 @@ fn build_mlx() -> PathBuf {
         if let Ok(cuda_path) = env::var("CUDA_HOME") {
             config.define("CMAKE_CUDA_COMPILER", format!("{cuda_path}/bin/nvcc"));
         } else if PathBuf::from("/usr/local/cuda/bin/nvcc").exists() {
-            config.define(
-                "CMAKE_CUDA_COMPILER",
-                "/usr/local/cuda/bin/nvcc",
-            );
+            config.define("CMAKE_CUDA_COMPILER", "/usr/local/cuda/bin/nvcc");
         }
 
         // Set CUDA architecture - use env var or auto-detect via nvidia-smi
-        let cuda_arch = env::var("MLX_CUDA_ARCHITECTURES").unwrap_or_else(|_| {
-            detect_cuda_arch().unwrap_or_else(|| "90".to_string())
-        });
+        let cuda_arch = env::var("MLX_CUDA_ARCHITECTURES")
+            .unwrap_or_else(|_| detect_cuda_arch().unwrap_or_else(|| "90".to_string()));
         config.define("MLX_CUDA_ARCHITECTURES", &cuda_arch);
-
     }
 
     config.build()
+}
+
+fn cmake_bool_from_env(name: &str) -> Option<&'static str> {
+    let value = env::var(name).ok()?;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "on" | "true" | "yes" => Some("ON"),
+        "0" | "off" | "false" | "no" => Some("OFF"),
+        _ => panic!(
+            "Invalid {name} value {:?}. Expected one of: 1/0, on/off, true/false, yes/no.",
+            value
+        ),
+    }
 }
 
 #[cfg(feature = "cuda")]

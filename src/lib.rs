@@ -12,6 +12,7 @@ pub mod vision;
 mod loaded_model;
 mod loader;
 mod loader_vlm;
+mod runtime;
 
 // Re-export mlxcel-core generate module
 pub use mlxcel_core::generate;
@@ -21,3 +22,4 @@ pub use mlxcel_core::speculative::SpeculativeGenerator;
 // Re-export split modules
 pub use loaded_model::LoadedModel;
 pub use loader::{load_model, load_model_with_adapter, read_eos_token_ids};
+pub use runtime::{RuntimeDevice, RuntimeSetup, initialize_runtime};
