@@ -168,6 +168,52 @@ macro_rules! delegate_language_model {
     };
 }
 
+// Keep the embedding-aware subset in one place as well. These variants
+// implement custom token-embedding or embedding-prefill behavior that VLM
+// flows depend on.
+macro_rules! delegate_embedding_language_model {
+    ($self:expr, $method:ident ( $($arg:expr),* $(,)? ); fallback = $fallback:expr) => {
+        match $self {
+            LoadedModel::Gemma3(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Llama(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen2(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Llama4(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Llama4VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::LlavaVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen2VL(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen25VL(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen3VL(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen3VLMoe(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen35(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen35VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen35Moe(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Qwen35MoeVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma3n(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma3nVLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Phi3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Molmo2VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Cohere2(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma2(inner) => LanguageModel::$method(inner, $($arg),*),
+            _ => $fallback,
+        }
+    };
+}
+
+macro_rules! with_qwen_vl_model {
+    ($self:expr, $model:ident => $expr:expr, else $fallback:expr) => {
+        match $self {
+            LoadedModel::Qwen2VL($model) => $expr,
+            LoadedModel::Qwen25VL($model) => $expr,
+            LoadedModel::Qwen3VL($model) => $expr,
+            LoadedModel::Qwen3VLMoe($model) => $expr,
+            LoadedModel::Qwen35VLM($model) | LoadedModel::Qwen35MoeVLM($model) => $expr,
+            _ => $fallback,
+        }
+    };
+}
+
 impl LoadedModel {
     /// Check if this model is a vision-language model
     pub fn is_vlm(&self) -> bool {
@@ -239,39 +285,16 @@ impl LoadedModel {
     }
 
     pub fn qwen_vl_prompt_info(&self) -> Option<qwen_vl::QwenVlmPromptInfo<'_>> {
-        match self {
-            Self::Qwen2VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &m.processor,
-                spatial_merge_size: m.spatial_merge_size,
-                vision_start_token_id: m.vision_start_token_id,
-                image_token_id: m.image_token_id,
+        with_qwen_vl_model!(
+            self,
+            model => Some(qwen_vl::QwenVlmPromptInfo {
+                processor: &model.processor,
+                spatial_merge_size: model.spatial_merge_size,
+                vision_start_token_id: model.vision_start_token_id,
+                image_token_id: model.image_token_id,
             }),
-            Self::Qwen25VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &m.processor,
-                spatial_merge_size: m.spatial_merge_size,
-                vision_start_token_id: m.vision_start_token_id,
-                image_token_id: m.image_token_id,
-            }),
-            Self::Qwen3VL(m) => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &m.processor,
-                spatial_merge_size: m.spatial_merge_size,
-                vision_start_token_id: m.vision_start_token_id,
-                image_token_id: m.image_token_id,
-            }),
-            Self::Qwen3VLMoe(m) => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &m.processor,
-                spatial_merge_size: m.spatial_merge_size,
-                vision_start_token_id: m.vision_start_token_id,
-                image_token_id: m.image_token_id,
-            }),
-            Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &m.processor,
-                spatial_merge_size: m.spatial_merge_size,
-                vision_start_token_id: m.vision_start_token_id,
-                image_token_id: m.image_token_id,
-            }),
-            _ => None,
-        }
+            else None
+        )
     }
 
     pub fn qwen_vl_input_embeddings(
@@ -280,16 +303,11 @@ impl LoadedModel {
         pixel_values: &mlxcel_core::MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> Option<vision::merge::InputEmbeddings> {
-        match self {
-            Self::Qwen2VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
-            Self::Qwen25VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
-            Self::Qwen3VL(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
-            Self::Qwen3VLMoe(m) => Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw)),
-            Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => {
-                Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw))
-            }
-            _ => None,
-        }
+        with_qwen_vl_model!(
+            self,
+            model => Some(model.get_input_embeddings(input_ids, pixel_values, grid_thw)),
+            else None
+        )
     }
 
     pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
@@ -368,99 +386,17 @@ impl LanguageModel for LoadedModel {
         caches: &mut [mlxcel_core::layers::KVCache],
         mask: Option<&mlxcel_core::MlxArray>,
     ) -> UniquePtr<mlxcel_core::MlxArray> {
-        // Only VLM-capable models override this
-        match self {
-            Self::Gemma3(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Gemma3VLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Llama(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen2(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Llama4VLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::LlavaVLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Llama4(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen2VL(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen25VL(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen3VL(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen3VLMoe(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen35VLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Qwen35MoeVLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Gemma3nVLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Phi3VLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Molmo2VLM(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Cohere2(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Gemma(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            Self::Gemma2(m) => {
-                LanguageModel::forward_with_embeddings(m, input_ids, input_embeddings, caches, mask)
-            }
-            // All other models use the default (ignores embeddings, calls forward)
-            _ => self.forward(input_ids, caches, mask),
-        }
+        delegate_embedding_language_model!(
+            self,
+            forward_with_embeddings(input_ids, input_embeddings, caches, mask);
+            fallback = self.forward(input_ids, caches, mask)
+        )
     }
 
     fn embed_tokens(
         &self,
         input_ids: &mlxcel_core::MlxArray,
     ) -> Option<UniquePtr<mlxcel_core::MlxArray>> {
-        // VLM-capable models override this
-        match self {
-            Self::Gemma3(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Gemma3VLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Llama(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen2(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Llama4(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Llama4VLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::LlavaVLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen2VL(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen25VL(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen3VL(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen3VLMoe(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen35(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen35VLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen35Moe(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Qwen35MoeVLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Gemma3n(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Gemma3nVLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Phi3VLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Molmo2VLM(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Cohere2(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Gemma(m) => LanguageModel::embed_tokens(m, input_ids),
-            Self::Gemma2(m) => LanguageModel::embed_tokens(m, input_ids),
-            _ => None,
-        }
+        delegate_embedding_language_model!(self, embed_tokens(input_ids); fallback = None)
     }
 }
