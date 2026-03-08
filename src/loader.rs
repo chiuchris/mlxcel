@@ -43,6 +43,55 @@ fn parse_model_config<T: DeserializeOwned>(config_str: &str) -> Result<T> {
     serde_json::from_str(config_str).map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))
 }
 
+fn copy_weight_map(weights: &WeightMap) -> WeightMap {
+    weights
+        .iter()
+        .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
+        .collect()
+}
+
+fn is_ministral3_config(config: &serde_json::Value) -> bool {
+    config
+        .get("text_config")
+        .and_then(|tc| tc.get("model_type"))
+        .and_then(|mt| mt.as_str())
+        .map(|mt| mt == "ministral3")
+        .unwrap_or(false)
+}
+
+fn qwen35_text_config(config: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut text_config = config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| config.clone());
+
+    if text_config.get("quantization").is_none() && config.get("quantization").is_some() {
+        let text_config_obj = text_config.as_object_mut().ok_or_else(|| {
+            anyhow::anyhow!("Failed to merge quantization into non-object text_config")
+        })?;
+        text_config_obj.insert("quantization".to_string(), config["quantization"].clone());
+    }
+
+    Ok(text_config)
+}
+
+macro_rules! load_model_from_config {
+    ($config_str:expr, $weights:expr, $args_ty:ty, $builder:path, $wrap:expr) => {{
+        let args: $args_ty = parse_model_config($config_str)?;
+        let model = $builder($weights, &args).map_err(|e| anyhow::anyhow!("{}", e))?;
+        ($wrap)(model)
+    }};
+}
+
+macro_rules! load_owned_model_from_config {
+    ($config_str:expr, $weights:expr, $args_ty:ty, $builder:path, $wrap:expr) => {{
+        let args: $args_ty = parse_model_config($config_str)?;
+        let owned = copy_weight_map($weights);
+        let model = $builder(args, owned).map_err(|e| anyhow::anyhow!("{}", e))?;
+        ($wrap)(model)
+    }};
+}
+
 fn load_pair_from_dir<T, U, E, F>(path_str: &str, load: F) -> Result<T>
 where
     F: FnOnce(String) -> std::result::Result<(T, U), E>,
@@ -98,17 +147,9 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
             // Mistral3 is a VLM wrapper - check text_config for inner model type
             let config_path = model_path.join("config.json");
             let config_str = std::fs::read_to_string(&config_path)?;
-            let config: serde_json::Value = serde_json::from_str(&config_str)?;
+            let config: serde_json::Value = parse_model_config(&config_str)?;
 
-            // Check if text_config.model_type is "ministral3"
-            let is_ministral3 = config
-                .get("text_config")
-                .and_then(|tc| tc.get("model_type"))
-                .and_then(|mt| mt.as_str())
-                .map(|mt| mt == "ministral3")
-                .unwrap_or(false);
-
-            if is_ministral3 {
+            if is_ministral3_config(&config) {
                 // Load as Ministral3 with text_config extracted
                 LoadedModel::Ministral3(models::Ministral3Wrapper::new(load_pair_from_dir(
                     path_str,
@@ -388,14 +429,7 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
         ModelType::Llama | ModelType::Mistral3 => {
             // Check for ministral3 sub-type
             let config: serde_json::Value = parse_model_config(&config_str)?;
-            let is_ministral3 = config
-                .get("text_config")
-                .and_then(|tc| tc.get("model_type"))
-                .and_then(|mt| mt.as_str())
-                .map(|mt| mt == "ministral3")
-                .unwrap_or(false);
-
-            if model_type == ModelType::Mistral3 && is_ministral3 {
+            if model_type == ModelType::Mistral3 && is_ministral3_config(&config) {
                 // Load as Ministral3 with text_config
                 let text_config = config
                     .get("text_config")
@@ -414,10 +448,13 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             }
         }
         ModelType::Llama4 => {
-            let args: models::llama4::TextArgs = parse_model_config(&config_str)?;
-            let m = models::Llama4CxxModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Llama4(models::Llama4Wrapper::new(m))
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::llama4::TextArgs,
+                models::Llama4CxxModel::from_weights,
+                |m| LoadedModel::Llama4(models::Llama4Wrapper::new(m))
+            )
         }
         ModelType::Llama4VLM => {
             return Err(anyhow::anyhow!(
@@ -425,28 +462,40 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Qwen2 => {
-            let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
-            let m = models::Qwen2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::llama3::ModelArgs,
+                models::Qwen2Model::from_weights,
+                LoadedModel::Qwen2
+            )
         }
         ModelType::Qwen3 => {
-            let args: models::qwen3::ModelArgs = parse_model_config(&config_str)?;
-            let m = models::Qwen3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::qwen3::ModelArgs,
+                models::Qwen3Model::from_weights,
+                LoadedModel::Qwen3
+            )
         }
         ModelType::Qwen3Moe => {
-            let args: models::qwen3_moe::ModelArgs = parse_model_config(&config_str)?;
-            let m = models::Qwen3MoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3Moe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::qwen3_moe::ModelArgs,
+                models::Qwen3MoeModel::from_weights,
+                LoadedModel::Qwen3Moe
+            )
         }
         ModelType::Qwen3Next => {
-            let args: models::qwen3_next::Qwen3NextConfig = parse_model_config(&config_str)?;
-            let m = models::Qwen3NextModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen3Next(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::qwen3_next::Qwen3NextConfig,
+                models::Qwen3NextModel::from_weights,
+                LoadedModel::Qwen3Next
+            )
         }
         ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
             return Err(anyhow::anyhow!(
@@ -454,25 +503,11 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Qwen35 | ModelType::Qwen35Moe => {
-            let v: serde_json::Value = serde_json::from_str(&config_str)?;
-            let mut text_config = if let Some(tc) = v.get("text_config") {
-                tc.clone()
-            } else {
-                v.clone()
-            };
-            // Merge quantization from top level if not in text_config
-            if text_config.get("quantization").is_none() && v.get("quantization").is_some() {
-                text_config
-                    .as_object_mut()
-                    .unwrap()
-                    .insert("quantization".to_string(), v["quantization"].clone());
-            }
+            let v: serde_json::Value = parse_model_config(&config_str)?;
+            let text_config = qwen35_text_config(&v)?;
             let args: models::qwen3_5::Qwen35Config = serde_json::from_value(text_config)
                 .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
+            let owned = copy_weight_map(weights);
             let owned = models::qwen3_5::sanitize_moe_weights(owned, &args);
             let m = models::Qwen35Model::from_weights(&owned, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -483,32 +518,40 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             }
         }
         ModelType::Qwen2Moe => {
-            let args: models::qwen2_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Qwen2MoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Qwen2Moe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::qwen2_moe::ModelArgs,
+                models::Qwen2MoeModel::from_weights,
+                LoadedModel::Qwen2Moe
+            )
         }
         ModelType::Gemma => {
-            let args: models::gemma::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::GemmaModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::gemma::ModelArgs,
+                models::GemmaModel::from_weights,
+                LoadedModel::Gemma
+            )
         }
         ModelType::Gemma2 => {
-            let args: models::gemma2::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Gemma2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::gemma2::ModelArgs,
+                models::Gemma2Model::from_weights,
+                LoadedModel::Gemma2
+            )
         }
         ModelType::Gemma3 => {
-            let args: models::gemma3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Gemma3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma3(models::Gemma3Wrapper::new(m))
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::gemma3::ModelArgs,
+                models::Gemma3Model::from_weights,
+                |m| LoadedModel::Gemma3(models::Gemma3Wrapper::new(m))
+            )
         }
         ModelType::Gemma3VLM => {
             return Err(anyhow::anyhow!(
@@ -546,8 +589,7 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Gemma3n => {
-            let top_args: models::gemma3n::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let top_args: models::gemma3n::ModelArgs = parse_model_config(&config_str)?;
             let config = top_args.text_args();
             let language_model = models::gemma3n::Gemma3nLanguageModel::from_weights(
                 weights,
@@ -566,18 +608,22 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Phi => {
-            let args: models::phi::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::PhiModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::phi::ModelArgs,
+                models::PhiModel::from_weights,
+                LoadedModel::Phi
+            )
         }
         ModelType::Phi3 => {
-            let args: models::phi3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Phi3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::phi3::ModelArgs,
+                models::Phi3Model::from_weights,
+                LoadedModel::Phi3
+            )
         }
         ModelType::Phi3VLM => {
             return Err(anyhow::anyhow!(
@@ -590,327 +636,382 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             ));
         }
         ModelType::Phi3Small => {
-            let args: models::phi3small::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Phi3SmallModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Phi3Small(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::phi3small::ModelArgs,
+                models::Phi3SmallModel::from_weights,
+                LoadedModel::Phi3Small
+            )
         }
         ModelType::PhiMoe => {
-            let args: models::phimoe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::PhiMoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::PhiMoe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::phimoe::ModelArgs,
+                models::PhiMoeModel::from_weights,
+                LoadedModel::PhiMoe
+            )
         }
         ModelType::Mixtral => {
-            let args: models::mixtral::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::MixtralModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mixtral(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::mixtral::ModelArgs,
+                models::MixtralModel::from_weights,
+                LoadedModel::Mixtral
+            )
         }
         ModelType::OLMoE => {
-            let args: models::olmoe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::OlmoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::OLMoE(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::olmoe::ModelArgs,
+                models::OlmoeModel::from_weights,
+                LoadedModel::OLMoE
+            )
         }
         ModelType::DeepSeek => {
-            let args: models::deepseek::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::DeepSeekModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeek(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::deepseek::ModelArgs,
+                models::DeepSeekModel::from_weights,
+                LoadedModel::DeepSeek
+            )
         }
         ModelType::DeepSeekV2 => {
-            let args: models::deepseek_v2::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::DeepSeekV2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::deepseek_v2::ModelArgs,
+                models::DeepSeekV2Model::from_weights,
+                LoadedModel::DeepSeekV2
+            )
         }
         ModelType::DeepSeekV3 => {
-            let args: models::deepseek_v3::DeepSeekV3Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::DeepSeekV3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::deepseek_v3::DeepSeekV3Config,
+                models::DeepSeekV3Model::from_weights,
+                LoadedModel::DeepSeekV3
+            )
         }
         ModelType::DeepSeekV32 => {
-            let args: models::deepseek_v32::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::DeepSeekV32Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::DeepSeekV32(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::deepseek_v32::ModelArgs,
+                models::DeepSeekV32Model::from_weights,
+                LoadedModel::DeepSeekV32
+            )
         }
         ModelType::Cohere => {
-            let args: models::cohere::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::CohereModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Cohere(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::cohere::ModelArgs,
+                models::CohereModel::from_weights,
+                LoadedModel::Cohere
+            )
         }
         ModelType::Cohere2 => {
-            let args: models::cohere2::Cohere2Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Cohere2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Cohere2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::cohere2::Cohere2Config,
+                models::Cohere2Model::from_weights,
+                LoadedModel::Cohere2
+            )
         }
         ModelType::InternLM2 => {
-            let args: models::internlm2::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::InternLM2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::InternLM2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::internlm2::ModelArgs,
+                models::InternLM2Model::from_weights,
+                LoadedModel::InternLM2
+            )
         }
         ModelType::InternLM3 => {
-            let args: models::internlm3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::InternLM3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::InternLM3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::internlm3::ModelArgs,
+                models::InternLM3Model::from_weights,
+                LoadedModel::InternLM3
+            )
         }
         ModelType::Baichuan => {
-            let args: models::baichuan::BaichuanConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::BaichuanModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Baichuan(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::baichuan::BaichuanConfig,
+                models::BaichuanModel::from_weights,
+                LoadedModel::Baichuan
+            )
         }
         ModelType::Glm4 => {
-            let args: models::glm4::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Glm4Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::glm4::ModelArgs,
+                models::Glm4Model::from_weights,
+                LoadedModel::Glm4
+            )
         }
         ModelType::Glm4Moe => {
-            let args: models::glm4_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Glm4MoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4Moe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::glm4_moe::ModelArgs,
+                models::Glm4MoeModel::from_weights,
+                LoadedModel::Glm4Moe
+            )
         }
         ModelType::Glm4MoeLite => {
-            let args: models::glm4_moe_lite::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Glm4MoeLiteModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Glm4MoeLite(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::glm4_moe_lite::ModelArgs,
+                models::Glm4MoeLiteModel::from_weights,
+                LoadedModel::Glm4MoeLite
+            )
         }
         ModelType::GlmMoeDsa => {
-            let args: models::glm_moe_dsa::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::GlmMoeDsaModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::GlmMoeDsa(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::glm_moe_dsa::ModelArgs,
+                models::GlmMoeDsaModel::from_weights,
+                LoadedModel::GlmMoeDsa
+            )
         }
         ModelType::Ernie45 => {
-            let args: models::ernie4_5::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Ernie45Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ernie45(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::ernie4_5::ModelArgs,
+                models::Ernie45Model::from_weights,
+                LoadedModel::Ernie45
+            )
         }
         ModelType::Ernie45Moe => {
-            let args: models::ernie4_5_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Ernie45MoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ernie45Moe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::ernie4_5_moe::ModelArgs,
+                models::Ernie45MoeModel::from_weights,
+                LoadedModel::Ernie45Moe
+            )
         }
         ModelType::HunyuanMoe => {
-            let args: models::hunyuan_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::HunyuanMoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::HunyuanMoe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::hunyuan_moe::ModelArgs,
+                models::HunyuanMoeModel::from_weights,
+                LoadedModel::HunyuanMoe
+            )
         }
         ModelType::HunyuanV1Dense => {
-            let args: models::hunyuan_v1_dense::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::HunyuanV1DenseModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::HunyuanV1Dense(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::hunyuan_v1_dense::ModelArgs,
+                models::HunyuanV1DenseModel::from_weights,
+                LoadedModel::HunyuanV1Dense
+            )
         }
         ModelType::MiMo => {
-            let args: models::mimo::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::MiMoModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiMo(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::mimo::ModelArgs,
+                models::MiMoModel::from_weights,
+                LoadedModel::MiMo
+            )
         }
         ModelType::ExaOne => {
-            let args: models::exaone::ExaOneConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::ExaOneModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOne(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::exaone::ExaOneConfig,
+                models::ExaOneModel::from_weights,
+                LoadedModel::ExaOne
+            )
         }
         ModelType::ExaOne4 => {
-            let args: models::exaone4::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::ExaOne4Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m))
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::exaone4::ModelArgs,
+                models::ExaOne4Model::from_weights,
+                |m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m))
+            )
         }
         ModelType::ExaOneMoe => {
-            let args: models::exaone_moe::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::ExaoneMoeModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::ExaOneMoe(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::exaone_moe::ModelArgs,
+                models::ExaoneMoeModel::from_weights,
+                LoadedModel::ExaOneMoe
+            )
         }
         ModelType::Olmo => {
-            let args: models::olmo::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::OlmoModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::olmo::ModelArgs,
+                models::OlmoModel::from_weights,
+                LoadedModel::Olmo
+            )
         }
         ModelType::Olmo2 => {
-            let args: models::olmo2::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::OLMo2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::olmo2::ModelArgs,
+                models::OLMo2Model::from_weights,
+                LoadedModel::Olmo2
+            )
         }
         ModelType::Olmo3 => {
-            let args: models::olmo3::OLMo3Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::OLMo3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Olmo3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::olmo3::OLMo3Config,
+                models::OLMo3Model::from_weights,
+                LoadedModel::Olmo3
+            )
         }
         ModelType::StarCoder2 => {
-            let args: models::starcoder2::StarCoder2Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::StarCoder2Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::StarCoder2(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::starcoder2::StarCoder2Config,
+                models::StarCoder2Model::from_weights,
+                LoadedModel::StarCoder2
+            )
         }
         ModelType::MiniCPM => {
-            let args: models::minicpm::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::MiniCPMModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiniCPM(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::minicpm::ModelArgs,
+                models::MiniCPMModel::from_weights,
+                LoadedModel::MiniCPM
+            )
         }
         ModelType::MiniCPM3 => {
-            let args: models::minicpm3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::MiniCPM3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::MiniCPM3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::minicpm3::ModelArgs,
+                models::MiniCPM3Model::from_weights,
+                LoadedModel::MiniCPM3
+            )
         }
         ModelType::StableLM => {
-            let args: models::stablelm::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::StableLMModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::StableLM(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::stablelm::ModelArgs,
+                models::StableLMModel::from_weights,
+                LoadedModel::StableLM
+            )
         }
         ModelType::SmolLM3 => {
-            let args: models::smollm3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::SmolLM3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::SmolLM3(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::smollm3::ModelArgs,
+                models::SmolLM3Model::from_weights,
+                LoadedModel::SmolLM3
+            )
         }
         ModelType::Ministral3 => {
-            let args: models::ministral3::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Ministral3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::ministral3::ModelArgs,
+                models::Ministral3Model::from_weights,
+                |m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
+            )
         }
         ModelType::Nemotron => {
-            let args: models::nemotron::ModelArgs = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::NemotronModel::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Nemotron(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::nemotron::ModelArgs,
+                models::NemotronModel::from_weights,
+                LoadedModel::Nemotron
+            )
         }
         // SSM/Hybrid models that take ownership of weights
         ModelType::Mamba => {
-            let args: models::mamba::MambaConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
-            let m = models::MambaModel::from_weights(args, owned)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mamba(m)
+            load_owned_model_from_config!(
+                &config_str,
+                weights,
+                models::mamba::MambaConfig,
+                models::MambaModel::from_weights,
+                LoadedModel::Mamba
+            )
         }
         ModelType::Mamba2 => {
-            let args: models::mamba2::Mamba2Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
-            let m = models::Mamba2Model::from_weights(args, owned)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Mamba2(m)
+            load_owned_model_from_config!(
+                &config_str,
+                weights,
+                models::mamba2::Mamba2Config,
+                models::Mamba2Model::from_weights,
+                LoadedModel::Mamba2
+            )
         }
         ModelType::Jamba => {
-            let args: models::jamba::JambaConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
-            let m = models::JambaModel::from_weights(args, owned)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Jamba(m)
+            load_owned_model_from_config!(
+                &config_str,
+                weights,
+                models::jamba::JambaConfig,
+                models::JambaModel::from_weights,
+                LoadedModel::Jamba
+            )
         }
         ModelType::NemotronH => {
-            let args: models::nemotron_h::NemotronHConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::nemotron_h::NemotronHConfig = parse_model_config(&config_str)?;
             let block_types: Vec<models::nemotron_h::BlockType> = args
                 .hybrid_override_pattern
                 .iter()
                 .map(|s| models::nemotron_h::BlockType::from_str(s))
                 .collect();
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
+            let owned = copy_weight_map(weights);
             let owned = models::NemotronHModel::sanitize_weights(owned, &args);
             let m = models::NemotronHModel::from_weights(args, owned, block_types)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::NemotronH(m)
         }
         ModelType::NemotronNAS => {
-            let args: models::nemotron_nas::NemotronNASConfig =
-                serde_json::from_str(&config_str)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
-            let m = models::NemotronNASModel::from_weights(args, owned)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::NemotronNAS(m)
+            load_owned_model_from_config!(
+                &config_str,
+                weights,
+                models::nemotron_nas::NemotronNASConfig,
+                models::NemotronNASModel::from_weights,
+                LoadedModel::NemotronNAS
+            )
         }
         ModelType::Step3p5 => {
-            let args: models::step3p5::Step3p5Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let m = models::Step3p5Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Step3p5(m)
+            load_model_from_config!(
+                &config_str,
+                weights,
+                models::step3p5::Step3p5Config,
+                models::Step3p5Model::from_weights,
+                LoadedModel::Step3p5
+            )
         }
         ModelType::KimiLinear => {
-            let args: models::kimi_linear::KimiLinearConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let mut owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
+            let args: models::kimi_linear::KimiLinearConfig = parse_model_config(&config_str)?;
+            let mut owned = copy_weight_map(weights);
             owned = models::KimiLinearModel::sanitize_weights(owned, &args);
             let m = models::KimiLinearModel::from_weights(&owned, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -918,12 +1019,8 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
         }
         ModelType::LongcatFlash | ModelType::LongcatFlashNgram => {
             let args: models::longcat_flash_ngram::LongcatFlashNgramConfig =
-                serde_json::from_str(&config_str)
-                    .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let mut owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
+                parse_model_config(&config_str)?;
+            let mut owned = copy_weight_map(weights);
             owned = models::longcat_flash_ngram::sanitize_weights(owned, &args);
             let m = models::LongcatFlashNgramModel::from_weights(&owned, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
@@ -934,22 +1031,19 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
             }
         }
         ModelType::Rwkv7 => {
-            let args: models::rwkv7::Rwkv7Config = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let args: models::rwkv7::Rwkv7Config = parse_model_config(&config_str)?;
             let m =
                 models::Rwkv7::from_weights(weights, args).map_err(|e| anyhow::anyhow!("{}", e))?;
             LoadedModel::Rwkv7(m)
         }
         ModelType::RecurrentGemma => {
-            let args: models::recurrent_gemma::GriffinConfig = serde_json::from_str(&config_str)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned: WeightMap = weights
-                .iter()
-                .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
-                .collect();
-            let m = models::GriffinModel::from_weights(args, owned)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::RecurrentGemma(m)
+            load_owned_model_from_config!(
+                &config_str,
+                weights,
+                models::recurrent_gemma::GriffinConfig,
+                models::GriffinModel::from_weights,
+                LoadedModel::RecurrentGemma
+            )
         }
     };
 

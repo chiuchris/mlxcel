@@ -1,4 +1,7 @@
-use super::{parse_eos_token_ids, read_eos_token_ids, resolve_model_dir};
+use super::{
+    is_ministral3_config, parse_eos_token_ids, qwen35_text_config, read_eos_token_ids,
+    resolve_model_dir,
+};
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -71,4 +74,62 @@ fn resolve_model_dir_keeps_directory_paths() {
     assert_eq!(resolve_model_dir(&model_dir), model_dir);
 
     fs::remove_dir_all(model_dir).unwrap();
+}
+
+#[test]
+fn is_ministral3_config_detects_nested_model_type() {
+    let config = json!({
+        "text_config": {
+            "model_type": "ministral3"
+        }
+    });
+
+    assert!(is_ministral3_config(&config));
+}
+
+#[test]
+fn is_ministral3_config_returns_false_without_matching_text_model() {
+    let config = json!({
+        "text_config": {
+            "model_type": "llama"
+        }
+    });
+
+    assert!(!is_ministral3_config(&config));
+}
+
+#[test]
+fn qwen35_text_config_merges_top_level_quantization() {
+    let config = json!({
+        "text_config": {
+            "hidden_size": 1024
+        },
+        "quantization": {
+            "group_size": 128
+        }
+    });
+
+    let merged = qwen35_text_config(&config).unwrap();
+
+    assert_eq!(merged["hidden_size"], 1024);
+    assert_eq!(merged["quantization"]["group_size"], 128);
+}
+
+#[test]
+fn qwen35_text_config_preserves_nested_quantization() {
+    let config = json!({
+        "text_config": {
+            "hidden_size": 1024,
+            "quantization": {
+                "group_size": 64
+            }
+        },
+        "quantization": {
+            "group_size": 128
+        }
+    });
+
+    let merged = qwen35_text_config(&config).unwrap();
+
+    assert_eq!(merged["quantization"]["group_size"], 64);
 }
