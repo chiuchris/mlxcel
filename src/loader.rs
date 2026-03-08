@@ -653,6 +653,96 @@ fn adapter_loading_unsupported_message(model_type: ModelType) -> Option<&'static
     }
 }
 
+fn try_load_vlm_model_from_dir(
+    model_type: ModelType,
+    model_path: &Path,
+) -> Result<Option<LoadedModel>> {
+    Ok(match model_type {
+        ModelType::Llama4VLM => Some(load_llama4_vlm(model_path)?),
+        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => Some(
+            match qwen35_vlm_kind(model_type)
+                .expect("Qwen3.5 VLM variants should map to a concrete loader")
+            {
+                Qwen35VlmKind::Dense => load_qwen3_5_vlm(model_path)?,
+                Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
+            },
+        ),
+        ModelType::Gemma3VLM => Some(load_gemma3_vlm(model_path)?),
+        ModelType::LlavaVLM => Some(load_llava_vlm(model_path)?),
+        ModelType::LlavaBunnyVLM => Some(load_llava_bunny_vlm(model_path)?),
+        ModelType::AyaVisionVLM => Some(load_aya_vision_vlm(model_path)?),
+        ModelType::PaliGemmaVLM => Some(load_paligemma_vlm(model_path)?),
+        ModelType::PixtralVLM => Some(load_pixtral_vlm(model_path)?),
+        ModelType::Mistral3VLM => Some(load_mistral3_vlm(model_path)?),
+        ModelType::Qwen2VL => Some(load_qwen2_vl(model_path)?),
+        ModelType::Qwen25VL => Some(load_qwen2_5_vl(model_path)?),
+        ModelType::Qwen3VL => Some(load_qwen3_vl(model_path)?),
+        ModelType::Qwen3VLMoe => Some(load_qwen3_vl_moe(model_path)?),
+        ModelType::Gemma3nVLM => Some(load_gemma3n_vlm(model_path)?),
+        ModelType::Phi3VLM => Some(load_phi3_vlm(model_path)?),
+        ModelType::Molmo2VLM => Some(load_molmo2_vlm(model_path)?),
+        _ => None,
+    })
+}
+
+fn try_load_nonstandard_model_from_dir(
+    model_type: ModelType,
+    model_path: &Path,
+    path_str: &str,
+) -> Result<Option<LoadedModel>> {
+    Ok(match model_type {
+        ModelType::Qwen35 => {
+            Some(load_pair_from_dir(path_str, models::Qwen35Model::load).map(LoadedModel::Qwen35)?)
+        }
+        ModelType::Qwen35Moe => Some(
+            load_pair_from_dir(path_str, models::Qwen35Model::load).map(LoadedModel::Qwen35Moe)?,
+        ),
+        ModelType::Gemma3n => {
+            Some(load_from_dir(path_str, models::Gemma3nModel::load).map(LoadedModel::Gemma3n)?)
+        }
+        ModelType::Mamba => Some(
+            load_pair_from_dir(path_str, |path| models::MambaModel::load(&path))
+                .map(LoadedModel::Mamba)?,
+        ),
+        ModelType::Mamba2 => Some(
+            load_pair_from_dir(path_str, |path| models::Mamba2Model::load(&path))
+                .map(LoadedModel::Mamba2)?,
+        ),
+        ModelType::Jamba => Some(
+            load_pair_from_dir(path_str, |path| models::JambaModel::load(&path))
+                .map(LoadedModel::Jamba)?,
+        ),
+        ModelType::NemotronH => Some(
+            load_pair_from_dir(path_str, |path| models::NemotronHModel::load(&path))
+                .map(LoadedModel::NemotronH)?,
+        ),
+        ModelType::NemotronNAS => Some(
+            load_pair_from_dir(path_str, |path| models::NemotronNASModel::load(&path))
+                .map(LoadedModel::NemotronNAS)?,
+        ),
+        ModelType::KimiLinear => Some(
+            load_pair_from_dir(path_str, models::KimiLinearModel::load)
+                .map(LoadedModel::KimiLinear)?,
+        ),
+        ModelType::LongcatFlash => Some(
+            load_pair_from_dir(path_str, |path| models::LongcatFlashNgramModel::load(&path))
+                .map(LoadedModel::LongcatFlash)?,
+        ),
+        ModelType::LongcatFlashNgram => Some(
+            load_pair_from_dir(path_str, |path| models::LongcatFlashNgramModel::load(&path))
+                .map(LoadedModel::LongcatFlashNgram)?,
+        ),
+        ModelType::Rwkv7 => {
+            Some(load_from_path(model_path, models::Rwkv7::load).map(LoadedModel::Rwkv7)?)
+        }
+        ModelType::RecurrentGemma => Some(
+            load_pair_from_dir(path_str, |path| models::GriffinModel::load(&path))
+                .map(LoadedModel::RecurrentGemma)?,
+        ),
+        _ => None,
+    })
+}
+
 fn load_pair_from_dir<T, U, E, F>(path_str: &str, load: F) -> Result<T>
 where
     F: FnOnce(String) -> std::result::Result<(T, U), E>,
@@ -700,94 +790,32 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_type = get_model_type(model_path)?;
     let path_str = model_path.to_str().unwrap();
 
-    let model = match model_type {
-        ModelType::Mistral3 => {
-            // Mistral3 is a VLM wrapper - check text_config for inner model type
-            let config_path = model_path.join("config.json");
-            let config_str = std::fs::read_to_string(&config_path)?;
-            let config: serde_json::Value = parse_model_config(&config_str)?;
+    let model = if model_type == ModelType::Mistral3 {
+        // Mistral3 is a VLM wrapper - check text_config for inner model type
+        let config_path = model_path.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)?;
+        let config: serde_json::Value = parse_model_config(&config_str)?;
 
-            if is_ministral3_config(&config) {
-                // Load as Ministral3 with text_config extracted
-                LoadedModel::Ministral3(models::Ministral3Wrapper::new(load_pair_from_dir(
-                    path_str,
-                    models::Ministral3Model::load_from_text_config,
-                )?))
-            } else {
-                // Load as standard Llama
-                LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
-            }
+        if is_ministral3_config(&config) {
+            // Load as Ministral3 with text_config extracted
+            LoadedModel::Ministral3(models::Ministral3Wrapper::new(load_pair_from_dir(
+                path_str,
+                models::Ministral3Model::load_from_text_config,
+            )?))
+        } else {
+            // Load as standard Llama
+            LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
         }
-        ModelType::Llama4VLM => load_llama4_vlm(model_path)?,
-        ModelType::Qwen35 => {
-            LoadedModel::Qwen35(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
-        }
-        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
-            match qwen35_vlm_kind(model_type).unwrap() {
-                Qwen35VlmKind::Dense => load_qwen3_5_vlm(model_path)?,
-                Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
-            }
-        }
-        ModelType::Qwen35Moe => {
-            LoadedModel::Qwen35Moe(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
-        }
-        ModelType::Gemma3VLM => load_gemma3_vlm(model_path)?,
-        ModelType::LlavaVLM => load_llava_vlm(model_path)?,
-        ModelType::LlavaBunnyVLM => load_llava_bunny_vlm(model_path)?,
-        ModelType::AyaVisionVLM => load_aya_vision_vlm(model_path)?,
-        ModelType::PaliGemmaVLM => load_paligemma_vlm(model_path)?,
-        ModelType::PixtralVLM => load_pixtral_vlm(model_path)?,
-        ModelType::Mistral3VLM => load_mistral3_vlm(model_path)?,
-        ModelType::Qwen2VL => load_qwen2_vl(model_path)?,
-        ModelType::Qwen25VL => load_qwen2_5_vl(model_path)?,
-        ModelType::Qwen3VL => load_qwen3_vl(model_path)?,
-        ModelType::Qwen3VLMoe => load_qwen3_vl_moe(model_path)?,
-        ModelType::Gemma3n => {
-            LoadedModel::Gemma3n(load_from_dir(path_str, models::Gemma3nModel::load)?)
-        }
-        ModelType::Gemma3nVLM => load_gemma3n_vlm(model_path)?,
-        ModelType::Phi3VLM => load_phi3_vlm(model_path)?,
-        ModelType::Molmo2VLM => load_molmo2_vlm(model_path)?,
-        ModelType::Mamba => LoadedModel::Mamba(load_pair_from_dir(path_str, |path| {
-            models::MambaModel::load(&path)
-        })?),
-        ModelType::Mamba2 => LoadedModel::Mamba2(load_pair_from_dir(path_str, |path| {
-            models::Mamba2Model::load(&path)
-        })?),
-        ModelType::Jamba => LoadedModel::Jamba(load_pair_from_dir(path_str, |path| {
-            models::JambaModel::load(&path)
-        })?),
-        ModelType::NemotronH => LoadedModel::NemotronH(load_pair_from_dir(path_str, |path| {
-            models::NemotronHModel::load(&path)
-        })?),
-        ModelType::NemotronNAS => LoadedModel::NemotronNAS(load_pair_from_dir(path_str, |path| {
-            models::NemotronNASModel::load(&path)
-        })?),
-        ModelType::Step3p5 => {
-            LoadedModel::Step3p5(load_pair_from_dir(path_str, models::Step3p5Model::load)?)
-        }
-        ModelType::KimiLinear => {
-            LoadedModel::KimiLinear(load_pair_from_dir(path_str, models::KimiLinearModel::load)?)
-        }
-        ModelType::LongcatFlash => {
-            LoadedModel::LongcatFlash(load_pair_from_dir(path_str, |path| {
-                models::LongcatFlashNgramModel::load(&path)
-            })?)
-        }
-        ModelType::LongcatFlashNgram => {
-            LoadedModel::LongcatFlashNgram(load_pair_from_dir(path_str, |path| {
-                models::LongcatFlashNgramModel::load(&path)
-            })?)
-        }
-        ModelType::Rwkv7 => LoadedModel::Rwkv7(load_from_path(model_path, models::Rwkv7::load)?),
-        ModelType::RecurrentGemma => {
-            LoadedModel::RecurrentGemma(load_pair_from_dir(path_str, |path| {
-                models::GriffinModel::load(&path)
-            })?)
-        }
-        _ => try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
+    } else if let Some(model) = try_load_vlm_model_from_dir(model_type, model_path)? {
+        model
+    } else if let Some(model) =
+        try_load_nonstandard_model_from_dir(model_type, model_path, path_str)?
+    {
+        model
+    } else {
+        try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
             anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
-        })?,
+        })?
     };
 
     let tokenizer = tokenizer::load_tokenizer(model_path)?;
