@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::path::PathBuf;
 
+use mlxcel::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use mlxcel::qwen_vl::insert_qwen_vl_image_tokens;
 use mlxcel::vision::processors::ImageProcessor;
 use mlxcel::vlm_prompt::{ImageTokenBlockAction, apply_image_token_blocks};
@@ -84,8 +85,6 @@ pub(crate) fn prepare_vlm_tokens(
             );
         }
     } else if let Some(phi3v) = model.phi3_vl_model() {
-        // Phi-3V: split text around <|image_N|> tags, tokenize chunks,
-        // and interleave with negative IDs (matching Python Phi3VProcessor)
         let images_for_tokens: Vec<image::DynamicImage> = image_paths
             .iter()
             .map(|path| {
@@ -93,78 +92,28 @@ pub(crate) fn prepare_vlm_tokens(
                     .map_err(|e| anyhow::anyhow!("Failed to load image {:?}: {}", path, e))
             })
             .collect::<Result<Vec<_>>>()?;
-        let num_images = images_for_tokens.len();
-
-        // Ensure <|image_N|> tags are in the prompt text
-        let mut text = prompt.to_string();
-        let has_image_tags = (1..=num_images).any(|i| text.contains(&format!("<|image_{}|>", i)));
-
-        if !has_image_tags && num_images > 0 {
-            // Insert <|image_N|> tags after <|user|>\n or at the beginning
-            let image_tags: String = (1..=num_images)
-                .map(|i| format!("<|image_{}|>\n", i))
-                .collect();
-            if let Some(pos) = text.find("<|user|>\n") {
-                text.insert_str(pos + "<|user|>\n".len(), &image_tags);
-            } else {
-                text = format!("{}{}", image_tags, text);
-            }
-        }
-
-        // Collect image tag positions and IDs, sorted by position
-        let mut tag_positions: Vec<(usize, usize, usize)> = Vec::new(); // (start, end, image_num)
-        for n in 1..=num_images {
-            let tag = format!("<|image_{}|>", n);
-            let mut search_from = 0;
-            while let Some(pos) = text[search_from..].find(&tag) {
-                let abs_pos = search_from + pos;
-                tag_positions.push((abs_pos, abs_pos + tag.len(), n));
-                search_from = abs_pos + tag.len();
-            }
-        }
-        tag_positions.sort_by_key(|&(start, _, _)| start);
-
-        if !tag_positions.is_empty() {
-            // Split text around image tags and tokenize each chunk
-            let mut new_tokens: Vec<i32> = Vec::new();
-            let mut last_end = 0;
-
-            for (chunk_idx, &(tag_start, tag_end, image_num)) in tag_positions.iter().enumerate() {
-                // Tokenize text before this image tag
-                let before = &text[last_end..tag_start];
-                if !before.is_empty() {
-                    let add_special = chunk_idx == 0 && last_end == 0;
-                    let tokens = tokenizer.encode(before, add_special).unwrap_or_default();
-                    new_tokens.extend(tokens.iter().map(|&t| t as i32));
-                }
-
-                // Insert negative IDs for this image
-                if image_num <= num_images {
-                    let (w, h) = (
-                        images_for_tokens[image_num - 1].width(),
-                        images_for_tokens[image_num - 1].height(),
-                    );
-                    let num_img_tokens = phi3v.processor.calc_num_image_tokens(w, h);
-                    let neg_id = -(image_num as i32);
-                    for _ in 0..num_img_tokens {
-                        new_tokens.push(neg_id);
-                    }
-                }
-
-                last_end = tag_end;
-            }
-
-            // Tokenize remaining text after the last image tag
-            let after = &text[last_end..];
-            if !after.is_empty() {
-                let tokens = tokenizer.encode(after, false).unwrap_or_default();
-                new_tokens.extend(tokens.iter().map(|&t| t as i32));
-            }
-
-            *prompt_tokens = new_tokens;
+        if let Some(prepared) = prepare_phi3v_prompt_tokens(
+            prompt,
+            images_for_tokens.len(),
+            |text, add_special| {
+                tokenizer
+                    .encode(text, add_special)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&t| t as i32)
+                    .collect()
+            },
+            |image_num| {
+                let image = &images_for_tokens[image_num - 1];
+                phi3v
+                    .processor
+                    .calc_num_image_tokens(image.width(), image.height())
+            },
+        ) {
+            *prompt_tokens = prepared.tokens;
             println!(
                 "Phi3V: tokenized with {} image slots ({} total tokens)",
-                tag_positions.len(),
+                prepared.image_slots,
                 prompt_tokens.len()
             );
         }

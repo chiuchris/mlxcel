@@ -5,6 +5,7 @@
 
 pub mod lora;
 pub mod models;
+pub mod phi3v_prompt;
 pub mod qwen_vl;
 pub mod server;
 pub mod tokenizer;

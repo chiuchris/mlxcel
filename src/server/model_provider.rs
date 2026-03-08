@@ -10,6 +10,7 @@ use std::thread;
 
 use anyhow::Result;
 
+use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::server::ServerGenerateOptions;
 use crate::vision::processors::ImageProcessor;
@@ -267,79 +268,25 @@ impl ModelProvider {
                                     None
                                 }
                             } else if let Some(phi3v) = model.phi3_vl_model() {
-                                // Phi-3V VLM: split text around <|image_N|> tags,
-                                // tokenize chunks, interleave with negative IDs
-                                let num_images = decoded_images.len();
-
-                                // Ensure <|image_N|> tags are in the prompt text
-                                let mut text = prompt.clone();
-                                let has_image_tags = (1..=num_images)
-                                    .any(|i| text.contains(&format!("<|image_{}|>", i)));
-
-                                if !has_image_tags && num_images > 0 {
-                                    let image_tags: String = (1..=num_images)
-                                        .map(|i| format!("<|image_{}|>\n", i))
-                                        .collect();
-                                    if let Some(pos) = text.find("<|user|>\n") {
-                                        text.insert_str(pos + "<|user|>\n".len(), &image_tags);
-                                    } else {
-                                        text = format!("{}{}", image_tags, text);
-                                    }
-                                }
-
-                                // Collect image tag positions sorted by position
-                                let mut tag_positions: Vec<(usize, usize, usize)> = Vec::new();
-                                for n in 1..=num_images {
-                                    let tag = format!("<|image_{}|>", n);
-                                    let mut search_from = 0;
-                                    while let Some(pos) = text[search_from..].find(&tag) {
-                                        let abs_pos = search_from + pos;
-                                        tag_positions.push((abs_pos, abs_pos + tag.len(), n));
-                                        search_from = abs_pos + tag.len();
-                                    }
-                                }
-                                tag_positions.sort_by_key(|&(start, _, _)| start);
-
-                                if !tag_positions.is_empty() {
-                                    let mut new_tokens: Vec<i32> = Vec::new();
-                                    let mut last_end = 0;
-
-                                    for (chunk_idx, &(tag_start, tag_end, image_num)) in
-                                        tag_positions.iter().enumerate()
-                                    {
-                                        let before = &text[last_end..tag_start];
-                                        if !before.is_empty() {
-                                            let add_special = chunk_idx == 0 && last_end == 0;
-                                            let tokens = tokenizer
-                                                .encode(before, add_special)
-                                                .unwrap_or_default();
-                                            new_tokens.extend(tokens.iter().map(|&t| t as i32));
-                                        }
-
-                                        if image_num <= num_images {
-                                            let (w, h) = (
-                                                decoded_images[image_num - 1].width(),
-                                                decoded_images[image_num - 1].height(),
-                                            );
-                                            let num_img_tokens =
-                                                phi3v.processor.calc_num_image_tokens(w, h);
-                                            let neg_id = -(image_num as i32);
-                                            for _ in 0..num_img_tokens {
-                                                new_tokens.push(neg_id);
-                                            }
-                                        }
-
-                                        last_end = tag_end;
-                                    }
-
-                                    let after = &text[last_end..];
-                                    if !after.is_empty() {
-                                        let tokens =
-                                            tokenizer.encode(after, false).unwrap_or_default();
-                                        new_tokens.extend(tokens.iter().map(|&t| t as i32));
-                                    }
-
-                                    prompt_tokens = new_tokens;
+                                if let Some(prepared) = prepare_phi3v_prompt_tokens(
+                                    &prompt,
+                                    decoded_images.len(),
+                                    |text, add_special| {
+                                        tokenizer
+                                            .encode(text, add_special)
+                                            .unwrap_or_default()
+                                            .iter()
+                                            .map(|&t| t as i32)
+                                            .collect()
+                                    },
+                                    |image_num| {
+                                        let image = &decoded_images[image_num - 1];
+                                        phi3v
+                                            .processor
+                                            .calc_num_image_tokens(image.width(), image.height())
+                                    },
+                                ) {
+                                    prompt_tokens = prepared.tokens;
                                 }
 
                                 let (pixel_values, image_sizes) =
