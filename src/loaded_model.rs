@@ -214,6 +214,17 @@ macro_rules! with_qwen_vl_model {
     };
 }
 
+macro_rules! single_model_accessor {
+    ($name:ident, $variant:ident, $ty:ty) => {
+        pub fn $name(&self) -> Option<&$ty> {
+            match self {
+                Self::$variant(model) => Some(model),
+                _ => None,
+            }
+        }
+    };
+}
+
 impl LoadedModel {
     /// Check if this model is a vision-language model
     pub fn is_vlm(&self) -> bool {
@@ -244,37 +255,10 @@ impl LoadedModel {
         }
     }
 
-    /// Get the Qwen2-VL model if this is a Qwen2-VL VLM
-    pub fn qwen2_vl_model(&self) -> Option<&vision::Qwen2VLModel> {
-        match self {
-            Self::Qwen2VL(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    /// Get the Qwen2.5-VL model if this is a Qwen2.5-VL VLM
-    pub fn qwen2_5_vl_model(&self) -> Option<&vision::Qwen25VLModel> {
-        match self {
-            Self::Qwen25VL(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    /// Get the Qwen3-VL model if this is a Qwen3-VL VLM
-    pub fn qwen3_vl_model(&self) -> Option<&vision::Qwen3VLModel> {
-        match self {
-            Self::Qwen3VL(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    /// Get the Qwen3-VL-MoE model if this is a Qwen3-VL-MoE VLM
-    pub fn qwen3_vl_moe_model(&self) -> Option<&vision::Qwen3VLMoeModel> {
-        match self {
-            Self::Qwen3VLMoe(m) => Some(m),
-            _ => None,
-        }
-    }
+    single_model_accessor!(qwen2_vl_model, Qwen2VL, vision::Qwen2VLModel);
+    single_model_accessor!(qwen2_5_vl_model, Qwen25VL, vision::Qwen25VLModel);
+    single_model_accessor!(qwen3_vl_model, Qwen3VL, vision::Qwen3VLModel);
+    single_model_accessor!(qwen3_vl_moe_model, Qwen3VLMoe, vision::Qwen3VLMoeModel);
 
     /// Get the Qwen3.5 VLM model
     pub fn qwen3_5_vl_model(&self) -> Option<&vision::Qwen35VLModel> {
@@ -331,29 +315,9 @@ impl LoadedModel {
         }
     }
 
-    /// Get the Gemma3n-VL model if this is a Gemma3n VLM
-    pub fn gemma3n_vl_model(&self) -> Option<&vision::Gemma3nVLModel> {
-        match self {
-            Self::Gemma3nVLM(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    /// Get the Phi3-V model if this is a Phi3 VLM
-    pub fn phi3_vl_model(&self) -> Option<&vision::Phi3VLModel> {
-        match self {
-            Self::Phi3VLM(m) => Some(m),
-            _ => None,
-        }
-    }
-
-    /// Get the Molmo2 VLM model if this is a Molmo2 VLM
-    pub fn molmo2_vl_model(&self) -> Option<&vision::Molmo2VLModel> {
-        match self {
-            Self::Molmo2VLM(m) => Some(m),
-            _ => None,
-        }
-    }
+    single_model_accessor!(gemma3n_vl_model, Gemma3nVLM, vision::Gemma3nVLModel);
+    single_model_accessor!(phi3_vl_model, Phi3VLM, vision::Phi3VLModel);
+    single_model_accessor!(molmo2_vl_model, Molmo2VLM, vision::Molmo2VLModel);
 }
 
 impl LanguageModel for LoadedModel {
