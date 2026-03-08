@@ -1,7 +1,8 @@
 use super::{
-    is_ministral3_config, parse_eos_token_ids, qwen35_text_config, read_eos_token_ids,
-    resolve_model_dir,
+    Qwen35VlmKind, is_ministral3_config, parse_eos_token_ids, qwen35_text_config, qwen35_vlm_kind,
+    read_eos_token_ids, resolve_model_dir,
 };
+use crate::models::ModelType;
 use serde_json::json;
 use std::fs;
 use std::path::PathBuf;
@@ -132,4 +133,17 @@ fn qwen35_text_config_preserves_nested_quantization() {
     let merged = qwen35_text_config(&config).unwrap();
 
     assert_eq!(merged["quantization"]["group_size"], 64);
+}
+
+#[test]
+fn qwen35_vlm_kind_matches_supported_model_types() {
+    assert_eq!(
+        qwen35_vlm_kind(ModelType::Qwen35VLM),
+        Some(Qwen35VlmKind::Dense)
+    );
+    assert_eq!(
+        qwen35_vlm_kind(ModelType::Qwen35MoeVLM),
+        Some(Qwen35VlmKind::Moe)
+    );
+    assert_eq!(qwen35_vlm_kind(ModelType::Qwen35), None);
 }

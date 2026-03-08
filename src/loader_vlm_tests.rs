@@ -1,6 +1,6 @@
 use super::{
     QwenVisionTokenIds, inherit_qwen_vision_quantization, qwen_vl_token_ids,
-    rewrite_qwen3_vl_weight_key,
+    qwen35_vlm_token_defaults, rewrite_qwen3_vl_weight_key,
 };
 use crate::vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 use serde_json::json;
@@ -104,6 +104,18 @@ fn qwen_vl_token_ids_applies_defaults_and_overrides() {
             image_token_id: 20,
             video_token_id: 11,
             vision_start_token_id: 22,
+        }
+    );
+}
+
+#[test]
+fn qwen35_vlm_token_defaults_match_reference_config() {
+    assert_eq!(
+        qwen35_vlm_token_defaults(),
+        QwenVisionTokenIds {
+            image_token_id: 248056,
+            video_token_id: 248057,
+            vision_start_token_id: 248045,
         }
     );
 }

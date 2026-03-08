@@ -75,6 +75,20 @@ fn qwen35_text_config(config: &serde_json::Value) -> Result<serde_json::Value> {
     Ok(text_config)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen35VlmKind {
+    Dense,
+    Moe,
+}
+
+fn qwen35_vlm_kind(model_type: ModelType) -> Option<Qwen35VlmKind> {
+    match model_type {
+        ModelType::Qwen35VLM => Some(Qwen35VlmKind::Dense),
+        ModelType::Qwen35MoeVLM => Some(Qwen35VlmKind::Moe),
+        _ => None,
+    }
+}
+
 macro_rules! load_model_from_config {
     ($config_str:expr, $weights:expr, $args_ty:ty, $builder:path, $wrap:expr) => {{
         let args: $args_ty = parse_model_config($config_str)?;
@@ -180,20 +194,15 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
         ModelType::Qwen35 => {
             LoadedModel::Qwen35(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
         }
-        ModelType::Qwen35VLM => {
-            return Ok((
-                load_qwen3_5_vlm(model_path)?,
-                tokenizer::load_tokenizer(model_path)?,
-            ));
+        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
+            let loaded = match qwen35_vlm_kind(model_type).unwrap() {
+                Qwen35VlmKind::Dense => load_qwen3_5_vlm(model_path)?,
+                Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
+            };
+            return Ok((loaded, tokenizer::load_tokenizer(model_path)?));
         }
         ModelType::Qwen35Moe => {
             LoadedModel::Qwen35Moe(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
-        }
-        ModelType::Qwen35MoeVLM => {
-            return Ok((
-                load_qwen3_5_vlm(model_path)?,
-                tokenizer::load_tokenizer(model_path)?,
-            ));
         }
         ModelType::Qwen2Moe => {
             LoadedModel::Qwen2Moe(load_pair_from_dir(path_str, models::Qwen2MoeModel::load)?)

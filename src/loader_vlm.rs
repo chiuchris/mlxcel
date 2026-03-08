@@ -209,6 +209,12 @@ struct QwenVisionTokenIds {
     vision_start_token_id: i32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Qwen35VlmVariant {
+    Dense,
+    Moe,
+}
+
 fn qwen_vl_token_ids(full_config: &Value, defaults: QwenVisionTokenIds) -> QwenVisionTokenIds {
     QwenVisionTokenIds {
         image_token_id: full_config
@@ -223,6 +229,21 @@ fn qwen_vl_token_ids(full_config: &Value, defaults: QwenVisionTokenIds) -> QwenV
             .get("vision_start_token_id")
             .and_then(|v| v.as_i64())
             .unwrap_or(defaults.vision_start_token_id as i64) as i32,
+    }
+}
+
+fn qwen35_vlm_token_defaults() -> QwenVisionTokenIds {
+    QwenVisionTokenIds {
+        image_token_id: 248056,
+        video_token_id: 248057,
+        vision_start_token_id: 248045,
+    }
+}
+
+fn wrap_qwen35_vlm(vlm: vision::Qwen35VLModel, variant: Qwen35VlmVariant) -> LoadedModel {
+    match variant {
+        Qwen35VlmVariant::Dense => LoadedModel::Qwen35VLM(vlm),
+        Qwen35VlmVariant::Moe => LoadedModel::Qwen35MoeVLM(vlm),
     }
 }
 
@@ -2517,6 +2538,18 @@ pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
 
 /// Load a Qwen3.5 VLM (Qwen3-VL vision encoder + Qwen3.5 hybrid text backbone)
 pub(crate) fn load_qwen3_5_vlm(model_path: &Path) -> Result<LoadedModel> {
+    load_qwen3_5_vlm_with_variant(model_path, Qwen35VlmVariant::Dense)
+}
+
+/// Load a Qwen3.5 MoE VLM (Qwen3-VL vision encoder + Qwen3.5 MoE hybrid text backbone)
+pub(crate) fn load_qwen3_5_moe_vlm(model_path: &Path) -> Result<LoadedModel> {
+    load_qwen3_5_vlm_with_variant(model_path, Qwen35VlmVariant::Moe)
+}
+
+fn load_qwen3_5_vlm_with_variant(
+    model_path: &Path,
+    variant: Qwen35VlmVariant,
+) -> Result<LoadedModel> {
     use vision::encoders::qwen3_vl::{Qwen3VLVisionConfig, Qwen3VLVisionEncoder};
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
@@ -2617,14 +2650,7 @@ pub(crate) fn load_qwen3_5_vlm(model_path: &Path) -> Result<LoadedModel> {
     let processor = qwen_vl_processor_with_norm(&vision_config, [0.5, 0.5, 0.5], [0.5, 0.5, 0.5]);
 
     // Token IDs (Qwen3.5 uses different defaults than Qwen3-VL)
-    let token_ids = qwen_vl_token_ids(
-        &full_config,
-        QwenVisionTokenIds {
-            image_token_id: 248056,
-            video_token_id: 248057,
-            vision_start_token_id: 248053,
-        },
-    );
+    let token_ids = qwen_vl_token_ids(&full_config, qwen35_vlm_token_defaults());
 
     let vlm = vision::Qwen35VLModel {
         text_model,
@@ -2636,7 +2662,7 @@ pub(crate) fn load_qwen3_5_vlm(model_path: &Path) -> Result<LoadedModel> {
         spatial_merge_size: vision_config.spatial_merge_size,
     };
 
-    Ok(LoadedModel::Qwen35VLM(vlm))
+    Ok(wrap_qwen35_vlm(vlm, variant))
 }
 
 #[cfg(test)]
