@@ -10,11 +10,8 @@ use std::thread;
 
 use anyhow::Result;
 
-use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
-use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::server::ServerGenerateOptions;
-use crate::vision::processors::ImageProcessor;
-use crate::vlm_prompt::apply_image_token_blocks;
+use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
 
 /// Request to the model thread
 pub enum ModelRequest {
@@ -177,158 +174,25 @@ impl ModelProvider {
                                 continue;
                             }
 
-                            if let Some(info) = model.qwen_vl_prompt_info() {
-                                let (pixel_values, grid_thw) =
-                                    info.processor.preprocess_with_grid(&decoded_images);
-                                let _ = insert_qwen_vl_image_tokens(
-                                    &mut prompt_tokens,
-                                    &grid_thw,
-                                    info.spatial_merge_size,
-                                    info.vision_start_token_id,
-                                    info.image_token_id,
-                                );
-
-                                let input_ids_arr = mlxcel_core::from_slice_i32(
-                                    &prompt_tokens,
-                                    &[1, prompt_tokens.len() as i32],
-                                );
-                                let merged = model
-                                    .qwen_vl_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &grid_thw,
-                                    )
-                                    .expect("Qwen-VL prompt info without matching model");
-                                Some(merged)
-                            } else if let Some(gemma3n_vl) = model.gemma3n_vl_model() {
-                                let _ = model.image_token_block_info().and_then(|info| {
-                                    apply_image_token_blocks(
-                                        &mut prompt_tokens,
-                                        info,
-                                        decoded_images.len(),
-                                    )
-                                });
-
-                                let pixel_values = gemma3n_vl.processor.preprocess(&decoded_images);
-                                let input_ids_arr = mlxcel_core::from_slice_i32(
-                                    &prompt_tokens,
-                                    &[1, prompt_tokens.len() as i32],
-                                );
-                                let merged =
-                                    gemma3n_vl.get_input_embeddings(&input_ids_arr, &pixel_values);
-                                Some(merged)
-                            } else if let Some(molmo2) = model.molmo2_vl_model() {
-                                // Molmo2 VLM: multi-scale preprocessing + additive merge
-                                if let Some(img) = decoded_images.first() {
-                                    let proc_out = molmo2.processor.preprocess_image(img);
-
-                                    // Generate image token string and re-tokenize
-                                    let image_token_str =
-                                        molmo2.processor.get_image_tokens(&proc_out.image_grid);
-                                    let mut text = prompt.clone();
-                                    if text.contains("<|image|>") {
-                                        text = text.replace("<|image|>", &image_token_str);
-                                    } else {
-                                        text = format!("{}{}", image_token_str, text);
-                                    }
-                                    prompt_tokens = tokenizer
-                                        .encode(&text, true)
+                            match prepare_and_compute_vlm_embeddings(
+                                &model,
+                                &mut prompt_tokens,
+                                &prompt,
+                                &decoded_images,
+                                |text, add_special| {
+                                    tokenizer
+                                        .encode(text, add_special)
                                         .unwrap_or_default()
                                         .iter()
                                         .map(|&t| t as i32)
-                                        .collect();
-
-                                    let pixel_values = mlxcel_core::from_slice_f32(
-                                        &proc_out.pixel_values,
-                                        &proc_out.pixel_values_shape,
-                                    );
-                                    let image_token_pooling = mlxcel_core::from_slice_i32(
-                                        &proc_out.image_token_pooling,
-                                        &proc_out.image_token_pooling_shape,
-                                    );
-                                    let image_grids =
-                                        mlxcel_core::from_slice_i32(&proc_out.image_grid, &[4]);
-                                    let image_num_crops = mlxcel_core::from_slice_i32(
-                                        &[proc_out.image_num_crops],
-                                        &[1],
-                                    );
-                                    let input_ids_arr = mlxcel_core::from_slice_i32(
-                                        &prompt_tokens,
-                                        &[1, prompt_tokens.len() as i32],
-                                    );
-                                    let merged = molmo2.get_input_embeddings(
-                                        &input_ids_arr,
-                                        &pixel_values,
-                                        &image_token_pooling,
-                                        &image_grids,
-                                        &image_num_crops,
-                                    );
-                                    Some(merged)
-                                } else {
-                                    None
+                                        .collect()
+                                },
+                            ) {
+                                Ok(prepared) => prepared.map(|prepared| prepared.embeddings),
+                                Err(err) => {
+                                    let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
+                                    continue;
                                 }
-                            } else if let Some(phi3v) = model.phi3_vl_model() {
-                                if let Some(prepared) = prepare_phi3v_prompt_tokens(
-                                    &prompt,
-                                    decoded_images.len(),
-                                    |text, add_special| {
-                                        tokenizer
-                                            .encode(text, add_special)
-                                            .unwrap_or_default()
-                                            .iter()
-                                            .map(|&t| t as i32)
-                                            .collect()
-                                    },
-                                    |image_num| {
-                                        let image = &decoded_images[image_num - 1];
-                                        phi3v
-                                            .processor
-                                            .calc_num_image_tokens(image.width(), image.height())
-                                    },
-                                ) {
-                                    prompt_tokens = prepared.tokens;
-                                }
-
-                                let (pixel_values, image_sizes) =
-                                    phi3v.processor.preprocess(&decoded_images);
-                                let input_ids_arr = mlxcel_core::from_slice_i32(
-                                    &prompt_tokens,
-                                    &[1, prompt_tokens.len() as i32],
-                                );
-                                let merged = phi3v.get_input_embeddings(
-                                    &input_ids_arr,
-                                    &pixel_values,
-                                    &image_sizes,
-                                );
-                                Some(merged)
-                            } else if let Some(vision_module) = model.vision_module() {
-                                let _ = model.image_token_block_info().and_then(|info| {
-                                    apply_image_token_blocks(
-                                        &mut prompt_tokens,
-                                        info,
-                                        decoded_images.len(),
-                                    )
-                                });
-
-                                let pixel_values =
-                                    vision_module.processor.preprocess(&decoded_images);
-                                let mask = mlxcel_core::ones(
-                                    &[1, prompt_tokens.len() as i32],
-                                    mlxcel_core::dtype::INT32,
-                                );
-                                let input_ids_arr = mlxcel_core::from_slice_i32(
-                                    &prompt_tokens,
-                                    &[1, prompt_tokens.len() as i32],
-                                );
-                                let merged = vision_module.get_input_embeddings(
-                                    &model,
-                                    &input_ids_arr,
-                                    Some(&pixel_values),
-                                    &mask,
-                                );
-                                Some(merged)
-                            } else {
-                                None
                             }
                         } else {
                             None

@@ -60,18 +60,6 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     let mut prompt_tokens: Vec<i32> = prompt_token_ids.iter().map(|&x| x as i32).collect();
 
-    // For VLM: ensure image tokens are in the prompt
-    let has_images = !args.generation.image.is_empty();
-    if has_images && model.is_vlm() {
-        generate_vlm::prepare_vlm_tokens(
-            &model,
-            &mut prompt_tokens,
-            &prompt,
-            &args.generation.image,
-            &tokenizer,
-        )?;
-    }
-
     println!("Generating...");
     print!("{}", args.generation.prompt);
     io::stdout().flush()?;
@@ -113,9 +101,10 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     // Check for VLM image mode
     let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
         &model,
-        &prompt_tokens,
+        &mut prompt_tokens,
+        &prompt,
         &args.generation.image,
-        has_images,
+        &tokenizer,
     )?;
 
     // Generate tokens (speculative or standard)

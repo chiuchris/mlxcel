@@ -11,6 +11,7 @@ pub mod server;
 pub mod tokenizer;
 pub mod vision;
 pub mod vlm_prompt;
+pub mod vlm_runtime;
 
 mod loaded_model;
 mod loader;
