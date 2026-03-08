@@ -653,6 +653,159 @@ fn adapter_loading_unsupported_message(model_type: ModelType) -> Option<&'static
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpecialWeightLoaderKind {
+    Qwen35,
+    Gemma3n,
+    OwnedConfig,
+    NemotronH,
+    KimiLinear,
+    Longcat,
+    Rwkv7,
+}
+
+fn special_weight_loader_kind(model_type: ModelType) -> Option<SpecialWeightLoaderKind> {
+    match model_type {
+        ModelType::Qwen35 | ModelType::Qwen35Moe => Some(SpecialWeightLoaderKind::Qwen35),
+        ModelType::Gemma3n => Some(SpecialWeightLoaderKind::Gemma3n),
+        ModelType::Mamba
+        | ModelType::Mamba2
+        | ModelType::Jamba
+        | ModelType::NemotronNAS
+        | ModelType::RecurrentGemma => Some(SpecialWeightLoaderKind::OwnedConfig),
+        ModelType::NemotronH => Some(SpecialWeightLoaderKind::NemotronH),
+        ModelType::KimiLinear => Some(SpecialWeightLoaderKind::KimiLinear),
+        ModelType::LongcatFlash | ModelType::LongcatFlashNgram => {
+            Some(SpecialWeightLoaderKind::Longcat)
+        }
+        ModelType::Rwkv7 => Some(SpecialWeightLoaderKind::Rwkv7),
+        _ => None,
+    }
+}
+
+fn try_load_special_model_from_weights(
+    model_type: ModelType,
+    config_str: &str,
+    weights: &mut WeightMap,
+) -> Result<Option<LoadedModel>> {
+    let Some(kind) = special_weight_loader_kind(model_type) else {
+        return Ok(None);
+    };
+
+    Ok(Some(match kind {
+        SpecialWeightLoaderKind::Qwen35 => {
+            let v: serde_json::Value = parse_model_config(config_str)?;
+            let text_config = qwen35_text_config(&v)?;
+            let args: models::qwen3_5::Qwen35Config = serde_json::from_value(text_config)
+                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
+            let owned = copy_weight_map(weights);
+            let owned = models::qwen3_5::sanitize_moe_weights(owned, &args);
+            let m = models::Qwen35Model::from_weights(&owned, &args)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if model_type == ModelType::Qwen35Moe {
+                LoadedModel::Qwen35Moe(m)
+            } else {
+                LoadedModel::Qwen35(m)
+            }
+        }
+        SpecialWeightLoaderKind::Gemma3n => {
+            let top_args: models::gemma3n::ModelArgs = parse_model_config(config_str)?;
+            let config = top_args.text_args();
+            let language_model = models::gemma3n::Gemma3nLanguageModel::from_weights(
+                weights,
+                &config,
+                "language_model.model",
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            LoadedModel::Gemma3n(models::Gemma3nModel {
+                language_model,
+                config,
+            })
+        }
+        SpecialWeightLoaderKind::OwnedConfig => match model_type {
+            ModelType::Mamba => load_owned_model_from_config!(
+                config_str,
+                weights,
+                models::mamba::MambaConfig,
+                models::MambaModel::from_weights,
+                LoadedModel::Mamba
+            ),
+            ModelType::Mamba2 => load_owned_model_from_config!(
+                config_str,
+                weights,
+                models::mamba2::Mamba2Config,
+                models::Mamba2Model::from_weights,
+                LoadedModel::Mamba2
+            ),
+            ModelType::Jamba => load_owned_model_from_config!(
+                config_str,
+                weights,
+                models::jamba::JambaConfig,
+                models::JambaModel::from_weights,
+                LoadedModel::Jamba
+            ),
+            ModelType::NemotronNAS => load_owned_model_from_config!(
+                config_str,
+                weights,
+                models::nemotron_nas::NemotronNASConfig,
+                models::NemotronNASModel::from_weights,
+                LoadedModel::NemotronNAS
+            ),
+            ModelType::RecurrentGemma => load_owned_model_from_config!(
+                config_str,
+                weights,
+                models::recurrent_gemma::GriffinConfig,
+                models::GriffinModel::from_weights,
+                LoadedModel::RecurrentGemma
+            ),
+            _ => unreachable!(
+                "owned-config helper called for non-owned model: {:?}",
+                model_type
+            ),
+        },
+        SpecialWeightLoaderKind::NemotronH => {
+            let args: models::nemotron_h::NemotronHConfig = parse_model_config(config_str)?;
+            let block_types: Vec<models::nemotron_h::BlockType> = args
+                .hybrid_override_pattern
+                .iter()
+                .map(|s| models::nemotron_h::BlockType::from_str(s))
+                .collect();
+            let owned = copy_weight_map(weights);
+            let owned = models::NemotronHModel::sanitize_weights(owned, &args);
+            let m = models::NemotronHModel::from_weights(args, owned, block_types)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            LoadedModel::NemotronH(m)
+        }
+        SpecialWeightLoaderKind::KimiLinear => {
+            let args: models::kimi_linear::KimiLinearConfig = parse_model_config(config_str)?;
+            let mut owned = copy_weight_map(weights);
+            owned = models::KimiLinearModel::sanitize_weights(owned, &args);
+            let m = models::KimiLinearModel::from_weights(&owned, &args)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            LoadedModel::KimiLinear(m)
+        }
+        SpecialWeightLoaderKind::Longcat => {
+            let args: models::longcat_flash_ngram::LongcatFlashNgramConfig =
+                parse_model_config(config_str)?;
+            let mut owned = copy_weight_map(weights);
+            owned = models::longcat_flash_ngram::sanitize_weights(owned, &args);
+            let m = models::LongcatFlashNgramModel::from_weights(&owned, &args)
+                .map_err(|e| anyhow::anyhow!("{}", e))?;
+            if model_type == ModelType::LongcatFlashNgram {
+                LoadedModel::LongcatFlashNgram(m)
+            } else {
+                LoadedModel::LongcatFlash(m)
+            }
+        }
+        SpecialWeightLoaderKind::Rwkv7 => {
+            let args: models::rwkv7::Rwkv7Config = parse_model_config(config_str)?;
+            let m =
+                models::Rwkv7::from_weights(weights, args).map_err(|e| anyhow::anyhow!("{}", e))?;
+            LoadedModel::Rwkv7(m)
+        }
+    }))
+}
+
 fn try_load_vlm_model_from_dir(
     model_type: ModelType,
     model_path: &Path,
@@ -861,156 +1014,34 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
         return Err(anyhow::anyhow!(message));
     }
 
-    let model = match model_type {
-        ModelType::Llama | ModelType::Mistral3 => {
-            // Check for ministral3 sub-type
-            let config: serde_json::Value = parse_model_config(&config_str)?;
-            if model_type == ModelType::Mistral3 && is_ministral3_config(&config) {
-                // Load as Ministral3 with text_config
-                let text_config = config
-                    .get("text_config")
-                    .ok_or_else(|| anyhow::anyhow!("Missing text_config for Ministral3"))?;
-                let args: models::ministral3::ModelArgs =
-                    serde_json::from_value(text_config.clone())
-                        .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
-                let m = models::Ministral3Model::from_weights(weights, &args)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
-            } else {
-                let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
-                let m = models::Llama3Model::from_weights(weights, &args)
-                    .map_err(|e| anyhow::anyhow!("{}", e))?;
-                LoadedModel::Llama(m)
-            }
-        }
-        ModelType::Qwen35 | ModelType::Qwen35Moe => {
-            let v: serde_json::Value = parse_model_config(&config_str)?;
-            let text_config = qwen35_text_config(&v)?;
-            let args: models::qwen3_5::Qwen35Config = serde_json::from_value(text_config)
-                .map_err(|e| anyhow::anyhow!("Failed to parse config: {}", e))?;
-            let owned = copy_weight_map(weights);
-            let owned = models::qwen3_5::sanitize_moe_weights(owned, &args);
-            let m = models::Qwen35Model::from_weights(&owned, &args)
+    let model = if matches!(model_type, ModelType::Llama | ModelType::Mistral3) {
+        // Check for ministral3 sub-type
+        let config: serde_json::Value = parse_model_config(&config_str)?;
+        if model_type == ModelType::Mistral3 && is_ministral3_config(&config) {
+            // Load as Ministral3 with text_config
+            let text_config = config
+                .get("text_config")
+                .ok_or_else(|| anyhow::anyhow!("Missing text_config for Ministral3"))?;
+            let args: models::ministral3::ModelArgs =
+                serde_json::from_value(text_config.clone())
+                    .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
+            let m = models::Ministral3Model::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            if model_type == ModelType::Qwen35Moe {
-                LoadedModel::Qwen35Moe(m)
-            } else {
-                LoadedModel::Qwen35(m)
-            }
-        }
-        ModelType::Gemma3n => {
-            let top_args: models::gemma3n::ModelArgs = parse_model_config(&config_str)?;
-            let config = top_args.text_args();
-            let language_model = models::gemma3n::Gemma3nLanguageModel::from_weights(
-                weights,
-                &config,
-                "language_model.model",
-            )
-            .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Gemma3n(models::Gemma3nModel {
-                language_model,
-                config,
-            })
-        }
-        // SSM/Hybrid models that take ownership of weights
-        ModelType::Mamba => {
-            load_owned_model_from_config!(
-                &config_str,
-                weights,
-                models::mamba::MambaConfig,
-                models::MambaModel::from_weights,
-                LoadedModel::Mamba
-            )
-        }
-        ModelType::Mamba2 => {
-            load_owned_model_from_config!(
-                &config_str,
-                weights,
-                models::mamba2::Mamba2Config,
-                models::Mamba2Model::from_weights,
-                LoadedModel::Mamba2
-            )
-        }
-        ModelType::Jamba => {
-            load_owned_model_from_config!(
-                &config_str,
-                weights,
-                models::jamba::JambaConfig,
-                models::JambaModel::from_weights,
-                LoadedModel::Jamba
-            )
-        }
-        ModelType::NemotronH => {
-            let args: models::nemotron_h::NemotronHConfig = parse_model_config(&config_str)?;
-            let block_types: Vec<models::nemotron_h::BlockType> = args
-                .hybrid_override_pattern
-                .iter()
-                .map(|s| models::nemotron_h::BlockType::from_str(s))
-                .collect();
-            let owned = copy_weight_map(weights);
-            let owned = models::NemotronHModel::sanitize_weights(owned, &args);
-            let m = models::NemotronHModel::from_weights(args, owned, block_types)
+            LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
+        } else {
+            let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
+            let m = models::Llama3Model::from_weights(weights, &args)
                 .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::NemotronH(m)
+            LoadedModel::Llama(m)
         }
-        ModelType::NemotronNAS => {
-            load_owned_model_from_config!(
-                &config_str,
-                weights,
-                models::nemotron_nas::NemotronNASConfig,
-                models::NemotronNASModel::from_weights,
-                LoadedModel::NemotronNAS
-            )
-        }
-        ModelType::Step3p5 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::step3p5::Step3p5Config,
-                models::Step3p5Model::from_weights,
-                LoadedModel::Step3p5
-            )
-        }
-        ModelType::KimiLinear => {
-            let args: models::kimi_linear::KimiLinearConfig = parse_model_config(&config_str)?;
-            let mut owned = copy_weight_map(weights);
-            owned = models::KimiLinearModel::sanitize_weights(owned, &args);
-            let m = models::KimiLinearModel::from_weights(&owned, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::KimiLinear(m)
-        }
-        ModelType::LongcatFlash | ModelType::LongcatFlashNgram => {
-            let args: models::longcat_flash_ngram::LongcatFlashNgramConfig =
-                parse_model_config(&config_str)?;
-            let mut owned = copy_weight_map(weights);
-            owned = models::longcat_flash_ngram::sanitize_weights(owned, &args);
-            let m = models::LongcatFlashNgramModel::from_weights(&owned, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            if model_type == ModelType::LongcatFlashNgram {
-                LoadedModel::LongcatFlashNgram(m)
-            } else {
-                LoadedModel::LongcatFlash(m)
-            }
-        }
-        ModelType::Rwkv7 => {
-            let args: models::rwkv7::Rwkv7Config = parse_model_config(&config_str)?;
-            let m =
-                models::Rwkv7::from_weights(weights, args).map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Rwkv7(m)
-        }
-        ModelType::RecurrentGemma => {
-            load_owned_model_from_config!(
-                &config_str,
-                weights,
-                models::recurrent_gemma::GriffinConfig,
-                models::GriffinModel::from_weights,
-                LoadedModel::RecurrentGemma
-            )
-        }
-        _ => try_load_config_backed_model_from_weights(model_type, &config_str, weights)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type)
-            })?,
+    } else if let Some(model) =
+        try_load_special_model_from_weights(model_type, &config_str, weights)?
+    {
+        model
+    } else {
+        try_load_config_backed_model_from_weights(model_type, &config_str, weights)?.ok_or_else(
+            || anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type),
+        )?
     };
 
     Ok(model)

@@ -1,6 +1,7 @@
 use super::{
-    Qwen35VlmKind, adapter_loading_unsupported_message, is_ministral3_config, parse_eos_token_ids,
-    qwen35_text_config, qwen35_vlm_kind, read_eos_token_ids, resolve_model_dir,
+    Qwen35VlmKind, SpecialWeightLoaderKind, adapter_loading_unsupported_message,
+    is_ministral3_config, parse_eos_token_ids, qwen35_text_config, qwen35_vlm_kind,
+    read_eos_token_ids, resolve_model_dir, special_weight_loader_kind,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -172,4 +173,31 @@ fn adapter_loading_unsupported_message_returns_none_for_text_models() {
         adapter_loading_unsupported_message(ModelType::Gemma3n),
         None
     );
+}
+
+#[test]
+fn special_weight_loader_kind_covers_special_families() {
+    assert_eq!(
+        special_weight_loader_kind(ModelType::Qwen35),
+        Some(SpecialWeightLoaderKind::Qwen35)
+    );
+    assert_eq!(
+        special_weight_loader_kind(ModelType::Mamba2),
+        Some(SpecialWeightLoaderKind::OwnedConfig)
+    );
+    assert_eq!(
+        special_weight_loader_kind(ModelType::LongcatFlashNgram),
+        Some(SpecialWeightLoaderKind::Longcat)
+    );
+    assert_eq!(
+        special_weight_loader_kind(ModelType::Rwkv7),
+        Some(SpecialWeightLoaderKind::Rwkv7)
+    );
+}
+
+#[test]
+fn special_weight_loader_kind_returns_none_for_config_backed_models() {
+    assert_eq!(special_weight_loader_kind(ModelType::Llama), None);
+    assert_eq!(special_weight_loader_kind(ModelType::Qwen3), None);
+    assert_eq!(special_weight_loader_kind(ModelType::Step3p5), None);
 }
