@@ -333,6 +333,31 @@ pub fn sanitize_config_json(config_str: &str) -> String {
         .replace("NaN", "0.0")
 }
 
+fn has_vision_config(config: &serde_json::Value) -> bool {
+    config.get("vision_config").is_some()
+}
+
+fn detect_text_or_vlm(
+    config: &serde_json::Value,
+    text_model: ModelType,
+    vlm_model: ModelType,
+) -> ModelType {
+    if has_vision_config(config) {
+        vlm_model
+    } else {
+        text_model
+    }
+}
+
+fn detect_hunyuan_model_type(config: &serde_json::Value) -> ModelType {
+    let num_experts = config["num_experts"].as_i64().unwrap_or(1);
+    if num_experts > 1 {
+        ModelType::HunyuanMoe
+    } else {
+        ModelType::HunyuanV1Dense
+    }
+}
+
 /// Detect model type from config.json
 pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     let config_path = model_path.join("config.json");
@@ -346,52 +371,38 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
 
     match model_type {
         "llama" | "mistral" => Ok(ModelType::Llama),
-        "llama4" => {
-            // Detect VLM: has vision_config in config.json
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Llama4VLM)
-            } else {
-                Ok(ModelType::Llama4)
-            }
-        }
+        "llama4" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Llama4,
+            ModelType::Llama4VLM,
+        )),
         "qwen2" => Ok(ModelType::Qwen2),
         "qwen3" => Ok(ModelType::Qwen3),
         "qwen3_moe" => Ok(ModelType::Qwen3Moe),
         "qwen3_next" | "qwen3next" => Ok(ModelType::Qwen3Next),
-        "qwen3_5" => {
-            // Detect VLM: has vision_config in config.json
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Qwen35VLM)
-            } else {
-                Ok(ModelType::Qwen35)
-            }
-        }
-        "qwen3_5_moe" => {
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Qwen35MoeVLM)
-            } else {
-                Ok(ModelType::Qwen35Moe)
-            }
-        }
+        "qwen3_5" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Qwen35,
+            ModelType::Qwen35VLM,
+        )),
+        "qwen3_5_moe" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Qwen35Moe,
+            ModelType::Qwen35MoeVLM,
+        )),
         "qwen2_moe" => Ok(ModelType::Qwen2Moe),
         "gemma" => Ok(ModelType::Gemma),
         "gemma2" => Ok(ModelType::Gemma2),
-        "gemma3" | "gemma3_text" => {
-            // Detect VLM: has vision_config in config.json
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Gemma3VLM)
-            } else {
-                Ok(ModelType::Gemma3)
-            }
-        }
-        "gemma3n" | "gemma3n_text" => {
-            // Detect VLM: has vision_config in config.json
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Gemma3nVLM)
-            } else {
-                Ok(ModelType::Gemma3n)
-            }
-        }
+        "gemma3" | "gemma3_text" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Gemma3,
+            ModelType::Gemma3VLM,
+        )),
+        "gemma3n" | "gemma3n_text" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Gemma3n,
+            ModelType::Gemma3nVLM,
+        )),
         "phi" | "phi-msft" => Ok(ModelType::Phi),
         "phi3" => Ok(ModelType::Phi3),
         "phi3_v" => Ok(ModelType::Phi3VLM),
@@ -415,15 +426,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "ernie4_5" | "ernie4.5" => Ok(ModelType::Ernie45),
         "ernie4_5_moe" | "ernie4.5_moe" => Ok(ModelType::Ernie45Moe),
         "hunyuan_v1_dense" | "hunyuan_dense" => Ok(ModelType::HunyuanV1Dense),
-        "hunyuan" => {
-            // Detect MoE vs Dense based on num_experts
-            let num_experts = v["num_experts"].as_i64().unwrap_or(1);
-            if num_experts > 1 {
-                Ok(ModelType::HunyuanMoe)
-            } else {
-                Ok(ModelType::HunyuanV1Dense)
-            }
-        }
+        "hunyuan" => Ok(detect_hunyuan_model_type(&v)),
         "mimo" => Ok(ModelType::MiMo),
         "exaone" => Ok(ModelType::ExaOne),
         "exaone4" => Ok(ModelType::ExaOne4),
@@ -437,13 +440,11 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "stablelm" => Ok(ModelType::StableLM),
         "smollm3" => Ok(ModelType::SmolLM3),
         "ministral3" => Ok(ModelType::Ministral3),
-        "mistral3" => {
-            if v.get("vision_config").is_some() {
-                Ok(ModelType::Mistral3VLM)
-            } else {
-                Ok(ModelType::Mistral3)
-            }
-        }
+        "mistral3" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Mistral3,
+            ModelType::Mistral3VLM,
+        )),
         "nemotron" => Ok(ModelType::Nemotron),
         "mamba" | "falcon_mamba" => Ok(ModelType::Mamba),
         "mamba2" => Ok(ModelType::Mamba2),
@@ -469,3 +470,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         _ => Err(anyhow::anyhow!("Unsupported model type: {}", model_type)),
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;
