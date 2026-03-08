@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use mlxcel::qwen_vl::insert_qwen_vl_image_tokens;
 use mlxcel::vision::processors::ImageProcessor;
+use mlxcel::vlm_prompt::{ImageTokenBlockAction, apply_image_token_blocks};
 use mlxcel::{LoadedModel, vision::merge::InputEmbeddings};
 
 use crate::MlxcelTokenizer;
@@ -167,85 +168,24 @@ pub(crate) fn prepare_vlm_tokens(
                 prompt_tokens.len()
             );
         }
-    } else if model.gemma3n_vl_model().is_some() || model.vision_module().is_some() {
-        // Extract VLM token parameters from either Gemma3nVLM or generic VisionModule
-        let (use_boi_eoi, image_token_id, mm_tokens_per_image, boi_token_id, eoi_token_id) =
-            if let Some(g3n) = model.gemma3n_vl_model() {
-                (
-                    true,
-                    g3n.image_token_id,
-                    256usize,
-                    g3n.boi_token_id,
-                    g3n.eoi_token_id,
-                )
-            } else {
-                let vm = model.vision_module().unwrap();
-                (
-                    vm.boi_token_id != 0,
-                    vm.image_token_id,
-                    vm.mm_tokens_per_image,
-                    vm.boi_token_id,
-                    vm.eoi_token_id,
-                )
-            };
-        let num_images = image_paths.len();
-
-        // Check if the tokenized prompt already contains image tokens
-        let existing_image_count = prompt_tokens
-            .iter()
-            .filter(|&&t| t == image_token_id)
-            .count();
-
-        if existing_image_count > 0 {
-            // Expand existing image tokens
-            let mut expanded = Vec::with_capacity(
-                prompt_tokens.len() + (mm_tokens_per_image - 1) * existing_image_count,
-            );
-            for &tok in prompt_tokens.iter() {
-                if tok == image_token_id {
-                    if use_boi_eoi {
-                        expanded.push(boi_token_id);
-                    }
-                    for _ in 0..mm_tokens_per_image {
-                        expanded.push(image_token_id);
-                    }
-                    if use_boi_eoi {
-                        expanded.push(eoi_token_id);
-                    }
-                } else {
-                    expanded.push(tok);
+    } else if let Some(info) = model.image_token_block_info() {
+        if let Some(stats) = apply_image_token_blocks(prompt_tokens, info, image_paths.len()) {
+            match stats.action {
+                ImageTokenBlockAction::Expanded {
+                    existing_image_count,
+                } => {
+                    println!(
+                        "Expanded {} <image> token(s) to {} tokens each",
+                        existing_image_count, stats.tokens_per_image
+                    );
+                }
+                ImageTokenBlockAction::Inserted { image_blocks } => {
+                    println!(
+                        "Inserted {} image token blocks ({} tokens each)",
+                        image_blocks, stats.tokens_per_image
+                    );
                 }
             }
-            *prompt_tokens = expanded;
-            println!(
-                "Expanded {} <image> token(s) to {} tokens each",
-                existing_image_count, mm_tokens_per_image
-            );
-        } else {
-            // No image tokens in prompt -- insert after BOS
-            let mut image_tokens = Vec::new();
-            for _ in 0..num_images {
-                if use_boi_eoi {
-                    image_tokens.push(boi_token_id);
-                }
-                for _ in 0..mm_tokens_per_image {
-                    image_tokens.push(image_token_id);
-                }
-                if use_boi_eoi {
-                    image_tokens.push(eoi_token_id);
-                }
-            }
-            if !prompt_tokens.is_empty() {
-                let bos = prompt_tokens[0];
-                let rest = prompt_tokens[1..].to_vec();
-                *prompt_tokens = vec![bos];
-                prompt_tokens.extend(image_tokens);
-                prompt_tokens.extend(rest);
-            }
-            println!(
-                "Inserted {} image token blocks ({} tokens each)",
-                num_images, mm_tokens_per_image
-            );
         }
     }
 

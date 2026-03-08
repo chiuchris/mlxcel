@@ -9,6 +9,7 @@ pub mod qwen_vl;
 pub mod server;
 pub mod tokenizer;
 pub mod vision;
+pub mod vlm_prompt;
 
 mod loaded_model;
 mod loader;

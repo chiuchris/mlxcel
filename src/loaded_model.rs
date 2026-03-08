@@ -1,4 +1,4 @@
-use crate::{models, qwen_vl, vision};
+use crate::{models, qwen_vl, vision, vlm_prompt};
 use mlxcel_core::UniquePtr;
 use mlxcel_core::generate::LanguageModel;
 
@@ -289,6 +289,27 @@ impl LoadedModel {
                 Some(m.get_input_embeddings(input_ids, pixel_values, grid_thw))
             }
             _ => None,
+        }
+    }
+
+    pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
+        if let Some(g3n) = self.gemma3n_vl_model() {
+            Some(vlm_prompt::ImageTokenBlockInfo {
+                use_boi_eoi: true,
+                image_token_id: g3n.image_token_id,
+                mm_tokens_per_image: 256,
+                boi_token_id: g3n.boi_token_id,
+                eoi_token_id: g3n.eoi_token_id,
+            })
+        } else {
+            self.vision_module()
+                .map(|vm| vlm_prompt::ImageTokenBlockInfo {
+                    use_boi_eoi: vm.boi_token_id != 0,
+                    image_token_id: vm.image_token_id,
+                    mm_tokens_per_image: vm.mm_tokens_per_image,
+                    boi_token_id: vm.boi_token_id,
+                    eoi_token_id: vm.eoi_token_id,
+                })
         }
     }
 

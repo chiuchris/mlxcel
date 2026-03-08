@@ -13,6 +13,7 @@ use anyhow::Result;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::server::ServerGenerateOptions;
 use crate::vision::processors::ImageProcessor;
+use crate::vlm_prompt::apply_image_token_blocks;
 
 /// Request to the model thread
 pub enum ModelRequest {
@@ -199,46 +200,13 @@ impl ModelProvider {
                                     .expect("Qwen-VL prompt info without matching model");
                                 Some(merged)
                             } else if let Some(gemma3n_vl) = model.gemma3n_vl_model() {
-                                // Gemma3n VLM dispatch
-                                let num_images = decoded_images.len();
-                                let image_token_id = gemma3n_vl.image_token_id;
-                                let mm_tokens_per_image = 256usize;
-
-                                let existing_count = prompt_tokens
-                                    .iter()
-                                    .filter(|&&t| t == image_token_id)
-                                    .count();
-
-                                if existing_count > 0 {
-                                    let mut expanded = Vec::with_capacity(
-                                        prompt_tokens.len()
-                                            + (mm_tokens_per_image - 1) * existing_count,
-                                    );
-                                    for &tok in &prompt_tokens {
-                                        if tok == image_token_id {
-                                            for _ in 0..mm_tokens_per_image {
-                                                expanded.push(image_token_id);
-                                            }
-                                        } else {
-                                            expanded.push(tok);
-                                        }
-                                    }
-                                    prompt_tokens = expanded;
-                                } else {
-                                    let mut image_tokens = Vec::new();
-                                    for _ in 0..num_images {
-                                        for _ in 0..mm_tokens_per_image {
-                                            image_tokens.push(image_token_id);
-                                        }
-                                    }
-                                    if !prompt_tokens.is_empty() {
-                                        let bos = prompt_tokens[0];
-                                        let rest = prompt_tokens[1..].to_vec();
-                                        prompt_tokens = vec![bos];
-                                        prompt_tokens.extend(image_tokens);
-                                        prompt_tokens.extend(rest);
-                                    }
-                                }
+                                let _ = model.image_token_block_info().and_then(|info| {
+                                    apply_image_token_blocks(
+                                        &mut prompt_tokens,
+                                        info,
+                                        decoded_images.len(),
+                                    )
+                                });
 
                                 let pixel_values = gemma3n_vl.processor.preprocess(&decoded_images);
                                 let input_ids_arr = mlxcel_core::from_slice_i32(
@@ -387,61 +355,13 @@ impl ModelProvider {
                                 );
                                 Some(merged)
                             } else if let Some(vision_module) = model.vision_module() {
-                                let num_images = decoded_images.len();
-                                let use_boi_eoi = vision_module.boi_token_id != 0;
-                                let image_token_id = vision_module.image_token_id;
-
-                                // Check if tokenized prompt already contains image tokens
-                                let existing_count = prompt_tokens
-                                    .iter()
-                                    .filter(|&&t| t == image_token_id)
-                                    .count();
-
-                                if existing_count > 0 {
-                                    // Expand existing image tokens to mm_tokens_per_image each
-                                    let mut expanded = Vec::with_capacity(
-                                        prompt_tokens.len()
-                                            + (vision_module.mm_tokens_per_image - 1)
-                                                * existing_count,
-                                    );
-                                    for &tok in &prompt_tokens {
-                                        if tok == image_token_id {
-                                            if use_boi_eoi {
-                                                expanded.push(vision_module.boi_token_id);
-                                            }
-                                            for _ in 0..vision_module.mm_tokens_per_image {
-                                                expanded.push(image_token_id);
-                                            }
-                                            if use_boi_eoi {
-                                                expanded.push(vision_module.eoi_token_id);
-                                            }
-                                        } else {
-                                            expanded.push(tok);
-                                        }
-                                    }
-                                    prompt_tokens = expanded;
-                                } else {
-                                    // No image tokens — insert after BOS
-                                    let mut image_tokens = Vec::new();
-                                    for _ in 0..num_images {
-                                        if use_boi_eoi {
-                                            image_tokens.push(vision_module.boi_token_id);
-                                        }
-                                        for _ in 0..vision_module.mm_tokens_per_image {
-                                            image_tokens.push(image_token_id);
-                                        }
-                                        if use_boi_eoi {
-                                            image_tokens.push(vision_module.eoi_token_id);
-                                        }
-                                    }
-                                    if !prompt_tokens.is_empty() {
-                                        let bos = prompt_tokens[0];
-                                        let rest = prompt_tokens[1..].to_vec();
-                                        prompt_tokens = vec![bos];
-                                        prompt_tokens.extend(image_tokens);
-                                        prompt_tokens.extend(rest);
-                                    }
-                                }
+                                let _ = model.image_token_block_info().and_then(|info| {
+                                    apply_image_token_blocks(
+                                        &mut prompt_tokens,
+                                        info,
+                                        decoded_images.len(),
+                                    )
+                                });
 
                                 let pixel_values =
                                     vision_module.processor.preprocess(&decoded_images);
