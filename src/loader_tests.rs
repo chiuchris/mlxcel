@@ -1,6 +1,6 @@
 use super::{
-    Qwen35VlmKind, is_ministral3_config, parse_eos_token_ids, qwen35_text_config, qwen35_vlm_kind,
-    read_eos_token_ids, resolve_model_dir,
+    Qwen35VlmKind, adapter_loading_unsupported_message, is_ministral3_config, parse_eos_token_ids,
+    qwen35_text_config, qwen35_vlm_kind, read_eos_token_ids, resolve_model_dir,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -146,4 +146,30 @@ fn qwen35_vlm_kind_matches_supported_model_types() {
         Some(Qwen35VlmKind::Moe)
     );
     assert_eq!(qwen35_vlm_kind(ModelType::Qwen35), None);
+}
+
+#[test]
+fn adapter_loading_unsupported_message_groups_vlm_families() {
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Qwen35VLM),
+        Some("Qwen3.5 VLM does not support adapter loading")
+    );
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Qwen3VL),
+        Some("Qwen VL models cannot be loaded with LoRA adapters yet")
+    );
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Phi3VLM),
+        Some("Phi3V VLM does not support adapter loading; use load_model() instead")
+    );
+}
+
+#[test]
+fn adapter_loading_unsupported_message_returns_none_for_text_models() {
+    assert_eq!(adapter_loading_unsupported_message(ModelType::Llama), None);
+    assert_eq!(adapter_loading_unsupported_message(ModelType::Qwen35), None);
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Gemma3n),
+        None
+    );
 }

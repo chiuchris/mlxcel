@@ -106,6 +106,553 @@ macro_rules! load_owned_model_from_config {
     }};
 }
 
+fn try_load_config_backed_model_from_dir(
+    model_type: ModelType,
+    path_str: &str,
+) -> Result<Option<LoadedModel>> {
+    Ok(match model_type {
+        ModelType::Llama => {
+            Some(load_pair_from_dir(path_str, models::Llama3Model::load).map(LoadedModel::Llama)?)
+        }
+        ModelType::Llama4 => Some(
+            load_pair_from_dir(path_str, models::Llama4CxxModel::load)
+                .map(|m| LoadedModel::Llama4(models::Llama4Wrapper::new(m)))?,
+        ),
+        ModelType::Qwen2 => {
+            Some(load_pair_from_dir(path_str, models::Qwen2Model::load).map(LoadedModel::Qwen2)?)
+        }
+        ModelType::Qwen3 => {
+            Some(load_pair_from_dir(path_str, models::Qwen3Model::load).map(LoadedModel::Qwen3)?)
+        }
+        ModelType::Qwen3Moe => Some(
+            load_pair_from_dir(path_str, models::Qwen3MoeModel::load).map(LoadedModel::Qwen3Moe)?,
+        ),
+        ModelType::Qwen3Next => Some(
+            load_pair_from_dir(path_str, models::Qwen3NextModel::load)
+                .map(LoadedModel::Qwen3Next)?,
+        ),
+        ModelType::Qwen2Moe => Some(
+            load_pair_from_dir(path_str, models::Qwen2MoeModel::load).map(LoadedModel::Qwen2Moe)?,
+        ),
+        ModelType::Gemma => {
+            Some(load_pair_from_dir(path_str, models::GemmaModel::load).map(LoadedModel::Gemma)?)
+        }
+        ModelType::Gemma2 => {
+            Some(load_pair_from_dir(path_str, models::Gemma2Model::load).map(LoadedModel::Gemma2)?)
+        }
+        ModelType::Gemma3 => Some(
+            load_pair_from_dir(path_str, models::Gemma3Model::load)
+                .map(|m| LoadedModel::Gemma3(models::Gemma3Wrapper::new(m)))?,
+        ),
+        ModelType::Phi => {
+            Some(load_pair_from_dir(path_str, models::PhiModel::load).map(LoadedModel::Phi)?)
+        }
+        ModelType::Phi3 => {
+            Some(load_pair_from_dir(path_str, models::Phi3Model::load).map(LoadedModel::Phi3)?)
+        }
+        ModelType::Phi3Small => Some(
+            load_pair_from_dir(path_str, models::Phi3SmallModel::load)
+                .map(LoadedModel::Phi3Small)?,
+        ),
+        ModelType::PhiMoe => {
+            Some(load_pair_from_dir(path_str, models::PhiMoeModel::load).map(LoadedModel::PhiMoe)?)
+        }
+        ModelType::Mixtral => Some(
+            load_pair_from_dir(path_str, models::MixtralModel::load).map(LoadedModel::Mixtral)?,
+        ),
+        ModelType::OLMoE => {
+            Some(load_pair_from_dir(path_str, models::OlmoeModel::load).map(LoadedModel::OLMoE)?)
+        }
+        ModelType::DeepSeek => Some(
+            load_pair_from_dir(path_str, models::DeepSeekModel::load).map(LoadedModel::DeepSeek)?,
+        ),
+        ModelType::DeepSeekV2 => Some(
+            load_pair_from_dir(path_str, models::DeepSeekV2Model::load)
+                .map(LoadedModel::DeepSeekV2)?,
+        ),
+        ModelType::DeepSeekV3 => Some(
+            load_pair_from_dir(path_str, models::DeepSeekV3Model::load)
+                .map(LoadedModel::DeepSeekV3)?,
+        ),
+        ModelType::DeepSeekV32 => Some(
+            load_pair_from_dir(path_str, models::DeepSeekV32Model::load)
+                .map(LoadedModel::DeepSeekV32)?,
+        ),
+        ModelType::Cohere => {
+            Some(load_pair_from_dir(path_str, models::CohereModel::load).map(LoadedModel::Cohere)?)
+        }
+        ModelType::Cohere2 => Some(
+            load_pair_from_dir(path_str, models::Cohere2Model::load).map(LoadedModel::Cohere2)?,
+        ),
+        ModelType::InternLM2 => Some(
+            load_pair_from_dir(path_str, models::InternLM2Model::load)
+                .map(LoadedModel::InternLM2)?,
+        ),
+        ModelType::InternLM3 => Some(
+            load_pair_from_dir(path_str, models::InternLM3Model::load)
+                .map(LoadedModel::InternLM3)?,
+        ),
+        ModelType::Baichuan => Some(
+            load_pair_from_dir(path_str, models::BaichuanModel::load).map(LoadedModel::Baichuan)?,
+        ),
+        ModelType::Glm4 => {
+            Some(load_pair_from_dir(path_str, models::Glm4Model::load).map(LoadedModel::Glm4)?)
+        }
+        ModelType::Glm4Moe => Some(
+            load_pair_from_dir(path_str, models::Glm4MoeModel::load).map(LoadedModel::Glm4Moe)?,
+        ),
+        ModelType::Glm4MoeLite => Some(
+            load_pair_from_dir(path_str, models::Glm4MoeLiteModel::load)
+                .map(LoadedModel::Glm4MoeLite)?,
+        ),
+        ModelType::GlmMoeDsa => Some(
+            load_pair_from_dir(path_str, models::GlmMoeDsaModel::load)
+                .map(LoadedModel::GlmMoeDsa)?,
+        ),
+        ModelType::Ernie45 => Some(
+            load_pair_from_dir(path_str, models::Ernie45Model::load).map(LoadedModel::Ernie45)?,
+        ),
+        ModelType::Ernie45Moe => Some(
+            load_pair_from_dir(path_str, models::Ernie45MoeModel::load)
+                .map(LoadedModel::Ernie45Moe)?,
+        ),
+        ModelType::HunyuanMoe => Some(
+            load_pair_from_dir(path_str, models::HunyuanMoeModel::load)
+                .map(LoadedModel::HunyuanMoe)?,
+        ),
+        ModelType::HunyuanV1Dense => Some(
+            load_pair_from_dir(path_str, models::HunyuanV1DenseModel::load)
+                .map(LoadedModel::HunyuanV1Dense)?,
+        ),
+        ModelType::MiMo => {
+            Some(load_pair_from_dir(path_str, models::MiMoModel::load).map(LoadedModel::MiMo)?)
+        }
+        ModelType::ExaOne => {
+            Some(load_pair_from_dir(path_str, models::ExaOneModel::load).map(LoadedModel::ExaOne)?)
+        }
+        ModelType::ExaOne4 => Some(
+            load_pair_from_dir(path_str, models::ExaOne4Model::load)
+                .map(|m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m)))?,
+        ),
+        ModelType::ExaOneMoe => Some(
+            load_pair_from_dir(path_str, models::ExaoneMoeModel::load)
+                .map(LoadedModel::ExaOneMoe)?,
+        ),
+        ModelType::Olmo => {
+            Some(load_pair_from_dir(path_str, models::OlmoModel::load).map(LoadedModel::Olmo)?)
+        }
+        ModelType::Olmo2 => {
+            Some(load_pair_from_dir(path_str, models::OLMo2Model::load).map(LoadedModel::Olmo2)?)
+        }
+        ModelType::Olmo3 => {
+            Some(load_pair_from_dir(path_str, models::OLMo3Model::load).map(LoadedModel::Olmo3)?)
+        }
+        ModelType::StarCoder2 => Some(
+            load_pair_from_dir(path_str, models::StarCoder2Model::load)
+                .map(LoadedModel::StarCoder2)?,
+        ),
+        ModelType::MiniCPM => Some(
+            load_pair_from_dir(path_str, models::MiniCPMModel::load).map(LoadedModel::MiniCPM)?,
+        ),
+        ModelType::MiniCPM3 => Some(
+            load_pair_from_dir(path_str, models::MiniCPM3Model::load).map(LoadedModel::MiniCPM3)?,
+        ),
+        ModelType::StableLM => Some(
+            load_pair_from_dir(path_str, models::StableLMModel::load).map(LoadedModel::StableLM)?,
+        ),
+        ModelType::SmolLM3 => Some(
+            load_pair_from_dir(path_str, models::SmolLM3Model::load).map(LoadedModel::SmolLM3)?,
+        ),
+        ModelType::Ministral3 => Some(
+            load_pair_from_dir(path_str, models::Ministral3Model::load)
+                .map(|m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m)))?,
+        ),
+        ModelType::Nemotron => Some(
+            load_pair_from_dir(path_str, models::NemotronModel::load).map(LoadedModel::Nemotron)?,
+        ),
+        ModelType::Step3p5 => Some(
+            load_pair_from_dir(path_str, models::Step3p5Model::load).map(LoadedModel::Step3p5)?,
+        ),
+        _ => None,
+    })
+}
+
+fn try_load_config_backed_model_from_weights(
+    model_type: ModelType,
+    config_str: &str,
+    weights: &mut WeightMap,
+) -> Result<Option<LoadedModel>> {
+    Ok(match model_type {
+        ModelType::Llama => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::llama3::ModelArgs,
+            models::Llama3Model::from_weights,
+            LoadedModel::Llama
+        )),
+        ModelType::Llama4 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::llama4::TextArgs,
+            models::Llama4CxxModel::from_weights,
+            |m| LoadedModel::Llama4(models::Llama4Wrapper::new(m))
+        )),
+        ModelType::Qwen2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::llama3::ModelArgs,
+            models::Qwen2Model::from_weights,
+            LoadedModel::Qwen2
+        )),
+        ModelType::Qwen3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::qwen3::ModelArgs,
+            models::Qwen3Model::from_weights,
+            LoadedModel::Qwen3
+        )),
+        ModelType::Qwen3Moe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::qwen3_moe::ModelArgs,
+            models::Qwen3MoeModel::from_weights,
+            LoadedModel::Qwen3Moe
+        )),
+        ModelType::Qwen3Next => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::qwen3_next::Qwen3NextConfig,
+            models::Qwen3NextModel::from_weights,
+            LoadedModel::Qwen3Next
+        )),
+        ModelType::Qwen2Moe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::qwen2_moe::ModelArgs,
+            models::Qwen2MoeModel::from_weights,
+            LoadedModel::Qwen2Moe
+        )),
+        ModelType::Gemma => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::gemma::ModelArgs,
+            models::GemmaModel::from_weights,
+            LoadedModel::Gemma
+        )),
+        ModelType::Gemma2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::gemma2::ModelArgs,
+            models::Gemma2Model::from_weights,
+            LoadedModel::Gemma2
+        )),
+        ModelType::Gemma3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::gemma3::ModelArgs,
+            models::Gemma3Model::from_weights,
+            |m| LoadedModel::Gemma3(models::Gemma3Wrapper::new(m))
+        )),
+        ModelType::Phi => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::phi::ModelArgs,
+            models::PhiModel::from_weights,
+            LoadedModel::Phi
+        )),
+        ModelType::Phi3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::phi3::ModelArgs,
+            models::Phi3Model::from_weights,
+            LoadedModel::Phi3
+        )),
+        ModelType::Phi3Small => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::phi3small::ModelArgs,
+            models::Phi3SmallModel::from_weights,
+            LoadedModel::Phi3Small
+        )),
+        ModelType::PhiMoe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::phimoe::ModelArgs,
+            models::PhiMoeModel::from_weights,
+            LoadedModel::PhiMoe
+        )),
+        ModelType::Mixtral => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::mixtral::ModelArgs,
+            models::MixtralModel::from_weights,
+            LoadedModel::Mixtral
+        )),
+        ModelType::OLMoE => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::olmoe::ModelArgs,
+            models::OlmoeModel::from_weights,
+            LoadedModel::OLMoE
+        )),
+        ModelType::DeepSeek => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::deepseek::ModelArgs,
+            models::DeepSeekModel::from_weights,
+            LoadedModel::DeepSeek
+        )),
+        ModelType::DeepSeekV2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::deepseek_v2::ModelArgs,
+            models::DeepSeekV2Model::from_weights,
+            LoadedModel::DeepSeekV2
+        )),
+        ModelType::DeepSeekV3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::deepseek_v3::DeepSeekV3Config,
+            models::DeepSeekV3Model::from_weights,
+            LoadedModel::DeepSeekV3
+        )),
+        ModelType::DeepSeekV32 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::deepseek_v32::ModelArgs,
+            models::DeepSeekV32Model::from_weights,
+            LoadedModel::DeepSeekV32
+        )),
+        ModelType::Cohere => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::cohere::ModelArgs,
+            models::CohereModel::from_weights,
+            LoadedModel::Cohere
+        )),
+        ModelType::Cohere2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::cohere2::Cohere2Config,
+            models::Cohere2Model::from_weights,
+            LoadedModel::Cohere2
+        )),
+        ModelType::InternLM2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::internlm2::ModelArgs,
+            models::InternLM2Model::from_weights,
+            LoadedModel::InternLM2
+        )),
+        ModelType::InternLM3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::internlm3::ModelArgs,
+            models::InternLM3Model::from_weights,
+            LoadedModel::InternLM3
+        )),
+        ModelType::Baichuan => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::baichuan::BaichuanConfig,
+            models::BaichuanModel::from_weights,
+            LoadedModel::Baichuan
+        )),
+        ModelType::Glm4 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::glm4::ModelArgs,
+            models::Glm4Model::from_weights,
+            LoadedModel::Glm4
+        )),
+        ModelType::Glm4Moe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::glm4_moe::ModelArgs,
+            models::Glm4MoeModel::from_weights,
+            LoadedModel::Glm4Moe
+        )),
+        ModelType::Glm4MoeLite => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::glm4_moe_lite::ModelArgs,
+            models::Glm4MoeLiteModel::from_weights,
+            LoadedModel::Glm4MoeLite
+        )),
+        ModelType::GlmMoeDsa => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::glm_moe_dsa::ModelArgs,
+            models::GlmMoeDsaModel::from_weights,
+            LoadedModel::GlmMoeDsa
+        )),
+        ModelType::Ernie45 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::ernie4_5::ModelArgs,
+            models::Ernie45Model::from_weights,
+            LoadedModel::Ernie45
+        )),
+        ModelType::Ernie45Moe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::ernie4_5_moe::ModelArgs,
+            models::Ernie45MoeModel::from_weights,
+            LoadedModel::Ernie45Moe
+        )),
+        ModelType::HunyuanMoe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::hunyuan_moe::ModelArgs,
+            models::HunyuanMoeModel::from_weights,
+            LoadedModel::HunyuanMoe
+        )),
+        ModelType::HunyuanV1Dense => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::hunyuan_v1_dense::ModelArgs,
+            models::HunyuanV1DenseModel::from_weights,
+            LoadedModel::HunyuanV1Dense
+        )),
+        ModelType::MiMo => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::mimo::ModelArgs,
+            models::MiMoModel::from_weights,
+            LoadedModel::MiMo
+        )),
+        ModelType::ExaOne => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::exaone::ExaOneConfig,
+            models::ExaOneModel::from_weights,
+            LoadedModel::ExaOne
+        )),
+        ModelType::ExaOne4 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::exaone4::ModelArgs,
+            models::ExaOne4Model::from_weights,
+            |m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m))
+        )),
+        ModelType::ExaOneMoe => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::exaone_moe::ModelArgs,
+            models::ExaoneMoeModel::from_weights,
+            LoadedModel::ExaOneMoe
+        )),
+        ModelType::Olmo => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::olmo::ModelArgs,
+            models::OlmoModel::from_weights,
+            LoadedModel::Olmo
+        )),
+        ModelType::Olmo2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::olmo2::ModelArgs,
+            models::OLMo2Model::from_weights,
+            LoadedModel::Olmo2
+        )),
+        ModelType::Olmo3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::olmo3::OLMo3Config,
+            models::OLMo3Model::from_weights,
+            LoadedModel::Olmo3
+        )),
+        ModelType::StarCoder2 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::starcoder2::StarCoder2Config,
+            models::StarCoder2Model::from_weights,
+            LoadedModel::StarCoder2
+        )),
+        ModelType::MiniCPM => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::minicpm::ModelArgs,
+            models::MiniCPMModel::from_weights,
+            LoadedModel::MiniCPM
+        )),
+        ModelType::MiniCPM3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::minicpm3::ModelArgs,
+            models::MiniCPM3Model::from_weights,
+            LoadedModel::MiniCPM3
+        )),
+        ModelType::StableLM => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::stablelm::ModelArgs,
+            models::StableLMModel::from_weights,
+            LoadedModel::StableLM
+        )),
+        ModelType::SmolLM3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::smollm3::ModelArgs,
+            models::SmolLM3Model::from_weights,
+            LoadedModel::SmolLM3
+        )),
+        ModelType::Ministral3 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::ministral3::ModelArgs,
+            models::Ministral3Model::from_weights,
+            |m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
+        )),
+        ModelType::Nemotron => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::nemotron::ModelArgs,
+            models::NemotronModel::from_weights,
+            LoadedModel::Nemotron
+        )),
+        ModelType::Step3p5 => Some(load_model_from_config!(
+            &config_str,
+            weights,
+            models::step3p5::Step3p5Config,
+            models::Step3p5Model::from_weights,
+            LoadedModel::Step3p5
+        )),
+        _ => None,
+    })
+}
+
+fn adapter_loading_unsupported_message(model_type: ModelType) -> Option<&'static str> {
+    match model_type {
+        ModelType::Llama4VLM => Some("Llama4 VLM cannot be loaded with LoRA adapters yet"),
+        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
+            Some("Qwen3.5 VLM does not support adapter loading")
+        }
+        ModelType::Gemma3VLM => Some("Gemma3 VLM cannot be loaded with LoRA adapters yet"),
+        ModelType::LlavaVLM | ModelType::LlavaBunnyVLM => {
+            Some("LLaVA VLM cannot be loaded with LoRA adapters yet")
+        }
+        ModelType::AyaVisionVLM => Some("Aya Vision VLM cannot be loaded with LoRA adapters yet"),
+        ModelType::PaliGemmaVLM => Some("PaliGemma VLM cannot be loaded with LoRA adapters yet"),
+        ModelType::PixtralVLM | ModelType::Mistral3VLM => {
+            Some("Pixtral/Mistral3 VLM cannot be loaded with LoRA adapters yet")
+        }
+        ModelType::Qwen2VL => Some("Qwen2-VL cannot be loaded with LoRA adapters yet"),
+        ModelType::Qwen25VL | ModelType::Qwen3VL | ModelType::Qwen3VLMoe => {
+            Some("Qwen VL models cannot be loaded with LoRA adapters yet")
+        }
+        ModelType::Gemma3nVLM => Some("Gemma3n VLM cannot be loaded with LoRA adapters yet"),
+        ModelType::Phi3VLM => {
+            Some("Phi3V VLM does not support adapter loading; use load_model() instead")
+        }
+        ModelType::Molmo2VLM => {
+            Some("Molmo2 VLM does not support adapter loading; use load_model() instead")
+        }
+        _ => None,
+    }
+}
+
 fn load_pair_from_dir<T, U, E, F>(path_str: &str, load: F) -> Result<T>
 where
     F: FnOnce(String) -> std::result::Result<(T, U), E>,
@@ -154,9 +701,6 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let path_str = model_path.to_str().unwrap();
 
     let model = match model_type {
-        ModelType::Llama => {
-            LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
-        }
         ModelType::Mistral3 => {
             // Mistral3 is a VLM wrapper - check text_config for inner model type
             let config_path = model_path.join("config.json");
@@ -174,49 +718,19 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
                 LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
             }
         }
-        ModelType::Llama4 => LoadedModel::Llama4(models::Llama4Wrapper::new(load_pair_from_dir(
-            path_str,
-            models::Llama4CxxModel::load,
-        )?)),
         ModelType::Llama4VLM => load_llama4_vlm(model_path)?,
-        ModelType::Qwen2 => {
-            LoadedModel::Qwen2(load_pair_from_dir(path_str, models::Qwen2Model::load)?)
-        }
-        ModelType::Qwen3 => {
-            LoadedModel::Qwen3(load_pair_from_dir(path_str, models::Qwen3Model::load)?)
-        }
-        ModelType::Qwen3Moe => {
-            LoadedModel::Qwen3Moe(load_pair_from_dir(path_str, models::Qwen3MoeModel::load)?)
-        }
-        ModelType::Qwen3Next => {
-            LoadedModel::Qwen3Next(load_pair_from_dir(path_str, models::Qwen3NextModel::load)?)
-        }
         ModelType::Qwen35 => {
             LoadedModel::Qwen35(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
         }
         ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
-            let loaded = match qwen35_vlm_kind(model_type).unwrap() {
+            match qwen35_vlm_kind(model_type).unwrap() {
                 Qwen35VlmKind::Dense => load_qwen3_5_vlm(model_path)?,
                 Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
-            };
-            return Ok((loaded, tokenizer::load_tokenizer(model_path)?));
+            }
         }
         ModelType::Qwen35Moe => {
             LoadedModel::Qwen35Moe(load_pair_from_dir(path_str, models::Qwen35Model::load)?)
         }
-        ModelType::Qwen2Moe => {
-            LoadedModel::Qwen2Moe(load_pair_from_dir(path_str, models::Qwen2MoeModel::load)?)
-        }
-        ModelType::Gemma => {
-            LoadedModel::Gemma(load_pair_from_dir(path_str, models::GemmaModel::load)?)
-        }
-        ModelType::Gemma2 => {
-            LoadedModel::Gemma2(load_pair_from_dir(path_str, models::Gemma2Model::load)?)
-        }
-        ModelType::Gemma3 => LoadedModel::Gemma3(models::Gemma3Wrapper::new(load_pair_from_dir(
-            path_str,
-            models::Gemma3Model::load,
-        )?)),
         ModelType::Gemma3VLM => load_gemma3_vlm(model_path)?,
         ModelType::LlavaVLM => load_llava_vlm(model_path)?,
         ModelType::LlavaBunnyVLM => load_llava_bunny_vlm(model_path)?,
@@ -232,130 +746,8 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
             LoadedModel::Gemma3n(load_from_dir(path_str, models::Gemma3nModel::load)?)
         }
         ModelType::Gemma3nVLM => load_gemma3n_vlm(model_path)?,
-        ModelType::Phi => LoadedModel::Phi(load_pair_from_dir(path_str, models::PhiModel::load)?),
-        ModelType::Phi3 => {
-            LoadedModel::Phi3(load_pair_from_dir(path_str, models::Phi3Model::load)?)
-        }
-        ModelType::Phi3VLM => {
-            return Ok((
-                load_phi3_vlm(model_path)?,
-                tokenizer::load_tokenizer(model_path)?,
-            ));
-        }
-        ModelType::Molmo2VLM => {
-            return Ok((
-                load_molmo2_vlm(model_path)?,
-                tokenizer::load_tokenizer(model_path)?,
-            ));
-        }
-        ModelType::Phi3Small => {
-            LoadedModel::Phi3Small(load_pair_from_dir(path_str, models::Phi3SmallModel::load)?)
-        }
-        ModelType::PhiMoe => {
-            LoadedModel::PhiMoe(load_pair_from_dir(path_str, models::PhiMoeModel::load)?)
-        }
-        ModelType::Mixtral => {
-            LoadedModel::Mixtral(load_pair_from_dir(path_str, models::MixtralModel::load)?)
-        }
-        ModelType::OLMoE => {
-            LoadedModel::OLMoE(load_pair_from_dir(path_str, models::OlmoeModel::load)?)
-        }
-        ModelType::DeepSeek => {
-            LoadedModel::DeepSeek(load_pair_from_dir(path_str, models::DeepSeekModel::load)?)
-        }
-        ModelType::DeepSeekV2 => {
-            LoadedModel::DeepSeekV2(load_pair_from_dir(path_str, models::DeepSeekV2Model::load)?)
-        }
-        ModelType::DeepSeekV3 => {
-            LoadedModel::DeepSeekV3(load_pair_from_dir(path_str, models::DeepSeekV3Model::load)?)
-        }
-        ModelType::DeepSeekV32 => LoadedModel::DeepSeekV32(load_pair_from_dir(
-            path_str,
-            models::DeepSeekV32Model::load,
-        )?),
-        ModelType::Cohere => {
-            LoadedModel::Cohere(load_pair_from_dir(path_str, models::CohereModel::load)?)
-        }
-        ModelType::Cohere2 => {
-            LoadedModel::Cohere2(load_pair_from_dir(path_str, models::Cohere2Model::load)?)
-        }
-        ModelType::InternLM2 => {
-            LoadedModel::InternLM2(load_pair_from_dir(path_str, models::InternLM2Model::load)?)
-        }
-        ModelType::InternLM3 => {
-            LoadedModel::InternLM3(load_pair_from_dir(path_str, models::InternLM3Model::load)?)
-        }
-        ModelType::Baichuan => {
-            LoadedModel::Baichuan(load_pair_from_dir(path_str, models::BaichuanModel::load)?)
-        }
-        ModelType::Glm4 => {
-            LoadedModel::Glm4(load_pair_from_dir(path_str, models::Glm4Model::load)?)
-        }
-        ModelType::Glm4Moe => {
-            LoadedModel::Glm4Moe(load_pair_from_dir(path_str, models::Glm4MoeModel::load)?)
-        }
-        ModelType::Glm4MoeLite => LoadedModel::Glm4MoeLite(load_pair_from_dir(
-            path_str,
-            models::Glm4MoeLiteModel::load,
-        )?),
-        ModelType::GlmMoeDsa => {
-            LoadedModel::GlmMoeDsa(load_pair_from_dir(path_str, models::GlmMoeDsaModel::load)?)
-        }
-        ModelType::Ernie45 => {
-            LoadedModel::Ernie45(load_pair_from_dir(path_str, models::Ernie45Model::load)?)
-        }
-        ModelType::Ernie45Moe => {
-            LoadedModel::Ernie45Moe(load_pair_from_dir(path_str, models::Ernie45MoeModel::load)?)
-        }
-        ModelType::HunyuanMoe => {
-            LoadedModel::HunyuanMoe(load_pair_from_dir(path_str, models::HunyuanMoeModel::load)?)
-        }
-        ModelType::HunyuanV1Dense => LoadedModel::HunyuanV1Dense(load_pair_from_dir(
-            path_str,
-            models::HunyuanV1DenseModel::load,
-        )?),
-        ModelType::MiMo => {
-            LoadedModel::MiMo(load_pair_from_dir(path_str, models::MiMoModel::load)?)
-        }
-        ModelType::ExaOne => {
-            LoadedModel::ExaOne(load_pair_from_dir(path_str, models::ExaOneModel::load)?)
-        }
-        ModelType::ExaOne4 => LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(
-            load_pair_from_dir(path_str, models::ExaOne4Model::load)?,
-        )),
-        ModelType::ExaOneMoe => {
-            LoadedModel::ExaOneMoe(load_pair_from_dir(path_str, models::ExaoneMoeModel::load)?)
-        }
-        ModelType::Olmo => {
-            LoadedModel::Olmo(load_pair_from_dir(path_str, models::OlmoModel::load)?)
-        }
-        ModelType::Olmo2 => {
-            LoadedModel::Olmo2(load_pair_from_dir(path_str, models::OLMo2Model::load)?)
-        }
-        ModelType::Olmo3 => {
-            LoadedModel::Olmo3(load_pair_from_dir(path_str, models::OLMo3Model::load)?)
-        }
-        ModelType::StarCoder2 => {
-            LoadedModel::StarCoder2(load_pair_from_dir(path_str, models::StarCoder2Model::load)?)
-        }
-        ModelType::MiniCPM => {
-            LoadedModel::MiniCPM(load_pair_from_dir(path_str, models::MiniCPMModel::load)?)
-        }
-        ModelType::MiniCPM3 => {
-            LoadedModel::MiniCPM3(load_pair_from_dir(path_str, models::MiniCPM3Model::load)?)
-        }
-        ModelType::StableLM => {
-            LoadedModel::StableLM(load_pair_from_dir(path_str, models::StableLMModel::load)?)
-        }
-        ModelType::SmolLM3 => {
-            LoadedModel::SmolLM3(load_pair_from_dir(path_str, models::SmolLM3Model::load)?)
-        }
-        ModelType::Ministral3 => LoadedModel::Ministral3(models::Ministral3Wrapper::new(
-            load_pair_from_dir(path_str, models::Ministral3Model::load)?,
-        )),
-        ModelType::Nemotron => {
-            LoadedModel::Nemotron(load_pair_from_dir(path_str, models::NemotronModel::load)?)
-        }
+        ModelType::Phi3VLM => load_phi3_vlm(model_path)?,
+        ModelType::Molmo2VLM => load_molmo2_vlm(model_path)?,
         ModelType::Mamba => LoadedModel::Mamba(load_pair_from_dir(path_str, |path| {
             models::MambaModel::load(&path)
         })?),
@@ -393,6 +785,9 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
                 models::GriffinModel::load(&path)
             })?)
         }
+        _ => try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
+            anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
+        })?,
     };
 
     let tokenizer = tokenizer::load_tokenizer(model_path)?;
@@ -434,6 +829,10 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
     let config_value: serde_json::Value = parse_model_config(&config_str)?;
     models::sanitize_tied_embeddings(weights, &config_value);
 
+    if let Some(message) = adapter_loading_unsupported_message(model_type) {
+        return Err(anyhow::anyhow!(message));
+    }
+
     let model = match model_type {
         ModelType::Llama | ModelType::Mistral3 => {
             // Check for ministral3 sub-type
@@ -456,61 +855,6 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
                 LoadedModel::Llama(m)
             }
         }
-        ModelType::Llama4 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::llama4::TextArgs,
-                models::Llama4CxxModel::from_weights,
-                |m| LoadedModel::Llama4(models::Llama4Wrapper::new(m))
-            )
-        }
-        ModelType::Llama4VLM => {
-            return Err(anyhow::anyhow!(
-                "Llama4 VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::Qwen2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::llama3::ModelArgs,
-                models::Qwen2Model::from_weights,
-                LoadedModel::Qwen2
-            )
-        }
-        ModelType::Qwen3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::qwen3::ModelArgs,
-                models::Qwen3Model::from_weights,
-                LoadedModel::Qwen3
-            )
-        }
-        ModelType::Qwen3Moe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::qwen3_moe::ModelArgs,
-                models::Qwen3MoeModel::from_weights,
-                LoadedModel::Qwen3Moe
-            )
-        }
-        ModelType::Qwen3Next => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::qwen3_next::Qwen3NextConfig,
-                models::Qwen3NextModel::from_weights,
-                LoadedModel::Qwen3Next
-            )
-        }
-        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
-            return Err(anyhow::anyhow!(
-                "Qwen3.5 VLM does not support adapter loading"
-            ));
-        }
         ModelType::Qwen35 | ModelType::Qwen35Moe => {
             let v: serde_json::Value = parse_model_config(&config_str)?;
             let text_config = qwen35_text_config(&v)?;
@@ -526,77 +870,6 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
                 LoadedModel::Qwen35(m)
             }
         }
-        ModelType::Qwen2Moe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::qwen2_moe::ModelArgs,
-                models::Qwen2MoeModel::from_weights,
-                LoadedModel::Qwen2Moe
-            )
-        }
-        ModelType::Gemma => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::gemma::ModelArgs,
-                models::GemmaModel::from_weights,
-                LoadedModel::Gemma
-            )
-        }
-        ModelType::Gemma2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::gemma2::ModelArgs,
-                models::Gemma2Model::from_weights,
-                LoadedModel::Gemma2
-            )
-        }
-        ModelType::Gemma3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::gemma3::ModelArgs,
-                models::Gemma3Model::from_weights,
-                |m| LoadedModel::Gemma3(models::Gemma3Wrapper::new(m))
-            )
-        }
-        ModelType::Gemma3VLM => {
-            return Err(anyhow::anyhow!(
-                "Gemma3 VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::LlavaVLM | ModelType::LlavaBunnyVLM => {
-            return Err(anyhow::anyhow!(
-                "LLaVA VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::AyaVisionVLM => {
-            return Err(anyhow::anyhow!(
-                "Aya Vision VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::PaliGemmaVLM => {
-            return Err(anyhow::anyhow!(
-                "PaliGemma VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::PixtralVLM | ModelType::Mistral3VLM => {
-            return Err(anyhow::anyhow!(
-                "Pixtral/Mistral3 VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::Qwen2VL => {
-            return Err(anyhow::anyhow!(
-                "Qwen2-VL cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::Qwen25VL | ModelType::Qwen3VL | ModelType::Qwen3VLMoe => {
-            return Err(anyhow::anyhow!(
-                "Qwen VL models cannot be loaded with LoRA adapters yet"
-            ));
-        }
         ModelType::Gemma3n => {
             let top_args: models::gemma3n::ModelArgs = parse_model_config(&config_str)?;
             let config = top_args.text_args();
@@ -610,354 +883,6 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
                 language_model,
                 config,
             })
-        }
-        ModelType::Gemma3nVLM => {
-            return Err(anyhow::anyhow!(
-                "Gemma3n VLM cannot be loaded with LoRA adapters yet"
-            ));
-        }
-        ModelType::Phi => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::phi::ModelArgs,
-                models::PhiModel::from_weights,
-                LoadedModel::Phi
-            )
-        }
-        ModelType::Phi3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::phi3::ModelArgs,
-                models::Phi3Model::from_weights,
-                LoadedModel::Phi3
-            )
-        }
-        ModelType::Phi3VLM => {
-            return Err(anyhow::anyhow!(
-                "Phi3V VLM does not support adapter loading; use load_model() instead"
-            ));
-        }
-        ModelType::Molmo2VLM => {
-            return Err(anyhow::anyhow!(
-                "Molmo2 VLM does not support adapter loading; use load_model() instead"
-            ));
-        }
-        ModelType::Phi3Small => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::phi3small::ModelArgs,
-                models::Phi3SmallModel::from_weights,
-                LoadedModel::Phi3Small
-            )
-        }
-        ModelType::PhiMoe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::phimoe::ModelArgs,
-                models::PhiMoeModel::from_weights,
-                LoadedModel::PhiMoe
-            )
-        }
-        ModelType::Mixtral => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::mixtral::ModelArgs,
-                models::MixtralModel::from_weights,
-                LoadedModel::Mixtral
-            )
-        }
-        ModelType::OLMoE => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::olmoe::ModelArgs,
-                models::OlmoeModel::from_weights,
-                LoadedModel::OLMoE
-            )
-        }
-        ModelType::DeepSeek => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::deepseek::ModelArgs,
-                models::DeepSeekModel::from_weights,
-                LoadedModel::DeepSeek
-            )
-        }
-        ModelType::DeepSeekV2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::deepseek_v2::ModelArgs,
-                models::DeepSeekV2Model::from_weights,
-                LoadedModel::DeepSeekV2
-            )
-        }
-        ModelType::DeepSeekV3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::deepseek_v3::DeepSeekV3Config,
-                models::DeepSeekV3Model::from_weights,
-                LoadedModel::DeepSeekV3
-            )
-        }
-        ModelType::DeepSeekV32 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::deepseek_v32::ModelArgs,
-                models::DeepSeekV32Model::from_weights,
-                LoadedModel::DeepSeekV32
-            )
-        }
-        ModelType::Cohere => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::cohere::ModelArgs,
-                models::CohereModel::from_weights,
-                LoadedModel::Cohere
-            )
-        }
-        ModelType::Cohere2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::cohere2::Cohere2Config,
-                models::Cohere2Model::from_weights,
-                LoadedModel::Cohere2
-            )
-        }
-        ModelType::InternLM2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::internlm2::ModelArgs,
-                models::InternLM2Model::from_weights,
-                LoadedModel::InternLM2
-            )
-        }
-        ModelType::InternLM3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::internlm3::ModelArgs,
-                models::InternLM3Model::from_weights,
-                LoadedModel::InternLM3
-            )
-        }
-        ModelType::Baichuan => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::baichuan::BaichuanConfig,
-                models::BaichuanModel::from_weights,
-                LoadedModel::Baichuan
-            )
-        }
-        ModelType::Glm4 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::glm4::ModelArgs,
-                models::Glm4Model::from_weights,
-                LoadedModel::Glm4
-            )
-        }
-        ModelType::Glm4Moe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::glm4_moe::ModelArgs,
-                models::Glm4MoeModel::from_weights,
-                LoadedModel::Glm4Moe
-            )
-        }
-        ModelType::Glm4MoeLite => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::glm4_moe_lite::ModelArgs,
-                models::Glm4MoeLiteModel::from_weights,
-                LoadedModel::Glm4MoeLite
-            )
-        }
-        ModelType::GlmMoeDsa => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::glm_moe_dsa::ModelArgs,
-                models::GlmMoeDsaModel::from_weights,
-                LoadedModel::GlmMoeDsa
-            )
-        }
-        ModelType::Ernie45 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::ernie4_5::ModelArgs,
-                models::Ernie45Model::from_weights,
-                LoadedModel::Ernie45
-            )
-        }
-        ModelType::Ernie45Moe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::ernie4_5_moe::ModelArgs,
-                models::Ernie45MoeModel::from_weights,
-                LoadedModel::Ernie45Moe
-            )
-        }
-        ModelType::HunyuanMoe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::hunyuan_moe::ModelArgs,
-                models::HunyuanMoeModel::from_weights,
-                LoadedModel::HunyuanMoe
-            )
-        }
-        ModelType::HunyuanV1Dense => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::hunyuan_v1_dense::ModelArgs,
-                models::HunyuanV1DenseModel::from_weights,
-                LoadedModel::HunyuanV1Dense
-            )
-        }
-        ModelType::MiMo => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::mimo::ModelArgs,
-                models::MiMoModel::from_weights,
-                LoadedModel::MiMo
-            )
-        }
-        ModelType::ExaOne => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::exaone::ExaOneConfig,
-                models::ExaOneModel::from_weights,
-                LoadedModel::ExaOne
-            )
-        }
-        ModelType::ExaOne4 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::exaone4::ModelArgs,
-                models::ExaOne4Model::from_weights,
-                |m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m))
-            )
-        }
-        ModelType::ExaOneMoe => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::exaone_moe::ModelArgs,
-                models::ExaoneMoeModel::from_weights,
-                LoadedModel::ExaOneMoe
-            )
-        }
-        ModelType::Olmo => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::olmo::ModelArgs,
-                models::OlmoModel::from_weights,
-                LoadedModel::Olmo
-            )
-        }
-        ModelType::Olmo2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::olmo2::ModelArgs,
-                models::OLMo2Model::from_weights,
-                LoadedModel::Olmo2
-            )
-        }
-        ModelType::Olmo3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::olmo3::OLMo3Config,
-                models::OLMo3Model::from_weights,
-                LoadedModel::Olmo3
-            )
-        }
-        ModelType::StarCoder2 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::starcoder2::StarCoder2Config,
-                models::StarCoder2Model::from_weights,
-                LoadedModel::StarCoder2
-            )
-        }
-        ModelType::MiniCPM => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::minicpm::ModelArgs,
-                models::MiniCPMModel::from_weights,
-                LoadedModel::MiniCPM
-            )
-        }
-        ModelType::MiniCPM3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::minicpm3::ModelArgs,
-                models::MiniCPM3Model::from_weights,
-                LoadedModel::MiniCPM3
-            )
-        }
-        ModelType::StableLM => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::stablelm::ModelArgs,
-                models::StableLMModel::from_weights,
-                LoadedModel::StableLM
-            )
-        }
-        ModelType::SmolLM3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::smollm3::ModelArgs,
-                models::SmolLM3Model::from_weights,
-                LoadedModel::SmolLM3
-            )
-        }
-        ModelType::Ministral3 => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::ministral3::ModelArgs,
-                models::Ministral3Model::from_weights,
-                |m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
-            )
-        }
-        ModelType::Nemotron => {
-            load_model_from_config!(
-                &config_str,
-                weights,
-                models::nemotron::ModelArgs,
-                models::NemotronModel::from_weights,
-                LoadedModel::Nemotron
-            )
         }
         // SSM/Hybrid models that take ownership of weights
         ModelType::Mamba => {
@@ -1054,6 +979,10 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
                 LoadedModel::RecurrentGemma
             )
         }
+        _ => try_load_config_backed_model_from_weights(model_type, &config_str, weights)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type)
+            })?,
     };
 
     Ok(model)
