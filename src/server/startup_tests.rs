@@ -14,7 +14,7 @@ fn temp_path(name: &str) -> PathBuf {
 
 #[test]
 fn resolve_default_max_tokens_matches_server_policy() {
-    assert_eq!(resolve_default_max_tokens(-1), 512);
+    assert_eq!(resolve_default_max_tokens(-1), 4096);
     assert_eq!(resolve_default_max_tokens(128), 128);
 }
 
@@ -115,7 +115,7 @@ fn build_server_config_applies_normalized_startup_values() {
     assert_eq!(config.default_min_p, 0.05);
     assert_eq!(config.default_repetition_penalty, 1.2);
     assert_eq!(config.default_repetition_context_size, 96);
-    assert_eq!(config.default_max_tokens, 512);
+    assert_eq!(config.default_max_tokens, 4096);
     assert_eq!(config.default_seed, Some(7));
     assert_eq!(config.default_presence_penalty, 0.4);
     assert_eq!(config.default_frequency_penalty, 0.3);

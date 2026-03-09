@@ -123,7 +123,7 @@ impl Default for ServerStartupConfig {
 
 pub(super) fn resolve_default_max_tokens(n_predict: i32) -> usize {
     if n_predict < 0 {
-        512
+        4096
     } else {
         n_predict as usize
     }

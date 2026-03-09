@@ -245,6 +245,9 @@ fn handle_generate_request(
         generator.generate_streaming(model, &prompt_tokens, max_tokens, &sampling, on_token);
     }
 
+    // Flush any remaining text buffered due to incomplete UTF-8 sequences
+    decode_state.flush(tokenizer);
+
     let result = decode_state.finish(start, prompt_token_count, max_tokens);
     let _ = response_tx.send(GenerateEvent::Done(result));
 }
@@ -283,14 +286,38 @@ impl StreamingDecodeState {
         self.all_ids.push(token_id as u32);
 
         let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
-        let new_text = &full_text[self.prev_decoded_len..];
+
+        // Find the safe emit boundary: skip trailing U+FFFD replacement characters.
+        // Byte-level BPE tokenizers split multi-byte UTF-8 sequences across tokens.
+        // Incomplete byte sequences decode as U+FFFD, but become valid characters
+        // once the completing token arrives. Emitting FFFD prematurely corrupts
+        // the output (e.g. "최솟값" → "최�값") because the byte offset shifts
+        // when the replacement chars resolve into shorter real characters.
+        let safe_len = safe_emit_boundary(&full_text);
+
+        if safe_len <= self.prev_decoded_len {
+            return None;
+        }
+
+        let new_text = &full_text[self.prev_decoded_len..safe_len];
         if new_text.is_empty() {
             return None;
         }
 
         self.generated_text.push_str(new_text);
-        self.prev_decoded_len = full_text.len();
+        self.prev_decoded_len = safe_len;
         Some(new_text.to_string())
+    }
+
+    /// Flush any remaining buffered text (including unresolved replacement chars)
+    /// at the end of generation.
+    pub(crate) fn flush(&mut self, tokenizer: &MlxcelTokenizer) {
+        let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
+        if full_text.len() > self.prev_decoded_len {
+            let remaining = &full_text[self.prev_decoded_len..];
+            self.generated_text.push_str(remaining);
+            self.prev_decoded_len = full_text.len();
+        }
     }
 
     pub(crate) fn finish(
@@ -314,6 +341,17 @@ impl StreamingDecodeState {
             max_tokens,
         )
     }
+}
+
+/// Find the byte position after the last non-U+FFFD character.
+/// Trailing replacement characters are buffered because they likely come from
+/// incomplete multi-byte UTF-8 sequences that will be completed by the next token.
+fn safe_emit_boundary(text: &str) -> usize {
+    text.char_indices()
+        .rev()
+        .find(|(_, c)| *c != '\u{FFFD}')
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
