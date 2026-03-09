@@ -1,8 +1,15 @@
 //! Vision model support for mlxcel
 //!
-//! Provides modular vision functionality that layers on top of existing text models.
-//! Uses the VisionModule pattern: vision encoder + connector + processor,
-//! composable with any LanguageModel via the VisionLanguageModel wrapper.
+//! Provides modular vision functionality that layers on top of existing text
+//! models. The vision stack is intentionally split into:
+//!
+//! - `processors`: image normalization / tiling / resizing
+//! - `encoders`: vision towers
+//! - `connectors`: projection into the text hidden space
+//! - `merge`: text/vision embedding composition
+//!
+//! `VisionModule` composes those pieces into one runtime unit that can be
+//! attached to any `LanguageModel` through `VisionLanguageModel`.
 
 pub mod config;
 pub mod connectors;
@@ -41,19 +48,32 @@ use processors::ImageProcessor;
 /// Merge strategy for combining vision and text embeddings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeStrategy {
-    /// Gemma3-style: masked_scatter with 4D attention mask
+    /// Used by: Gemma3, Gemma3n
+    ///
+    /// Gemma-style multimodal routing keeps a 4D attention mask and merges
+    /// image features with a masked-scatter style operation.
     Gemma3,
-    /// LLaVA-style: simple replacement at image token positions, standard causal masking
+    /// Used by: LLaVA, Aya Vision, PaliGemma, Pixtral, Mistral3, Qwen2/2.5/3-VL,
+    /// Phi3V, Molmo2, Llama4
+    ///
+    /// LLaVA-style routing replaces image-token positions directly and then
+    /// relies on standard causal masking.
     LLaVA,
 }
 
 /// Vision module: encodes images and merges with text embeddings
 pub struct VisionModule {
+    /// Vision tower that produces image hidden states.
     pub encoder: Box<dyn VisionEncoder>,
+    /// Projection layer from vision hidden size into text hidden size.
     pub connector: Box<dyn MultiModalConnector>,
+    /// Preprocessing policy for raw images before the vision tower.
     pub processor: Box<dyn ImageProcessor>,
+    /// Token ID that marks image placeholder positions in the text prompt.
     pub image_token_id: i32,
+    /// Padding token used by merge helpers when prompts include image padding.
     pub pad_token_id: i32,
+    /// Hidden size expected by the text tower.
     pub hidden_size: usize,
     /// Begin-of-image token ID (0 = no BOI/EOI framing)
     pub boi_token_id: i32,
@@ -66,7 +86,10 @@ pub struct VisionModule {
 }
 
 impl VisionModule {
-    /// Process images and merge with text embeddings
+    /// Process images and merge with text embeddings.
+    ///
+    /// Used by: Gemma3, Gemma3n, LLaVA, Aya Vision, PaliGemma, Pixtral,
+    /// Mistral3, Qwen2/2.5/3-VL, Phi3V, Molmo2, Llama4
     ///
     /// 1. Get text embeddings from the text model
     /// 2. Encode images through vision encoder
@@ -96,11 +119,10 @@ impl VisionModule {
         // Get dtype of text embeddings for casting
         let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
 
-        // Vision encoder expects [B, H, W, C] (channels-last)
-        // Input pixel_values may be [B, C, H, W], need to transpose
+        // Vision encoders use channels-last tensors. Most image processors emit
+        // channels-first `[B, C, H, W]`, so we normalize the layout here once.
         let pv_shape = mlxcel_core::array_shape(pixel_values);
         let pv = if pv_shape.len() == 4 && pv_shape[1] <= 4 {
-            // [B, C, H, W] -> [B, H, W, C]
             let transposed = mlxcel_core::transpose_axes(pixel_values, &[0, 2, 3, 1]);
             mlxcel_core::astype(&transposed, embed_dtype)
         } else {
@@ -113,7 +135,8 @@ impl VisionModule {
         // Project to text embedding space
         let image_features = self.connector.forward(&encoder_output.hidden_states);
 
-        // Merge text and vision embeddings using the appropriate strategy
+        // Different VLM families make different masking assumptions, so merge
+        // strategy selection stays explicit instead of being inferred.
         match self.merge_strategy {
             MergeStrategy::Gemma3 => merge::prepare_inputs_for_multimodal(
                 self.hidden_size,
@@ -136,7 +159,9 @@ impl VisionModule {
 
 /// Vision-language model: wraps a text model with a vision module
 pub struct VisionLanguageModel {
+    /// Underlying text model, already loaded through `LoadedModel`.
     pub text_model: Box<crate::LoadedModel>,
+    /// Vision runtime components used to turn images into text-space embeddings.
     pub vision: VisionModule,
 }
 
