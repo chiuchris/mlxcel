@@ -39,6 +39,7 @@ pub mod longcat_flash_ngram;
 pub mod mamba;
 pub mod mamba2;
 pub mod mimo;
+pub mod minimax;
 pub mod minicpm;
 pub mod minicpm3;
 pub mod ministral3;
@@ -104,6 +105,7 @@ pub use longcat_flash_ngram::LongcatFlashNgramModel;
 pub use mamba::MambaModel;
 pub use mamba2::Mamba2Model;
 pub use mimo::MiMoModel;
+pub use minimax::MiniMaxModel;
 pub use minicpm::MiniCPMModel;
 pub use minicpm3::MiniCPM3Model;
 pub use ministral3::{Ministral3Model, Ministral3Wrapper};
@@ -178,6 +180,7 @@ pub enum ModelType {
     PhiMoe,        // Phi MoE
 
     // MoE models
+    MiniMax,
     Mixtral,
     Qwen2Moe,
     OLMoE,
@@ -408,6 +411,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "phi3_v" => Ok(ModelType::Phi3VLM),
         "phi3small" => Ok(ModelType::Phi3Small),
         "phimoe" => Ok(ModelType::PhiMoe),
+        "minimax" => Ok(ModelType::MiniMax),
         "mixtral" => Ok(ModelType::Mixtral),
         "olmoe" => Ok(ModelType::OLMoE),
         "deepseek" => Ok(ModelType::DeepSeek),

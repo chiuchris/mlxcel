@@ -27,6 +27,7 @@ macro_rules! for_each_config_backed_model {
             Phi3, models::Phi3Model::load, models::phi3::ModelArgs, models::Phi3Model::from_weights, LoadedModel::Phi3;
             Phi3Small, models::Phi3SmallModel::load, models::phi3small::ModelArgs, models::Phi3SmallModel::from_weights, LoadedModel::Phi3Small;
             PhiMoe, models::PhiMoeModel::load, models::phimoe::ModelArgs, models::PhiMoeModel::from_weights, LoadedModel::PhiMoe;
+            MiniMax, models::MiniMaxModel::load, models::minimax::ModelArgs, models::MiniMaxModel::from_weights, LoadedModel::MiniMax;
             Mixtral, models::MixtralModel::load, models::mixtral::ModelArgs, models::MixtralModel::from_weights, LoadedModel::Mixtral;
             OLMoE, models::OlmoeModel::load, models::olmoe::ModelArgs, models::OlmoeModel::from_weights, LoadedModel::OLMoE;
             DeepSeek, models::DeepSeekModel::load, models::deepseek::ModelArgs, models::DeepSeekModel::from_weights, LoadedModel::DeepSeek;
