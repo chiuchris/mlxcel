@@ -10,7 +10,8 @@ use mlxcel::{
     vision::merge::InputEmbeddings,
 };
 
-use super::{GenerateArgs, generate_vlm};
+use super::generate_vlm;
+use crate::GenerateArgs;
 
 fn generation_stats_from_duration(
     prompt_tokens: usize,

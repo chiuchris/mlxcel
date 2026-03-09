@@ -2,8 +2,7 @@ use clap::{Args, Parser, Subcommand};
 use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
-mod generate;
-mod generate_vlm;
+mod commands;
 
 /// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon
 ///
@@ -333,7 +332,7 @@ fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Generate(args) => generate::run_generate(args),
+        Commands::Generate(args) => commands::run_generate(args),
         Commands::Serve(args) => run_serve(args),
         Commands::List => {
             print_supported_models();
