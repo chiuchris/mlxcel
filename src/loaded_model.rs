@@ -10,6 +10,11 @@
 //! - forward `LanguageModel` methods through centralized macros
 //! - expose capability-oriented helpers used by multimodal paths
 //!
+//! Rationale:
+//! - keep model-family wiring explicit and exhaustively matchable
+//! - expose stable control-plane capabilities without erasing family identity
+//! - centralize the retest surface for new model variants
+//!
 //! When adding a new variant, update the dispatch macros below before adding
 //! any one-off match blocks elsewhere.
 

@@ -2,6 +2,11 @@
 //!
 //! Family-specific registries live in sibling modules while this file keeps the
 //! public `load_model*` APIs thin and focused on route selection.
+//!
+//! Rationale:
+//! - keep directory and weight loading policy in one place
+//! - keep family-specific construction out of the public router
+//! - make new model additions update policy tables before implementation code
 
 use anyhow::Result;
 use serde::de::DeserializeOwned;
