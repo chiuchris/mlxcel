@@ -1,10 +1,16 @@
+//! CLI text-generation command handler.
+//!
+//! This module keeps the user-facing `generate` flow readable by separating
+//! prompt preparation, generation-mode selection, and terminal output helpers.
+
 use anyhow::Result;
 use std::io::{self, Write as IoWrite};
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use mlxcel::{
-    CxxGenerator, GenerationStats, LanguageModel, SamplingConfig, SpeculativeGenerator,
-    initialize_runtime, load_model, load_model_with_adapter,
+    CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
+    SpeculativeGenerator, initialize_runtime, load_model, load_model_with_adapter,
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
     vision::merge::InputEmbeddings,
@@ -33,6 +39,160 @@ fn generation_stats_from_duration(
         prefill_tok_per_sec: 0.0,
         decode_tok_per_sec,
     }
+}
+
+fn print_runtime_setup(runtime: &RuntimeSetup) {
+    if let Some(invalid) = runtime.invalid_device_override.as_deref() {
+        eprintln!(
+            "Ignoring invalid MLXCEL_DEVICE value {:?}; using gpu.",
+            invalid
+        );
+    }
+    println!("Runtime device: {}", runtime.device);
+    if let Some(max_memory) = runtime.wired_limit_bytes {
+        println!(
+            "Wired memory limit: {:.1} GB",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+}
+
+fn load_generation_model(
+    args: &GenerateArgs,
+) -> Result<(mlxcel::LoadedModel, mlxcel::tokenizer::MlxcelTokenizer)> {
+    println!("Loading model from {:?}...", args.model.model);
+    let result = if let Some(ref adapter_path) = args.model.adapter {
+        println!("Loading LoRA adapter from {:?}...", adapter_path);
+        load_model_with_adapter(&args.model.model, adapter_path)
+    } else {
+        load_model(&args.model.model)
+    }?;
+    println!("Model loaded.");
+    Ok(result)
+}
+
+fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str) -> String {
+    let messages = [ChatMessage {
+        role: "user".to_string(),
+        content: user_prompt.to_string(),
+    }];
+
+    processor
+        .apply(&messages)
+        .unwrap_or_else(|_| user_prompt.to_string())
+}
+
+fn resolve_cli_prompt(
+    user_prompt: &str,
+    no_chat_template: bool,
+    processor: Option<&ChatTemplateProcessor>,
+) -> String {
+    if no_chat_template {
+        return user_prompt.to_string();
+    }
+
+    processor.map_or_else(
+        || user_prompt.to_string(),
+        |processor| apply_user_chat_template(processor, user_prompt),
+    )
+}
+
+fn load_cli_prompt(model_path: &Path, user_prompt: &str, no_chat_template: bool) -> String {
+    let processor = if no_chat_template {
+        None
+    } else {
+        ChatTemplateProcessor::from_model_path(model_path)
+            .ok()
+            .flatten()
+    };
+
+    resolve_cli_prompt(user_prompt, no_chat_template, processor.as_ref())
+}
+
+fn tokenize_prompt(
+    tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
+    prompt: &str,
+) -> Result<Vec<i32>> {
+    let prompt_token_ids = tokenizer
+        .encode(prompt, true)
+        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
+    Ok(prompt_token_ids.iter().map(|&x| x as i32).collect())
+}
+
+fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> SamplingConfig {
+    build_sampling_config(ResolvedSamplingParams {
+        temperature: args.sampling.temp,
+        top_k: args.sampling.top_k,
+        top_p: args.sampling.top_p,
+        min_p: args.sampling.min_p,
+        seed: None,
+        repetition_penalty: args.sampling.repetition_penalty,
+        dry_multiplier: args.sampling.dry_multiplier,
+        dry_base: args.sampling.dry_base,
+        dry_allowed_length: args.sampling.dry_allowed_length,
+        dry_penalty_last_n: args.sampling.dry_penalty_last_n,
+        dry_sequence_breakers: Vec::new(),
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        stop_token_ids,
+    })
+}
+
+fn print_generation_preamble(user_prompt: &str) -> Result<()> {
+    println!("Generating...");
+    print!("{}", user_prompt);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn generated_suffix<'a>(full_text: &'a str, prompt_text: &str) -> &'a str {
+    full_text.strip_prefix(prompt_text).unwrap_or(full_text)
+}
+
+fn decode_generated_text(
+    tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
+    prompt_tokens: &[i32],
+    generated_tokens: &[i32],
+) -> String {
+    let all_tokens: Vec<u32> = prompt_tokens
+        .iter()
+        .map(|&x| x as u32)
+        .chain(generated_tokens.iter().map(|&x| x as u32))
+        .collect();
+    let full_text = tokenizer.decode(&all_tokens, false).unwrap_or_default();
+    let prompt_decoded = tokenizer
+        .decode(
+            &prompt_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
+            false,
+        )
+        .unwrap_or_default();
+
+    generated_suffix(&full_text, &prompt_decoded).to_string()
+}
+
+fn print_generation_result(
+    generated_text: &str,
+    stats: &GenerationStats,
+    profile: bool,
+) -> Result<()> {
+    print!("{}", generated_text);
+    io::stdout().flush()?;
+
+    println!();
+    println!();
+
+    if profile {
+        println!("[Profile Results]");
+        stats.print();
+    } else {
+        let total_time_sec = stats.decode_time_ms / 1000.0;
+        println!(
+            "[Generated {} tokens in {:.2}s = {:.2} tok/s]",
+            stats.generated_tokens, total_time_sec, stats.decode_tok_per_sec
+        );
+    }
+
+    Ok(())
 }
 
 fn generate_standard<M: LanguageModel>(
@@ -107,80 +267,68 @@ fn generate_with_embeddings<M: LanguageModel>(
     )
 }
 
+fn run_generation_mode<M: LanguageModel>(
+    model: &M,
+    args: &GenerateArgs,
+    prompt_tokens: &[i32],
+    sampling_config: &SamplingConfig,
+    vlm_embeddings: Option<&InputEmbeddings>,
+) -> Result<(Vec<i32>, GenerationStats)> {
+    let output = if let Some(ref draft_model_path) = args.model.draft_model {
+        println!("Loading draft model from {:?}...", draft_model_path);
+        let (draft_model, _draft_tokenizer) = load_model(draft_model_path)?;
+        println!("Draft model loaded.");
+
+        let draft_num_layers = draft_model.num_layers();
+        let main_num_layers = model.num_layers();
+        let mut spec_generator = SpeculativeGenerator::new(main_num_layers, draft_num_layers);
+
+        spec_generator.generate(
+            model,
+            &draft_model,
+            prompt_tokens,
+            args.generation.max_tokens,
+            args.model.num_draft_tokens,
+            sampling_config,
+        )
+    } else if let Some(embeddings) = vlm_embeddings {
+        generate_with_embeddings(
+            model,
+            prompt_tokens,
+            embeddings,
+            args.generation.max_tokens,
+            sampling_config,
+            args.generation.profile,
+        )
+    } else {
+        generate_standard(
+            model,
+            prompt_tokens,
+            args.generation.max_tokens,
+            sampling_config,
+            args.generation.profile,
+        )
+    };
+
+    Ok(output)
+}
+
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
-    if let Some(invalid) = runtime.invalid_device_override.as_deref() {
-        eprintln!(
-            "Ignoring invalid MLXCEL_DEVICE value {:?}; using gpu.",
-            invalid
-        );
-    }
-    println!("Runtime device: {}", runtime.device);
-    if let Some(max_memory) = runtime.wired_limit_bytes {
-        println!(
-            "Wired memory limit: {:.1} GB",
-            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
-        );
-    }
+    print_runtime_setup(&runtime);
 
-    println!("Loading model from {:?}...", args.model.model);
-    let (model, tokenizer) = if let Some(ref adapter_path) = args.model.adapter {
-        println!("Loading LoRA adapter from {:?}...", adapter_path);
-        load_model_with_adapter(&args.model.model, adapter_path)?
-    } else {
-        load_model(&args.model.model)?
-    };
-    println!("Model loaded.");
+    let (model, tokenizer) = load_generation_model(&args)?;
+    let prompt = load_cli_prompt(
+        &args.model.model,
+        &args.generation.prompt,
+        args.generation.no_chat_template,
+    );
+    let mut prompt_tokens = tokenize_prompt(&tokenizer, &prompt)?;
 
-    // Apply chat template if available (unless --no-chat-template is set)
-    let prompt = if args.generation.no_chat_template {
-        args.generation.prompt.clone()
-    } else {
-        match ChatTemplateProcessor::from_model_path(&args.model.model) {
-            Ok(Some(processor)) => {
-                let messages = vec![ChatMessage {
-                    role: "user".to_string(),
-                    content: args.generation.prompt.clone(),
-                }];
-                match processor.apply(&messages) {
-                    Ok(result) => result,
-                    Err(_) => args.generation.prompt.clone(),
-                }
-            }
-            _ => args.generation.prompt.clone(),
-        }
-    };
+    print_generation_preamble(&args.generation.prompt)?;
 
-    // Tokenize prompt (add_special_tokens=true to include BOS for models that need it)
-    let prompt_token_ids = tokenizer
-        .encode(prompt.as_str(), true)
-        .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
-    let mut prompt_tokens: Vec<i32> = prompt_token_ids.iter().map(|&x| x as i32).collect();
-
-    println!("Generating...");
-    print!("{}", args.generation.prompt);
-    io::stdout().flush()?;
-
-    // Read EOS tokens from generation_config.json
-    let config_eos = mlxcel::read_eos_token_ids(&args.model.model);
-
-    // Create sampling config
-    let sampling_config = build_sampling_config(ResolvedSamplingParams {
-        temperature: args.sampling.temp,
-        top_k: args.sampling.top_k,
-        top_p: args.sampling.top_p,
-        min_p: args.sampling.min_p,
-        seed: None,
-        repetition_penalty: args.sampling.repetition_penalty,
-        dry_multiplier: args.sampling.dry_multiplier,
-        dry_base: args.sampling.dry_base,
-        dry_allowed_length: args.sampling.dry_allowed_length,
-        dry_penalty_last_n: args.sampling.dry_penalty_last_n,
-        dry_sequence_breakers: Vec::new(),
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
-        stop_token_ids: config_eos,
-    });
+    let sampling_config =
+        build_cli_sampling_config(&args, mlxcel::read_eos_token_ids(&args.model.model));
 
     // Check for VLM image mode
     let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
@@ -191,80 +339,15 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         &tokenizer,
     )?;
 
-    // Generate tokens (speculative or standard)
-    let (generated_tokens, stats) = if let Some(ref draft_model_path) = args.model.draft_model {
-        // Speculative decoding mode
-        println!("Loading draft model from {:?}...", draft_model_path);
-        let (draft_model, _draft_tokenizer) = load_model(draft_model_path)?;
-        println!("Draft model loaded.");
-
-        let draft_num_layers = draft_model.num_layers();
-        let main_num_layers = model.num_layers();
-        let mut spec_generator = SpeculativeGenerator::new(main_num_layers, draft_num_layers);
-
-        spec_generator.generate(
-            &model,
-            &draft_model,
-            &prompt_tokens,
-            args.generation.max_tokens,
-            args.model.num_draft_tokens,
-            &sampling_config,
-        )
-    } else if let Some(ref embeddings) = vlm_embeddings {
-        generate_with_embeddings(
-            &model,
-            &prompt_tokens,
-            embeddings,
-            args.generation.max_tokens,
-            &sampling_config,
-            args.generation.profile,
-        )
-    } else {
-        generate_standard(
-            &model,
-            &prompt_tokens,
-            args.generation.max_tokens,
-            &sampling_config,
-            args.generation.profile,
-        )
-    };
-
-    // Decode and print tokens
-    // We need to decode with context to get proper spacing for sentencepiece tokenizers
-    // The simplest approach is to decode prompt+generated and strip the prompt part
-    let all_tokens: Vec<u32> = prompt_tokens
-        .iter()
-        .map(|&x| x as u32)
-        .chain(generated_tokens.iter().map(|&x| x as u32))
-        .collect();
-    let full_text = tokenizer.decode(&all_tokens, false).unwrap_or_default();
-    // Strip the prompt (decode prompt alone to get exact length)
-    let prompt_decoded = tokenizer
-        .decode(
-            &prompt_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
-            false,
-        )
-        .unwrap_or_default();
-    let generated_text = &full_text[prompt_decoded.len()..];
-    print!("{}", generated_text);
-    io::stdout().flush()?;
-
-    // Print stats
-    println!();
-    println!();
-
-    if args.generation.profile {
-        // Detailed profile output
-        println!("[Profile Results]");
-        stats.print();
-    } else {
-        // Simple output for normal mode
-        let total_time_sec = stats.decode_time_ms / 1000.0;
-        println!(
-            "[Generated {} tokens in {:.2}s = {:.2} tok/s]",
-            stats.generated_tokens, total_time_sec, stats.decode_tok_per_sec
-        );
-    }
+    let (generated_tokens, stats) = run_generation_mode(
+        &model,
+        &args,
+        &prompt_tokens,
+        &sampling_config,
+        vlm_embeddings.as_ref(),
+    )?;
+    let generated_text = decode_generated_text(&tokenizer, &prompt_tokens, &generated_tokens);
+    print_generation_result(&generated_text, &stats, args.generation.profile)?;
 
     // Cleanup
     mlxcel_core::clear_memory_cache();
