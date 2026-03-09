@@ -5,6 +5,7 @@
 //! CLI/server callers so Qwen-VL prompt preparation stays consistent.
 
 use crate::vision;
+use mlxcel_core::MlxArray;
 
 #[derive(Clone, Copy)]
 pub struct QwenVlmPromptInfo<'a> {
@@ -19,6 +20,46 @@ pub struct InsertedQwenVlmTokens {
     pub image_blocks: usize,
     pub total_image_tokens: i32,
 }
+
+pub trait QwenVlRuntime {
+    fn prompt_info(&self) -> QwenVlmPromptInfo<'_>;
+    fn input_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+    ) -> vision::merge::InputEmbeddings;
+}
+
+macro_rules! impl_qwen_vl_runtime {
+    ($ty:ty) => {
+        impl QwenVlRuntime for $ty {
+            fn prompt_info(&self) -> QwenVlmPromptInfo<'_> {
+                QwenVlmPromptInfo {
+                    processor: &self.processor,
+                    spatial_merge_size: self.spatial_merge_size,
+                    vision_start_token_id: self.vision_start_token_id,
+                    image_token_id: self.image_token_id,
+                }
+            }
+
+            fn input_embeddings(
+                &self,
+                input_ids: &MlxArray,
+                pixel_values: &MlxArray,
+                grid_thw: &[(i32, i32, i32)],
+            ) -> vision::merge::InputEmbeddings {
+                self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+            }
+        }
+    };
+}
+
+impl_qwen_vl_runtime!(vision::Qwen2VLModel);
+impl_qwen_vl_runtime!(vision::Qwen25VLModel);
+impl_qwen_vl_runtime!(vision::Qwen3VLModel);
+impl_qwen_vl_runtime!(vision::Qwen3VLMoeModel);
+impl_qwen_vl_runtime!(vision::Qwen35VLModel);
 
 pub fn insert_qwen_vl_image_tokens(
     prompt_tokens: &mut Vec<i32>,

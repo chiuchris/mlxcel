@@ -220,28 +220,45 @@ macro_rules! delegate_embedding_language_model {
     };
 }
 
-macro_rules! with_qwen_vl_model {
-    ($self:expr, $model:ident => $expr:expr, else $fallback:expr) => {
-        match $self {
-            LoadedModel::Qwen2VL($model) => $expr,
-            LoadedModel::Qwen25VL($model) => $expr,
-            LoadedModel::Qwen3VL($model) => $expr,
-            LoadedModel::Qwen3VLMoe($model) => $expr,
-            LoadedModel::Qwen35VLM($model) | LoadedModel::Qwen35MoeVLM($model) => $expr,
-            _ => $fallback,
-        }
-    };
+/// Capability-oriented references used by CLI/server multimodal preparation.
+///
+/// The control plane should ask for the narrowest VLM runtime capability it
+/// needs instead of depending on concrete `LoadedModel` variants. Add new
+/// variants here only when a family truly needs distinct preparation logic.
+pub enum VlmRuntimeRef<'a> {
+    Qwen(&'a dyn qwen_vl::QwenVlRuntime),
+    Gemma3n(&'a vision::Gemma3nVLModel),
+    Phi3V(&'a vision::Phi3VLModel),
+    Molmo2(&'a vision::Molmo2VLModel),
+    Standard(&'a vision::VisionModule),
 }
 
-macro_rules! single_model_accessor {
-    ($name:ident, $variant:ident, $ty:ty) => {
-        pub fn $name(&self) -> Option<&$ty> {
-            match self {
-                Self::$variant(model) => Some(model),
-                _ => None,
-            }
-        }
-    };
+fn standard_image_token_block_info(vm: &vision::VisionModule) -> vlm_prompt::ImageTokenBlockInfo {
+    vlm_prompt::ImageTokenBlockInfo {
+        use_boi_eoi: vm.boi_token_id != 0,
+        image_token_id: vm.image_token_id,
+        mm_tokens_per_image: vm.mm_tokens_per_image,
+        boi_token_id: vm.boi_token_id,
+        eoi_token_id: vm.eoi_token_id,
+        has_bos: vm.has_bos,
+        separator_token_id: vm.separator_token_id,
+        suffix_tokens: vm.suffix_tokens.clone(),
+    }
+}
+
+fn gemma3n_image_token_block_info(
+    model: &vision::Gemma3nVLModel,
+) -> vlm_prompt::ImageTokenBlockInfo {
+    vlm_prompt::ImageTokenBlockInfo {
+        use_boi_eoi: true,
+        image_token_id: model.image_token_id,
+        mm_tokens_per_image: 256,
+        boi_token_id: model.boi_token_id,
+        eoi_token_id: model.eoi_token_id,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
+    }
 }
 
 impl LoadedModel {
@@ -266,38 +283,38 @@ impl LoadedModel {
 
     /// Get the vision module if this is a VLM (Gemma3/LLaVA-style)
     pub fn vision_module(&self) -> Option<&vision::VisionModule> {
-        match self {
-            Self::Gemma3VLM(vlm) => Some(&vlm.vision),
-            Self::Llama4VLM(vlm) => Some(&vlm.vision),
-            Self::LlavaVLM(vlm) => Some(&vlm.vision),
+        match self.vlm_runtime()? {
+            VlmRuntimeRef::Standard(vision) => Some(vision),
             _ => None,
         }
     }
 
-    single_model_accessor!(qwen2_vl_model, Qwen2VL, vision::Qwen2VLModel);
-    single_model_accessor!(qwen2_5_vl_model, Qwen25VL, vision::Qwen25VLModel);
-    single_model_accessor!(qwen3_vl_model, Qwen3VL, vision::Qwen3VLModel);
-    single_model_accessor!(qwen3_vl_moe_model, Qwen3VLMoe, vision::Qwen3VLMoeModel);
-
-    /// Get the Qwen3.5 VLM model
-    pub fn qwen3_5_vl_model(&self) -> Option<&vision::Qwen35VLModel> {
+    /// Return the multimodal runtime capability needed by prompt/image prep.
+    ///
+    /// Keep this as the single VLM switchboard so new variants do not require
+    /// ad hoc getter methods throughout CLI or server code.
+    pub fn vlm_runtime(&self) -> Option<VlmRuntimeRef<'_>> {
         match self {
-            Self::Qwen35VLM(m) | Self::Qwen35MoeVLM(m) => Some(m),
+            Self::Qwen2VL(model) => Some(VlmRuntimeRef::Qwen(model)),
+            Self::Qwen25VL(model) => Some(VlmRuntimeRef::Qwen(model)),
+            Self::Qwen3VL(model) => Some(VlmRuntimeRef::Qwen(model)),
+            Self::Qwen3VLMoe(model) => Some(VlmRuntimeRef::Qwen(model)),
+            Self::Qwen35VLM(model) | Self::Qwen35MoeVLM(model) => Some(VlmRuntimeRef::Qwen(model)),
+            Self::Gemma3nVLM(model) => Some(VlmRuntimeRef::Gemma3n(model)),
+            Self::Phi3VLM(model) => Some(VlmRuntimeRef::Phi3V(model)),
+            Self::Molmo2VLM(model) => Some(VlmRuntimeRef::Molmo2(model)),
+            Self::Gemma3VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
+            Self::Llama4VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
+            Self::LlavaVLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
             _ => None,
         }
     }
 
     pub fn qwen_vl_prompt_info(&self) -> Option<qwen_vl::QwenVlmPromptInfo<'_>> {
-        with_qwen_vl_model!(
-            self,
-            model => Some(qwen_vl::QwenVlmPromptInfo {
-                processor: &model.processor,
-                spatial_merge_size: model.spatial_merge_size,
-                vision_start_token_id: model.vision_start_token_id,
-                image_token_id: model.image_token_id,
-            }),
-            else None
-        )
+        match self.vlm_runtime()? {
+            VlmRuntimeRef::Qwen(runtime) => Some(runtime.prompt_info()),
+            _ => None,
+        }
     }
 
     pub fn qwen_vl_input_embeddings(
@@ -306,43 +323,21 @@ impl LoadedModel {
         pixel_values: &mlxcel_core::MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> Option<vision::merge::InputEmbeddings> {
-        with_qwen_vl_model!(
-            self,
-            model => Some(model.get_input_embeddings(input_ids, pixel_values, grid_thw)),
-            else None
-        )
-    }
-
-    pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
-        if let Some(g3n) = self.gemma3n_vl_model() {
-            Some(vlm_prompt::ImageTokenBlockInfo {
-                use_boi_eoi: true,
-                image_token_id: g3n.image_token_id,
-                mm_tokens_per_image: 256,
-                boi_token_id: g3n.boi_token_id,
-                eoi_token_id: g3n.eoi_token_id,
-                has_bos: true,
-                separator_token_id: None,
-                suffix_tokens: Vec::new(),
-            })
-        } else {
-            self.vision_module()
-                .map(|vm| vlm_prompt::ImageTokenBlockInfo {
-                    use_boi_eoi: vm.boi_token_id != 0,
-                    image_token_id: vm.image_token_id,
-                    mm_tokens_per_image: vm.mm_tokens_per_image,
-                    boi_token_id: vm.boi_token_id,
-                    eoi_token_id: vm.eoi_token_id,
-                    has_bos: vm.has_bos,
-                    separator_token_id: vm.separator_token_id,
-                    suffix_tokens: vm.suffix_tokens.clone(),
-                })
+        match self.vlm_runtime()? {
+            VlmRuntimeRef::Qwen(runtime) => {
+                Some(runtime.input_embeddings(input_ids, pixel_values, grid_thw))
+            }
+            _ => None,
         }
     }
 
-    single_model_accessor!(gemma3n_vl_model, Gemma3nVLM, vision::Gemma3nVLModel);
-    single_model_accessor!(phi3_vl_model, Phi3VLM, vision::Phi3VLModel);
-    single_model_accessor!(molmo2_vl_model, Molmo2VLM, vision::Molmo2VLModel);
+    pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
+        match self.vlm_runtime()? {
+            VlmRuntimeRef::Gemma3n(model) => Some(gemma3n_image_token_block_info(model)),
+            VlmRuntimeRef::Standard(vision) => Some(standard_image_token_block_info(vision)),
+            _ => None,
+        }
+    }
 }
 
 impl LanguageModel for LoadedModel {
@@ -389,3 +384,7 @@ impl LanguageModel for LoadedModel {
         delegate_embedding_language_model!(self, embed_tokens(input_ids); fallback = None)
     }
 }
+
+#[cfg(test)]
+#[path = "loaded_model_tests.rs"]
+mod tests;
