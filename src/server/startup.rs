@@ -1,0 +1,363 @@
+//! Server startup pipeline shared by `mlxcel serve` and `mlxcel-server`.
+//!
+//! This module keeps process-level side effects such as tracing initialization,
+//! chat-template resolution, model warmup, and socket binding out of
+//! `server/mod.rs` so the server root can focus on shared types and state.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use anyhow::{Context, Result};
+use tower::Service;
+
+use crate::SamplingConfig;
+
+use super::{
+    AppState, ChatTemplateProcessor, ModelProvider, ServerConfig, ServerGenerateOptions, create_app,
+};
+
+/// Startup configuration for the server (shared between `mlxcel serve` and `mlxcel-server`).
+#[derive(Debug)]
+pub struct ServerStartupConfig {
+    // Model
+    pub model_path: PathBuf,
+    pub adapter_path: Option<PathBuf>,
+    pub model_alias: Option<String>,
+
+    // Network
+    pub host: String,
+    pub port: u16,
+
+    // Auth
+    pub api_key: Option<String>,
+    pub api_key_file: Option<PathBuf>,
+
+    // Limits
+    pub n_parallel: usize,
+    pub ctx_size: usize,
+    pub n_predict: i32, // -1 = unlimited
+    pub timeout: u64,
+
+    // Speculative decoding
+    pub draft_model_path: Option<PathBuf>,
+    pub draft_max: usize,
+
+    // Chat template
+    pub chat_template: Option<String>,
+    pub chat_template_file: Option<PathBuf>,
+
+    // Endpoint toggles
+    pub enable_slots: bool,
+    pub enable_props: bool,
+    pub enable_metrics: bool,
+
+    // Warmup
+    pub warmup: bool,
+
+    // Default sampling
+    pub temperature: f32,
+    pub top_k: i32,
+    pub top_p: f32,
+    pub min_p: f32,
+    pub seed: Option<u64>,
+    pub repeat_last_n: usize,
+    pub repeat_penalty: f32,
+    pub presence_penalty: f32,
+    pub frequency_penalty: f32,
+
+    // DRY
+    pub dry_multiplier: f32,
+    pub dry_base: f32,
+    pub dry_allowed_length: usize,
+    pub dry_penalty_last_n: i32, // -1 = use full context
+    pub dry_sequence_breakers: Vec<String>,
+
+    // Logging
+    pub verbose: bool,
+    pub log_disable: bool,
+    pub log_file: Option<PathBuf>,
+}
+
+impl Default for ServerStartupConfig {
+    fn default() -> Self {
+        Self {
+            model_path: PathBuf::new(),
+            adapter_path: None,
+            model_alias: None,
+            host: "127.0.0.1".to_string(),
+            port: 8080,
+            api_key: None,
+            api_key_file: None,
+            n_parallel: 1,
+            ctx_size: 0,
+            n_predict: -1,
+            timeout: 600,
+            draft_model_path: None,
+            draft_max: 16,
+            chat_template: None,
+            chat_template_file: None,
+            enable_slots: true,
+            enable_props: false,
+            enable_metrics: false,
+            warmup: true,
+            temperature: 0.8,
+            top_k: 40,
+            top_p: 0.9,
+            min_p: 0.1,
+            seed: None,
+            repeat_last_n: 64,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: -1,
+            dry_sequence_breakers: Vec::new(),
+            verbose: false,
+            log_disable: false,
+            log_file: None,
+        }
+    }
+}
+
+pub(super) fn resolve_default_max_tokens(n_predict: i32) -> usize {
+    if n_predict < 0 {
+        512
+    } else {
+        n_predict as usize
+    }
+}
+
+pub(super) fn resolve_dry_penalty_last_n(value: i32) -> usize {
+    if value < 0 { 0 } else { value as usize }
+}
+
+/// Resolve API key from flag or file.
+pub(super) fn resolve_api_key(
+    api_key: Option<String>,
+    api_key_file: Option<&Path>,
+) -> Result<Option<String>> {
+    if api_key.is_some() {
+        return Ok(api_key);
+    }
+    if let Some(path) = api_key_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read API key file: {:?}", path))?;
+        let key = content.trim().to_string();
+        if key.is_empty() {
+            anyhow::bail!("API key file {:?} is empty", path);
+        }
+        return Ok(Some(key));
+    }
+    Ok(None)
+}
+
+/// Resolve chat template from override string, file, or model's tokenizer metadata.
+pub(super) fn resolve_chat_template(
+    template_override: Option<&str>,
+    template_file: Option<&Path>,
+    model_path: &Path,
+) -> Result<ChatTemplateProcessor> {
+    if let Some(template) = template_override {
+        return Ok(ChatTemplateProcessor::with_template(template.to_string()));
+    }
+    if let Some(path) = template_file {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read chat template file: {:?}", path))?;
+        return Ok(ChatTemplateProcessor::with_template(content));
+    }
+    Ok(ChatTemplateProcessor::from_model_path(model_path)?.unwrap_or_default())
+}
+
+pub(super) fn build_server_config(
+    startup: &ServerStartupConfig,
+    api_key: Option<String>,
+) -> ServerConfig {
+    ServerConfig {
+        api_key,
+        timeout_seconds: startup.timeout,
+        model_alias: startup.model_alias.clone(),
+        context_size: startup.ctx_size,
+        n_parallel: startup.n_parallel,
+        enable_slots_endpoint: startup.enable_slots,
+        enable_props_endpoint: startup.enable_props,
+        enable_metrics_endpoint: startup.enable_metrics,
+        default_temperature: startup.temperature,
+        default_top_p: startup.top_p,
+        default_top_k: startup.top_k,
+        default_min_p: startup.min_p,
+        default_repetition_penalty: startup.repeat_penalty,
+        default_repetition_context_size: startup.repeat_last_n,
+        default_max_tokens: resolve_default_max_tokens(startup.n_predict),
+        default_seed: startup.seed,
+        default_frequency_penalty: startup.frequency_penalty,
+        default_presence_penalty: startup.presence_penalty,
+        default_dry_multiplier: startup.dry_multiplier,
+        default_dry_base: startup.dry_base,
+        default_dry_allowed_length: startup.dry_allowed_length,
+        default_dry_penalty_last_n: resolve_dry_penalty_last_n(startup.dry_penalty_last_n),
+        draft_model_path: startup.draft_model_path.clone(),
+        num_draft_tokens: startup.draft_max,
+    }
+}
+
+fn initialize_server_logging(startup: &ServerStartupConfig) -> Result<()> {
+    if startup.log_disable {
+        return Ok(());
+    }
+
+    let filter = if startup.verbose { "debug" } else { "info" };
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter));
+
+    if let Some(ref log_path) = startup.log_file {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_path)
+            .with_context(|| format!("Failed to open log file: {:?}", log_path))?;
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_writer(file)
+            .init();
+    } else {
+        tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    }
+
+    Ok(())
+}
+
+fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
+    model_provider.generate(
+        "Hello".to_string(),
+        ServerGenerateOptions {
+            max_tokens: 1,
+            sampling: SamplingConfig::greedy(),
+            stop_sequences: None,
+        },
+    )?;
+    Ok(())
+}
+
+fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
+    tracing::info!("Starting mlxcel server on {}", addr);
+    tracing::info!("Endpoints:");
+    tracing::info!("  POST /v1/chat/completions  - OpenAI chat completions");
+    tracing::info!("  POST /v1/completions       - OpenAI text completions");
+    tracing::info!("  GET  /v1/models            - List models");
+    tracing::info!("  POST /completion           - llama-server native completion");
+    tracing::info!("  POST /tokenize             - Tokenize text");
+    tracing::info!("  POST /detokenize           - Detokenize tokens");
+    if startup.enable_props {
+        tracing::info!("  GET  /props                - Server properties");
+    }
+    if startup.enable_slots {
+        tracing::info!("  GET  /slots                - Slot status");
+    }
+    tracing::info!("  GET  /health               - Health check");
+}
+
+async fn serve_unix_socket(startup: &ServerStartupConfig, app: axum::Router) -> Result<()> {
+    let socket_path = Path::new(&startup.host);
+
+    if socket_path.exists() {
+        std::fs::remove_file(socket_path)
+            .with_context(|| format!("Failed to remove stale socket: {:?}", socket_path))?;
+    }
+    if let Some(parent) = socket_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create socket directory: {:?}", parent))?;
+    }
+
+    log_endpoints(startup, &startup.host);
+    let listener = tokio::net::UnixListener::bind(socket_path)
+        .with_context(|| format!("Failed to bind Unix socket: {:?}", socket_path))?;
+
+    loop {
+        let (socket, _addr) = listener.accept().await?;
+        let app = app.clone();
+        tokio::spawn(async move {
+            let socket = hyper_util::rt::TokioIo::new(socket);
+            let hyper_service =
+                hyper::service::service_fn(move |request| app.clone().call(request));
+            if let Err(err) =
+                hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new())
+                    .serve_connection(socket, hyper_service)
+                    .await
+            {
+                tracing::debug!("Unix socket connection error: {}", err);
+            }
+        });
+    }
+}
+
+async fn serve_tcp(startup: &ServerStartupConfig, app: axum::Router) -> Result<()> {
+    let addr = format!("{}:{}", startup.host, startup.port);
+    log_endpoints(startup, &addr);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+/// Start the server with the given startup configuration.
+///
+/// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
+pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
+    initialize_server_logging(&startup)?;
+
+    let runtime = crate::initialize_runtime();
+    if let Some(invalid) = runtime.invalid_device_override.as_deref() {
+        tracing::warn!(
+            value = invalid,
+            "Ignoring invalid MLXCEL_DEVICE override; using gpu"
+        );
+    }
+    tracing::info!("Runtime device: {}", runtime.device);
+    if let Some(max_memory) = runtime.wired_limit_bytes {
+        tracing::info!(
+            "Wired memory limit: {:.1} GB",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
+    }
+
+    let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
+    let config = build_server_config(&startup, api_key);
+    let chat_template = resolve_chat_template(
+        startup.chat_template.as_deref(),
+        startup.chat_template_file.as_deref(),
+        &startup.model_path,
+    )?;
+    let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+    let model_provider = Arc::new(ModelProvider::new_with_adapter(
+        startup.model_path.clone(),
+        startup.adapter_path.clone(),
+    )?);
+
+    if startup.warmup {
+        tracing::info!("Warming up model...");
+        match warmup_model(model_provider.as_ref()) {
+            Ok(()) => tracing::info!("Warmup complete"),
+            Err(err) => tracing::warn!("Warmup failed (non-fatal): {}", err),
+        }
+    }
+
+    let state = AppState::new(
+        model_provider,
+        config,
+        chat_template,
+        tokenizer,
+        startup.model_path.clone(),
+    );
+    let app = create_app(state);
+
+    if startup.port == 0 {
+        serve_unix_socket(&startup, app).await
+    } else {
+        serve_tcp(&startup, app).await
+    }
+}
+
+#[cfg(test)]
+#[path = "startup_tests.rs"]
+mod tests;
