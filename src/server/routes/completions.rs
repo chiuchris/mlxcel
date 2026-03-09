@@ -95,7 +95,7 @@ async fn stream_completion(
                 // Send error and return
                 let error_chunk =
                     CompletionChunk::finish(request_id_clone, model_id_clone, "error".to_string());
-                finish_events.json(&error_chunk);
+                let _ = finish_events.json(&error_chunk);
                 finish_events.done();
                 return;
             }
@@ -114,7 +114,7 @@ async fn stream_completion(
                     model_id_inner.clone(),
                     token,
                 );
-                token_events.json(&chunk);
+                let _ = token_events.json(&chunk);
             });
 
         // Send finish chunk
@@ -123,7 +123,7 @@ async fn stream_completion(
             Err(_) => "error".to_string(),
         };
         let finish = CompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
-        finish_events.json(&finish);
+        let _ = finish_events.json(&finish);
         finish_events.done();
 
         // _permit is dropped here, releasing the slot

@@ -122,15 +122,17 @@ fn detect_bunny_text_backend(full_config: &Value) -> LlavaTextBackend {
         .unwrap_or(LlavaTextBackend::Llama)
 }
 
-fn inherit_text_quantization_if_missing(text_config_value: &mut Value, full_config: &Value) {
+fn inherit_text_quantization_if_missing(
+    text_config_value: &mut Value,
+    full_config: &Value,
+) -> Result<()> {
     if text_config_value.get("quantization").is_none()
         && let Some(q) = full_config.get("quantization")
     {
-        text_config_value
-            .as_object_mut()
-            .unwrap()
+        super::require_object_mut(text_config_value, "LLaVA text_config")?
             .insert("quantization".to_string(), q.clone());
     }
+    Ok(())
 }
 
 fn build_llava_text_model(
@@ -256,7 +258,7 @@ pub(crate) fn load_llava_vlm(model_path: &Path) -> Result<LoadedModel> {
 
     let mut text_config_value = vlm_config.text_config.clone();
     infer_llama_config_from_weights(&mut text_config_value, &weights);
-    inherit_text_quantization_if_missing(&mut text_config_value, &full_config);
+    inherit_text_quantization_if_missing(&mut text_config_value, &full_config)?;
 
     models::sanitize_tied_embeddings(&mut weights, &full_config);
     let text_model = build_llava_text_model(&weights, &text_config_value, backend, "LLaVA")?;
@@ -353,7 +355,7 @@ pub(crate) fn load_llava_bunny_vlm(model_path: &Path) -> Result<LoadedModel> {
         full_config.clone()
     };
     infer_llama_config_from_weights(&mut text_config_value, &weights);
-    inherit_text_quantization_if_missing(&mut text_config_value, &full_config);
+    inherit_text_quantization_if_missing(&mut text_config_value, &full_config)?;
 
     let text_model = build_llava_text_model(
         &weights,

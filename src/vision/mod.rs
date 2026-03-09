@@ -11,6 +11,8 @@
 //! `VisionModule` composes those pieces into one runtime unit that can be
 //! attached to any `LanguageModel` through `VisionLanguageModel`.
 
+use anyhow::Result;
+
 pub mod config;
 pub mod connectors;
 pub mod encoders;
@@ -44,6 +46,12 @@ use merge::InputEmbeddings;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 use processors::ImageProcessor;
+
+fn require_array_ref<'a>(array: &'a UniquePtr<MlxArray>, label: &str) -> Result<&'a MlxArray> {
+    array
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Vision module produced a null {}", label))
+}
 
 /// Merge strategy for combining vision and text embeddings
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,20 +119,19 @@ impl VisionModule {
         input_ids: &MlxArray,
         pixel_values: Option<&MlxArray>,
         attention_mask: &MlxArray,
-    ) -> InputEmbeddings {
+    ) -> Result<InputEmbeddings> {
         // Get text embeddings
         let inputs_embeds = text_model
             .embed_tokens(input_ids)
-            .expect("Text model must support embed_tokens for VLM");
+            .ok_or_else(|| anyhow::anyhow!("Text model must support embed_tokens for VLM"))?;
+        let _ = require_array_ref(&inputs_embeds, "text embedding buffer")?;
 
-        if pixel_values.is_none() {
-            return InputEmbeddings {
+        let Some(pixel_values) = pixel_values else {
+            return Ok(InputEmbeddings {
                 inputs_embeds,
                 attention_mask_4d: None,
-            };
-        }
-
-        let pixel_values = pixel_values.unwrap();
+            });
+        };
 
         // Get dtype of text embeddings for casting
         let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
@@ -147,7 +154,7 @@ impl VisionModule {
 
         // Different VLM families make different masking assumptions, so merge
         // strategy selection stays explicit instead of being inferred.
-        match self.merge_strategy {
+        Ok(match self.merge_strategy {
             MergeStrategy::Gemma3 => merge::prepare_inputs_for_multimodal(
                 self.hidden_size,
                 self.pad_token_id,
@@ -163,7 +170,7 @@ impl VisionModule {
                 &inputs_embeds,
                 input_ids,
             ),
-        }
+        })
     }
 }
 
@@ -212,3 +219,7 @@ impl LanguageModel for VisionLanguageModel {
         self.text_model.eos_token_ids()
     }
 }
+
+#[cfg(test)]
+#[path = "mod_tests.rs"]
+mod tests;

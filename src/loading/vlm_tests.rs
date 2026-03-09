@@ -1,6 +1,6 @@
 use super::{
     QwenVisionTokenIds, inherit_qwen_vision_quantization, qwen_vl_token_ids,
-    qwen35_vlm_token_defaults, rewrite_qwen3_vl_weight_key,
+    qwen35_vlm_token_defaults, require_object_mut, rewrite_qwen3_vl_weight_key,
 };
 use crate::vision::encoders::qwen3_vl::Qwen3VLVisionConfig;
 use serde_json::json;
@@ -80,6 +80,15 @@ fn rewrite_qwen3_vl_weight_key_sanitizes_moe_expert_weights() {
         ),
         "model.layers.0.mlp.switch_mlp.up_proj.weight"
     );
+}
+
+#[test]
+fn require_object_mut_rejects_non_object_values() {
+    let mut value = json!(7);
+    let err = require_object_mut(&mut value, "test config")
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Expected test config to be a JSON object"));
 }
 
 #[test]

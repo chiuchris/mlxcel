@@ -25,15 +25,17 @@ struct PixtralFamilyContext {
     rms_norm_eps: f32,
 }
 
-fn inherit_quantization_if_missing(text_config_value: &mut Value, full_config: &Value) {
+fn inherit_quantization_if_missing(
+    text_config_value: &mut Value,
+    full_config: &Value,
+) -> Result<()> {
     if text_config_value.get("quantization").is_none()
         && let Some(q) = full_config.get("quantization")
     {
-        text_config_value
-            .as_object_mut()
-            .unwrap()
+        super::require_object_mut(text_config_value, "Pixtral/Mistral3 text_config")?
             .insert("quantization".to_string(), q.clone());
     }
+    Ok(())
 }
 
 pub(super) fn apply_mistral_attention_head_override(
@@ -65,7 +67,7 @@ pub(super) fn build_mistral_text_config(full_config: &Value, weights: &WeightMap
         .unwrap_or_else(|| serde_json::json!({}));
     infer_llama_config_from_weights(&mut text_config_value, weights);
     apply_mistral_attention_head_override(&mut text_config_value, weights);
-    inherit_quantization_if_missing(&mut text_config_value, full_config);
+    inherit_quantization_if_missing(&mut text_config_value, full_config)?;
     Ok(text_config_value)
 }
 

@@ -1,4 +1,7 @@
-use super::{apply_mistral_attention_head_override, build_mistral_text_config};
+use super::{
+    apply_mistral_attention_head_override, build_mistral_text_config,
+    inherit_quantization_if_missing,
+};
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
 use serde_json::json;
@@ -83,4 +86,17 @@ fn build_mistral_text_config_preserves_existing_quantization() {
 
     assert_eq!(text_config["quantization"]["group_size"], 64);
     assert_eq!(text_config["quantization"]["bits"], 4);
+}
+
+#[test]
+fn inherit_quantization_if_missing_rejects_non_object_configs() {
+    let mut text_config = json!(true);
+    let full_config = json!({
+        "quantization": {"group_size": 128, "bits": 8}
+    });
+
+    let err = inherit_quantization_if_missing(&mut text_config, &full_config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Pixtral/Mistral3 text_config"));
 }

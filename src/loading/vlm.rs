@@ -58,6 +58,15 @@ fn parse_required_vlm_subconfig<T: DeserializeOwned>(
     serde_json::from_value(value).map_err(|e| anyhow::anyhow!("Failed to parse {}: {}", label, e))
 }
 
+pub(super) fn require_object_mut<'a>(
+    value: &'a mut Value,
+    label: &str,
+) -> Result<&'a mut serde_json::Map<String, Value>> {
+    value
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("Expected {} to be a JSON object", label))
+}
+
 fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
     mlxcel_core::weights::load_weights_from_dir(model_path).map_err(|e| anyhow::anyhow!("{}", e))
 }
@@ -312,14 +321,17 @@ fn rewrite_qwen3_vl_weight_key(key: String, moe_experts: bool) -> String {
     };
 
     if moe_experts && new_key.contains(".mlp.experts.") {
-        let after_experts = new_key.rsplit_once(".mlp.experts.").unwrap().1;
-        if !after_experts.contains('.') {
-            format!(
-                "{}.weight",
+        if let Some((_, after_experts)) = new_key.rsplit_once(".mlp.experts.") {
+            if !after_experts.contains('.') {
+                format!(
+                    "{}.weight",
+                    new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
+                )
+            } else {
                 new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
-            )
+            }
         } else {
-            new_key.replace(".mlp.experts.", ".mlp.switch_mlp.")
+            new_key
         }
     } else {
         new_key

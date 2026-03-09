@@ -31,15 +31,14 @@ fn resolve_image_token_id(full_config: &Value, default: i32) -> i32 {
         .unwrap_or(default as i64) as i32
 }
 
-fn inherit_quantization_if_missing(text_config: &mut Value, full_config: &Value) {
+fn inherit_quantization_if_missing(text_config: &mut Value, full_config: &Value) -> Result<()> {
     if text_config.get("quantization").is_none()
         && let Some(q) = full_config.get("quantization")
     {
-        text_config
-            .as_object_mut()
-            .unwrap()
+        super::require_object_mut(text_config, "SigLIP text_config")?
             .insert("quantization".to_string(), q.clone());
     }
+    Ok(())
 }
 
 fn rewrite_aya_weight_key(key: &str) -> Option<String> {
@@ -64,8 +63,8 @@ fn sanitize_aya_weights(weights: &mut WeightMap) {
     }
 }
 
-fn inject_aya_text_defaults(text_config: &mut Value, weights: &WeightMap) {
-    let obj = text_config.as_object_mut().unwrap();
+fn inject_aya_text_defaults(text_config: &mut Value, weights: &WeightMap) -> Result<()> {
+    let obj = super::require_object_mut(text_config, "Aya Vision text_config")?;
     if !obj.contains_key("vocab_size") {
         obj.insert("vocab_size".to_string(), serde_json::json!(256000));
     }
@@ -89,6 +88,7 @@ fn inject_aya_text_defaults(text_config: &mut Value, weights: &WeightMap) {
     if !obj.contains_key("tie_word_embeddings") && !weights.contains_key("lm_head.weight") {
         obj.insert("tie_word_embeddings".to_string(), serde_json::json!(true));
     }
+    Ok(())
 }
 
 fn rewrite_paligemma_weight_key(key: &str) -> Option<String> {
@@ -107,8 +107,8 @@ fn sanitize_paligemma_weights(weights: &mut WeightMap) {
     }
 }
 
-fn inject_paligemma_text_defaults(text_config: &mut Value) {
-    let obj = text_config.as_object_mut().unwrap();
+fn inject_paligemma_text_defaults(text_config: &mut Value) -> Result<()> {
+    let obj = super::require_object_mut(text_config, "PaliGemma text_config")?;
     if !obj.contains_key("rms_norm_eps") {
         obj.insert("rms_norm_eps".to_string(), serde_json::json!(1e-6));
     }
@@ -119,6 +119,7 @@ fn inject_paligemma_text_defaults(text_config: &mut Value) {
             .unwrap_or(256);
         obj.insert("head_dim".to_string(), serde_json::json!(default_head_dim));
     }
+    Ok(())
 }
 
 fn build_paligemma_text_model(weights: &WeightMap, text_config: &Value) -> Result<LoadedModel> {
@@ -172,8 +173,8 @@ pub(crate) fn load_aya_vision_vlm(model_path: &Path) -> Result<LoadedModel> {
         .get("text_config")
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("Missing text_config"))?;
-    inherit_quantization_if_missing(&mut text_config, &full_config);
-    inject_aya_text_defaults(&mut text_config, &weights);
+    inherit_quantization_if_missing(&mut text_config, &full_config)?;
+    inject_aya_text_defaults(&mut text_config, &weights)?;
 
     let text_args: models::cohere2::Cohere2Config = serde_json::from_value(text_config.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse text_config as Cohere2: {}", e))?;
@@ -266,8 +267,8 @@ pub(crate) fn load_paligemma_vlm(model_path: &Path) -> Result<LoadedModel> {
         .get("text_config")
         .ok_or_else(|| anyhow::anyhow!("Missing text_config"))?;
     let mut text_config = text_config_val.clone();
-    inherit_quantization_if_missing(&mut text_config, &full_config);
-    inject_paligemma_text_defaults(&mut text_config);
+    inherit_quantization_if_missing(&mut text_config, &full_config)?;
+    inject_paligemma_text_defaults(&mut text_config)?;
     let text_model = build_paligemma_text_model(&weights, &text_config)?;
 
     let (quant_group_size, quant_bits) = quantization_params(&full_config);

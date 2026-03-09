@@ -14,6 +14,7 @@ use mlxcel::{
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
     vision::merge::InputEmbeddings,
+    vlm_runtime::prepared_embedding_refs,
 };
 
 use super::generate_vlm;
@@ -235,23 +236,19 @@ fn generate_with_embeddings<M: LanguageModel>(
     max_tokens: usize,
     sampling_config: &SamplingConfig,
     profile: bool,
-) -> (Vec<i32>, GenerationStats) {
+) -> Result<(Vec<i32>, GenerationStats)> {
     let mut generator = CxxGenerator::new(model.num_layers());
-    let mask_ref = embeddings
-        .attention_mask_4d
-        .as_ref()
-        .map(|m| m.as_ref().unwrap());
-    let input_embeds = embeddings.inputs_embeds.as_ref().unwrap();
+    let (input_embeds, mask_ref) = prepared_embedding_refs(embeddings)?;
 
     if profile {
-        return generator.generate_with_stats_and_embeddings(
+        return Ok(generator.generate_with_stats_and_embeddings(
             model,
             prompt_tokens,
             Some(input_embeds),
             mask_ref,
             max_tokens,
             sampling_config,
-        );
+        ));
     }
 
     let start_time = Instant::now();
@@ -267,10 +264,10 @@ fn generate_with_embeddings<M: LanguageModel>(
     let total_time = start_time.elapsed();
     let generated_len = tokens.len();
 
-    (
+    Ok((
         tokens,
         generation_stats_from_duration(prompt_tokens.len(), generated_len, total_time),
-    )
+    ))
 }
 
 fn run_generation_mode<M: LanguageModel>(
@@ -305,7 +302,7 @@ fn run_generation_mode<M: LanguageModel>(
             args.generation.max_tokens,
             sampling_config,
             args.generation.profile,
-        )
+        )?
     } else {
         generate_standard(
             model,

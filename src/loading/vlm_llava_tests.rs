@@ -1,6 +1,7 @@
 use super::{
     LlavaTextBackend, detect_bunny_text_backend, infer_llama_config_from_weights,
-    llava_text_backend, parse_bunny_vision_config, rewrite_bunny_weight_key,
+    inherit_text_quantization_if_missing, llava_text_backend, parse_bunny_vision_config,
+    rewrite_bunny_weight_key,
 };
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
@@ -117,6 +118,19 @@ fn parse_bunny_vision_config_uses_defaults_for_sparse_configs() {
     assert_eq!(config.intermediate_size, 5120);
     assert_eq!(config.patch_size, 14);
     assert_eq!(config.image_size, 384);
+}
+
+#[test]
+fn inherit_text_quantization_if_missing_rejects_non_object_configs() {
+    let mut text_config = json!("bad");
+    let full_config = json!({
+        "quantization": {"group_size": 128, "bits": 8}
+    });
+
+    let err = inherit_text_quantization_if_missing(&mut text_config, &full_config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("LLaVA text_config"));
 }
 
 #[test]

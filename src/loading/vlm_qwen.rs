@@ -260,7 +260,7 @@ fn load_qwen3_5_vlm_with_variant(
         .ok_or_else(|| anyhow::anyhow!("Missing text_config in config.json"))?;
 
     if text_config_val.get("quantization").is_none() && full_config.get("quantization").is_some() {
-        text_config_val.as_object_mut().unwrap().insert(
+        super::require_object_mut(&mut text_config_val, "Qwen3.5 text_config")?.insert(
             "quantization".to_string(),
             full_config["quantization"].clone(),
         );

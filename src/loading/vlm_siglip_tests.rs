@@ -32,7 +32,7 @@ fn inject_aya_text_defaults_sets_missing_values() {
     });
     let weights = WeightMap::new();
 
-    inject_aya_text_defaults(&mut text_config, &weights);
+    inject_aya_text_defaults(&mut text_config, &weights).unwrap();
 
     assert_eq!(text_config["vocab_size"], 256000);
     assert_eq!(text_config["layer_norm_eps"], 1e-5);
@@ -56,7 +56,7 @@ fn inject_aya_text_defaults_preserves_explicit_values() {
         mlxcel_core::ones(&[2, 2], dtype::FLOAT32),
     );
 
-    inject_aya_text_defaults(&mut text_config, &weights);
+    inject_aya_text_defaults(&mut text_config, &weights).unwrap();
 
     assert_eq!(text_config["vocab_size"], 123);
     assert_eq!(text_config["layer_norm_eps"], 1e-6);
@@ -80,10 +80,28 @@ fn inject_paligemma_text_defaults_uses_query_scalar_when_present() {
         "query_pre_attn_scalar": 192
     });
 
-    inject_paligemma_text_defaults(&mut text_config);
+    inject_paligemma_text_defaults(&mut text_config).unwrap();
 
     assert_eq!(text_config["rms_norm_eps"], 1e-6);
     assert_eq!(text_config["head_dim"], 192);
+}
+
+#[test]
+fn inject_aya_text_defaults_rejects_non_object_configs() {
+    let mut text_config = json!(null);
+    let err = inject_aya_text_defaults(&mut text_config, &WeightMap::new())
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Aya Vision text_config"));
+}
+
+#[test]
+fn inject_paligemma_text_defaults_rejects_non_object_configs() {
+    let mut text_config = json!([]);
+    let err = inject_paligemma_text_defaults(&mut text_config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("PaliGemma text_config"));
 }
 
 #[test]

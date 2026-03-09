@@ -86,6 +86,15 @@ fn qwen35_vlm_kind(model_type: ModelType) -> Option<Qwen35VlmKind> {
     }
 }
 
+fn require_qwen35_vlm_kind(model_type: ModelType) -> Result<Qwen35VlmKind> {
+    qwen35_vlm_kind(model_type).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Expected a Qwen3.5 VLM variant but got model type: {:?}",
+            model_type
+        )
+    })
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 fn is_vlm_model_type(model_type: ModelType) -> bool {
     matches!(
@@ -189,14 +198,12 @@ fn try_load_vlm_model_from_dir(
 ) -> Result<Option<LoadedModel>> {
     Ok(match model_type {
         ModelType::Llama4VLM => Some(load_llama4_vlm(model_path)?),
-        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => Some(
-            match qwen35_vlm_kind(model_type)
-                .expect("Qwen3.5 VLM variants should map to a concrete loader")
-            {
+        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
+            Some(match require_qwen35_vlm_kind(model_type)? {
                 Qwen35VlmKind::Dense => load_qwen3_5_vlm(model_path)?,
                 Qwen35VlmKind::Moe => load_qwen3_5_moe_vlm(model_path)?,
-            },
-        ),
+            })
+        }
         ModelType::Gemma3VLM => Some(load_gemma3_vlm(model_path)?),
         ModelType::LlavaVLM => Some(load_llava_vlm(model_path)?),
         ModelType::LlavaBunnyVLM => Some(load_llava_bunny_vlm(model_path)?),
@@ -222,6 +229,12 @@ where
 {
     let (model, _) = load(path_str.to_owned()).map_err(|e| anyhow::anyhow!("{}", e))?;
     Ok(model)
+}
+
+fn model_path_str(model_path: &Path) -> Result<&str> {
+    model_path
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("Model path contains invalid UTF-8: {:?}", model_path))
 }
 
 fn load_mistral3_text_directory_variant(path_str: &str) -> Result<LoadedModel> {
@@ -282,7 +295,7 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_path = resolve_model_dir(model_path);
     let model_path = model_path.as_path();
     let model_type = get_model_type(model_path)?;
-    let path_str = model_path.to_str().unwrap();
+    let path_str = model_path_str(model_path)?;
 
     let route = if model_type == ModelType::Mistral3 {
         let config_path = model_path.join("config.json");

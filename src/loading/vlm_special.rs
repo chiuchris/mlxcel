@@ -208,7 +208,7 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
         .get("text_config")
         .cloned()
         .unwrap_or_else(|| full_config.clone());
-    inherit_quantization_if_missing(&mut text_config_value, &full_config);
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
     let text_config: models::molmo2::Molmo2TextConfig =
         serde_json::from_value(text_config_value)
             .map_err(|e| anyhow::anyhow!("Failed to parse text config: {}", e))?;
@@ -349,15 +349,17 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
     Ok(LoadedModel::Molmo2VLM(vlm))
 }
 
-pub(super) fn inherit_quantization_if_missing(text_config: &mut Value, full_config: &Value) {
+pub(super) fn inherit_quantization_if_missing(
+    text_config: &mut Value,
+    full_config: &Value,
+) -> Result<()> {
     if text_config.get("quantization").is_none()
         && let Some(q) = full_config.get("quantization")
     {
-        text_config
-            .as_object_mut()
-            .unwrap()
+        super::require_object_mut(text_config, "special VLM text_config")?
             .insert("quantization".to_string(), q.clone());
     }
+    Ok(())
 }
 
 fn language_model_only_weights(weights: &WeightMap) -> WeightMap {
@@ -421,7 +423,7 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let text_config_value = if let Some(tc) = full_config.get("text_config") {
         let mut tc = tc.clone();
-        inherit_quantization_if_missing(&mut tc, &full_config);
+        inherit_quantization_if_missing(&mut tc, &full_config)?;
         tc
     } else {
         full_config.clone()

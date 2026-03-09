@@ -32,8 +32,9 @@ pub(crate) fn sse_channel(
 }
 
 impl BlockingSseSender {
-    pub(crate) fn json<T: Serialize>(&self, value: &T) {
-        self.text(serialize_json_data(value));
+    pub(crate) fn json<T: Serialize>(&self, value: &T) -> Result<(), serde_json::Error> {
+        self.text(serialize_json_data(value)?);
+        Ok(())
     }
 
     pub(crate) fn text(&self, data: impl Into<String>) {
@@ -50,8 +51,8 @@ fn payload_channel(buffer: usize) -> (BlockingSseSender, mpsc::Receiver<SsePaylo
     (BlockingSseSender { tx }, rx)
 }
 
-fn serialize_json_data<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).expect("server streaming payloads must serialize")
+fn serialize_json_data<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {
+    serde_json::to_string(value)
 }
 
 fn sse_event(data: String) -> Event {

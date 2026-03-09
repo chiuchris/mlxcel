@@ -102,7 +102,7 @@ async fn stream_chat_completion(
                     model_id_clone,
                     "error".to_string(),
                 );
-                finish_events.json(&error_chunk);
+                let _ = finish_events.json(&error_chunk);
                 finish_events.done();
                 return;
             }
@@ -111,7 +111,7 @@ async fn stream_chat_completion(
         // Send initial chunk with role
         let initial =
             ChatCompletionChunk::initial(request_id_clone.clone(), model_id_clone.clone());
-        finish_events.json(&initial);
+        let _ = finish_events.json(&initial);
 
         // Use model provider's streaming API
         let token_events = finish_events.clone();
@@ -128,7 +128,7 @@ async fn stream_chat_completion(
                     model_id_inner.clone(),
                     token,
                 );
-                token_events.json(&chunk);
+                let _ = token_events.json(&chunk);
             },
         );
 
@@ -138,7 +138,7 @@ async fn stream_chat_completion(
             Err(_) => "error".to_string(),
         };
         let finish = ChatCompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
-        finish_events.json(&finish);
+        let _ = finish_events.json(&finish);
         finish_events.done();
 
         // _permit is dropped here, releasing the slot

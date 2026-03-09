@@ -1,11 +1,15 @@
 use super::{
     DirectoryLoadRoute, Qwen35VlmKind, WeightLoadRoute, directory_load_route, is_ministral3_config,
-    is_vlm_model_type, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids, resolve_model_dir,
-    weight_load_route,
+    is_vlm_model_type, model_path_str, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids,
+    require_qwen35_vlm_kind, resolve_model_dir, weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
+#[cfg(unix)]
+use std::ffi::OsString;
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -79,6 +83,27 @@ fn resolve_model_dir_keeps_directory_paths() {
 }
 
 #[test]
+fn model_path_str_accepts_utf8_paths() {
+    let model_dir = temp_path("utf8_path");
+    fs::create_dir_all(&model_dir).unwrap();
+
+    assert_eq!(
+        model_path_str(&model_dir).unwrap(),
+        model_dir.to_str().unwrap()
+    );
+
+    fs::remove_dir_all(model_dir).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn model_path_str_rejects_non_utf8_paths() {
+    let path = PathBuf::from(OsString::from_vec(vec![0xff, b'm', b'o', b'd', b'e', b'l']));
+    let err = model_path_str(&path).unwrap_err().to_string();
+    assert!(err.contains("invalid UTF-8"));
+}
+
+#[test]
 fn is_ministral3_config_detects_nested_model_type() {
     let config = json!({
         "text_config": {
@@ -111,6 +136,14 @@ fn qwen35_vlm_kind_matches_supported_model_types() {
         Some(Qwen35VlmKind::Moe)
     );
     assert_eq!(qwen35_vlm_kind(ModelType::Qwen35), None);
+}
+
+#[test]
+fn require_qwen35_vlm_kind_rejects_non_vlm_variants() {
+    let err = require_qwen35_vlm_kind(ModelType::Qwen35)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("Expected a Qwen3.5 VLM variant"));
 }
 
 #[test]

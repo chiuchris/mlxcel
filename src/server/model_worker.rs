@@ -16,7 +16,7 @@ use crate::LoadedModel;
 use crate::SamplingConfig;
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::merge::InputEmbeddings;
-use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
+use crate::vlm_runtime::{prepare_and_compute_vlm_embeddings, prepared_embedding_refs};
 
 use super::{GenerateEvent, GenerationResult, ModelRequest};
 
@@ -228,14 +228,17 @@ fn handle_generate_request(
     };
 
     if let Some(ref embeddings) = vlm_embeddings {
-        let mask_ref = embeddings
-            .attention_mask_4d
-            .as_ref()
-            .map(|mask| mask.as_ref().unwrap());
+        let (input_embeds, mask_ref) = match prepared_embedding_refs(embeddings) {
+            Ok(refs) => refs,
+            Err(err) => {
+                let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
+                return;
+            }
+        };
         generator.generate_streaming_with_embeddings(
             model,
             &prompt_tokens,
-            Some(embeddings.inputs_embeds.as_ref().unwrap()),
+            Some(input_embeds),
             mask_ref,
             max_tokens,
             &sampling,

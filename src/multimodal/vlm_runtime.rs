@@ -1,5 +1,6 @@
 use anyhow::Result;
 use image::DynamicImage;
+use mlxcel_core::MlxArray;
 
 use crate::LoadedModel;
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
@@ -27,6 +28,22 @@ pub enum VlmPreparationSummary {
 pub struct PreparedVlmEmbeddings {
     pub embeddings: InputEmbeddings,
     pub preparation: Option<VlmPreparationSummary>,
+}
+
+pub fn prepared_embedding_refs(
+    embeddings: &InputEmbeddings,
+) -> Result<(&MlxArray, Option<&MlxArray>)> {
+    let input_embeds = embeddings
+        .inputs_embeds
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Prepared VLM embeddings are missing input embeddings"))?;
+    let attention_mask = match embeddings.attention_mask_4d.as_ref() {
+        Some(mask) => Some(mask.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("Prepared VLM embeddings contain a null 4D attention mask")
+        })?),
+        None => None,
+    };
+    Ok((input_embeds, attention_mask))
 }
 
 fn should_prepare_vlm_embeddings(image_count: usize, is_vlm: bool) -> Result<bool> {
@@ -155,7 +172,9 @@ where
             preparation,
         }))
     } else {
-        let vision_module = model.vision_module().unwrap();
+        let vision_module = model
+            .vision_module()
+            .ok_or_else(|| anyhow::anyhow!("VLM model is missing a standard vision module"))?;
         let preparation = model
             .image_token_block_info()
             .and_then(|info| apply_image_token_blocks(prompt_tokens, info, images.len()))
@@ -164,8 +183,12 @@ where
         let pixel_values = vision_module.processor.preprocess(images);
         let mask = mlxcel_core::ones(&[1, prompt_tokens.len() as i32], mlxcel_core::dtype::INT32);
         let input_ids_arr = prompt_ids_array(prompt_tokens);
-        let embeddings =
-            vision_module.get_input_embeddings(model, &input_ids_arr, Some(&pixel_values), &mask);
+        let embeddings = vision_module.get_input_embeddings(
+            model,
+            &input_ids_arr,
+            Some(&pixel_values),
+            &mask,
+        )?;
 
         Ok(Some(PreparedVlmEmbeddings {
             embeddings,

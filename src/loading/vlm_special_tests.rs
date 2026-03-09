@@ -105,16 +105,29 @@ fn inherit_quantization_if_missing_copies_top_level_quantization_once() {
         "quantization": {"group_size": 128, "bits": 8}
     });
 
-    inherit_quantization_if_missing(&mut text_config, &full_config);
+    inherit_quantization_if_missing(&mut text_config, &full_config).unwrap();
     assert_eq!(text_config["quantization"]["group_size"], 128);
     assert_eq!(text_config["quantization"]["bits"], 8);
 
     let mut explicit = json!({
         "quantization": {"group_size": 64, "bits": 4}
     });
-    inherit_quantization_if_missing(&mut explicit, &full_config);
+    inherit_quantization_if_missing(&mut explicit, &full_config).unwrap();
     assert_eq!(explicit["quantization"]["group_size"], 64);
     assert_eq!(explicit["quantization"]["bits"], 4);
+}
+
+#[test]
+fn inherit_quantization_if_missing_rejects_non_object_text_config() {
+    let mut text_config = json!(5);
+    let full_config = json!({
+        "quantization": {"group_size": 128, "bits": 8}
+    });
+
+    let err = inherit_quantization_if_missing(&mut text_config, &full_config)
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("special VLM text_config"));
 }
 
 #[test]

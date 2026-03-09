@@ -115,7 +115,7 @@ async fn stream_native_completion(
             Some(p) => p,
             None => {
                 let err = serde_json::json!({"content": "", "stop": true});
-                finish_events.json(&err);
+                let _ = finish_events.json(&err);
                 return;
             }
         };
@@ -129,7 +129,7 @@ async fn stream_native_completion(
                     "content": token,
                     "stop": false,
                 });
-                token_events.json(&chunk);
+                let _ = token_events.json(&chunk);
             });
 
         // Send final chunk
@@ -142,7 +142,7 @@ async fn stream_native_completion(
             "stop": true,
             "stop_type": if stop { "stop" } else { "limit" },
         });
-        finish_events.json(&final_chunk);
+        let _ = finish_events.json(&final_chunk);
     });
 
     Sse::new(stream)
