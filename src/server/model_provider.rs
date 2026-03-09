@@ -11,7 +11,6 @@ use std::thread;
 use anyhow::Result;
 
 use crate::server::ServerGenerateOptions;
-use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
 
 /// Request to the model thread
 pub enum ModelRequest {
@@ -43,6 +42,9 @@ pub struct GenerationResult {
     pub generation_only_ms: u64,
     pub finish_reason: String,
 }
+
+#[path = "model_worker.rs"]
+mod model_worker;
 
 /// Thread-safe model provider using channels
 pub struct ModelProvider {
@@ -143,97 +145,37 @@ impl ModelProvider {
                         generator.reset_with_model(&model);
 
                         let max_tokens = options.max_tokens;
+                        let sampling = model_worker::merge_config_stop_tokens(
+                            options.sampling.clone(),
+                            &config_eos,
+                        );
 
-                        // Inject config-based EOS tokens into sampling config
-                        let mut sampling = options.sampling.clone();
-                        for &id in &config_eos {
-                            if !sampling.stop_token_ids.contains(&id) {
-                                sampling.stop_token_ids.push(id);
-                            }
-                        }
-
-                        // Check if this is a VLM request with images
-                        let vlm_embeddings = if !images.is_empty() && model.is_vlm() {
-                            // Decode raw bytes to DynamicImage
-                            let decoded_images: Vec<image::DynamicImage> = images
-                                .iter()
-                                .filter_map(|bytes| {
-                                    image::load_from_memory(bytes)
-                                        .map_err(|e| {
-                                            tracing::warn!("Failed to decode image: {}", e);
-                                            e
-                                        })
-                                        .ok()
-                                })
-                                .collect();
-
-                            if decoded_images.is_empty() {
-                                let _ = response_tx.send(GenerateEvent::Error(
-                                    "Failed to decode any images".to_string(),
-                                ));
+                        let vlm_embeddings = match model_worker::prepare_request_vlm_embeddings(
+                            &model,
+                            &tokenizer,
+                            &prompt,
+                            &mut prompt_tokens,
+                            &images,
+                        ) {
+                            Ok(prepared) => prepared,
+                            Err(err) => {
+                                let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
                                 continue;
                             }
-
-                            match prepare_and_compute_vlm_embeddings(
-                                &model,
-                                &mut prompt_tokens,
-                                &prompt,
-                                &decoded_images,
-                                |text, add_special| {
-                                    tokenizer
-                                        .encode(text, add_special)
-                                        .unwrap_or_default()
-                                        .iter()
-                                        .map(|&t| t as i32)
-                                        .collect()
-                                },
-                            ) {
-                                Ok(prepared) => prepared.map(|prepared| prepared.embeddings),
-                                Err(err) => {
-                                    let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            None
                         };
 
-                        // Context-aware streaming decode state
-                        let mut all_ids: Vec<u32> =
-                            prompt_tokens.iter().map(|&x| x as u32).collect();
-                        let mut prev_decoded_len = tokenizer
-                            .decode(
-                                &prompt_tokens.iter().map(|&x| x as u32).collect::<Vec<_>>(),
-                                false,
-                            )
-                            .unwrap_or_default()
-                            .len();
-                        let mut generated_text = String::new();
-                        let mut completion_tokens = 0usize;
-                        let mut first_token_time: Option<std::time::Instant> = None;
+                        // Keep decode state outside the MLX callback so the closure only
+                        // forwards incremental text and does not accumulate orchestration logic.
+                        let mut decode_state =
+                            model_worker::StreamingDecodeState::new(&tokenizer, &prompt_tokens);
 
                         let tx_clone = response_tx.clone();
                         let tokenizer_ref = &tokenizer;
 
                         let on_token = |token_id: i32| {
-                            if first_token_time.is_none() {
-                                first_token_time = Some(std::time::Instant::now());
-                            }
-                            completion_tokens += 1;
-                            all_ids.push(token_id as u32);
-
-                            // Context-aware decode: decode all IDs, diff with previous
-                            let full_text =
-                                tokenizer_ref.decode(&all_ids, false).unwrap_or_default();
-                            let new_text = &full_text[prev_decoded_len..];
-
-                            if !new_text.is_empty() {
-                                generated_text.push_str(new_text);
+                            if let Some(new_text) = decode_state.on_token(token_id, tokenizer_ref) {
                                 let _ = tx_clone.send(GenerateEvent::Token(new_text.to_string()));
-                                prev_decoded_len = full_text.len();
                             }
-
-                            // Return true to continue generation
                             true
                         };
 
@@ -262,27 +204,8 @@ impl ModelProvider {
                             );
                         }
 
-                        let elapsed = start.elapsed();
-                        let prompt_eval_ms = first_token_time
-                            .map(|t| (t - start).as_millis() as u64)
-                            .unwrap_or(elapsed.as_millis() as u64);
-                        let generation_only_ms = elapsed.as_millis() as u64 - prompt_eval_ms;
-
-                        let finish_reason = if completion_tokens >= max_tokens {
-                            "length".to_string()
-                        } else {
-                            "stop".to_string()
-                        };
-
-                        let _ = response_tx.send(GenerateEvent::Done(GenerationResult {
-                            text: generated_text,
-                            prompt_tokens: prompt_token_count,
-                            completion_tokens,
-                            generation_time_ms: elapsed.as_millis() as u64,
-                            prompt_eval_ms,
-                            generation_only_ms,
-                            finish_reason,
-                        }));
+                        let result = decode_state.finish(start, prompt_token_count, max_tokens);
+                        let _ = response_tx.send(GenerateEvent::Done(result));
                     }
                     Ok(ModelRequest::Shutdown) => {
                         tracing::info!("Model worker thread shutting down");
