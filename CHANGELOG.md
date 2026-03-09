@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.2] - 2026-03-10
+
+### Added
+- Solar Open 100B INT4 model support with GPTQ conversion
+- MiniMax-M2 MoE model support
+
+### Fixed
+- GPU wired memory limit now opt-in via `MLXCEL_WIRED_LIMIT` environment variable
+- Llama4 vision encoder now uses UnifiedLinear to support quantized weights
+- Molmo2 VLM inherits quantization config correctly; stale examples updated
+- PaliGemma2 VLM no longer produces pad/EOS tokens instead of correct output
+- Qwen3.5 VLM loader variants corrected
+- Resolved all clippy warnings in vision and loading modules
+
+### Changed
+- Major codebase refactoring: modularized server, CLI, loader, and multimodal paths
+- Extracted loader modules into `src/loading/` directory (SigLIP, Pixtral, Gemma, LLaVA, Qwen VLM loaders)
+- Moved CLI command handlers under `src/commands/`
+- Grouped execution policy helpers under `src/execution/`
+- Grouped multimodal helpers under `src/multimodal/`
+- Split server into config, state, streaming, and media helper modules
+- Centralized LoadedModel embedding dispatch and reduced accessor boilerplate
+- Shared sampling config assembly across CLI and server
+- Refined model detection helpers with added guide
+- Refreshed architecture and vision documentation
+
 ## [v0.0.1] - 2026-03-07
 
 Initial public release of mlxcel.
@@ -28,4 +54,5 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.2]: https://github.com/lablup/mlxcel/compare/v0.0.1...v0.0.2
 [v0.0.1]: https://github.com/lablup/mlxcel/releases/tag/v0.0.1
