@@ -1,7 +1,8 @@
 use super::{
-    DirectoryLoadRoute, Qwen35VlmKind, WeightLoadRoute, directory_load_route, is_ministral3_config,
-    is_vlm_model_type, model_path_str, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids,
-    require_qwen35_vlm_kind, resolve_model_dir, weight_load_route,
+    DirectoryLoadRoute, ModelCapabilities, ModelKind, ModelLoadPolicy, Qwen35VlmKind,
+    WeightLoadRoute, directory_load_route, is_ministral3_config, is_vlm_model_type,
+    model_capabilities, model_load_policy, model_path_str, parse_eos_token_ids, qwen35_vlm_kind,
+    read_eos_token_ids, require_qwen35_vlm_kind, resolve_model_dir, weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -155,6 +156,21 @@ fn is_vlm_model_type_distinguishes_multimodal_variants() {
 }
 
 #[test]
+fn model_capabilities_distinguish_kind_and_adapter_support() {
+    assert_eq!(
+        model_capabilities(ModelType::Llama),
+        ModelCapabilities {
+            kind: ModelKind::Text,
+            adapter_unsupported_message: None,
+        }
+    );
+
+    let qwen_vl = model_capabilities(ModelType::Qwen3VL);
+    assert_eq!(qwen_vl.kind, ModelKind::Vlm);
+    assert!(qwen_vl.adapter_unsupported_message.is_some());
+}
+
+#[test]
 fn directory_load_route_handles_mistral3_text_subtype() {
     let config = json!({
         "text_config": {
@@ -212,4 +228,42 @@ fn weight_load_route_distinguishes_loader_strategies() {
         weight_load_route(ModelType::Qwen3).unwrap(),
         WeightLoadRoute::ConfigBacked
     );
+}
+
+#[test]
+fn model_load_policy_combines_routes_and_capabilities() {
+    let text_policy = model_load_policy(ModelType::Qwen35, None).unwrap();
+    assert_eq!(
+        text_policy,
+        ModelLoadPolicy {
+            capabilities: ModelCapabilities {
+                kind: ModelKind::Text,
+                adapter_unsupported_message: None,
+            },
+            directory_route: DirectoryLoadRoute::Nonstandard,
+            weight_route: Some(WeightLoadRoute::Special),
+        }
+    );
+
+    let vlm_policy = model_load_policy(ModelType::Qwen3VL, None).unwrap();
+    assert_eq!(vlm_policy.capabilities.kind, ModelKind::Vlm);
+    assert_eq!(vlm_policy.directory_route, DirectoryLoadRoute::Vlm);
+    assert_eq!(vlm_policy.weight_route, None);
+}
+
+#[test]
+fn model_load_policy_handles_mistral3_text_wrapper_config() {
+    let config = json!({
+        "text_config": {
+            "model_type": "ministral3"
+        }
+    });
+
+    let policy = model_load_policy(ModelType::Mistral3, Some(&config)).unwrap();
+    assert_eq!(policy.capabilities.kind, ModelKind::Text);
+    assert_eq!(
+        policy.directory_route,
+        DirectoryLoadRoute::Mistral3TextWrapper
+    );
+    assert_eq!(policy.weight_route, Some(WeightLoadRoute::LlamaFamily));
 }

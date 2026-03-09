@@ -120,6 +120,29 @@ fn is_vlm_model_type(model_type: ModelType) -> bool {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelKind {
+    Text,
+    Vlm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelCapabilities {
+    kind: ModelKind,
+    adapter_unsupported_message: Option<&'static str>,
+}
+
+fn model_capabilities(model_type: ModelType) -> ModelCapabilities {
+    ModelCapabilities {
+        kind: if is_vlm_model_type(model_type) {
+            ModelKind::Vlm
+        } else {
+            ModelKind::Text
+        },
+        adapter_unsupported_message: adapter_loading_unsupported_message(model_type),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DirectoryLoadRoute {
     /// `Mistral3` wrapper with `ministral3` text tower in `text_config`.
     Mistral3TextWrapper,
@@ -141,6 +164,13 @@ enum WeightLoadRoute {
     Special,
     /// Standard config-backed text families.
     ConfigBacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ModelLoadPolicy {
+    capabilities: ModelCapabilities,
+    directory_route: DirectoryLoadRoute,
+    weight_route: Option<WeightLoadRoute>,
 }
 
 fn directory_load_route(
@@ -190,6 +220,25 @@ fn weight_load_route(model_type: ModelType) -> Result<WeightLoadRoute> {
         "Missing weight loader for model type: {:?}",
         model_type
     ))
+}
+
+fn model_load_policy(
+    model_type: ModelType,
+    config: Option<&serde_json::Value>,
+) -> Result<ModelLoadPolicy> {
+    let capabilities = model_capabilities(model_type);
+    let directory_route = directory_load_route(model_type, config)?;
+    let weight_route = if capabilities.adapter_unsupported_message.is_some() {
+        None
+    } else {
+        Some(weight_load_route(model_type)?)
+    };
+
+    Ok(ModelLoadPolicy {
+        capabilities,
+        directory_route,
+        weight_route,
+    })
 }
 
 fn try_load_vlm_model_from_dir(
@@ -297,41 +346,63 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_type = get_model_type(model_path)?;
     let path_str = model_path_str(model_path)?;
 
-    let route = if model_type == ModelType::Mistral3 {
+    let policy = if model_type == ModelType::Mistral3 {
         let config_path = model_path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let config: serde_json::Value = parse_model_config(&config_str)?;
-        (
-            directory_load_route(model_type, Some(&config))?,
-            Some(config),
-        )
+        (model_load_policy(model_type, Some(&config))?, Some(config))
     } else {
-        (directory_load_route(model_type, None)?, None)
+        (model_load_policy(model_type, None)?, None)
     };
 
-    let model = match route {
-        (DirectoryLoadRoute::Mistral3TextWrapper, Some(_)) => {
-            load_mistral3_text_directory_variant(path_str)?
-        }
-        (DirectoryLoadRoute::Mistral3LlamaFallback, Some(_)) => {
-            load_mistral3_llama_directory_variant(path_str)?
-        }
-        (DirectoryLoadRoute::Vlm, _) => try_load_vlm_model_from_dir(model_type, model_path)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
-            })?,
-        (DirectoryLoadRoute::Nonstandard, _) => {
-            try_load_nonstandard_model_from_dir(model_type, model_path, path_str)?.ok_or_else(
-                || anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type),
-            )?
-        }
-        (DirectoryLoadRoute::ConfigBacked, _) => {
-            try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
-                anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
-            })?
-        }
+    let model = match policy {
         (
-            DirectoryLoadRoute::Mistral3TextWrapper | DirectoryLoadRoute::Mistral3LlamaFallback,
+            ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::Mistral3TextWrapper,
+                ..
+            },
+            Some(_),
+        ) => load_mistral3_text_directory_variant(path_str)?,
+        (
+            ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::Mistral3LlamaFallback,
+                ..
+            },
+            Some(_),
+        ) => load_mistral3_llama_directory_variant(path_str)?,
+        (
+            ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::Vlm,
+                ..
+            },
+            _,
+        ) => try_load_vlm_model_from_dir(model_type, model_path)?.ok_or_else(|| {
+            anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
+        })?,
+        (
+            ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::Nonstandard,
+                ..
+            },
+            _,
+        ) => try_load_nonstandard_model_from_dir(model_type, model_path, path_str)?.ok_or_else(
+            || anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type),
+        )?,
+        (
+            ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::ConfigBacked,
+                ..
+            },
+            _,
+        ) => try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
+            anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
+        })?,
+        (
+            ModelLoadPolicy {
+                directory_route:
+                    DirectoryLoadRoute::Mistral3TextWrapper | DirectoryLoadRoute::Mistral3LlamaFallback,
+                ..
+            },
             None,
         ) => {
             unreachable!("Mistral3 routes require config context")
@@ -377,11 +448,17 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
     let config_value: serde_json::Value = parse_model_config(&config_str)?;
     models::sanitize_tied_embeddings(weights, &config_value);
 
-    if let Some(message) = adapter_loading_unsupported_message(model_type) {
+    let policy = model_load_policy(model_type, Some(&config_value))?;
+
+    if let Some(message) = policy.capabilities.adapter_unsupported_message {
         return Err(anyhow::anyhow!(message));
     }
 
-    let model = match weight_load_route(model_type)? {
+    let weight_route = policy
+        .weight_route
+        .ok_or_else(|| anyhow::anyhow!("Missing adapter weight route for {:?}", model_type))?;
+
+    let model = match weight_route {
         WeightLoadRoute::LlamaFamily => {
             load_llama_family_from_weights(model_type, &config_str, &config_value, weights)?
         }
