@@ -74,6 +74,18 @@ jobs:
                      --sign "Distribution" "$BIN_DIR/$BIN"
           done
 
+      # Find mlx.metallib from build output
+      - name: Locate mlx.metallib
+        if: runner.os == 'macOS'
+        run: |
+          METALLIB=$(find target/${{ matrix.target }}/release/build/mlxcel-core-*/out/build/lib -name "mlx.metallib" 2>/dev/null | head -1)
+          if [ -z "$METALLIB" ]; then
+            echo "::error::mlx.metallib not found in build output"
+            exit 1
+          fi
+          echo "METALLIB_PATH=$METALLIB" >> $GITHUB_ENV
+          echo "Found mlx.metallib at: $METALLIB ($(du -h "$METALLIB" | cut -f1))"
+
       # Package binaries
       - name: Package macOS binaries (zip)
         if: runner.os == 'macOS'
@@ -82,6 +94,7 @@ jobs:
           mkdir -p package
           cp "$BIN_DIR/mlxcel" package/
           cp "$BIN_DIR/mlxcel-server" package/
+          cp "$METALLIB_PATH" package/mlx.metallib
           ditto -c -k --sequesterRsrc package "${{ matrix.asset_name }}.zip"
 
       # Generate checksum
