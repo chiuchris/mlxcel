@@ -11,10 +11,9 @@ use axum::{
     },
 };
 use futures::stream::Stream;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::AppState;
+use crate::server::streaming::sse_channel;
 use crate::server::types::{CompletionChunk, CompletionRequest, CompletionResponse, ErrorResponse};
 
 use super::chat::build_generate_options;
@@ -80,12 +79,12 @@ async fn stream_completion(
     let prompt = request.prompt.clone();
     let options = build_generate_options(&request.params, &state.config);
 
-    // Create async channel for SSE events
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
+    let (events, stream) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
     let model_id_clone = model_id.clone();
+    let finish_events = events.clone();
 
     // Spawn a blocking task to handle generation
     tokio::task::spawn_blocking(move || {
@@ -96,16 +95,14 @@ async fn stream_completion(
                 // Send error and return
                 let error_chunk =
                     CompletionChunk::finish(request_id_clone, model_id_clone, "error".to_string());
-                let _ = tx.blocking_send(Ok(
-                    Event::default().data(serde_json::to_string(&error_chunk).unwrap())
-                ));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                finish_events.json(&error_chunk);
+                finish_events.done();
                 return;
             }
         };
 
         // Use model provider's streaming API
-        let tx_clone = tx.clone();
+        let token_events = finish_events.clone();
         let request_id_inner = request_id_clone.clone();
         let model_id_inner = model_id_clone.clone();
 
@@ -117,9 +114,7 @@ async fn stream_completion(
                     model_id_inner.clone(),
                     token,
                 );
-                let _ = tx_clone.blocking_send(Ok(
-                    Event::default().data(serde_json::to_string(&chunk).unwrap())
-                ));
+                token_events.json(&chunk);
             });
 
         // Send finish chunk
@@ -128,15 +123,11 @@ async fn stream_completion(
             Err(_) => "error".to_string(),
         };
         let finish = CompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
-        let _ = tx.blocking_send(Ok(
-            Event::default().data(serde_json::to_string(&finish).unwrap())
-        ));
-
-        // Send [DONE] marker
-        let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+        finish_events.json(&finish);
+        finish_events.done();
 
         // _permit is dropped here, releasing the slot
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Sse::new(stream)
 }

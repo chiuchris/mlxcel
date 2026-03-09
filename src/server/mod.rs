@@ -9,6 +9,7 @@ mod request_options;
 pub mod routes;
 mod startup;
 mod state;
+mod streaming;
 pub mod types;
 
 pub use app::create_app;

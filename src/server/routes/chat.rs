@@ -10,12 +10,11 @@ use axum::{
 };
 use futures::stream::Stream;
 use std::convert::Infallible;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::chat_template::ChatMessage;
 use crate::server::media::extract_chat_image_data;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
+use crate::server::streaming::sse_channel;
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
     SamplingParams,
@@ -125,12 +124,12 @@ async fn stream_chat_completion(
 
     let options = build_generate_options(&request.params, &state.config);
 
-    // Create async channel for SSE events
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
+    let (events, stream) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
     let model_id_clone = model_id.clone();
+    let finish_events = events.clone();
 
     // Spawn a blocking task to handle generation
     tokio::task::spawn_blocking(move || {
@@ -144,10 +143,8 @@ async fn stream_chat_completion(
                     model_id_clone,
                     "error".to_string(),
                 );
-                let _ = tx.blocking_send(Ok(
-                    Event::default().data(serde_json::to_string(&error_chunk).unwrap())
-                ));
-                let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+                finish_events.json(&error_chunk);
+                finish_events.done();
                 return;
             }
         };
@@ -155,12 +152,10 @@ async fn stream_chat_completion(
         // Send initial chunk with role
         let initial =
             ChatCompletionChunk::initial(request_id_clone.clone(), model_id_clone.clone());
-        let _ = tx.blocking_send(Ok(
-            Event::default().data(serde_json::to_string(&initial).unwrap())
-        ));
+        finish_events.json(&initial);
 
         // Use model provider's streaming API
-        let tx_clone = tx.clone();
+        let token_events = finish_events.clone();
         let request_id_inner = request_id_clone.clone();
         let model_id_inner = model_id_clone.clone();
 
@@ -174,9 +169,7 @@ async fn stream_chat_completion(
                     model_id_inner.clone(),
                     token,
                 );
-                let _ = tx_clone.blocking_send(Ok(
-                    Event::default().data(serde_json::to_string(&chunk).unwrap())
-                ));
+                token_events.json(&chunk);
             },
         );
 
@@ -186,17 +179,13 @@ async fn stream_chat_completion(
             Err(_) => "error".to_string(),
         };
         let finish = ChatCompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
-        let _ = tx.blocking_send(Ok(
-            Event::default().data(serde_json::to_string(&finish).unwrap())
-        ));
-
-        // Send [DONE] marker
-        let _ = tx.blocking_send(Ok(Event::default().data("[DONE]")));
+        finish_events.json(&finish);
+        finish_events.done();
 
         // _permit is dropped here, releasing the slot
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Sse::new(stream)
 }
 
 /// Build ServerGenerateOptions using request params with server config as defaults

@@ -14,10 +14,9 @@ use axum::{
     },
 };
 use futures::stream::Stream;
-use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
+use crate::server::streaming::sse_channel;
 use crate::server::types::{
     ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
 };
@@ -108,19 +107,20 @@ async fn stream_native_completion(
     let options = build_native_options(&request, &state);
     let prompt = request.prompt.clone();
 
-    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
+    let (events, stream) = sse_channel(100);
+    let finish_events = events.clone();
 
     tokio::task::spawn_blocking(move || {
         let _permit = match permit {
             Some(p) => p,
             None => {
                 let err = serde_json::json!({"content": "", "stop": true});
-                let _ = tx.blocking_send(Ok(Event::default().data(err.to_string())));
+                finish_events.json(&err);
                 return;
             }
         };
 
-        let tx_clone = tx.clone();
+        let token_events = finish_events.clone();
 
         let result = state
             .model_provider
@@ -129,7 +129,7 @@ async fn stream_native_completion(
                     "content": token,
                     "stop": false,
                 });
-                let _ = tx_clone.blocking_send(Ok(Event::default().data(chunk.to_string())));
+                token_events.json(&chunk);
             });
 
         // Send final chunk
@@ -142,10 +142,10 @@ async fn stream_native_completion(
             "stop": true,
             "stop_type": if stop { "stop" } else { "limit" },
         });
-        let _ = tx.blocking_send(Ok(Event::default().data(final_chunk.to_string())));
+        finish_events.json(&final_chunk);
     });
 
-    Sse::new(ReceiverStream::new(rx))
+    Sse::new(stream)
 }
 
 fn build_native_options(
