@@ -4,6 +4,7 @@ pub mod app;
 pub mod chat_template;
 mod config;
 pub mod model_provider;
+mod request_options;
 pub mod routes;
 mod startup;
 mod state;

@@ -1,8 +1,5 @@
 //! Chat completions endpoint
 
-use std::convert::Infallible;
-use std::sync::Arc;
-
 use axum::{
     Json,
     extract::State,
@@ -12,11 +9,12 @@ use axum::{
     },
 };
 use futures::stream::Stream;
+use std::convert::Infallible;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::sampling::{ResolvedSamplingParams, build_sampling_config};
 use crate::server::chat_template::ChatMessage;
+use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
     SamplingParams,
@@ -203,54 +201,28 @@ async fn stream_chat_completion(
 /// Build ServerGenerateOptions using request params with server config as defaults
 pub(crate) fn build_generate_options(
     params: &SamplingParams,
-    config: &Arc<ServerConfig>,
+    config: &ServerConfig,
 ) -> ServerGenerateOptions {
-    let temperature = params.temperature.unwrap_or(config.default_temperature);
-    let top_k = params
-        .top_k
-        .map(|k| k as i32)
-        .unwrap_or(config.default_top_k);
-    let top_p = params.top_p.unwrap_or(config.default_top_p);
-    let repetition_penalty = params
-        .repetition_penalty
-        .unwrap_or(config.default_repetition_penalty);
-    let min_p = params.min_p.unwrap_or(config.default_min_p);
-    let seed = params.seed.or(config.default_seed);
-    let frequency_penalty = params
-        .frequency_penalty
-        .unwrap_or(config.default_frequency_penalty);
-    let presence_penalty = params
-        .presence_penalty
-        .unwrap_or(config.default_presence_penalty);
-
-    let sampling = build_sampling_config(ResolvedSamplingParams {
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        seed,
-        repetition_penalty,
-        dry_multiplier: params
-            .dry_multiplier
-            .unwrap_or(config.default_dry_multiplier),
-        dry_base: params.dry_base.unwrap_or(config.default_dry_base),
-        dry_allowed_length: params
-            .dry_allowed_length
-            .unwrap_or(config.default_dry_allowed_length),
-        dry_penalty_last_n: params
-            .dry_penalty_last_n
-            .unwrap_or(config.default_dry_penalty_last_n),
-        dry_sequence_breakers: params.dry_sequence_breakers.clone().unwrap_or_default(),
-        frequency_penalty,
-        presence_penalty,
-        stop_token_ids: Vec::new(),
-    });
-
-    ServerGenerateOptions {
-        max_tokens: params.max_tokens.unwrap_or(config.default_max_tokens),
-        sampling,
-        stop_sequences: params.stop.clone(),
-    }
+    build_server_generate_options(
+        config,
+        RequestOptionOverrides {
+            max_tokens: params.max_tokens,
+            temperature: params.temperature,
+            top_k: params.top_k.map(|k| k as i32),
+            top_p: params.top_p,
+            min_p: params.min_p,
+            repetition_penalty: params.repetition_penalty,
+            seed: params.seed,
+            frequency_penalty: params.frequency_penalty,
+            presence_penalty: params.presence_penalty,
+            dry_multiplier: params.dry_multiplier,
+            dry_base: params.dry_base,
+            dry_allowed_length: params.dry_allowed_length,
+            dry_penalty_last_n: params.dry_penalty_last_n,
+            dry_sequence_breakers: params.dry_sequence_breakers.clone(),
+            stop_sequences: params.stop.clone(),
+        },
+    )
 }
 
 /// Extract image data from multimodal chat messages

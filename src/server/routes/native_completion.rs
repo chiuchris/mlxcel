@@ -17,11 +17,11 @@ use futures::stream::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::sampling::{ResolvedSamplingParams, build_sampling_config};
+use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::types::{
     ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
 };
-use crate::server::{AppState, ServerGenerateOptions};
+use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
 
 /// POST /completion
 pub async fn native_completion(
@@ -152,48 +152,31 @@ fn build_native_options(
     request: &NativeCompletionRequest,
     state: &AppState,
 ) -> ServerGenerateOptions {
-    let config = &state.config;
-    let temperature = request.temperature.unwrap_or(config.default_temperature);
-    let top_k = request.top_k.unwrap_or(config.default_top_k);
-    let top_p = request.top_p.unwrap_or(config.default_top_p);
-    let repeat_penalty = request
-        .repeat_penalty
-        .unwrap_or(config.default_repetition_penalty);
-    let min_p = request.min_p.unwrap_or(config.default_min_p);
-    let seed = request.seed.or(config.default_seed);
-    let frequency_penalty = request
-        .frequency_penalty
-        .unwrap_or(config.default_frequency_penalty);
-    let presence_penalty = request
-        .presence_penalty
-        .unwrap_or(config.default_presence_penalty);
+    build_native_generate_options(&state.config, request)
+}
 
-    let sampling = build_sampling_config(ResolvedSamplingParams {
-        temperature,
-        top_k,
-        top_p,
-        min_p,
-        seed,
-        repetition_penalty: repeat_penalty,
-        dry_multiplier: request
-            .dry_multiplier
-            .unwrap_or(config.default_dry_multiplier),
-        dry_base: request.dry_base.unwrap_or(config.default_dry_base),
-        dry_allowed_length: request
-            .dry_allowed_length
-            .unwrap_or(config.default_dry_allowed_length),
-        dry_penalty_last_n: request
-            .dry_penalty_last_n
-            .unwrap_or(config.default_dry_penalty_last_n),
-        dry_sequence_breakers: request.dry_sequence_breakers.clone().unwrap_or_default(),
-        frequency_penalty,
-        presence_penalty,
-        stop_token_ids: Vec::new(),
-    });
-
-    ServerGenerateOptions {
-        max_tokens: request.n_predict.unwrap_or(config.default_max_tokens),
-        sampling,
-        stop_sequences: request.stop.clone(),
-    }
+fn build_native_generate_options(
+    config: &ServerConfig,
+    request: &NativeCompletionRequest,
+) -> ServerGenerateOptions {
+    build_server_generate_options(
+        config,
+        RequestOptionOverrides {
+            max_tokens: request.n_predict,
+            temperature: request.temperature,
+            top_k: request.top_k,
+            top_p: request.top_p,
+            min_p: request.min_p,
+            repetition_penalty: request.repeat_penalty,
+            seed: request.seed,
+            frequency_penalty: request.frequency_penalty,
+            presence_penalty: request.presence_penalty,
+            dry_multiplier: request.dry_multiplier,
+            dry_base: request.dry_base,
+            dry_allowed_length: request.dry_allowed_length,
+            dry_penalty_last_n: request.dry_penalty_last_n,
+            dry_sequence_breakers: request.dry_sequence_breakers.clone(),
+            stop_sequences: request.stop.clone(),
+        },
+    )
 }
