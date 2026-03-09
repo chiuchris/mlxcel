@@ -1,0 +1,77 @@
+use super::{build_chat_messages, prepare_chat_request};
+use crate::server::chat_template::ChatTemplateProcessor;
+use crate::server::types::{
+    ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent, Role, SamplingParams,
+};
+
+fn request_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
+    ChatCompletionRequest {
+        model: "test-model".to_string(),
+        messages,
+        stream: false,
+        params: SamplingParams::default(),
+    }
+}
+
+#[test]
+fn build_chat_messages_flattens_text_parts() {
+    let request = request_with_messages(vec![Message {
+        role: Role::User,
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Hello".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,aGVsbG8=".to_string(),
+                },
+            },
+            ContentPart::Text {
+                text: " world".to_string(),
+            },
+        ]),
+        name: None,
+    }]);
+
+    let messages = build_chat_messages(&request);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, "user");
+    assert_eq!(messages[0].content, "Hello world");
+}
+
+#[test]
+fn prepare_chat_request_uses_template_output_and_extracts_images() {
+    let request = request_with_messages(vec![Message {
+        role: Role::User,
+        content: MessageContent::Parts(vec![
+            ContentPart::Text {
+                text: "Look".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,aGVsbG8=".to_string(),
+                },
+            },
+        ]),
+        name: None,
+    }]);
+    let processor =
+        ChatTemplateProcessor::with_template("Prompt: {{ messages[0].content }}".to_string());
+
+    let prepared = prepare_chat_request(&processor, &request);
+    assert_eq!(prepared.prompt, "Prompt: Look");
+    assert_eq!(prepared.image_data, vec![b"hello".to_vec()]);
+}
+
+#[test]
+fn prepare_chat_request_falls_back_to_simple_prompt_on_template_error() {
+    let request = request_with_messages(vec![Message {
+        role: Role::User,
+        content: MessageContent::Text("Hello".to_string()),
+        name: None,
+    }]);
+    let processor = ChatTemplateProcessor::with_template("{% if %}".to_string());
+
+    let prepared = prepare_chat_request(&processor, &request);
+    assert_eq!(prepared.prompt, request.to_prompt());
+}

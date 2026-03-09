@@ -11,8 +11,7 @@ use axum::{
 use futures::stream::Stream;
 use std::convert::Infallible;
 
-use crate::server::chat_template::ChatMessage;
-use crate::server::media::extract_chat_image_data;
+use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
 use crate::server::types::{
@@ -47,34 +46,13 @@ async fn non_stream_chat_completion(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
 
-    // Convert messages to chat template format
-    let messages: Vec<ChatMessage> = request
-        .messages
-        .iter()
-        .map(|m| ChatMessage {
-            role: m.role.as_str().to_string(),
-            content: m.content.text(),
-        })
-        .collect();
-
-    // Extract images from multimodal content
-    let image_data = extract_chat_image_data(&request);
-
-    // Apply chat template (fallback to simple format on error)
-    let prompt = match state.chat_template.apply(&messages) {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!("Chat template render failed, using fallback: {:#}", e);
-            request.to_prompt()
-        }
-    };
-
+    let prepared = prepare_chat_request(&state.chat_template, &request);
     let options = build_generate_options(&request.params, &state.config);
 
     // Generate (blocking call handled by model provider's worker thread)
     let result = state
         .model_provider
-        .generate_with_images(prompt, options, image_data)
+        .generate_with_images(prepared.prompt, options, prepared.image_data)
         .map_err(|e| ErrorResponse::new(format!("Generation error: {}", e), "server_error"))?;
 
     state.metrics.record_request(
@@ -102,26 +80,7 @@ async fn stream_chat_completion(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
-
-    // Convert messages to chat template format
-    let messages: Vec<ChatMessage> = request
-        .messages
-        .iter()
-        .map(|m| ChatMessage {
-            role: m.role.as_str().to_string(),
-            content: m.content.text(),
-        })
-        .collect();
-
-    // Extract images from multimodal content
-    let image_data = extract_chat_image_data(&request);
-
-    // Apply chat template (fallback to simple format on error for streaming)
-    let prompt = state
-        .chat_template
-        .apply(&messages)
-        .unwrap_or_else(|_| request.to_prompt());
-
+    let prepared = prepare_chat_request(&state.chat_template, &request);
     let options = build_generate_options(&request.params, &state.config);
 
     let (events, stream) = sse_channel(100);
@@ -160,9 +119,9 @@ async fn stream_chat_completion(
         let model_id_inner = model_id_clone.clone();
 
         let result = state.model_provider.generate_streaming_with_images(
-            prompt,
+            prepared.prompt,
             options,
-            image_data,
+            prepared.image_data,
             |token| {
                 let chunk = ChatCompletionChunk::content(
                     request_id_inner.clone(),

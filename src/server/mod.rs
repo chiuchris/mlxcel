@@ -1,6 +1,7 @@
 //! OpenAI/llama-server compatible HTTP server for mlxcel
 
 pub mod app;
+mod chat_request;
 pub mod chat_template;
 mod config;
 mod media;
