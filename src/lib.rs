@@ -6,6 +6,7 @@
 pub mod lora;
 pub mod models;
 pub mod multimodal;
+pub mod sampling;
 pub mod server;
 pub mod tokenizer;
 pub mod vision;

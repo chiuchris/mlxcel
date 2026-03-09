@@ -17,7 +17,7 @@ use futures::stream::Stream;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use crate::SamplingConfig;
+use crate::sampling::{ResolvedSamplingParams, build_sampling_config};
 use crate::server::types::{
     ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
 };
@@ -168,49 +168,28 @@ fn build_native_options(
         .presence_penalty
         .unwrap_or(config.default_presence_penalty);
 
-    let sampling = if temperature <= 0.0 {
-        SamplingConfig {
-            min_p,
-            seed,
-            repetition_penalty: repeat_penalty,
-            frequency_penalty,
-            presence_penalty,
-            dry_multiplier: request
-                .dry_multiplier
-                .unwrap_or(config.default_dry_multiplier),
-            dry_base: request.dry_base.unwrap_or(config.default_dry_base),
-            dry_allowed_length: request
-                .dry_allowed_length
-                .unwrap_or(config.default_dry_allowed_length),
-            dry_penalty_last_n: request
-                .dry_penalty_last_n
-                .unwrap_or(config.default_dry_penalty_last_n),
-            ..SamplingConfig::greedy()
-        }
-    } else {
-        SamplingConfig {
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            seed,
-            repetition_penalty: repeat_penalty,
-            frequency_penalty,
-            presence_penalty,
-            dry_multiplier: request
-                .dry_multiplier
-                .unwrap_or(config.default_dry_multiplier),
-            dry_base: request.dry_base.unwrap_or(config.default_dry_base),
-            dry_allowed_length: request
-                .dry_allowed_length
-                .unwrap_or(config.default_dry_allowed_length),
-            dry_penalty_last_n: request
-                .dry_penalty_last_n
-                .unwrap_or(config.default_dry_penalty_last_n),
-            dry_sequence_breakers: request.dry_sequence_breakers.clone().unwrap_or_default(),
-            stop_token_ids: Vec::new(),
-        }
-    };
+    let sampling = build_sampling_config(ResolvedSamplingParams {
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        seed,
+        repetition_penalty: repeat_penalty,
+        dry_multiplier: request
+            .dry_multiplier
+            .unwrap_or(config.default_dry_multiplier),
+        dry_base: request.dry_base.unwrap_or(config.default_dry_base),
+        dry_allowed_length: request
+            .dry_allowed_length
+            .unwrap_or(config.default_dry_allowed_length),
+        dry_penalty_last_n: request
+            .dry_penalty_last_n
+            .unwrap_or(config.default_dry_penalty_last_n),
+        dry_sequence_breakers: request.dry_sequence_breakers.clone().unwrap_or_default(),
+        frequency_penalty,
+        presence_penalty,
+        stop_token_ids: Vec::new(),
+    });
 
     ServerGenerateOptions {
         max_tokens: request.n_predict.unwrap_or(config.default_max_tokens),

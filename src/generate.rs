@@ -3,8 +3,9 @@ use std::io::{self, Write as IoWrite};
 use std::time::Instant;
 
 use mlxcel::{
-    CxxGenerator, GenerationStats, LanguageModel, SamplingConfig, SpeculativeGenerator,
-    initialize_runtime, load_model, load_model_with_adapter,
+    CxxGenerator, GenerationStats, LanguageModel, SpeculativeGenerator, initialize_runtime,
+    load_model, load_model_with_adapter,
+    sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
 };
 
@@ -68,35 +69,22 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let config_eos = mlxcel::read_eos_token_ids(&args.model.model);
 
     // Create sampling config
-    let sampling_config = if args.sampling.temp <= 0.0 {
-        SamplingConfig {
-            min_p: args.sampling.min_p,
-            repetition_penalty: args.sampling.repetition_penalty,
-            dry_multiplier: args.sampling.dry_multiplier,
-            dry_base: args.sampling.dry_base,
-            dry_allowed_length: args.sampling.dry_allowed_length,
-            dry_penalty_last_n: args.sampling.dry_penalty_last_n,
-            stop_token_ids: config_eos.clone(),
-            ..SamplingConfig::greedy()
-        }
-    } else {
-        SamplingConfig {
-            temperature: args.sampling.temp,
-            top_k: args.sampling.top_k,
-            top_p: args.sampling.top_p,
-            min_p: args.sampling.min_p,
-            seed: None,
-            repetition_penalty: args.sampling.repetition_penalty,
-            dry_multiplier: args.sampling.dry_multiplier,
-            dry_base: args.sampling.dry_base,
-            dry_allowed_length: args.sampling.dry_allowed_length,
-            dry_penalty_last_n: args.sampling.dry_penalty_last_n,
-            dry_sequence_breakers: Vec::new(),
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-            stop_token_ids: config_eos,
-        }
-    };
+    let sampling_config = build_sampling_config(ResolvedSamplingParams {
+        temperature: args.sampling.temp,
+        top_k: args.sampling.top_k,
+        top_p: args.sampling.top_p,
+        min_p: args.sampling.min_p,
+        seed: None,
+        repetition_penalty: args.sampling.repetition_penalty,
+        dry_multiplier: args.sampling.dry_multiplier,
+        dry_base: args.sampling.dry_base,
+        dry_allowed_length: args.sampling.dry_allowed_length,
+        dry_penalty_last_n: args.sampling.dry_penalty_last_n,
+        dry_sequence_breakers: Vec::new(),
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
+        stop_token_ids: config_eos,
+    });
 
     // Check for VLM image mode
     let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
