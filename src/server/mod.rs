@@ -3,6 +3,7 @@
 pub mod app;
 pub mod chat_template;
 mod config;
+mod media;
 pub mod model_provider;
 mod request_options;
 pub mod routes;

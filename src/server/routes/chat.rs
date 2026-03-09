@@ -14,6 +14,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::server::chat_template::ChatMessage;
+use crate::server::media::extract_chat_image_data;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
@@ -58,7 +59,7 @@ async fn non_stream_chat_completion(
         .collect();
 
     // Extract images from multimodal content
-    let image_data = extract_image_data(&request);
+    let image_data = extract_chat_image_data(&request);
 
     // Apply chat template (fallback to simple format on error)
     let prompt = match state.chat_template.apply(&messages) {
@@ -114,7 +115,7 @@ async fn stream_chat_completion(
         .collect();
 
     // Extract images from multimodal content
-    let image_data = extract_image_data(&request);
+    let image_data = extract_chat_image_data(&request);
 
     // Apply chat template (fallback to simple format on error for streaming)
     let prompt = state
@@ -223,50 +224,4 @@ pub(crate) fn build_generate_options(
             stop_sequences: params.stop.clone(),
         },
     )
-}
-
-/// Extract image data from multimodal chat messages
-///
-/// Supports:
-/// - base64 data URIs: `data:image/png;base64,...`
-/// - file:// URLs: `file:///path/to/image.jpg`
-fn extract_image_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
-    let urls = request.image_urls();
-    if urls.is_empty() {
-        return Vec::new();
-    }
-
-    urls.iter()
-        .filter_map(|url| {
-            if url.starts_with("data:") {
-                // Parse base64 data URI: data:image/...;base64,<data>
-                if let Some(comma_pos) = url.find(',') {
-                    let b64_data = &url[comma_pos + 1..];
-                    use base64::Engine;
-                    match base64::engine::general_purpose::STANDARD.decode(b64_data) {
-                        Ok(bytes) => Some(bytes),
-                        Err(e) => {
-                            tracing::warn!("Failed to decode base64 image: {}", e);
-                            None
-                        }
-                    }
-                } else {
-                    tracing::warn!("Invalid data URI format");
-                    None
-                }
-            } else if let Some(path) = url.strip_prefix("file://") {
-                // Read from local file
-                match std::fs::read(path) {
-                    Ok(bytes) => Some(bytes),
-                    Err(e) => {
-                        tracing::warn!("Failed to read image file {}: {}", path, e);
-                        None
-                    }
-                }
-            } else {
-                tracing::warn!("Unsupported image URL scheme: {}", url);
-                None
-            }
-        })
-        .collect()
 }
