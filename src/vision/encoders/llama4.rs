@@ -14,7 +14,7 @@
 //! Used by: Llama 4 Vision
 
 use super::{VisionEncoder, VisionEncoderOutput};
-use mlxcel_core::layers::{LayerNorm, Linear};
+use mlxcel_core::layers::{LayerNorm, Linear, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -324,10 +324,10 @@ fn apply_vision_rope(
 /// Multi-head attention for Llama4 vision encoder
 /// Uses biases on all projections and vision RoPE
 struct VisionAttention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: UnifiedLinear,
+    k_proj: UnifiedLinear,
+    v_proj: UnifiedLinear,
+    o_proj: UnifiedLinear,
     num_heads: usize,
     head_dim: usize,
     scale: f32,
@@ -338,11 +338,17 @@ impl VisionAttention {
         weights: &WeightMap,
         prefix: &str,
         config: &Llama4VisionConfig,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
-        let q_proj = Linear::from_weights(weights, &format!("{}.q_proj", prefix))?;
-        let k_proj = Linear::from_weights(weights, &format!("{}.k_proj", prefix))?;
-        let v_proj = Linear::from_weights(weights, &format!("{}.v_proj", prefix))?;
-        let o_proj = Linear::from_weights(weights, &format!("{}.o_proj", prefix))?;
+        let q_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
+        let k_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
+        let v_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
+        let o_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = config.hidden_size / config.num_attention_heads;
         let scale = (head_dim as f32).powf(-0.5);
@@ -415,30 +421,22 @@ impl VisionAttention {
 /// Vision MLP: fc1 -> GELU(fast) -> fc2
 /// When is_projector=true, applies double GELU: fc1 -> GELU -> fc2 -> GELU
 struct VisionMLP {
-    fc1: Linear,
-    fc2: Linear,
+    fc1: UnifiedLinear,
+    fc2: UnifiedLinear,
     is_projector: bool,
 }
 
 impl VisionMLP {
-    fn from_weights(weights: &WeightMap, prefix: &str, bias: bool) -> Result<Self, String> {
-        let fc1 = if bias {
-            Linear::from_weights(weights, &format!("{}.fc1", prefix))?
-        } else {
-            // No bias variant - load weight only
-            let w = weights
-                .get(&format!("{}.fc1.weight", prefix))
-                .ok_or_else(|| format!("Missing {}.fc1.weight", prefix))?;
-            Linear::new(mlxcel_core::copy(w), None)
-        };
-        let fc2 = if bias {
-            Linear::from_weights(weights, &format!("{}.fc2", prefix))?
-        } else {
-            let w = weights
-                .get(&format!("{}.fc2.weight", prefix))
-                .ok_or_else(|| format!("Missing {}.fc2.weight", prefix))?;
-            Linear::new(mlxcel_core::copy(w), None)
-        };
+    fn from_weights(
+        weights: &WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+    ) -> Result<Self, String> {
+        let fc1 =
+            UnifiedLinear::from_weights(weights, &format!("{}.fc1", prefix), group_size, bits)?;
+        let fc2 =
+            UnifiedLinear::from_weights(weights, &format!("{}.fc2", prefix), group_size, bits)?;
         Ok(Self {
             fc1,
             fc2,
@@ -475,14 +473,17 @@ impl VisionEncoderLayer {
         weights: &WeightMap,
         prefix: &str,
         config: &Llama4VisionConfig,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
-        let self_attn =
-            VisionAttention::from_weights(weights, &format!("{}.self_attn", prefix), config)?;
-        let mlp = VisionMLP::from_weights(
+        let self_attn = VisionAttention::from_weights(
             weights,
-            &format!("{}.mlp", prefix),
-            true, // encoder MLP has bias
+            &format!("{}.self_attn", prefix),
+            config,
+            group_size,
+            bits,
         )?;
+        let mlp = VisionMLP::from_weights(weights, &format!("{}.mlp", prefix), group_size, bits)?;
 
         // LayerNorm with bias
         let ln_prefix = format!("{}.input_layernorm", prefix);
@@ -551,12 +552,11 @@ impl PixelShuffleMLP {
         weights: &WeightMap,
         prefix: &str,
         _config: &Llama4VisionConfig,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
-        let mut mlp = VisionMLP::from_weights(
-            weights,
-            &format!("{}.mlp", prefix),
-            false, // projector MLP has no bias
-        )?;
+        let mut mlp =
+            VisionMLP::from_weights(weights, &format!("{}.mlp", prefix), group_size, bits)?;
         mlp.is_projector = true; // enables double GELU
 
         Ok(Self {
@@ -629,6 +629,8 @@ impl Llama4VisionModel {
         weights: &WeightMap,
         config: &Llama4VisionConfig,
         prefix: &str,
+        group_size: i32,
+        bits: i32,
     ) -> Result<Self, String> {
         // Patch embedding (UnfoldConvolution)
         let patch_embedding = UnfoldConvolution::from_weights(
@@ -673,13 +675,20 @@ impl Llama4VisionModel {
                 weights,
                 &format!("{}.model.layers.{}", prefix, i),
                 config,
+                group_size,
+                bits,
             )?;
             layers.push(layer);
         }
 
         // Vision adapter (PixelShuffleMLP)
-        let vision_adapter =
-            PixelShuffleMLP::from_weights(weights, &format!("{}.vision_adapter", prefix), config)?;
+        let vision_adapter = PixelShuffleMLP::from_weights(
+            weights,
+            &format!("{}.vision_adapter", prefix),
+            config,
+            group_size,
+            bits,
+        )?;
 
         // Precompute RoPE
         let rope = VisionRotaryEmbedding::new(config);

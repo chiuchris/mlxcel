@@ -445,11 +445,16 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
         .map_err(|e| anyhow::anyhow!("Failed to load Llama4 text model: {}", e))?;
     let text_wrapper = models::Llama4Wrapper::new(text_model);
 
-    let vision_encoder =
-        Llama4VisionModel::from_weights(&weights, &vision_config, llama4_vision_prefix(&weights))
-            .map_err(|e| anyhow::anyhow!("Failed to load Llama4 vision encoder: {}", e))?;
-
     let (quant_group_size, quant_bits) = llama4_quantization_params(&full_config);
+    let vision_encoder = Llama4VisionModel::from_weights(
+        &weights,
+        &vision_config,
+        llama4_vision_prefix(&weights),
+        quant_group_size,
+        quant_bits,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Llama4 vision encoder: {}", e))?;
+
     let connector = LinearProjector::from_weights(
         &weights,
         "multi_modal_projector",
