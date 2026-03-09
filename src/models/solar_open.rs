@@ -136,7 +136,11 @@ fn gptq_to_mlx_tensors(
     qzeros: Option<&UniquePtr<MlxArray>>,
     bits: i32,
     _group_size: i32,
-) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+) -> (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+) {
     let pack_factor = 32 / bits;
     let qw_shape = mlxcel_core::array_shape(qweight);
     // auto_gptq: qweight is [in_features / pack_factor, out_features]
@@ -229,11 +233,7 @@ fn unpack_gptq_cols(packed: &MlxArray, pack_factor: i32) -> UniquePtr<MlxArray> 
 ///
 /// Input: [out_features, in_features]
 /// Output: [out_features, in_features / pack_factor]
-fn pack_mlx_4bit(
-    values: &MlxArray,
-    in_features: i32,
-    out_features: i32,
-) -> UniquePtr<MlxArray> {
+fn pack_mlx_4bit(values: &MlxArray, in_features: i32, out_features: i32) -> UniquePtr<MlxArray> {
     let pack_factor = 8; // 32 / 4 bits
     let packed_in = in_features / pack_factor;
 
@@ -314,8 +314,7 @@ fn stack_expert_weights(weights: &mut WeightMap, config: &ModelArgs) {
 
                 if expert_tensors.len() == n_experts {
                     let stacked = stack_arrays(&expert_tensors, 0);
-                    let stacked_key =
-                        format!("{}.mlp.switch_mlp.{}.{}", prefix, proj, suffix);
+                    let stacked_key = format!("{}.mlp.switch_mlp.{}.{}", prefix, proj, suffix);
                     weights.insert(stacked_key, stacked);
                 }
             }
@@ -663,12 +662,8 @@ impl MoE {
         let e_score_correction_bias =
             get_weight_copy(weights, &format!("{}.gate.e_score_correction_bias", prefix))?;
 
-        let switch_mlp = SwitchGLU::from_weights(
-            weights,
-            &format!("{}.switch_mlp", prefix),
-            group_size,
-            bits,
-        )?;
+        let switch_mlp =
+            SwitchGLU::from_weights(weights, &format!("{}.switch_mlp", prefix), group_size, bits)?;
 
         let shared_expert = if args.n_shared_experts.is_some() {
             Some(SharedExpertMLP::from_weights(
@@ -710,7 +705,6 @@ impl FFN {
             FFN::Moe(moe) => moe.forward(x),
         }
     }
-
 }
 
 // ============================================================================
@@ -911,7 +905,6 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .map(|w| mlxcel_core::copy(w))
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
-
 
 // ============================================================================
 // Tests

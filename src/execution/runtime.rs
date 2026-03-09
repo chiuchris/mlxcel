@@ -98,9 +98,15 @@ fn resolve_wired_limit() -> Option<usize> {
 fn parse_memory_size(s: &str) -> Option<usize> {
     let s = s.trim().to_ascii_uppercase();
     if let Some(n) = s.strip_suffix("GB") {
-        n.trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0) as usize)
+        n.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| (v * 1024.0 * 1024.0 * 1024.0) as usize)
     } else if let Some(n) = s.strip_suffix("MB") {
-        n.trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0) as usize)
+        n.trim()
+            .parse::<f64>()
+            .ok()
+            .map(|v| (v * 1024.0 * 1024.0) as usize)
     } else {
         s.parse::<usize>().ok()
     }

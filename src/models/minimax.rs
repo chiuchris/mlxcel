@@ -141,14 +141,7 @@ impl Attention {
             1.0,
             offset,
         );
-        let k = mlxcel_core::fast_rope(
-            &k,
-            self.rope_dims,
-            false,
-            self.rope_base,
-            1.0,
-            offset,
-        );
+        let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
 
         // Update KV cache
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
@@ -169,8 +162,7 @@ impl Attention {
 
         // Transpose back and reshape
         let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
-        let attn_out =
-            mlxcel_core::reshape(&attn_out, &[b, l, self.num_heads * self.head_dim]);
+        let attn_out = mlxcel_core::reshape(&attn_out, &[b, l, self.num_heads * self.head_dim]);
 
         self.o_proj.forward(&attn_out)
     }
@@ -194,10 +186,8 @@ impl Attention {
 
         // Load Q/K normalization weights (optional)
         let (q_norm, k_norm) = if args.use_qk_norm {
-            let q_norm_weight =
-                get_weight_copy(weights, &format!("{}.q_norm.weight", prefix))?;
-            let k_norm_weight =
-                get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?;
+            let q_norm_weight = get_weight_copy(weights, &format!("{}.q_norm.weight", prefix))?;
+            let k_norm_weight = get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?;
             (
                 Some(RMSNorm::new(q_norm_weight, args.rms_norm_eps)),
                 Some(RMSNorm::new(k_norm_weight, args.rms_norm_eps)),
