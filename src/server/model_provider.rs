@@ -260,34 +260,8 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
     ) -> Result<GenerationResult> {
-        let (response_tx, response_rx) = mpsc::channel();
-
-        self.request_tx
-            .send(ModelRequest::Generate {
-                prompt,
-                options,
-                images,
-                response_tx,
-            })
-            .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
-
-        // Collect all tokens and wait for done
-        loop {
-            match response_rx.recv() {
-                Ok(GenerateEvent::Token(_)) => {
-                    // Ignore tokens for non-streaming
-                }
-                Ok(GenerateEvent::Done(r)) => {
-                    return Ok(r);
-                }
-                Ok(GenerateEvent::Error(e)) => {
-                    return Err(anyhow::anyhow!(e));
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("Response channel closed"));
-                }
-            }
-        }
+        let response_rx = self.send_generate_request(prompt, options, images)?;
+        drain_generation_events(response_rx, |_| {})
     }
 
     /// Generate text with streaming callback
@@ -309,11 +283,21 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
-        mut callback: F,
+        callback: F,
     ) -> Result<GenerationResult>
     where
         F: FnMut(String),
     {
+        let response_rx = self.send_generate_request(prompt, options, images)?;
+        drain_generation_events(response_rx, callback)
+    }
+
+    fn send_generate_request(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+    ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();
 
         self.request_tx
@@ -325,22 +309,23 @@ impl ModelProvider {
             })
             .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
 
-        // Process events
-        loop {
-            match response_rx.recv() {
-                Ok(GenerateEvent::Token(token)) => {
-                    callback(token);
-                }
-                Ok(GenerateEvent::Done(r)) => {
-                    return Ok(r);
-                }
-                Ok(GenerateEvent::Error(e)) => {
-                    return Err(anyhow::anyhow!(e));
-                }
-                Err(_) => {
-                    return Err(anyhow::anyhow!("Response channel closed"));
-                }
-            }
+        Ok(response_rx)
+    }
+}
+
+fn drain_generation_events<F>(
+    response_rx: mpsc::Receiver<GenerateEvent>,
+    mut on_token: F,
+) -> Result<GenerationResult>
+where
+    F: FnMut(String),
+{
+    loop {
+        match response_rx.recv() {
+            Ok(GenerateEvent::Token(token)) => on_token(token),
+            Ok(GenerateEvent::Done(result)) => return Ok(result),
+            Ok(GenerateEvent::Error(err)) => return Err(anyhow::anyhow!(err)),
+            Err(_) => return Err(anyhow::anyhow!("Response channel closed")),
         }
     }
 }
@@ -355,3 +340,7 @@ impl Drop for ModelProvider {
 // ModelProvider is Send + Sync because it only contains channels and atomics
 unsafe impl Send for ModelProvider {}
 unsafe impl Sync for ModelProvider {}
+
+#[cfg(test)]
+#[path = "model_provider_tests.rs"]
+mod tests;
