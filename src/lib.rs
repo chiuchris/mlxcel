@@ -5,13 +5,10 @@
 
 pub mod lora;
 pub mod models;
-pub mod phi3v_prompt;
-pub mod qwen_vl;
+pub mod multimodal;
 pub mod server;
 pub mod tokenizer;
 pub mod vision;
-pub mod vlm_prompt;
-pub mod vlm_runtime;
 
 mod loaded_model;
 mod loading;
@@ -21,6 +18,7 @@ mod runtime;
 pub use mlxcel_core::generate;
 pub use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
 pub use mlxcel_core::speculative::SpeculativeGenerator;
+pub use multimodal::{phi3v_prompt, qwen_vl, vlm_prompt, vlm_runtime};
 
 // Re-export split modules
 pub use loaded_model::LoadedModel;
