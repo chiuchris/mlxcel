@@ -7,6 +7,7 @@
 use std::fmt;
 
 const RUNTIME_DEVICE_ENV: &str = "MLXCEL_DEVICE";
+const WIRED_LIMIT_ENV: &str = "MLXCEL_WIRED_LIMIT";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuntimeDevice {
@@ -51,9 +52,7 @@ pub fn initialize_runtime() -> RuntimeSetup {
     };
 
     let wired_limit_bytes = if device.uses_gpu() {
-        let max_memory = mlxcel_core::gpu_max_memory_size();
-        mlxcel_core::set_wired_limit(max_memory);
-        Some(max_memory)
+        resolve_wired_limit()
     } else {
         None
     };
@@ -72,6 +71,38 @@ fn resolve_runtime_device(value: Option<&str>) -> (RuntimeDevice, Option<String>
             None => (RuntimeDevice::Gpu, Some(raw.to_owned())),
         },
         None => (RuntimeDevice::Gpu, None),
+    }
+}
+
+/// Resolve wired memory limit from MLXCEL_WIRED_LIMIT env var.
+///
+/// - Not set or "0": no wired limit (default, matches Python mlx-lm behavior)
+/// - "max": set to gpu_max_memory_size (previous default behavior)
+/// - Number (bytes) or "NGB"/"NMB": explicit limit
+fn resolve_wired_limit() -> Option<usize> {
+    let raw = std::env::var(WIRED_LIMIT_ENV).ok();
+    let limit = match raw.as_deref() {
+        None | Some("") | Some("0") => return None,
+        Some("max") => mlxcel_core::gpu_max_memory_size(),
+        Some(s) => parse_memory_size(s).unwrap_or(0),
+    };
+    if limit > 0 {
+        mlxcel_core::set_wired_limit(limit);
+        Some(limit)
+    } else {
+        None
+    }
+}
+
+/// Parse a memory size string: plain bytes, "NGB", or "NMB".
+fn parse_memory_size(s: &str) -> Option<usize> {
+    let s = s.trim().to_ascii_uppercase();
+    if let Some(n) = s.strip_suffix("GB") {
+        n.trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0 * 1024.0) as usize)
+    } else if let Some(n) = s.strip_suffix("MB") {
+        n.trim().parse::<f64>().ok().map(|v| (v * 1024.0 * 1024.0) as usize)
+    } else {
+        s.parse::<usize>().ok()
     }
 }
 

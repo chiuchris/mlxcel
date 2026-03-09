@@ -319,6 +319,12 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
             "Wired memory limit: {:.1} GB",
             max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
         );
+    } else if runtime.device == crate::RuntimeDevice::Gpu {
+        let max_memory = mlxcel_core::gpu_max_memory_size();
+        tracing::info!(
+            "GPU memory: {:.1} GB (no wired limit)",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
     }
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;

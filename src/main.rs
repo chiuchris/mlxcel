@@ -16,7 +16,15 @@ mod commands;
     version,
     about = "High-performance LLM/VLM/VLA inference on Apple Silicon",
     long_about = None,
-    after_help = "For more information, visit: https://github.com/lablup/mlxcel"
+    after_help = "\
+Environment Variables:
+  MLXCEL_DEVICE          Runtime device: \"gpu\" (default), \"cpu\"
+  MLXCEL_WIRED_LIMIT     GPU wired memory limit (default: none, like Python mlx-lm)
+                           \"max\"  — pin all GPU memory (may OOM on large models)
+                           \"0\"    — no limit (default)
+                           \"96GB\" — explicit limit (supports GB, MB, or bytes)
+
+For more information, visit: https://github.com/lablup/mlxcel"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -412,6 +420,7 @@ fn print_supported_models() {
     println!("  GLM:              GLM4, GLM4 MoE");
     println!("  ExaOne:           ExaOne 3/4, ExaOne MoE");
     println!("  OLMo:             OLMo 1/2/3, OLMoE");
+    println!("  MiniMax:          MiniMax-M2 (MoE, 256 experts)");
     println!("  Others:           StarCoder2, StableLM, Baichuan, MiniCPM 1/3");
     println!();
 

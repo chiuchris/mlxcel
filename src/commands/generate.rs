@@ -54,6 +54,12 @@ fn print_runtime_setup(runtime: &RuntimeSetup) {
             "Wired memory limit: {:.1} GB",
             max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
         );
+    } else if runtime.device == mlxcel::RuntimeDevice::Gpu {
+        let max_memory = mlxcel_core::gpu_max_memory_size();
+        println!(
+            "GPU memory: {:.1} GB (no wired limit)",
+            max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
+        );
     }
 }
 
