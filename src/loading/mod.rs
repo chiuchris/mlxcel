@@ -1,3 +1,8 @@
+//! Shared model-loading entry points and routing helpers.
+//!
+//! Family-specific registries live in sibling modules while this file keeps the
+//! public `load_model*` APIs thin and focused on route selection.
+
 use anyhow::Result;
 use serde::de::DeserializeOwned;
 use std::fmt::Display;
@@ -15,10 +20,14 @@ mod special;
 mod vlm;
 
 use self::config_backed::{
-    try_load_config_backed_model_from_dir, try_load_config_backed_model_from_weights,
+    is_config_backed_model_type, try_load_config_backed_model_from_dir,
+    try_load_config_backed_model_from_weights,
 };
-use self::nonstandard::try_load_nonstandard_model_from_dir;
-use self::special::{adapter_loading_unsupported_message, try_load_special_model_from_weights};
+use self::nonstandard::{is_nonstandard_model_type, try_load_nonstandard_model_from_dir};
+use self::special::{
+    adapter_loading_unsupported_message, is_special_weight_model_type,
+    try_load_special_model_from_weights,
+};
 use self::vlm::*;
 
 /// Resolve model path: if a file is given, use its parent directory.
@@ -77,6 +86,103 @@ fn qwen35_vlm_kind(model_type: ModelType) -> Option<Qwen35VlmKind> {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_vlm_model_type(model_type: ModelType) -> bool {
+    matches!(
+        model_type,
+        ModelType::Llama4VLM
+            | ModelType::Qwen35VLM
+            | ModelType::Qwen35MoeVLM
+            | ModelType::Gemma3VLM
+            | ModelType::LlavaVLM
+            | ModelType::LlavaBunnyVLM
+            | ModelType::AyaVisionVLM
+            | ModelType::PaliGemmaVLM
+            | ModelType::PixtralVLM
+            | ModelType::Mistral3VLM
+            | ModelType::Qwen2VL
+            | ModelType::Qwen25VL
+            | ModelType::Qwen3VL
+            | ModelType::Qwen3VLMoe
+            | ModelType::Gemma3nVLM
+            | ModelType::Phi3VLM
+            | ModelType::Molmo2VLM
+    )
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectoryLoadRoute {
+    /// `Mistral3` wrapper with `ministral3` text tower in `text_config`.
+    Mistral3TextWrapper,
+    /// `Mistral3` wrapper whose inner text tower should fall back to `Llama`.
+    Mistral3LlamaFallback,
+    /// Vision-language model families routed through `src/loading/vlm*.rs`.
+    Vlm,
+    /// Text families with directory loaders that do not fit the standard registry.
+    Nonstandard,
+    /// Standard config-backed text families.
+    ConfigBacked,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WeightLoadRoute {
+    /// `Llama` plus the `Mistral3` text-wrapper fallback path.
+    LlamaFamily,
+    /// Architectures that require owned weights or custom sanitization.
+    Special,
+    /// Standard config-backed text families.
+    ConfigBacked,
+}
+
+fn directory_load_route(
+    model_type: ModelType,
+    config: Option<&serde_json::Value>,
+) -> Result<DirectoryLoadRoute> {
+    if model_type == ModelType::Mistral3 {
+        return Ok(if config.is_some_and(is_ministral3_config) {
+            DirectoryLoadRoute::Mistral3TextWrapper
+        } else {
+            DirectoryLoadRoute::Mistral3LlamaFallback
+        });
+    }
+
+    if is_vlm_model_type(model_type) {
+        return Ok(DirectoryLoadRoute::Vlm);
+    }
+
+    if is_nonstandard_model_type(model_type) {
+        return Ok(DirectoryLoadRoute::Nonstandard);
+    }
+
+    if is_config_backed_model_type(model_type) {
+        return Ok(DirectoryLoadRoute::ConfigBacked);
+    }
+
+    Err(anyhow::anyhow!(
+        "Missing directory loader for model type: {:?}",
+        model_type
+    ))
+}
+
+fn weight_load_route(model_type: ModelType) -> Result<WeightLoadRoute> {
+    if matches!(model_type, ModelType::Llama | ModelType::Mistral3) {
+        return Ok(WeightLoadRoute::LlamaFamily);
+    }
+
+    if is_special_weight_model_type(model_type) {
+        return Ok(WeightLoadRoute::Special);
+    }
+
+    if is_config_backed_model_type(model_type) {
+        return Ok(WeightLoadRoute::ConfigBacked);
+    }
+
+    Err(anyhow::anyhow!(
+        "Missing weight loader for model type: {:?}",
+        model_type
+    ))
+}
+
 fn try_load_vlm_model_from_dir(
     model_type: ModelType,
     model_path: &Path,
@@ -118,6 +224,44 @@ where
     Ok(model)
 }
 
+fn load_mistral3_text_directory_variant(path_str: &str) -> Result<LoadedModel> {
+    Ok(LoadedModel::Ministral3(models::Ministral3Wrapper::new(
+        load_pair_from_dir(path_str, models::Ministral3Model::load_from_text_config)?,
+    )))
+}
+
+fn load_mistral3_llama_directory_variant(path_str: &str) -> Result<LoadedModel> {
+    Ok(LoadedModel::Llama(load_pair_from_dir(
+        path_str,
+        models::Llama3Model::load,
+    )?))
+}
+
+fn load_llama_family_from_weights(
+    model_type: ModelType,
+    config_str: &str,
+    config: &serde_json::Value,
+    weights: &mut WeightMap,
+) -> Result<LoadedModel> {
+    if model_type == ModelType::Mistral3 && is_ministral3_config(config) {
+        let text_config = config
+            .get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("Missing text_config for Ministral3"))?;
+        let args: models::ministral3::ModelArgs = serde_json::from_value(text_config.clone())
+            .map_err(|err| anyhow::anyhow!("Failed to parse text_config: {}", err))?;
+        let model = models::Ministral3Model::from_weights(weights, &args)
+            .map_err(|err| anyhow::anyhow!("{}", err))?;
+        return Ok(LoadedModel::Ministral3(models::Ministral3Wrapper::new(
+            model,
+        )));
+    }
+
+    let args: models::llama3::ModelArgs = parse_model_config(config_str)?;
+    let model = models::Llama3Model::from_weights(weights, &args)
+        .map_err(|err| anyhow::anyhow!("{}", err))?;
+    Ok(LoadedModel::Llama(model))
+}
+
 /// Read EOS token IDs from generation_config.json
 ///
 /// Returns the token IDs from the `eos_token_id` field, which can be either
@@ -140,32 +284,45 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
     let model_type = get_model_type(model_path)?;
     let path_str = model_path.to_str().unwrap();
 
-    let model = if model_type == ModelType::Mistral3 {
-        // Mistral3 is a VLM wrapper - check text_config for inner model type
+    let route = if model_type == ModelType::Mistral3 {
         let config_path = model_path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let config: serde_json::Value = parse_model_config(&config_str)?;
-
-        if is_ministral3_config(&config) {
-            // Load as Ministral3 with text_config extracted
-            LoadedModel::Ministral3(models::Ministral3Wrapper::new(load_pair_from_dir(
-                path_str,
-                models::Ministral3Model::load_from_text_config,
-            )?))
-        } else {
-            // Load as standard Llama
-            LoadedModel::Llama(load_pair_from_dir(path_str, models::Llama3Model::load)?)
-        }
-    } else if let Some(model) = try_load_vlm_model_from_dir(model_type, model_path)? {
-        model
-    } else if let Some(model) =
-        try_load_nonstandard_model_from_dir(model_type, model_path, path_str)?
-    {
-        model
+        (
+            directory_load_route(model_type, Some(&config))?,
+            Some(config),
+        )
     } else {
-        try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
-            anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
-        })?
+        (directory_load_route(model_type, None)?, None)
+    };
+
+    let model = match route {
+        (DirectoryLoadRoute::Mistral3TextWrapper, Some(_)) => {
+            load_mistral3_text_directory_variant(path_str)?
+        }
+        (DirectoryLoadRoute::Mistral3LlamaFallback, Some(_)) => {
+            load_mistral3_llama_directory_variant(path_str)?
+        }
+        (DirectoryLoadRoute::Vlm, _) => try_load_vlm_model_from_dir(model_type, model_path)?
+            .ok_or_else(|| {
+                anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
+            })?,
+        (DirectoryLoadRoute::Nonstandard, _) => {
+            try_load_nonstandard_model_from_dir(model_type, model_path, path_str)?.ok_or_else(
+                || anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type),
+            )?
+        }
+        (DirectoryLoadRoute::ConfigBacked, _) => {
+            try_load_config_backed_model_from_dir(model_type, path_str)?.ok_or_else(|| {
+                anyhow::anyhow!("Missing directory loader for model type: {:?}", model_type)
+            })?
+        }
+        (
+            DirectoryLoadRoute::Mistral3TextWrapper | DirectoryLoadRoute::Mistral3LlamaFallback,
+            None,
+        ) => {
+            unreachable!("Mistral3 routes require config context")
+        }
     };
 
     let tokenizer = tokenizer::load_tokenizer(model_path)?;
@@ -211,34 +368,21 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
         return Err(anyhow::anyhow!(message));
     }
 
-    let model = if matches!(model_type, ModelType::Llama | ModelType::Mistral3) {
-        // Check for ministral3 sub-type
-        let config: serde_json::Value = parse_model_config(&config_str)?;
-        if model_type == ModelType::Mistral3 && is_ministral3_config(&config) {
-            // Load as Ministral3 with text_config
-            let text_config = config
-                .get("text_config")
-                .ok_or_else(|| anyhow::anyhow!("Missing text_config for Ministral3"))?;
-            let args: models::ministral3::ModelArgs =
-                serde_json::from_value(text_config.clone())
-                    .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
-            let m = models::Ministral3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Ministral3(models::Ministral3Wrapper::new(m))
-        } else {
-            let args: models::llama3::ModelArgs = parse_model_config(&config_str)?;
-            let m = models::Llama3Model::from_weights(weights, &args)
-                .map_err(|e| anyhow::anyhow!("{}", e))?;
-            LoadedModel::Llama(m)
+    let model = match weight_load_route(model_type)? {
+        WeightLoadRoute::LlamaFamily => {
+            load_llama_family_from_weights(model_type, &config_str, &config_value, weights)?
         }
-    } else if let Some(model) =
-        try_load_special_model_from_weights(model_type, &config_str, weights)?
-    {
-        model
-    } else {
-        try_load_config_backed_model_from_weights(model_type, &config_str, weights)?.ok_or_else(
-            || anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type),
-        )?
+        WeightLoadRoute::Special => {
+            try_load_special_model_from_weights(model_type, &config_str, weights)?.ok_or_else(
+                || anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type),
+            )?
+        }
+        WeightLoadRoute::ConfigBacked => {
+            try_load_config_backed_model_from_weights(model_type, &config_str, weights)?
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Missing weight loader for model type: {:?}", model_type)
+                })?
+        }
     };
 
     Ok(model)

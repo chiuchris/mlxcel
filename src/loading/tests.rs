@@ -1,6 +1,7 @@
 use super::{
-    Qwen35VlmKind, is_ministral3_config, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids,
-    resolve_model_dir,
+    DirectoryLoadRoute, Qwen35VlmKind, WeightLoadRoute, directory_load_route, is_ministral3_config,
+    is_vlm_model_type, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids, resolve_model_dir,
+    weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -110,4 +111,72 @@ fn qwen35_vlm_kind_matches_supported_model_types() {
         Some(Qwen35VlmKind::Moe)
     );
     assert_eq!(qwen35_vlm_kind(ModelType::Qwen35), None);
+}
+
+#[test]
+fn is_vlm_model_type_distinguishes_multimodal_variants() {
+    assert!(is_vlm_model_type(ModelType::Qwen3VL));
+    assert!(is_vlm_model_type(ModelType::LlavaVLM));
+    assert!(!is_vlm_model_type(ModelType::Qwen35));
+    assert!(!is_vlm_model_type(ModelType::Llama));
+}
+
+#[test]
+fn directory_load_route_handles_mistral3_text_subtype() {
+    let config = json!({
+        "text_config": {
+            "model_type": "ministral3"
+        }
+    });
+
+    assert_eq!(
+        directory_load_route(ModelType::Mistral3, Some(&config)).unwrap(),
+        DirectoryLoadRoute::Mistral3TextWrapper
+    );
+}
+
+#[test]
+fn directory_load_route_handles_mistral3_llama_fallback() {
+    let config = json!({
+        "text_config": {
+            "model_type": "llama"
+        }
+    });
+
+    assert_eq!(
+        directory_load_route(ModelType::Mistral3, Some(&config)).unwrap(),
+        DirectoryLoadRoute::Mistral3LlamaFallback
+    );
+}
+
+#[test]
+fn directory_load_route_distinguishes_vlm_nonstandard_and_config_backed() {
+    assert_eq!(
+        directory_load_route(ModelType::Qwen3VL, None).unwrap(),
+        DirectoryLoadRoute::Vlm
+    );
+    assert_eq!(
+        directory_load_route(ModelType::Qwen35, None).unwrap(),
+        DirectoryLoadRoute::Nonstandard
+    );
+    assert_eq!(
+        directory_load_route(ModelType::Llama, None).unwrap(),
+        DirectoryLoadRoute::ConfigBacked
+    );
+}
+
+#[test]
+fn weight_load_route_distinguishes_loader_strategies() {
+    assert_eq!(
+        weight_load_route(ModelType::Mistral3).unwrap(),
+        WeightLoadRoute::LlamaFamily
+    );
+    assert_eq!(
+        weight_load_route(ModelType::Gemma3n).unwrap(),
+        WeightLoadRoute::Special
+    );
+    assert_eq!(
+        weight_load_route(ModelType::Qwen3).unwrap(),
+        WeightLoadRoute::ConfigBacked
+    );
 }
