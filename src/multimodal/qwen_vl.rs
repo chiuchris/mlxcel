@@ -1,3 +1,9 @@
+//! Qwen-VL prompt token insertion rules.
+//!
+//! Qwen2/2.5/3/3.5-VL families reserve image-token blocks based on the image
+//! grid and spatial merge size. This module keeps that token arithmetic out of
+//! CLI/server callers so Qwen-VL prompt preparation stays consistent.
+
 use crate::vision;
 
 #[derive(Clone, Copy)]

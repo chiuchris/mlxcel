@@ -1,3 +1,9 @@
+//! Generic image-token block expansion helpers for non-Qwen VLMs.
+//!
+//! Families such as Gemma3n, LLaVA-style VLMs, and related wrappers all need
+//! predictable insertion or expansion of image-token blocks. This module keeps
+//! that policy separate from model loading and request parsing.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageTokenBlockInfo {
     pub use_boi_eoi: bool,

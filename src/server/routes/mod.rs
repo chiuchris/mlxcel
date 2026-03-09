@@ -1,4 +1,8 @@
-//! HTTP route handlers
+//! Thin HTTP route adapters.
+//!
+//! These files should stay focused on request/response translation. Shared
+//! policy belongs in `server/request_options.rs`, `server/chat_request.rs`,
+//! `server/media.rs`, `server/streaming.rs`, and `server/model_worker.rs`.
 
 pub mod chat;
 pub mod completions;

@@ -1,3 +1,12 @@
+//! Gemma-family VLM loaders.
+//!
+//! Families:
+//! - Gemma3 VLM
+//! - Gemma3n VLM
+//!
+//! This file keeps Gemma-specific weight sanitation, metadata defaults, and
+//! wrapper assembly out of the generic VLM router.
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;

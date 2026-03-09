@@ -1,3 +1,12 @@
+//! Shared VLM runtime preparation used by CLI and server flows.
+//!
+//! This module answers two questions for the control plane:
+//! - should a request prepare multimodal embeddings at all?
+//! - if so, which model-family-specific embedding path should be used?
+//!
+//! It owns request-time image preprocessing and prepared-embedding validation,
+//! while model loading and vision math stay in `src/loading/` and `src/vision/`.
+
 use anyhow::Result;
 use image::DynamicImage;
 use mlxcel_core::MlxArray;

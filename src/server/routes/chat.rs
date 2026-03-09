@@ -1,4 +1,8 @@
-//! Chat completions endpoint
+//! OpenAI-compatible chat completions adapter.
+//!
+//! This file should stay thin: it flattens the HTTP request, delegates prompt
+//! preparation and option merging to shared helpers, and streams chunk payloads
+//! back through `server/streaming.rs`.
 
 use axum::{
     Json,

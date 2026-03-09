@@ -1,3 +1,12 @@
+//! Pixtral-family VLM loaders.
+//!
+//! Families:
+//! - Pixtral
+//! - Mistral3 VLM
+//!
+//! These families share Pixtral vision-tower assembly and Mistral-compatible
+//! text-config shaping, so the family-specific normalization stays here.
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;

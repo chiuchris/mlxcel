@@ -1,4 +1,7 @@
-//! Detokenize endpoint (llama-server compatible)
+//! Detokenize endpoint (llama-server compatible).
+//!
+//! This route is intentionally narrow: HTTP translation only, with tokenizer
+//! ownership and model state handled elsewhere.
 
 use axum::{Json, extract::State};
 

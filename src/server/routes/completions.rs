@@ -1,4 +1,7 @@
-//! Text completions endpoint
+//! OpenAI-compatible text completions adapter.
+//!
+//! Policy for defaults, sampling, and streaming stays in shared server helpers;
+//! this module only translates the HTTP request/response shape.
 
 use std::convert::Infallible;
 

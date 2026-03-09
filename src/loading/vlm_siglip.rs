@@ -1,3 +1,12 @@
+//! SigLIP-backed VLM loaders.
+//!
+//! Families:
+//! - Aya Vision
+//! - PaliGemma
+//!
+//! These models share a SigLIP-family vision tower but diverge in text-backend
+//! defaults and projector wiring, so their config normalization is grouped here.
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;

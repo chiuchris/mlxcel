@@ -1,3 +1,13 @@
+//! Special-case VLM loaders that do not fit another family bucket.
+//!
+//! Families:
+//! - Llama4 VLM
+//! - Phi3V
+//! - Molmo2
+//!
+//! These architectures need custom config shaping or weight remapping that is
+//! distinct from the LLaVA/Qwen/Gemma/SigLIP families, so they are grouped here.
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;

@@ -1,4 +1,7 @@
-//! Tokenize endpoint (llama-server compatible)
+//! Tokenize endpoint (llama-server compatible).
+//!
+//! This is a thin tokenizer adapter and should not grow generation or chat
+//! policy that belongs in other server modules.
 
 use axum::{Json, extract::State};
 

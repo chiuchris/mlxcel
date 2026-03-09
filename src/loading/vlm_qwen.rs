@@ -1,3 +1,15 @@
+//! Qwen-VL family loaders.
+//!
+//! Families:
+//! - Qwen2-VL
+//! - Qwen2.5-VL
+//! - Qwen3-VL / Qwen3-VL-MoE
+//! - Qwen3.5-VL / Qwen3.5-VL-MoE
+//!
+//! This file centralizes Qwen-specific token defaults, quantization inheritance,
+//! and weight-key remapping so the generic VLM router does not need to know
+//! about Qwen family details.
+
 use anyhow::Result;
 use std::path::Path;
 

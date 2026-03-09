@@ -1,4 +1,7 @@
-//! Models endpoint
+//! Models endpoint.
+//!
+//! This route reports server-visible model identity only; model loading and
+//! capability policy stay in the loading and provider layers.
 
 use axum::{Json, extract::State};
 

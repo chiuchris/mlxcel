@@ -1,3 +1,18 @@
+//! Unified loaded-model storage and capability dispatch.
+//!
+//! `LoadedModel` is the control-plane bridge between model loading and runtime
+//! execution. New model variants are stored here once, then exposed through a
+//! small set of dispatch/capability helpers instead of ad hoc matches in CLI,
+//! server, or multimodal code.
+//!
+//! Responsibilities:
+//! - store every loaded text/VLM family in one enum
+//! - forward `LanguageModel` methods through centralized macros
+//! - expose capability-oriented helpers used by multimodal paths
+//!
+//! When adding a new variant, update the dispatch macros below before adding
+//! any one-off match blocks elsewhere.
+
 use crate::{models, qwen_vl, vision, vlm_prompt};
 use mlxcel_core::UniquePtr;
 use mlxcel_core::generate::LanguageModel;

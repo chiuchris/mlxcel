@@ -1,4 +1,7 @@
-//! Slots endpoint (llama-server compatible)
+//! Slots endpoint (llama-server compatible).
+//!
+//! Slot accounting lives in shared state; this module only adapts that state
+//! into the llama-server-compatible response shape.
 
 use axum::{Json, extract::State};
 

@@ -1,3 +1,17 @@
+//! Shared VLM loading router and helper utilities.
+//!
+//! This module owns the common config/weight helpers used by family-specific
+//! VLM loaders. Real construction logic stays in sibling `vlm_<family>.rs`
+//! modules so this file can remain a router plus a small toolbox.
+//!
+//! Families:
+//! - `vlm_gemma.rs`: Gemma3 / Gemma3n
+//! - `vlm_llava.rs`: LLaVA / Bunny
+//! - `vlm_pixtral.rs`: Pixtral / Mistral3
+//! - `vlm_qwen.rs`: Qwen2 / 2.5 / 3 / 3.5-VL
+//! - `vlm_siglip.rs`: Aya Vision / PaliGemma
+//! - `vlm_special.rs`: Llama4 / Phi3V / Molmo2
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde::de::DeserializeOwned;

@@ -2,6 +2,9 @@
 //!
 //! Different from /v1/completions — uses `n_predict` instead of `max_tokens`,
 //! returns `{"content": "...", "stop": true, "timings": {...}}`.
+//!
+//! Like the OpenAI-compatible routes, this file stays as an HTTP adapter while
+//! generation policy and SSE plumbing live in shared server modules.
 
 use std::convert::Infallible;
 

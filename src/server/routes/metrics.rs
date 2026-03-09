@@ -1,4 +1,6 @@
-//! Prometheus-compatible metrics endpoint
+//! Prometheus-compatible metrics endpoint.
+//!
+//! This route is read-only and should remain separate from generation policy.
 
 use std::sync::atomic::Ordering;
 

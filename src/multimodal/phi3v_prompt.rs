@@ -1,3 +1,9 @@
+//! Phi3V-specific prompt normalization helpers.
+//!
+//! Phi3V can receive prompts with missing or partially numbered image tags.
+//! These helpers normalize `<|image_N|>` placement before tokenization so both
+//! CLI and server flows share the same prompt-to-image-slot mapping.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Phi3vImageTag {
     pub start: usize,

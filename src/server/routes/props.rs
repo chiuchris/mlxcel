@@ -1,4 +1,7 @@
-//! Server properties endpoint (llama-server compatible)
+//! Server properties endpoint (llama-server compatible).
+//!
+//! This route surfaces configuration/state snapshots and should stay as a thin
+//! read-only adapter.
 
 use axum::{Json, extract::State};
 

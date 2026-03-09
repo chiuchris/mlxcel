@@ -1,3 +1,12 @@
+//! LLaVA-style VLM loaders.
+//!
+//! Families:
+//! - LLaVA
+//! - LLaVA-Bunny
+//!
+//! These families share SigLIP/CLIP-style vision towers plus text-backend
+//! selection and projector wiring, so their config normalization lives here.
+
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;

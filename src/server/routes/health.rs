@@ -1,4 +1,7 @@
-//! Health check endpoint (llama-server compatible)
+//! Health check endpoint (llama-server compatible).
+//!
+//! This route only reports server liveness and slot availability. Slot policy
+//! itself stays in shared server state.
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
