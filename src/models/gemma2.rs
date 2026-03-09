@@ -411,16 +411,21 @@ impl Gemma2Model {
         (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
 
-    /// Get token embeddings (for VLM merge)
+    /// Get raw token embeddings without scaling (for VLM merge)
+    ///
+    /// Returns raw embeddings without sqrt(hidden_size) normalization.
+    /// The normalization is applied in forward_with_embeddings_impl to ALL
+    /// embeddings (text + image), matching Python GemmaModel behavior.
+    /// Used by: PaliGemma VLM
     pub fn get_embed_tokens(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
-        // Gemma2 scales embeddings by sqrt(hidden_size)
-        let h = self.embed_tokens.forward(input_ids);
-        let hidden_size = mlxcel_core::array_shape(&h)[2];
-        let scale = (hidden_size as f32).sqrt();
-        mlxcel_core::multiply_scalar(&h, scale)
+        self.embed_tokens.forward(input_ids)
     }
 
     /// Forward with pre-computed embeddings (for VLM prefill)
+    ///
+    /// Always applies sqrt(hidden_size) normalization to match Python
+    /// GemmaModel.__call__ which scales ALL embeddings (lines 227-228).
+    /// Used by: PaliGemma VLM
     pub fn forward_with_embeddings_impl(
         &self,
         input_ids: &MlxArray,
@@ -431,8 +436,15 @@ impl Gemma2Model {
         let mut h = if let Some(embeds) = input_embeddings {
             mlxcel_core::copy(embeds)
         } else {
-            self.get_embed_tokens(input_ids)
+            self.embed_tokens.forward(input_ids)
         };
+
+        // Apply sqrt(hidden_size) normalization to ALL embeddings.
+        // Python: normalizer = sqrt(config.hidden_size); h = h * normalizer
+        // Used by: PaliGemma VLM (Gemma2 backbone)
+        let hidden_size = mlxcel_core::array_shape(&h)[2];
+        let scale = (hidden_size as f32).sqrt();
+        h = mlxcel_core::multiply_scalar(&h, scale);
 
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
@@ -447,6 +459,7 @@ impl Gemma2Model {
         };
 
         logits = softcap(&logits, self.final_logit_softcapping);
+
         logits
     }
 

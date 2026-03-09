@@ -83,6 +83,16 @@ pub struct VisionModule {
     pub mm_tokens_per_image: usize,
     /// Strategy for merging vision and text embeddings
     pub merge_strategy: MergeStrategy,
+    /// Whether the tokenizer adds a BOS token before text.
+    /// When false (e.g., PaliGemma), image tokens are prepended without BOS.
+    /// Used by: PaliGemma (false), all others (true)
+    pub has_bos: bool,
+    /// Token to insert between image tokens and text when `has_bos` is false.
+    /// PaliGemma: BOS(2) between images and text despite add_bos_token=false.
+    pub separator_token_id: Option<i32>,
+    /// Tokens to append after text.
+    /// PaliGemma: newline(108) appended after text prompt.
+    pub suffix_tokens: Vec<i32>,
 }
 
 impl VisionModule {

@@ -302,6 +302,9 @@ impl LoadedModel {
                 mm_tokens_per_image: 256,
                 boi_token_id: g3n.boi_token_id,
                 eoi_token_id: g3n.eoi_token_id,
+                has_bos: true,
+                separator_token_id: None,
+                suffix_tokens: Vec::new(),
             })
         } else {
             self.vision_module()
@@ -311,6 +314,9 @@ impl LoadedModel {
                     mm_tokens_per_image: vm.mm_tokens_per_image,
                     boi_token_id: vm.boi_token_id,
                     eoi_token_id: vm.eoi_token_id,
+                    has_bos: vm.has_bos,
+                    separator_token_id: vm.separator_token_id,
+                    suffix_tokens: vm.suffix_tokens.clone(),
                 })
         }
     }

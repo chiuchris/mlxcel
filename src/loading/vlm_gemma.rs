@@ -154,6 +154,9 @@ pub(crate) fn load_gemma3_vlm(model_path: &Path) -> Result<LoadedModel> {
         eoi_token_id: vlm_config.eoi_token_index,
         mm_tokens_per_image,
         merge_strategy: vision::MergeStrategy::Gemma3,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {

@@ -46,13 +46,13 @@ pub fn prepare_inputs_for_multimodal(
     let batch_size = ids_shape[0];
     let sequence_length = ids_shape[1];
 
-    // NOTE: In Python mlx-vlm, vision features are scaled by 1/sqrt(hidden_size) here,
-    // but then the language model forward() scales ALL embeddings by sqrt(hidden_size),
-    // which cancels out. Since our embed_tokens() already applies sqrt(hidden_size)
-    // scaling to text embeddings, and our forward_with_caches_and_embeddings() does NOT
-    // apply additional scaling, we skip the 1/sqrt(hidden_size) scaling here.
-    let _ = hidden_size;
-    let scaled_image_features = mlxcel_core::copy(image_features);
+    // Scale image features by 1/sqrt(hidden_size), matching Python mlx-vlm behavior.
+    // Python: scaled_image_features = image_features / (config.hidden_size ** 0.5)
+    // The language model's forward then multiplies ALL embeddings by sqrt(hidden_size),
+    // so image features end up at approximately their original scale.
+    // Used by: PaliGemma VLM
+    let scale = 1.0 / (hidden_size as f32).sqrt();
+    let scaled_image_features = mlxcel_core::multiply_scalar(image_features, scale);
 
     // Create zero embedding buffer
     let mut final_embedding = mlxcel_core::zeros(
@@ -95,11 +95,23 @@ pub fn prepare_inputs_for_multimodal(
         &scaled_image_features,
     );
 
-    // Build 4D attention mask
+    // Build 4D attention mask in additive format (0=attend, -inf=masked)
+    // Python mlx-vlm creates a 0/1 mask and converts it in the attention layer:
+    //   mask = (1.0 - mask) * finfo.min
+    // We do the conversion here so the attention code can simply add the mask to scores.
+    // Used by: PaliGemma (Gemma2 backbone), Gemma3 VLM
     let attn_mask_1 = mlxcel_core::expand_dims(attention_mask, 1); // [B, 1, S]
     let attn_mask_2 = mlxcel_core::expand_dims(attention_mask, 2); // [B, S, 1]
     let attn_mask_4d = mlxcel_core::multiply(&attn_mask_1, &attn_mask_2); // [B, S, S]
     let attn_mask_4d = mlxcel_core::expand_dims(&attn_mask_4d, 1); // [B, 1, S, S]
+    // Convert from boolean-style (1=attend, 0=mask) to additive (0=attend, -inf=mask)
+    let attn_mask_float = mlxcel_core::astype(&attn_mask_4d, mlxcel_core::dtype::FLOAT32);
+    let ones = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+    let inverted = mlxcel_core::subtract(&ones, &attn_mask_float); // 1→0, 0→1
+    // Use f32::MIN (not NEG_INFINITY) to avoid NaN from 0.0 * -inf in IEEE 754.
+    // Matches Python's mx.finfo(dtype).min = -3.4028235e+38.
+    let mask_fill = mlxcel_core::full_f32(&[1], f32::MIN, mlxcel_core::dtype::FLOAT32);
+    let attn_mask_4d = mlxcel_core::multiply(&inverted, &mask_fill); // 0→0, 1→-3.4e38
 
     // Cast final embedding to same dtype as inputs_embeds
     let dtype = mlxcel_core::array_dtype(inputs_embeds);

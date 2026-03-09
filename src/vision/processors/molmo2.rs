@@ -424,13 +424,13 @@ impl Molmo2Processor {
         let (pool_h, pool_w) = self.pooling_size;
 
         // Calculate centered padding
-        let h_pad = pool_h * ((h + pool_h - 1) / pool_h) - h;
-        let w_pad = pool_w * ((w + pool_w - 1) / pool_w) - w;
+        let h_pad = pool_h * h.div_ceil(pool_h) - h;
+        let w_pad = pool_w * w.div_ceil(pool_w) - w;
 
         let pad_top = h_pad / 2;
-        let pad_bottom = (h_pad + 1) / 2;
+        let pad_bottom = h_pad.div_ceil(2);
         let pad_left = w_pad / 2;
-        let pad_right = (w_pad + 1) / 2;
+        let pad_right = w_pad.div_ceil(2);
 
         let padded_h = h + pad_top + pad_bottom;
         let padded_w = w + pad_left + pad_right;

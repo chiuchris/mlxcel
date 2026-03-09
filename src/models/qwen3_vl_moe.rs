@@ -670,7 +670,7 @@ impl DecoderLayer {
         // Determine if this layer should be MoE or dense
         let is_moe = !config.mlp_only_layers.contains(&layer_idx)
             && config.num_experts > 0
-            && (layer_idx + 1) % config.decoder_sparse_step == 0;
+            && (layer_idx + 1).is_multiple_of(config.decoder_sparse_step);
 
         let mlp = if is_moe {
             MLPType::MoE(SparseMoeBlock::from_weights(

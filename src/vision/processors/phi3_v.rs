@@ -15,7 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 const IMG_SIZE: usize = 336;
 const CLIP_MEAN: [f32; 3] = [0.48145466, 0.4578275, 0.40821073];
-const CLIP_STD: [f32; 3] = [0.26862954, 0.26130258, 0.27577711];
+const CLIP_STD: [f32; 3] = [0.26862954, 0.261_302_6, 0.275_777_1];
 
 pub struct Phi3VProcessor {
     pub num_crops: usize,
@@ -117,8 +117,8 @@ impl Phi3VProcessor {
         let hd_rgb = hd_image.to_rgb8();
 
         // Pad to 336-multiple (should already be after calc_hd_transform_size, but be safe)
-        let padded_w = ((hd_w + IMG_SIZE - 1) / IMG_SIZE) * IMG_SIZE;
-        let padded_h = ((hd_h + IMG_SIZE - 1) / IMG_SIZE) * IMG_SIZE;
+        let padded_w = hd_w.div_ceil(IMG_SIZE) * IMG_SIZE;
+        let padded_h = hd_h.div_ceil(IMG_SIZE) * IMG_SIZE;
 
         // Create global image (resize to 336x336)
         let global_image =
@@ -226,8 +226,8 @@ fn calc_hd_transform_size(width: usize, height: usize, hd_num: usize) -> (usize,
     let new_h = (new_w as f64 / ratio) as usize;
 
     // Pad to 336-multiple
-    let padded_w = ((new_w + IMG_SIZE - 1) / IMG_SIZE) * IMG_SIZE;
-    let padded_h = ((new_h + IMG_SIZE - 1) / IMG_SIZE) * IMG_SIZE;
+    let padded_w = new_w.div_ceil(IMG_SIZE) * IMG_SIZE;
+    let padded_h = new_h.div_ceil(IMG_SIZE) * IMG_SIZE;
 
     if transposed {
         (padded_h, padded_w)

@@ -469,6 +469,9 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
         eoi_token_id: 0,
         mm_tokens_per_image: llama4_mm_tokens_per_image(&vision_config),
         merge_strategy: vision::MergeStrategy::LLaVA,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {

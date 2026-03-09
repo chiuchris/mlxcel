@@ -10,6 +10,9 @@ fn apply_image_token_blocks_expands_existing_tokens_with_boi_eoi() {
         mm_tokens_per_image: 3,
         boi_token_id: 10,
         eoi_token_id: 11,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
     };
     let mut prompt_tokens = vec![1, 99, 2];
 
@@ -35,6 +38,9 @@ fn apply_image_token_blocks_inserts_blocks_after_bos() {
         mm_tokens_per_image: 2,
         boi_token_id: 0,
         eoi_token_id: 0,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
     };
     let mut prompt_tokens = vec![1, 2, 3];
 
@@ -51,6 +57,37 @@ fn apply_image_token_blocks_inserts_blocks_after_bos() {
 }
 
 #[test]
+fn apply_image_token_blocks_paligemma_format() {
+    // PaliGemma: [img*N, BOS(2), text, \n(108)]
+    let info = ImageTokenBlockInfo {
+        use_boi_eoi: false,
+        image_token_id: 257152,
+        mm_tokens_per_image: 3,
+        boi_token_id: 0,
+        eoi_token_id: 0,
+        has_bos: false,
+        separator_token_id: Some(2), // BOS between images and text
+        suffix_tokens: vec![108],    // newline after text
+    };
+    let mut prompt_tokens = vec![100, 200, 300]; // text tokens only, no BOS
+
+    let stats = apply_image_token_blocks(&mut prompt_tokens, info, 1);
+
+    assert_eq!(
+        stats,
+        Some(ImageTokenBlockStats {
+            action: ImageTokenBlockAction::Inserted { image_blocks: 1 },
+            tokens_per_image: 3,
+        })
+    );
+    // [img*3, BOS(2), text, \n(108)]
+    assert_eq!(
+        prompt_tokens,
+        vec![257152, 257152, 257152, 2, 100, 200, 300, 108]
+    );
+}
+
+#[test]
 fn apply_image_token_blocks_is_noop_without_prompt_or_images() {
     let info = ImageTokenBlockInfo {
         use_boi_eoi: true,
@@ -58,10 +95,16 @@ fn apply_image_token_blocks_is_noop_without_prompt_or_images() {
         mm_tokens_per_image: 4,
         boi_token_id: 6,
         eoi_token_id: 7,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
     };
 
     let mut empty_prompt = Vec::new();
-    assert_eq!(apply_image_token_blocks(&mut empty_prompt, info, 1), None);
+    assert_eq!(
+        apply_image_token_blocks(&mut empty_prompt, info.clone(), 1),
+        None
+    );
 
     let mut prompt_tokens = vec![1, 2, 3];
     assert_eq!(apply_image_token_blocks(&mut prompt_tokens, info, 0), None);
