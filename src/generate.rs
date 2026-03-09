@@ -1,15 +1,110 @@
 use anyhow::Result;
 use std::io::{self, Write as IoWrite};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mlxcel::{
-    CxxGenerator, GenerationStats, LanguageModel, SpeculativeGenerator, initialize_runtime,
-    load_model, load_model_with_adapter,
+    CxxGenerator, GenerationStats, LanguageModel, SamplingConfig, SpeculativeGenerator,
+    initialize_runtime, load_model, load_model_with_adapter,
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
+    vision::merge::InputEmbeddings,
 };
 
 use super::{GenerateArgs, generate_vlm};
+
+fn generation_stats_from_duration(
+    prompt_tokens: usize,
+    generated_tokens: usize,
+    total_time: Duration,
+) -> GenerationStats {
+    let decode_time_ms = total_time.as_secs_f64() * 1000.0;
+    let decode_tok_per_sec = if total_time.as_secs_f64() > 0.0 {
+        generated_tokens as f64 / total_time.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    GenerationStats {
+        prompt_tokens,
+        generated_tokens,
+        prefill_time_ms: 0.0,
+        decode_time_ms,
+        prefill_tok_per_sec: 0.0,
+        decode_tok_per_sec,
+    }
+}
+
+fn generate_standard<M: LanguageModel>(
+    model: &M,
+    prompt_tokens: &[i32],
+    max_tokens: usize,
+    sampling_config: &SamplingConfig,
+    profile: bool,
+) -> (Vec<i32>, GenerationStats) {
+    let mut generator = CxxGenerator::new(model.num_layers());
+
+    if profile {
+        return generator.generate_with_stats(model, prompt_tokens, max_tokens, sampling_config);
+    }
+
+    let _ = generator.generate(model, prompt_tokens, 1, sampling_config);
+    generator.reset_with_model(model);
+
+    let start_time = Instant::now();
+    let tokens = generator.generate(model, prompt_tokens, max_tokens, sampling_config);
+    let total_time = start_time.elapsed();
+    let generated_len = tokens.len();
+
+    (
+        tokens,
+        generation_stats_from_duration(prompt_tokens.len(), generated_len, total_time),
+    )
+}
+
+fn generate_with_embeddings<M: LanguageModel>(
+    model: &M,
+    prompt_tokens: &[i32],
+    embeddings: &InputEmbeddings,
+    max_tokens: usize,
+    sampling_config: &SamplingConfig,
+    profile: bool,
+) -> (Vec<i32>, GenerationStats) {
+    let mut generator = CxxGenerator::new(model.num_layers());
+    let mask_ref = embeddings
+        .attention_mask_4d
+        .as_ref()
+        .map(|m| m.as_ref().unwrap());
+    let input_embeds = embeddings.inputs_embeds.as_ref().unwrap();
+
+    if profile {
+        return generator.generate_with_stats_and_embeddings(
+            model,
+            prompt_tokens,
+            Some(input_embeds),
+            mask_ref,
+            max_tokens,
+            sampling_config,
+        );
+    }
+
+    let start_time = Instant::now();
+    let tokens = generator.generate_streaming_with_embeddings(
+        model,
+        prompt_tokens,
+        Some(input_embeds),
+        mask_ref,
+        max_tokens,
+        sampling_config,
+        |_| true,
+    );
+    let total_time = start_time.elapsed();
+    let generated_len = tokens.len();
+
+    (
+        tokens,
+        generation_stats_from_duration(prompt_tokens.len(), generated_len, total_time),
+    )
+}
 
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
@@ -115,95 +210,22 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             &sampling_config,
         )
     } else if let Some(ref embeddings) = vlm_embeddings {
-        // VLM generation with pre-computed embeddings
-        let num_layers = model.num_layers();
-        let mut generator = CxxGenerator::new(num_layers);
-
-        let mask_ref = embeddings
-            .attention_mask_4d
-            .as_ref()
-            .map(|m| m.as_ref().unwrap());
-
-        if args.generation.profile {
-            generator.generate_with_stats_and_embeddings(
-                &model,
-                &prompt_tokens,
-                Some(embeddings.inputs_embeds.as_ref().unwrap()),
-                mask_ref,
-                args.generation.max_tokens,
-                &sampling_config,
-            )
-        } else {
-            let start_time = Instant::now();
-            let tokens = generator.generate_streaming_with_embeddings(
-                &model,
-                &prompt_tokens,
-                Some(embeddings.inputs_embeds.as_ref().unwrap()),
-                mask_ref,
-                args.generation.max_tokens,
-                &sampling_config,
-                |_| true,
-            );
-            let total_time = start_time.elapsed();
-
-            let stats = GenerationStats {
-                prompt_tokens: prompt_tokens.len(),
-                generated_tokens: tokens.len(),
-                prefill_time_ms: 0.0,
-                decode_time_ms: total_time.as_secs_f64() * 1000.0,
-                prefill_tok_per_sec: 0.0,
-                decode_tok_per_sec: if total_time.as_secs_f64() > 0.0 {
-                    tokens.len() as f64 / total_time.as_secs_f64()
-                } else {
-                    0.0
-                },
-            };
-
-            (tokens, stats)
-        }
+        generate_with_embeddings(
+            &model,
+            &prompt_tokens,
+            embeddings,
+            args.generation.max_tokens,
+            &sampling_config,
+            args.generation.profile,
+        )
     } else {
-        // Standard generation
-        let num_layers = model.num_layers();
-        let mut generator = CxxGenerator::new(num_layers);
-
-        if args.generation.profile {
-            // Profile mode: use generate_with_stats for detailed timing
-            generator.generate_with_stats(
-                &model,
-                &prompt_tokens,
-                args.generation.max_tokens,
-                &sampling_config,
-            )
-        } else {
-            // Normal mode: warmup + regular generation
-            let _ = generator.generate(&model, &prompt_tokens, 1, &sampling_config);
-            generator.reset_with_model(&model);
-
-            let start_time = Instant::now();
-            let tokens = generator.generate(
-                &model,
-                &prompt_tokens,
-                args.generation.max_tokens,
-                &sampling_config,
-            );
-            let total_time = start_time.elapsed();
-
-            // Create stats from total time (no prefill/decode separation)
-            let stats = GenerationStats {
-                prompt_tokens: prompt_tokens.len(),
-                generated_tokens: tokens.len(),
-                prefill_time_ms: 0.0,
-                decode_time_ms: total_time.as_secs_f64() * 1000.0,
-                prefill_tok_per_sec: 0.0,
-                decode_tok_per_sec: if total_time.as_secs_f64() > 0.0 {
-                    tokens.len() as f64 / total_time.as_secs_f64()
-                } else {
-                    0.0
-                },
-            };
-
-            (tokens, stats)
-        }
+        generate_standard(
+            &model,
+            &prompt_tokens,
+            args.generation.max_tokens,
+            &sampling_config,
+            args.generation.profile,
+        )
     };
 
     // Decode and print tokens
@@ -248,3 +270,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "generate_tests.rs"]
+mod tests;
