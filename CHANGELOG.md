@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.3] - 2026-03-10
+
+### Fixed
+- Streaming UTF-8 corruption for multi-byte characters (e.g., Korean, CJK) caused by byte-level BPE token boundaries
+- Default `max_tokens` increased from 512 to 4096 so thinking models produce complete responses
+- Release archive now includes `mlx.metallib` for Metal GPU acceleration
+
 ## [v0.0.2] - 2026-03-10
 
 ### Added
@@ -54,5 +61,6 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.3]: https://github.com/lablup/mlxcel/compare/v0.0.2...v0.0.3
 [v0.0.2]: https://github.com/lablup/mlxcel/compare/v0.0.1...v0.0.2
 [v0.0.1]: https://github.com/lablup/mlxcel/releases/tag/v0.0.1
