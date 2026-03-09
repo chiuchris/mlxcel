@@ -70,6 +70,7 @@ pub mod rwkv7;
 pub mod smollm3;
 pub mod stablelm;
 pub mod starcoder2;
+pub mod solar_open;
 pub mod step3p5;
 
 // Re-export model types
@@ -134,6 +135,7 @@ pub use qwen3_vl_moe::Qwen3VLMoeModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
 pub use smollm3::SmolLM3Model;
+pub use solar_open::SolarOpenModel;
 pub use stablelm::StableLMModel;
 pub use starcoder2::StarCoder2Model;
 pub use step3p5::Step3p5Model;
@@ -213,6 +215,7 @@ pub enum ModelType {
     ExaOne,
     ExaOne4,
     ExaOneMoe,
+    SolarOpen,
 
     // OLMo family
     Olmo,
@@ -425,6 +428,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "baichuan_m1" => Ok(ModelType::Baichuan),
         "glm4" => Ok(ModelType::Glm4),
         "glm4_moe" => Ok(ModelType::Glm4Moe),
+        "solar_open" => Ok(ModelType::SolarOpen),
         "glm4_moe_lite" => Ok(ModelType::Glm4MoeLite),
         "glm_moe_dsa" => Ok(ModelType::GlmMoeDsa),
         "ernie4_5" | "ernie4.5" => Ok(ModelType::Ernie45),

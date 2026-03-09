@@ -51,6 +51,7 @@ macro_rules! for_each_config_backed_model {
             ExaOne, models::ExaOneModel::load, models::exaone::ExaOneConfig, models::ExaOneModel::from_weights, LoadedModel::ExaOne;
             ExaOne4, models::ExaOne4Model::load, models::exaone4::ModelArgs, models::ExaOne4Model::from_weights, |m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m));
             ExaOneMoe, models::ExaoneMoeModel::load, models::exaone_moe::ModelArgs, models::ExaoneMoeModel::from_weights, LoadedModel::ExaOneMoe;
+            SolarOpen, models::SolarOpenModel::load, models::solar_open::ModelArgs, models::SolarOpenModel::from_weights, LoadedModel::SolarOpen;
             Olmo, models::OlmoModel::load, models::olmo::ModelArgs, models::OlmoModel::from_weights, LoadedModel::Olmo;
             Olmo2, models::OLMo2Model::load, models::olmo2::ModelArgs, models::OLMo2Model::from_weights, LoadedModel::Olmo2;
             Olmo3, models::OLMo3Model::load, models::olmo3::OLMo3Config, models::OLMo3Model::from_weights, LoadedModel::Olmo3;

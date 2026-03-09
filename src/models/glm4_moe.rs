@@ -79,6 +79,18 @@ pub struct ModelArgs {
 
     #[serde(default)]
     pub bits: Option<i32>,
+
+    /// Nested quantization config (used by solar_open, auto_round, etc.)
+    #[serde(default)]
+    pub quantization_config: Option<QuantizationConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct QuantizationConfig {
+    #[serde(default)]
+    pub group_size: Option<i32>,
+    #[serde(default)]
+    pub bits: Option<i32>,
 }
 
 fn default_scoring_func() -> String {
@@ -116,11 +128,15 @@ impl ModelArgs {
     }
 
     pub fn group_size(&self) -> i32 {
-        self.group_size.unwrap_or(64)
+        self.group_size
+            .or_else(|| self.quantization_config.as_ref().and_then(|q| q.group_size))
+            .unwrap_or(64)
     }
 
     pub fn bits(&self) -> i32 {
-        self.bits.unwrap_or(4)
+        self.bits
+            .or_else(|| self.quantization_config.as_ref().and_then(|q| q.bits))
+            .unwrap_or(4)
     }
 }
 
@@ -1064,5 +1080,91 @@ mod tests {
         // Test is_moe_layer
         assert!(!args.is_moe_layer(0)); // Layer 0 should be dense
         assert!(args.is_moe_layer(1)); // Layer 1+ should be MoE
+    }
+
+    #[test]
+    fn test_solar_open_config_with_quantization_config() {
+        let json = r#"{
+            "model_type": "solar_open",
+            "vocab_size": 196608,
+            "hidden_size": 4096,
+            "intermediate_size": 10240,
+            "max_position_embeddings": 131072,
+            "moe_intermediate_size": 1280,
+            "num_attention_heads": 64,
+            "num_hidden_layers": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 1000000,
+            "partial_rotary_factor": 1.0,
+            "n_routed_experts": 128,
+            "num_experts_per_tok": 8,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": true,
+            "first_k_dense_replace": 0,
+            "n_shared_experts": 1,
+            "quantization_config": {
+                "bits": 4,
+                "group_size": 128
+            }
+        }"#;
+
+        let args: ModelArgs = serde_json::from_str(json).unwrap();
+
+        assert_eq!(args.vocab_size, 196608);
+        assert_eq!(args.num_hidden_layers, 48);
+        assert_eq!(args.n_routed_experts, 128);
+        assert_eq!(args.num_experts_per_tok, 8);
+        assert_eq!(args.first_k_dense_replace, 0);
+
+        // quantization_config fallback
+        assert_eq!(args.group_size(), 128);
+        assert_eq!(args.bits(), 4);
+
+        // All layers should be MoE (first_k_dense_replace = 0)
+        assert!(args.is_moe_layer(0));
+
+        // Full RoPE (partial_rotary_factor = 1.0)
+        assert_eq!(args.rope_dims(), 128);
+    }
+
+    #[test]
+    fn test_top_level_quantization_takes_precedence() {
+        let json = r#"{
+            "model_type": "glm4_moe",
+            "vocab_size": 151552,
+            "hidden_size": 4096,
+            "intermediate_size": 13696,
+            "max_position_embeddings": 8192,
+            "moe_intermediate_size": 1408,
+            "num_attention_heads": 32,
+            "num_hidden_layers": 40,
+            "num_key_value_heads": 8,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 10000.0,
+            "partial_rotary_factor": 0.5,
+            "n_routed_experts": 16,
+            "num_experts_per_tok": 2,
+            "n_group": 1,
+            "topk_group": 1,
+            "routed_scaling_factor": 1.0,
+            "norm_topk_prob": false,
+            "first_k_dense_replace": 1,
+            "group_size": 64,
+            "bits": 4,
+            "quantization_config": {
+                "bits": 8,
+                "group_size": 256
+            }
+        }"#;
+
+        let args: ModelArgs = serde_json::from_str(json).unwrap();
+
+        // Top-level values should take precedence over quantization_config
+        assert_eq!(args.group_size(), 64);
+        assert_eq!(args.bits(), 4);
     }
 }

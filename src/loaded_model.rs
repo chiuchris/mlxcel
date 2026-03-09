@@ -63,6 +63,7 @@ pub enum LoadedModel {
     // Sliding window model uses wrapper
     ExaOne4(models::ExaOne4Wrapper),
     ExaOneMoe(models::ExaoneMoeModel),
+    SolarOpen(models::SolarOpenModel),
     Olmo(models::OlmoModel),
     Olmo2(models::OLMo2Model),
     Olmo3(models::OLMo3Model),
@@ -145,6 +146,7 @@ macro_rules! delegate_language_model {
             LoadedModel::ExaOne(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::ExaOne4(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::ExaOneMoe(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::SolarOpen(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Olmo(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Olmo2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Olmo3(inner) => LanguageModel::$method(inner, $($arg),*),
