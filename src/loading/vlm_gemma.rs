@@ -231,5 +231,5 @@ pub(crate) fn load_gemma3n_vlm(model_path: &Path) -> Result<LoadedModel> {
 }
 
 #[cfg(test)]
-#[path = "loader_vlm_gemma_tests.rs"]
+#[path = "vlm_gemma_tests.rs"]
 mod tests;

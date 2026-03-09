@@ -4,11 +4,14 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
-use crate::loader_vlm::*;
 use crate::lora;
 use crate::models::{self, ModelType, get_model_type, sanitize_config_json};
 use crate::tokenizer::{self, MlxcelTokenizer};
 use mlxcel_core::weights::WeightMap;
+
+mod vlm;
+
+use self::vlm::*;
 
 /// Resolve model path: if a file is given, use its parent directory.
 ///
@@ -1048,5 +1051,5 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
 }
 
 #[cfg(test)]
-#[path = "loader_tests.rs"]
+#[path = "tests.rs"]
 mod tests;

@@ -9,11 +9,11 @@ use crate::models;
 use crate::vision;
 use models::sanitize_config_json;
 
-#[path = "loader_vlm_gemma.rs"]
+#[path = "vlm_gemma.rs"]
 mod gemma;
-#[path = "loader_vlm_llava.rs"]
+#[path = "vlm_llava.rs"]
 mod llava;
-#[path = "loader_vlm_qwen.rs"]
+#[path = "vlm_qwen.rs"]
 mod qwen;
 
 pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm};
@@ -1568,5 +1568,5 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
 }
 
 #[cfg(test)]
-#[path = "loader_vlm_tests.rs"]
+#[path = "vlm_tests.rs"]
 mod tests;

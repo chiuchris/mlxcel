@@ -451,5 +451,5 @@ pub(crate) fn load_llava_bunny_vlm(model_path: &Path) -> Result<LoadedModel> {
 }
 
 #[cfg(test)]
-#[path = "loader_vlm_llava_tests.rs"]
+#[path = "vlm_llava_tests.rs"]
 mod tests;
