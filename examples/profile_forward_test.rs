@@ -1,9 +1,11 @@
 fn main() {
-    use mlxcel::models::cxx::llama3::Llama3Model;
+    use mlxcel::generate::LanguageModel;
     use mlxcel_core::layers::KVCache;
+    use std::path::Path;
     use std::time::Instant;
 
-    let (model, _) = Llama3Model::load("models/Meta-Llama-3.1-8B-Instruct-4bit").unwrap();
+    let (model, _) =
+        mlxcel::load_model(Path::new("models/Meta-Llama-3.1-8B-Instruct-4bit")).unwrap();
     let input = mlxcel_core::from_slice_i32(&[9906], &[1, 1]);
 
     // Warmup

@@ -204,10 +204,11 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
-    let text_config_value = full_config
+    let mut text_config_value = full_config
         .get("text_config")
         .cloned()
         .unwrap_or_else(|| full_config.clone());
+    inherit_quantization_if_missing(&mut text_config_value, &full_config);
     let text_config: models::molmo2::Molmo2TextConfig =
         serde_json::from_value(text_config_value)
             .map_err(|e| anyhow::anyhow!("Failed to parse text config: {}", e))?;
