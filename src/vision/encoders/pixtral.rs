@@ -43,8 +43,8 @@ impl PixtralRoPE {
 
         // freqs = 1.0 / (base ^ (arange(0, dim, 2) / dim))  → [half_dim]
         let mut freqs = vec![0.0f32; half_dim];
-        for i in 0..half_dim {
-            freqs[i] = 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32);
+        for (i, freq) in freqs.iter_mut().enumerate() {
+            *freq = 1.0 / rope_theta.powf((2 * i) as f32 / head_dim as f32);
         }
 
         // freqs_h = outer(arange(max_patches), freqs[::2]) → [max_patches, quarter_dim]

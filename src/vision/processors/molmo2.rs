@@ -275,39 +275,39 @@ impl Molmo2Processor {
 
                 // Build patch index for this crop
                 let mut patch_idx = vec![vec![0i32; crop_patch_w]; crop_patch_h];
-                for py in 0..crop_patch_h {
-                    for px in 0..crop_patch_w {
-                        patch_idx[py][px] =
+                for (py, row) in patch_idx.iter_mut().enumerate() {
+                    for (px, cell) in row.iter_mut().enumerate() {
+                        *cell =
                             (on_crop * crop_patch_h * crop_patch_w + py * crop_patch_w + px) as i32;
                     }
                 }
 
                 // Mask margins
                 if i != 0 {
-                    for py in 0..left_margin {
-                        for px in 0..crop_patch_w {
-                            patch_idx[py][px] = -1;
+                    for row in &mut patch_idx[..left_margin] {
+                        for cell in row.iter_mut() {
+                            *cell = -1;
                         }
                     }
                 }
                 if j != 0 {
-                    for py in 0..crop_patch_h {
-                        for px in 0..left_margin {
-                            patch_idx[py][px] = -1;
+                    for row in &mut patch_idx {
+                        for cell in row[..left_margin].iter_mut() {
+                            *cell = -1;
                         }
                     }
                 }
                 if i != tiling.0 - 1 {
-                    for py in (crop_patch_h - right_margin)..crop_patch_h {
-                        for px in 0..crop_patch_w {
-                            patch_idx[py][px] = -1;
+                    for row in &mut patch_idx[(crop_patch_h - right_margin)..] {
+                        for cell in row.iter_mut() {
+                            *cell = -1;
                         }
                     }
                 }
                 if j != tiling.1 - 1 {
-                    for py in 0..crop_patch_h {
-                        for px in (crop_patch_w - right_margin)..crop_patch_w {
-                            patch_idx[py][px] = -1;
+                    for row in &mut patch_idx {
+                        for cell in row[(crop_patch_w - right_margin)..].iter_mut() {
+                            *cell = -1;
                         }
                     }
                 }
@@ -315,12 +315,12 @@ impl Molmo2Processor {
                 // Write into full patch index array
                 let y_start = i * crop_window_patches;
                 let x_start = j * crop_window_patches;
-                for py in 0..crop_patch_h {
-                    for px in 0..crop_patch_w {
+                for (py, row) in patch_idx.iter().enumerate() {
+                    for (px, &cell) in row.iter().enumerate() {
                         let fy = y_start + py;
                         let fx = x_start + px;
-                        if patch_idx[py][px] >= 0 {
-                            patch_idx_full[fy][fx] = patch_idx[py][px];
+                        if cell >= 0 {
+                            patch_idx_full[fy][fx] = cell;
                         }
                     }
                 }
@@ -354,9 +354,9 @@ impl Molmo2Processor {
         let crop_patch_w = base_w / self.patch_size;
 
         let mut resize_idx = vec![vec![0i32; crop_patch_w]; crop_patch_h];
-        for py in 0..crop_patch_h {
-            for px in 0..crop_patch_w {
-                resize_idx[py][px] = (py * crop_patch_w + px) as i32;
+        for (py, row) in resize_idx.iter_mut().enumerate() {
+            for (px, cell) in row.iter_mut().enumerate() {
+                *cell = (py * crop_patch_w + px) as i32;
             }
         }
 

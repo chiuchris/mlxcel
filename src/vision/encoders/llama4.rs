@@ -178,21 +178,21 @@ impl VisionRotaryEmbedding {
         for pos in 0..num_positions as usize {
             let is_cls = pos == (num_positions - 1) as usize;
             // First half: x frequencies
-            for f in 0..half_freq_dim {
+            for &freq in &rope_freq[..half_freq_dim] {
                 let val = if is_cls {
                     0.0
                 } else {
-                    frequencies_x[pos] * rope_freq[f]
+                    frequencies_x[pos] * freq
                 };
                 cos_data.push(val.cos());
                 sin_data.push(val.sin());
             }
             // Second half: y frequencies
-            for f in 0..half_freq_dim {
+            for &freq in &rope_freq[..half_freq_dim] {
                 let val = if is_cls {
                     0.0
                 } else {
-                    frequencies_y[pos] * rope_freq[f]
+                    frequencies_y[pos] * freq
                 };
                 cos_data.push(val.cos());
                 sin_data.push(val.sin());

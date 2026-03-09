@@ -108,8 +108,7 @@ impl Phi3VLModel {
         // Count total tiles for indexing into img_features
         let mut tile_offset = 0i32;
 
-        for img_idx in 0..image_sizes.len() {
-            let (hd_h, hd_w) = image_sizes[img_idx];
+        for &(hd_h, hd_w) in image_sizes {
             let h_tiles = hd_h / 336;
             let w_tiles = hd_w / 336;
             let b_ = h_tiles * w_tiles; // number of sub-tiles

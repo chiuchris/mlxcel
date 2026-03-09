@@ -249,9 +249,7 @@ fn load_qwen3_5_vlm_with_variant(
         } else if key.starts_with("language_model.lm_head.") {
             let new_key = key.replacen("language_model.", "", 1);
             text_weights.insert(new_key, value);
-        } else if key.starts_with("lm_head.") {
-            text_weights.insert(key, value);
-        } else if key.starts_with("model.") {
+        } else if key.starts_with("lm_head.") || key.starts_with("model.") {
             text_weights.insert(key, value);
         }
     }
