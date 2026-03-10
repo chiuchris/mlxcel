@@ -160,7 +160,7 @@ pub(crate) struct SamplingOptions {
 
 /// Server options
 #[derive(Args, Debug)]
-struct ServeArgs {
+pub(crate) struct ServeArgs {
     /// Path to the model directory
     #[arg(short, long, env = "LLAMA_ARG_MODEL", value_name = "PATH")]
     model: PathBuf,
@@ -355,68 +355,12 @@ fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Generate(args) => commands::run_generate(args),
-        Commands::Serve(args) => run_serve(args),
+        Commands::Serve(args) => commands::run_serve(args),
         Commands::List => {
             print_supported_models();
             Ok(())
         }
     }
-}
-
-#[tokio::main]
-async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
-    use mlxcel::server::{ServerStartupConfig, start_server};
-
-    // Handle --no-slots / --no-warmup overrides
-    let enable_slots = args.slots && !args._no_slots;
-    let enable_warmup = args.warmup && !args._no_warmup;
-
-    let seed = if args.seed < 0 {
-        None
-    } else {
-        Some(args.seed as u64)
-    };
-
-    let startup = ServerStartupConfig {
-        model_path: args.model,
-        adapter_path: args.adapter,
-        model_alias: args.alias,
-        host: args.host,
-        port: args.port,
-        api_key: args.api_key,
-        api_key_file: args.api_key_file,
-        n_parallel: args.n_parallel,
-        ctx_size: args.ctx_size,
-        n_predict: args.n_predict,
-        timeout: args.timeout,
-        draft_model_path: args.draft_model,
-        draft_max: args.draft_max,
-        chat_template: args.chat_template,
-        chat_template_file: args.chat_template_file,
-        enable_slots,
-        enable_props: args.props,
-        enable_metrics: args.metrics,
-        warmup: enable_warmup,
-        temperature: args.temp,
-        top_k: args.top_k,
-        top_p: args.top_p,
-        min_p: args.min_p,
-        seed,
-        repeat_last_n: args.repeat_last_n,
-        repeat_penalty: args.repeat_penalty,
-        presence_penalty: args.presence_penalty,
-        frequency_penalty: args.frequency_penalty,
-        dry_multiplier: args.dry_multiplier,
-        dry_base: args.dry_base,
-        dry_allowed_length: args.dry_allowed_length,
-        dry_penalty_last_n: args.dry_penalty_last_n,
-        dry_sequence_breakers: args.dry_sequence_breakers,
-        verbose: args.verbose,
-        log_disable: args.log_disable,
-        log_file: args.log_file,
-    };
-
-    start_server(startup).await
 }
 
 fn print_supported_models() {

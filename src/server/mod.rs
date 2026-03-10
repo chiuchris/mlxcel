@@ -17,6 +17,7 @@
 pub mod app;
 mod chat_request;
 pub mod chat_template;
+mod cli_input;
 mod config;
 mod media;
 pub mod model_provider;
@@ -29,6 +30,7 @@ pub mod types;
 
 pub use app::create_app;
 pub use chat_template::ChatTemplateProcessor;
+pub use cli_input::ServerStartupInput;
 pub use config::{ServerConfig, ServerGenerateOptions};
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use startup::{ServerStartupConfig, start_server};

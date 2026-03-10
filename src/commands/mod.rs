@@ -20,5 +20,7 @@
 
 pub(crate) mod generate;
 mod generate_vlm;
+mod serve;
 
 pub(crate) use generate::run_generate;
+pub(crate) use serve::run_serve;

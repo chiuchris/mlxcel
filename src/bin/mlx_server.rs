@@ -15,7 +15,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 
-use mlxcel::server::{ServerStartupConfig, start_server};
+use mlxcel::server::{ServerStartupInput, start_server};
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
 ///
@@ -251,18 +251,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
+    start_server(build_startup_input(args).into_startup_config()).await
+}
 
-    // Handle --no-slots / --no-warmup overrides
-    let enable_slots = args.slots && !args._no_slots;
-    let enable_warmup = args.warmup && !args._no_warmup;
-
-    let seed = if args.seed < 0 {
-        None
-    } else {
-        Some(args.seed as u64)
-    };
-
-    let startup = ServerStartupConfig {
+fn build_startup_input(args: Args) -> ServerStartupInput {
+    ServerStartupInput {
         model_path: args.model,
         adapter_path: args.lora,
         model_alias: args.alias,
@@ -278,15 +271,17 @@ async fn main() -> anyhow::Result<()> {
         draft_max: args.draft,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
-        enable_slots,
-        enable_props: args.props,
-        enable_metrics: args.metrics,
-        warmup: enable_warmup,
+        slots: args.slots,
+        no_slots: args._no_slots,
+        props: args.props,
+        metrics: args.metrics,
+        warmup: args.warmup,
+        no_warmup: args._no_warmup,
         temperature: args.temp,
         top_k: args.top_k,
         top_p: args.top_p,
         min_p: args.min_p,
-        seed,
+        seed: args.seed,
         repeat_last_n: args.repeat_last_n,
         repeat_penalty: args.repeat_penalty,
         presence_penalty: args.presence_penalty,
@@ -299,7 +294,5 @@ async fn main() -> anyhow::Result<()> {
         verbose: args.verbose,
         log_disable: args.log_disable,
         log_file: args.log_file,
-    };
-
-    start_server(startup).await
+    }
 }
