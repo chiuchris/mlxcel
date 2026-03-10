@@ -23,72 +23,19 @@
 //!
 //! Reference: references/mlx-vlm/mlx_vlm/models/gemma3n/vision.py
 
+#[path = "gemma3n_helpers.rs"]
+mod helpers;
+
+#[cfg(test)]
+#[path = "gemma3n_helpers_tests.rs"]
+mod helper_tests;
+
+use self::helpers::{
+    get_same_padding, get_static_padding, get_weight, is_static_pad, make_divisible,
+    nearest_upsample_nchw, num_groups, sanitize_conv_weight, split_symmetric_padding,
+};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
-
-// Helpers.
-/// Round to nearest multiple of divisor (for MobileNet channel counts)
-fn make_divisible(v: f32, divisor: i32) -> i32 {
-    let min_value = divisor;
-    let new_v = ((v + divisor as f32 / 2.0) as i32 / divisor) * divisor;
-    let new_v = new_v.max(min_value);
-    if (new_v as f32) < 0.9 * v {
-        new_v + divisor
-    } else {
-        new_v
-    }
-}
-
-/// Compute groups from group_size for depthwise convolutions
-fn num_groups(group_size: i32, channels: i32) -> i32 {
-    if group_size == 0 {
-        1
-    } else {
-        channels / group_size
-    }
-}
-
-/// Calculate 'same' padding for one dimension
-fn get_same_padding(input_size: i32, kernel_size: i32, stride: i32, dilation: i32) -> i32 {
-    let eff_k = dilation * (kernel_size - 1) + 1;
-    let out_size = (input_size + stride - 1) / stride;
-    (0i32).max((out_size - 1) * stride + eff_k - input_size)
-}
-
-/// Check if static (symmetric) padding suffices (stride == 1)
-fn is_static_pad(stride: i32) -> bool {
-    stride == 1
-}
-
-/// Get static symmetric padding
-fn get_static_padding(kernel_size: i32, dilation: i32) -> i32 {
-    let eff_k = dilation * (kernel_size - 1) + 1;
-    (eff_k - 1) / 2
-}
-
-/// Copy weight from weight map
-fn get_weight(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
-    weights
-        .get(name)
-        .map(|w| mlxcel_core::copy(w))
-        .ok_or_else(|| format!("Weight not found: {}", name))
-}
-
-/// Transpose conv2d weight from PyTorch [O,I,H,W] to MLX [O,H,W,I] if needed
-fn sanitize_conv_weight(w: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
-    let shape = mlxcel_core::array_shape(&w);
-    if shape.len() == 4 {
-        // If shape[1] > shape[2], it's PyTorch layout [O,I,H,W]
-        // MLX layout is [O,H,W,I]
-        if shape[1] > shape[2] {
-            mlxcel_core::transpose_axes(&w, &[0, 2, 3, 1])
-        } else {
-            w
-        }
-    } else {
-        w
-    }
-}
 
 // RMSNormAct2d — RMS normalization on channel axis + optional GELU.
 /// RMS normalization operating on channel dimension (NHWC layout).
@@ -232,15 +179,17 @@ impl Conv2dSame {
             let iw = shape[2];
             let pad_h = get_same_padding(ih, self.kernel_h, self.stride_h, self.dilation_h);
             let pad_w = get_same_padding(iw, self.kernel_w, self.stride_w, self.dilation_w);
+            let (pad_h_before, pad_h_after) = split_symmetric_padding(pad_h);
+            let (pad_w_before, pad_w_after) = split_symmetric_padding(pad_w);
 
             // Pad: [batch_before, batch_after, h_before, h_after, w_before, w_after, c_before, c_after]
             let pad_width = [
                 0,
                 0, // batch
-                pad_h / 2,
-                pad_h - pad_h / 2, // height
-                pad_w / 2,
-                pad_w - pad_w / 2, // width
+                pad_h_before,
+                pad_h_after, // height
+                pad_w_before,
+                pad_w_after, // width
                 0,
                 0, // channels
             ];
@@ -556,25 +505,6 @@ impl MSFA {
             self.norm.forward(&img)
         }
     }
-}
-
-/// Nearest-neighbor upsample in NCHW layout using reshape+broadcast
-fn nearest_upsample_nchw(x: &MlxArray, target_h: i32, target_w: i32) -> UniquePtr<MlxArray> {
-    let shape = mlxcel_core::array_shape(x);
-    let b = shape[0];
-    let c = shape[1];
-    let h = shape[2];
-    let w = shape[3];
-
-    let scale_h = target_h / h;
-    let scale_w = target_w / w;
-
-    // [B, C, H, W] → [B, C, H, 1, W, 1]
-    let x = mlxcel_core::reshape(x, &[b, c, h, 1, w, 1]);
-    // Broadcast to [B, C, H, scale_h, W, scale_w]
-    let x = mlxcel_core::broadcast_to(&x, &[b, c, h, scale_h, w, scale_w]);
-    // Reshape to [B, C, H*scale_h, W*scale_w]
-    mlxcel_core::reshape(&x, &[b, c, h * scale_h, w * scale_w])
 }
 
 // VisionTower.

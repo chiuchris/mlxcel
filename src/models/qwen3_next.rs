@@ -25,6 +25,13 @@
 //!
 //! Reference: mlx-lm/mlx_lm/models/qwen3_next.py
 
+#[path = "qwen3_next_helpers.rs"]
+mod helpers;
+
+#[cfg(test)]
+#[path = "qwen3_next_helpers_tests.rs"]
+mod helper_tests;
+
 use crate::models::gated_delta::{GatedDeltaCache, RMSNormGated, gated_delta_update};
 use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
@@ -34,6 +41,8 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
+
+use self::helpers::{build_projection_layout, split_conv_output_ranges};
 
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
@@ -191,72 +200,58 @@ impl GatedDeltaNet {
         UniquePtr<MlxArray>,
         UniquePtr<MlxArray>,
     ) {
-        let nk = self.num_k_heads as i32;
-        let dn = self.head_k_dim as i32;
-        let nv = self.num_v_heads as i32;
-        let dv = self.head_v_dim as i32;
-
         let shape = mlxcel_core::array_shape(mixed_qkvz);
         let batch_dims = &shape[..shape.len() - 1];
-        let mut new_shape: Vec<i32> = batch_dims.to_vec();
-        new_shape.push(nk);
-        new_shape.push(-1);
+        let layout = build_projection_layout(
+            batch_dims,
+            self.num_k_heads,
+            self.head_k_dim,
+            self.num_v_heads,
+            self.head_v_dim,
+        );
 
-        let mixed_qkvz = mlxcel_core::reshape(mixed_qkvz, &new_shape);
-
-        let mut ba_shape: Vec<i32> = batch_dims.to_vec();
-        ba_shape.push(nk);
-        ba_shape.push(-1);
-        let mixed_ba = mlxcel_core::reshape(mixed_ba, &ba_shape);
+        let mixed_qkvz = mlxcel_core::reshape(mixed_qkvz, &layout.mixed_qkvz_shape);
+        let mixed_ba = mlxcel_core::reshape(mixed_ba, &layout.mixed_ba_shape);
 
         // Split qkvz into q, k, v, z
-        let mut starts = vec![0i32; new_shape.len()];
-        let mut stops = new_shape.clone();
+        let mut starts = vec![0i32; layout.mixed_qkvz_shape.len()];
+        let mut stops = layout.mixed_qkvz_shape.clone();
+        let last_axis = layout.mixed_qkvz_shape.len() - 1;
 
-        // q
-        let last_axis = new_shape.len() - 1;
-        starts[last_axis] = 0;
-        stops[last_axis] = dn;
+        starts[last_axis] = layout.q_range.0;
+        stops[last_axis] = layout.q_range.1;
         let q = mlxcel_core::slice(&mixed_qkvz, &starts, &stops);
 
-        // k
-        starts[last_axis] = dn;
-        stops[last_axis] = 2 * dn;
+        starts[last_axis] = layout.k_range.0;
+        stops[last_axis] = layout.k_range.1;
         let k = mlxcel_core::slice(&mixed_qkvz, &starts, &stops);
 
-        // v
-        let v_size = nv / nk * dv;
-        starts[last_axis] = 2 * dn;
-        stops[last_axis] = 2 * dn + v_size;
+        starts[last_axis] = layout.v_range.0;
+        stops[last_axis] = layout.v_range.1;
         let v = mlxcel_core::slice(&mixed_qkvz, &starts, &stops);
 
-        // z
-        starts[last_axis] = 2 * dn + v_size;
-        stops[last_axis] = -1;
+        starts[last_axis] = layout.z_range.0;
+        stops[last_axis] = layout.z_range.1;
         let z = mlxcel_core::slice(&mixed_qkvz, &starts, &stops);
 
         // Split ba into b, a
-        let b_size = nv / nk;
-        let ba_last_axis = ba_shape.len() - 1;
-        let mut ba_starts = vec![0i32; ba_shape.len()];
-        let mut ba_stops = ba_shape.clone();
+        let ba_last_axis = layout.mixed_ba_shape.len() - 1;
+        let mut ba_starts = vec![0i32; layout.mixed_ba_shape.len()];
+        let mut ba_stops = layout.mixed_ba_shape.clone();
 
-        ba_starts[ba_last_axis] = 0;
-        ba_stops[ba_last_axis] = b_size;
+        ba_starts[ba_last_axis] = layout.b_range.0;
+        ba_stops[ba_last_axis] = layout.b_range.1;
         let b = mlxcel_core::slice(&mixed_ba, &ba_starts, &ba_stops);
 
-        ba_starts[ba_last_axis] = b_size;
-        ba_stops[ba_last_axis] = -1;
+        ba_starts[ba_last_axis] = layout.a_range.0;
+        ba_stops[ba_last_axis] = layout.a_range.1;
         let a = mlxcel_core::slice(&mixed_ba, &ba_starts, &ba_stops);
 
         // Reshape v, z, b, a
-        let v_shape: Vec<i32> = batch_dims.iter().cloned().chain(vec![-1, dv]).collect();
-        let v = mlxcel_core::reshape(&v, &v_shape);
-        let z = mlxcel_core::reshape(&z, &v_shape);
-
-        let ba_final_shape: Vec<i32> = batch_dims.iter().cloned().chain(vec![nv]).collect();
-        let b = mlxcel_core::reshape(&b, &ba_final_shape);
-        let a = mlxcel_core::reshape(&a, &ba_final_shape);
+        let v = mlxcel_core::reshape(&v, &layout.v_shape);
+        let z = mlxcel_core::reshape(&z, &layout.v_shape);
+        let b = mlxcel_core::reshape(&b, &layout.ba_final_shape);
+        let a = mlxcel_core::reshape(&a, &layout.ba_final_shape);
 
         (q, k, v, z, b, a)
     }
@@ -341,17 +336,10 @@ impl GatedDeltaNet {
         // Use actual conv_out seq length for correct slicing
         let conv_out_shape = mlxcel_core::array_shape(&conv_out);
         let conv_seq = conv_out_shape[1];
-        let q_out = mlxcel_core::slice(&conv_out, &[0, 0, 0], &[b, conv_seq, self.key_dim as i32]);
-        let k_out = mlxcel_core::slice(
-            &conv_out,
-            &[0, 0, self.key_dim as i32],
-            &[b, conv_seq, (2 * self.key_dim) as i32],
-        );
-        let v_out = mlxcel_core::slice(
-            &conv_out,
-            &[0, 0, (2 * self.key_dim) as i32],
-            &[b, conv_seq, self.conv_dim as i32],
-        );
+        let [q_range, k_range, v_range] = split_conv_output_ranges(self.key_dim, self.conv_dim);
+        let q_out = mlxcel_core::slice(&conv_out, &[0, 0, q_range.0], &[b, conv_seq, q_range.1]);
+        let k_out = mlxcel_core::slice(&conv_out, &[0, 0, k_range.0], &[b, conv_seq, k_range.1]);
+        let v_out = mlxcel_core::slice(&conv_out, &[0, 0, v_range.0], &[b, conv_seq, v_range.1]);
 
         // Reshape to heads
         let q = mlxcel_core::reshape(
