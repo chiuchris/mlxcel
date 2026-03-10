@@ -529,11 +529,13 @@ fn flatten_phi4mm_patch_embedding(
 fn rewrite_phi4mm_vision_key(key: &str) -> Option<String> {
     if key.contains("position_ids")
         || key.contains("img_processor.head.")
-        || key.contains("glb_GN")
-        || key.contains("sub_GN")
         || key.starts_with("model.embed_tokens_extend.audio_embed.")
     {
         None
+    } else if key == "model.embed_tokens_extend.image_embed.glb_GN" {
+        Some("glb_GN".to_string())
+    } else if key == "model.embed_tokens_extend.image_embed.sub_GN" {
+        Some("sub_GN".to_string())
     } else if let Some(rest) =
         key.strip_prefix("model.embed_tokens_extend.image_embed.img_processor.")
     {
@@ -710,7 +712,7 @@ fn merge_phi4mm_lora_weight(
 
 pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::encoders::phi4_siglip::{Phi4SigLipVisionConfig, Phi4SigLipVisionEncoder};
-    use vision::processors::phi4_siglip::Phi4SigLipProcessor;
+    use vision::processors::phi4mm::Phi4MMProcessor;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
@@ -723,19 +725,52 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         serde_json::from_value(phi4mm_vision_config_value(&full_config))
             .map_err(|e| anyhow::anyhow!("Failed to parse Phi4MM vision config: {}", e))?;
 
-    let min_num_patches = full_config
-        .get("min_num_patches")
-        .and_then(Value::as_u64)
-        .unwrap_or(256) as usize;
-    let max_num_patches = full_config
-        .get("max_num_patches")
-        .and_then(Value::as_u64)
-        .unwrap_or(3600) as usize;
     let select_layer = -2isize;
     let vision_lora_scale = phi4mm_vision_lora_scale(&full_config);
 
+    // Read HD transform config
+    let image_embd_layer = full_config
+        .get("embd_layer")
+        .and_then(|layer| layer.get("image_embd_layer"));
+    let crop_size = image_embd_layer
+        .and_then(|cfg| cfg.get("crop_size"))
+        .and_then(Value::as_u64)
+        .unwrap_or(448) as usize;
+    let hd_transform_order = image_embd_layer
+        .and_then(|cfg| cfg.get("hd_transform_order"))
+        .and_then(Value::as_str)
+        .unwrap_or("glb_sub")
+        .to_string();
+
+    // Read dynamic_hd from preprocessor_config.json
+    let dynamic_hd = {
+        let preproc_path = model_path.join("preprocessor_config.json");
+        if preproc_path.exists() {
+            let preproc_str = std::fs::read_to_string(&preproc_path)
+                .map_err(|e| anyhow::anyhow!("Failed to read preprocessor_config.json: {}", e))?;
+            let preproc: serde_json::Value = serde_json::from_str(&preproc_str)
+                .map_err(|e| anyhow::anyhow!("Failed to parse preprocessor_config.json: {}", e))?;
+            preproc
+                .get("dynamic_hd")
+                .and_then(Value::as_u64)
+                .unwrap_or(36) as usize
+        } else {
+            36
+        }
+    };
+
     let mut weights = remap_phi4mm_weights(load_vlm_weights(model_path)?, vision_lora_scale)?;
     models::sanitize_tied_embeddings(&mut weights, &full_config);
+
+    // Load glb_GN and sub_GN learnable separator weights
+    let glb_gn = weights
+        .get("glb_GN")
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| anyhow::anyhow!("Phi4MM glb_GN weight not found"))?;
+    let sub_gn = weights
+        .get("sub_GN")
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| anyhow::anyhow!("Phi4MM sub_GN weight not found"))?;
 
     let text_model = models::Phi4MMModel::from_weights(&weights, &text_config)
         .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM text model: {}", e))?;
@@ -763,8 +798,7 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
     )
     .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM mm_projector_linear2: {}", e))?;
 
-    let processor =
-        Phi4SigLipProcessor::new(vision_config.patch_size, min_num_patches, max_num_patches);
+    let processor = Phi4MMProcessor::new(crop_size, vision_config.patch_size, dynamic_hd);
     let eos_token_ids = match full_config.get("eos_token_id") {
         Some(Value::Array(values)) => values
             .iter()
@@ -782,6 +816,9 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         processor,
         select_layer,
         eos_token_ids,
+        glb_gn,
+        sub_gn,
+        hd_transform_order,
     }))
 }
 

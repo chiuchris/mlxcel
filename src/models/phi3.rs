@@ -356,8 +356,23 @@ impl Phi3Model {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        // Embed tokens
-        let mut h = self.embed_tokens.forward(input_ids);
+        self.forward_impl(input_ids, None, caches, mask)
+    }
+
+    /// Forward with optional pre-computed embeddings (for VLM prefill).
+    /// Used by: Phi4MM VLM, Phi4-SigLIP VLM
+    pub fn forward_impl(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = if let Some(embeddings) = input_embeddings {
+            mlxcel_core::copy(embeddings)
+        } else {
+            self.embed_tokens.forward(input_ids)
+        };
 
         // Pass through transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
@@ -369,6 +384,12 @@ impl Phi3Model {
 
         // LM head
         self.lm_head.forward(&h)
+    }
+
+    /// Get raw token embeddings (for VLM embedding merge).
+    /// Used by: Phi4MM VLM, Phi4-SigLIP VLM
+    pub fn get_embed_tokens(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
+        self.embed_tokens.forward(input_ids)
     }
 
     /// Create KV caches for all layers
@@ -450,6 +471,20 @@ impl LanguageModel for Phi3Model {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         Phi3Model::forward(self, input_ids, caches, mask)
+    }
+
+    fn forward_with_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        Some(self.get_embed_tokens(input_ids))
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

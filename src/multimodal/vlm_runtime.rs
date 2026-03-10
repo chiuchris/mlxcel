@@ -208,11 +208,34 @@ where
             }))
         }
         VlmRuntimeRef::Phi4MM(phi4mm) => {
+            // 1. Preprocess images first to get num_img_tokens per image
+            let processed_images = phi4mm.processor.preprocess(images);
+
+            // 2. Tokenize prompt (gets 1x -200 per image placeholder)
             let prepared = prepare_phi4mm_prompt_tokens(prompt, images.len(), &mut encode)
                 .map_err(|err| anyhow::anyhow!("{}", err))?;
-            *prompt_tokens = prepared.tokens;
+            let tokens = prepared.tokens;
 
-            let processed_images = phi4mm.processor.preprocess(images);
+            // 3. Expand each -200 sentinel to match num_img_tokens from HD transform
+            let mut img_idx = 0;
+            let mut expanded = Vec::with_capacity(tokens.len());
+            for &tok in &tokens {
+                if tok == crate::phi4_siglip_prompt::PHI4_SIGLIP_IMAGE_TOKEN_INDEX {
+                    if let Some(processed) = processed_images.get(img_idx) {
+                        expanded.extend(std::iter::repeat_n(
+                            crate::phi4_siglip_prompt::PHI4_SIGLIP_IMAGE_TOKEN_INDEX,
+                            processed.num_img_tokens,
+                        ));
+                    } else {
+                        expanded.push(tok);
+                    }
+                    img_idx += 1;
+                } else {
+                    expanded.push(tok);
+                }
+            }
+            *prompt_tokens = expanded;
+
             let input_ids_arr = prompt_ids_array(prompt_tokens);
             let embeddings = phi4mm.get_input_embeddings(&input_ids_arr, &processed_images);
 

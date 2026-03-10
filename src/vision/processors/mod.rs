@@ -21,6 +21,7 @@ pub mod molmo2;
 pub mod moondream3;
 pub mod phi3_v;
 pub mod phi4_siglip;
+pub mod phi4mm;
 pub mod qwen2_vl;
 pub mod siglip;
 
