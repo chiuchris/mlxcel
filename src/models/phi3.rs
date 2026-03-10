@@ -17,6 +17,7 @@
 //! Key differences from standard Llama:
 //! - Fused QKV projection (single linear outputs Q, K, V concatenated)
 //! - Fused gate_up projection in MLP (single linear outputs gate, up concatenated)
+//! - Optional partial RoPE for Phi4MM-style checkpoints
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
@@ -44,6 +45,9 @@ pub struct ModelArgs {
 
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
+
+    #[serde(default = "default_partial_rotary_factor")]
+    pub partial_rotary_factor: f32,
 
     #[serde(default)]
     pub rope_scaling: Option<RopeScaling>,
@@ -82,6 +86,10 @@ fn default_rope_theta() -> f32 {
     10000.0
 }
 
+fn default_partial_rotary_factor() -> f32 {
+    1.0
+}
+
 fn default_max_position_embeddings() -> usize {
     131072
 }
@@ -94,6 +102,10 @@ impl ModelArgs {
 
     pub fn num_kv_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
+    }
+
+    pub fn rope_dims(&self) -> usize {
+        ((self.head_dim() as f32) * self.partial_rotary_factor) as usize
     }
 
     pub fn group_size(&self) -> i32 {
@@ -214,7 +226,7 @@ impl Phi3Attention {
             num_kv_heads: args.num_kv_heads() as i32,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
-            rope_dims: head_dim,
+            rope_dims: args.rope_dims() as i32,
             rope_base: args.rope_theta,
         })
     }
@@ -453,3 +465,7 @@ impl LanguageModel for Phi3Model {
         vec![32000, 32007] // <|end|>, <|endoftext|>
     }
 }
+
+#[cfg(test)]
+#[path = "phi3_tests.rs"]
+mod tests;

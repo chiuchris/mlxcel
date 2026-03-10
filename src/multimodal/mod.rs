@@ -19,6 +19,7 @@
 //! expansion, and prepared-embedding plumbing reusable across frontends.
 //!
 //! Modules:
+//! - `phi4mm_prompt`: Phi4MM `<|image_N|>` normalization and audio guard
 //! - `phi4_siglip_prompt`: Phi4-SigLIP `<image>` placeholder handling
 //! - `minicpmo_prompt`: MiniCPM-o image placeholder expansion and bounds
 //! - `qwen_vl`: Qwen-VL token insertion rules
@@ -29,6 +30,7 @@
 pub mod minicpmo_prompt;
 pub mod phi3v_prompt;
 pub mod phi4_siglip_prompt;
+pub mod phi4mm_prompt;
 pub mod qwen_vl;
 pub mod vlm_prompt;
 pub mod vlm_runtime;

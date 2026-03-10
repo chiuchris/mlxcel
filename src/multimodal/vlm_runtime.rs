@@ -28,6 +28,7 @@ use mlxcel_core::MlxArray;
 use crate::minicpmo_prompt::prepare_minicpmo_prompt_tokens;
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
+use crate::phi4mm_prompt::prepare_phi4mm_prompt_tokens;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::processors::ImageProcessor;
@@ -41,6 +42,10 @@ pub enum VlmPreparationSummary {
         total_image_tokens: i32,
     },
     MiniCPMO {
+        image_slots: usize,
+        total_tokens: usize,
+    },
+    Phi4MM {
         image_slots: usize,
         total_tokens: usize,
     },
@@ -176,6 +181,23 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation,
+            }))
+        }
+        VlmRuntimeRef::Phi4MM(phi4mm) => {
+            let prepared = prepare_phi4mm_prompt_tokens(prompt, images.len(), &mut encode)
+                .map_err(|err| anyhow::anyhow!("{}", err))?;
+            *prompt_tokens = prepared.tokens;
+
+            let processed_images = phi4mm.processor.preprocess(images);
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = phi4mm.get_input_embeddings(&input_ids_arr, &processed_images);
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::Phi4MM {
+                    image_slots: prepared.image_slots,
+                    total_tokens: prompt_tokens.len(),
+                }),
             }))
         }
         VlmRuntimeRef::Phi4SigLip(phi4_siglip) => {

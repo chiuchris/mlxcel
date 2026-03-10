@@ -74,6 +74,7 @@ pub mod olmoe;
 pub mod phi;
 pub mod phi3;
 pub mod phi3small;
+pub mod phi4mm;
 pub mod phimoe;
 pub mod qwen2;
 pub mod qwen2_moe;
@@ -142,6 +143,7 @@ pub use olmoe::OlmoeModel;
 pub use phi::PhiModel;
 pub use phi3::Phi3Model;
 pub use phi3small::Phi3SmallModel;
+pub use phi4mm::Phi4MMModel;
 pub use phimoe::PhiMoeModel;
 pub use qwen2::Qwen2Model;
 pub use qwen2_moe::Qwen2MoeModel;
@@ -195,6 +197,7 @@ pub enum ModelType {
     Gemma3nVLM,    // Gemma 3n VLM (MobileNetV5 + Gemma3n)
     Phi,           // Phi 1/2
     Phi3,          // Phi 3
+    Phi4MMVLM,     // Phi-4 Multimodal (SigLIP2 NaFlex + Phi4 text, image path only)
     Phi4SigLipVLM, // Phi-4 reasoning vision (SigLIP2 NaFlex + Phi3-style text)
     Phi3VLM,       // Phi 3.5 Vision (CLIP + Phi3)
     Molmo2VLM,     // Molmo2 (custom ViT + attention pooling + Molmo2 text)

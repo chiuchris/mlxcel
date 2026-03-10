@@ -89,10 +89,16 @@ impl TiktokenTokenizer {
         }
 
         // Override with tokenizer_config.json if available
-        Self::load_special_tokens_from_config(model_path, &mut special_encoder, &mut special_decoder);
+        Self::load_special_tokens_from_config(
+            model_path,
+            &mut special_encoder,
+            &mut special_decoder,
+        );
 
-        let mut special_tokens_sorted: Vec<(String, u32)> =
-            special_encoder.iter().map(|(k, &v)| (k.clone(), v)).collect();
+        let mut special_tokens_sorted: Vec<(String, u32)> = special_encoder
+            .iter()
+            .map(|(k, &v)| (k.clone(), v))
+            .collect();
         special_tokens_sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
 
         let pat = Regex::new(HUNYUAN_PAT)?;
@@ -316,7 +322,11 @@ mod tests {
     #[ignore] // Requires model files
     fn test_load_tiktoken() {
         let tokenizer = TiktokenTokenizer::from_file(&tiktoken_file(), &test_model_path());
-        assert!(tokenizer.is_ok(), "Failed to load tiktoken: {:?}", tokenizer.err());
+        assert!(
+            tokenizer.is_ok(),
+            "Failed to load tiktoken: {:?}",
+            tokenizer.err()
+        );
         let t = tokenizer.unwrap();
         assert!(!t.encoder.is_empty());
         assert!(!t.special_encoder.is_empty());

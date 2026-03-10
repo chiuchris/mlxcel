@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Phi4-SigLIP vision-language model.
+//! Phi4MM vision-language model.
 //!
-//! Used by: Phi4-SigLIP VLM
+//! Used by: Phi4MM VLM
 
 use crate::LanguageModel;
 use crate::multimodal::phi4_siglip_prompt::PHI4_SIGLIP_IMAGE_TOKEN_INDEX;
@@ -23,8 +23,8 @@ use crate::vision::{encoders, processors};
 use mlxcel_core::layers::{KVCache, UnifiedLinear};
 use mlxcel_core::{MlxArray, UniquePtr};
 
-pub struct Phi4SigLipVLModel {
-    pub text_model: crate::models::Phi3Model,
+pub struct Phi4MMVLModel {
+    pub text_model: crate::models::Phi4MMModel,
     pub vision_tower: encoders::phi4_siglip::Phi4SigLipVisionEncoder,
     pub mm_projector_linear1: UnifiedLinear,
     pub mm_projector_linear2: UnifiedLinear,
@@ -33,7 +33,7 @@ pub struct Phi4SigLipVLModel {
     pub eos_token_ids: Vec<i32>,
 }
 
-impl Phi4SigLipVLModel {
+impl Phi4MMVLModel {
     pub fn get_input_embeddings(
         &self,
         input_ids: &MlxArray,
@@ -41,7 +41,6 @@ impl Phi4SigLipVLModel {
     ) -> InputEmbeddings {
         let ids_shape = mlxcel_core::array_shape(input_ids);
         let seq_len = ids_shape[1] as usize;
-        let mut original_tokens = Vec::with_capacity(seq_len);
         let mut safe_tokens = Vec::with_capacity(seq_len);
         let mut image_positions = Vec::new();
 
@@ -53,7 +52,6 @@ impl Phi4SigLipVLModel {
             );
             mlxcel_core::eval(&token);
             let value = mlxcel_core::item_i32(&token);
-            original_tokens.push(value);
             if value == PHI4_SIGLIP_IMAGE_TOKEN_INDEX {
                 image_positions.push(token_idx);
                 safe_tokens.push(0);
@@ -117,15 +115,14 @@ impl Phi4SigLipVLModel {
             segments.push(tail);
         }
 
-        let inputs_embeds = encoders::phi4_siglip::concat_arrays(&segments, 1);
         InputEmbeddings {
-            inputs_embeds,
+            inputs_embeds: encoders::phi4_siglip::concat_arrays(&segments, 1),
             attention_mask_4d: None,
         }
     }
 }
 
-impl LanguageModel for Phi4SigLipVLModel {
+impl LanguageModel for Phi4MMVLModel {
     fn forward(
         &self,
         input_ids: &MlxArray,

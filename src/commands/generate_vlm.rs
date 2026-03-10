@@ -42,6 +42,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_slots, total_tokens
             );
         }
+        VlmPreparationSummary::Phi4MM {
+            image_slots,
+            total_tokens,
+        } => {
+            println!(
+                "Phi4MM: tokenized with {} image slots ({} total tokens)",
+                image_slots, total_tokens
+            );
+        }
         VlmPreparationSummary::Molmo2 { total_tokens } => {
             println!(
                 "Molmo2: expanded prompt with image tokens ({} total tokens)",

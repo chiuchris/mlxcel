@@ -14,10 +14,11 @@
 
 use super::{
     cap_molmo2_vit_num_layers, inherit_quantization_if_missing, llama4_mm_tokens_per_image,
-    llama4_quantization_params, llama4_token_ids, llama4_vision_prefix, molmo2_max_crops,
-    parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
-    remap_minicpmo_text_weights, rewrite_molmo2_weight_key, rewrite_phi3_weight_key,
-    rewrite_phi4_siglip_weight_key, should_transpose_phi3_patch_embedding,
+    llama4_quantization_params, llama4_token_ids, llama4_vision_prefix, merge_phi4mm_lora_weight,
+    molmo2_max_crops, parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
+    phi4mm_text_config_value, phi4mm_vision_config_value, remap_minicpmo_text_weights,
+    rewrite_molmo2_weight_key, rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key,
+    rewrite_phi4mm_vision_key, should_transpose_phi3_patch_embedding,
 };
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
@@ -137,6 +138,107 @@ fn phi4_siglip_text_config_value_inherits_root_text_fields() {
     assert_eq!(text_config["hidden_size"], 5120);
     assert_eq!(text_config["num_attention_heads"], 40);
     assert_eq!(text_config["quantization"]["group_size"], 64);
+}
+
+#[test]
+fn rewrite_phi4mm_vision_key_maps_multimodal_prefixes_and_skips_audio() {
+    assert_eq!(
+        rewrite_phi4mm_vision_key(
+            "model.embed_tokens_extend.image_embed.img_processor.embeddings.patch_embedding.weight"
+        ),
+        Some(
+            "vision_tower.vision_tower.vision_model.embeddings.patch_embedding.weight".to_string()
+        )
+    );
+    assert_eq!(
+        rewrite_phi4mm_vision_key("model.embed_tokens_extend.image_embed.img_projection.0.weight"),
+        Some("mm_projector_linear1.weight".to_string())
+    );
+    assert_eq!(
+        rewrite_phi4mm_vision_key("model.layers.0.self_attn.qkv_proj.base_layer.weight"),
+        Some("model.layers.0.self_attn.qkv_proj.base_layer.weight".to_string())
+    );
+    assert_eq!(
+        rewrite_phi4mm_vision_key(
+            "model.embed_tokens_extend.audio_embed.audio_projection.speech.0.weight"
+        ),
+        None
+    );
+}
+
+#[test]
+fn phi4mm_text_config_value_inherits_root_text_fields() {
+    let text_config = phi4mm_text_config_value(&json!({
+        "model_type": "phi4mm",
+        "hidden_size": 3072,
+        "num_attention_heads": 24,
+        "num_hidden_layers": 32,
+        "intermediate_size": 8192,
+        "vocab_size": 200064,
+        "partial_rotary_factor": 0.75,
+        "tie_word_embeddings": true
+    }))
+    .unwrap();
+
+    assert_eq!(text_config["model_type"], "phi4mm");
+    assert_eq!(text_config["partial_rotary_factor"], 0.75);
+    assert_eq!(text_config["tie_word_embeddings"], true);
+}
+
+#[test]
+fn phi4mm_vision_config_value_uses_crop_size_defaults() {
+    let vision_config = phi4mm_vision_config_value(&json!({
+        "embd_layer": {
+            "image_embd_layer": {
+                "crop_size": 448
+            }
+        }
+    }));
+
+    assert_eq!(vision_config["patch_size"], 14);
+    assert_eq!(vision_config["image_size"], 448);
+    assert_eq!(vision_config["num_patches"], 1024);
+}
+
+#[test]
+fn merge_phi4mm_lora_weight_handles_standard_peft_orientation() {
+    let base = mlxcel_core::ones(&[3, 2], dtype::FLOAT32);
+    let lora_a = mlxcel_core::ones(&[1, 2], dtype::FLOAT32);
+    let lora_b = mlxcel_core::ones(&[3, 1], dtype::FLOAT32);
+
+    let fused = merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 2.0).unwrap();
+    assert_eq!(mlxcel_core::array_shape(&fused), vec![3, 2]);
+
+    let total = mlxcel_core::sum_all(&fused);
+    mlxcel_core::eval(&total);
+    assert_eq!(mlxcel_core::item_f32(&total), 18.0);
+}
+
+#[test]
+fn merge_phi4mm_lora_weight_handles_mlx_orientation() {
+    let base = mlxcel_core::ones(&[3, 2], dtype::FLOAT32);
+    let lora_a = mlxcel_core::ones(&[2, 1], dtype::FLOAT32);
+    let lora_b = mlxcel_core::ones(&[1, 3], dtype::FLOAT32);
+
+    let fused = merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 2.0).unwrap();
+    assert_eq!(mlxcel_core::array_shape(&fused), vec![3, 2]);
+
+    let total = mlxcel_core::sum_all(&fused);
+    mlxcel_core::eval(&total);
+    assert_eq!(mlxcel_core::item_f32(&total), 18.0);
+}
+
+#[test]
+fn merge_phi4mm_lora_weight_rejects_ambiguous_shapes_without_base_match() {
+    let base = mlxcel_core::ones(&[2, 2], dtype::FLOAT32);
+    let lora_a = mlxcel_core::ones(&[1, 2], dtype::FLOAT32);
+    let lora_b = mlxcel_core::ones(&[3, 1], dtype::FLOAT32);
+
+    let err = match merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 1.0) {
+        Ok(_) => panic!("expected Phi4MM LoRA shape validation to fail"),
+        Err(err) => err.to_string(),
+    };
+    assert!(err.contains("Phi4MM vision LoRA shapes do not match base weight"));
 }
 #[test]
 fn molmo2_helpers_clamp_layer_count_and_parse_defaults() {

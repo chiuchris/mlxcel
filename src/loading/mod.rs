@@ -130,6 +130,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::Qwen3VLMoe => Some(load_qwen3_vl_moe(model_path)?),
         ModelType::MiniCPMOVLM => Some(load_minicpmo_vlm(model_path)?),
         ModelType::Gemma3nVLM => Some(load_gemma3n_vlm(model_path)?),
+        ModelType::Phi4MMVLM => Some(load_phi4mm_vlm(model_path)?),
         ModelType::Phi4SigLipVLM => Some(load_phi4_siglip_vlm(model_path)?),
         ModelType::Phi3VLM => Some(load_phi3_vlm(model_path)?),
         ModelType::Molmo2VLM => Some(load_molmo2_vlm(model_path)?),

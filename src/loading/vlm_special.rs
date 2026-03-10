@@ -17,6 +17,7 @@
 //! Families:
 //! - Llama4 VLM
 //! - MiniCPM-o
+//! - Phi4MM
 //! - Phi4-SigLIP
 //! - Phi3V
 //! - Molmo2
@@ -27,6 +28,7 @@
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::Path;
 
 use crate::LoadedModel;
@@ -52,7 +54,7 @@ fn phi3_vision_config() -> vision::config::VisionConfig {
     }
 }
 
-const PHI4_SIGLIP_TEXT_FIELDS: &[&str] = &[
+const PHI4_FUSED_TEXT_FIELDS: &[&str] = &[
     "vocab_size",
     "num_hidden_layers",
     "intermediate_size",
@@ -214,7 +216,7 @@ pub(super) fn phi4_siglip_text_config_value(full_config: &Value) -> Result<Value
         .unwrap_or_else(|| serde_json::json!({}));
 
     let text_obj = super::require_object_mut(&mut text_config, "Phi4-SigLIP text_config")?;
-    for &field in PHI4_SIGLIP_TEXT_FIELDS {
+    for &field in PHI4_FUSED_TEXT_FIELDS {
         if let Some(value) = full_config.get(field) {
             text_obj
                 .entry(field.to_string())
@@ -223,6 +225,290 @@ pub(super) fn phi4_siglip_text_config_value(full_config: &Value) -> Result<Value
     }
 
     Ok(text_config)
+}
+
+fn phi4mm_vision_lora_scale(full_config: &Value) -> f32 {
+    let vision_lora = full_config.get("vision_lora").and_then(Value::as_object);
+    let rank = vision_lora
+        .and_then(|cfg| cfg.get("r"))
+        .and_then(Value::as_f64)
+        .unwrap_or(256.0);
+    let alpha = vision_lora
+        .and_then(|cfg| cfg.get("lora_alpha"))
+        .and_then(Value::as_f64)
+        .unwrap_or(512.0);
+    (alpha / rank.max(1.0)) as f32
+}
+
+fn flatten_phi4mm_patch_embedding(
+    weight: &mlxcel_core::MlxArray,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let shape = mlxcel_core::array_shape(weight);
+    if shape.len() != 4 {
+        return mlxcel_core::copy(weight);
+    }
+
+    let transposed = mlxcel_core::transpose_axes(weight, &[0, 2, 3, 1]);
+    mlxcel_core::reshape(&transposed, &[shape[0], shape[1] * shape[2] * shape[3]])
+}
+
+fn rewrite_phi4mm_vision_key(key: &str) -> Option<String> {
+    if key.contains("position_ids")
+        || key.contains("img_processor.head.")
+        || key.contains("glb_GN")
+        || key.contains("sub_GN")
+        || key.starts_with("model.embed_tokens_extend.audio_embed.")
+    {
+        None
+    } else if let Some(rest) =
+        key.strip_prefix("model.embed_tokens_extend.image_embed.img_processor.")
+    {
+        Some(format!("vision_tower.vision_tower.vision_model.{}", rest))
+    } else if let Some(rest) =
+        key.strip_prefix("model.embed_tokens_extend.image_embed.img_projection.0.")
+    {
+        Some(format!("mm_projector_linear1.{}", rest))
+    } else if let Some(rest) =
+        key.strip_prefix("model.embed_tokens_extend.image_embed.img_projection.2.")
+    {
+        Some(format!("mm_projector_linear2.{}", rest))
+    } else {
+        Some(key.to_string())
+    }
+}
+
+pub(super) fn phi4mm_text_config_value(full_config: &Value) -> Result<Value> {
+    let mut text_config = full_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let text_obj = super::require_object_mut(&mut text_config, "Phi4MM text_config")?;
+    for &field in PHI4_FUSED_TEXT_FIELDS {
+        if let Some(value) = full_config.get(field) {
+            text_obj
+                .entry(field.to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    Ok(text_config)
+}
+
+pub(super) fn phi4mm_vision_config_value(full_config: &Value) -> Value {
+    let image_size = full_config
+        .get("embd_layer")
+        .and_then(|layer| layer.get("image_embd_layer"))
+        .and_then(|layer| layer.get("crop_size"))
+        .and_then(Value::as_u64)
+        .unwrap_or(448);
+    let patch_size = full_config
+        .get("vision_config")
+        .and_then(|cfg| cfg.get("patch_size"))
+        .and_then(Value::as_u64)
+        .unwrap_or(14);
+
+    serde_json::json!({
+        "hidden_size": 1152,
+        "intermediate_size": 4304,
+        "num_hidden_layers": 27,
+        "num_attention_heads": 16,
+        "num_channels": 3,
+        "image_size": image_size,
+        "patch_size": patch_size,
+        "num_patches": (image_size / patch_size).pow(2),
+        "layer_norm_eps": 1e-6
+    })
+}
+
+fn remap_phi4mm_weights(raw_weights: WeightMap, vision_lora_scale: f32) -> Result<WeightMap> {
+    let mut phi4mm_vision_lora: HashMap<
+        String,
+        (
+            Option<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
+            Option<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
+        ),
+    > = HashMap::new();
+    let mut base_weights = WeightMap::new();
+
+    for (key, value) in raw_weights {
+        if let Some(base_key) = key.strip_suffix(".lora_A.vision.weight") {
+            let final_key = rewrite_phi4mm_vision_key(&format!("{}.weight", base_key))
+                .map(|key| key.replace(".base_layer.", "."));
+            if let Some(final_key) = final_key {
+                phi4mm_vision_lora
+                    .entry(final_key)
+                    .or_insert((None, None))
+                    .0 = Some(value);
+            }
+            continue;
+        }
+        if let Some(base_key) = key.strip_suffix(".lora_B.vision.weight") {
+            let final_key = rewrite_phi4mm_vision_key(&format!("{}.weight", base_key))
+                .map(|key| key.replace(".base_layer.", "."));
+            if let Some(final_key) = final_key {
+                phi4mm_vision_lora
+                    .entry(final_key)
+                    .or_insert((None, None))
+                    .1 = Some(value);
+            }
+            continue;
+        }
+        if key.contains(".lora_A.speech.") || key.contains(".lora_B.speech.") {
+            continue;
+        }
+
+        let Some(mut new_key) = rewrite_phi4mm_vision_key(&key) else {
+            continue;
+        };
+        if new_key.contains(".base_layer.") {
+            new_key = new_key.replace(".base_layer.", ".");
+        }
+
+        let value = if new_key.ends_with("patch_embedding.weight") {
+            flatten_phi4mm_patch_embedding(&value)
+        } else {
+            value
+        };
+        base_weights.insert(new_key, value);
+    }
+
+    for (base_key, (lora_a, lora_b)) in phi4mm_vision_lora {
+        let (Some(lora_a), Some(lora_b)) = (lora_a, lora_b) else {
+            tracing::warn!(
+                "Incomplete Phi4MM vision LoRA pair for {}: missing lora_A or lora_B",
+                base_key
+            );
+            continue;
+        };
+
+        let Some(base_weight) = base_weights.get(&base_key) else {
+            tracing::warn!(
+                "Skipping Phi4MM vision LoRA pair for {} because the base weight is missing",
+                base_key
+            );
+            continue;
+        };
+
+        let fused = merge_phi4mm_lora_weight(base_weight, &lora_a, &lora_b, vision_lora_scale)?;
+        base_weights.insert(base_key, fused);
+    }
+
+    Ok(base_weights)
+}
+
+fn merge_phi4mm_lora_weight(
+    base_weight: &mlxcel_core::MlxArray,
+    lora_a: &mlxcel_core::MlxArray,
+    lora_b: &mlxcel_core::MlxArray,
+    scale: f32,
+) -> Result<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>> {
+    let base_shape = mlxcel_core::array_shape(base_weight);
+    let a_shape = mlxcel_core::array_shape(lora_a);
+    let b_shape = mlxcel_core::array_shape(lora_b);
+
+    if base_shape.len() != 2 || a_shape.len() != 2 || b_shape.len() != 2 {
+        anyhow::bail!(
+            "Phi4MM vision LoRA expects 2D tensors, got base={:?}, lora_a={:?}, lora_b={:?}",
+            base_shape,
+            a_shape,
+            b_shape
+        );
+    }
+
+    let delta = if a_shape[0] == b_shape[1] && base_shape == vec![b_shape[0], a_shape[1]] {
+        mlxcel_core::matmul(lora_b, lora_a)
+    } else if a_shape[1] == b_shape[0] && base_shape == vec![b_shape[1], a_shape[0]] {
+        let product = mlxcel_core::matmul(lora_a, lora_b);
+        mlxcel_core::transpose_axes(&product, &[1, 0])
+    } else {
+        anyhow::bail!(
+            "Phi4MM vision LoRA shapes do not match base weight: base={:?}, lora_a={:?}, lora_b={:?}",
+            base_shape,
+            a_shape,
+            b_shape
+        );
+    };
+
+    let scaled_delta = mlxcel_core::multiply_scalar(&delta, scale);
+    Ok(mlxcel_core::add(base_weight, &scaled_delta))
+}
+
+pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
+    use vision::encoders::phi4_siglip::{Phi4SigLipVisionConfig, Phi4SigLipVisionEncoder};
+    use vision::processors::phi4_siglip::Phi4SigLipProcessor;
+
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+
+    let mut text_config_value = phi4mm_text_config_value(&full_config)?;
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
+    let text_config: models::phi4mm::ModelArgs = serde_json::from_value(text_config_value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Phi4MM text config: {}", e))?;
+
+    let vision_config: Phi4SigLipVisionConfig =
+        serde_json::from_value(phi4mm_vision_config_value(&full_config))
+            .map_err(|e| anyhow::anyhow!("Failed to parse Phi4MM vision config: {}", e))?;
+
+    let min_num_patches = full_config
+        .get("min_num_patches")
+        .and_then(Value::as_u64)
+        .unwrap_or(256) as usize;
+    let max_num_patches = full_config
+        .get("max_num_patches")
+        .and_then(Value::as_u64)
+        .unwrap_or(3600) as usize;
+    let select_layer = -2isize;
+    let vision_lora_scale = phi4mm_vision_lora_scale(&full_config);
+
+    let mut weights = remap_phi4mm_weights(load_vlm_weights(model_path)?, vision_lora_scale)?;
+    models::sanitize_tied_embeddings(&mut weights, &full_config);
+
+    let text_model = models::Phi4MMModel::from_weights(&weights, &text_config)
+        .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM text model: {}", e))?;
+    let vision_tower = Phi4SigLipVisionEncoder::from_weights(
+        &weights,
+        &vision_config,
+        "vision_tower.vision_tower.vision_model",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM vision tower: {}", e))?;
+
+    let mm_projector_linear1 = mlxcel_core::layers::UnifiedLinear::from_weights(
+        &weights,
+        "mm_projector_linear1",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM mm_projector_linear1: {}", e))?;
+    let mm_projector_linear2 = mlxcel_core::layers::UnifiedLinear::from_weights(
+        &weights,
+        "mm_projector_linear2",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM mm_projector_linear2: {}", e))?;
+
+    let processor =
+        Phi4SigLipProcessor::new(vision_config.patch_size, min_num_patches, max_num_patches);
+    let eos_token_ids = match full_config.get("eos_token_id") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_i64().map(|id| id as i32))
+            .collect(),
+        Some(Value::Number(value)) => value.as_i64().map(|id| vec![id as i32]).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    Ok(LoadedModel::Phi4MMVLM(vision::Phi4MMVLModel {
+        text_model,
+        vision_tower,
+        mm_projector_linear1,
+        mm_projector_linear2,
+        processor,
+        select_layer,
+        eos_token_ids,
+    }))
 }
 
 pub(crate) fn load_phi4_siglip_vlm(model_path: &Path) -> Result<LoadedModel> {
