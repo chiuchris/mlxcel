@@ -27,6 +27,11 @@ pub mod vision;
 
 mod loaded_model;
 mod loading;
+mod model_metadata;
+
+#[cfg(test)]
+#[path = "model_metadata_tests.rs"]
+mod model_metadata_tests;
 
 // Re-export mlxcel-core generate module
 pub use execution::runtime::{RuntimeDevice, RuntimeSetup, initialize_runtime};

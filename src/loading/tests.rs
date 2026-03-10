@@ -13,10 +13,13 @@
 // limitations under the License.
 
 use super::{
-    DirectoryLoadRoute, ModelCapabilities, ModelKind, ModelLoadPolicy, Qwen35VlmKind,
-    WeightLoadRoute, directory_load_route, is_ministral3_config, is_vlm_model_type,
-    model_capabilities, model_load_policy, model_path_str, parse_eos_token_ids, qwen35_vlm_kind,
-    read_eos_token_ids, require_qwen35_vlm_kind, resolve_model_dir, weight_load_route,
+    Qwen35VlmKind, model_path_str, parse_eos_token_ids, qwen35_vlm_kind, read_eos_token_ids,
+    require_qwen35_vlm_kind, resolve_model_dir,
+};
+use crate::model_metadata::{
+    DirectoryLoadRoute, ModelCapabilities, ModelKind, ModelLoadPolicy, WeightLoadRoute,
+    directory_load_route, is_ministral3_config, is_vlm_model_type, model_capabilities,
+    model_load_policy, weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
