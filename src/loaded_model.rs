@@ -256,4 +256,8 @@ impl LanguageModel for LoadedModel {
     ) -> Option<UniquePtr<mlxcel_core::MlxArray>> {
         delegate_language_model!(self, embed_tokens(input_ids))
     }
+
+    fn after_prefill(&self) {
+        delegate_language_model!(self, after_prefill())
+    }
 }

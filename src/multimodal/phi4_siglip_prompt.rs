@@ -37,9 +37,14 @@ pub fn ensure_phi4_siglip_image_tokens(prompt: &str, num_images: usize) -> Strin
     }
 
     let image_tokens = format!("{}\n", PHI4_SIGLIP_IMAGE_TOKEN).repeat(num_images);
+    // Insert image tokens after <|user|> tag (with or without trailing newline)
     if let Some(pos) = prompt.find("<|user|>\n") {
         let mut text = prompt.to_string();
         text.insert_str(pos + "<|user|>\n".len(), &image_tokens);
+        text
+    } else if let Some(pos) = prompt.find("<|user|>") {
+        let mut text = prompt.to_string();
+        text.insert_str(pos + "<|user|>".len(), &image_tokens);
         text
     } else {
         format!("{}{}", image_tokens, prompt)

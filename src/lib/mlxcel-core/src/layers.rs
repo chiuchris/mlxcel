@@ -297,16 +297,35 @@ impl LayerNorm {
     }
 }
 
+/// Optional LoRA weights for runtime on-the-fly application.
+/// Used by: Phi4MM VLM (vision LoRA active during prefill only)
+pub struct LoRAWeights {
+    /// LoRA A weight: [rank, in_features]
+    pub a: UniquePtr<MlxArray>,
+    /// LoRA B weight: [out_features, rank]
+    pub b: UniquePtr<MlxArray>,
+    pub scale: f32,
+    /// Whether LoRA is currently active. Uses Cell for interior mutability
+    /// so that after_prefill(&self) can toggle it without &mut self.
+    active: std::cell::Cell<bool>,
+}
+
 /// Regular (non-quantized) Linear layer
 pub struct Linear {
     pub weight: UniquePtr<MlxArray>,
     pub bias: Option<UniquePtr<MlxArray>>,
+    /// Optional runtime LoRA (applied on-the-fly, not fused into weight)
+    lora: Option<LoRAWeights>,
 }
 
 impl Linear {
     /// Create a new linear layer
     pub fn new(weight: UniquePtr<MlxArray>, bias: Option<UniquePtr<MlxArray>>) -> Self {
-        Self { weight, bias }
+        Self {
+            weight,
+            bias,
+            lora: None,
+        }
     }
 
     /// Load from weight map
@@ -322,14 +341,46 @@ impl Linear {
         let bias_name = format!("{}.bias", prefix);
         let bias = weights.get(&bias_name).map(|w| ffi::copy(w));
 
-        Ok(Self { weight, bias })
+        Ok(Self {
+            weight,
+            bias,
+            lora: None,
+        })
     }
 
-    /// Forward pass: y = x @ W.T + bias
+    /// Set runtime LoRA weights. Starts active.
+    pub fn set_lora(&mut self, a: UniquePtr<MlxArray>, b: UniquePtr<MlxArray>, scale: f32) {
+        self.lora = Some(LoRAWeights {
+            a,
+            b,
+            scale,
+            active: std::cell::Cell::new(true),
+        });
+    }
+
+    /// Toggle LoRA active state (no-op if no LoRA weights set)
+    pub fn set_lora_active(&self, active: bool) {
+        if let Some(ref lora) = self.lora {
+            lora.active.set(active);
+        }
+    }
+
+    /// Forward pass: y = x @ W.T + bias [+ LoRA if active]
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // Transpose weight from [out, in] to [in, out]
         let wt = ffi::transpose(&self.weight);
-        let result = ffi::matmul(x, &wt);
+        let mut result = ffi::matmul(x, &wt);
+
+        // Apply runtime LoRA: result += (x @ A.T) @ B.T * scale
+        if let Some(ref lora) = self.lora {
+            if lora.active.get() {
+                let at = ffi::transpose(&lora.a);
+                let bt = ffi::transpose(&lora.b);
+                let lora_out = ffi::matmul(&ffi::matmul(x, &at), &bt);
+                let scaled = crate::multiply_scalar(&lora_out, lora.scale);
+                result = ffi::add(&result, &scaled);
+            }
+        }
 
         match &self.bias {
             Some(b) => ffi::add(&result, b),
@@ -435,6 +486,20 @@ impl UnifiedLinear {
                 }
             }
             Self::Regular(linear) => linear.forward(x),
+        }
+    }
+
+    /// Set runtime LoRA weights (only for Regular variant)
+    pub fn set_lora(&mut self, a: UniquePtr<MlxArray>, b: UniquePtr<MlxArray>, scale: f32) {
+        if let Self::Regular(linear) = self {
+            linear.set_lora(a, b, scale);
+        }
+    }
+
+    /// Toggle LoRA active state
+    pub fn set_lora_active(&self, active: bool) {
+        if let Self::Regular(linear) = self {
+            linear.set_lora_active(active);
         }
     }
 

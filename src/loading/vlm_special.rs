@@ -597,7 +597,19 @@ pub(super) fn phi4mm_vision_config_value(full_config: &Value) -> Value {
     })
 }
 
-fn remap_phi4mm_weights(raw_weights: WeightMap, vision_lora_scale: f32) -> Result<WeightMap> {
+/// LoRA pair: (lora_A weight, lora_B weight) keyed by the base weight name.
+type LoRAPairs = Vec<(
+    String,
+    mlxcel_core::UniquePtr<mlxcel_core::MlxArray>,
+    mlxcel_core::UniquePtr<mlxcel_core::MlxArray>,
+)>;
+
+/// Returns (remapped_weights, lora_pairs) where lora_pairs contains
+/// the raw LoRA A/B weights for runtime on-the-fly application.
+fn remap_phi4mm_weights(
+    raw_weights: WeightMap,
+    vision_lora_scale: f32,
+) -> Result<(WeightMap, LoRAPairs, f32)> {
     let mut phi4mm_vision_lora: HashMap<
         String,
         (
@@ -649,6 +661,8 @@ fn remap_phi4mm_weights(raw_weights: WeightMap, vision_lora_scale: f32) -> Resul
         base_weights.insert(new_key, value);
     }
 
+    let mut lora_pairs: LoRAPairs = Vec::new();
+    let effective_scale = vision_lora_scale;
     for (base_key, (lora_a, lora_b)) in phi4mm_vision_lora {
         let (Some(lora_a), Some(lora_b)) = (lora_a, lora_b) else {
             tracing::warn!(
@@ -658,56 +672,19 @@ fn remap_phi4mm_weights(raw_weights: WeightMap, vision_lora_scale: f32) -> Resul
             continue;
         };
 
-        let Some(base_weight) = base_weights.get(&base_key) else {
+        if !base_weights.contains_key(&base_key) {
             tracing::warn!(
                 "Skipping Phi4MM vision LoRA pair for {} because the base weight is missing",
                 base_key
             );
             continue;
-        };
+        }
 
-        let fused = merge_phi4mm_lora_weight(base_weight, &lora_a, &lora_b, vision_lora_scale)?;
-        base_weights.insert(base_key, fused);
+        // Store raw LoRA A/B for runtime on-the-fly application (not fused)
+        lora_pairs.push((base_key, lora_a, lora_b));
     }
 
-    Ok(base_weights)
-}
-
-fn merge_phi4mm_lora_weight(
-    base_weight: &mlxcel_core::MlxArray,
-    lora_a: &mlxcel_core::MlxArray,
-    lora_b: &mlxcel_core::MlxArray,
-    scale: f32,
-) -> Result<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>> {
-    let base_shape = mlxcel_core::array_shape(base_weight);
-    let a_shape = mlxcel_core::array_shape(lora_a);
-    let b_shape = mlxcel_core::array_shape(lora_b);
-
-    if base_shape.len() != 2 || a_shape.len() != 2 || b_shape.len() != 2 {
-        anyhow::bail!(
-            "Phi4MM vision LoRA expects 2D tensors, got base={:?}, lora_a={:?}, lora_b={:?}",
-            base_shape,
-            a_shape,
-            b_shape
-        );
-    }
-
-    let delta = if a_shape[0] == b_shape[1] && base_shape == vec![b_shape[0], a_shape[1]] {
-        mlxcel_core::matmul(lora_b, lora_a)
-    } else if a_shape[1] == b_shape[0] && base_shape == vec![b_shape[1], a_shape[0]] {
-        let product = mlxcel_core::matmul(lora_a, lora_b);
-        mlxcel_core::transpose_axes(&product, &[1, 0])
-    } else {
-        anyhow::bail!(
-            "Phi4MM vision LoRA shapes do not match base weight: base={:?}, lora_a={:?}, lora_b={:?}",
-            base_shape,
-            a_shape,
-            b_shape
-        );
-    };
-
-    let scaled_delta = mlxcel_core::multiply_scalar(&delta, scale);
-    Ok(mlxcel_core::add(base_weight, &scaled_delta))
+    Ok((base_weights, lora_pairs, effective_scale))
 }
 
 pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
@@ -759,7 +736,8 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         }
     };
 
-    let mut weights = remap_phi4mm_weights(load_vlm_weights(model_path)?, vision_lora_scale)?;
+    let (mut weights, lora_pairs, effective_scale) =
+        remap_phi4mm_weights(load_vlm_weights(model_path)?, vision_lora_scale)?;
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     // Load glb_GN and sub_GN learnable separator weights
@@ -772,8 +750,62 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         .map(|w| mlxcel_core::copy(w))
         .ok_or_else(|| anyhow::anyhow!("Phi4MM sub_GN weight not found"))?;
 
-    let text_model = models::Phi4MMModel::from_weights(&weights, &text_config)
+    let mut text_model = models::Phi4MMModel::from_weights(&weights, &text_config)
         .map_err(|e| anyhow::anyhow!("Failed to load Phi4MM text model: {}", e))?;
+
+    // Set runtime LoRA weights on the text model's linear layers.
+    // LoRA starts active (applied during prefill) and is deactivated
+    // by after_prefill() so decode uses base weights only — matching
+    // Python PEFT behavior.
+    let has_runtime_lora = !lora_pairs.is_empty();
+    let mut lora_set_count = 0usize;
+    for (key, lora_a, lora_b) in lora_pairs {
+        // key = "model.layers.N.{section}.{proj}.weight"
+        let parts: Vec<&str> = key.split('.').collect();
+        if parts.len() < 5 || parts[0] != "model" || parts[1] != "layers" {
+            continue;
+        }
+        let Some(layer_idx) = parts[2].parse::<usize>().ok() else {
+            continue;
+        };
+        if layer_idx >= text_model.layers.len() {
+            continue;
+        }
+        let layer = &mut text_model.layers[layer_idx];
+        match (parts[3], parts[4]) {
+            ("self_attn", "qkv_proj") => {
+                layer
+                    .self_attn
+                    .qkv_proj
+                    .set_lora(lora_a, lora_b, effective_scale);
+                lora_set_count += 1;
+            }
+            ("self_attn", "o_proj") => {
+                layer
+                    .self_attn
+                    .o_proj
+                    .set_lora(lora_a, lora_b, effective_scale);
+                lora_set_count += 1;
+            }
+            ("mlp", "gate_up_proj") => {
+                layer
+                    .mlp
+                    .gate_up_proj
+                    .set_lora(lora_a, lora_b, effective_scale);
+                lora_set_count += 1;
+            }
+            ("mlp", "down_proj") => {
+                layer
+                    .mlp
+                    .down_proj
+                    .set_lora(lora_a, lora_b, effective_scale);
+                lora_set_count += 1;
+            }
+            _ => {}
+        }
+    }
+    tracing::debug!("Phi4MM: set LoRA on {} linear layers", lora_set_count);
+
     let vision_tower = Phi4SigLipVisionEncoder::from_weights(
         &weights,
         &vision_config,
@@ -819,6 +851,7 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         glb_gn,
         sub_gn,
         hd_transform_order,
+        has_runtime_lora,
     }))
 }
 

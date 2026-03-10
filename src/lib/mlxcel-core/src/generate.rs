@@ -73,6 +73,11 @@ pub trait LanguageModel {
     fn embed_tokens(&self, _input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
         None // default: not supported
     }
+
+    /// Called once after prefill completes and before decode starts.
+    /// Used by models that need to adjust internal state between phases,
+    /// e.g. Phi4MM unfuses vision LoRA so decode uses base weights.
+    fn after_prefill(&self) {}
 }
 
 /// Sampling configuration
@@ -403,6 +408,15 @@ impl CxxGenerator {
         let logits =
             model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
 
+        // Force evaluation of the prefill graph before any weight modifications
+        // in after_prefill. MLX lazy evaluation means the graph references the
+        // current weight arrays; we must ensure evaluation completes before
+        // those arrays are replaced.
+        ffi::eval(&logits);
+
+        // Allow models to adjust state between prefill and decode (e.g. Phi4MM LoRA unfusion)
+        model.after_prefill();
+
         ffi::clear_memory_cache();
 
         let needs_history = sampling.needs_token_history();
@@ -494,6 +508,7 @@ impl CxxGenerator {
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
         let logits =
             model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
+        model.after_prefill();
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::eval(&y);
         let prefill_time = prefill_start.elapsed();

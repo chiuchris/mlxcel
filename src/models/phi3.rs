@@ -74,6 +74,12 @@ pub struct RopeScaling {
     pub high_freq_factor: Option<f32>,
     #[serde(default)]
     pub original_max_position_embeddings: Option<usize>,
+    /// SuScaledRoPE / longrope: per-dimension scaling factors for long sequences.
+    #[serde(default)]
+    pub long_factor: Option<Vec<f64>>,
+    /// SuScaledRoPE / longrope: per-dimension scaling factors for short sequences.
+    #[serde(default)]
+    pub short_factor: Option<Vec<f64>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -131,6 +137,12 @@ pub struct Phi3Attention {
     pub scale: f32,
     pub rope_dims: i32,
     pub rope_base: f32,
+    /// SuScaledRoPE: pre-computed frequencies (long_factor * base_freqs).
+    /// Used by: Phi4MM, Phi3V (longrope scaling)
+    pub su_rope_freqs: Option<UniquePtr<MlxArray>>,
+    /// SuScaledRoPE: input scaling factor applied to Q/K before rotation.
+    /// = sqrt(1 + log(max_pos/orig_max_pos) / log(orig_max_pos))
+    pub su_rope_scale: f32,
 }
 
 impl Phi3Attention {
@@ -168,9 +180,22 @@ impl Phi3Attention {
 
         let offset = cache.offset;
 
-        // Apply RoPE
-        let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
-        let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
+        // Apply RoPE (SuScaledRoPE for longrope models, plain RoPE otherwise)
+        let (q, k) = if let Some(ref freqs) = self.su_rope_freqs {
+            // SuScaledRoPE: pre-scale the rotary dimensions, then apply with custom freqs
+            let s = self.su_rope_scale;
+            let q = su_scale_rotary_dims(&q, s, self.rope_dims);
+            let k = su_scale_rotary_dims(&k, s, self.rope_dims);
+            let q =
+                mlxcel_core::fast_rope_with_freqs(&q, self.rope_dims, false, 1.0, offset, freqs);
+            let k =
+                mlxcel_core::fast_rope_with_freqs(&k, self.rope_dims, false, 1.0, offset, freqs);
+            (q, k)
+        } else {
+            let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
+            let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
+            (q, k)
+        };
 
         // Update KV cache and get sliced views
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
@@ -219,7 +244,7 @@ impl Phi3Attention {
 
         let head_dim = args.head_dim() as i32;
 
-        Ok(Self {
+        let mut attn = Self {
             qkv_proj,
             o_proj,
             num_heads: args.num_attention_heads as i32,
@@ -228,7 +253,78 @@ impl Phi3Attention {
             scale: 1.0 / (head_dim as f32).sqrt(),
             rope_dims: args.rope_dims() as i32,
             rope_base: args.rope_theta,
-        })
+            su_rope_freqs: None,
+            su_rope_scale: 1.0,
+        };
+
+        // Configure SuScaledRoPE if longrope scaling is present
+        if let Some(ref scaling) = args.rope_scaling {
+            let rope_type = scaling.rope_type.as_deref().unwrap_or("");
+            if rope_type == "longrope" || rope_type == "su" {
+                attn.configure_su_rope(args);
+            }
+        }
+
+        Ok(attn)
+    }
+
+    /// Configure SuScaledRoPE from model config.
+    /// Used by: Phi4MM, Phi3V (longrope/su scaling)
+    fn configure_su_rope(&mut self, args: &ModelArgs) {
+        let scaling = match &args.rope_scaling {
+            Some(s) => s,
+            None => return,
+        };
+        let long_factor = match &scaling.long_factor {
+            Some(f) => f,
+            None => return,
+        };
+
+        let dims = self.rope_dims as usize;
+        let half_dims = dims / 2;
+        if long_factor.len() < half_dims {
+            return;
+        }
+
+        // Compute modified frequencies: long_factor[i] * base^(2i/dims)
+        let base = self.rope_base as f64;
+        let mut freqs = vec![0.0f32; half_dims];
+        for i in 0..half_dims {
+            let exponent = (2 * i) as f64 / dims as f64;
+            freqs[i] = (long_factor[i] * base.powf(exponent)) as f32;
+        }
+        self.su_rope_freqs = Some(mlxcel_core::from_slice_f32(&freqs, &[half_dims as i32]));
+
+        // Compute scaling factor
+        let orig_max = scaling.original_max_position_embeddings.unwrap_or(4096) as f64;
+        let max_pos = args.max_position_embeddings as f64;
+        let factor = max_pos / orig_max;
+        self.su_rope_scale = if factor <= 1.0 {
+            1.0
+        } else {
+            (1.0 + factor.ln() / orig_max.ln()).sqrt() as f32
+        };
+    }
+}
+
+/// Pre-scale the rotary dimensions of Q/K for SuScaledRoPE.
+/// x shape: [batch, heads, seq, head_dim], scales x[..., :rope_dims] by `scale`.
+/// Used by: Phi4MM, Phi3V (longrope scaling)
+fn su_scale_rotary_dims(x: &MlxArray, scale: f32, rope_dims: i32) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(x);
+    let head_dim = shape[3];
+    if rope_dims >= head_dim {
+        // Full rotation: scale everything
+        let scale_arr = mlxcel_core::from_slice_f32(&[scale], &[1]);
+        mlxcel_core::multiply(x, &scale_arr)
+    } else {
+        // Partial rotation: scale only the first rope_dims
+        let rotary_part =
+            mlxcel_core::slice(x, &[0, 0, 0, 0], &[shape[0], shape[1], shape[2], rope_dims]);
+        let pass_part = mlxcel_core::slice(x, &[0, 0, 0, rope_dims], &shape);
+        let scale_arr = mlxcel_core::from_slice_f32(&[scale], &[1]);
+        let scaled = mlxcel_core::multiply(&rotary_part, &scale_arr);
+        mlxcel_core::concatenate(&scaled, &pass_part, 3)
     }
 }
 

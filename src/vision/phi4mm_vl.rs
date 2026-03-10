@@ -43,6 +43,9 @@ pub struct Phi4MMVLModel {
     pub sub_gn: UniquePtr<MlxArray>,
     /// hd_transform_order: "sub_glb" or "glb_sub"
     pub hd_transform_order: String,
+    /// Whether the model has runtime LoRA weights set on its linear layers.
+    /// Vision LoRA stays active for all steps (prefill + decode), matching Python PEFT.
+    pub has_runtime_lora: bool,
 }
 
 impl Phi4MMVLModel {
@@ -98,7 +101,7 @@ impl Phi4MMVLModel {
 
         // Process each image through HD transform
         let mut vision_features_list: Vec<UniquePtr<MlxArray>> = Vec::new();
-        for processed in processed_images {
+        for processed in processed_images.iter() {
             let features = self.hd_transform(processed, embed_dtype);
             vision_features_list.push(features);
         }
@@ -144,8 +147,9 @@ impl Phi4MMVLModel {
             segments.push(tail);
         }
 
+        let merged = encoders::phi4_siglip::concat_arrays(&segments, 1);
         InputEmbeddings {
-            inputs_embeds: encoders::phi4_siglip::concat_arrays(&segments, 1),
+            inputs_embeds: merged,
             attention_mask_4d: None,
         }
     }
@@ -381,5 +385,10 @@ impl LanguageModel for Phi4MMVLModel {
 
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
+    }
+
+    fn after_prefill(&self) {
+        // Python PEFT keeps vision LoRA active for ALL steps (prefill + decode).
+        // No deactivation needed.
     }
 }
