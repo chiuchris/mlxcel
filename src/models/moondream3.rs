@@ -219,8 +219,10 @@ impl Moondream3Attention {
 
         let q = self.apply_tau_to_q(&qkv, &q, offset);
         let v = self.apply_tau_to_v(&qkv, &v, offset);
-        let q = mlxcel_core::fast_rope(&q, self.rope_dims, true, 1500000.0, 1.0, offset);
-        let k = mlxcel_core::fast_rope(&k, self.rope_dims, true, 1500000.0, 1.0, offset);
+
+        // Moondream3 uses non-interleaved (halves) RoPE layout → traditional=false
+        let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, 1500000.0, 1.0, offset);
+        let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, 1500000.0, 1.0, offset);
 
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
         let attn = if seq_len > 1 && mask.is_none() {
@@ -228,9 +230,7 @@ impl Moondream3Attention {
                 &q, &cache_k, &cache_v, self.scale,
             )
         } else {
-            let mask_ptr = mask
-                .map(|value| value as *const _)
-                .unwrap_or(std::ptr::null());
+            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::fast_scaled_dot_product_attention(
                     &q, &cache_k, &cache_v, self.scale, mask_ptr,

@@ -14,9 +14,10 @@
 
 //! Moondream3 vision tower.
 //!
-//! The Rust port mirrors the ViT backbone and projection MLP from the shipped
-//! reference code. Local crop fusion is currently reduced by averaging the
-//! local-crop feature grids before the projection stage.
+//! The Rust port mirrors the ViT backbone, crop reconstruction, and projection
+//! MLP from the shipped reference code. Local crops are stitched back into a
+//! spatial feature map via `reconstruct_from_crops`, then pooled to the encoder
+//! grid size before concatenation with global features.
 
 use mlxcel_core::layers::{LayerNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -267,21 +268,40 @@ impl Moondream3VisionModel {
         self.post_ln.forward(&hidden)
     }
 
-    pub fn encode_image_embeddings(&self, pixel_values: &MlxArray) -> UniquePtr<MlxArray> {
+    pub fn encode_image_embeddings(
+        &self,
+        pixel_values: &MlxArray,
+        tiling: (usize, usize),
+    ) -> UniquePtr<MlxArray> {
         let crops = self.encode_crops(pixel_values);
         let crop_count = mlxcel_core::array_shape(&crops)[0];
-        let global = mlxcel_core::slice(&crops, &[0, 0, 0], &[1, 729, self.config.enc_dim as i32]);
-        let local_mean = if crop_count > 1 {
-            let local = mlxcel_core::slice(
-                &crops,
-                &[1, 0, 0],
-                &[crop_count, 729, self.config.enc_dim as i32],
-            );
-            mlxcel_core::mean_axis(&local, 0, true)
+        let enc_n = self.config.enc_n_layers as i32; // 27
+        let dim = self.config.enc_dim as i32; // 1152
+
+        // Global features: [1, 729, dim] → [729, dim]
+        let global = mlxcel_core::slice(&crops, &[0, 0, 0], &[1, enc_n * enc_n, dim]);
+        let global = mlxcel_core::reshape(&global, &[enc_n * enc_n, dim]);
+
+        // Local features: reconstruct spatial layout then pool
+        let reconstructed = if crop_count > 1 {
+            let local = mlxcel_core::slice(&crops, &[1, 0, 0], &[crop_count, enc_n * enc_n, dim]);
+            let num_local = crop_count - 1;
+            let local_spatial = mlxcel_core::reshape(&local, &[num_local, enc_n, enc_n, dim]);
+            let stitched =
+                reconstruct_from_crops(&local_spatial, tiling, self.config.overlap_margin);
+            let pool_target = self.config.enc_n_layers;
+            adaptive_avg_pool2d(&stitched, pool_target, pool_target)
         } else {
-            mlxcel_core::copy(&global)
+            mlxcel_core::reshape(&global, &[enc_n, enc_n, dim])
         };
-        let merged = mlxcel_core::concatenate(&global, &local_mean, 2);
+
+        // Flatten reconstructed: [27, 27, dim] → [729, dim]
+        let reconstructed_flat = mlxcel_core::reshape(&reconstructed, &[enc_n * enc_n, dim]);
+
+        // Concatenate global + reconstructed in feature dim → [729, 2304]
+        let merged = mlxcel_core::concatenate(&global, &reconstructed_flat, 1);
+        let merged = mlxcel_core::reshape(&merged, &[1, enc_n * enc_n, dim * 2]);
+
         let projected = self.proj_fc1.forward(&merged);
         let projected = mlxcel_core::gelu_approx(&projected);
         self.proj_fc2.forward(&projected)
@@ -290,6 +310,117 @@ impl Moondream3VisionModel {
     pub fn output_token_count(&self) -> usize {
         (self.config.crop_size / self.config.enc_patch_size).pow(2)
     }
+}
+
+/// Reconstruct a spatial feature map from overlapping crops.
+///
+/// Input `crops`: [num_crops, crop_h, crop_w, dim] — local crop feature grids.
+/// Returns [output_h, output_w, dim] with overlapping margins removed.
+///
+/// Port of Python `image_crops.py::reconstruct_from_crops` with patch_size=1.
+fn reconstruct_from_crops(
+    crops: &MlxArray,
+    tiling: (usize, usize),
+    overlap_margin: usize,
+) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(crops);
+    let crop_h = shape[1] as usize;
+    let crop_w = shape[2] as usize;
+    let dim = shape[3];
+    let (tiling_h, tiling_w) = tiling;
+    let margin = overlap_margin; // In patch units (patch_size=1)
+
+    // Build the result by slicing non-overlapping portions and concatenating
+    let mut row_results: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(tiling_h);
+    for tile_y in 0..tiling_h {
+        let y_start = if tile_y == 0 { 0 } else { margin };
+        let y_end = if tile_y == tiling_h - 1 {
+            crop_h
+        } else {
+            crop_h - margin
+        };
+
+        let mut col_results: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(tiling_w);
+        for tile_x in 0..tiling_w {
+            let x_start = if tile_x == 0 { 0 } else { margin };
+            let x_end = if tile_x == tiling_w - 1 {
+                crop_w
+            } else {
+                crop_w - margin
+            };
+
+            let crop_idx = (tile_y * tiling_w + tile_x) as i32;
+            // Slice this crop: [1, crop_h, crop_w, dim] → [y_end-y_start, x_end-x_start, dim]
+            let patch = mlxcel_core::slice(
+                crops,
+                &[crop_idx, y_start as i32, x_start as i32, 0],
+                &[crop_idx + 1, y_end as i32, x_end as i32, dim],
+            );
+            // Remove batch dim: [1, h, w, dim] → [h, w, dim]
+            let patch = mlxcel_core::reshape(
+                &patch,
+                &[(y_end - y_start) as i32, (x_end - x_start) as i32, dim],
+            );
+            col_results.push(patch);
+        }
+        // Concatenate columns: [row_h, total_w, dim]
+        let row = concat_along_axis(&col_results, 1);
+        row_results.push(row);
+    }
+    // Concatenate rows: [total_h, total_w, dim]
+    concat_along_axis(&row_results, 0)
+}
+
+/// Adaptive 2D average pooling: [H, W, C] → [target_h, target_w, C].
+///
+/// Uses separable two-pass approach (row pooling then column pooling).
+fn adaptive_avg_pool2d(input: &MlxArray, target_h: usize, target_w: usize) -> UniquePtr<MlxArray> {
+    let shape = mlxcel_core::array_shape(input);
+    let h = shape[0] as usize;
+    let w = shape[1] as usize;
+    let c = shape[2];
+
+    // Pass 1: pool rows — [H, W, C] → [target_h, W, C]
+    let inter = if h == target_h {
+        mlxcel_core::copy(input)
+    } else {
+        let mut rows: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(target_h);
+        for i in 0..target_h {
+            let y1 = (i * h / target_h) as i32;
+            let y2 = ((i + 1) * h).div_ceil(target_h) as i32;
+            let row_slice = mlxcel_core::slice(input, &[y1, 0, 0], &[y2, w as i32, c]);
+            let row_mean = mlxcel_core::mean_axis(&row_slice, 0, true);
+            rows.push(row_mean);
+        }
+        concat_along_axis(&rows, 0)
+    };
+
+    // Pass 2: pool columns — [target_h, W, C] → [target_h, target_w, C]
+    if w == target_w {
+        inter
+    } else {
+        let mut cols: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(target_w);
+        for j in 0..target_w {
+            let x1 = (j * w / target_w) as i32;
+            let x2 = ((j + 1) * w).div_ceil(target_w) as i32;
+            let col_slice = mlxcel_core::slice(&inter, &[0, x1, 0], &[target_h as i32, x2, c]);
+            let col_mean = mlxcel_core::mean_axis(&col_slice, 1, true);
+            cols.push(col_mean);
+        }
+        concat_along_axis(&cols, 1)
+    }
+}
+
+/// Concatenate arrays along a given axis.
+fn concat_along_axis(arrays: &[UniquePtr<MlxArray>], axis: i32) -> UniquePtr<MlxArray> {
+    if arrays.len() == 1 {
+        return mlxcel_core::copy(&arrays[0]);
+    }
+    let mut result = mlxcel_core::copy(&arrays[0]);
+    for arr in &arrays[1..] {
+        result = mlxcel_core::concatenate(&result, arr, axis);
+    }
+    result
 }
 
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {

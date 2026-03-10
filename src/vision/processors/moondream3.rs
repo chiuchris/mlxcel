@@ -27,6 +27,8 @@ use super::ImageProcessor;
 pub struct Moondream3ImageInput {
     pub pixel_values: Vec<f32>,
     pub pixel_values_shape: Vec<i32>,
+    /// Tiling grid (h_tiles, w_tiles) used for crop reconstruction.
+    pub tiling: (usize, usize),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -88,7 +90,7 @@ impl Moondream3Processor {
         (h_tiles.max(1), w_tiles.max(1))
     }
 
-    fn overlap_crop_image(&self, image: &RgbImage) -> Vec<RgbImage> {
+    fn overlap_crop_image(&self, image: &RgbImage) -> (Vec<RgbImage>, (usize, usize)) {
         let original_h = image.height() as usize;
         let original_w = image.width() as usize;
         let margin_pixels = self.patch_size * self.overlap_margin;
@@ -143,12 +145,12 @@ impl Moondream3Processor {
             }
         }
 
-        crops
+        (crops, tiling)
     }
 
     pub fn preprocess_image(&self, image: &DynamicImage) -> Moondream3ImageInput {
         let rgb = image.to_rgb8();
-        let crops = self.overlap_crop_image(&rgb);
+        let (crops, tiling) = self.overlap_crop_image(&rgb);
         let crop_count = crops.len();
         let mut pixel_values = vec![0.0f32; crop_count * 3 * self.crop_size * self.crop_size];
 
@@ -176,6 +178,7 @@ impl Moondream3Processor {
                 self.crop_size as i32,
                 self.crop_size as i32,
             ],
+            tiling,
         }
     }
 }
@@ -188,6 +191,7 @@ impl ImageProcessor for Moondream3Processor {
             .unwrap_or(Moondream3ImageInput {
                 pixel_values: Vec::new(),
                 pixel_values_shape: vec![0, 3, self.crop_size as i32, self.crop_size as i32],
+                tiling: (1, 1),
             });
         mlxcel_core::from_slice_f32(&processed.pixel_values, &processed.pixel_values_shape)
     }

@@ -43,7 +43,11 @@ pub(crate) fn build_moondream3_attention_mask(
         }
     }
 
-    mlxcel_core::from_slice_f32(&values, &[1, 1, total_tokens as i32, total_tokens as i32])
+    let mask =
+        mlxcel_core::from_slice_f32(&values, &[1, 1, total_tokens as i32, total_tokens as i32]);
+    // Cast to bfloat16 to match model dtype – MLX SDPA requires mask type
+    // promotable to the Q/K/V dtype.
+    mlxcel_core::astype(&mask, mlxcel_core::dtype::BFLOAT16)
 }
 
 pub struct Moondream3VLModel {
@@ -72,19 +76,20 @@ impl Moondream3VLModel {
             &processed_image.pixel_values_shape,
         );
         let pixel_values = mlxcel_core::astype(&pixel_values, embed_dtype);
-        let image_embeddings = self.vision_tower.encode_image_embeddings(&pixel_values);
+        let image_embeddings = self
+            .vision_tower
+            .encode_image_embeddings(&pixel_values, processed_image.tiling);
 
         let bos_ids = mlxcel_core::from_slice_i32(&[self.text_model.bos_token_id()], &[1, 1]);
         let bos_embeddings = self.text_model.embed_tokens.forward(&bos_ids);
+
         let prefix_embeddings = mlxcel_core::concatenate(&bos_embeddings, &image_embeddings, 1);
         let all_embeddings = mlxcel_core::concatenate(&prefix_embeddings, &prompt_embeddings, 1);
+        let prefix_len = self.prefix_token_count();
 
         InputEmbeddings {
             inputs_embeds: all_embeddings,
-            attention_mask_4d: Some(build_moondream3_attention_mask(
-                self.prefix_token_count(),
-                prompt_len,
-            )),
+            attention_mask_4d: Some(build_moondream3_attention_mask(prefix_len, prompt_len)),
         }
     }
 }
@@ -106,6 +111,7 @@ impl LanguageModel for Moondream3VLModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        // Single-pass with prefix-causal mask
         self.text_model
             .forward_with_embeddings(input_ids, input_embeddings, caches, mask)
     }
