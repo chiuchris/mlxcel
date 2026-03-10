@@ -16,12 +16,34 @@ use super::{
     cap_molmo2_vit_num_layers, inherit_quantization_if_missing, llama4_mm_tokens_per_image,
     llama4_quantization_params, llama4_token_ids, llama4_vision_prefix, molmo2_max_crops,
     parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
-    rewrite_molmo2_weight_key, rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key,
-    should_transpose_phi3_patch_embedding,
+    remap_minicpmo_text_weights, rewrite_molmo2_weight_key, rewrite_phi3_weight_key,
+    rewrite_phi4_siglip_weight_key, should_transpose_phi3_patch_embedding,
 };
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
 use serde_json::json;
+
+#[test]
+fn remap_minicpmo_text_weights_strips_language_model_prefix() {
+    let mut weights = WeightMap::new();
+    weights.insert(
+        "language_model.model.embed_tokens.weight".to_string(),
+        mlxcel_core::ones(&[2, 2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "language_model.lm_head.weight".to_string(),
+        mlxcel_core::ones(&[2, 2], dtype::FLOAT32),
+    );
+    weights.insert(
+        "vision_tower.embeddings.patch_embedding.weight".to_string(),
+        mlxcel_core::ones(&[2, 2], dtype::FLOAT32),
+    );
+
+    let remapped = remap_minicpmo_text_weights(&weights);
+    assert!(remapped.contains_key("model.embed_tokens.weight"));
+    assert!(remapped.contains_key("lm_head.weight"));
+    assert!(remapped.contains_key("vision_tower.embeddings.patch_embedding.weight"));
+}
 
 #[test]
 fn rewrite_phi3_weight_key_skips_position_ids_and_maps_known_prefixes() {

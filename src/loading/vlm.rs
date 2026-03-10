@@ -24,7 +24,7 @@
 //! - `vlm_pixtral.rs`: Pixtral / Mistral3
 //! - `vlm_qwen.rs`: Qwen2 / 2.5 / 3 / 3.5-VL
 //! - `vlm_siglip.rs`: Aya Vision / PaliGemma
-//! - `vlm_special.rs`: Llama4 / Phi4-SigLIP / Phi3V / Molmo2
+//! - `vlm_special.rs`: Llama4 / MiniCPM-o / Phi4-SigLIP / Phi3V / Molmo2
 
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
@@ -58,7 +58,9 @@ pub(crate) use qwen::{
     load_qwen3_vl_moe,
 };
 pub(crate) use siglip::{load_aya_vision_vlm, load_paligemma_vlm};
-pub(crate) use special::{load_llama4_vlm, load_molmo2_vlm, load_phi3_vlm, load_phi4_siglip_vlm};
+pub(crate) use special::{
+    load_llama4_vlm, load_minicpmo_vlm, load_molmo2_vlm, load_phi3_vlm, load_phi4_siglip_vlm,
+};
 
 fn read_sanitized_vlm_config(model_path: &Path) -> Result<(String, Value)> {
     let config_path = model_path.join("config.json");
@@ -105,7 +107,7 @@ fn read_optional_model_json(model_path: &Path, file_name: &str) -> Option<Value>
     serde_json::from_str(&json).ok()
 }
 
-fn strip_language_model_prefix(raw_weights: WeightMap) -> WeightMap {
+pub(super) fn strip_language_model_prefix(raw_weights: WeightMap) -> WeightMap {
     let mut weights = WeightMap::new();
     for (key, value) in raw_weights {
         let new_key = if let Some(stripped) = key.strip_prefix("language_model.") {

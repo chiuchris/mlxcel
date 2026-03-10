@@ -190,6 +190,7 @@ pub enum ModelType {
     Qwen25VL,      // Qwen2.5-VL (windowed ViT + Qwen2 w/ MRoPE)
     Qwen3VL,       // Qwen3-VL (ViT + interleaved MRoPE + DeepStack)
     Qwen3VLMoe,    // Qwen3-VL-MoE (Qwen3-VL + MoE text backbone)
+    MiniCPMOVLM,   // MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)
     Gemma3n,       // Gemma 3n (text-only)
     Gemma3nVLM,    // Gemma 3n VLM (MobileNetV5 + Gemma3n)
     Phi,           // Phi 1/2

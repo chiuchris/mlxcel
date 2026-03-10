@@ -16,6 +16,7 @@
 //!
 //! Families:
 //! - Llama4 VLM
+//! - MiniCPM-o
 //! - Phi4-SigLIP
 //! - Phi3V
 //! - Molmo2
@@ -68,6 +69,118 @@ const PHI4_SIGLIP_TEXT_FIELDS: &[&str] = &[
     "tie_word_embeddings",
     "max_position_embeddings",
 ];
+
+fn parse_quantization_params(full_config: &Value) -> (i32, i32) {
+    let group_size = full_config
+        .get("quantization")
+        .and_then(|value| value.get("group_size"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    let bits = full_config
+        .get("quantization")
+        .and_then(|value| value.get("bits"))
+        .and_then(|value| value.as_i64())
+        .unwrap_or(0) as i32;
+    (group_size, bits)
+}
+
+pub(super) fn remap_minicpmo_text_weights(raw_weights: &WeightMap) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for (key, value) in raw_weights {
+        let new_key = if let Some(stripped) = key.strip_prefix("language_model.") {
+            stripped.to_string()
+        } else {
+            key.clone()
+        };
+        weights.insert(new_key, mlxcel_core::copy(value));
+    }
+    weights
+}
+
+fn minicpmo_processor_config_value(model_path: &Path, full_config: &Value) -> Option<Value> {
+    read_optional_model_json(model_path, "preprocessor_config.json")
+        .or_else(|| {
+            read_optional_model_json(model_path, "processor_config.json")
+                .and_then(|value| value.get("image_processor").cloned().or(Some(value)))
+        })
+        .or_else(|| Some(full_config.clone()))
+}
+
+pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
+    use vision::encoders::minicpmo::{
+        MiniCPMOResampler, MiniCPMOVisionConfig, MiniCPMOVisionModel,
+    };
+    use vision::processors::minicpmo::MiniCPMOProcessor;
+
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+    let text_config: models::qwen3_vl::Qwen3VLConfig = serde_json::from_value(full_config.clone())
+        .map_err(|e| anyhow::anyhow!("Failed to parse MiniCPM-o text config: {}", e))?;
+    let vision_config: MiniCPMOVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "MiniCPM-o vision config")?;
+    let processor_config = minicpmo_processor_config_value(model_path, &full_config)
+        .unwrap_or_else(|| full_config.clone());
+
+    let raw_weights = load_vlm_weights(model_path)?;
+    let text_weights = remap_minicpmo_text_weights(&raw_weights);
+    let (group_size, bits) = parse_quantization_params(&full_config);
+
+    let text_model = models::Qwen3VLModel::from_weights(&text_weights, &text_config)
+        .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-o text model: {}", e))?;
+    let vision_tower = MiniCPMOVisionModel::from_weights(
+        &raw_weights,
+        &vision_config,
+        "vision_tower",
+        group_size,
+        bits,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-o vision tower: {}", e))?;
+    let resampler = MiniCPMOResampler::from_weights(
+        &raw_weights,
+        "resampler",
+        text_config.hidden_size,
+        (text_config.hidden_size / 128).max(1),
+        group_size,
+        bits,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-o resampler: {}", e))?;
+
+    let processor = MiniCPMOProcessor::new(
+        processor_config
+            .get("patch_size")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(14) as usize,
+        processor_config
+            .get("scale_resolution")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(448) as usize,
+        processor_config
+            .get("image_feature_size")
+            .and_then(|value| value.as_u64())
+            .unwrap_or(
+                full_config
+                    .get("query_num")
+                    .and_then(|value| value.as_u64())
+                    .unwrap_or(64),
+            ) as usize,
+    );
+
+    let eos_token_ids = match full_config.get("eos_token_id") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_i64().map(|id| id as i32))
+            .collect(),
+        Some(Value::Number(value)) => value.as_i64().map(|id| vec![id as i32]).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    Ok(LoadedModel::MiniCPMOVLM(vision::MiniCPMOVLModel {
+        text_model,
+        vision_tower,
+        resampler,
+        processor,
+        eos_token_ids,
+    }))
+}
 
 pub(super) fn rewrite_phi4_siglip_weight_key(key: &str) -> Option<String> {
     if key.contains("position_ids") || key.contains("vision_model.head.") {

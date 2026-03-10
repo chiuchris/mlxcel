@@ -33,6 +33,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_blocks, total_image_tokens
             );
         }
+        VlmPreparationSummary::MiniCPMO {
+            image_slots,
+            total_tokens,
+        } => {
+            println!(
+                "MiniCPM-o: tokenized with {} image slots ({} total tokens)",
+                image_slots, total_tokens
+            );
+        }
         VlmPreparationSummary::Molmo2 { total_tokens } => {
             println!(
                 "Molmo2: expanded prompt with image tokens ({} total tokens)",

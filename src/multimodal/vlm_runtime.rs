@@ -25,6 +25,7 @@ use anyhow::Result;
 use image::DynamicImage;
 use mlxcel_core::MlxArray;
 
+use crate::minicpmo_prompt::prepare_minicpmo_prompt_tokens;
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
@@ -38,6 +39,10 @@ pub enum VlmPreparationSummary {
     QwenVlm {
         image_blocks: usize,
         total_image_tokens: i32,
+    },
+    MiniCPMO {
+        image_slots: usize,
+        total_tokens: usize,
     },
     Molmo2 {
         total_tokens: usize,
@@ -130,6 +135,32 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation,
+            }))
+        }
+        VlmRuntimeRef::MiniCPMO(minicpmo) => {
+            let prepared = prepare_minicpmo_prompt_tokens(
+                prompt,
+                images.len(),
+                minicpmo.processor.image_feature_size,
+                &mut encode,
+            )
+            .map_err(|err| anyhow::anyhow!("{}", err))?;
+            *prompt_tokens = prepared.tokens;
+
+            let processed_images = minicpmo.processor.preprocess(images);
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = minicpmo.get_input_embeddings(
+                &input_ids_arr,
+                &processed_images,
+                &prepared.image_bounds,
+            );
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::MiniCPMO {
+                    image_slots: prepared.image_slots,
+                    total_tokens: prompt_tokens.len(),
+                }),
             }))
         }
         VlmRuntimeRef::Gemma3n(gemma3n_vl) => {

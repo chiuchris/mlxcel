@@ -12,29 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Vision encoder implementations
-//!
-//! Provides the VisionEncoder trait and encoder implementations.
+use super::{current_patch_position_ids, get_2d_sincos_pos_embed};
 
-pub mod gemma3n;
-pub mod llama4;
-pub mod minicpmo;
-pub mod molmo2;
-pub mod phi4_siglip;
-pub mod pixtral;
-pub mod qwen2_5_vl;
-pub mod qwen2_vl;
-pub mod qwen3_vl;
-pub mod siglip;
-
-use mlxcel_core::{MlxArray, UniquePtr};
-
-/// Output from a vision encoder
-pub struct VisionEncoderOutput {
-    pub hidden_states: UniquePtr<MlxArray>, // [batch, num_patches, hidden_dim]
+#[test]
+fn current_patch_position_ids_bucket_dynamic_grid() {
+    let ids = current_patch_position_ids(70, 2, 3);
+    assert_eq!(ids.len(), 6);
+    assert_eq!(ids[0], 0);
+    assert_eq!(ids[1], 23);
+    assert_eq!(ids[2], 46);
+    assert_eq!(ids[3], 35 * 70);
 }
 
-/// Trait for vision encoders
-pub trait VisionEncoder {
-    fn forward(&self, pixel_values: &MlxArray) -> VisionEncoderOutput;
+#[test]
+fn get_2d_sincos_pos_embed_returns_expected_length() {
+    let embed = get_2d_sincos_pos_embed(2, 3, 8);
+    assert_eq!(embed.len(), 2 * 3 * 8);
 }

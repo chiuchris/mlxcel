@@ -16,6 +16,7 @@
 //!
 //! Provides the ImageProcessor trait and processor implementations.
 
+pub mod minicpmo;
 pub mod molmo2;
 pub mod phi3_v;
 pub mod phi4_siglip;

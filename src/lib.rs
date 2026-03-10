@@ -40,7 +40,9 @@ pub use execution::sampling;
 pub use mlxcel_core::generate;
 pub use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
 pub use mlxcel_core::speculative::SpeculativeGenerator;
-pub use multimodal::{phi3v_prompt, phi4_siglip_prompt, qwen_vl, vlm_prompt, vlm_runtime};
+pub use multimodal::{
+    minicpmo_prompt, phi3v_prompt, phi4_siglip_prompt, qwen_vl, vlm_prompt, vlm_runtime,
+};
 
 // Re-export split modules
 pub use loaded_model::LoadedModel;
