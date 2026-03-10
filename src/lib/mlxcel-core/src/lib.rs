@@ -1396,11 +1396,17 @@ pub mod weights;
 // Token generation
 pub mod generate;
 
+// Decode-loop setup helpers shared by standard and speculative generation
+mod generation_policy;
+
 // Shared sampling and token-penalty policy helpers
 mod sampling;
 
 // Speculative decoding
 pub mod speculative;
+
+// Generation-time stream selection and installation wrappers
+mod streams;
 
 pub mod dtype;
 

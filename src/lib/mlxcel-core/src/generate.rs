@@ -22,11 +22,16 @@
 //! - Lookahead pipelining: compute token n+1 while returning token n
 //! - Optimized decode loops for standard and embedding-prefill paths
 //! - Shared sampling policy delegated to `crate::sampling`
+//! - Shared decode setup delegated to `crate::generation_policy`
 
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxStream};
+use crate::generation_policy::{
+    ensure_model_caches, initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
+};
 use crate::layers::KVCache;
 use crate::sampling::sample_token_optimized;
+use crate::streams::{install_default_stream, new_generation_stream};
 use cxx::UniquePtr;
 
 /// Trait for language models that can be used for generation
@@ -208,17 +213,10 @@ pub struct CxxGenerator {
 impl CxxGenerator {
     /// Create a new generator
     pub fn new(num_layers: usize) -> Self {
-        // Create dedicated generation stream like Python mlx-lm
-        let generation_stream = if ffi::is_gpu_available() {
-            Some(ffi::new_gpu_stream())
-        } else {
-            None
-        };
-
         Self {
             caches: (0..num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
-            generation_stream,
+            generation_stream: new_generation_stream(),
         }
     }
 
@@ -278,27 +276,16 @@ impl CxxGenerator {
         self.reset();
 
         // Set random seed if specified (for reproducibility)
-        if let Some(seed) = sampling.seed {
-            ffi::random_seed(seed);
-        }
+        seed_rng_if_needed(sampling);
 
         // Ensure caches are initialized for this model
-        if self.caches.len() != model.num_layers() {
-            self.caches = model.make_caches();
-        }
+        ensure_model_caches(&mut self.caches, model);
 
         // Set generation stream as default for better pipelining
-        if let Some(ref stream) = self.generation_stream {
-            ffi::set_default_stream(stream);
-        }
+        install_default_stream(self.generation_stream.as_ref());
 
         // Get EOS tokens for this model
-        let mut eos_tokens = model.eos_token_ids();
-        for &id in &sampling.stop_token_ids {
-            if !eos_tokens.contains(&id) {
-                eos_tokens.push(id);
-            }
-        }
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
         // Prefill: process all prompt tokens at once
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -309,11 +296,7 @@ impl CxxGenerator {
 
         // Build token history from prompt for penalty-based sampling
         let needs_history = sampling.needs_token_history();
-        let mut token_history: Vec<i32> = if needs_history {
-            prompt_tokens.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // Sample first token
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
@@ -407,24 +390,13 @@ impl CxxGenerator {
         // Reset state
         self.reset();
 
-        if let Some(seed) = sampling.seed {
-            ffi::random_seed(seed);
-        }
+        seed_rng_if_needed(sampling);
 
-        if self.caches.len() != model.num_layers() {
-            self.caches = model.make_caches();
-        }
+        ensure_model_caches(&mut self.caches, model);
 
-        if let Some(ref stream) = self.generation_stream {
-            ffi::set_default_stream(stream);
-        }
+        install_default_stream(self.generation_stream.as_ref());
 
-        let mut eos_tokens = model.eos_token_ids();
-        for &id in &sampling.stop_token_ids {
-            if !eos_tokens.contains(&id) {
-                eos_tokens.push(id);
-            }
-        }
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
         // Prefill: use forward_with_embeddings for merged vision+text embeddings
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -434,11 +406,7 @@ impl CxxGenerator {
         ffi::clear_memory_cache();
 
         let needs_history = sampling.needs_token_history();
-        let mut token_history: Vec<i32> = if needs_history {
-            prompt_tokens.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::async_eval(&y);
@@ -513,28 +481,13 @@ impl CxxGenerator {
 
         self.reset();
 
-        if let Some(seed) = sampling.seed {
-            ffi::random_seed(seed);
-        }
-        if self.caches.len() != model.num_layers() {
-            self.caches = model.make_caches();
-        }
-        if let Some(ref stream) = self.generation_stream {
-            ffi::set_default_stream(stream);
-        }
+        seed_rng_if_needed(sampling);
+        ensure_model_caches(&mut self.caches, model);
+        install_default_stream(self.generation_stream.as_ref());
 
-        let mut eos_tokens = model.eos_token_ids();
-        for &id in &sampling.stop_token_ids {
-            if !eos_tokens.contains(&id) {
-                eos_tokens.push(id);
-            }
-        }
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
-        let mut token_history: Vec<i32> = if needs_history {
-            prompt_tokens.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // Prefill with embeddings
         let prefill_start = Instant::now();
@@ -633,35 +586,20 @@ impl CxxGenerator {
         self.reset();
 
         // Set random seed if specified (for reproducibility)
-        if let Some(seed) = sampling.seed {
-            ffi::random_seed(seed);
-        }
+        seed_rng_if_needed(sampling);
 
         // Ensure caches are initialized for this model
-        if self.caches.len() != model.num_layers() {
-            self.caches = model.make_caches();
-        }
+        ensure_model_caches(&mut self.caches, model);
 
         // Set generation stream as default for better pipelining
-        if let Some(ref stream) = self.generation_stream {
-            ffi::set_default_stream(stream);
-        }
+        install_default_stream(self.generation_stream.as_ref());
 
         // Get EOS tokens for this model
-        let mut eos_tokens = model.eos_token_ids();
-        for &id in &sampling.stop_token_ids {
-            if !eos_tokens.contains(&id) {
-                eos_tokens.push(id);
-            }
-        }
+        let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
         // Build token history from prompt for penalty-based sampling
         let needs_history = sampling.needs_token_history();
-        let mut token_history: Vec<i32> = if needs_history {
-            prompt_tokens.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // PREFILL PHASE.
         let prefill_start = Instant::now();

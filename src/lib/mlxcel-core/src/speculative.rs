@@ -31,8 +31,10 @@
 use crate::ffi;
 use crate::ffi::MlxStream;
 use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
+use crate::generation_policy::{initial_token_history, merged_eos_token_ids};
 use crate::layers::KVCache;
 use crate::sampling::sample_token_optimized;
+use crate::streams::{install_default_stream, new_generation_stream};
 use cxx::UniquePtr;
 use std::time::Instant;
 
@@ -51,17 +53,11 @@ pub struct SpeculativeGenerator {
 impl SpeculativeGenerator {
     /// Create a new speculative generator
     pub fn new(main_num_layers: usize, draft_num_layers: usize) -> Self {
-        let generation_stream = if ffi::is_gpu_available() {
-            Some(ffi::new_gpu_stream())
-        } else {
-            None
-        };
-
         Self {
             main_caches: (0..main_num_layers).map(|_| KVCache::new()).collect(),
             draft_caches: (0..draft_num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
-            generation_stream,
+            generation_stream: new_generation_stream(),
         }
     }
 
@@ -102,22 +98,11 @@ impl SpeculativeGenerator {
         self.reset();
 
         // Set generation stream
-        if let Some(ref stream) = self.generation_stream {
-            ffi::set_default_stream(stream);
-        }
+        install_default_stream(self.generation_stream.as_ref());
 
-        let mut eos_tokens = main_model.eos_token_ids();
-        for &id in &sampling.stop_token_ids {
-            if !eos_tokens.contains(&id) {
-                eos_tokens.push(id);
-            }
-        }
+        let eos_tokens = merged_eos_token_ids(main_model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
-        let mut token_history: Vec<i32> = if needs_history {
-            prompt_tokens.to_vec()
-        } else {
-            Vec::new()
-        };
+        let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // PREFILL PHASE.
         let prefill_start = Instant::now();
