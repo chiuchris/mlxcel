@@ -14,9 +14,11 @@
 
 //! MiniCPM-o vision-language model.
 //!
-//! `mlxcel` currently exposes the image path of MiniCPM-o. The upstream audio
-//! tower remains loaded from checkpoints but is not wired into the CLI/server
-//! because the runtime has no audio input surface yet.
+//! MiniCPM-o uses standard Qwen3 (NOT Qwen3-VL) as the text backbone, meaning
+//! standard RoPE rather than interleaved MRoPE. `mlxcel` currently exposes the
+//! image path; the upstream audio tower remains loaded from checkpoints but is
+//! not wired into the CLI/server because the runtime has no audio input surface
+//! yet.
 
 use crate::LanguageModel;
 use crate::vision::merge::InputEmbeddings;
@@ -25,7 +27,7 @@ use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 pub struct MiniCPMOVLModel {
-    pub text_model: crate::models::Qwen3VLModel,
+    pub text_model: crate::models::Qwen3Model,
     pub vision_tower: encoders::minicpmo::MiniCPMOVisionModel,
     pub resampler: encoders::minicpmo::MiniCPMOResampler,
     pub processor: processors::minicpmo::MiniCPMOProcessor,
@@ -33,15 +35,6 @@ pub struct MiniCPMOVLModel {
 }
 
 impl MiniCPMOVLModel {
-    fn build_position_ids(seq_len: i32) -> UniquePtr<MlxArray> {
-        let base: Vec<i32> = (0..seq_len).collect();
-        let t = mlxcel_core::from_slice_i32(&base, &[1, 1, seq_len]);
-        let h = mlxcel_core::from_slice_i32(&base, &[1, 1, seq_len]);
-        let w = mlxcel_core::from_slice_i32(&base, &[1, 1, seq_len]);
-        let th = mlxcel_core::concatenate(t.as_ref().unwrap(), h.as_ref().unwrap(), 0);
-        mlxcel_core::concatenate(th.as_ref().unwrap(), w.as_ref().unwrap(), 0)
-    }
-
     fn fit_feature_span(
         feature_span: UniquePtr<MlxArray>,
         target_len: usize,
@@ -78,11 +71,6 @@ impl MiniCPMOVLModel {
         image_bounds: &[(usize, usize)],
     ) -> InputEmbeddings {
         let inputs_embeds = self.text_model.get_embed_tokens(input_ids);
-        self.text_model.clear_deepstack_state();
-        self.text_model.clear_mrope_state();
-        let seq_len = mlxcel_core::array_shape(input_ids)[1];
-        self.text_model
-            .set_mrope_state(Self::build_position_ids(seq_len), 0);
 
         if processed_images.is_empty() || image_bounds.is_empty() {
             return InputEmbeddings {
@@ -115,9 +103,11 @@ impl MiniCPMOVLModel {
                 let vision_hidden_states = self
                     .vision_tower
                     .forward(&pixel_values, processed.spatial_shape);
+
                 let resampled = self
                     .resampler
                     .forward(&vision_hidden_states, processed.spatial_shape);
+
                 let fitted =
                     Self::fit_feature_span(resampled, end.saturating_sub(start), hidden_size);
                 segments.push(fitted);

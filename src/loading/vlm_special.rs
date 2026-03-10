@@ -354,7 +354,8 @@ pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::processors::minicpmo::MiniCPMOProcessor;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
-    let text_config: models::qwen3_vl::Qwen3VLConfig = serde_json::from_value(full_config.clone())
+    // MiniCPM-o uses standard Qwen3 (NOT Qwen3-VL) as text backbone
+    let text_config: models::qwen3::ModelArgs = serde_json::from_value(full_config.clone())
         .map_err(|e| anyhow::anyhow!("Failed to parse MiniCPM-o text config: {}", e))?;
     let vision_config: MiniCPMOVisionConfig =
         parse_required_vlm_subconfig(&full_config, "vision_config", "MiniCPM-o vision config")?;
@@ -365,7 +366,7 @@ pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
     let text_weights = remap_minicpmo_text_weights(&raw_weights);
     let (group_size, bits) = parse_quantization_params(&full_config);
 
-    let text_model = models::Qwen3VLModel::from_weights(&text_weights, &text_config)
+    let text_model = models::Qwen3Model::from_weights(&text_weights, &text_config)
         .map_err(|e| anyhow::anyhow!("Failed to load MiniCPM-o text model: {}", e))?;
     let vision_tower = MiniCPMOVisionModel::from_weights(
         &raw_weights,

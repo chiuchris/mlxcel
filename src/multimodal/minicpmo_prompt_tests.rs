@@ -77,9 +77,22 @@ fn compute_minicpmo_image_bounds_finds_placeholder_spans() {
 
 #[test]
 fn prepare_minicpmo_prompt_tokens_encodes_prompt_and_bounds() {
-    let prepared = prepare_minicpmo_prompt_tokens("<image>abc", 1, 3, fake_encode).unwrap();
+    // Use a prompt that already has chat template formatting
+    let prepared =
+        prepare_minicpmo_prompt_tokens("<|im_start|>user\n<image>abc<|im_end|>", 1, 3, fake_encode)
+            .unwrap();
 
     assert_eq!(prepared.image_slots, 1);
-    assert_eq!(prepared.image_bounds, vec![(2, 5)]);
-    assert_eq!(&prepared.tokens[..6], &[1, 10, 12, 12, 12, 11]);
+    // Find the image bounds within the tokenized sequence
+    let image_start_pos = prepared.tokens.iter().position(|&t| t == 10).unwrap();
+    let image_end_pos = prepared.tokens.iter().position(|&t| t == 11).unwrap();
+    assert_eq!(
+        prepared.image_bounds,
+        vec![(image_start_pos + 1, image_end_pos)]
+    );
+    // Verify 3 unk tokens between start and end
+    assert_eq!(
+        &prepared.tokens[image_start_pos..=image_end_pos],
+        &[10, 12, 12, 12, 11]
+    );
 }

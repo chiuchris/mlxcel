@@ -58,14 +58,27 @@ pub fn ensure_minicpmo_image_placeholders(
     let marker_count = normalized.matches(MINICPMO_IMAGE_START_TOKEN).count();
     let normalized = normalized.replace(MINICPMO_IMAGE_START_TOKEN, MINICPMO_IMAGE_MARKER_SENTINEL);
 
-    if marker_count > 0 {
-        if marker_count != num_images {
+    // Count inline markers that were replaced by sentinel
+    let sentinel_count = normalized.matches(MINICPMO_IMAGE_MARKER_SENTINEL).count();
+
+    if marker_count > 0 || sentinel_count > 0 {
+        let total_markers = marker_count.max(sentinel_count);
+        if total_markers != num_images {
             return Err(format!(
                 "MiniCPM-o prompt contains {} <image> placeholders but {} image(s) were provided",
-                marker_count, num_images
+                total_markers, num_images
             ));
         }
-        return Ok(normalized.replace(MINICPMO_IMAGE_MARKER_SENTINEL, &placeholder));
+        let expanded = normalized.replace(MINICPMO_IMAGE_MARKER_SENTINEL, &placeholder);
+        // If prompt already has chat formatting, return as-is
+        if expanded.contains("<|im_start|>") {
+            return Ok(expanded);
+        }
+        // Otherwise wrap in chat template
+        return Ok(format!(
+            "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
+            expanded
+        ));
     }
 
     if num_images == 0 {
@@ -82,7 +95,11 @@ pub fn ensure_minicpmo_image_placeholders(
             &prompt[insert_pos..]
         ))
     } else {
-        Ok(format!("{}{}", image_prefix, prompt))
+        // Wrap in Qwen3-style chat template (MiniCPM-o uses Qwen3 as backbone)
+        Ok(format!(
+            "<|im_start|>user\n{}{}<|im_end|>\n<|im_start|>assistant\n",
+            image_prefix, prompt
+        ))
     }
 }
 
