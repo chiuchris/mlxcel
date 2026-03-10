@@ -206,39 +206,6 @@ macro_rules! delegate_language_model {
     };
 }
 
-// Keep the embedding-aware subset in one place as well. These variants
-// implement custom token-embedding or embedding-prefill behavior that VLM
-// flows depend on.
-macro_rules! delegate_embedding_language_model {
-    ($self:expr, $method:ident ( $($arg:expr),* $(,)? ); fallback = $fallback:expr) => {
-        match $self {
-            LoadedModel::Gemma3(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Gemma3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Llama(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen2(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Llama4(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Llama4VLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::LlavaVLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen2VL(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen25VL(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen3VL(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen3VLMoe(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen35(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen35VLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen35Moe(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Qwen35MoeVLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Gemma3n(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Gemma3nVLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Phi3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Molmo2VLM(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Cohere2(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Gemma(inner) => LanguageModel::$method(inner, $($arg),*),
-            LoadedModel::Gemma2(inner) => LanguageModel::$method(inner, $($arg),*),
-            _ => $fallback,
-        }
-    };
-}
-
 /// Capability-oriented references used by CLI/server multimodal preparation.
 ///
 /// The control plane should ask for the narrowest VLM runtime capability it
@@ -283,21 +250,7 @@ fn gemma3n_image_token_block_info(
 impl LoadedModel {
     /// Check if this model is a vision-language model
     pub fn is_vlm(&self) -> bool {
-        matches!(
-            self,
-            Self::Gemma3VLM(_)
-                | Self::Llama4VLM(_)
-                | Self::LlavaVLM(_)
-                | Self::Qwen2VL(_)
-                | Self::Qwen25VL(_)
-                | Self::Qwen3VL(_)
-                | Self::Qwen3VLMoe(_)
-                | Self::Qwen35VLM(_)
-                | Self::Qwen35MoeVLM(_)
-                | Self::Gemma3nVLM(_)
-                | Self::Phi3VLM(_)
-                | Self::Molmo2VLM(_)
-        )
+        self.vlm_runtime().is_some()
     }
 
     /// Get the vision module if this is a VLM (Gemma3/LLaVA-style)
@@ -389,10 +342,9 @@ impl LanguageModel for LoadedModel {
         caches: &mut [mlxcel_core::layers::KVCache],
         mask: Option<&mlxcel_core::MlxArray>,
     ) -> UniquePtr<mlxcel_core::MlxArray> {
-        delegate_embedding_language_model!(
+        delegate_language_model!(
             self,
-            forward_with_embeddings(input_ids, input_embeddings, caches, mask);
-            fallback = self.forward(input_ids, caches, mask)
+            forward_with_embeddings(input_ids, input_embeddings, caches, mask)
         )
     }
 
@@ -400,7 +352,7 @@ impl LanguageModel for LoadedModel {
         &self,
         input_ids: &mlxcel_core::MlxArray,
     ) -> Option<UniquePtr<mlxcel_core::MlxArray>> {
-        delegate_embedding_language_model!(self, embed_tokens(input_ids); fallback = None)
+        delegate_language_model!(self, embed_tokens(input_ids))
     }
 }
 
