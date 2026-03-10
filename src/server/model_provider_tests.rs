@@ -14,7 +14,10 @@
 
 use std::sync::mpsc;
 
-use super::{GenerateEvent, GenerationResult, ModelProvider, ModelRequest, drain_generation_events, send_shutdown_signal};
+use super::{
+    GenerateEvent, GenerationResult, ModelProvider, ModelRequest, drain_generation_events,
+    send_shutdown_signal,
+};
 
 fn sample_result() -> GenerationResult {
     GenerationResult {

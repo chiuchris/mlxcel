@@ -85,6 +85,9 @@ fn into_startup_config_normalizes_edge_only_flags() {
     assert!(!startup.warmup);
     assert_eq!(startup.seed, None);
     assert_eq!(startup.adapter_path, Some(PathBuf::from("adapters/bar")));
-    assert_eq!(startup.draft_model_path, Some(PathBuf::from("models/draft")));
+    assert_eq!(
+        startup.draft_model_path,
+        Some(PathBuf::from("models/draft"))
+    );
     assert_eq!(startup.log_file, Some(PathBuf::from("server.log")));
 }

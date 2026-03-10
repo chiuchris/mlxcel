@@ -79,5 +79,8 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
     assert!(input.warmup);
     assert!(input.no_warmup);
     assert_eq!(input.seed, -1);
-    assert_eq!(input.dry_sequence_breakers, vec!["\n".to_string(), "\t".to_string()]);
+    assert_eq!(
+        input.dry_sequence_breakers,
+        vec!["\n".to_string(), "\t".to_string()]
+    );
 }

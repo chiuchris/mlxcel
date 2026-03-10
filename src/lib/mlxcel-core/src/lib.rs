@@ -1419,6 +1419,9 @@ pub fn divide_scalar(a: &ffi::MlxArray, scalar: f32) -> cxx::UniquePtr<ffi::MlxA
 // High-level layer abstractions
 pub mod layers;
 
+// Cache state machines shared by attention families
+mod cache;
+
 // Common utility functions
 pub mod utils;
 
@@ -1427,6 +1430,9 @@ pub mod weights;
 
 // Token generation
 pub mod generate;
+
+// Shared sampling and token-penalty policy helpers
+mod sampling;
 
 // Speculative decoding
 pub mod speculative;

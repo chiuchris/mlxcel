@@ -30,8 +30,9 @@
 
 use crate::ffi;
 use crate::ffi::MlxStream;
-use crate::generate::{sample_token_optimized, GenerationStats, LanguageModel, SamplingConfig};
+use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
 use crate::layers::KVCache;
+use crate::sampling::sample_token_optimized;
 use cxx::UniquePtr;
 use std::time::Instant;
 
