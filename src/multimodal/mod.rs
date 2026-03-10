@@ -22,15 +22,21 @@
 //! - `phi4mm_prompt`: Phi4MM `<|image_N|>` normalization and audio guard
 //! - `phi4_siglip_prompt`: Phi4-SigLIP `<image>` placeholder handling
 //! - `minicpmo_prompt`: MiniCPM-o image placeholder expansion and bounds
+//! - `moondream3_prompt`: Moondream3 query/caption template shaping
 //! - `qwen_vl`: Qwen-VL token insertion rules
 //! - `phi3v_prompt`: Phi3V image-tag normalization
 //! - `vlm_prompt`: generic image-token block expansion
 //! - `vlm_runtime`: image preprocessing and embedding preparation shared by CLI/server
 
 pub mod minicpmo_prompt;
+pub mod moondream3_prompt;
 pub mod phi3v_prompt;
 pub mod phi4_siglip_prompt;
 pub mod phi4mm_prompt;
 pub mod qwen_vl;
 pub mod vlm_prompt;
 pub mod vlm_runtime;
+
+#[cfg(test)]
+#[path = "moondream3_prompt_tests.rs"]
+mod moondream3_prompt_tests;

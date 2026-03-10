@@ -64,6 +64,7 @@ pub mod minimax;
 pub mod ministral3;
 pub mod mixtral;
 pub mod molmo2;
+pub mod moondream3;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
@@ -133,6 +134,7 @@ pub use minimax::MiniMaxModel;
 pub use ministral3::{Ministral3Model, Ministral3Wrapper};
 pub use mixtral::MixtralModel;
 pub use molmo2::Molmo2Model;
+pub use moondream3::Moondream3Model;
 pub use nemotron::NemotronModel;
 pub use nemotron_h::NemotronHModel;
 pub use nemotron_nas::NemotronNASModel;
@@ -193,6 +195,7 @@ pub enum ModelType {
     Qwen3VL,       // Qwen3-VL (ViT + interleaved MRoPE + DeepStack)
     Qwen3VLMoe,    // Qwen3-VL-MoE (Qwen3-VL + MoE text backbone)
     MiniCPMOVLM,   // MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)
+    Moondream3VLM, // Moondream3 (custom ViT + custom text decoder, query/caption image path)
     Gemma3n,       // Gemma 3n (text-only)
     Gemma3nVLM,    // Gemma 3n VLM (MobileNetV5 + Gemma3n)
     Phi,           // Phi 1/2

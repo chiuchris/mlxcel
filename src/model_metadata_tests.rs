@@ -47,6 +47,11 @@ fn model_metadata_distinguishes_text_and_vlm_routes() {
     assert_eq!(minicpmo_policy.capabilities.kind, ModelKind::Vlm);
     assert_eq!(minicpmo_policy.directory_route, DirectoryLoadRoute::Vlm);
     assert_eq!(minicpmo_policy.weight_route, None);
+
+    let moondream3_policy = model_load_policy(ModelType::Moondream3VLM, None).unwrap();
+    assert_eq!(moondream3_policy.capabilities.kind, ModelKind::Vlm);
+    assert_eq!(moondream3_policy.directory_route, DirectoryLoadRoute::Vlm);
+    assert_eq!(moondream3_policy.weight_route, None);
 }
 
 #[test]
@@ -71,6 +76,7 @@ fn is_vlm_model_type_matches_control_plane_capabilities() {
     assert!(is_vlm_model_type(ModelType::Phi4MMVLM));
     assert!(is_vlm_model_type(ModelType::Phi4SigLipVLM));
     assert!(is_vlm_model_type(ModelType::MiniCPMOVLM));
+    assert!(is_vlm_model_type(ModelType::Moondream3VLM));
     assert!(is_vlm_model_type(ModelType::Phi3VLM));
     assert!(!is_vlm_model_type(ModelType::Gemma3));
     assert!(!is_vlm_model_type(ModelType::Mamba2));
@@ -126,6 +132,10 @@ fn descriptor_backed_support_helpers_stay_in_sync() {
     assert_eq!(
         adapter_loading_unsupported_message(ModelType::MiniCPMOVLM),
         Some("MiniCPM-o VLM does not support adapter loading; use load_model() instead")
+    );
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Moondream3VLM),
+        Some("Moondream3 VLM does not support adapter loading; use load_model() instead")
     );
     assert_eq!(adapter_loading_unsupported_message(ModelType::Llama), None);
 }

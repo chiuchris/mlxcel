@@ -15,6 +15,7 @@
 mod tiktoken;
 
 use anyhow::Result;
+use hf_hub::api::sync::Api;
 use sentencepiece::SentencePieceProcessor;
 use std::collections::HashMap;
 use std::path::Path;
@@ -262,11 +263,38 @@ fn find_tiktoken_file(model_path: &Path) -> Option<std::path::PathBuf> {
     // Try any *.tiktoken file
     let pattern = model_path.join("*.tiktoken");
     if let Ok(paths) = glob::glob(pattern.to_str()?) {
-        for entry in paths.flatten() {
-            return Some(entry);
-        }
+        return paths.flatten().next();
     }
     None
+}
+
+fn remote_tokenizer_repo_for_model_type(model_type: &str) -> Option<&'static str> {
+    match model_type {
+        "moondream3" => Some("moondream/starmie-v1"),
+        _ => None,
+    }
+}
+
+fn remote_tokenizer_repo_for_model(model_path: &Path) -> Option<&'static str> {
+    let config_path = model_path.join("config.json");
+    let content = std::fs::read_to_string(config_path).ok()?;
+    let config = serde_json::from_str::<serde_json::Value>(&content).ok()?;
+    let model_type = config.get("model_type").and_then(|value| value.as_str())?;
+    remote_tokenizer_repo_for_model_type(model_type)
+}
+
+fn download_remote_tokenizer(repo_id: &str) -> Result<tokenizers::Tokenizer> {
+    let api = Api::new()
+        .map_err(|err| anyhow::anyhow!("Failed to initialize Hugging Face API: {}", err))?;
+    let repo = api.model(repo_id.to_string());
+    let tokenizer_path = repo.get("tokenizer.json").map_err(|err| {
+        anyhow::anyhow!(
+            "Failed to download tokenizer.json from {}: {}",
+            repo_id,
+            err
+        )
+    })?;
+    tokenizers::Tokenizer::from_file(tokenizer_path).map_err(|err| anyhow::anyhow!(err))
 }
 
 pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
@@ -298,8 +326,53 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
         return Ok(MlxcelTokenizer::Tiktoken(tokenizer));
     }
 
+    if let Some(repo_id) = remote_tokenizer_repo_for_model(model_path) {
+        let tokenizer = download_remote_tokenizer(repo_id).map_err(|err| {
+            anyhow::anyhow!(
+                "Failed to resolve fallback tokenizer {} for {:?}: {}",
+                repo_id,
+                model_path,
+                err
+            )
+        })?;
+        return Ok(MlxcelTokenizer::HuggingFace(tokenizer));
+    }
+
     Err(anyhow::anyhow!(
         "No tokenizer found in {:?} (tried tokenizer.json, tokenizer.model, and *.tiktoken)",
         model_path
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type};
+
+    #[test]
+    fn remote_tokenizer_repo_for_model_type_matches_moondream3() {
+        assert_eq!(
+            remote_tokenizer_repo_for_model_type("moondream3"),
+            Some("moondream/starmie-v1")
+        );
+        assert_eq!(remote_tokenizer_repo_for_model_type("llama"), None);
+    }
+
+    #[test]
+    fn remote_tokenizer_repo_for_model_reads_config_json_model_type() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("mlxcel-tokenizer-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            temp_dir.join("config.json"),
+            r#"{"model_type":"moondream3"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            remote_tokenizer_repo_for_model(&temp_dir),
+            Some("moondream/starmie-v1")
+        );
+
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
 }

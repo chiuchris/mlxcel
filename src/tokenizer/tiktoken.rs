@@ -137,19 +137,17 @@ impl TiktokenTokenizer {
         let config_path = model_path.join("tokenizer_config.json");
         if let Ok(content) = std::fs::read_to_string(&config_path)
             && let Ok(config) = serde_json::from_str::<serde_json::Value>(&content)
-        {
-            if let Some(decoder_map) = config
+            && let Some(decoder_map) = config
                 .get("added_tokens_decoder")
                 .and_then(|v| v.as_object())
-            {
-                for (id_str, entry) in decoder_map {
-                    if let (Ok(id), Some(token_content)) = (
-                        id_str.parse::<u32>(),
-                        entry.get("content").and_then(|v| v.as_str()),
-                    ) {
-                        special_encoder.insert(token_content.to_string(), id);
-                        special_decoder.insert(id, token_content.to_string());
-                    }
+        {
+            for (id_str, entry) in decoder_map {
+                if let (Ok(id), Some(token_content)) = (
+                    id_str.parse::<u32>(),
+                    entry.get("content").and_then(|v| v.as_str()),
+                ) {
+                    special_encoder.insert(token_content.to_string(), id);
+                    special_decoder.insert(id, token_content.to_string());
                 }
             }
         }
@@ -237,11 +235,11 @@ impl TiktokenTokenizer {
             for i in 0..parts.len() - 1 {
                 let mut merged = parts[i].clone();
                 merged.extend_from_slice(&parts[i + 1]);
-                if let Some(&rank) = self.encoder.get(&merged) {
-                    if rank < min_rank {
-                        min_rank = rank;
-                        min_idx = i;
-                    }
+                if let Some(&rank) = self.encoder.get(&merged)
+                    && rank < min_rank
+                {
+                    min_rank = rank;
+                    min_idx = i;
                 }
             }
 
@@ -290,10 +288,10 @@ impl TiktokenTokenizer {
                 // Find the next special token occurrence
                 let mut next_pos = remaining.len();
                 for (token, _) in &self.special_tokens_sorted {
-                    if let Some(pos) = remaining.find(token.as_str()) {
-                        if pos < next_pos {
-                            next_pos = pos;
-                        }
+                    if let Some(pos) = remaining.find(token.as_str())
+                        && pos < next_pos
+                    {
+                        next_pos = pos;
                     }
                 }
                 segments.push(remaining[..next_pos].to_string());

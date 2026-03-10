@@ -37,6 +37,7 @@ pub mod processors;
 pub mod gemma3n_vl;
 pub mod minicpmo_vl;
 pub mod molmo2_vl;
+pub mod moondream3_vl;
 pub mod phi3_vl;
 pub mod phi4_siglip_vl;
 pub mod phi4mm_vl;
@@ -50,6 +51,7 @@ pub mod qwen3_vl_moe;
 pub use gemma3n_vl::Gemma3nVLModel;
 pub use minicpmo_vl::MiniCPMOVLModel;
 pub use molmo2_vl::Molmo2VLModel;
+pub use moondream3_vl::Moondream3VLModel;
 pub use phi3_vl::Phi3VLModel;
 pub use phi4_siglip_vl::Phi4SigLipVLModel;
 pub use phi4mm_vl::Phi4MMVLModel;
@@ -243,3 +245,7 @@ impl LanguageModel for VisionLanguageModel {
 #[cfg(test)]
 #[path = "mod_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "moondream3_vl_tests.rs"]
+mod moondream3_vl_tests;

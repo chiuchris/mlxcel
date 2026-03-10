@@ -157,6 +157,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "qwen3_vl" => Ok(ModelType::Qwen3VL),
         "qwen3_vl_moe" => Ok(ModelType::Qwen3VLMoe),
         "minicpmo" => Ok(ModelType::MiniCPMOVLM),
+        "moondream3" => Ok(ModelType::Moondream3VLM),
         "llava" | "llava_next" => Ok(ModelType::LlavaVLM),
         "llava_bunny" | "bunny-llama" | "llava-qwen2" => Ok(ModelType::LlavaBunnyVLM),
         "aya_vision" => Ok(ModelType::AyaVisionVLM),

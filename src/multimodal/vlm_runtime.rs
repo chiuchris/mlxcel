@@ -26,6 +26,7 @@ use image::DynamicImage;
 use mlxcel_core::MlxArray;
 
 use crate::minicpmo_prompt::prepare_minicpmo_prompt_tokens;
+use crate::moondream3_prompt::{Moondream3PromptMode, prepare_moondream3_prompt_tokens};
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
 use crate::phi4mm_prompt::prepare_phi4mm_prompt_tokens;
@@ -44,6 +45,11 @@ pub enum VlmPreparationSummary {
     MiniCPMO {
         image_slots: usize,
         total_tokens: usize,
+    },
+    Moondream3 {
+        mode: Moondream3PromptMode,
+        total_tokens: usize,
+        prefix_tokens: usize,
     },
     Phi4MM {
         image_slots: usize,
@@ -165,6 +171,24 @@ where
                 preparation: Some(VlmPreparationSummary::MiniCPMO {
                     image_slots: prepared.image_slots,
                     total_tokens: prompt_tokens.len(),
+                }),
+            }))
+        }
+        VlmRuntimeRef::Moondream3(moondream3) => {
+            let prepared = prepare_moondream3_prompt_tokens(prompt, images.len(), &mut encode)
+                .map_err(|err| anyhow::anyhow!("{}", err))?;
+            *prompt_tokens = prepared.tokens;
+
+            let processed_image = moondream3.processor.preprocess_image(&images[0]);
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = moondream3.get_input_embeddings(&input_ids_arr, &processed_image);
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::Moondream3 {
+                    mode: prepared.mode,
+                    total_tokens: prompt_tokens.len(),
+                    prefix_tokens: moondream3.prefix_token_count(),
                 }),
             }))
         }

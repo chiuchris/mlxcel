@@ -12,22 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Image processors for vision models
-//!
-//! Provides the ImageProcessor trait and processor implementations.
+use super::ModelArgs;
 
-pub mod minicpmo;
-pub mod molmo2;
-pub mod moondream3;
-pub mod phi3_v;
-pub mod phi4_siglip;
-pub mod qwen2_vl;
-pub mod siglip;
+#[test]
+fn moondream3_model_args_fill_default_moe_and_attention_dimensions() {
+    let args: ModelArgs = serde_json::from_value(serde_json::json!({})).unwrap();
+    assert_eq!(args.dim, 2048);
+    assert_eq!(args.n_heads, 32);
+    assert_eq!(args.n_kv_heads, 32);
+    assert_eq!(args.head_dim(), 64);
+    assert_eq!(args.group_size, 128);
+    assert_eq!(args.bits, 4);
 
-use mlxcel_core::{MlxArray, UniquePtr};
-
-/// Trait for image preprocessors
-pub trait ImageProcessor {
-    /// Preprocess images to tensor format ready for vision encoder
-    fn preprocess(&self, images: &[image::DynamicImage]) -> UniquePtr<MlxArray>;
+    let moe = args
+        .moe
+        .expect("Moondream3 default MoE config should exist");
+    assert_eq!(moe.start_layer, 4);
+    assert_eq!(moe.num_experts, 64);
+    assert_eq!(moe.experts_per_token, 8);
 }

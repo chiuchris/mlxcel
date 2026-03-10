@@ -13,12 +13,14 @@
 // limitations under the License.
 
 use super::{
-    cap_molmo2_vit_num_layers, inherit_quantization_if_missing, llama4_mm_tokens_per_image,
-    llama4_quantization_params, llama4_token_ids, llama4_vision_prefix, merge_phi4mm_lora_weight,
-    molmo2_max_crops, parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
-    phi4mm_text_config_value, phi4mm_vision_config_value, remap_minicpmo_text_weights,
-    rewrite_molmo2_weight_key, rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key,
-    rewrite_phi4mm_vision_key, should_transpose_phi3_patch_embedding,
+    cap_molmo2_vit_num_layers, dequantize_moondream3_weight, inherit_quantization_if_missing,
+    llama4_mm_tokens_per_image, llama4_quantization_params, llama4_token_ids, llama4_vision_prefix,
+    merge_phi4mm_lora_weight, molmo2_max_crops, moondream3_text_config_value,
+    moondream3_vision_config_value, parse_molmo2_vit_layers, phi3_num_crops,
+    phi4_siglip_text_config_value, phi4mm_text_config_value, phi4mm_vision_config_value,
+    remap_minicpmo_text_weights, rewrite_molmo2_weight_key, rewrite_moondream3_weight_key,
+    rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key, rewrite_phi4mm_vision_key,
+    should_transpose_phi3_patch_embedding,
 };
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
@@ -44,6 +46,57 @@ fn remap_minicpmo_text_weights_strips_language_model_prefix() {
     assert!(remapped.contains_key("model.embed_tokens.weight"));
     assert!(remapped.contains_key("lm_head.weight"));
     assert!(remapped.contains_key("vision_tower.embeddings.patch_embedding.weight"));
+}
+
+#[test]
+fn rewrite_moondream3_weight_key_strips_model_prefix_and_skips_region_branch() {
+    assert_eq!(
+        rewrite_moondream3_weight_key("model.text.wte"),
+        Some("text.wte.weight".to_string())
+    );
+    assert_eq!(
+        rewrite_moondream3_weight_key("model.text.blocks.4.attn.qkv.weight.packed"),
+        Some("text.blocks.4.attn.qkv.weight.packed".to_string())
+    );
+    assert_eq!(
+        rewrite_moondream3_weight_key("model.region.coord_encoder.weight"),
+        None
+    );
+}
+
+#[test]
+fn moondream3_text_and_vision_config_helpers_fill_default_shapes() {
+    let text = moondream3_text_config_value(&json!({
+        "text_group_size": 64,
+        "expert_group_size": 32,
+        "quantization_config": {"quant_method": "int4"}
+    }));
+    let vision = moondream3_vision_config_value(&json!({}));
+
+    assert_eq!(text["model_type"], "moondream3");
+    assert_eq!(text["group_size"], 64);
+    assert_eq!(text["moe"]["expert_group_size"], 32);
+    assert_eq!(text["bits"], 4);
+    assert_eq!(vision["crop_size"], 378);
+    assert_eq!(vision["enc_patch_size"], 14);
+}
+
+#[test]
+fn dequantize_moondream3_weight_restores_interleaved_uint4_rows() {
+    let mut packed_bytes = [0u8; 128];
+    packed_bytes[0] = 0x1F;
+    packed_bytes[1] = 0x20;
+    let packed_i32: Vec<i32> = packed_bytes.iter().map(|&value| value as i32).collect();
+    let packed = mlxcel_core::from_slice_i32(&packed_i32, &[1, 128]);
+    let packed = mlxcel_core::astype(&packed, dtype::UINT8);
+    let scale = mlxcel_core::ones(&[2, 1], dtype::FLOAT32);
+    let zero = mlxcel_core::zeros(&[2, 1], dtype::FLOAT32);
+
+    let dequantized = dequantize_moondream3_weight(&packed, &scale, &zero, &[2, 128]);
+    assert_eq!(mlxcel_core::array_shape(&dequantized), vec![2, 128]);
+    let total = mlxcel_core::sum_all(&dequantized);
+    mlxcel_core::eval(&total);
+    assert!(mlxcel_core::item_f32(&total) > 0.0);
 }
 
 #[test]

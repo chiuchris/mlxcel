@@ -17,6 +17,7 @@
 //! Families:
 //! - Llama4 VLM
 //! - MiniCPM-o
+//! - Moondream3
 //! - Phi4MM
 //! - Phi4-SigLIP
 //! - Phi3V
@@ -84,6 +85,244 @@ fn parse_quantization_params(full_config: &Value) -> (i32, i32) {
         .and_then(|value| value.as_i64())
         .unwrap_or(0) as i32;
     (group_size, bits)
+}
+
+fn moondream3_bits(full_config: &Value) -> i32 {
+    full_config
+        .get("quantization_config")
+        .and_then(|value| value.get("bits"))
+        .and_then(|value| value.as_i64())
+        .map(|value| value as i32)
+        .or_else(|| {
+            full_config
+                .get("quantization_config")
+                .and_then(|value| value.get("quant_method"))
+                .and_then(|value| value.as_str())
+                .and_then(|method| method.strip_prefix("int"))
+                .and_then(|bits| bits.parse::<i32>().ok())
+        })
+        .unwrap_or(4)
+}
+
+fn moondream3_group_size(full_config: &Value, field: &str) -> i32 {
+    full_config
+        .get(field)
+        .and_then(|value| value.as_i64())
+        .unwrap_or(128) as i32
+}
+
+pub(super) fn moondream3_text_config_value(full_config: &Value) -> Value {
+    let bits = moondream3_bits(full_config);
+    serde_json::json!({
+        "model_type": "moondream3",
+        "dim": 2048,
+        "ff_dim": 8192,
+        "n_layers": 24,
+        "vocab_size": 51200,
+        "max_context": 4096,
+        "n_heads": 32,
+        "n_kv_heads": 32,
+        "prefix_attn": 730,
+        "group_size": moondream3_group_size(full_config, "text_group_size"),
+        "bits": bits,
+        "eos_token_id": 0,
+        "moe": {
+            "num_experts": 64,
+            "start_layer": 4,
+            "experts_per_token": 8,
+            "expert_inner_dim": 1024,
+            "expert_group_size": moondream3_group_size(full_config, "expert_group_size")
+        }
+    })
+}
+
+pub(super) fn moondream3_vision_config_value(_full_config: &Value) -> Value {
+    serde_json::json!({
+        "enc_dim": 1152,
+        "enc_patch_size": 14,
+        "enc_n_layers": 27,
+        "enc_ff_dim": 4304,
+        "enc_n_heads": 16,
+        "proj_out_dim": 2048,
+        "crop_size": 378,
+        "in_channels": 3,
+        "max_crops": 12,
+        "overlap_margin": 4,
+        "proj_inner_dim": 8192
+    })
+}
+
+pub(super) fn rewrite_moondream3_weight_key(key: &str) -> Option<String> {
+    if key.starts_with("model.region.") {
+        return None;
+    }
+
+    let key = key.strip_prefix("model.").unwrap_or(key);
+    if key == "text.wte" {
+        Some("text.wte.weight".to_string())
+    } else if let Some(prefix) = key.strip_suffix(".weight.packed") {
+        Some(format!("{}.weight.packed", prefix))
+    } else if let Some(prefix) = key.strip_suffix(".weight.scale") {
+        Some(format!("{}.weight.scale", prefix))
+    } else if let Some(prefix) = key.strip_suffix(".weight.zero_point") {
+        Some(format!("{}.weight.zero_point", prefix))
+    } else {
+        Some(key.to_string())
+    }
+}
+
+fn moondream3_qkv_dim(config: &models::moondream3::ModelArgs) -> i32 {
+    let head_dim = (config.dim / config.n_heads) as i32;
+    (config.n_heads as i32 + 2 * config.n_kv_heads as i32) * head_dim
+}
+
+fn moondream3_dense_weight_shape(
+    prefix: &str,
+    config: &models::moondream3::ModelArgs,
+) -> Result<Vec<i32>> {
+    if prefix.ends_with(".attn.qkv") {
+        Ok(vec![moondream3_qkv_dim(config), config.dim as i32])
+    } else if prefix.ends_with(".attn.proj") {
+        Ok(vec![config.dim as i32, config.dim as i32])
+    } else if prefix.ends_with(".mlp.fc1") {
+        Ok(vec![config.ff_dim as i32, config.dim as i32])
+    } else if prefix.ends_with(".mlp.fc2") {
+        Ok(vec![config.dim as i32, config.ff_dim as i32])
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported Moondream3 dense packed weight prefix: {}",
+            prefix
+        ))
+    }
+}
+
+fn moondream3_moe_weight_shape(
+    prefix: &str,
+    config: &models::moondream3::ModelArgs,
+) -> Result<Vec<i32>> {
+    let moe = config
+        .moe
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("Moondream3 MoE weight requires moe config"))?;
+    let expert_count = moe.num_experts as i32;
+    let dim = config.dim as i32;
+    let expert_inner_dim = moe.expert_inner_dim as i32;
+
+    if prefix.ends_with(".mlp.fc1") {
+        Ok(vec![expert_count, expert_inner_dim * 2, dim])
+    } else if prefix.ends_with(".mlp.fc2") {
+        Ok(vec![expert_count, dim, expert_inner_dim])
+    } else {
+        Err(anyhow::anyhow!(
+            "Unsupported Moondream3 MoE packed weight prefix: {}",
+            prefix
+        ))
+    }
+}
+
+pub(super) fn dequantize_moondream3_weight(
+    packed: &mlxcel_core::MlxArray,
+    scale: &mlxcel_core::MlxArray,
+    zero_point: &mlxcel_core::MlxArray,
+    original_shape: &[i32],
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let packed_shape = mlxcel_core::array_shape(packed);
+    let packed_i32 = mlxcel_core::astype(packed, mlxcel_core::dtype::INT32);
+    let high_shift = mlxcel_core::from_slice_i32(&[4], &[1]);
+    let nibble_mask = mlxcel_core::from_slice_i32(&[0xF], &[1]);
+
+    let high = mlxcel_core::right_shift(&packed_i32, &high_shift);
+    let high = mlxcel_core::bitwise_and(&high, &nibble_mask);
+    let low = mlxcel_core::bitwise_and(&packed_i32, &nibble_mask);
+
+    let unpacked = if original_shape.len() == 2 {
+        let combined = mlxcel_core::concatenate(&high, &low, 0);
+        let reorder: Vec<i32> = (0..packed_shape[0])
+            .flat_map(|idx| [idx, idx + packed_shape[0]])
+            .collect();
+        let reorder = mlxcel_core::from_slice_i32(&reorder, &[packed_shape[0] * 2]);
+        mlxcel_core::take(&combined, &reorder, 0)
+    } else {
+        let combined = mlxcel_core::concatenate(&high, &low, 1);
+        let reorder: Vec<i32> = (0..packed_shape[1])
+            .flat_map(|idx| [idx, idx + packed_shape[1]])
+            .collect();
+        let reorder = mlxcel_core::from_slice_i32(&reorder, &[packed_shape[1] * 2]);
+        mlxcel_core::take(&combined, &reorder, 1)
+    };
+
+    let unpacked = mlxcel_core::astype(&unpacked, mlxcel_core::dtype::FLOAT32);
+    let centered = mlxcel_core::subtract(&unpacked, zero_point);
+    let dequantized = mlxcel_core::multiply(&centered, scale);
+    let dequantized = mlxcel_core::astype(&dequantized, mlxcel_core::dtype::BFLOAT16);
+    mlxcel_core::reshape(&dequantized, original_shape)
+}
+
+fn remap_moondream3_weights(
+    raw_weights: &WeightMap,
+    text_config: &models::moondream3::ModelArgs,
+) -> Result<WeightMap> {
+    let mut weights = WeightMap::new();
+
+    for (key, value) in raw_weights {
+        let Some(new_key) = rewrite_moondream3_weight_key(key) else {
+            continue;
+        };
+
+        if new_key.ends_with(".weight.packed")
+            || new_key.ends_with(".weight.scale")
+            || new_key.ends_with(".weight.zero_point")
+        {
+            continue;
+        }
+
+        weights.insert(new_key, mlxcel_core::copy(value));
+    }
+
+    for key in raw_weights.keys() {
+        let Some(prefix) = key.strip_suffix(".weight.packed") else {
+            continue;
+        };
+        let Some(new_prefix) = rewrite_moondream3_weight_key(prefix) else {
+            continue;
+        };
+
+        let packed = raw_weights
+            .get(&format!("{}.weight.packed", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing Moondream3 packed weight for {}", prefix))?;
+        let scale = raw_weights
+            .get(&format!("{}.weight.scale", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing Moondream3 weight scale for {}", prefix))?;
+        let zero_point = raw_weights
+            .get(&format!("{}.weight.zero_point", prefix))
+            .ok_or_else(|| anyhow::anyhow!("Missing Moondream3 zero_point for {}", prefix))?;
+
+        let packed_shape = mlxcel_core::array_shape(packed);
+        let original_shape = match packed_shape.len() {
+            2 => moondream3_dense_weight_shape(&new_prefix, text_config)?,
+            3 => moondream3_moe_weight_shape(&new_prefix, text_config)?,
+            _ => {
+                return Err(anyhow::anyhow!(
+                    "Unsupported Moondream3 packed rank {} for {}",
+                    packed_shape.len(),
+                    new_prefix
+                ));
+            }
+        };
+
+        let weight = dequantize_moondream3_weight(packed, scale, zero_point, &original_shape);
+        weights.insert(format!("{}.weight", new_prefix), weight);
+    }
+
+    let ptrs: Vec<*const mlxcel_core::MlxArray> = weights
+        .values()
+        .filter_map(|value| value.as_ref().map(|array| array as *const _))
+        .collect();
+    if !ptrs.is_empty() {
+        unsafe { mlxcel_core::eval_all(&ptrs) };
+    }
+
+    Ok(weights)
 }
 
 pub(super) fn remap_minicpmo_text_weights(raw_weights: &WeightMap) -> WeightMap {
@@ -181,6 +420,40 @@ pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
         resampler,
         processor,
         eos_token_ids,
+    }))
+}
+
+pub(crate) fn load_moondream3_vlm(model_path: &Path) -> Result<LoadedModel> {
+    use vision::encoders::moondream3::{Moondream3VisionConfig, Moondream3VisionModel};
+    use vision::processors::moondream3::Moondream3Processor;
+
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+    let text_config: models::moondream3::ModelArgs =
+        serde_json::from_value(moondream3_text_config_value(&full_config))
+            .map_err(|err| anyhow::anyhow!("Failed to parse Moondream3 text config: {}", err))?;
+    let vision_config: Moondream3VisionConfig =
+        serde_json::from_value(moondream3_vision_config_value(&full_config))
+            .map_err(|err| anyhow::anyhow!("Failed to parse Moondream3 vision config: {}", err))?;
+
+    let raw_weights = load_vlm_weights(model_path)?;
+    let weights = remap_moondream3_weights(&raw_weights, &text_config)?;
+
+    let text_model = models::Moondream3Model::from_weights(&weights, &text_config)
+        .map_err(|err| anyhow::anyhow!("Failed to load Moondream3 text model: {}", err))?;
+    let vision_tower = Moondream3VisionModel::from_weights(&weights, &vision_config)
+        .map_err(|err| anyhow::anyhow!("Failed to load Moondream3 vision tower: {}", err))?;
+    let processor = Moondream3Processor::new(
+        vision_config.crop_size,
+        vision_config.enc_patch_size,
+        vision_config.max_crops,
+        vision_config.overlap_margin,
+    );
+
+    Ok(LoadedModel::Moondream3VLM(vision::Moondream3VLModel {
+        text_model,
+        vision_tower,
+        processor,
+        eos_token_ids: vec![text_config.eos_token_id],
     }))
 }
 

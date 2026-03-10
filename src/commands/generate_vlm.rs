@@ -42,6 +42,16 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_slots, total_tokens
             );
         }
+        VlmPreparationSummary::Moondream3 {
+            mode,
+            total_tokens,
+            prefix_tokens,
+        } => {
+            println!(
+                "Moondream3: prepared {:?} prompt ({} text tokens, {} image-prefix tokens)",
+                mode, total_tokens, prefix_tokens
+            );
+        }
         VlmPreparationSummary::Phi4MM {
             image_slots,
             total_tokens,
