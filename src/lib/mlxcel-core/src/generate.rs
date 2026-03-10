@@ -648,7 +648,7 @@ impl CxxGenerator {
             Vec::new()
         };
 
-        // ===== PREFILL PHASE =====
+        // PREFILL PHASE.
         let prefill_start = Instant::now();
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
         let logits = model.forward(&input, &mut self.caches, None);
@@ -661,7 +661,7 @@ impl CxxGenerator {
         // Clear intermediate tensors from prefill to free memory
         ffi::clear_memory_cache();
 
-        // ===== DECODE PHASE (with lookahead pipelining) =====
+        // DECODE PHASE (with lookahead pipelining).
         let decode_start = Instant::now();
 
         let mut n = 0;

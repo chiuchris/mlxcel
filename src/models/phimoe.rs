@@ -15,10 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
@@ -119,10 +116,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 pub enum SwitchLinear {
@@ -188,10 +182,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: GLU with GELU activation and stacked expert weights
-// ============================================================================
-
+// SwitchGLU: GLU with GELU activation and stacked expert weights.
 /// SwitchGLU: GLU with GELU activation (not SiLU) for PhiMoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -311,10 +302,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Sparse MoE Block
-// ============================================================================
-
+// Sparse MoE Block.
 /// PhiMoE sparse mixture of experts layer
 pub struct SparseMoeBlock {
     pub router: UnifiedLinear, // Router/gate network
@@ -374,10 +362,7 @@ impl SparseMoeBlock {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -484,10 +469,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct DecoderLayer {
     pub self_attn: Attention,
     pub block_sparse_moe: SparseMoeBlock,
@@ -552,10 +534,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// PhiMoE Model
-// ============================================================================
-
+// PhiMoE Model.
 pub struct PhiMoeModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<DecoderLayer>,
@@ -728,10 +707,7 @@ impl PhiMoeModel {
     }
 }
 
-// ============================================================================
-// MoE Implementation Details
-// ============================================================================
-
+// MoE Implementation Details.
 impl SparseMoeBlock {
     pub fn from_weights(
         weights: &WeightMap,
@@ -793,10 +769,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -804,10 +777,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for PhiMoeModel {
     fn forward(
         &self,

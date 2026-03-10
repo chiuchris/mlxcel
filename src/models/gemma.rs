@@ -13,10 +13,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -62,10 +59,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Gemma RMSNorm (uses 1.0 + weight)
-// ============================================================================
-
+// Gemma RMSNorm (uses 1.0 + weight).
 pub struct GemmaRMSNorm {
     pub weight: UniquePtr<MlxArray>,
     pub eps: f32,
@@ -84,10 +78,7 @@ impl GemmaRMSNorm {
     }
 }
 
-// ============================================================================
-// Attention (standard, same as Llama)
-// ============================================================================
-
+// Attention (standard, same as Llama).
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -197,10 +188,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (uses GELU instead of SiLU)
-// ============================================================================
-
+// MLP (uses GELU instead of SiLU).
 pub struct GemmaMLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -254,10 +242,7 @@ impl GemmaMLP {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: GemmaMLP,
@@ -312,10 +297,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Gemma Model
-// ============================================================================
-
+// Gemma Model.
 pub struct GemmaModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -434,10 +416,7 @@ impl GemmaModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -445,10 +424,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for GemmaModel {
     fn forward(
         &self,

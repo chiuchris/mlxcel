@@ -15,10 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::cell::RefCell;
 
-// ============================================================================
-// Config
-// ============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3VLConfig {
     pub hidden_size: usize,
@@ -95,10 +92,7 @@ impl Qwen3VLConfig {
     }
 }
 
-// ============================================================================
-// Interleaved MRoPE
-// ============================================================================
-
+// Interleaved MRoPE.
 pub(crate) struct InterleavedMRoPE {
     inv_freq: Vec<f32>,
     mrope_section: Vec<i32>,
@@ -263,10 +257,7 @@ pub(crate) fn rotate_half(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::concatenate(&neg_x2, &x1, ndim as i32 - 1)
 }
 
-// ============================================================================
-// Attention with q_norm/k_norm and Interleaved MRoPE
-// ============================================================================
-
+// Attention with q_norm/k_norm and Interleaved MRoPE.
 struct Attention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -422,10 +413,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (SwiGLU, same as Qwen2-VL/Llama)
-// ============================================================================
-
+// MLP (SwiGLU, same as Qwen2-VL/Llama).
 struct MLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -470,10 +458,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     attn: Attention,
     mlp: MLP,
@@ -528,10 +513,7 @@ fn load_rms_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<RMSNorm,
     Ok(RMSNorm::new(weight, eps))
 }
 
-// ============================================================================
-// Qwen3VLModel - Full language model with DeepStack support
-// ============================================================================
-
+// Qwen3VLModel - Full language model with DeepStack support.
 pub struct Qwen3VLModel {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -792,10 +774,7 @@ impl Qwen3VLModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl mlxcel_core::generate::LanguageModel for Qwen3VLModel {
     fn forward(
         &self,

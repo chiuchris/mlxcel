@@ -17,10 +17,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
@@ -233,10 +230,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Yarn RoPE
-// ============================================================================
-
+// Yarn RoPE.
 fn yarn_find_correction_dim(num_rotations: f32, dim: usize, base: f32, max_pos: usize) -> f32 {
     let dim_f = dim as f32;
     let max_pos_f = max_pos as f32;
@@ -332,10 +326,7 @@ impl YarnRoPE {
     }
 }
 
-// ============================================================================
-// MLA Attention
-// ============================================================================
-
+// MLA Attention.
 #[allow(dead_code)]
 struct MLAAttention {
     // Q projection: either direct or LoRA-style
@@ -444,10 +435,7 @@ impl MLAAttention {
     }
 }
 
-// ============================================================================
-// MLP (Dense and MoE)
-// ============================================================================
-
+// MLP (Dense and MoE).
 struct DenseMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -603,10 +591,7 @@ impl MLPType {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     self_attn: MLAAttention,
     mlp: MLPType,
@@ -631,10 +616,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// DeepSeek V2 Model
-// ============================================================================
-
+// DeepSeek V2 Model.
 pub struct DeepSeekV2Model {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -726,10 +708,7 @@ impl DeepSeekV2Model {
     }
 }
 
-// ============================================================================
-// Weight Loading Helpers
-// ============================================================================
-
+// Weight Loading Helpers.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -993,10 +972,7 @@ fn load_switch_linear(
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for DeepSeekV2Model {
     fn forward(
         &self,

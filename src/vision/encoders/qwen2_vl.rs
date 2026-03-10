@@ -79,10 +79,7 @@ fn default_mlp_ratio() -> f32 {
     4.0
 }
 
-// ============================================================================
-// Helper: load LayerNorm from weights
-// ============================================================================
-
+// Helper: load LayerNorm from weights.
 fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerNorm, String> {
     let weight_key = format!("{}.weight", prefix);
     let bias_key = format!("{}.bias", prefix);
@@ -96,10 +93,7 @@ fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerN
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
-// ============================================================================
-// PatchEmbed - Conv3d degenerated to Linear (kernel == stride)
-// ============================================================================
-
+// PatchEmbed - Conv3d degenerated to Linear (kernel == stride).
 struct PatchEmbed {
     proj_weight: UniquePtr<MlxArray>,
     proj_bias: Option<UniquePtr<MlxArray>>,
@@ -177,10 +171,7 @@ impl PatchEmbed {
     }
 }
 
-// ============================================================================
-// VisionRotaryEmbedding - 2D spatial position encoding
-// ============================================================================
-
+// VisionRotaryEmbedding - 2D spatial position encoding.
 /// Used by: Qwen2-VL, Qwen2.5-VL
 pub struct VisionRotaryEmbedding {
     dim: usize,
@@ -210,10 +201,7 @@ impl VisionRotaryEmbedding {
     }
 }
 
-// ============================================================================
-// Vision Attention - Fused QKV with packed sequences
-// ============================================================================
-
+// Vision Attention - Fused QKV with packed sequences.
 struct VisionAttention {
     qkv: UnifiedLinear,
     proj: UnifiedLinear,
@@ -393,10 +381,7 @@ pub fn rotate_half(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::concatenate(&neg_x2, &x1, ndim as i32 - 1)
 }
 
-// ============================================================================
-// Vision MLP
-// ============================================================================
-
+// Vision MLP.
 struct VisionMLP {
     fc1: UnifiedLinear,
     fc2: UnifiedLinear,
@@ -417,10 +402,7 @@ impl VisionMLP {
     }
 }
 
-// ============================================================================
-// VisionBlock
-// ============================================================================
-
+// VisionBlock.
 struct VisionBlock {
     norm1: LayerNorm,
     norm2: LayerNorm,
@@ -459,10 +441,7 @@ impl VisionBlock {
     }
 }
 
-// ============================================================================
-// PatchMerger - spatial downsampling + projection to text hidden size
-// ============================================================================
-
+// PatchMerger - spatial downsampling + projection to text hidden size.
 struct PatchMerger {
     ln_q: LayerNorm,
     mlp_0: UnifiedLinear,
@@ -497,10 +476,7 @@ impl PatchMerger {
     }
 }
 
-// ============================================================================
-// Qwen2VLVisionEncoder
-// ============================================================================
-
+// Qwen2VLVisionEncoder.
 /// Qwen2-VL Vision Model
 ///
 /// Used by: Qwen2-VL

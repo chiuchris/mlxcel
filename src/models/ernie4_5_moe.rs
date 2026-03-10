@@ -14,10 +14,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -127,10 +124,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -219,10 +213,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
@@ -299,10 +290,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -420,10 +408,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Dense MLP (for non-MoE layers and shared experts)
-// ============================================================================
-
+// Dense MLP (for non-MoE layers and shared experts).
 /// Standard MLP with SwiGLU activation
 pub struct DenseMLP {
     pub gate_proj: UnifiedLinear,
@@ -443,10 +428,7 @@ impl DenseMLP {
     }
 }
 
-// ============================================================================
-// Shared Experts for MoE
-// ============================================================================
-
+// Shared Experts for MoE.
 /// Shared experts that always process input in parallel with routed experts
 pub struct SharedExperts {
     pub experts: Vec<DenseMLP>,
@@ -467,10 +449,7 @@ impl SharedExperts {
     }
 }
 
-// ============================================================================
-// MoE Block
-// ============================================================================
-
+// MoE Block.
 /// MoE layer with sparse routed experts and shared experts
 pub struct MoEBlock {
     pub gate: UnifiedLinear,
@@ -549,10 +528,7 @@ impl MoEBlock {
     }
 }
 
-// ============================================================================
-// MLP Variant (Dense or MoE)
-// ============================================================================
-
+// MLP Variant (Dense or MoE).
 pub enum MLPVariant {
     Dense(DenseMLP),
     MoE(MoEBlock),
@@ -567,10 +543,7 @@ impl MLPVariant {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 /// ERNIE 4.5 MoE transformer block
 pub struct TransformerBlock {
     pub self_attn: Attention,
@@ -598,10 +571,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Full Model
-// ============================================================================
-
+// Full Model.
 /// ERNIE 4.5 MoE model
 pub struct Ernie45MoeModel {
     pub embed_tokens: UnifiedEmbedding,
@@ -877,10 +847,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper functions for weight loading
-// ============================================================================
-
+// Helper functions for weight loading.
 /// Get a copy of a weight from the weight map
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
@@ -898,10 +865,7 @@ fn load_quantized_linear(
     UnifiedLinear::from_weights(weights, prefix, args.group_size(), args.bits())
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Ernie45MoeModel {
     fn forward(
         &self,

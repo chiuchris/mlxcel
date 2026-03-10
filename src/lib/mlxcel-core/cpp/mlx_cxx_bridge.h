@@ -27,18 +27,12 @@ struct MlxStream {
 };
 
 
-// ============================================================================
-// Stream functions
-// ============================================================================
-
+// Stream functions.
 std::unique_ptr<MlxStream> default_stream();
 std::unique_ptr<MlxStream> new_stream_on_device(bool gpu);
 void synchronize_stream(const MlxStream& stream);
 
-// ============================================================================
-// Array factory functions
-// ============================================================================
-
+// Array factory functions.
 // Create array filled with zeros
 std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype);
 std::unique_ptr<MlxArray> zeros_stream(rust::Slice<const int32_t> shape, int32_t dtype, const MlxStream& stream);
@@ -73,10 +67,7 @@ std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slic
 // Create half-precision array from raw bytes
 std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool bfloat16);
 
-// ============================================================================
-// Array property accessors
-// ============================================================================
-
+// Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr);
 int32_t array_dtype(const MlxArray& arr);
 size_t array_size(const MlxArray& arr);
@@ -84,26 +75,17 @@ size_t array_ndim(const MlxArray& arr);
 size_t array_itemsize(const MlxArray& arr);
 size_t array_nbytes(const MlxArray& arr);
 
-// ============================================================================
-// Array data access (scalar extraction)
-// ============================================================================
-
+// Array data access (scalar extraction).
 float item_f32(const MlxArray& arr);
 int32_t item_i32(const MlxArray& arr);
 int64_t item_i64(const MlxArray& arr);
 bool item_bool(const MlxArray& arr);
 
-// ============================================================================
-// Evaluation
-// ============================================================================
-
+// Evaluation.
 void eval(const MlxArray& arr);
 void eval_all(rust::Slice<const MlxArray* const> arrays);
 
-// ============================================================================
-// Element-wise binary operations
-// ============================================================================
-
+// Element-wise binary operations.
 std::unique_ptr<MlxArray> add(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> subtract(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> remainder(const MlxArray& a, const MlxArray& b);
@@ -112,10 +94,7 @@ std::unique_ptr<MlxArray> divide(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> maximum(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> minimum(const MlxArray& a, const MlxArray& b);
 
-// ============================================================================
-// Element-wise unary operations
-// ============================================================================
-
+// Element-wise unary operations.
 std::unique_ptr<MlxArray> negative(const MlxArray& a);
 std::unique_ptr<MlxArray> abs(const MlxArray& a);
 std::unique_ptr<MlxArray> exp(const MlxArray& a);
@@ -163,10 +142,7 @@ std::unique_ptr<MlxArray> isfinite(const MlxArray& a);
 std::unique_ptr<MlxArray> isneginf(const MlxArray& a);
 std::unique_ptr<MlxArray> isposinf(const MlxArray& a);
 
-// ============================================================================
-// Reduction operations
-// ============================================================================
-
+// Reduction operations.
 std::unique_ptr<MlxArray> sum_all(const MlxArray& a);
 std::unique_ptr<MlxArray> sum_axis(const MlxArray& a, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> mean_all(const MlxArray& a);
@@ -194,19 +170,13 @@ std::unique_ptr<MlxArray> logsumexp_axis(const MlxArray& a, int32_t axis, bool k
 std::unique_ptr<MlxArray> all_all(const MlxArray& a);
 std::unique_ptr<MlxArray> any_all(const MlxArray& a);
 
-// ============================================================================
-// Matrix operations
-// ============================================================================
-
+// Matrix operations.
 std::unique_ptr<MlxArray> matmul(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> transpose(const MlxArray& a);
 std::unique_ptr<MlxArray> transpose_axes(const MlxArray& a, rust::Slice<const int32_t> axes);
 std::unique_ptr<MlxArray> reshape(const MlxArray& a, rust::Slice<const int32_t> shape);
 
-// ============================================================================
-// Shape operations
-// ============================================================================
-
+// Shape operations.
 std::unique_ptr<MlxArray> expand_dims(const MlxArray& a, int32_t axis);
 std::unique_ptr<MlxArray> squeeze(const MlxArray& a);
 std::unique_ptr<MlxArray> squeeze_axis(const MlxArray& a, int32_t axis);
@@ -229,22 +199,13 @@ std::unique_ptr<MlxArray> split_at_indices(const MlxArray& a, rust::Slice<const 
 std::unique_ptr<MlxArray> diag(const MlxArray& a, int32_t k);
 std::unique_ptr<MlxArray> diagonal(const MlxArray& a, int32_t offset, int32_t axis1, int32_t axis2);
 
-// ============================================================================
-// Type conversion
-// ============================================================================
-
+// Type conversion.
 std::unique_ptr<MlxArray> astype(const MlxArray& a, int32_t dtype);
 
-// ============================================================================
-// Copy
-// ============================================================================
-
+// Copy.
 std::unique_ptr<MlxArray> copy(const MlxArray& a);
 
-// ============================================================================
-// High-level operations for LLM inference
-// ============================================================================
-
+// High-level operations for LLM inference.
 // Softmax along axis
 std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis);
 
@@ -293,10 +254,7 @@ void random_seed(uint64_t seed);
 // Random categorical sampling
 std::unique_ptr<MlxArray> random_categorical(const MlxArray& logits, int32_t axis);
 
-// ============================================================================
-// Transformer-specific high-level operations (reduces FFI calls)
-// ============================================================================
-
+// Transformer-specific high-level operations (reduces FFI calls).
 // Rotary position embedding (RoPE)
 // Returns (cos, sin) for position embedding
 std::unique_ptr<MlxArray> rope_forward(
@@ -386,10 +344,7 @@ std::unique_ptr<MlxArray> transformer_layer_forward(
     float norm_eps
 );
 
-// ============================================================================
-// Advanced indexing operations
-// ============================================================================
-
+// Advanced indexing operations.
 // Take elements along an axis using indices
 std::unique_ptr<MlxArray> take(const MlxArray& a, const MlxArray& indices, int32_t axis);
 
@@ -420,10 +375,7 @@ std::unique_ptr<MlxArray> repeat(const MlxArray& a, int32_t repeats, int32_t axi
 std::unique_ptr<MlxArray> arange_f32(float start, float stop, float step);
 std::unique_ptr<MlxArray> arange_i32(int32_t start, int32_t stop, int32_t step);
 
-// ============================================================================
-// Logical operations
-// ============================================================================
-
+// Logical operations.
 std::unique_ptr<MlxArray> logical_not(const MlxArray& a);
 std::unique_ptr<MlxArray> logical_and(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> logical_or(const MlxArray& a, const MlxArray& b);
@@ -433,20 +385,14 @@ std::unique_ptr<MlxArray> greater_equal(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> less_equal(const MlxArray& a, const MlxArray& b);
 std::unique_ptr<MlxArray> not_equal(const MlxArray& a, const MlxArray& b);
 
-// ============================================================================
-// Activation functions
-// ============================================================================
-
+// Activation functions.
 std::unique_ptr<MlxArray> silu(const MlxArray& a);
 std::unique_ptr<MlxArray> gelu(const MlxArray& a);
 std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a);
 std::unique_ptr<MlxArray> relu(const MlxArray& a);
 std::unique_ptr<MlxArray> leaky_relu(const MlxArray& a, float negative_slope);
 
-// ============================================================================
-// Sorting and searching
-// ============================================================================
-
+// Sorting and searching.
 std::unique_ptr<MlxArray> argsort(const MlxArray& a, int32_t axis);
 std::unique_ptr<MlxArray> argpartition(const MlxArray& a, int32_t kth, int32_t axis);
 std::unique_ptr<MlxArray> argmin(const MlxArray& a, int32_t axis, bool keepdims);
@@ -509,10 +455,7 @@ std::unique_ptr<MlxArray> avg_pool2d(
     int32_t padding_h, int32_t padding_w
 );
 
-// ============================================================================
-// MoE (Mixture of Experts) operations
-// ============================================================================
-
+// MoE (Mixture of Experts) operations.
 // Gather matrix multiply for MoE
 // sorted_indices: if true, lhs_indices are pre-sorted for better memory access
 std::unique_ptr<MlxArray> gather_mm(
@@ -560,10 +503,7 @@ std::unique_ptr<MlxArray> dequantize(
     int32_t bits
 );
 
-// ============================================================================
-// Embedding
-// ============================================================================
-
+// Embedding.
 std::unique_ptr<MlxArray> embedding(const MlxArray& weight, const MlxArray& indices);
 
 // Quantized embedding lookup with dequantization
@@ -576,10 +516,7 @@ std::unique_ptr<MlxArray> quantized_embedding(
     int32_t bits
 );
 
-// ============================================================================
-// Fast operations (using MLX fast kernels)
-// ============================================================================
-
+// Fast operations (using MLX fast kernels).
 // Fast RoPE using MLX fast kernel
 std::unique_ptr<MlxArray> fast_rope(
     const MlxArray& x,
@@ -649,10 +586,7 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     bool apply_rope
 );
 
-// ============================================================================
-// Compiled operations (with kernel fusion)
-// ============================================================================
-
+// Compiled operations (with kernel fusion).
 // Compiled full MoE expert forward
 // Compiles: silu(gate_proj(x)) * up_proj(x), then down_proj
 std::unique_ptr<MlxArray> compiled_moe_expert_forward(
@@ -670,10 +604,7 @@ std::unique_ptr<MlxArray> compiled_moe_expert_forward(
     int32_t bits
 );
 
-// ============================================================================
-// Memory and stream management
-// ============================================================================
-
+// Memory and stream management.
 void clear_memory_cache();
 
 // Async evaluation
@@ -696,10 +627,7 @@ size_t gpu_max_memory_size();
 // Create new stream on GPU
 std::unique_ptr<MlxStream> new_gpu_stream();
 
-// ============================================================================
-// Optimized generation functions
-// ============================================================================
-
+// Optimized generation functions.
 // Extract last token logits: logits[:, -1, :] -> [batch, vocab]
 // Optimized for sampling during generation
 std::unique_ptr<MlxArray> slice_last_logits(const MlxArray& logits);
@@ -735,10 +663,7 @@ std::unique_ptr<MlxArray> fused_sample(
     float min_p
 );
 
-// ============================================================================
-// SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H
-// ============================================================================
-
+// SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H.
 // Cumulative sum along axis
 std::unique_ptr<MlxArray> cumsum(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
 
@@ -770,10 +695,7 @@ std::unique_ptr<MlxArray> conv1d(
 // Swap axes (convenient for SSM attention)
 std::unique_ptr<MlxArray> swap_axes(const MlxArray& a, int32_t axis1, int32_t axis2);
 
-// ============================================================================
-// Core ops additions
-// ============================================================================
-
+// Core ops additions.
 // Array creation
 std::unique_ptr<MlxArray> identity(int32_t n, int32_t dtype);
 std::unique_ptr<MlxArray> tri(int32_t n, int32_t m, int32_t k, int32_t dtype);
@@ -830,10 +752,7 @@ std::unique_ptr<MlxArray> hadamard_transform(const MlxArray& a);
 // Number of elements
 std::unique_ptr<MlxArray> number_of_elements(const MlxArray& a, rust::Slice<const int32_t> axes, bool inverted, int32_t dtype);
 
-// ============================================================================
-// Convolution additions
-// ============================================================================
-
+// Convolution additions.
 std::unique_ptr<MlxArray> conv3d(
     const MlxArray& input,
     const MlxArray& weight,
@@ -873,16 +792,10 @@ std::unique_ptr<MlxArray> conv_transpose3d(
     int32_t groups
 );
 
-// ============================================================================
-// Einsum
-// ============================================================================
-
+// Einsum.
 std::unique_ptr<MlxArray> einsum(rust::Str subscripts, rust::Slice<const MlxArray* const> operands);
 
-// ============================================================================
-// Linear algebra (mlx/linalg.h)
-// ============================================================================
-
+// Linear algebra (mlx/linalg.h).
 std::unique_ptr<MlxArray> linalg_norm(const MlxArray& a, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> linalg_norm_ord(const MlxArray& a, double ord, int32_t axis, bool keepdims);
 std::unique_ptr<MlxArray> linalg_norm_str(const MlxArray& a, rust::Str ord, int32_t axis, bool keepdims);
@@ -911,10 +824,7 @@ std::unique_ptr<MlxArray> linalg_cross(const MlxArray& a, const MlxArray& b, int
 std::unique_ptr<MlxArray> linalg_tri_inv(const MlxArray& a, bool upper);
 std::unique_ptr<MlxArray> linalg_cholesky_inv(const MlxArray& a, bool upper);
 
-// ============================================================================
-// FFT (mlx/fft.h)
-// ============================================================================
-
+// FFT (mlx/fft.h).
 std::unique_ptr<MlxArray> fft(const MlxArray& a, int32_t n, int32_t axis);
 std::unique_ptr<MlxArray> ifft(const MlxArray& a, int32_t n, int32_t axis);
 std::unique_ptr<MlxArray> rfft(const MlxArray& a, int32_t n, int32_t axis);
@@ -930,10 +840,7 @@ std::unique_ptr<MlxArray> irfftn_axes(const MlxArray& a, rust::Slice<const int32
 std::unique_ptr<MlxArray> fftshift(const MlxArray& a, rust::Slice<const int32_t> axes);
 std::unique_ptr<MlxArray> ifftshift(const MlxArray& a, rust::Slice<const int32_t> axes);
 
-// ============================================================================
-// Random (mlx/random.h)
-// ============================================================================
-
+// Random (mlx/random.h).
 std::unique_ptr<MlxArray> random_key(uint64_t seed);
 std::unique_ptr<MlxArray> random_split_key(const MlxArray& key, int32_t num);
 std::unique_ptr<MlxArray> random_uniform(float low, float high, rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
@@ -953,10 +860,7 @@ std::unique_ptr<MlxArray> random_multivariate_normal(
     const MlxArray* key
 );
 
-// ============================================================================
-// Quantization additions
-// ============================================================================
-
+// Quantization additions.
 std::unique_ptr<MlxArray> quantize_weights_w(const MlxArray& w, int32_t group_size, int32_t bits);
 std::unique_ptr<MlxArray> quantize_weights_scales(const MlxArray& w, int32_t group_size, int32_t bits);
 std::unique_ptr<MlxArray> quantize_weights_biases(const MlxArray& w, int32_t group_size, int32_t bits);

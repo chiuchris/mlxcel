@@ -16,10 +16,7 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -129,10 +126,7 @@ impl ModelArgs {
     }
 }
 
-// =============================================================================
-// MoE SwitchLinear and SwitchGLU
-// =============================================================================
-
+// MoE SwitchLinear and SwitchGLU.
 /// Stacked linear layers for MoE experts
 pub enum SwitchLinear {
     Quantized {
@@ -300,10 +294,7 @@ impl SwitchGLU {
     }
 }
 
-// =============================================================================
-// MoE Gate with Sigmoid Scoring
-// =============================================================================
-
+// MoE Gate with Sigmoid Scoring.
 /// MoE Gate with grouped expert selection (simplified to standard top-k)
 pub struct MoEGate {
     pub router: UnifiedLinear,
@@ -365,10 +356,7 @@ impl MoEGate {
     }
 }
 
-// =============================================================================
-// Dense MLP (for non-MoE layers)
-// =============================================================================
-
+// Dense MLP (for non-MoE layers).
 pub struct ExaoneMoeMLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -387,10 +375,7 @@ impl ExaoneMoeMLP {
     }
 }
 
-// =============================================================================
-// MoE Block with Shared Experts
-// =============================================================================
-
+// MoE Block with Shared Experts.
 pub struct ExaoneMoE {
     pub switch_mlp: SwitchGLU,
     pub gate: MoEGate,
@@ -439,10 +424,7 @@ impl ExaoneMoE {
     }
 }
 
-// =============================================================================
-// FFN Enum for Dense or MoE
-// =============================================================================
-
+// FFN Enum for Dense or MoE.
 pub enum ExaoneMoeFFN {
     Dense(ExaoneMoeMLP),
     Moe(ExaoneMoE),
@@ -457,10 +439,7 @@ impl ExaoneMoeFFN {
     }
 }
 
-// =============================================================================
-// Attention with Q/K Normalization
-// =============================================================================
-
+// Attention with Q/K Normalization.
 pub struct ExaoneMoeAttention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -555,10 +534,7 @@ impl ExaoneMoeAttention {
     }
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 pub struct ExaoneMoeDecoderLayer {
     pub self_attn: ExaoneMoeAttention,
     pub mlp: ExaoneMoeFFN,
@@ -586,10 +562,7 @@ impl ExaoneMoeDecoderLayer {
     }
 }
 
-// =============================================================================
-// KVCache Trait for Dynamic Dispatch
-// =============================================================================
-
+// KVCache Trait for Dynamic Dispatch.
 pub trait KVCacheTrait {
     fn update_and_fetch(
         &mut self,
@@ -653,10 +626,7 @@ impl KVCacheTrait for AnyKVCache {
     }
 }
 
-// =============================================================================
-// Model
-// =============================================================================
-
+// Model.
 pub struct ExaoneMoeModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<ExaoneMoeDecoderLayer>,
@@ -798,10 +768,7 @@ impl ExaoneMoeModel {
     }
 }
 
-// =============================================================================
-// Weight Loading Helpers
-// =============================================================================
-
+// Weight Loading Helpers.
 fn load_decoder_layer(
     weights: &WeightMap,
     args: &ModelArgs,
@@ -1019,10 +986,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for ExaoneMoeModel {
     fn forward(
         &self,

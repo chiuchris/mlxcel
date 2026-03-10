@@ -15,10 +15,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -115,10 +112,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// SuScaledRoPE - Su-scaled rotary position embedding
-// ============================================================================
-
+// SuScaledRoPE - Su-scaled rotary position embedding.
 struct SuScaledRoPE {
     scaled_base: f32,
     mscale: f32,
@@ -154,10 +148,7 @@ impl SuScaledRoPE {
     }
 }
 
-// ============================================================================
-// MLA Attention
-// ============================================================================
-
+// MLA Attention.
 #[allow(dead_code)]
 struct MLAAttention {
     // Query path: x -> q_a_proj -> q_a_layernorm -> q_b_proj
@@ -264,10 +255,7 @@ impl MLAAttention {
     }
 }
 
-// ============================================================================
-// MLP
-// ============================================================================
-
+// MLP.
 struct MLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -283,10 +271,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     self_attn: MLAAttention,
     mlp: MLP,
@@ -318,10 +303,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// MiniCPM3 Model
-// ============================================================================
-
+// MiniCPM3 Model.
 pub struct MiniCPM3Model {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -438,10 +420,7 @@ impl MiniCPM3Model {
     }
 }
 
-// ============================================================================
-// Weight Loading Helpers
-// ============================================================================
-
+// Weight Loading Helpers.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -564,10 +543,7 @@ fn load_mla_attention(
     })
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for MiniCPM3Model {
     fn forward(
         &self,

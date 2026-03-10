@@ -19,10 +19,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -140,10 +137,7 @@ impl KimiLinearConfig {
     }
 }
 
-// =============================================================================
-// MultiLinear - Per-head matrix multiply (dense or quantized)
-// =============================================================================
-
+// MultiLinear - Per-head matrix multiply (dense or quantized).
 /// Per-head linear projection used in MLA.
 /// Weight shape: [num_heads, output_dims, input_dims]
 ///
@@ -215,10 +209,7 @@ impl MultiLinear {
     }
 }
 
-// =============================================================================
-// ShortConv1d - Depthwise convolution with state
-// =============================================================================
-
+// ShortConv1d - Depthwise convolution with state.
 /// Short depthwise convolution with manual state management.
 /// Used for preprocessing Q, K, V in delta attention layers.
 ///
@@ -313,10 +304,7 @@ impl ShortConv1d {
     }
 }
 
-// =============================================================================
-// Cache Types
-// =============================================================================
-
+// Cache Types.
 /// Cache for KimiDeltaAttention layers (4 elements).
 pub struct KimiDeltaCache {
     pub q_conv_state: Option<UniquePtr<MlxArray>>,
@@ -363,10 +351,7 @@ impl KimiLinearCache {
     }
 }
 
-// =============================================================================
-// KimiMLAAttention - Multi-head Latent Attention
-// =============================================================================
-
+// KimiMLAAttention - Multi-head Latent Attention.
 struct KimiMLAAttention {
     q_proj: UnifiedLinear,
     kv_a_proj_with_mqa: UnifiedLinear,
@@ -525,10 +510,7 @@ impl KimiMLAAttention {
     }
 }
 
-// =============================================================================
-// KimiDeltaAttention - Linear Attention via GatedDeltaNet
-// =============================================================================
-
+// KimiDeltaAttention - Linear Attention via GatedDeltaNet.
 struct KimiDeltaAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -718,10 +700,7 @@ impl KimiDeltaAttention {
     }
 }
 
-// =============================================================================
-// MLP
-// =============================================================================
-
+// MLP.
 struct KimiMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -765,10 +744,7 @@ impl KimiMLP {
     }
 }
 
-// =============================================================================
-// KimiSparseMoE
-// =============================================================================
-
+// KimiSparseMoE.
 struct KimiSparseMoE {
     gate: UnifiedLinear,
     switch_mlp: SwitchGLU,
@@ -906,10 +882,7 @@ impl KimiSparseMoE {
     }
 }
 
-// =============================================================================
-// MLP Variant
-// =============================================================================
-
+// MLP Variant.
 enum MLPVariant {
     Dense(KimiMLP),
     MoE(KimiSparseMoE),
@@ -924,19 +897,13 @@ impl MLPVariant {
     }
 }
 
-// =============================================================================
-// Attention Variant
-// =============================================================================
-
+// Attention Variant.
 enum AttentionVariant {
     MLA(KimiMLAAttention),
     Delta(KimiDeltaAttention),
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 struct KimiDecoderLayer {
     is_linear: bool,
     self_attn: AttentionVariant,
@@ -1028,10 +995,7 @@ impl KimiDecoderLayer {
     }
 }
 
-// =============================================================================
-// KimiLinear Model
-// =============================================================================
-
+// KimiLinear Model.
 pub struct KimiLinearModel {
     pub embed_tokens: UnifiedEmbedding,
     layers: Vec<KimiDecoderLayer>,
@@ -1371,10 +1335,7 @@ impl KimiLinearModel {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for KimiLinearModel {
     fn num_layers(&self) -> usize {
         self.layers.len()

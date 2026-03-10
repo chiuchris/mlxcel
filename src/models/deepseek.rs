@@ -15,10 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -80,10 +77,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
@@ -162,10 +156,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -283,10 +274,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// MLP for dense layers
-// ============================================================================
-
+// MLP for dense layers.
 /// Standard MLP with SwiGLU activation
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
@@ -306,10 +294,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// MoE Layer
-// ============================================================================
-
+// MoE Layer.
 /// MoE Gate for routing
 pub struct MoEGate {
     pub weight: UniquePtr<MlxArray>,
@@ -406,10 +391,7 @@ impl MoE {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -497,10 +479,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub enum FeedForward {
     Dense(MLP),
     MoE(MoE),
@@ -543,10 +522,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Full Model
-// ============================================================================
-
+// Full Model.
 /// DeepSeek v1 MoE language model
 pub struct DeepSeekModel {
     pub embed_tokens: UnifiedEmbedding,
@@ -834,10 +810,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper functions for weight loading
-// ============================================================================
-
+// Helper functions for weight loading.
 /// Get a copy of a weight from the weight map
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
@@ -855,10 +828,7 @@ fn load_quantized_linear(
     UnifiedLinear::from_weights(weights, prefix, args.group_size(), args.bits())
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for DeepSeekModel {
     fn forward(
         &self,

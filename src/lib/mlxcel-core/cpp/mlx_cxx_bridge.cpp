@@ -67,10 +67,7 @@ static int32_t from_dtype(Dtype dtype) {
     }
 }
 
-// ============================================================================
-// Stream functions
-// ============================================================================
-
+// Stream functions.
 std::unique_ptr<MlxStream> default_stream() {
     return std::make_unique<MlxStream>(mlx::core::default_stream(mlx::core::default_device()));
 }
@@ -84,10 +81,7 @@ void synchronize_stream(const MlxStream& stream) {
     mlx::core::synchronize(stream.inner);
 }
 
-// ============================================================================
-// Array factory functions
-// ============================================================================
-
+// Array factory functions.
 std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::zeros(to_shape(shape), to_dtype(dtype)));
 }
@@ -244,10 +238,7 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
     return std::make_unique<MlxArray>(array(float_data.data(), mlx_shape));
 }
 
-// ============================================================================
-// Array property accessors
-// ============================================================================
-
+// Array property accessors.
 rust::Vec<int32_t> array_shape(const MlxArray& arr) {
     rust::Vec<int32_t> result;
     const auto& shape = arr.inner.shape();
@@ -277,10 +268,7 @@ size_t array_nbytes(const MlxArray& arr) {
     return arr.inner.nbytes();
 }
 
-// ============================================================================
-// Array data access (scalar extraction)
-// ============================================================================
-
+// Array data access (scalar extraction).
 float item_f32(const MlxArray& arr) {
     return const_cast<array&>(arr.inner).item<float>();
 }
@@ -297,10 +285,7 @@ bool item_bool(const MlxArray& arr) {
     return const_cast<array&>(arr.inner).item<bool>();
 }
 
-// ============================================================================
-// Evaluation
-// ============================================================================
-
+// Evaluation.
 void eval(const MlxArray& arr) {
     const_cast<array&>(arr.inner).eval();
 }
@@ -314,10 +299,7 @@ void eval_all(rust::Slice<const MlxArray* const> arrays) {
     mlx::core::eval(arrs);
 }
 
-// ============================================================================
-// Element-wise binary operations
-// ============================================================================
-
+// Element-wise binary operations.
 std::unique_ptr<MlxArray> add(const MlxArray& a, const MlxArray& b) {
     return std::make_unique<MlxArray>(mlx::core::add(a.inner, b.inner));
 }
@@ -346,10 +328,7 @@ std::unique_ptr<MlxArray> minimum(const MlxArray& a, const MlxArray& b) {
     return std::make_unique<MlxArray>(mlx::core::minimum(a.inner, b.inner));
 }
 
-// ============================================================================
-// Element-wise unary operations
-// ============================================================================
-
+// Element-wise unary operations.
 std::unique_ptr<MlxArray> negative(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::negative(a.inner));
 }
@@ -517,10 +496,7 @@ std::unique_ptr<MlxArray> isposinf(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::isposinf(a.inner));
 }
 
-// ============================================================================
-// Reduction operations
-// ============================================================================
-
+// Reduction operations.
 std::unique_ptr<MlxArray> sum_all(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::sum(a.inner));
 }
@@ -597,10 +573,7 @@ std::unique_ptr<MlxArray> any_all(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::any(a.inner));
 }
 
-// ============================================================================
-// Matrix operations
-// ============================================================================
-
+// Matrix operations.
 std::unique_ptr<MlxArray> matmul(const MlxArray& a, const MlxArray& b) {
     return std::make_unique<MlxArray>(mlx::core::matmul(a.inner, b.inner));
 }
@@ -618,10 +591,7 @@ std::unique_ptr<MlxArray> reshape(const MlxArray& a, rust::Slice<const int32_t> 
     return std::make_unique<MlxArray>(mlx::core::reshape(a.inner, to_shape(shape)));
 }
 
-// ============================================================================
-// Shape operations
-// ============================================================================
-
+// Shape operations.
 std::unique_ptr<MlxArray> expand_dims(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::expand_dims(a.inner, axis));
 }
@@ -686,26 +656,17 @@ std::unique_ptr<MlxArray> diagonal(const MlxArray& a, int32_t offset, int32_t ax
     return std::make_unique<MlxArray>(mlx::core::diagonal(a.inner, offset, axis1, axis2));
 }
 
-// ============================================================================
-// Type conversion
-// ============================================================================
-
+// Type conversion.
 std::unique_ptr<MlxArray> astype(const MlxArray& a, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::astype(a.inner, to_dtype(dtype)));
 }
 
-// ============================================================================
-// Copy
-// ============================================================================
-
+// Copy.
 std::unique_ptr<MlxArray> copy(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::copy(a.inner));
 }
 
-// ============================================================================
-// High-level operations for LLM inference
-// ============================================================================
-
+// High-level operations for LLM inference.
 std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::softmax(a.inner, axis));
 }
@@ -800,10 +761,7 @@ std::unique_ptr<MlxArray> random_categorical(const MlxArray& logits, int32_t axi
     return std::make_unique<MlxArray>(mlx::core::random::categorical(logits.inner, axis));
 }
 
-// ============================================================================
-// Transformer-specific high-level operations
-// ============================================================================
-
+// Transformer-specific high-level operations.
 std::unique_ptr<MlxArray> rope_forward(
     const MlxArray& x,
     int32_t head_dim,
@@ -1122,10 +1080,7 @@ std::unique_ptr<MlxArray> transformer_layer_forward(
     return std::make_unique<MlxArray>(mlx::core::add(h2, ffn_out));
 }
 
-// ============================================================================
-// Advanced indexing operations
-// ============================================================================
-
+// Advanced indexing operations.
 std::unique_ptr<MlxArray> take(const MlxArray& a, const MlxArray& indices, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::take(a.inner, indices.inner, axis));
 }
@@ -1190,10 +1145,7 @@ std::unique_ptr<MlxArray> arange_i32(int32_t start, int32_t stop, int32_t step) 
     return std::make_unique<MlxArray>(mlx::core::arange(start, stop, step));
 }
 
-// ============================================================================
-// Logical operations
-// ============================================================================
-
+// Logical operations.
 std::unique_ptr<MlxArray> logical_not(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::logical_not(a.inner));
 }
@@ -1226,10 +1178,7 @@ std::unique_ptr<MlxArray> not_equal(const MlxArray& a, const MlxArray& b) {
     return std::make_unique<MlxArray>(mlx::core::not_equal(a.inner, b.inner));
 }
 
-// ============================================================================
-// Activation functions
-// ============================================================================
-
+// Activation functions.
 std::unique_ptr<MlxArray> silu(const MlxArray& a) {
     // silu(x) = x * sigmoid(x)
     return std::make_unique<MlxArray>(mlx::core::multiply(a.inner, mlx::core::sigmoid(a.inner)));
@@ -1271,10 +1220,7 @@ std::unique_ptr<MlxArray> leaky_relu(const MlxArray& a, float negative_slope) {
     return std::make_unique<MlxArray>(mlx::core::add(pos, neg));
 }
 
-// ============================================================================
-// Sorting and searching
-// ============================================================================
-
+// Sorting and searching.
 std::unique_ptr<MlxArray> argsort(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::argsort(a.inner, axis));
 }
@@ -1446,10 +1392,7 @@ std::unique_ptr<MlxArray> avg_pool2d(
     return std::make_unique<MlxArray>(std::move(result));
 }
 
-// ============================================================================
-// MoE (Mixture of Experts) operations
-// ============================================================================
-
+// MoE (Mixture of Experts) operations.
 std::unique_ptr<MlxArray> gather_mm(
     const MlxArray& a,
     const MlxArray& b,
@@ -1521,10 +1464,7 @@ std::unique_ptr<MlxArray> dequantize(
     ));
 }
 
-// ============================================================================
-// Embedding
-// ============================================================================
-
+// Embedding.
 std::unique_ptr<MlxArray> embedding(const MlxArray& weight, const MlxArray& indices) {
     return std::make_unique<MlxArray>(mlx::core::take(weight.inner, indices.inner, 0));
 }
@@ -1574,10 +1514,7 @@ std::unique_ptr<MlxArray> quantized_embedding(
     return std::make_unique<MlxArray>(reshaped);
 }
 
-// ============================================================================
-// Fast operations (using MLX fast kernels)
-// ============================================================================
-
+// Fast operations (using MLX fast kernels).
 std::unique_ptr<MlxArray> fast_rope(
     const MlxArray& x,
     int32_t dims,
@@ -1691,10 +1628,7 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     return std::make_unique<MlxArray>(std::move(proj));
 }
 
-// ============================================================================
-// Compiled operations (with kernel fusion)
-// ============================================================================
-
+// Compiled operations (with kernel fusion).
 // Compiled MoE expert forward with quantized weights
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_qmoe_expert() {
@@ -1759,10 +1693,7 @@ std::unique_ptr<MlxArray> compiled_moe_expert_forward(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
-// ============================================================================
-// Memory management
-// ============================================================================
-
+// Memory management.
 void clear_memory_cache() {
     mlx::core::clear_cache();
 }
@@ -1818,10 +1749,7 @@ std::unique_ptr<MlxStream> new_gpu_stream() {
     return std::make_unique<MlxStream>(mlx::core::new_stream(mlx::core::Device::gpu));
 }
 
-// ============================================================================
-// Optimized generation functions
-// ============================================================================
-
+// Optimized generation functions.
 // Extract last token logits: logits[:, -1, :] -> [batch, vocab]
 // This is the optimized path for sampling during generation
 std::unique_ptr<MlxArray> slice_last_logits(const MlxArray& logits) {
@@ -1969,10 +1897,7 @@ std::unique_ptr<MlxArray> fused_sample(
     return std::make_unique<MlxArray>(mlx::core::random::categorical(x, -1));
 }
 
-// ============================================================================
-// SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H
-// ============================================================================
-
+// SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H.
 // Cumulative sum along axis
 std::unique_ptr<MlxArray> cumsum(const MlxArray& a, int32_t axis, bool reverse, bool inclusive) {
     return std::make_unique<MlxArray>(mlx::core::cumsum(a.inner, axis, reverse, inclusive));
@@ -2023,10 +1948,7 @@ std::unique_ptr<MlxArray> swap_axes(const MlxArray& a, int32_t axis1, int32_t ax
     return std::make_unique<MlxArray>(mlx::core::swapaxes(a.inner, axis1, axis2));
 }
 
-// ============================================================================
-// Core ops additions
-// ============================================================================
-
+// Core ops additions.
 std::unique_ptr<MlxArray> identity(int32_t n, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::identity(n, to_dtype(dtype)));
 }
@@ -2150,10 +2072,7 @@ std::unique_ptr<MlxArray> number_of_elements(const MlxArray& a, rust::Slice<cons
     return std::make_unique<MlxArray>(mlx::core::number_of_elements(a.inner, axes_vec, inverted, to_dtype(dtype)));
 }
 
-// ============================================================================
-// Convolution additions
-// ============================================================================
-
+// Convolution additions.
 std::unique_ptr<MlxArray> conv3d(
     const MlxArray& input,
     const MlxArray& weight,
@@ -2223,10 +2142,7 @@ std::unique_ptr<MlxArray> conv_transpose3d(
     ));
 }
 
-// ============================================================================
-// Einsum
-// ============================================================================
-
+// Einsum.
 std::unique_ptr<MlxArray> einsum(rust::Str subscripts, rust::Slice<const MlxArray* const> operands) {
     std::string subscripts_str(subscripts.begin(), subscripts.end());
     std::vector<mlx::core::array> operands_vec;
@@ -2237,10 +2153,7 @@ std::unique_ptr<MlxArray> einsum(rust::Str subscripts, rust::Slice<const MlxArra
     return std::make_unique<MlxArray>(mlx::core::einsum(subscripts_str, operands_vec));
 }
 
-// ============================================================================
-// Linear algebra
-// ============================================================================
-
+// Linear algebra.
 std::unique_ptr<MlxArray> linalg_norm(const MlxArray& a, int32_t axis, bool keepdims) {
     return std::make_unique<MlxArray>(mlx::core::linalg::norm(a.inner, axis, keepdims));
 }
@@ -2364,10 +2277,7 @@ std::unique_ptr<MlxArray> linalg_cholesky_inv(const MlxArray& a, bool upper) {
     return std::make_unique<MlxArray>(mlx::core::linalg::cholesky_inv(a.inner, upper));
 }
 
-// ============================================================================
-// FFT
-// ============================================================================
-
+// FFT.
 std::unique_ptr<MlxArray> fft(const MlxArray& a, int32_t n, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::fft::fftn(a.inner, {n}, {axis}));
 }
@@ -2434,10 +2344,7 @@ std::unique_ptr<MlxArray> ifftshift(const MlxArray& a, rust::Slice<const int32_t
     return std::make_unique<MlxArray>(mlx::core::fft::ifftshift(a.inner, axes_vec));
 }
 
-// ============================================================================
-// Random
-// ============================================================================
-
+// Random.
 std::unique_ptr<MlxArray> random_key(uint64_t seed) {
     return std::make_unique<MlxArray>(mlx::core::random::key(seed));
 }
@@ -2510,10 +2417,7 @@ std::unique_ptr<MlxArray> random_multivariate_normal(
     ));
 }
 
-// ============================================================================
-// Quantization additions
-// ============================================================================
-
+// Quantization additions.
 std::unique_ptr<MlxArray> quantize_weights_w(const MlxArray& w, int32_t group_size, int32_t bits) {
     auto result = mlx::core::quantize(w.inner, group_size, bits);
     return std::make_unique<MlxArray>(std::move(result[0]));

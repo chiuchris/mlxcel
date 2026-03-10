@@ -13,10 +13,7 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::Path;
 
-// =============================================================================
-// Config
-// =============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct BaichuanConfig {
     pub model_type: String,
@@ -64,10 +61,7 @@ impl BaichuanConfig {
     }
 }
 
-// =============================================================================
-// Attention
-// =============================================================================
-
+// Attention.
 pub struct BaichuanAttention {
     pub w_pack: UnifiedLinear,
     pub o_proj: UnifiedLinear,
@@ -281,10 +275,7 @@ impl BaichuanAttention {
     }
 }
 
-// =============================================================================
-// MLP
-// =============================================================================
-
+// MLP.
 pub struct BaichuanMLP {
     pub gate_proj: UnifiedLinear,
     pub down_proj: UnifiedLinear,
@@ -333,10 +324,7 @@ impl BaichuanMLP {
     }
 }
 
-// =============================================================================
-// Transformer Block
-// =============================================================================
-
+// Transformer Block.
 pub struct BaichuanDecoderLayer {
     pub self_attn: BaichuanAttention,
     pub mlp: BaichuanMLP,
@@ -397,10 +385,7 @@ impl BaichuanDecoderLayer {
     }
 }
 
-// =============================================================================
-// Model
-// =============================================================================
-
+// Model.
 /// Convolution state for Baichuan attention (stores last K/V before conv)
 pub type ConvState = Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>;
 
@@ -512,10 +497,7 @@ impl BaichuanModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -523,10 +505,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for BaichuanModel {
     fn forward(
         &self,

@@ -15,10 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     #[serde(default = "default_model_type")]
@@ -121,10 +118,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with Partial RoPE
-// ============================================================================
-
+// Attention with Partial RoPE.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -229,10 +223,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (Simple GELU - no gate/up pattern)
-// ============================================================================
-
+// MLP (Simple GELU - no gate/up pattern).
 pub struct MLP {
     pub fc1: UnifiedLinear,
     pub fc2: UnifiedLinear,
@@ -263,10 +254,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block (Parallel Attention + MLP)
-// ============================================================================
-
+// Transformer Block (Parallel Attention + MLP).
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MLP,
@@ -319,10 +307,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Phi Model
-// ============================================================================
-
+// Phi Model.
 pub struct PhiModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -409,10 +394,7 @@ impl PhiModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -420,10 +402,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for PhiModel {
     fn forward(
         &self,

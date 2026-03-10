@@ -13,10 +13,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -80,10 +77,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with Partial RoPE
-// ============================================================================
-
+// Attention with Partial RoPE.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -207,10 +201,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP with Fused gate_up_proj
-// ============================================================================
-
+// MLP with Fused gate_up_proj.
 pub struct MLP {
     pub gate_up_proj: UnifiedLinear, // Fused: outputs 2 * intermediate_size
     pub down_proj: UnifiedLinear,
@@ -262,10 +253,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block with 4 RMSNorm layers
-// ============================================================================
-
+// Transformer Block with 4 RMSNorm layers.
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MLP,
@@ -336,10 +324,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// GLM4 Model
-// ============================================================================
-
+// GLM4 Model.
 pub struct Glm4Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -427,10 +412,7 @@ impl Glm4Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -438,10 +420,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Glm4Model {
     fn forward(
         &self,

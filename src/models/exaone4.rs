@@ -14,10 +14,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -63,10 +60,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -216,10 +210,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP
-// ============================================================================
-
+// MLP.
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -273,10 +264,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block (Output-norm: norm outputs before residual add)
-// ============================================================================
-
+// Transformer Block (Output-norm: norm outputs before residual add).
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MLP,
@@ -343,10 +331,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Cache Interface (trait for KVCache / RotatingKVCache polymorphism)
-// ============================================================================
-
+// Cache Interface (trait for KVCache / RotatingKVCache polymorphism).
 pub trait CacheInterface {
     fn offset(&self) -> i32;
     fn update_and_fetch(
@@ -398,10 +383,7 @@ impl Cache {
     }
 }
 
-// ============================================================================
-// ExaOne4 Model
-// ============================================================================
-
+// ExaOne4 Model.
 pub struct ExaOne4Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -540,10 +522,7 @@ impl ExaOne4Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -613,10 +592,7 @@ fn compute_rope_freqs(args: &ModelArgs) -> Option<UniquePtr<MlxArray>> {
     Some(mlxcel_core::from_slice_f32(&freq_vals, &[half_dims as i32]))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 use std::cell::RefCell;
 
 impl ExaOne4Model {

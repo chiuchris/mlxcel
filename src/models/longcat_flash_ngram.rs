@@ -22,10 +22,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
     pub group_size: i32,
@@ -130,10 +127,7 @@ impl LongcatFlashNgramConfig {
     }
 }
 
-// =============================================================================
-// Helper: get weight with copy
-// =============================================================================
-
+// Helper: get weight with copy.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -141,11 +135,8 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Missing weight: {name}"))
 }
 
-// =============================================================================
-// LongcatFlashMLA - Multi-head Latent Attention
-// Used by: LongcatFlash, LongcatFlashNgram
-// =============================================================================
-
+// LongcatFlashMLA - Multi-head Latent Attention.
+// Used by: LongcatFlash, LongcatFlashNgram.
 struct LongcatFlashMLA {
     // Q projection with LoRA
     q_a_proj: Option<UnifiedLinear>,
@@ -377,10 +368,7 @@ impl LongcatFlashMLA {
     }
 }
 
-// =============================================================================
-// LongcatFlashMLP - Dense MLP (used for per-sublayer MLPs)
-// =============================================================================
-
+// LongcatFlashMLP - Dense MLP (used for per-sublayer MLPs).
 struct LongcatFlashMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -421,10 +409,7 @@ impl LongcatFlashMLP {
     }
 }
 
-// =============================================================================
-// LongcatFlashTopkRouter
-// =============================================================================
-
+// LongcatFlashTopkRouter.
 struct LongcatFlashTopkRouter {
     classifier: UnifiedLinear,
     e_score_correction_bias: UniquePtr<MlxArray>,
@@ -511,10 +496,7 @@ impl LongcatFlashTopkRouter {
     }
 }
 
-// =============================================================================
-// LongcatFlashMoE - MoE with identity zero experts
-// =============================================================================
-
+// LongcatFlashMoE - MoE with identity zero experts.
 struct LongcatFlashMoE {
     router: LongcatFlashTopkRouter,
     switch_mlp: SwitchGLU,
@@ -575,11 +557,8 @@ impl LongcatFlashMoE {
     }
 }
 
-// =============================================================================
-// LongcatFlashDecoderLayer - dual sub-layer architecture
-// Each layer has 2 attention + 2 MLP sub-layers plus a shared MoE MLP
-// =============================================================================
-
+// LongcatFlashDecoderLayer - dual sub-layer architecture.
+// Each layer has 2 attention + 2 MLP sub-layers plus a shared MoE MLP.
 struct LongcatFlashDecoderLayer {
     self_attn: [LongcatFlashMLA; 2],
     mlps: [LongcatFlashMLP; 2],
@@ -687,10 +666,7 @@ impl LongcatFlashDecoderLayer {
     }
 }
 
-// =============================================================================
-// NgramEmbedding - n-gram hash embeddings
-// =============================================================================
-
+// NgramEmbedding - n-gram hash embeddings.
 struct NgramEmbedder {
     embedding: UnifiedEmbedding,
     post_proj: UnifiedLinear,
@@ -888,10 +864,7 @@ impl NgramEmbedding {
     }
 }
 
-// =============================================================================
-// LongcatFlashNgramModel - top-level model
-// =============================================================================
-
+// LongcatFlashNgramModel - top-level model.
 pub struct LongcatFlashNgramModel {
     // For ngram model
     ngram_embeddings: Option<NgramEmbedding>,
@@ -1035,10 +1008,7 @@ impl LanguageModel for LongcatFlashNgramModel {
     }
 }
 
-// =============================================================================
-// Weight sanitization
-// =============================================================================
-
+// Weight sanitization.
 pub fn sanitize_weights(mut weights: WeightMap, args: &LongcatFlashNgramConfig) -> WeightMap {
     // Stack MoE expert weights into SwitchGLU format
     for l in 0..args.num_layers {

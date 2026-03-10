@@ -10,10 +10,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -81,10 +78,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with Fused QKV
-// ============================================================================
-
+// Attention with Fused QKV.
 pub struct Attention {
     pub wqkv: UnifiedLinear, // Fused Q, K, V projection
     pub wo: UnifiedLinear,
@@ -201,10 +195,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (SwiGLU)
-// ============================================================================
-
+// MLP (SwiGLU).
 pub struct MLP {
     pub w1: UnifiedLinear, // gate_proj
     pub w2: UnifiedLinear, // down_proj
@@ -235,10 +226,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct TransformerBlock {
     pub attention: Attention,
     pub feed_forward: MLP,
@@ -290,10 +278,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// InternLM2 Model
-// ============================================================================
-
+// InternLM2 Model.
 pub struct InternLM2Model {
     pub tok_embeddings: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -389,10 +374,7 @@ impl InternLM2Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -400,10 +382,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for InternLM2Model {
     fn forward(
         &self,

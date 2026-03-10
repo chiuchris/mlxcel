@@ -18,10 +18,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 use crate::vision::config::VisionConfig;
 
-// ============================================================================
-// Vision MLP
-// ============================================================================
-
+// Vision MLP.
 struct VisionMLP {
     fc1: UnifiedLinear,
     fc2: UnifiedLinear,
@@ -48,10 +45,7 @@ impl VisionMLP {
     }
 }
 
-// ============================================================================
-// Vision Attention
-// ============================================================================
-
+// Vision Attention.
 struct VisionAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -134,10 +128,7 @@ impl VisionAttention {
     }
 }
 
-// ============================================================================
-// Encoder Layer
-// ============================================================================
-
+// Encoder Layer.
 struct EncoderLayer {
     self_attn: VisionAttention,
     layer_norm1: LayerNorm,
@@ -193,10 +184,7 @@ impl EncoderLayer {
     }
 }
 
-// ============================================================================
-// Vision Embeddings (Conv2d patch embedding + position embedding + optional CLS)
-// ============================================================================
-
+// Vision Embeddings (Conv2d patch embedding + position embedding + optional CLS).
 struct VisionEmbeddings {
     patch_embedding_weight: UniquePtr<MlxArray>,
     patch_embedding_bias: Option<UniquePtr<MlxArray>>,
@@ -324,10 +312,7 @@ impl VisionEmbeddings {
     }
 }
 
-// ============================================================================
-// SigLIP/CLIP Vision Model
-// ============================================================================
-
+// SigLIP/CLIP Vision Model.
 pub struct SigLipVisionModel {
     embeddings: VisionEmbeddings,
     layers: Vec<EncoderLayer>,
@@ -479,10 +464,7 @@ impl SigLipVisionModel {
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
+// Helper functions.
 fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerNorm, String> {
     let weight_key = format!("{}.weight", prefix);
     let bias_key = format!("{}.bias", prefix);

@@ -13,10 +13,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Config
-// =============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExaOneConfig {
     pub model_type: String,
@@ -84,10 +81,7 @@ impl ExaOneConfig {
     }
 }
 
-// =============================================================================
-// Attention
-// =============================================================================
-
+// Attention.
 pub struct ExaOneAttention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -220,10 +214,7 @@ impl ExaOneAttention {
     }
 }
 
-// =============================================================================
-// MLP
-// =============================================================================
-
+// MLP.
 pub struct ExaOneMLP {
     pub c_fc_0: UnifiedLinear, // gate_proj equivalent
     pub c_fc_1: UnifiedLinear, // up_proj equivalent
@@ -272,10 +263,7 @@ impl ExaOneMLP {
     }
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 pub struct ExaOneDecoderLayer {
     pub attn: ExaOneAttention,
     pub mlp: ExaOneMLP,
@@ -327,10 +315,7 @@ impl ExaOneDecoderLayer {
     }
 }
 
-// =============================================================================
-// Model
-// =============================================================================
-
+// Model.
 pub struct ExaOneModel {
     pub wte: UnifiedEmbedding,      // embed_tokens equivalent
     pub h: Vec<ExaOneDecoderLayer>, // layers equivalent
@@ -423,10 +408,7 @@ impl ExaOneModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -434,10 +416,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for ExaOneModel {
     fn forward(
         &self,

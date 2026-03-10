@@ -8,10 +8,7 @@ use crate::ffi;
 use crate::ffi::MlxArray;
 use cxx::UniquePtr;
 
-// =============================================================================
-// Array Slicing Utilities
-// =============================================================================
-
+// Array Slicing Utilities.
 /// Slice an array along a specified axis.
 ///
 /// # Arguments
@@ -64,10 +61,7 @@ pub fn slice_axis(x: &MlxArray, axis: i32, start: i32, end: i32) -> UniquePtr<Ml
     ffi::slice(x, &starts, &stops)
 }
 
-// =============================================================================
-// Attention Mask Utilities
-// =============================================================================
-
+// Attention Mask Utilities.
 /// Create a causal attention mask.
 ///
 /// Creates a lower triangular mask of shape [size, size + offset] where:
@@ -132,10 +126,7 @@ pub fn create_causal_mask_with_window(
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
 }
 
-// =============================================================================
-// KV Cache Utilities
-// =============================================================================
-
+// KV Cache Utilities.
 /// Repeat key/value tensors for grouped-query attention.
 ///
 /// When n_kv_heads < n_heads, we need to repeat K and V to match Q dimensions.
@@ -167,10 +158,7 @@ pub fn repeat_kv(x: &MlxArray, n_rep: i32) -> UniquePtr<MlxArray> {
     ffi::reshape(&x_broad, &[batch, n_kv_heads * n_rep, seq_len, head_dim])
 }
 
-// =============================================================================
-// Activation Functions
-// =============================================================================
-
+// Activation Functions.
 /// SiLU (Swish) activation: x * sigmoid(x)
 #[inline]
 pub fn silu(x: &MlxArray) -> UniquePtr<MlxArray> {
@@ -266,10 +254,7 @@ pub fn gegelu(x: &MlxArray, limit: f32) -> UniquePtr<MlxArray> {
     ffi::multiply(&out_gelu, &linear_plus_one)
 }
 
-// =============================================================================
-// Gemma-specific Functions
-// =============================================================================
-
+// Gemma-specific Functions.
 /// Softcap function for Gemma 2/3 attention and logits.
 ///
 /// Applies tanh(x / cap) * cap to prevent extreme values.
@@ -327,10 +312,7 @@ pub fn clip_residual_f16(x: &MlxArray, y: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::astype(&clipped, dtype::FLOAT16)
 }
 
-// =============================================================================
-// Shape Utilities
-// =============================================================================
-
+// Shape Utilities.
 /// Concatenate two arrays along the specified axis.
 #[inline]
 pub fn concatenate(a: &MlxArray, b: &MlxArray, axis: i32) -> UniquePtr<MlxArray> {

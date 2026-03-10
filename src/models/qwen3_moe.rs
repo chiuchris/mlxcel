@@ -17,10 +17,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -86,10 +83,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 pub enum SwitchLinear {
@@ -155,10 +149,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -273,10 +264,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Sparse MoE Block
-// ============================================================================
-
+// Sparse MoE Block.
 /// Qwen3 sparse mixture of experts layer
 pub struct SparseMoeBlock {
     pub router: UnifiedLinear,
@@ -345,10 +333,7 @@ impl SparseMoeBlock {
     }
 }
 
-// ============================================================================
-// Dense MLP
-// ============================================================================
-
+// Dense MLP.
 /// Dense MLP layer (used for mlp_only_layers)
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
@@ -395,10 +380,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Attention with Q/K Normalization
-// ============================================================================
-
+// Attention with Q/K Normalization.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -515,10 +497,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP Type Enum
-// ============================================================================
-
+// MLP Type Enum.
 /// MLP type selection based on decoder_sparse_step and mlp_only_layers
 pub enum MLPType {
     Dense(MLP),
@@ -534,10 +513,7 @@ impl MLPType {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct DecoderLayer {
     pub self_attn: Attention,
     pub mlp: MLPType,
@@ -610,10 +586,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// Qwen3 MoE Model
-// ============================================================================
-
+// Qwen3 MoE Model.
 pub struct Qwen3MoeModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<DecoderLayer>,
@@ -709,10 +682,7 @@ impl Qwen3MoeModel {
     }
 }
 
-// ============================================================================
-// MoE Implementation Details
-// ============================================================================
-
+// MoE Implementation Details.
 impl SparseMoeBlock {
     pub fn from_weights(
         weights: &WeightMap,
@@ -778,10 +748,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -789,10 +756,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Qwen3MoeModel {
     fn forward(
         &self,

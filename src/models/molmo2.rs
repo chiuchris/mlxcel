@@ -16,10 +16,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Molmo2TextConfig {
     #[serde(default = "default_model_type")]
@@ -105,10 +102,7 @@ impl Molmo2TextConfig {
     }
 }
 
-// ============================================================================
-// Molmo2 Embedding (base + new_embedding)
-// ============================================================================
-
+// Molmo2 Embedding (base + new_embedding).
 pub struct Molmo2Embedding {
     pub embedding: UniquePtr<MlxArray>, // [vocab_size, hidden_size]
     pub new_embedding: UniquePtr<MlxArray>, // [additional_vocab_size, hidden_size]
@@ -137,10 +131,7 @@ impl Molmo2Embedding {
     }
 }
 
-// ============================================================================
-// Molmo2 Attention (fused QKV + per-head QK norm)
-// ============================================================================
-
+// Molmo2 Attention (fused QKV + per-head QK norm).
 pub struct Molmo2Attention {
     pub att_proj: UnifiedLinear, // Fused QKV projection
     pub attn_out: UnifiedLinear, // Output projection
@@ -267,10 +258,7 @@ impl Molmo2Attention {
     }
 }
 
-// ============================================================================
-// Molmo2 MLP (fused SwiGLU)
-// ============================================================================
-
+// Molmo2 MLP (fused SwiGLU).
 pub struct Molmo2MLP {
     pub ff_proj: UnifiedLinear, // hidden → intermediate*2 (fused gate+up)
     pub ff_out: UnifiedLinear,  // intermediate → hidden
@@ -309,10 +297,7 @@ impl Molmo2MLP {
     }
 }
 
-// ============================================================================
-// Molmo2 Transformer Block (pre-norm)
-// ============================================================================
-
+// Molmo2 Transformer Block (pre-norm).
 pub struct Molmo2TransformerBlock {
     pub self_attn: Molmo2Attention,
     pub mlp: Molmo2MLP,
@@ -366,10 +351,7 @@ impl Molmo2TransformerBlock {
     }
 }
 
-// ============================================================================
-// Molmo2 Model
-// ============================================================================
-
+// Molmo2 Model.
 pub struct Molmo2Model {
     pub wte: Molmo2Embedding,
     pub blocks: Vec<Molmo2TransformerBlock>,
@@ -459,10 +441,7 @@ impl Molmo2Model {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Molmo2Model {
     fn forward(
         &self,
@@ -501,10 +480,7 @@ impl LanguageModel for Molmo2Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)

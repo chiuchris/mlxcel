@@ -104,7 +104,7 @@ impl SpeculativeGenerator {
             Vec::new()
         };
 
-        // ===== PREFILL PHASE =====
+        // PREFILL PHASE.
         let prefill_start = Instant::now();
 
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -134,7 +134,7 @@ impl SpeculativeGenerator {
             token_history.push(first_token);
         }
 
-        // ===== DECODE PHASE =====
+        // DECODE PHASE.
         let decode_start = Instant::now();
         let mut current_token = first_token;
         let mut done = false;

@@ -12,10 +12,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::cell::RefCell;
 
-// ============================================================================
-// Config
-// ============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen2VLConfig {
     pub hidden_size: usize,
@@ -93,10 +90,7 @@ impl Qwen2VLConfig {
     }
 }
 
-// ============================================================================
-// MRoPE (Multimodal Rotary Position Embedding)
-// ============================================================================
-
+// MRoPE (Multimodal Rotary Position Embedding).
 struct MRoPE {
     inv_freq: Vec<f32>,
     mrope_section: Vec<i32>,
@@ -246,10 +240,7 @@ fn rotate_half(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::concatenate(&neg_x2, &x1, ndim as i32 - 1)
 }
 
-// ============================================================================
-// Attention with MRoPE
-// ============================================================================
-
+// Attention with MRoPE.
 struct Attention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -384,10 +375,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (SwiGLU, same as standard Qwen2/Llama)
-// ============================================================================
-
+// MLP (SwiGLU, same as standard Qwen2/Llama).
 struct MLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -432,10 +420,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     attn: Attention,
     mlp: MLP,
@@ -490,10 +475,7 @@ fn load_rms_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<RMSNorm,
     Ok(RMSNorm::new(weight, eps))
 }
 
-// ============================================================================
-// Qwen2VLModel - Full language model
-// ============================================================================
-
+// Qwen2VLModel - Full language model.
 pub struct Qwen2VLModel {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -649,10 +631,7 @@ impl Qwen2VLModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl mlxcel_core::generate::LanguageModel for Qwen2VLModel {
     fn forward(
         &self,

@@ -19,10 +19,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Llama4VisionConfig {
     pub hidden_size: usize,
@@ -60,10 +57,7 @@ fn default_pixel_shuffle_ratio() -> f32 {
     0.5
 }
 
-// ============================================================================
-// UnfoldConvolution (im2col patch embedding)
-// ============================================================================
-
+// UnfoldConvolution (im2col patch embedding).
 /// im2col-based patch embedding: extract non-overlapping patches + linear projection
 ///
 /// Input [B, C, H, W] -> extract patches -> [B, num_patches, C*P*P] -> linear -> [B, num_patches, hidden]
@@ -104,10 +98,7 @@ impl UnfoldConvolution {
     }
 }
 
-// ============================================================================
-// Vision RoPE (2D coordinate-based)
-// ============================================================================
-
+// Vision RoPE (2D coordinate-based).
 /// Precomputed 2D rotary position embeddings for vision encoder
 ///
 /// Creates cos/sin frequency pairs from 2D (x, y) patch coordinates.
@@ -317,10 +308,7 @@ fn apply_vision_rope(
     (q_out, k_out)
 }
 
-// ============================================================================
-// Vision Attention
-// ============================================================================
-
+// Vision Attention.
 /// Multi-head attention for Llama4 vision encoder
 /// Uses biases on all projections and vision RoPE
 struct VisionAttention {
@@ -414,10 +402,7 @@ impl VisionAttention {
     }
 }
 
-// ============================================================================
-// Vision MLP
-// ============================================================================
-
+// Vision MLP.
 /// Vision MLP: fc1 -> GELU(fast) -> fc2
 /// When is_projector=true, applies double GELU: fc1 -> GELU -> fc2 -> GELU
 struct VisionMLP {
@@ -456,10 +441,7 @@ impl VisionMLP {
     }
 }
 
-// ============================================================================
-// Vision Encoder Layer
-// ============================================================================
-
+// Vision Encoder Layer.
 /// Pre-norm transformer layer for vision encoder
 struct VisionEncoderLayer {
     self_attn: VisionAttention,
@@ -534,10 +516,7 @@ impl VisionEncoderLayer {
     }
 }
 
-// ============================================================================
-// PixelShuffleMLP (Vision Adapter)
-// ============================================================================
-
+// PixelShuffleMLP (Vision Adapter).
 /// Pixel shuffle + MLP adapter
 ///
 /// 1. pixel_shuffle: [B, 6400, 1280] -> [B, 1600, 5120]
@@ -606,10 +585,7 @@ fn pixel_shuffle(x: &MlxArray, ratio: f32) -> UniquePtr<MlxArray> {
     mlxcel_core::reshape(&x, &[batch_size, final_patches, new_c2])
 }
 
-// ============================================================================
-// VisionModel
-// ============================================================================
-
+// VisionModel.
 /// Llama 4 Vision Model (full encoder pipeline)
 pub struct Llama4VisionModel {
     patch_embedding: UnfoldConvolution,

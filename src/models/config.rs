@@ -4,10 +4,7 @@
 
 use serde::Deserialize;
 
-// =============================================================================
-// Common Default Functions
-// =============================================================================
-
+// Common Default Functions.
 /// Default RoPE theta (base frequency)
 pub fn default_rope_theta() -> f32 {
     10000.0
@@ -88,10 +85,7 @@ pub fn default_false() -> bool {
     false
 }
 
-// =============================================================================
-// MoE Defaults
-// =============================================================================
-
+// MoE Defaults.
 /// Default number of groups for grouped MoE
 pub fn default_n_group() -> usize {
     1
@@ -132,10 +126,7 @@ pub fn default_topk_method_group() -> String {
     "group_limited_greedy".to_string()
 }
 
-// =============================================================================
-// SSM Defaults
-// =============================================================================
-
+// SSM Defaults.
 /// Default Mamba d_conv (convolution size)
 pub fn default_mamba_d_conv() -> usize {
     4
@@ -156,10 +147,7 @@ pub fn default_time_step_limit() -> (f32, f32) {
     (0.0, f32::INFINITY)
 }
 
-// =============================================================================
-// RoPE Scaling Defaults
-// =============================================================================
-
+// RoPE Scaling Defaults.
 /// Default original max position embeddings for SuScaled RoPE
 pub fn default_original_max_position_embeddings() -> usize {
     4096
@@ -170,10 +158,7 @@ pub fn default_llama_4_scaling_beta() -> f32 {
     0.5
 }
 
-// =============================================================================
-// Custom Deserializers
-// =============================================================================
-
+// Custom Deserializers.
 /// Deserialize time_step_rank which can be "auto" or a number
 pub fn deserialize_time_step_rank<'de, D>(deserializer: D) -> Result<usize, D::Error>
 where
@@ -238,10 +223,7 @@ where
     deserialize_time_step_rank(deserializer)
 }
 
-// =============================================================================
-// Quantization Configuration
-// =============================================================================
-
+// Quantization Configuration.
 /// Common quantization arguments
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QuantizationArgs {
@@ -265,10 +247,7 @@ impl QuantizationArgs {
     }
 }
 
-// =============================================================================
-// RoPE Scaling Configuration
-// =============================================================================
-
+// RoPE Scaling Configuration.
 /// RoPE scaling configuration
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct RopeScaling {

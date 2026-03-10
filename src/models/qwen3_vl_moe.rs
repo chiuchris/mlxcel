@@ -22,10 +22,7 @@ use std::cell::RefCell;
 // Reuse MoE components from qwen3_moe
 use super::qwen3_moe::{SwitchGLU, SwitchLinear};
 
-// ============================================================================
-// Config
-// ============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen3VLMoeConfig {
     pub hidden_size: usize,
@@ -127,10 +124,7 @@ impl Qwen3VLMoeConfig {
     }
 }
 
-// ============================================================================
-// Interleaved MRoPE (same as Qwen3-VL)
-// ============================================================================
-
+// Interleaved MRoPE (same as Qwen3-VL).
 struct InterleavedMRoPE {
     inv_freq: Vec<f32>,
     mrope_section: Vec<i32>,
@@ -285,10 +279,7 @@ fn rotate_half(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::concatenate(&neg_x2, &x1, ndim as i32 - 1)
 }
 
-// ============================================================================
-// Attention with q_norm/k_norm and Interleaved MRoPE (same as Qwen3-VL)
-// ============================================================================
-
+// Attention with q_norm/k_norm and Interleaved MRoPE (same as Qwen3-VL).
 struct Attention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -444,10 +435,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// Dense MLP (SwiGLU)
-// ============================================================================
-
+// Dense MLP (SwiGLU).
 struct MLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -492,10 +480,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Sparse MoE Block (uses SwitchGLU/SwitchLinear from qwen3_moe)
-// ============================================================================
-
+// Sparse MoE Block (uses SwitchGLU/SwitchLinear from qwen3_moe).
 struct SparseMoeBlock {
     router: UnifiedLinear,
     experts: SwitchGLU,
@@ -627,10 +612,7 @@ fn load_switch_linear(
     }
 }
 
-// ============================================================================
-// MLP Type Enum
-// ============================================================================
-
+// MLP Type Enum.
 enum MLPType {
     Dense(MLP),
     MoE(SparseMoeBlock),
@@ -645,10 +627,7 @@ impl MLPType {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     attn: Attention,
     mlp: MLPType,
@@ -730,10 +709,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// Qwen3VLMoeModel - Full language model with DeepStack support
-// ============================================================================
-
+// Qwen3VLMoeModel - Full language model with DeepStack support.
 pub struct Qwen3VLMoeModel {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -983,10 +959,7 @@ impl Qwen3VLMoeModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl mlxcel_core::generate::LanguageModel for Qwen3VLMoeModel {
     fn forward(
         &self,

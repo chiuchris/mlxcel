@@ -12,10 +12,7 @@
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-// ============================================================================
-// Helpers
-// ============================================================================
-
+// Helpers.
 /// Round to nearest multiple of divisor (for MobileNet channel counts)
 fn make_divisible(v: f32, divisor: i32) -> i32 {
     let min_value = divisor;
@@ -79,10 +76,7 @@ fn sanitize_conv_weight(w: UniquePtr<MlxArray>) -> UniquePtr<MlxArray> {
     }
 }
 
-// ============================================================================
-// RMSNormAct2d — RMS normalization on channel axis + optional GELU
-// ============================================================================
-
+// RMSNormAct2d — RMS normalization on channel axis + optional GELU.
 /// RMS normalization operating on channel dimension (NHWC layout).
 /// Internally transposes to NCHW for channel-wise normalization.
 pub struct RMSNormAct2d {
@@ -150,10 +144,7 @@ impl RMSNormAct2d {
     }
 }
 
-// ============================================================================
-// Conv2d operations (regular and "same" padding)
-// ============================================================================
-
+// Conv2d operations (regular and "same" padding).
 /// Regular Conv2d layer with stored weights
 pub struct Conv2dLayer {
     pub weight: UniquePtr<MlxArray>,
@@ -262,10 +253,7 @@ impl Conv2dSame {
     }
 }
 
-// ============================================================================
-// ConvNormAct — Conv2d + RMSNormAct2d
-// ============================================================================
-
+// ConvNormAct — Conv2d + RMSNormAct2d.
 pub enum ConvType {
     Regular(Conv2dLayer),
     Same(Conv2dSame),
@@ -286,10 +274,7 @@ impl ConvNormAct {
     }
 }
 
-// ============================================================================
-// LayerScale2d — Element-wise scale
-// ============================================================================
-
+// LayerScale2d — Element-wise scale.
 pub struct LayerScale2d {
     pub gamma: UniquePtr<MlxArray>,
 }
@@ -305,10 +290,7 @@ impl LayerScale2d {
     }
 }
 
-// ============================================================================
-// EdgeResidual
-// ============================================================================
-
+// EdgeResidual.
 pub struct EdgeResidual {
     pub conv_exp: Conv2dSame,
     pub bn1: RMSNormAct2d,
@@ -336,10 +318,7 @@ impl EdgeResidual {
     }
 }
 
-// ============================================================================
-// UniversalInvertedResidual (UIR)
-// ============================================================================
-
+// UniversalInvertedResidual (UIR).
 pub struct UniversalInvertedResidual {
     pub dw_start: Option<ConvNormAct>,
     pub pw_exp: ConvNormAct,
@@ -377,10 +356,7 @@ impl UniversalInvertedResidual {
     }
 }
 
-// ============================================================================
-// MultiQueryAttention2d
-// ============================================================================
-
+// MultiQueryAttention2d.
 pub struct MultiQueryAttention2d {
     // Query projection: 1x1 conv
     pub query_proj: Conv2dLayer,
@@ -452,10 +428,7 @@ impl MultiQueryAttention2d {
     }
 }
 
-// ============================================================================
-// MobileAttention — norm → attention → layer_scale + skip
-// ============================================================================
-
+// MobileAttention — norm → attention → layer_scale + skip.
 pub struct MobileAttention {
     pub norm: RMSNormAct2d,
     pub attn: MultiQueryAttention2d,
@@ -483,10 +456,7 @@ impl MobileAttention {
     }
 }
 
-// ============================================================================
-// Block enum (replaces dyn trait)
-// ============================================================================
-
+// Block enum (replaces dyn trait).
 pub enum MobileNetBlock {
     EdgeRes(EdgeResidual),
     UIR(UniversalInvertedResidual),
@@ -503,10 +473,7 @@ impl MobileNetBlock {
     }
 }
 
-// ============================================================================
-// Multi-Scale Fusion Adapter (MSFA)
-// ============================================================================
-
+// Multi-Scale Fusion Adapter (MSFA).
 pub struct MSFA {
     pub ffn: UniversalInvertedResidual,
     pub norm: RMSNormAct2d,
@@ -596,10 +563,7 @@ fn nearest_upsample_nchw(x: &MlxArray, target_h: i32, target_w: i32) -> UniquePt
     mlxcel_core::reshape(&x, &[b, c, h * scale_h, w * scale_w])
 }
 
-// ============================================================================
-// VisionTower
-// ============================================================================
-
+// VisionTower.
 pub struct VisionTower {
     pub conv_stem: ConvNormAct,
     pub blocks: Vec<Vec<MobileNetBlock>>, // 4 stages
@@ -639,10 +603,7 @@ impl VisionTower {
     }
 }
 
-// ============================================================================
-// Gemma3nVisionModel — wraps VisionTower
-// ============================================================================
-
+// Gemma3nVisionModel — wraps VisionTower.
 pub struct Gemma3nVisionModel {
     pub tower: VisionTower,
 }
@@ -654,10 +615,7 @@ impl Gemma3nVisionModel {
     }
 }
 
-// ============================================================================
-// Architecture definition (gemma3n_mobilenet_def)
-// ============================================================================
-
+// Architecture definition (gemma3n_mobilenet_def).
 #[derive(Clone)]
 enum BlockDef {
     ER {
@@ -746,10 +704,7 @@ fn gemma3n_mobilenet_def() -> Vec<Vec<BlockDef>> {
     ]
 }
 
-// ============================================================================
-// Weight loading
-// ============================================================================
-
+// Weight loading.
 fn load_conv2d_regular(
     weights: &WeightMap,
     prefix: &str,

@@ -25,10 +25,7 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Qwen35Config {
     pub model_type: String,
@@ -198,10 +195,7 @@ impl Qwen35Config {
     }
 }
 
-// =============================================================================
-// GatedDeltaNet - Qwen3.5 variant with separate projections
-// =============================================================================
-
+// GatedDeltaNet - Qwen3.5 variant with separate projections.
 /// GatedDeltaNet for Qwen3.5 with separate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a
 #[allow(dead_code)]
 struct Qwen35GatedDeltaNet {
@@ -477,10 +471,7 @@ impl Qwen35GatedDeltaNet {
     }
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 /// Attention variant for Qwen3.5
 enum Qwen35AttentionVariant {
     FullAttention(Qwen3NextAttention),
@@ -591,10 +582,7 @@ impl Qwen35DecoderLayer {
     }
 }
 
-// =============================================================================
-// Qwen3.5 Model
-// =============================================================================
-
+// Qwen3.5 Model.
 pub struct Qwen35Model {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<Qwen35DecoderLayer>,
@@ -867,10 +855,7 @@ impl Qwen35Model {
     }
 }
 
-// =============================================================================
-// Weight Sanitization
-// =============================================================================
-
+// Weight Sanitization.
 pub fn sanitize_weights(mut weights: WeightMap, config: &Qwen35Config) -> WeightMap {
     // 1. Detect sanitization needs
     let has_mtp = weights.keys().any(|k| k.contains("mtp."));
@@ -1101,10 +1086,7 @@ pub fn sanitize_moe_weights(weights: WeightMap, config: &Qwen35Config) -> Weight
     sanitize_weights(final_weights, config)
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Qwen35Model {
     fn forward(
         &self,

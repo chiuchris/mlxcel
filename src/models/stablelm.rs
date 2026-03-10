@@ -12,10 +12,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -67,10 +64,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Q/K Normalization (LayerNorm per head)
-// ============================================================================
-
+// Q/K Normalization (LayerNorm per head).
 /// LayerNorm applied per head: [n_heads, head_dim]
 pub struct LayerNormPerHead {
     pub weight: UniquePtr<MlxArray>,
@@ -102,10 +96,7 @@ impl LayerNormPerHead {
     }
 }
 
-// ============================================================================
-// Attention with Partial RoPE and Q/K Normalization
-// ============================================================================
-
+// Attention with Partial RoPE and Q/K Normalization.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -254,10 +245,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP (SwiGLU)
-// ============================================================================
-
+// MLP (SwiGLU).
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -303,10 +291,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block (with optional parallel residual)
-// ============================================================================
-
+// Transformer Block (with optional parallel residual).
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MLP,
@@ -395,10 +380,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// StableLM Model
-// ============================================================================
-
+// StableLM Model.
 pub struct StableLMModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -491,10 +473,7 @@ impl StableLMModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for StableLMModel {
     fn forward(
         &self,

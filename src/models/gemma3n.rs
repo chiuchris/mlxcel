@@ -17,10 +17,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TextConfig {
     pub model_type: String,
@@ -110,10 +107,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
+// Helper functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -142,10 +136,7 @@ fn erfinv(x: f32) -> f32 {
     sign * ((term_a * term_a - term_b).sqrt() - term_a).sqrt()
 }
 
-// ============================================================================
-// RMSNoScale - RMSNorm without learnable scale (uses unit weight)
-// ============================================================================
-
+// RMSNoScale - RMSNorm without learnable scale (uses unit weight).
 pub struct RMSNoScale {
     pub eps: f32,
     pub unit_weight: UniquePtr<MlxArray>,
@@ -165,10 +156,7 @@ impl RMSNoScale {
     }
 }
 
-// ============================================================================
-// LAUREL (Learned Augmented Residual Layer)
-// ============================================================================
-
+// LAUREL (Learned Augmented Residual Layer).
 pub struct LaurelBlock {
     pub linear_left: UnifiedLinear,
     pub linear_right: UnifiedLinear,
@@ -223,10 +211,7 @@ impl LaurelBlock {
     }
 }
 
-// ============================================================================
-// AltUp (Alternating Updates)
-// ============================================================================
-
+// AltUp (Alternating Updates).
 pub struct AltUp {
     pub correct_output_scale: UniquePtr<MlxArray>,
     // correction_coefs and prediction_coefs are NOT quantized (small 4x4 and 16x4 layers)
@@ -411,10 +396,7 @@ impl AltUp {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Gemma3nAttention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -592,10 +574,7 @@ impl Gemma3nAttention {
     }
 }
 
-// ============================================================================
-// MLP with gelu_topk activation
-// ============================================================================
-
+// MLP with gelu_topk activation.
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -694,10 +673,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 pub struct DecoderLayer {
     pub self_attn: Gemma3nAttention,
     pub mlp: MLP,
@@ -875,10 +851,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// Language Model
-// ============================================================================
-
+// Language Model.
 pub struct Gemma3nLanguageModel {
     pub embed_tokens: UnifiedEmbedding,
     pub embed_tokens_per_layer: UnifiedEmbedding,
@@ -1313,10 +1286,7 @@ impl Gemma3nLanguageModel {
     }
 }
 
-// ============================================================================
-// Model
-// ============================================================================
-
+// Model.
 pub struct Gemma3nModel {
     pub language_model: Gemma3nLanguageModel,
     pub config: TextConfig,
@@ -1384,10 +1354,7 @@ impl LanguageModel for Gemma3nModel {
     }
 }
 
-// ============================================================================
-// Multimodal Embedder (for VLM)
-// ============================================================================
-
+// Multimodal Embedder (for VLM).
 /// Embeds soft tokens (vision features) into language model space.
 ///
 /// soft_embedding_norm → embedding_projection → post_projection_norm
@@ -1437,10 +1404,7 @@ impl Gemma3nMultimodalEmbedder {
     }
 }
 
-// ============================================================================
-// Helper functions
-// ============================================================================
-
+// Helper functions.
 /// Stack arrays along a new axis
 fn stack_arrays(arrays: &[UniquePtr<MlxArray>], axis: i32) -> UniquePtr<MlxArray> {
     let ptrs: Vec<*const MlxArray> = arrays

@@ -18,10 +18,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -140,10 +137,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with Partial RoPE and Optional Q/K Norm
-// ============================================================================
-
+// Attention with Partial RoPE and Optional Q/K Norm.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -292,10 +286,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// Dense MLP for first K layers
-// ============================================================================
-
+// Dense MLP for first K layers.
 pub struct DenseMLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -344,10 +335,7 @@ impl DenseMLP {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
@@ -457,10 +445,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with fused gate_up projection
-// ============================================================================
-
+// SwitchGLU: SwiGLU with fused gate_up projection.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 /// Uses fused gate_up projection that is split at intermediate_size
 pub struct SwitchGLU {
@@ -609,10 +594,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Shared Expert MLP
-// ============================================================================
-
+// Shared Expert MLP.
 /// Standard MLP with SwiGLU activation for shared expert
 pub struct SharedExpertMLP {
     pub gate_proj: UnifiedLinear,
@@ -662,10 +644,7 @@ impl SharedExpertMLP {
     }
 }
 
-// ============================================================================
-// MoE Block with Sigmoid Routing
-// ============================================================================
-
+// MoE Block with Sigmoid Routing.
 /// GLM4 MoE layer with sigmoid routing, grouped selection, and optional shared experts
 pub struct Glm4Moe {
     pub router_weight: UniquePtr<MlxArray>,
@@ -793,10 +772,7 @@ impl Glm4Moe {
     }
 }
 
-// ============================================================================
-// FFN Enum: Dense or MoE
-// ============================================================================
-
+// FFN Enum: Dense or MoE.
 pub enum FFN {
     Dense(DenseMLP),
     Moe(Glm4Moe),
@@ -811,10 +787,7 @@ impl FFN {
     }
 }
 
-// ============================================================================
-// Transformer Block with 4 RMSNorm layers
-// ============================================================================
-
+// Transformer Block with 4 RMSNorm layers.
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: FFN,
@@ -898,10 +871,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// GLM4 MoE Model
-// ============================================================================
-
+// GLM4 MoE Model.
 pub struct Glm4MoeModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -989,10 +959,7 @@ impl Glm4MoeModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -1000,10 +967,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Glm4MoeModel {
     fn forward(
         &self,
@@ -1028,10 +992,7 @@ impl LanguageModel for Glm4MoeModel {
     }
 }
 
-// ============================================================================
-// Tests
-// ============================================================================
-
+// Tests.
 #[cfg(test)]
 mod tests {
     use super::*;

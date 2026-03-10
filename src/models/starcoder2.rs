@@ -12,10 +12,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Config
-// =============================================================================
-
+// Config.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StarCoder2Config {
     pub model_type: String,
@@ -65,10 +62,7 @@ impl StarCoder2Config {
     }
 }
 
-// =============================================================================
-// Attention
-// =============================================================================
-
+// Attention.
 pub struct StarCoder2Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -185,10 +179,7 @@ impl StarCoder2Attention {
     }
 }
 
-// =============================================================================
-// MLP
-// =============================================================================
-
+// MLP.
 pub struct StarCoder2MLP {
     pub c_fc: UnifiedLinear,
     pub c_proj: UnifiedLinear,
@@ -226,10 +217,7 @@ impl StarCoder2MLP {
     }
 }
 
-// =============================================================================
-// Transformer Block
-// =============================================================================
-
+// Transformer Block.
 pub struct StarCoder2TransformerBlock {
     pub self_attn: StarCoder2Attention,
     pub mlp: StarCoder2MLP,
@@ -289,10 +277,7 @@ impl StarCoder2TransformerBlock {
     }
 }
 
-// =============================================================================
-// Model
-// =============================================================================
-
+// Model.
 pub struct StarCoder2Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<StarCoder2TransformerBlock>,
@@ -389,10 +374,7 @@ impl StarCoder2Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -400,10 +382,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for StarCoder2Model {
     fn forward(
         &self,

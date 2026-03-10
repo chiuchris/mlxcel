@@ -16,10 +16,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct OLMo3Config {
     pub model_type: String,
@@ -131,10 +128,7 @@ impl OLMo3Config {
     }
 }
 
-// ============================================================================
-// OLMo3 Attention (with Q/K norm and optional sliding window)
-// ============================================================================
-
+// OLMo3 Attention (with Q/K norm and optional sliding window).
 pub struct OLMo3Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -267,10 +261,7 @@ impl OLMo3Attention {
     }
 }
 
-// ============================================================================
-// MLP (SwiGLU)
-// ============================================================================
-
+// MLP (SwiGLU).
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -320,10 +311,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// OLMo3 Transformer Block (Post-norm architecture)
-// ============================================================================
-
+// OLMo3 Transformer Block (Post-norm architecture).
 pub struct OLMo3TransformerBlock {
     pub self_attn: OLMo3Attention,
     pub mlp: MLP,
@@ -388,10 +376,7 @@ impl OLMo3TransformerBlock {
     }
 }
 
-// ============================================================================
-// OLMo3 Model
-// ============================================================================
-
+// OLMo3 Model.
 pub struct OLMo3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<OLMo3TransformerBlock>,
@@ -528,10 +513,7 @@ impl OLMo3Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -539,10 +521,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for OLMo3Model {
     fn forward(
         &self,

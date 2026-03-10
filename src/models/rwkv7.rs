@@ -8,10 +8,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -63,10 +60,7 @@ impl Rwkv7Config {
     }
 }
 
-// =============================================================================
-// RWKV7 Cache
-// =============================================================================
-
+// RWKV7 Cache.
 pub struct Rwkv7Cache {
     pub token_shift_cache: Option<UniquePtr<MlxArray>>,
     pub state_cache: Option<UniquePtr<MlxArray>>,
@@ -89,10 +83,7 @@ impl Default for Rwkv7Cache {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
+// Helper Functions.
 /// Helper function: x + y * z
 fn addcmul(x: &MlxArray, y: &MlxArray, z: &MlxArray) -> UniquePtr<MlxArray> {
     let yz = mlxcel_core::multiply(y, z);
@@ -160,10 +151,7 @@ fn wkv7_step_ops(
     (y, new_state)
 }
 
-// =============================================================================
-// Per-head Layer Normalization
-// =============================================================================
-
+// Per-head Layer Normalization.
 struct LayerNormPerHead {
     weight: UniquePtr<MlxArray>,
     bias: UniquePtr<MlxArray>,
@@ -215,10 +203,7 @@ impl LayerNormPerHead {
     }
 }
 
-// =============================================================================
-// LoRA (Low-Rank Adaptation) Module
-// =============================================================================
-
+// LoRA (Low-Rank Adaptation) Module.
 struct LoRA {
     linear1: UnifiedLinear,
     linear2: UnifiedLinear,
@@ -258,10 +243,7 @@ impl LoRA {
     }
 }
 
-// =============================================================================
-// RWKV7 Channel Mixing (FFN)
-// =============================================================================
-
+// RWKV7 Channel Mixing (FFN).
 struct Rwkv7ChannelMixing {
     key: UnifiedLinear,
     value: UnifiedLinear,
@@ -321,10 +303,7 @@ impl Rwkv7ChannelMixing {
     }
 }
 
-// =============================================================================
-// RWKV7 Time Mixing (main recurrent component)
-// =============================================================================
-
+// RWKV7 Time Mixing (main recurrent component).
 #[allow(dead_code)]
 struct Rwkv7TimeMixing {
     layer_idx: usize,
@@ -766,10 +745,7 @@ impl Rwkv7TimeMixing {
     }
 }
 
-// =============================================================================
-// RWKV7 Layer
-// =============================================================================
-
+// RWKV7 Layer.
 struct Rwkv7Layer {
     layer_idx: usize,
     pre_norm: Option<RMSNorm>,
@@ -852,10 +828,7 @@ impl Rwkv7Layer {
     }
 }
 
-// =============================================================================
-// RWKV7 Model
-// =============================================================================
-
+// RWKV7 Model.
 struct Rwkv7Model {
     embeddings: UnifiedEmbedding,
     layers: Vec<Rwkv7Layer>,
@@ -920,10 +893,7 @@ impl Rwkv7Model {
     }
 }
 
-// =============================================================================
-// Full RWKV7 Language Model
-// =============================================================================
-
+// Full RWKV7 Language Model.
 #[allow(dead_code)]
 pub struct Rwkv7 {
     config: Rwkv7Config,

@@ -11,10 +11,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -97,10 +94,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Phi3 Attention (with fused QKV)
-// ============================================================================
-
+// Phi3 Attention (with fused QKV).
 pub struct Phi3Attention {
     // Phi3 uses fused QKV projection: outputs [Q, K, V] concatenated
     pub qkv_proj: UnifiedLinear,
@@ -212,10 +206,7 @@ impl Phi3Attention {
     }
 }
 
-// ============================================================================
-// Phi3 MLP (with fused gate_up)
-// ============================================================================
-
+// Phi3 MLP (with fused gate_up).
 pub struct Phi3MLP {
     // Fused gate_up projection: outputs [gate, up] concatenated
     pub gate_up_proj: UnifiedLinear,
@@ -267,10 +258,7 @@ impl Phi3MLP {
     }
 }
 
-// ============================================================================
-// Phi3 Transformer Block
-// ============================================================================
-
+// Phi3 Transformer Block.
 pub struct Phi3TransformerBlock {
     pub self_attn: Phi3Attention,
     pub mlp: Phi3MLP,
@@ -326,10 +314,7 @@ impl Phi3TransformerBlock {
     }
 }
 
-// ============================================================================
-// Phi3 Model
-// ============================================================================
-
+// Phi3 Model.
 pub struct Phi3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<Phi3TransformerBlock>,
@@ -422,10 +407,7 @@ impl Phi3Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -433,10 +415,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Phi3Model {
     fn forward(
         &self,

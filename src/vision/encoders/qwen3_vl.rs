@@ -76,10 +76,7 @@ fn default_num_position_embeddings() -> usize {
     2304
 }
 
-// ============================================================================
-// Helper: load LayerNorm from weights
-// ============================================================================
-
+// Helper: load LayerNorm from weights.
 fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerNorm, String> {
     let weight_key = format!("{}.weight", prefix);
     let bias_key = format!("{}.bias", prefix);
@@ -93,10 +90,7 @@ fn load_layer_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<LayerN
     Ok(LayerNorm::new(weight, bias, eps))
 }
 
-// ============================================================================
-// PatchEmbed - Conv3d degenerated to Linear (same as Qwen2-VL/2.5-VL)
-// ============================================================================
-
+// PatchEmbed - Conv3d degenerated to Linear (same as Qwen2-VL/2.5-VL).
 struct PatchEmbed {
     proj_weight: UniquePtr<MlxArray>,
     proj_bias: Option<UniquePtr<MlxArray>>,
@@ -170,10 +164,7 @@ impl PatchEmbed {
     }
 }
 
-// ============================================================================
-// Learned Position Embeddings with Bilinear Interpolation
-// ============================================================================
-
+// Learned Position Embeddings with Bilinear Interpolation.
 struct PositionEmbedding {
     weight: UniquePtr<MlxArray>, // [num_position_embeddings, hidden_size]
     num_grid_per_side: i32,      // sqrt(num_position_embeddings)
@@ -339,10 +330,7 @@ impl PositionEmbedding {
     }
 }
 
-// ============================================================================
-// Vision Attention - fused QKV, same as Qwen2-VL
-// ============================================================================
-
+// Vision Attention - fused QKV, same as Qwen2-VL.
 struct VisionAttention {
     qkv: UnifiedLinear,
     proj: UnifiedLinear,
@@ -466,11 +454,8 @@ impl VisionAttention {
     }
 }
 
-// ============================================================================
-// Vision MLP - GELU (like Qwen2-VL, NOT SwiGLU like Qwen2.5-VL)
-// Weight keys: linear_fc1, linear_fc2 (not fc1/fc2 or gate_proj/up_proj/down_proj)
-// ============================================================================
-
+// Vision MLP - GELU (like Qwen2-VL, NOT SwiGLU like Qwen2.5-VL).
+// Weight keys: linear_fc1, linear_fc2 (not fc1/fc2 or gate_proj/up_proj/down_proj).
 struct VisionMLP {
     linear_fc1: UnifiedLinear,
     linear_fc2: UnifiedLinear,
@@ -501,10 +486,7 @@ impl VisionMLP {
     }
 }
 
-// ============================================================================
-// VisionBlock - LayerNorm + GELU MLP
-// ============================================================================
-
+// VisionBlock - LayerNorm + GELU MLP.
 struct VisionBlock {
     norm1: LayerNorm,
     norm2: LayerNorm,
@@ -543,15 +525,11 @@ impl VisionBlock {
     }
 }
 
-// ============================================================================
-// PatchMerger - LayerNorm + GELU MLP (projection to text hidden size)
-// Weight keys: norm, linear_fc1, linear_fc2 (not ln_q/mlp.0/mlp.2)
-//
+// PatchMerger - LayerNorm + GELU MLP (projection to text hidden size).
+// Weight keys: norm, linear_fc1, linear_fc2 (not ln_q/mlp.0/mlp.2).
 // Has use_postshuffle_norm parameter:
-// - Main merger: use_postshuffle_norm=false → norm on hidden_size, then reshape
-// - DeepStack mergers: use_postshuffle_norm=true → reshape first, then norm
-// ============================================================================
-
+// - Main merger: use_postshuffle_norm=false → norm on hidden_size, then reshape.
+// - DeepStack mergers: use_postshuffle_norm=true → reshape first, then norm.
 struct PatchMerger {
     norm: LayerNorm,
     linear_fc1: UnifiedLinear,
@@ -609,20 +587,14 @@ impl PatchMerger {
     }
 }
 
-// ============================================================================
-// Qwen3-VL Vision Encoder Output (includes deepstack features)
-// ============================================================================
-
+// Qwen3-VL Vision Encoder Output (includes deepstack features).
 /// Output from Qwen3-VL vision encoder including DeepStack features
 pub struct Qwen3VLVisionEncoderOutput {
     pub hidden_states: UniquePtr<MlxArray>,
     pub deepstack_features: Vec<UniquePtr<MlxArray>>,
 }
 
-// ============================================================================
-// Qwen3-VL Vision Encoder
-// ============================================================================
-
+// Qwen3-VL Vision Encoder.
 /// Qwen3-VL Vision Model with learned position embeddings and DeepStack
 ///
 /// Used by: Qwen3-VL

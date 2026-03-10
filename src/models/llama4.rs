@@ -10,10 +10,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Llama4 Cache Types
-// ============================================================================
-
+// Llama4 Cache Types.
 /// Cache enum for Llama4's iGQA (Interleaved GQA) pattern
 /// MoE layers use ChunkedKVCache, dense layers use regular KVCache
 pub enum Llama4Cache {
@@ -60,10 +57,7 @@ impl Llama4Cache {
     }
 }
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct TextArgs {
     pub model_type: String,
@@ -133,10 +127,7 @@ impl TextArgs {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
@@ -218,10 +209,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -339,10 +327,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// MoE Layer
-// ============================================================================
-
+// MoE Layer.
 /// Mixture of Experts layer with shared expert
 pub struct MoE {
     pub router: UnifiedLinear,
@@ -405,10 +390,7 @@ impl MoE {
     }
 }
 
-// ============================================================================
-// MLP for dense layers
-// ============================================================================
-
+// MLP for dense layers.
 /// Standard MLP with SwiGLU activation
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
@@ -428,10 +410,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 /// Multi-head attention with RoPE and optional QK normalization
 pub struct CxxAttention {
     pub q_proj: UnifiedLinear,
@@ -798,10 +777,7 @@ impl CxxAttention {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub enum FeedForward {
     Dense(MLP),
     MoE(MoE),
@@ -912,10 +888,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Full Model
-// ============================================================================
-
+// Full Model.
 /// Llama 4 language model using mlx-cxx for MoE optimization
 pub struct Llama4CxxModel {
     pub embed_tokens: UnifiedEmbedding,
@@ -1380,10 +1353,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper functions for attention masks
-// ============================================================================
-
+// Helper functions for attention masks.
 /// Create chunked attention mask for iGQA (interleaved GQA)
 /// This mask limits attention to within chunk_size blocks while maintaining causality.
 ///
@@ -1461,10 +1431,7 @@ fn create_chunked_attention_mask(
     mlxcel_core::where_cond(&bool_mask, &zeros, &neg_inf)
 }
 
-// ============================================================================
-// Helper functions for weight loading
-// ============================================================================
-
+// Helper functions for weight loading.
 /// Get a copy of a weight from the weight map
 /// NOTE: We create a deep copy by doing identity operation + eval
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
@@ -1487,10 +1454,7 @@ fn load_quantized_linear(
     UnifiedLinear::from_weights(weights, prefix, args.group_size(), args.bits())
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Llama4CxxModel {
     fn forward(
         &self,
@@ -1515,10 +1479,7 @@ impl LanguageModel for Llama4CxxModel {
     }
 }
 
-// ============================================================================
-// Llama4Wrapper - Wrapper for iGQA with internal cache management
-// ============================================================================
-
+// Llama4Wrapper - Wrapper for iGQA with internal cache management.
 use std::cell::RefCell;
 
 /// Wrapper for Llama4CxxModel that implements LanguageModel trait

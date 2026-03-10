@@ -166,10 +166,7 @@ impl Molmo2Processor {
         format!("{}{}", lo_res, hi_res)
     }
 
-    // ========================================================================
-    // Internal helpers
-    // ========================================================================
-
+    // Internal helpers.
     fn select_tiling(&self, h: usize, w: usize) -> (usize, usize) {
         let patch_size = self.base_image_size.0; // crop size (378)
         let max_crops = self.max_crops;

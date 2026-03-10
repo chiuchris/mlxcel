@@ -12,10 +12,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -96,10 +93,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Llama 4 Attention Scaling
-// ============================================================================
-
+// Llama 4 Attention Scaling.
 /// Compute Llama 4 attention scale per position
 /// scale = 1 + beta * ln(1 + floor(pos / max_pos))
 fn get_llama4_attn_scale(
@@ -117,10 +111,7 @@ fn get_llama4_attn_scale(
         .collect()
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -238,10 +229,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// MLP
-// ============================================================================
-
+// MLP.
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -295,10 +283,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MLP,
@@ -367,10 +352,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Cache Interface
-// ============================================================================
-
+// Cache Interface.
 pub trait CacheInterface {
     fn offset(&self) -> i32;
     fn update_and_fetch(
@@ -422,10 +404,7 @@ impl Cache {
     }
 }
 
-// ============================================================================
-// Ministral3 Model
-// ============================================================================
-
+// Ministral3 Model.
 pub struct Ministral3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -625,10 +604,7 @@ impl Ministral3Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -636,10 +612,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 use std::cell::RefCell;
 
 /// Wrapper for Ministral3Model that implements LanguageModel trait

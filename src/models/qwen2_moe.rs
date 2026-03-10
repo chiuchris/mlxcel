@@ -14,10 +14,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -73,10 +70,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with Q, K, V bias
-// ============================================================================
-
+// Attention with Q, K, V bias.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -165,10 +159,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 /// Stacked linear layers for MoE experts
 /// Weights shape: [num_experts, output_dim, input_dim_packed]
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
@@ -245,10 +236,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 /// SwitchGLU: SwiGLU activation with stacked expert weights for MoE
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
@@ -366,10 +354,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Shared Expert MLP
-// ============================================================================
-
+// Shared Expert MLP.
 /// Standard MLP with SwiGLU activation for shared expert
 pub struct SharedExpertMLP {
     pub gate_proj: UnifiedLinear,
@@ -389,10 +374,7 @@ impl SharedExpertMLP {
     }
 }
 
-// ============================================================================
-// Sparse MoE Block with Shared Expert
-// ============================================================================
-
+// Sparse MoE Block with Shared Expert.
 /// Qwen2 MoE layer with sparse experts and shared expert
 pub struct SparseMoeBlock {
     pub router: UnifiedLinear,
@@ -467,10 +449,7 @@ impl SparseMoeBlock {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 /// Qwen2 MoE transformer block
 pub struct TransformerBlock {
     pub self_attn: Attention,
@@ -498,10 +477,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Full Model
-// ============================================================================
-
+// Full Model.
 /// Qwen2 MoE model
 pub struct Qwen2MoeModel {
     pub embed_tokens: UnifiedEmbedding,
@@ -840,10 +816,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// Helper functions for weight loading
-// ============================================================================
-
+// Helper functions for weight loading.
 /// Get a copy of a weight from the weight map
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
@@ -861,10 +834,7 @@ fn load_quantized_linear(
     UnifiedLinear::from_weights(weights, prefix, args.group_size(), args.bits())
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Qwen2MoeModel {
     fn forward(
         &self,

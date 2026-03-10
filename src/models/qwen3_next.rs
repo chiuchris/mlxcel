@@ -21,10 +21,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -128,10 +125,7 @@ impl Qwen3NextConfig {
     }
 }
 
-// =============================================================================
-// Cache Types
-// =============================================================================
-
+// Cache Types.
 /// Mixed cache type for Qwen3Next layers
 pub enum Qwen3NextCache {
     Attention(KVCache),
@@ -147,10 +141,7 @@ impl Qwen3NextCache {
     }
 }
 
-// =============================================================================
-// GatedDeltaNet - Linear Attention Layer
-// =============================================================================
-
+// GatedDeltaNet - Linear Attention Layer.
 /// GatedDeltaNet layer
 #[allow(dead_code)]
 pub(crate) struct GatedDeltaNet {
@@ -498,10 +489,7 @@ impl GatedDeltaNet {
     }
 }
 
-// =============================================================================
-// Attention with Gated Output
-// =============================================================================
-
+// Attention with Gated Output.
 pub(crate) struct Qwen3NextAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -694,10 +682,7 @@ impl Qwen3NextAttention {
     }
 }
 
-// =============================================================================
-// MLP and MoE Layers
-// =============================================================================
-
+// MLP and MoE Layers.
 /// Dense MLP layer
 pub(crate) struct MLP {
     gate_proj: UnifiedLinear,
@@ -1042,10 +1027,7 @@ enum AttentionVariant {
     LinearAttention(GatedDeltaNet),
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 pub(crate) struct DecoderLayer {
     is_linear: bool,
     attention: AttentionVariant,
@@ -1139,10 +1121,7 @@ impl DecoderLayer {
     }
 }
 
-// =============================================================================
-// Qwen3Next Model
-// =============================================================================
-
+// Qwen3Next Model.
 pub struct Qwen3NextModel {
     pub embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -1323,10 +1302,7 @@ impl Qwen3NextModel {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Qwen3NextModel {
     fn forward(
         &self,

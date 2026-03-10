@@ -20,10 +20,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -111,10 +108,7 @@ impl GriffinConfig {
     }
 }
 
-// =============================================================================
-// Griffin Cache Types
-// =============================================================================
-
+// Griffin Cache Types.
 /// Cache for RGLRU (recurrent) blocks
 pub struct RGLRUCache {
     pub conv_cache: Option<UniquePtr<MlxArray>>,
@@ -142,10 +136,7 @@ pub enum GriffinLayerCache {
     Recurrent(RGLRUCache),
 }
 
-// =============================================================================
-// RNN Scan Operation
-// =============================================================================
-
+// RNN Scan Operation.
 /// RNN scan operation for recurrent computation.
 /// Implements the scan: y_t = a_t * y_{t-1} + x_t
 fn rnn_scan(
@@ -204,10 +195,7 @@ fn rnn_scan(
     }
 }
 
-// =============================================================================
-// RGLRU (Real-Gated Linear Recurrent Unit)
-// =============================================================================
-
+// RGLRU (Real-Gated Linear Recurrent Unit).
 struct RGLRU {
     width: usize,
     num_heads: usize,
@@ -304,10 +292,7 @@ impl RGLRU {
     }
 }
 
-// =============================================================================
-// Recurrent Block (RGLRU-based)
-// =============================================================================
-
+// Recurrent Block (RGLRU-based).
 struct RecurrentBlock {
     linear_y: UnifiedLinear,
     linear_x: UnifiedLinear,
@@ -388,10 +373,7 @@ impl RecurrentBlock {
     }
 }
 
-// =============================================================================
-// Local Attention Block (sliding window)
-// =============================================================================
-
+// Local Attention Block (sliding window).
 struct LocalAttentionBlock {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -507,10 +489,7 @@ impl LocalAttentionBlock {
     }
 }
 
-// =============================================================================
-// MLP Block (Gated)
-// =============================================================================
-
+// MLP Block (Gated).
 struct MLPBlock {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -529,19 +508,13 @@ impl MLPBlock {
     }
 }
 
-// =============================================================================
-// Temporal Block Enum
-// =============================================================================
-
+// Temporal Block Enum.
 enum TemporalBlock {
     Recurrent(RecurrentBlock),
     Attention(LocalAttentionBlock),
 }
 
-// =============================================================================
-// Residual Block
-// =============================================================================
-
+// Residual Block.
 struct ResidualBlock {
     temporal_block: TemporalBlock,
     mlp_block: MLPBlock,
@@ -582,10 +555,7 @@ impl ResidualBlock {
     }
 }
 
-// =============================================================================
-// Griffin Model Backbone
-// =============================================================================
-
+// Griffin Model Backbone.
 struct GriffinBackbone {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<ResidualBlock>,
@@ -663,10 +633,7 @@ impl GriffinBackbone {
     }
 }
 
-// =============================================================================
-// Full Griffin Model
-// =============================================================================
-
+// Full Griffin Model.
 pub struct GriffinModel {
     config: GriffinConfig,
     model: GriffinBackbone,
@@ -1001,10 +968,7 @@ impl GriffinModel {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for GriffinModel {
     fn forward(
         &self,

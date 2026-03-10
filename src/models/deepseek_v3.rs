@@ -15,10 +15,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct DeepSeekV3Config {
     #[serde(default = "default_model_type")]
@@ -175,10 +172,7 @@ impl DeepSeekV3Config {
     }
 }
 
-// ============================================================================
-// DeepSeek-V3 MLA (Multi-head Latent Attention)
-// ============================================================================
-
+// DeepSeek-V3 MLA (Multi-head Latent Attention).
 pub struct DeepSeekV3Attention {
     // Q projection with LoRA
     pub q_a_proj: UnifiedLinear,
@@ -393,10 +387,7 @@ impl DeepSeekV3Attention {
     }
 }
 
-// ============================================================================
-// Dense MLP
-// ============================================================================
-
+// Dense MLP.
 pub struct DenseMLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -442,10 +433,7 @@ impl DenseMLP {
     }
 }
 
-// ============================================================================
-// MoE Gate
-// ============================================================================
-
+// MoE Gate.
 pub struct MoEGate {
     pub weight: UniquePtr<MlxArray>,
     pub e_score_correction_bias: UniquePtr<MlxArray>,
@@ -525,10 +513,7 @@ impl MoEGate {
     }
 }
 
-// ============================================================================
-// SwitchGLU (MoE expert layer using gather_qmm)
-// ============================================================================
-
+// SwitchGLU (MoE expert layer using gather_qmm).
 pub struct SwitchGLU {
     // Expert weights: [num_experts, output_dim, input_dim]
     pub gate_weight: UniquePtr<MlxArray>,
@@ -665,10 +650,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// MoE Block
-// ============================================================================
-
+// MoE Block.
 pub struct MoEBlock {
     pub gate: MoEGate,
     pub switch_mlp: SwitchGLU,
@@ -725,19 +707,13 @@ impl MoEBlock {
     }
 }
 
-// ============================================================================
-// MLP Type (Dense or MoE)
-// ============================================================================
-
+// MLP Type (Dense or MoE).
 pub enum MLPType {
     Dense(DenseMLP),
     MoE(MoEBlock),
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 pub struct DecoderLayer {
     pub self_attn: DeepSeekV3Attention,
     pub mlp: MLPType,
@@ -809,10 +785,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// DeepSeek-V3 Model
-// ============================================================================
-
+// DeepSeek-V3 Model.
 pub struct DeepSeekV3Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<DecoderLayer>,
@@ -1037,10 +1010,7 @@ impl DeepSeekV3Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -1048,10 +1018,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for DeepSeekV3Model {
     fn forward(
         &self,

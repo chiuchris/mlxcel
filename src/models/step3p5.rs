@@ -18,10 +18,7 @@ use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Step3p5Config {
     #[serde(default = "default_model_type")]
@@ -259,10 +256,7 @@ fn parse_eos_token_ids(config: &serde_json::Value) -> Vec<i32> {
     vec![2] // Default EOS
 }
 
-// ============================================================================
-// Clamped SwiGLU activation
-// ============================================================================
-
+// Clamped SwiGLU activation.
 /// clip(silu(gate), max=limit) * clip(x, -limit, limit)
 fn clamped_swiglu(x: &MlxArray, gate: &MlxArray, limit: f32) -> UniquePtr<MlxArray> {
     let silu_gate = mlxcel_core::silu(gate);
@@ -273,10 +267,7 @@ fn clamped_swiglu(x: &MlxArray, gate: &MlxArray, limit: f32) -> UniquePtr<MlxArr
     mlxcel_core::multiply(&clamped_gate, &clamped_x)
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Step3p5Attention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -416,10 +407,7 @@ impl Step3p5Attention {
     }
 }
 
-// ============================================================================
-// Dense MLP (with optional clamped SwiGLU)
-// ============================================================================
-
+// Dense MLP (with optional clamped SwiGLU).
 pub struct Step3p5MLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -480,10 +468,7 @@ impl Step3p5MLP {
     }
 }
 
-// ============================================================================
-// MoE Gate (sigmoid-based with router_bias)
-// ============================================================================
-
+// MoE Gate (sigmoid-based with router_bias).
 pub struct Step3p5MoEGate {
     gate: UnifiedLinear,
     router_bias: UniquePtr<MlxArray>,
@@ -555,10 +540,7 @@ impl Step3p5MoEGate {
     }
 }
 
-// ============================================================================
-// SwitchGLU (MoE experts with optional clamped activation)
-// ============================================================================
-
+// SwitchGLU (MoE experts with optional clamped activation).
 pub struct Step3p5SwitchGLU {
     gate_weight: UniquePtr<MlxArray>,
     gate_scales: UniquePtr<MlxArray>,
@@ -691,10 +673,7 @@ impl Step3p5SwitchGLU {
     }
 }
 
-// ============================================================================
-// MoE Block
-// ============================================================================
-
+// MoE Block.
 pub struct Step3p5MoE {
     gate: Step3p5MoEGate,
     switch_mlp: Step3p5SwitchGLU,
@@ -767,19 +746,13 @@ impl Step3p5MoE {
     }
 }
 
-// ============================================================================
-// MLP Type (Dense or MoE)
-// ============================================================================
-
+// MLP Type (Dense or MoE).
 pub enum MLPType {
     Dense(Step3p5MLP),
     MoE(Step3p5MoE),
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 pub struct Step3p5DecoderLayer {
     self_attn: Step3p5Attention,
     mlp: MLPType,
@@ -864,10 +837,7 @@ impl Step3p5DecoderLayer {
     }
 }
 
-// ============================================================================
-// Step3p5 Model
-// ============================================================================
-
+// Step3p5 Model.
 pub struct Step3p5Model {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<Step3p5DecoderLayer>,
@@ -1054,10 +1024,7 @@ impl Step3p5Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -1065,10 +1032,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Step3p5Model {
     fn forward(
         &self,

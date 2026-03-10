@@ -15,10 +15,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -202,10 +199,7 @@ impl JambaConfig {
     }
 }
 
-// =============================================================================
-// Jamba Cache Types
-// =============================================================================
-
+// Jamba Cache Types.
 /// Cache for Mamba blocks (conv state + SSM state)
 pub struct JambaMambaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>,
@@ -242,10 +236,7 @@ impl JambaLayerCache {
     }
 }
 
-// =============================================================================
-// MLP (Non-MoE Feed Forward)
-// =============================================================================
-
+// MLP (Non-MoE Feed Forward).
 struct JambaMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -261,10 +252,7 @@ impl JambaMLP {
     }
 }
 
-// =============================================================================
-// SwitchLinear for MoE
-// =============================================================================
-
+// SwitchLinear for MoE.
 // Kept local: uses take+matmul (not gather_mm), different forward shape handling
 #[allow(dead_code)]
 enum SwitchLinear {
@@ -322,10 +310,7 @@ impl SwitchLinear {
     }
 }
 
-// =============================================================================
-// SwitchGLU (MoE FFN)
-// =============================================================================
-
+// SwitchGLU (MoE FFN).
 struct SwitchGLU {
     gate_proj: SwitchLinear,
     up_proj: SwitchLinear,
@@ -366,10 +351,7 @@ impl SwitchGLU {
     }
 }
 
-// =============================================================================
-// Sparse MoE Block
-// =============================================================================
-
+// Sparse MoE Block.
 struct JambaSparseMoeBlock {
     router: Linear,
     switch_mlp: SwitchGLU,
@@ -404,10 +386,7 @@ impl JambaSparseMoeBlock {
     }
 }
 
-// =============================================================================
-// Feed Forward Enum
-// =============================================================================
-
+// Feed Forward Enum.
 enum FeedForward {
     MLP(JambaMLP),
     MoE(JambaSparseMoeBlock),
@@ -422,10 +401,7 @@ impl FeedForward {
     }
 }
 
-// =============================================================================
-// Jamba Attention
-// =============================================================================
-
+// Jamba Attention.
 struct JambaAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -510,10 +486,7 @@ impl JambaAttention {
     }
 }
 
-// =============================================================================
-// Jamba Mamba Mixer
-// =============================================================================
-
+// Jamba Mamba Mixer.
 #[allow(dead_code)]
 struct JambaMambaMixer {
     hidden_size: usize,
@@ -721,19 +694,13 @@ impl JambaMambaMixer {
     }
 }
 
-// =============================================================================
-// Temporal Block Enum
-// =============================================================================
-
+// Temporal Block Enum.
 enum TemporalBlock {
     Attention(JambaAttention),
     Mamba(JambaMambaMixer),
 }
 
-// =============================================================================
-// Decoder Layer
-// =============================================================================
-
+// Decoder Layer.
 #[allow(dead_code)]
 struct JambaDecoderLayer {
     is_attn: bool,
@@ -770,10 +737,7 @@ impl JambaDecoderLayer {
     }
 }
 
-// =============================================================================
-// Jamba Model Backbone
-// =============================================================================
-
+// Jamba Model Backbone.
 struct JambaModelBackbone {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<JambaDecoderLayer>,
@@ -837,10 +801,7 @@ impl JambaModelBackbone {
     }
 }
 
-// =============================================================================
-// Full Jamba Model
-// =============================================================================
-
+// Full Jamba Model.
 use std::cell::RefCell;
 
 pub struct JambaModel {
@@ -1239,10 +1200,7 @@ fn load_linear(
     Ok(Linear::new(weight, bias))
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for JambaModel {
     fn forward(
         &self,

@@ -16,10 +16,7 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -105,10 +102,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// MLA Attention (Multi-head Latent Attention)
-// ============================================================================
-
+// MLA Attention (Multi-head Latent Attention).
 pub struct MlaAttention {
     // Q projection (LoRA compressed or direct)
     pub q_a_proj: Option<UnifiedLinear>,
@@ -348,10 +342,7 @@ impl MlaAttention {
     }
 }
 
-// ============================================================================
-// MLP
-// ============================================================================
-
+// MLP.
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -395,10 +386,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// SwitchLinear for MoE experts
-// ============================================================================
-
+// SwitchLinear for MoE experts.
 /// Stacked linear layers for MoE experts (Variant B: no num_experts field).
 /// Supports both quantized (gather_qmm) and non-quantized (gather_mm) forward paths.
 pub enum SwitchLinear {
@@ -488,10 +476,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU for MoE
-// ============================================================================
-
+// SwitchGLU for MoE.
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
     pub up_proj: SwitchLinear,
@@ -597,10 +582,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// MoE Layer
-// ============================================================================
-
+// MoE Layer.
 pub struct MoELayer {
     pub gate_weight: UniquePtr<MlxArray>,
     pub e_score_correction_bias: UniquePtr<MlxArray>,
@@ -725,10 +707,7 @@ impl MoELayer {
     }
 }
 
-// ============================================================================
-// FFN Enum
-// ============================================================================
-
+// FFN Enum.
 pub enum FFN {
     Dense(MLP),
     MoE(MoELayer),
@@ -743,10 +722,7 @@ impl FFN {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct TransformerBlock {
     pub self_attn: MlaAttention,
     pub mlp: FFN,
@@ -813,10 +789,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Model
-// ============================================================================
-
+// Model.
 pub struct Glm4MoeLiteModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -897,10 +870,7 @@ impl Glm4MoeLiteModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -908,10 +878,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Glm4MoeLiteModel {
     fn forward(
         &self,

@@ -13,10 +13,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -80,10 +77,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// Attention with fused QKV projection
-// ============================================================================
-
+// Attention with fused QKV projection.
 pub struct OlmoAttention {
     pub att_proj: UnifiedLinear, // Fused QKV projection
     pub attn_out: UnifiedLinear,
@@ -195,10 +189,7 @@ impl OlmoAttention {
     }
 }
 
-// ============================================================================
-// MLP with fused gate/up projection (SwiGLU)
-// ============================================================================
-
+// MLP with fused gate/up projection (SwiGLU).
 pub struct OlmoMLP {
     pub ff_proj: UnifiedLinear, // Fused gate+up projection
     pub ff_out: UnifiedLinear,
@@ -242,10 +233,7 @@ impl OlmoMLP {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct OlmoTransformerBlock {
     pub self_attn: OlmoAttention,
     pub mlp: OlmoMLP,
@@ -299,10 +287,7 @@ impl OlmoTransformerBlock {
     }
 }
 
-// ============================================================================
-// OLMo Model
-// ============================================================================
-
+// OLMo Model.
 pub struct OlmoModel {
     pub wte: Embedding,
     pub blocks: Vec<OlmoTransformerBlock>,
@@ -401,10 +386,7 @@ impl OlmoModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for OlmoModel {
     fn forward(
         &self,

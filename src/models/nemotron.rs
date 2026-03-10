@@ -17,10 +17,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -113,10 +110,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// NemotronLayerNorm1P: Uses (weight + 1) instead of just weight
-// ============================================================================
-
+// NemotronLayerNorm1P: Uses (weight + 1) instead of just weight.
 pub struct NemotronLayerNorm1P {
     pub weight: UniquePtr<MlxArray>,
     pub eps: f32,
@@ -151,10 +145,7 @@ impl NemotronLayerNorm1P {
     }
 }
 
-// ============================================================================
-// Partial RoPE Attention
-// ============================================================================
-
+// Partial RoPE Attention.
 pub struct NemotronAttention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -308,10 +299,7 @@ impl NemotronAttention {
     }
 }
 
-// ============================================================================
-// Simple MLP with relu_squared (no gating)
-// ============================================================================
-
+// Simple MLP with relu_squared (no gating).
 pub struct NemotronMLP {
     pub up_proj: UnifiedLinear,
     pub down_proj: UnifiedLinear,
@@ -346,10 +334,7 @@ impl NemotronMLP {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct NemotronBlock {
     pub self_attn: NemotronAttention,
     pub mlp: NemotronMLP,
@@ -406,10 +391,7 @@ impl NemotronBlock {
     }
 }
 
-// ============================================================================
-// Nemotron Model
-// ============================================================================
-
+// Nemotron Model.
 pub struct NemotronModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<NemotronBlock>,
@@ -501,10 +483,7 @@ impl NemotronModel {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for NemotronModel {
     fn forward(
         &self,

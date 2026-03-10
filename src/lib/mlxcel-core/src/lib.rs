@@ -15,10 +15,7 @@ mod ffi {
         /// Opaque wrapper for mlx::core::Stream
         type MlxStream;
 
-        // ====================================================================
-        // Stream functions
-        // ====================================================================
-
+        // Stream functions.
         /// Get the default stream
         fn default_stream() -> UniquePtr<MlxStream>;
 
@@ -28,10 +25,7 @@ mod ffi {
         /// Synchronize a stream
         fn synchronize_stream(stream: &MlxStream);
 
-        // ====================================================================
-        // Array factory functions
-        // ====================================================================
-
+        // Array factory functions.
         /// Create array filled with zeros
         fn zeros(shape: &[i32], dtype: i32) -> UniquePtr<MlxArray>;
 
@@ -80,10 +74,7 @@ mod ffi {
         /// Create half-precision array from raw bytes
         fn from_bytes_f16(data: &[u8], shape: &[i32], bfloat16: bool) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Array property accessors
-        // ====================================================================
-
+        // Array property accessors.
         /// Get the shape of an array
         fn array_shape(arr: &MlxArray) -> Vec<i32>;
 
@@ -102,10 +93,7 @@ mod ffi {
         /// Get the total size in bytes
         fn array_nbytes(arr: &MlxArray) -> usize;
 
-        // ====================================================================
-        // Scalar extraction
-        // ====================================================================
-
+        // Scalar extraction.
         /// Extract f32 scalar value
         fn item_f32(arr: &MlxArray) -> f32;
 
@@ -118,20 +106,14 @@ mod ffi {
         /// Extract bool scalar value
         fn item_bool(arr: &MlxArray) -> bool;
 
-        // ====================================================================
-        // Evaluation
-        // ====================================================================
-
+        // Evaluation.
         /// Evaluate an array
         fn eval(arr: &MlxArray);
 
         /// Evaluate multiple arrays at once
         unsafe fn eval_all(arrays: &[*const MlxArray]);
 
-        // ====================================================================
-        // Element-wise binary operations
-        // ====================================================================
-
+        // Element-wise binary operations.
         /// Element-wise addition
         fn add(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -153,10 +135,7 @@ mod ffi {
         /// Element-wise minimum
         fn minimum(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Element-wise unary operations
-        // ====================================================================
-
+        // Element-wise unary operations.
         /// Element-wise negation
         fn negative(a: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -280,10 +259,7 @@ mod ffi {
         /// Check if elements are positive infinity
         fn isposinf(a: &MlxArray) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Reduction operations
-        // ====================================================================
-
+        // Reduction operations.
         /// Sum all elements
         fn sum_all(a: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -338,10 +314,7 @@ mod ffi {
         /// Any element is true
         fn any_all(a: &MlxArray) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Matrix operations
-        // ====================================================================
-
+        // Matrix operations.
         /// Matrix multiplication
         fn matmul(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -354,10 +327,7 @@ mod ffi {
         /// Reshape array
         fn reshape(a: &MlxArray, shape: &[i32]) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Shape operations
-        // ====================================================================
-
+        // Shape operations.
         /// Expand dimensions at axis
         fn expand_dims(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -388,24 +358,15 @@ mod ffi {
         /// Extract diagonal from matrix
         fn diagonal(a: &MlxArray, offset: i32, axis1: i32, axis2: i32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Type conversion
-        // ====================================================================
-
+        // Type conversion.
         /// Convert array to specified dtype
         fn astype(a: &MlxArray, dtype: i32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Copy
-        // ====================================================================
-
+        // Copy.
         /// Copy array
         fn copy(a: &MlxArray) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // High-level operations for LLM inference
-        // ====================================================================
-
+        // High-level operations for LLM inference.
         /// Softmax along axis
         fn softmax(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -455,10 +416,7 @@ mod ffi {
         /// Random categorical sampling
         fn random_categorical(logits: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Transformer-specific high-level operations
-        // ====================================================================
-
+        // Transformer-specific high-level operations.
         /// Apply rotary embedding to input
         fn apply_rope(x: &MlxArray, cos: &MlxArray, sin: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -533,10 +491,7 @@ mod ffi {
             norm_eps: f32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Advanced indexing operations
-        // ====================================================================
-
+        // Advanced indexing operations.
         /// Take elements along axis using indices
         fn take(a: &MlxArray, indices: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -577,10 +532,7 @@ mod ffi {
         /// Create range of i32 values
         fn arange_i32(start: i32, stop: i32, step: i32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Logical operations
-        // ====================================================================
-
+        // Logical operations.
         /// Element-wise logical NOT
         fn logical_not(a: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -605,10 +557,7 @@ mod ffi {
         /// Not equal comparison
         fn not_equal(a: &MlxArray, b: &MlxArray) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Activation functions
-        // ====================================================================
-
+        // Activation functions.
         /// SiLU (Swish) activation: x * sigmoid(x)
         fn silu(a: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -624,10 +573,7 @@ mod ffi {
         /// Leaky ReLU activation
         fn leaky_relu(a: &MlxArray, negative_slope: f32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Sorting and searching
-        // ====================================================================
-
+        // Sorting and searching.
         /// Argsort along axis
         fn argsort(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -765,10 +711,7 @@ mod ffi {
             padding_w: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // MoE (Mixture of Experts) operations
-        // ====================================================================
-
+        // MoE (Mixture of Experts) operations.
         /// Gather matrix multiply for MoE
         /// sorted_indices: if true, lhs_indices are pre-sorted for better memory access
         unsafe fn gather_mm(
@@ -815,10 +758,7 @@ mod ffi {
             bits: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Embedding
-        // ====================================================================
-
+        // Embedding.
         /// Embedding lookup (same as take along axis 0)
         fn embedding(weight: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -832,10 +772,7 @@ mod ffi {
             bits: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Fast operations (using MLX fast kernels)
-        // ====================================================================
-
+        // Fast operations (using MLX fast kernels).
         /// Fast RoPE using MLX fast kernel
         fn fast_rope(
             x: &MlxArray,
@@ -902,10 +839,7 @@ mod ffi {
             apply_rope: bool,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Compiled operations (with kernel fusion)
-        // ====================================================================
-
+        // Compiled operations (with kernel fusion).
         /// Compiled MoE expert forward with quantized weights
         fn compiled_moe_expert_forward(
             x: &MlxArray,
@@ -922,10 +856,7 @@ mod ffi {
             bits: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Memory management
-        // ====================================================================
-
+        // Memory management.
         /// Clear memory cache
         fn clear_memory_cache();
 
@@ -953,10 +884,7 @@ mod ffi {
         /// Create new GPU stream
         fn new_gpu_stream() -> UniquePtr<MlxStream>;
 
-        // ====================================================================
-        // Optimized generation functions
-        // ====================================================================
-
+        // Optimized generation functions.
         /// Extract last token logits: logits[:, -1, :] -> [batch, vocab]
         /// Optimized for sampling during generation
         fn slice_last_logits(logits: &MlxArray) -> UniquePtr<MlxArray>;
@@ -993,10 +921,7 @@ mod ffi {
             min_p: f32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H
-        // ====================================================================
-
+        // SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H.
         /// Cumulative sum along axis
         fn cumsum(a: &MlxArray, axis: i32, reverse: bool, inclusive: bool) -> UniquePtr<MlxArray>;
 
@@ -1028,10 +953,7 @@ mod ffi {
         /// Swap axes (convenient for SSM attention)
         fn swap_axes(a: &MlxArray, axis1: i32, axis2: i32) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Core ops additions
-        // ====================================================================
-
+        // Core ops additions.
         /// Create identity matrix of size n x n
         fn identity(n: i32, dtype: i32) -> UniquePtr<MlxArray>;
 
@@ -1138,10 +1060,7 @@ mod ffi {
             dtype: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Convolution additions
-        // ====================================================================
-
+        // Convolution additions.
         /// 3D convolution
         fn conv3d(
             input: &MlxArray,
@@ -1203,17 +1122,11 @@ mod ffi {
             groups: i32,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Einsum
-        // ====================================================================
-
+        // Einsum.
         /// Einsum contraction
         unsafe fn einsum(subscripts: &str, operands: &[*const MlxArray]) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Linear algebra (linalg)
-        // ====================================================================
-
+        // Linear algebra (linalg).
         /// Vector/matrix norm along axis
         fn linalg_norm(a: &MlxArray, axis: i32, keepdims: bool) -> UniquePtr<MlxArray>;
 
@@ -1305,10 +1218,7 @@ mod ffi {
         /// Cholesky factor inverse
         fn linalg_cholesky_inv(a: &MlxArray, upper: bool) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // FFT
-        // ====================================================================
-
+        // FFT.
         /// 1D FFT with explicit n and axis
         fn fft(a: &MlxArray, n: i32, axis: i32) -> UniquePtr<MlxArray>;
 
@@ -1351,10 +1261,7 @@ mod ffi {
         /// Inverse FFT shift along axes
         fn ifftshift(a: &MlxArray, axes: &[i32]) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Random
-        // ====================================================================
-
+        // Random.
         /// Create a random key from seed
         fn random_key(seed: u64) -> UniquePtr<MlxArray>;
 
@@ -1435,10 +1342,7 @@ mod ffi {
             key: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        // ====================================================================
-        // Quantization additions
-        // ====================================================================
-
+        // Quantization additions.
         /// Quantize weights — quantized weights
         fn quantize_weights_w(w: &MlxArray, group_size: i32, bits: i32) -> UniquePtr<MlxArray>;
 

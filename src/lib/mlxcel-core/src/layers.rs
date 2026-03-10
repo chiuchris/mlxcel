@@ -36,10 +36,7 @@ impl QuantizedWeight {
     }
 }
 
-// =============================================================================
-// Embedding Layers
-// =============================================================================
-
+// Embedding Layers.
 /// Non-quantized embedding layer
 pub struct Embedding {
     pub weight: UniquePtr<MlxArray>,
@@ -213,10 +210,7 @@ impl UnifiedEmbedding {
     }
 }
 
-// =============================================================================
-// Cache Layers
-// =============================================================================
-
+// Cache Layers.
 /// KV Cache for attention layers
 ///
 /// Uses pre-allocated buffers with slice_update for O(1) per-token updates,
@@ -384,10 +378,7 @@ impl Default for KVCache {
     }
 }
 
-// =============================================================================
-// Rotating KV Cache (for sliding window attention)
-// =============================================================================
-
+// Rotating KV Cache (for sliding window attention).
 /// Rotating KV Cache for sliding window attention (e.g., Gemma 3, Ministral 3)
 /// Maintains a fixed-size circular buffer for keys/values
 pub struct RotatingKVCache {
@@ -660,10 +651,7 @@ impl Default for RotatingKVCache {
     }
 }
 
-// =============================================================================
-// Chunked KV Cache (for Llama 4 iGQA)
-// =============================================================================
-
+// Chunked KV Cache (for Llama 4 iGQA).
 /// Chunked KV Cache for Llama 4's iGQA (Interleaved GQA) attention
 /// Maintains a sliding window cache that trims from the front when exceeding chunk_size
 pub struct ChunkedKVCache {
@@ -1567,10 +1555,7 @@ impl Attention {
     }
 }
 
-// =============================================================================
-// MultiLinear Layer (for MLA attention: embed_q, unembed_out)
-// =============================================================================
-
+// MultiLinear Layer (for MLA attention: embed_q, unembed_out).
 /// MultiLinear layer for per-head linear projections.
 ///
 /// Weight shape: `[num_heads, output_dims, input_dims]`

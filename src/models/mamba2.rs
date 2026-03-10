@@ -9,10 +9,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -157,10 +154,7 @@ impl Mamba2Config {
     }
 }
 
-// =============================================================================
-// SSM Cache for Mamba2
-// =============================================================================
-
+// SSM Cache for Mamba2.
 pub struct Mamba2Cache {
     pub conv_state: Option<UniquePtr<MlxArray>>,
     pub ssm_state: Option<UniquePtr<MlxArray>>,
@@ -181,10 +175,7 @@ impl Default for Mamba2Cache {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
+// Helper Functions.
 /// Compute dt with bias and time step limits
 fn compute_dt(
     dt: &MlxArray,
@@ -382,10 +373,7 @@ fn ssm_attn(
     (y, current_state.unwrap())
 }
 
-// =============================================================================
-// Model Components
-// =============================================================================
-
+// Model Components.
 /// Gated RMS Normalization for Mamba2
 struct MambaRMSNormGated {
     weight: UniquePtr<MlxArray>,
@@ -613,10 +601,7 @@ impl ResidualBlock {
     }
 }
 
-// =============================================================================
-// Full Mamba2 Model
-// =============================================================================
-
+// Full Mamba2 Model.
 use std::cell::RefCell;
 
 pub struct Mamba2Model {
@@ -868,10 +853,7 @@ impl Mamba2Model {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 use mlxcel_core::layers::KVCache;
 
 impl LanguageModel for Mamba2Model {

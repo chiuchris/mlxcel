@@ -21,10 +21,7 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
     #[serde(alias = "type", alias = "rope_type")]
@@ -211,10 +208,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// MLA Attention (LoRA-style)
-// ============================================================================
-
+// MLA Attention (LoRA-style).
 fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
     if scale <= 1.0 {
         1.0
@@ -358,10 +352,7 @@ impl MLAAttention {
     }
 }
 
-// ============================================================================
-// MLP (Dense and MoE - reusing from V2)
-// ============================================================================
-
+// MLP (Dense and MoE - reusing from V2).
 struct DenseMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -548,10 +539,7 @@ impl MLPType {
     }
 }
 
-// ============================================================================
-// Decoder Layer
-// ============================================================================
-
+// Decoder Layer.
 struct DecoderLayer {
     self_attn: MLAAttention,
     mlp: MLPType,
@@ -576,10 +564,7 @@ impl DecoderLayer {
     }
 }
 
-// ============================================================================
-// DeepSeek V3.2 Model
-// ============================================================================
-
+// DeepSeek V3.2 Model.
 pub struct DeepSeekV32Model {
     embed_tokens: UnifiedEmbedding,
     layers: Vec<DecoderLayer>,
@@ -793,10 +778,7 @@ impl DeepSeekV32Model {
     }
 }
 
-// ============================================================================
-// Weight Loading Helpers
-// ============================================================================
-
+// Weight Loading Helpers.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -1067,10 +1049,7 @@ fn load_switch_linear(
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for DeepSeekV32Model {
     fn forward(
         &self,

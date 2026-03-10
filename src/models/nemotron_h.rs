@@ -18,10 +18,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 // Custom deserializer for hybrid_override_pattern which can be either:
 // - A string like "MEMEM*EMEMEM*..." (each char is a block type)
 // - A Vec<String> like ["M", "E", "M", ...]
@@ -226,10 +223,7 @@ impl NemotronHConfig {
     }
 }
 
-// =============================================================================
-// Block Types
-// =============================================================================
-
+// Block Types.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BlockType {
     Mamba,     // "M"
@@ -254,10 +248,7 @@ impl BlockType {
     }
 }
 
-// =============================================================================
-// Cache Types
-// =============================================================================
-
+// Cache Types.
 pub struct NemotronMambaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>,
     pub ssm_state: Option<UniquePtr<MlxArray>>,
@@ -292,10 +283,7 @@ impl NemotronLayerCache {
     }
 }
 
-// =============================================================================
-// MambaRMSNormGated - RMS norm with gating and group structure
-// =============================================================================
-
+// MambaRMSNormGated - RMS norm with gating and group structure.
 struct MambaRMSNormGated {
     weight: UniquePtr<MlxArray>,
     eps: f32,
@@ -333,10 +321,7 @@ impl MambaRMSNormGated {
     }
 }
 
-// =============================================================================
-// Mamba2 Mixer for Nemotron-H
-// =============================================================================
-
+// Mamba2 Mixer for Nemotron-H.
 struct NemotronHMamba2Mixer {
     num_heads: usize,
     #[allow(dead_code)]
@@ -662,10 +647,7 @@ fn segsum_nemotron(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::cumsum(&x_tril, -2, false, false)
 }
 
-// =============================================================================
-// Attention
-// =============================================================================
-
+// Attention.
 struct NemotronHAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -746,10 +728,7 @@ impl NemotronHAttention {
     }
 }
 
-// =============================================================================
-// MLP with relu^2 activation
-// =============================================================================
-
+// MLP with relu^2 activation.
 struct NemotronHMLP {
     up_proj: UnifiedLinear,
     down_proj: UnifiedLinear,
@@ -763,10 +742,7 @@ impl NemotronHMLP {
     }
 }
 
-// =============================================================================
-// QuantizedSwitchLinear and SwitchMLP for MoE (using gather_qmm)
-// =============================================================================
-
+// QuantizedSwitchLinear and SwitchMLP for MoE (using gather_qmm).
 // Kept local: uses weights.remove() (ownership), different naming (QuantizedSwitchLinear)
 enum QuantizedSwitchLinear {
     Quantized {
@@ -853,10 +829,7 @@ impl SwitchMLP {
     }
 }
 
-// =============================================================================
-// MoE Gate and Block
-// =============================================================================
-
+// MoE Gate and Block.
 struct NemotronHMoEGate {
     weight: UniquePtr<MlxArray>,
     e_score_correction_bias: UniquePtr<MlxArray>,
@@ -955,10 +928,7 @@ impl NemotronHMoE {
     }
 }
 
-// =============================================================================
-// Hybrid Block
-// =============================================================================
-
+// Hybrid Block.
 enum NemotronHMixer {
     Mamba(NemotronHMamba2Mixer),
     Attention(NemotronHAttention),
@@ -994,10 +964,7 @@ impl NemotronHBlock {
     }
 }
 
-// =============================================================================
-// Full Model
-// =============================================================================
-
+// Full Model.
 use std::cell::RefCell;
 
 pub struct NemotronHModel {
@@ -1460,10 +1427,7 @@ fn load_linear(
     Ok(Linear::new(weight, bias))
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for NemotronHModel {
     fn forward(
         &self,

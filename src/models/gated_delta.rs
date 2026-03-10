@@ -10,10 +10,7 @@
 use mlxcel_core::utils::{silu, softplus, stack_arrays};
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
-// =============================================================================
-// Cache
-// =============================================================================
-
+// Cache.
 /// Cache for GatedDeltaNet (linear attention) layers.
 /// Stores conv1d state and recurrent SSM state.
 ///
@@ -44,10 +41,7 @@ impl Default for GatedDeltaCache {
     }
 }
 
-// =============================================================================
-// Core Functions
-// =============================================================================
-
+// Core Functions.
 /// Compute gating values from A_log, a, and dt_bias.
 /// g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
@@ -285,10 +279,7 @@ pub fn gated_delta_update(
     gated_delta_ops(q, k, v, &g, &beta, state, mask)
 }
 
-// =============================================================================
-// RMSNorm with optional gating
-// =============================================================================
-
+// RMSNorm with optional gating.
 /// RMSNorm with optional SwiGLU gating (for GatedDeltaNet output).
 /// Gating: silu(gate) * rms_norm(x)
 ///

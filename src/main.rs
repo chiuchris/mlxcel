@@ -231,7 +231,7 @@ struct ServeArgs {
     #[arg(long = "no-warmup", overrides_with = "warmup", hide = true)]
     _no_warmup: bool,
 
-    // --- Default sampling parameters ---
+    // Default sampling parameters.
     /// Default sampling temperature
     #[arg(long = "temp", default_value_t = 0.8)]
     temp: f32,
@@ -268,7 +268,7 @@ struct ServeArgs {
     #[arg(long, default_value_t = 0.0)]
     frequency_penalty: f32,
 
-    // --- DRY sampling parameters ---
+    // DRY sampling parameters.
     /// DRY penalty multiplier (0.0 = disabled)
     #[arg(long, default_value_t = 0.0)]
     dry_multiplier: f32,
@@ -289,7 +289,7 @@ struct ServeArgs {
     #[arg(long, value_delimiter = ',')]
     dry_sequence_breakers: Vec<String>,
 
-    // --- Logging ---
+    // Logging.
     /// Enable verbose (debug) logging
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -302,7 +302,7 @@ struct ServeArgs {
     #[arg(long, env = "LLAMA_LOG_FILE", value_name = "PATH")]
     log_file: Option<PathBuf>,
 
-    // --- llama-server compatibility arguments (accepted but ignored) ---
+    // llama-server compatibility arguments (accepted but ignored).
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
     #[arg(long, hide = true)]
     _no_webui: bool,

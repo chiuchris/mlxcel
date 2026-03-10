@@ -16,10 +16,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 /// Cohere2 model configuration
 #[derive(Debug, Clone, Deserialize)]
 pub struct Cohere2Config {
@@ -110,10 +107,7 @@ impl Cohere2Config {
     }
 }
 
-// ============================================================================
-// Cohere2 Attention (with conditional RoPE)
-// ============================================================================
-
+// Cohere2 Attention (with conditional RoPE).
 pub struct Cohere2Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: UnifiedLinear,
@@ -230,10 +224,7 @@ impl Cohere2Attention {
     }
 }
 
-// ============================================================================
-// Cohere2 MLP
-// ============================================================================
-
+// Cohere2 MLP.
 pub struct Cohere2MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -282,10 +273,7 @@ impl Cohere2MLP {
     }
 }
 
-// ============================================================================
-// Cohere2 Transformer Block (parallel attention + MLP)
-// ============================================================================
-
+// Cohere2 Transformer Block (parallel attention + MLP).
 pub struct Cohere2TransformerBlock {
     pub self_attn: Cohere2Attention,
     pub mlp: Cohere2MLP,
@@ -342,10 +330,7 @@ impl Cohere2TransformerBlock {
     }
 }
 
-// ============================================================================
-// Cohere2 Model
-// ============================================================================
-
+// Cohere2 Model.
 pub struct Cohere2Model {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<Cohere2TransformerBlock>,
@@ -529,10 +514,7 @@ impl Cohere2Model {
     }
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for Cohere2Model {
     fn forward(
         &self,
@@ -574,10 +556,7 @@ impl LanguageModel for Cohere2Model {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)

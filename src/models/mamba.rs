@@ -9,10 +9,7 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate, dtype};
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
     pub group_size: i32,
@@ -105,10 +102,7 @@ impl MambaConfig {
     }
 }
 
-// =============================================================================
-// SSM Cache for Mamba
-// =============================================================================
-
+// SSM Cache for Mamba.
 pub struct MambaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>,
     pub ssm_state: Option<UniquePtr<MlxArray>>,
@@ -129,10 +123,7 @@ impl Default for MambaCache {
     }
 }
 
-// =============================================================================
-// Helper Functions
-// =============================================================================
-
+// Helper Functions.
 /// RMS normalization without learnable scale (for mixer_norm in falcon_mamba)
 fn rms_norm_no_scale(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray> {
     let x_sq = mlxcel_core::multiply(x, x);
@@ -143,10 +134,7 @@ fn rms_norm_no_scale(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray> {
     mlxcel_core::divide(x, &rms)
 }
 
-// =============================================================================
-// Model Components
-// =============================================================================
-
+// Model Components.
 /// Mamba SSM Block
 #[allow(dead_code)]
 pub struct MambaBlock {
@@ -366,10 +354,7 @@ impl ResidualBlock {
     }
 }
 
-// =============================================================================
-// Full Mamba Model
-// =============================================================================
-
+// Full Mamba Model.
 use std::cell::RefCell;
 
 #[allow(dead_code)]
@@ -612,10 +597,7 @@ impl MambaModel {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for MambaModel {
     fn forward(
         &self,

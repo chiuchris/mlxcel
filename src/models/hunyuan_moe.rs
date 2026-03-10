@@ -14,10 +14,7 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -203,10 +200,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// SwitchLinear: Stacked expert weights for MoE
-// ============================================================================
-
+// SwitchLinear: Stacked expert weights for MoE.
 pub enum SwitchLinear {
     Quantized {
         weight: UniquePtr<MlxArray>,
@@ -290,10 +284,7 @@ impl SwitchLinear {
     }
 }
 
-// ============================================================================
-// SwitchGLU: SwiGLU with stacked expert weights
-// ============================================================================
-
+// SwitchGLU: SwiGLU with stacked expert weights.
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
     pub up_proj: SwitchLinear,
@@ -410,10 +401,7 @@ impl SwitchGLU {
     }
 }
 
-// ============================================================================
-// Dense MLP (shared_mlp)
-// ============================================================================
-
+// Dense MLP (shared_mlp).
 pub struct MLP {
     pub gate_proj: UnifiedLinear,
     pub up_proj: UnifiedLinear,
@@ -457,10 +445,7 @@ impl MLP {
     }
 }
 
-// ============================================================================
-// Gate (Router)
-// ============================================================================
-
+// Gate (Router).
 pub struct Gate {
     pub wg: UnifiedLinear,
 }
@@ -481,10 +466,7 @@ impl Gate {
     }
 }
 
-// ============================================================================
-// MoE Block
-// ============================================================================
-
+// MoE Block.
 pub struct MoeBlock {
     pub shared_mlp: Option<MLP>,
     pub gate: Gate,
@@ -590,10 +572,7 @@ impl MoeBlock {
     }
 }
 
-// ============================================================================
-// Attention
-// ============================================================================
-
+// Attention.
 pub struct Attention {
     pub q_proj: UnifiedLinear,
     pub k_proj: Option<UnifiedLinear>,
@@ -794,10 +773,7 @@ impl Attention {
     }
 }
 
-// ============================================================================
-// Transformer Block
-// ============================================================================
-
+// Transformer Block.
 pub struct TransformerBlock {
     pub self_attn: Attention,
     pub mlp: MoeBlock,
@@ -859,10 +835,7 @@ impl TransformerBlock {
     }
 }
 
-// ============================================================================
-// Hunyuan MoE Model
-// ============================================================================
-
+// Hunyuan MoE Model.
 pub struct HunyuanMoeModel {
     pub embed_tokens: UnifiedEmbedding,
     pub layers: Vec<TransformerBlock>,
@@ -986,10 +959,7 @@ impl HunyuanMoeModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
@@ -997,10 +967,7 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// ============================================================================
-// LanguageModel trait implementation
-// ============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for HunyuanMoeModel {
     fn forward(
         &self,

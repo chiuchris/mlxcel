@@ -21,10 +21,7 @@ use mlxcel_core::{
 use serde::Deserialize;
 use std::path::Path;
 
-// =============================================================================
-// Configuration
-// =============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct RopeScaling {
     #[serde(alias = "type")]
@@ -181,10 +178,7 @@ fn ffn_mult_to_intermediate_size(ffn_mult: f32, n_embd: usize) -> usize {
     intermediate_size.div_ceil(256) * 256
 }
 
-// =============================================================================
-// NAS Attention - Standard GQA with RoPE
-// =============================================================================
-
+// NAS Attention - Standard GQA with RoPE.
 struct NASAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -279,10 +273,7 @@ impl NASAttention {
     }
 }
 
-// =============================================================================
-// NAS MLP - Gated MLP with configurable activation
-// =============================================================================
-
+// NAS MLP - Gated MLP with configurable activation.
 struct NASMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -308,10 +299,7 @@ impl NASMLP {
     }
 }
 
-// =============================================================================
-// Linear Replacement for no-op blocks
-// =============================================================================
-
+// Linear Replacement for no-op blocks.
 struct LinearReplacement {
     linear: UnifiedLinear,
 }
@@ -322,10 +310,7 @@ impl LinearReplacement {
     }
 }
 
-// =============================================================================
-// Attention and FFN Subblocks
-// =============================================================================
-
+// Attention and FFN Subblocks.
 enum AttentionSubblock {
     None,
     Linear(LinearReplacement),
@@ -338,10 +323,7 @@ enum FFNSubblock {
     MLP(NASMLP),
 }
 
-// =============================================================================
-// NAS Transformer Block with heterogeneous config
-// =============================================================================
-
+// NAS Transformer Block with heterogeneous config.
 struct NASTransformerBlock {
     input_layernorm: Option<RMSNorm>,
     self_attn: AttentionSubblock,
@@ -410,10 +392,7 @@ impl NASTransformerBlock {
     }
 }
 
-// =============================================================================
-// Full NAS Model
-// =============================================================================
-
+// Full NAS Model.
 pub struct NemotronNASModel {
     config: NemotronNASConfig,
     embeddings: UnifiedEmbedding,
@@ -637,10 +616,7 @@ impl NemotronNASModel {
     }
 }
 
-// =============================================================================
-// LanguageModel trait implementation
-// =============================================================================
-
+// LanguageModel trait implementation.
 impl LanguageModel for NemotronNASModel {
     fn forward(
         &self,

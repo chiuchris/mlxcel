@@ -15,10 +15,7 @@ use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
+// Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -209,10 +206,7 @@ impl ModelArgs {
     }
 }
 
-// ============================================================================
-// GLM MoE DSA Model (wraps DeepSeekV32Model)
-// ============================================================================
-
+// GLM MoE DSA Model (wraps DeepSeekV32Model).
 pub struct GlmMoeDsaModel {
     inner: DeepSeekV32Model,
 }

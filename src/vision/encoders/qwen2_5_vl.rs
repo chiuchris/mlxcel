@@ -84,10 +84,7 @@ fn default_fullatt_block_indexes() -> Vec<usize> {
     vec![7, 15, 23, 31]
 }
 
-// ============================================================================
-// RMSNorm for vision encoder
-// ============================================================================
-
+// RMSNorm for vision encoder.
 struct VisionRMSNorm {
     weight: UniquePtr<MlxArray>,
     eps: f32,
@@ -108,10 +105,7 @@ impl VisionRMSNorm {
     }
 }
 
-// ============================================================================
-// PatchEmbed - Conv3d degenerated to Linear (same as Qwen2-VL)
-// ============================================================================
-
+// PatchEmbed - Conv3d degenerated to Linear (same as Qwen2-VL).
 struct PatchEmbed {
     proj_weight: UniquePtr<MlxArray>,
     proj_bias: Option<UniquePtr<MlxArray>>,
@@ -186,10 +180,7 @@ impl PatchEmbed {
     }
 }
 
-// ============================================================================
-// Vision Attention - same as Qwen2-VL
-// ============================================================================
-
+// Vision Attention - same as Qwen2-VL.
 struct VisionAttention {
     qkv: UnifiedLinear,
     proj: UnifiedLinear,
@@ -313,10 +304,7 @@ impl VisionAttention {
     }
 }
 
-// ============================================================================
-// Vision MLP - SwiGLU (gate_proj/up_proj/down_proj with SiLU)
-// ============================================================================
-
+// Vision MLP - SwiGLU (gate_proj/up_proj/down_proj with SiLU).
 struct VisionMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -356,10 +344,7 @@ impl VisionMLP {
     }
 }
 
-// ============================================================================
-// VisionBlock - RMSNorm + SwiGLU MLP
-// ============================================================================
-
+// VisionBlock - RMSNorm + SwiGLU MLP.
 struct VisionBlock {
     norm1: VisionRMSNorm,
     norm2: VisionRMSNorm,
@@ -398,10 +383,7 @@ impl VisionBlock {
     }
 }
 
-// ============================================================================
-// PatchMerger - RMSNorm + GELU MLP (projection to text hidden size)
-// ============================================================================
-
+// PatchMerger - RMSNorm + GELU MLP (projection to text hidden size).
 struct PatchMerger {
     ln_q: VisionRMSNorm,
     mlp_0: UnifiedLinear,
@@ -436,10 +418,7 @@ impl PatchMerger {
     }
 }
 
-// ============================================================================
-// Qwen2.5-VL Vision Encoder
-// ============================================================================
-
+// Qwen2.5-VL Vision Encoder.
 /// Qwen2.5-VL Vision Model with windowed attention
 ///
 /// Used by: Qwen2.5-VL

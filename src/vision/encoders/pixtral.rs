@@ -20,10 +20,7 @@ use mlxcel_core::layers::{RMSNorm, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-// ============================================================================
-// 2D Rotary Position Embedding
-// ============================================================================
-
+// 2D Rotary Position Embedding.
 /// Precomputed 2D RoPE frequencies for vision patches
 ///
 /// Computes separate frequency components for height and width dimensions,
@@ -134,10 +131,7 @@ fn position_ids_in_meshgrid(
     ids
 }
 
-// ============================================================================
-// RoPE application (rotate_half pattern)
-// ============================================================================
-
+// RoPE application (rotate_half pattern).
 /// Apply rotary position embeddings to queries and keys
 /// q, k: [B, num_heads, L, head_dim]
 /// cos, sin: [L, head_dim] → expanded to [1, L, head_dim] for broadcasting
@@ -192,10 +186,7 @@ fn rotate_half(x: &MlxArray) -> UniquePtr<MlxArray> {
     mlxcel_core::concatenate(&neg_x2, &x1, ndim as i32 - 1)
 }
 
-// ============================================================================
-// Vision Attention (with 2D RoPE)
-// ============================================================================
-
+// Vision Attention (with 2D RoPE).
 struct PixtralAttention {
     q_proj: UnifiedLinear,
     k_proj: UnifiedLinear,
@@ -282,10 +273,7 @@ impl PixtralAttention {
     }
 }
 
-// ============================================================================
-// Vision MLP (SwiGLU)
-// ============================================================================
-
+// Vision MLP (SwiGLU).
 struct PixtralMLP {
     gate_proj: UnifiedLinear,
     up_proj: UnifiedLinear,
@@ -330,10 +318,7 @@ impl PixtralMLP {
     }
 }
 
-// ============================================================================
-// Encoder Layer
-// ============================================================================
-
+// Encoder Layer.
 struct PixtralEncoderLayer {
     attention: PixtralAttention,
     feed_forward: PixtralMLP,
@@ -398,10 +383,7 @@ impl PixtralEncoderLayer {
     }
 }
 
-// ============================================================================
-// Pixtral Vision Model
-// ============================================================================
-
+// Pixtral Vision Model.
 /// Pixtral vision encoder config (parsed from vision_config in config.json)
 pub struct PixtralVisionConfig {
     pub hidden_size: usize,
@@ -600,10 +582,7 @@ impl VisionEncoder for PixtralVisionModel {
     }
 }
 
-// ============================================================================
-// Block attention mask for multi-image batches
-// ============================================================================
-
+// Block attention mask for multi-image batches.
 /// Generate block-diagonal attention mask for multi-image batches
 /// Each image only attends to patches from the same image.
 /// Returns [1, 1, total_patches, total_patches]
@@ -630,10 +609,7 @@ fn generate_block_attention_mask(
     )
 }
 
-// ============================================================================
-// Helper: load RMSNorm from weights
-// ============================================================================
-
+// Helper: load RMSNorm from weights.
 fn load_rms_norm(weights: &WeightMap, prefix: &str, eps: f32) -> Result<RMSNorm, String> {
     let weight_key = format!("{}.weight", prefix);
     let weight = weights

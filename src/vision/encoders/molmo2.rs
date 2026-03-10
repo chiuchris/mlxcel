@@ -12,10 +12,7 @@ use mlxcel_core::layers::{LayerNorm, Linear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-// ============================================================================
-// ViT MLP
-// ============================================================================
-
+// ViT MLP.
 struct ViTMLP {
     w1: Linear,
     w2: Linear,
@@ -35,10 +32,7 @@ impl ViTMLP {
     }
 }
 
-// ============================================================================
-// ViT Multi-Head Dot Product Attention (supports cross-attention)
-// ============================================================================
-
+// ViT Multi-Head Dot Product Attention (supports cross-attention).
 struct ViTAttention {
     wq: Linear,
     wk: Linear,
@@ -155,10 +149,7 @@ impl ViTAttention {
     }
 }
 
-// ============================================================================
-// ViT Block
-// ============================================================================
-
+// ViT Block.
 struct Molmo2VisionBlock {
     attention: ViTAttention,
     feed_forward: ViTMLP,
@@ -222,10 +213,7 @@ impl Molmo2VisionBlock {
     }
 }
 
-// ============================================================================
-// Vision Transformer (returns all hidden states)
-// ============================================================================
-
+// Vision Transformer (returns all hidden states).
 struct Molmo2VisionTransformer {
     patch_embedding: Linear, // Linear, not Conv2d (patches already flattened)
     positional_embedding: UniquePtr<MlxArray>, // [image_num_pos, hidden_size]
@@ -318,10 +306,7 @@ impl Molmo2VisionTransformer {
     }
 }
 
-// ============================================================================
-// Image Projector MLP (SwiGLU)
-// ============================================================================
-
+// Image Projector MLP (SwiGLU).
 struct ImageProjectorMLP {
     w1: Linear,
     w2: Linear,
@@ -346,10 +331,7 @@ impl ImageProjectorMLP {
     }
 }
 
-// ============================================================================
-// Molmo2 Vision Model (ViT + Adapter)
-// ============================================================================
-
+// Molmo2 Vision Model (ViT + Adapter).
 pub struct Molmo2VisionModel {
     image_vit: Molmo2VisionTransformer,
     image_pooling_2d: ViTAttention,
@@ -627,10 +609,7 @@ impl Molmo2VisionModel {
     }
 }
 
-// ============================================================================
-// Helper Functions
-// ============================================================================
-
+// Helper Functions.
 fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
     weights
         .get(name)
