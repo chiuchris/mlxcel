@@ -1,7 +1,6 @@
-import os
+from pathlib import Path
 
-# Apache 2.0 license header in Rust-style comments
-APACHE_HEADER = """\
+PROJECT_HEADER = """\
 // Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
@@ -17,58 +16,74 @@ APACHE_HEADER = """\
 // limitations under the License.
 
 """
+PROJECT_COPYRIGHT_LINE = "// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin"
+TARGET_ROOTS = ("src", "examples", "tests")
+ALLOWED_SUFFIXES = {".rs", ".cpp", ".h"}
+SKIP_DIR_NAMES = {".git", "target", "__pycache__"}
+HEADER_SCAN_LINE_COUNT = 40
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
-def has_apache_header(content: str) -> bool:
-    """Check if the Apache license is already present in the file."""
-    return "Licensed under the Apache License, Version 2.0" in content
 
-def find_insert_index(lines: list[str]) -> int:
-    """
-    Determine the correct position to insert the license header.
-    Skip lines starting with #![...] or //!, which must stay at the top.
-    """
-    index = 0
-    while index < len(lines):
-        line = lines[index].strip()
-        if line.startswith("#!") or line.startswith("//!"):
-            index += 1
-        elif line == "":
-            index += 1  # Also skip leading empty lines
-        else:
-            break
-    return index
+def should_process_path(path: Path) -> bool:
+    """Return True when the file is part of our code surface."""
+    if path.suffix not in ALLOWED_SUFFIXES:
+        return False
+    if any(part in SKIP_DIR_NAMES for part in path.parts):
+        return False
+    return path.parts[0] in TARGET_ROOTS
 
-def insert_header_in_file(path: str):
-    """Insert the Apache license header into a given Rust file, if not already present."""
-    with open(path, 'r', encoding='utf-8') as f:
-        lines = f.readlines()
 
-    content = "".join(lines)
-    if has_apache_header(content):
-        print(f"✅ Already has header: {path}")
-        return
+def leading_header_window(content: str) -> str:
+    """Return the leading lines used to detect existing provenance."""
+    return "\n".join(content.splitlines()[:HEADER_SCAN_LINE_COUNT])
 
-    insert_index = find_insert_index(lines)
-    new_lines = lines[:insert_index] + [APACHE_HEADER] + lines[insert_index:]
 
-    with open(path, 'w', encoding='utf-8') as f:
-        f.writelines(new_lines)
+def has_existing_header(content: str) -> bool:
+    """Detect either our project header or another existing provenance header."""
+    leading = leading_header_window(content)
+    return any(
+        needle in leading
+        for needle in (
+            PROJECT_COPYRIGHT_LINE,
+            "Licensed under the Apache License, Version 2.0",
+            "SPDX-License-Identifier:",
+            "Copyright",
+        )
+    )
 
+
+def insert_header(content: str) -> str:
+    """Prepend the project header at the very top of the file."""
+    return PROJECT_HEADER + content.lstrip("\n")
+
+
+def insert_header_in_file(path: Path) -> bool:
+    """Insert the project header unless the file already has provenance metadata."""
+    content = path.read_text(encoding="utf-8")
+    if has_existing_header(content):
+        print(f"⏭️  Skipped existing header: {path}")
+        return False
+
+    path.write_text(insert_header(content), encoding="utf-8")
     print(f"📝 Header inserted: {path}")
+    return True
 
-def process_directory(root_dir: str):
-    """
-    Recursively find all `.rs` files under the given directory
-    and insert the license header where needed.
-    """
-    for root, dirs, files in os.walk(root_dir):
-        # Skip unnecessary directories
-        dirs[:] = [d for d in dirs if d not in ('target', '.git')]
-        for filename in files:
-            if filename.endswith('.rs'):
-                filepath = os.path.join(root, filename)
-                insert_header_in_file(filepath)
+
+def iter_target_files(repo_root: Path):
+    """Yield target Rust/C++ files under the repository roots we own."""
+    for root_name in TARGET_ROOTS:
+        root = repo_root / root_name
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if path.is_file() and should_process_path(path.relative_to(repo_root)):
+                yield path
+
+
+def main() -> None:
+    for path in iter_target_files(REPO_ROOT):
+        insert_header_in_file(path)
+
 
 if __name__ == "__main__":
-    target_dir = "."  # Start from the current directory
-    process_directory(target_dir)
+    main()
