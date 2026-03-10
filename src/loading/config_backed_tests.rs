@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::is_config_backed_model_type;
+use crate::model_metadata::has_config_backed_registration;
 use crate::models::ModelType;
 
 #[test]
@@ -27,4 +28,12 @@ fn config_backed_registry_excludes_special_and_vlm_models() {
     assert!(!is_config_backed_model_type(ModelType::Qwen35));
     assert!(!is_config_backed_model_type(ModelType::Gemma3n));
     assert!(!is_config_backed_model_type(ModelType::Qwen3VL));
+}
+
+#[test]
+fn config_backed_registry_is_driven_by_shared_registration_surface() {
+    assert!(has_config_backed_registration(ModelType::Llama4));
+    assert!(has_config_backed_registration(ModelType::Gemma3));
+    assert!(has_config_backed_registration(ModelType::Ministral3));
+    assert!(!has_config_backed_registration(ModelType::Mistral3));
 }

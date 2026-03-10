@@ -88,23 +88,23 @@ pub(crate) struct ModelLoadPolicy {
     pub(crate) weight_route: Option<WeightLoadRoute>,
 }
 
-macro_rules! for_each_model_descriptor {
+macro_rules! for_each_model_registration {
     ($macro:ident) => {
         $macro! {
-            Llama => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Llama4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Llama => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Llama3Model::load, args: models::llama3::ModelArgs, weight_builder: models::Llama3Model::from_weights, wrap: LoadedModel::Llama } };
+            Llama4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Llama4CxxModel::load, args: models::llama4::TextArgs, weight_builder: models::Llama4CxxModel::from_weights, wrap: |m| LoadedModel::Llama4(models::Llama4Wrapper::new(m)) } };
             Llama4VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Llama4 VLM cannot be loaded with LoRA adapters yet") };
-            Qwen2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Qwen3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Qwen3Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Qwen3Next => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Qwen2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen2Model::load, args: models::llama3::ModelArgs, weight_builder: models::Qwen2Model::from_weights, wrap: LoadedModel::Qwen2 } };
+            Qwen3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen3Model::load, args: models::qwen3::ModelArgs, weight_builder: models::Qwen3Model::from_weights, wrap: LoadedModel::Qwen3 } };
+            Qwen3Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen3MoeModel::load, args: models::qwen3_moe::ModelArgs, weight_builder: models::Qwen3MoeModel::from_weights, wrap: LoadedModel::Qwen3Moe } };
+            Qwen3Next => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen3NextModel::load, args: models::qwen3_next::Qwen3NextConfig, weight_builder: models::Qwen3NextModel::from_weights, wrap: LoadedModel::Qwen3Next } };
             Qwen35 => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Qwen35VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen3.5 VLM does not support adapter loading") };
             Qwen35Moe => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Qwen35MoeVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen3.5 VLM does not support adapter loading") };
-            Gemma => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Gemma2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Gemma3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Gemma => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::GemmaModel::load, args: models::gemma::ModelArgs, weight_builder: models::GemmaModel::from_weights, wrap: LoadedModel::Gemma } };
+            Gemma2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Gemma2Model::load, args: models::gemma2::ModelArgs, weight_builder: models::Gemma2Model::from_weights, wrap: LoadedModel::Gemma2 } };
+            Gemma3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Gemma3Model::load, args: models::gemma3::ModelArgs, weight_builder: models::Gemma3Model::from_weights, wrap: |m| LoadedModel::Gemma3(models::Gemma3Wrapper::new(m)) } };
             Gemma3VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Gemma3 VLM cannot be loaded with LoRA adapters yet") };
             LlavaVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("LLaVA VLM cannot be loaded with LoRA adapters yet") };
             LlavaBunnyVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("LLaVA VLM cannot be loaded with LoRA adapters yet") };
@@ -116,51 +116,51 @@ macro_rules! for_each_model_descriptor {
             Qwen25VL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen VL models cannot be loaded with LoRA adapters yet") };
             Qwen3VL => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen VL models cannot be loaded with LoRA adapters yet") };
             Qwen3VLMoe => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen VL models cannot be loaded with LoRA adapters yet") };
+            Qwen2Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen2MoeModel::load, args: models::qwen2_moe::ModelArgs, weight_builder: models::Qwen2MoeModel::from_weights, wrap: LoadedModel::Qwen2Moe } };
             Gemma3n => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Gemma3nVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Gemma3n VLM cannot be loaded with LoRA adapters yet") };
-            Phi => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Phi3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Phi => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::PhiModel::load, args: models::phi::ModelArgs, weight_builder: models::PhiModel::from_weights, wrap: LoadedModel::Phi } };
+            Phi3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Phi3Model::load, args: models::phi3::ModelArgs, weight_builder: models::Phi3Model::from_weights, wrap: LoadedModel::Phi3 } };
             Phi3VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Phi3V VLM does not support adapter loading; use load_model() instead") };
             Molmo2VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Molmo2 VLM does not support adapter loading; use load_model() instead") };
-            Phi3Small => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            PhiMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            MiniMax => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Mixtral => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Qwen2Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            OLMoE => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            DeepSeek => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            DeepSeekV2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            DeepSeekV3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            DeepSeekV32 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Cohere => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Cohere2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            InternLM2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            InternLM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Baichuan => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Glm4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Glm4Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Glm4MoeLite => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            GlmMoeDsa => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Ernie45 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Ernie45Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            HunyuanMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            HunyuanV1Dense => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            MiMo => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            ExaOne => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            ExaOne4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            ExaOneMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            SolarOpen => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Olmo => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Olmo2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Olmo3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            StarCoder2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            MiniCPM => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            MiniCPM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            StableLM => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            SmolLM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
-            Ministral3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Phi3Small => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Phi3SmallModel::load, args: models::phi3small::ModelArgs, weight_builder: models::Phi3SmallModel::from_weights, wrap: LoadedModel::Phi3Small } };
+            PhiMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::PhiMoeModel::load, args: models::phimoe::ModelArgs, weight_builder: models::PhiMoeModel::from_weights, wrap: LoadedModel::PhiMoe } };
+            MiniMax => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::MiniMaxModel::load, args: models::minimax::ModelArgs, weight_builder: models::MiniMaxModel::from_weights, wrap: LoadedModel::MiniMax } };
+            Mixtral => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::MixtralModel::load, args: models::mixtral::ModelArgs, weight_builder: models::MixtralModel::from_weights, wrap: LoadedModel::Mixtral } };
+            OLMoE => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::OlmoeModel::load, args: models::olmoe::ModelArgs, weight_builder: models::OlmoeModel::from_weights, wrap: LoadedModel::OLMoE } };
+            DeepSeek => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::DeepSeekModel::load, args: models::deepseek::ModelArgs, weight_builder: models::DeepSeekModel::from_weights, wrap: LoadedModel::DeepSeek } };
+            DeepSeekV2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::DeepSeekV2Model::load, args: models::deepseek_v2::ModelArgs, weight_builder: models::DeepSeekV2Model::from_weights, wrap: LoadedModel::DeepSeekV2 } };
+            DeepSeekV3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::DeepSeekV3Model::load, args: models::deepseek_v3::DeepSeekV3Config, weight_builder: models::DeepSeekV3Model::from_weights, wrap: LoadedModel::DeepSeekV3 } };
+            DeepSeekV32 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::DeepSeekV32Model::load, args: models::deepseek_v32::ModelArgs, weight_builder: models::DeepSeekV32Model::from_weights, wrap: LoadedModel::DeepSeekV32 } };
+            Cohere => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::CohereModel::load, args: models::cohere::ModelArgs, weight_builder: models::CohereModel::from_weights, wrap: LoadedModel::Cohere } };
+            Cohere2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Cohere2Model::load, args: models::cohere2::Cohere2Config, weight_builder: models::Cohere2Model::from_weights, wrap: LoadedModel::Cohere2 } };
+            InternLM2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::InternLM2Model::load, args: models::internlm2::ModelArgs, weight_builder: models::InternLM2Model::from_weights, wrap: LoadedModel::InternLM2 } };
+            InternLM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::InternLM3Model::load, args: models::internlm3::ModelArgs, weight_builder: models::InternLM3Model::from_weights, wrap: LoadedModel::InternLM3 } };
+            Baichuan => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::BaichuanModel::load, args: models::baichuan::BaichuanConfig, weight_builder: models::BaichuanModel::from_weights, wrap: LoadedModel::Baichuan } };
+            Glm4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Glm4Model::load, args: models::glm4::ModelArgs, weight_builder: models::Glm4Model::from_weights, wrap: LoadedModel::Glm4 } };
+            Glm4Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Glm4MoeModel::load, args: models::glm4_moe::ModelArgs, weight_builder: models::Glm4MoeModel::from_weights, wrap: LoadedModel::Glm4Moe } };
+            Glm4MoeLite => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Glm4MoeLiteModel::load, args: models::glm4_moe_lite::ModelArgs, weight_builder: models::Glm4MoeLiteModel::from_weights, wrap: LoadedModel::Glm4MoeLite } };
+            GlmMoeDsa => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::GlmMoeDsaModel::load, args: models::glm_moe_dsa::ModelArgs, weight_builder: models::GlmMoeDsaModel::from_weights, wrap: LoadedModel::GlmMoeDsa } };
+            Ernie45 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Ernie45Model::load, args: models::ernie4_5::ModelArgs, weight_builder: models::Ernie45Model::from_weights, wrap: LoadedModel::Ernie45 } };
+            Ernie45Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Ernie45MoeModel::load, args: models::ernie4_5_moe::ModelArgs, weight_builder: models::Ernie45MoeModel::from_weights, wrap: LoadedModel::Ernie45Moe } };
+            HunyuanMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::HunyuanMoeModel::load, args: models::hunyuan_moe::ModelArgs, weight_builder: models::HunyuanMoeModel::from_weights, wrap: LoadedModel::HunyuanMoe } };
+            HunyuanV1Dense => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::HunyuanV1DenseModel::load, args: models::hunyuan_v1_dense::ModelArgs, weight_builder: models::HunyuanV1DenseModel::from_weights, wrap: LoadedModel::HunyuanV1Dense } };
+            MiMo => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::MiMoModel::load, args: models::mimo::ModelArgs, weight_builder: models::MiMoModel::from_weights, wrap: LoadedModel::MiMo } };
+            ExaOne => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::ExaOneModel::load, args: models::exaone::ExaOneConfig, weight_builder: models::ExaOneModel::from_weights, wrap: LoadedModel::ExaOne } };
+            ExaOne4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::ExaOne4Model::load, args: models::exaone4::ModelArgs, weight_builder: models::ExaOne4Model::from_weights, wrap: |m| LoadedModel::ExaOne4(models::ExaOne4Wrapper::new(m)) } };
+            ExaOneMoe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::ExaoneMoeModel::load, args: models::exaone_moe::ModelArgs, weight_builder: models::ExaoneMoeModel::from_weights, wrap: LoadedModel::ExaOneMoe } };
+            SolarOpen => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::SolarOpenModel::load, args: models::solar_open::ModelArgs, weight_builder: models::SolarOpenModel::from_weights, wrap: LoadedModel::SolarOpen } };
+            Olmo => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::OlmoModel::load, args: models::olmo::ModelArgs, weight_builder: models::OlmoModel::from_weights, wrap: LoadedModel::Olmo } };
+            Olmo2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::OLMo2Model::load, args: models::olmo2::ModelArgs, weight_builder: models::OLMo2Model::from_weights, wrap: LoadedModel::Olmo2 } };
+            Olmo3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::OLMo3Model::load, args: models::olmo3::OLMo3Config, weight_builder: models::OLMo3Model::from_weights, wrap: LoadedModel::Olmo3 } };
+            StarCoder2 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::StarCoder2Model::load, args: models::starcoder2::StarCoder2Config, weight_builder: models::StarCoder2Model::from_weights, wrap: LoadedModel::StarCoder2 } };
+            MiniCPM => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::MiniCPMModel::load, args: models::minicpm::ModelArgs, weight_builder: models::MiniCPMModel::from_weights, wrap: LoadedModel::MiniCPM } };
+            MiniCPM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::MiniCPM3Model::load, args: models::minicpm3::ModelArgs, weight_builder: models::MiniCPM3Model::from_weights, wrap: LoadedModel::MiniCPM3 } };
+            StableLM => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::StableLMModel::load, args: models::stablelm::ModelArgs, weight_builder: models::StableLMModel::from_weights, wrap: LoadedModel::StableLM } };
+            SmolLM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::SmolLM3Model::load, args: models::smollm3::ModelArgs, weight_builder: models::SmolLM3Model::from_weights, wrap: LoadedModel::SmolLM3 } };
+            Ministral3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Ministral3Model::load, args: models::ministral3::ModelArgs, weight_builder: models::Ministral3Model::from_weights, wrap: |m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m)) } };
             Mistral3 => { kind: Text, directory: Mistral3Dynamic, weight: Some(WeightLoadRoute::LlamaFamily), adapter: None };
-            Nemotron => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Nemotron => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::NemotronModel::load, args: models::nemotron::ModelArgs, weight_builder: models::NemotronModel::from_weights, wrap: LoadedModel::Nemotron } };
             Mamba => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Mamba2 => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Jamba => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
@@ -169,7 +169,7 @@ macro_rules! for_each_model_descriptor {
             KimiLinear => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             LongcatFlash => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             LongcatFlashNgram => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
-            Step3p5 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None };
+            Step3p5 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Step3p5Model::load, args: models::step3p5::Step3p5Config, weight_builder: models::Step3p5Model::from_weights, wrap: LoadedModel::Step3p5 } };
             Rwkv7 => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             RecurrentGemma => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
         }
@@ -177,7 +177,7 @@ macro_rules! for_each_model_descriptor {
 }
 
 macro_rules! descriptor_match {
-    ($( $variant:ident => { kind: $kind:ident, directory: $directory:ident, weight: $weight:expr, adapter: $adapter:expr }; )*) => {
+    ($( $variant:ident => { kind: $kind:ident, directory: $directory:ident, weight: $weight:expr, adapter: $adapter:expr $(, config_backed: { dir_loader: $dir_loader:path, args: $args_ty:ty, weight_builder: $weight_builder:path, wrap: $wrap:expr })? }; )*) => {
         pub(crate) fn static_model_descriptor(model_type: ModelType) -> StaticModelDescriptor {
             match model_type {
                 $(
@@ -194,7 +194,13 @@ macro_rules! descriptor_match {
     };
 }
 
-for_each_model_descriptor!(descriptor_match);
+for_each_model_registration!(descriptor_match);
+pub(crate) use for_each_model_registration;
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn has_config_backed_registration(model_type: ModelType) -> bool {
+    is_config_backed_model_type(model_type)
+}
 
 pub(crate) fn is_ministral3_config(config: &serde_json::Value) -> bool {
     config

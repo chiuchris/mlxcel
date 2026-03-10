@@ -14,8 +14,9 @@
 
 use crate::model_metadata::{
     DirectoryLoadRoute, DirectoryRouteFamily, ModelKind, WeightLoadRoute,
-    adapter_loading_unsupported_message, is_config_backed_model_type, is_nonstandard_model_type,
-    is_special_weight_model_type, is_vlm_model_type, model_load_policy, static_model_descriptor,
+    adapter_loading_unsupported_message, has_config_backed_registration,
+    is_config_backed_model_type, is_nonstandard_model_type, is_special_weight_model_type,
+    is_vlm_model_type, model_load_policy, static_model_descriptor,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -86,8 +87,11 @@ fn static_model_descriptor_centralizes_directory_and_weight_families() {
 #[test]
 fn descriptor_backed_support_helpers_stay_in_sync() {
     assert!(is_config_backed_model_type(ModelType::Gemma3));
+    assert!(has_config_backed_registration(ModelType::Gemma3));
     assert!(is_nonstandard_model_type(ModelType::Gemma3n));
     assert!(is_special_weight_model_type(ModelType::Qwen35));
+    assert!(!has_config_backed_registration(ModelType::Gemma3n));
+    assert!(!has_config_backed_registration(ModelType::Qwen3VL));
 
     assert_eq!(
         adapter_loading_unsupported_message(ModelType::Phi3VLM),
