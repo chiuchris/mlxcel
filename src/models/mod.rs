@@ -16,6 +16,9 @@
 //!
 //! All implementations use mlxcel-core for direct MLX C++ bindings.
 
+mod detection;
+mod sanitize;
+
 // Shared modules
 pub mod gated_delta;
 pub mod switch_layers;
@@ -95,6 +98,7 @@ pub use deepseek::DeepSeekModel;
 pub use deepseek_v2::DeepSeekV2Model;
 pub use deepseek_v3::DeepSeekV3Model;
 pub use deepseek_v32::DeepSeekV32Model;
+pub use detection::get_model_type;
 pub use ernie4_5::Ernie45Model;
 pub use ernie4_5_moe::Ernie45MoeModel;
 pub use exaone::ExaOneModel;
@@ -148,14 +152,12 @@ pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
+pub use sanitize::{load_and_sanitize_weights, sanitize_config_json, sanitize_tied_embeddings};
 pub use smollm3::SmolLM3Model;
 pub use solar_open::SolarOpenModel;
 pub use stablelm::StableLMModel;
 pub use starcoder2::StarCoder2Model;
 pub use step3p5::Step3p5Model;
-
-use anyhow::Result;
-use std::path::Path;
 
 /// Supported model types
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,230 +271,10 @@ pub enum ModelType {
     Rwkv7,
     RecurrentGemma,
 }
-
-/// Ensure lm_head weights exist for models with tied embeddings.
-///
-/// Many models share embedding weights for the output projection (lm_head).
-/// When tie_word_embeddings is true (or omitted), lm_head.weight may not be
-/// saved in safetensors. This function auto-detects the missing weight and
-/// copies model.embed_tokens.* → lm_head.* so model loaders work uniformly.
-///
-/// Auto-detection: if tie_word_embeddings is explicitly false, do nothing.
-/// Otherwise (true or absent), copy if lm_head.weight is missing.
-///
-/// Used by: all VLM loaders, load_model_from_weights, load_and_sanitize_weights
-pub fn sanitize_tied_embeddings(
-    weights: &mut mlxcel_core::weights::WeightMap,
-    config: &serde_json::Value,
-) {
-    // If tie_word_embeddings is explicitly false, skip
-    let tie = config
-        .get("tie_word_embeddings")
-        .or_else(|| {
-            config
-                .get("text_config")
-                .and_then(|tc| tc.get("tie_word_embeddings"))
-        })
-        .and_then(|v| v.as_bool());
-
-    if tie == Some(false) {
-        return;
-    }
-
-    // Pattern 1: standard keys (after language_model. prefix stripping)
-    // model.embed_tokens.* → lm_head.*
-    if !weights.contains_key("lm_head.weight") {
-        for suffix in &["weight", "scales", "biases"] {
-            let src = format!("model.embed_tokens.{}", suffix);
-            let dst = format!("lm_head.{}", suffix);
-            if let Some(w) = weights.get(&src) {
-                weights.insert(dst, mlxcel_core::copy(w));
-            }
-        }
-    }
-
-    // Pattern 2: VLM keys with language_model. prefix (not stripped)
-    // language_model.model.embed_tokens.* → language_model.lm_head.*
-    if !weights.contains_key("language_model.lm_head.weight") {
-        for suffix in &["weight", "scales", "biases"] {
-            let src = format!("language_model.model.embed_tokens.{}", suffix);
-            let dst = format!("language_model.lm_head.{}", suffix);
-            if let Some(w) = weights.get(&src) {
-                weights.insert(dst, mlxcel_core::copy(w));
-            }
-        }
-    }
-}
-
-/// Load weights from a model directory with automatic tied-embedding sanitization.
-///
-/// This is the common weight loading entry point for text model `load()` functions.
-/// It reads safetensors, parses config.json, and ensures lm_head weights exist.
-pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
-    model_dir: P,
-) -> Result<mlxcel_core::weights::WeightMap, String> {
-    let model_dir = model_dir.as_ref();
-    let mut weights = mlxcel_core::weights::load_weights_from_dir(model_dir)?;
-
-    let config_path = model_dir.join("config.json");
-    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-        let config_str = sanitize_config_json(&config_str);
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-            sanitize_tied_embeddings(&mut weights, &config);
-        }
-    }
-
-    Ok(weights)
-}
-
-/// Sanitize config JSON string by replacing non-standard JSON values
-pub fn sanitize_config_json(config_str: &str) -> String {
-    config_str
-        .replace("Infinity", "1e38")
-        .replace("-Infinity", "-1e38")
-        .replace("NaN", "0.0")
-}
-
-fn has_vision_config(config: &serde_json::Value) -> bool {
-    config.get("vision_config").is_some()
-}
-
-fn detect_text_or_vlm(
-    config: &serde_json::Value,
-    text_model: ModelType,
-    vlm_model: ModelType,
-) -> ModelType {
-    if has_vision_config(config) {
-        vlm_model
-    } else {
-        text_model
-    }
-}
-
-fn detect_hunyuan_model_type(config: &serde_json::Value) -> ModelType {
-    let num_experts = config["num_experts"].as_i64().unwrap_or(1);
-    if num_experts > 1 {
-        ModelType::HunyuanMoe
-    } else {
-        ModelType::HunyuanV1Dense
-    }
-}
-
-/// Detect model type from config.json
-pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
-    let config_path = model_path.join("config.json");
-    let config_str = std::fs::read_to_string(config_path)?;
-    let config_str = sanitize_config_json(&config_str);
-    let v: serde_json::Value = serde_json::from_str(&config_str)?;
-
-    let model_type = v["model_type"]
-        .as_str()
-        .ok_or_else(|| anyhow::anyhow!("model_type not found"))?;
-
-    match model_type {
-        "llama" | "mistral" => Ok(ModelType::Llama),
-        "llama4" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Llama4,
-            ModelType::Llama4VLM,
-        )),
-        "qwen2" => Ok(ModelType::Qwen2),
-        "qwen3" => Ok(ModelType::Qwen3),
-        "qwen3_moe" => Ok(ModelType::Qwen3Moe),
-        "qwen3_next" | "qwen3next" => Ok(ModelType::Qwen3Next),
-        "qwen3_5" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Qwen35,
-            ModelType::Qwen35VLM,
-        )),
-        "qwen3_5_moe" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Qwen35Moe,
-            ModelType::Qwen35MoeVLM,
-        )),
-        "qwen2_moe" => Ok(ModelType::Qwen2Moe),
-        "gemma" => Ok(ModelType::Gemma),
-        "gemma2" => Ok(ModelType::Gemma2),
-        "gemma3" | "gemma3_text" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Gemma3,
-            ModelType::Gemma3VLM,
-        )),
-        "gemma3n" | "gemma3n_text" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Gemma3n,
-            ModelType::Gemma3nVLM,
-        )),
-        "phi" | "phi-msft" => Ok(ModelType::Phi),
-        "phi3" => Ok(ModelType::Phi3),
-        "phi3_v" => Ok(ModelType::Phi3VLM),
-        "phi3small" => Ok(ModelType::Phi3Small),
-        "phimoe" => Ok(ModelType::PhiMoe),
-        "minimax" => Ok(ModelType::MiniMax),
-        "mixtral" => Ok(ModelType::Mixtral),
-        "olmoe" => Ok(ModelType::OLMoE),
-        "deepseek" => Ok(ModelType::DeepSeek),
-        "deepseek_v2" => Ok(ModelType::DeepSeekV2),
-        "deepseek_v3" => Ok(ModelType::DeepSeekV3),
-        "deepseek_v32" | "deepseek_v3.2" => Ok(ModelType::DeepSeekV32),
-        "cohere" => Ok(ModelType::Cohere),
-        "cohere2" => Ok(ModelType::Cohere2),
-        "internlm2" => Ok(ModelType::InternLM2),
-        "internlm3" => Ok(ModelType::InternLM3),
-        "baichuan_m1" => Ok(ModelType::Baichuan),
-        "glm4" => Ok(ModelType::Glm4),
-        "glm4_moe" => Ok(ModelType::Glm4Moe),
-        "solar_open" => Ok(ModelType::SolarOpen),
-        "glm4_moe_lite" => Ok(ModelType::Glm4MoeLite),
-        "glm_moe_dsa" => Ok(ModelType::GlmMoeDsa),
-        "ernie4_5" | "ernie4.5" => Ok(ModelType::Ernie45),
-        "ernie4_5_moe" | "ernie4.5_moe" => Ok(ModelType::Ernie45Moe),
-        "hunyuan_v1_dense" | "hunyuan_dense" => Ok(ModelType::HunyuanV1Dense),
-        "hunyuan" => Ok(detect_hunyuan_model_type(&v)),
-        "mimo" => Ok(ModelType::MiMo),
-        "exaone" => Ok(ModelType::ExaOne),
-        "exaone4" => Ok(ModelType::ExaOne4),
-        "exaone_moe" => Ok(ModelType::ExaOneMoe),
-        "olmo" => Ok(ModelType::Olmo),
-        "olmo2" => Ok(ModelType::Olmo2),
-        "olmo3" => Ok(ModelType::Olmo3),
-        "starcoder2" => Ok(ModelType::StarCoder2),
-        "minicpm" => Ok(ModelType::MiniCPM),
-        "minicpm3" => Ok(ModelType::MiniCPM3),
-        "stablelm" => Ok(ModelType::StableLM),
-        "smollm3" => Ok(ModelType::SmolLM3),
-        "ministral3" => Ok(ModelType::Ministral3),
-        "mistral3" => Ok(detect_text_or_vlm(
-            &v,
-            ModelType::Mistral3,
-            ModelType::Mistral3VLM,
-        )),
-        "nemotron" => Ok(ModelType::Nemotron),
-        "mamba" | "falcon_mamba" => Ok(ModelType::Mamba),
-        "mamba2" => Ok(ModelType::Mamba2),
-        "jamba" => Ok(ModelType::Jamba),
-        "nemotron_h" => Ok(ModelType::NemotronH),
-        "nemotron-nas" => Ok(ModelType::NemotronNAS),
-        "rwkv7" => Ok(ModelType::Rwkv7),
-        "kimi_linear" => Ok(ModelType::KimiLinear),
-        "longcat_flash" => Ok(ModelType::LongcatFlash),
-        "longcat_flash_ngram" => Ok(ModelType::LongcatFlashNgram),
-        "step3p5" => Ok(ModelType::Step3p5),
-        "recurrent_gemma" | "griffin" => Ok(ModelType::RecurrentGemma),
-        "qwen2_vl" => Ok(ModelType::Qwen2VL),
-        "qwen2_5_vl" => Ok(ModelType::Qwen25VL),
-        "qwen3_vl" => Ok(ModelType::Qwen3VL),
-        "qwen3_vl_moe" => Ok(ModelType::Qwen3VLMoe),
-        "llava" | "llava_next" => Ok(ModelType::LlavaVLM),
-        "llava_bunny" | "bunny-llama" | "llava-qwen2" => Ok(ModelType::LlavaBunnyVLM),
-        "aya_vision" => Ok(ModelType::AyaVisionVLM),
-        "paligemma" => Ok(ModelType::PaliGemmaVLM),
-        "pixtral" => Ok(ModelType::PixtralVLM),
-        "molmo2" => Ok(ModelType::Molmo2VLM),
-        _ => Err(anyhow::anyhow!("Unsupported model type: {}", model_type)),
-    }
-}
+#[cfg(test)]
+#[path = "detection_tests.rs"]
+mod detection_tests;
 
 #[cfg(test)]
-#[path = "mod_tests.rs"]
-mod tests;
+#[path = "sanitize_tests.rs"]
+mod sanitize_tests;

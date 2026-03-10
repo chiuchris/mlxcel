@@ -12,18 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{
-    ModelType, detect_hunyuan_model_type, detect_text_or_vlm, has_vision_config,
-    sanitize_config_json,
-};
+use super::ModelType;
+use super::detection::{detect_hunyuan_model_type, detect_text_or_vlm, has_vision_config};
 use serde_json::json;
-
-#[test]
-fn sanitize_config_json_replaces_non_standard_values() {
-    let sanitized = sanitize_config_json("{\"a\": Infinity, \"b\": -Infinity, \"c\": NaN}");
-
-    assert_eq!(sanitized, "{\"a\": 1e38, \"b\": -1e38, \"c\": 0.0}");
-}
 
 #[test]
 fn has_vision_config_detects_vlm_configs() {

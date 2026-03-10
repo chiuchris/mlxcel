@@ -1,0 +1,165 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Model-type detection helpers.
+//!
+//! This module owns config-driven architecture classification and related
+//! detection helpers so `models/mod.rs` can stay focused on the registry of
+//! model implementations and exported types.
+
+use anyhow::Result;
+use std::path::Path;
+
+use super::ModelType;
+use super::sanitize::sanitize_config_json;
+
+pub(crate) fn has_vision_config(config: &serde_json::Value) -> bool {
+    config.get("vision_config").is_some()
+}
+
+pub(crate) fn detect_text_or_vlm(
+    config: &serde_json::Value,
+    text_model: ModelType,
+    vlm_model: ModelType,
+) -> ModelType {
+    if has_vision_config(config) {
+        vlm_model
+    } else {
+        text_model
+    }
+}
+
+pub(crate) fn detect_hunyuan_model_type(config: &serde_json::Value) -> ModelType {
+    let num_experts = config["num_experts"].as_i64().unwrap_or(1);
+    if num_experts > 1 {
+        ModelType::HunyuanMoe
+    } else {
+        ModelType::HunyuanV1Dense
+    }
+}
+
+/// Detect model type from config.json
+pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
+    let config_path = model_path.join("config.json");
+    let config_str = std::fs::read_to_string(config_path)?;
+    let config_str = sanitize_config_json(&config_str);
+    let v: serde_json::Value = serde_json::from_str(&config_str)?;
+
+    let model_type = v["model_type"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("model_type not found"))?;
+
+    match model_type {
+        "llama" | "mistral" => Ok(ModelType::Llama),
+        "llama4" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Llama4,
+            ModelType::Llama4VLM,
+        )),
+        "qwen2" => Ok(ModelType::Qwen2),
+        "qwen3" => Ok(ModelType::Qwen3),
+        "qwen3_moe" => Ok(ModelType::Qwen3Moe),
+        "qwen3_next" | "qwen3next" => Ok(ModelType::Qwen3Next),
+        "qwen3_5" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Qwen35,
+            ModelType::Qwen35VLM,
+        )),
+        "qwen3_5_moe" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Qwen35Moe,
+            ModelType::Qwen35MoeVLM,
+        )),
+        "qwen2_moe" => Ok(ModelType::Qwen2Moe),
+        "gemma" => Ok(ModelType::Gemma),
+        "gemma2" => Ok(ModelType::Gemma2),
+        "gemma3" | "gemma3_text" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Gemma3,
+            ModelType::Gemma3VLM,
+        )),
+        "gemma3n" | "gemma3n_text" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Gemma3n,
+            ModelType::Gemma3nVLM,
+        )),
+        "phi" | "phi-msft" => Ok(ModelType::Phi),
+        "phi3" => Ok(ModelType::Phi3),
+        "phi3_v" => Ok(ModelType::Phi3VLM),
+        "phi3small" => Ok(ModelType::Phi3Small),
+        "phimoe" => Ok(ModelType::PhiMoe),
+        "minimax" => Ok(ModelType::MiniMax),
+        "mixtral" => Ok(ModelType::Mixtral),
+        "olmoe" => Ok(ModelType::OLMoE),
+        "deepseek" => Ok(ModelType::DeepSeek),
+        "deepseek_v2" => Ok(ModelType::DeepSeekV2),
+        "deepseek_v3" => Ok(ModelType::DeepSeekV3),
+        "deepseek_v32" | "deepseek_v3.2" => Ok(ModelType::DeepSeekV32),
+        "cohere" => Ok(ModelType::Cohere),
+        "cohere2" => Ok(ModelType::Cohere2),
+        "internlm2" => Ok(ModelType::InternLM2),
+        "internlm3" => Ok(ModelType::InternLM3),
+        "baichuan_m1" => Ok(ModelType::Baichuan),
+        "glm4" => Ok(ModelType::Glm4),
+        "glm4_moe" => Ok(ModelType::Glm4Moe),
+        "solar_open" => Ok(ModelType::SolarOpen),
+        "glm4_moe_lite" => Ok(ModelType::Glm4MoeLite),
+        "glm_moe_dsa" => Ok(ModelType::GlmMoeDsa),
+        "ernie4_5" | "ernie4.5" => Ok(ModelType::Ernie45),
+        "ernie4_5_moe" | "ernie4.5_moe" => Ok(ModelType::Ernie45Moe),
+        "hunyuan_v1_dense" | "hunyuan_dense" => Ok(ModelType::HunyuanV1Dense),
+        "hunyuan" => Ok(detect_hunyuan_model_type(&v)),
+        "mimo" => Ok(ModelType::MiMo),
+        "exaone" => Ok(ModelType::ExaOne),
+        "exaone4" => Ok(ModelType::ExaOne4),
+        "exaone_moe" => Ok(ModelType::ExaOneMoe),
+        "olmo" => Ok(ModelType::Olmo),
+        "olmo2" => Ok(ModelType::Olmo2),
+        "olmo3" => Ok(ModelType::Olmo3),
+        "starcoder2" => Ok(ModelType::StarCoder2),
+        "minicpm" => Ok(ModelType::MiniCPM),
+        "minicpm3" => Ok(ModelType::MiniCPM3),
+        "stablelm" => Ok(ModelType::StableLM),
+        "smollm3" => Ok(ModelType::SmolLM3),
+        "ministral3" => Ok(ModelType::Ministral3),
+        "mistral3" => Ok(detect_text_or_vlm(
+            &v,
+            ModelType::Mistral3,
+            ModelType::Mistral3VLM,
+        )),
+        "nemotron" => Ok(ModelType::Nemotron),
+        "mamba" | "falcon_mamba" => Ok(ModelType::Mamba),
+        "mamba2" => Ok(ModelType::Mamba2),
+        "jamba" => Ok(ModelType::Jamba),
+        "nemotron_h" => Ok(ModelType::NemotronH),
+        "nemotron-nas" => Ok(ModelType::NemotronNAS),
+        "rwkv7" => Ok(ModelType::Rwkv7),
+        "kimi_linear" => Ok(ModelType::KimiLinear),
+        "longcat_flash" => Ok(ModelType::LongcatFlash),
+        "longcat_flash_ngram" => Ok(ModelType::LongcatFlashNgram),
+        "step3p5" => Ok(ModelType::Step3p5),
+        "recurrent_gemma" | "griffin" => Ok(ModelType::RecurrentGemma),
+        "qwen2_vl" => Ok(ModelType::Qwen2VL),
+        "qwen2_5_vl" => Ok(ModelType::Qwen25VL),
+        "qwen3_vl" => Ok(ModelType::Qwen3VL),
+        "qwen3_vl_moe" => Ok(ModelType::Qwen3VLMoe),
+        "llava" | "llava_next" => Ok(ModelType::LlavaVLM),
+        "llava_bunny" | "bunny-llama" | "llava-qwen2" => Ok(ModelType::LlavaBunnyVLM),
+        "aya_vision" => Ok(ModelType::AyaVisionVLM),
+        "paligemma" => Ok(ModelType::PaliGemmaVLM),
+        "pixtral" => Ok(ModelType::PixtralVLM),
+        "molmo2" => Ok(ModelType::Molmo2VLM),
+        _ => Err(anyhow::anyhow!("Unsupported model type: {}", model_type)),
+    }
+}
