@@ -48,6 +48,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_slots, total_tokens
             );
         }
+        VlmPreparationSummary::Phi4SigLip {
+            image_slots,
+            total_tokens,
+        } => {
+            println!(
+                "Phi4-SigLIP: tokenized with {} image slots ({} total tokens)",
+                image_slots, total_tokens
+            );
+        }
         VlmPreparationSummary::ImageBlocks(stats) => match stats.action {
             ImageTokenBlockAction::Expanded {
                 existing_image_count,

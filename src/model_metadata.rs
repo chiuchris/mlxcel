@@ -121,6 +121,7 @@ macro_rules! for_each_model_registration {
             Gemma3nVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Gemma3n VLM cannot be loaded with LoRA adapters yet") };
             Phi => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::PhiModel::load, args: models::phi::ModelArgs, weight_builder: models::PhiModel::from_weights, wrap: LoadedModel::Phi } };
             Phi3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Phi3Model::load, args: models::phi3::ModelArgs, weight_builder: models::Phi3Model::from_weights, wrap: LoadedModel::Phi3 } };
+            Phi4SigLipVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Phi4-SigLIP VLM does not support adapter loading; use load_model() instead") };
             Phi3VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Phi3V VLM does not support adapter loading; use load_model() instead") };
             Molmo2VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Molmo2 VLM does not support adapter loading; use load_model() instead") };
             Phi3Small => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Phi3SmallModel::load, args: models::phi3small::ModelArgs, weight_builder: models::Phi3SmallModel::from_weights, wrap: LoadedModel::Phi3Small } };

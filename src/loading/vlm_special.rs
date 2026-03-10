@@ -16,6 +16,7 @@
 //!
 //! Families:
 //! - Llama4 VLM
+//! - Phi4-SigLIP
 //! - Phi3V
 //! - Molmo2
 //!
@@ -32,7 +33,8 @@ use crate::models;
 use crate::vision;
 
 use super::{
-    load_vlm_weights, parse_vlm_config, read_optional_model_json, read_sanitized_vlm_config,
+    load_vlm_weights, parse_required_vlm_subconfig, parse_vlm_config, read_optional_model_json,
+    read_sanitized_vlm_config,
 };
 
 fn phi3_vision_config() -> vision::config::VisionConfig {
@@ -47,6 +49,157 @@ fn phi3_vision_config() -> vision::config::VisionConfig {
         patch_size: 14,
         layer_norm_eps: 1e-5,
     }
+}
+
+const PHI4_SIGLIP_TEXT_FIELDS: &[&str] = &[
+    "vocab_size",
+    "num_hidden_layers",
+    "intermediate_size",
+    "num_attention_heads",
+    "rms_norm_eps",
+    "hidden_size",
+    "num_key_value_heads",
+    "rope_theta",
+    "rope_traditional",
+    "partial_rotary_factor",
+    "rope_scaling",
+    "model_type",
+    "quantization",
+    "tie_word_embeddings",
+    "max_position_embeddings",
+];
+
+pub(super) fn rewrite_phi4_siglip_weight_key(key: &str) -> Option<String> {
+    if key.contains("position_ids") || key.contains("vision_model.head.") {
+        None
+    } else if let Some(rest) = key.strip_prefix("model.vision_tower.") {
+        Some(format!("vision_tower.{}", rest))
+    } else if let Some(rest) = key.strip_prefix("model.mm_projector.0.") {
+        Some(format!("mm_projector_linear1.{}", rest))
+    } else if let Some(rest) = key.strip_prefix("model.mm_projector.2.") {
+        Some(format!("mm_projector_linear2.{}", rest))
+    } else {
+        Some(key.to_string())
+    }
+}
+
+fn remap_phi4_siglip_weights(raw_weights: WeightMap) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for (key, value) in raw_weights {
+        let Some(new_key) = rewrite_phi4_siglip_weight_key(&key) else {
+            continue;
+        };
+        weights.insert(new_key, value);
+    }
+    weights
+}
+
+pub(super) fn phi4_siglip_text_config_value(full_config: &Value) -> Result<Value> {
+    let mut text_config = full_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+
+    let text_obj = super::require_object_mut(&mut text_config, "Phi4-SigLIP text_config")?;
+    for &field in PHI4_SIGLIP_TEXT_FIELDS {
+        if let Some(value) = full_config.get(field) {
+            text_obj
+                .entry(field.to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    Ok(text_config)
+}
+
+pub(crate) fn load_phi4_siglip_vlm(model_path: &Path) -> Result<LoadedModel> {
+    use vision::encoders::phi4_siglip::{Phi4SigLipVisionConfig, Phi4SigLipVisionEncoder};
+    use vision::processors::phi4_siglip::Phi4SigLipProcessor;
+
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+
+    let mut text_config_value = phi4_siglip_text_config_value(&full_config)?;
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
+    let text_config: models::phi3::ModelArgs = serde_json::from_value(text_config_value)
+        .map_err(|e| anyhow::anyhow!("Failed to parse Phi4-SigLIP text config: {}", e))?;
+
+    let vision_config: Phi4SigLipVisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Phi4-SigLIP vision config")?;
+
+    let mm_hidden_size = full_config
+        .get("mm_hidden_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(vision_config.hidden_size as i64) as usize;
+    let select_layer = full_config
+        .get("mm_vision_select_layer")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(-2) as isize;
+    let min_num_patches = full_config
+        .get("min_num_patches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(vision_config.num_patches as u64) as usize;
+    let max_num_patches = full_config
+        .get("max_num_patches")
+        .and_then(|v| v.as_u64())
+        .unwrap_or((vision_config.image_size / vision_config.patch_size).pow(2) as u64)
+        as usize;
+
+    let mut weights = remap_phi4_siglip_weights(load_vlm_weights(model_path)?);
+    models::sanitize_tied_embeddings(&mut weights, &full_config);
+
+    let text_model = models::Phi3Model::from_weights(&weights, &text_config)
+        .map_err(|e| anyhow::anyhow!("Failed to load Phi4-SigLIP text model: {}", e))?;
+    let vision_tower = Phi4SigLipVisionEncoder::from_weights(
+        &weights,
+        &vision_config,
+        "vision_tower.vision_tower.vision_model",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4-SigLIP vision tower: {}", e))?;
+
+    let mm_projector_linear1 = mlxcel_core::layers::UnifiedLinear::from_weights(
+        &weights,
+        "mm_projector_linear1",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4-SigLIP mm_projector_linear1: {}", e))?;
+    let mm_projector_linear2 = mlxcel_core::layers::UnifiedLinear::from_weights(
+        &weights,
+        "mm_projector_linear2",
+        text_config.group_size(),
+        text_config.bits(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Phi4-SigLIP mm_projector_linear2: {}", e))?;
+
+    let processor =
+        Phi4SigLipProcessor::new(vision_config.patch_size, min_num_patches, max_num_patches);
+
+    let eos_token_ids = match full_config.get("eos_token_id") {
+        Some(Value::Array(values)) => values
+            .iter()
+            .filter_map(|value| value.as_i64().map(|id| id as i32))
+            .collect(),
+        Some(Value::Number(value)) => value
+            .as_i64()
+            .map(|id| vec![id as i32])
+            .unwrap_or_else(Vec::new),
+        _ => Vec::new(),
+    };
+    let _ = mm_hidden_size;
+
+    let vlm = vision::Phi4SigLipVLModel {
+        text_model,
+        vision_tower,
+        mm_projector_linear1,
+        mm_projector_linear2,
+        processor,
+        select_layer,
+        eos_token_ids,
+    };
+
+    Ok(LoadedModel::Phi4SigLipVLM(vlm))
 }
 
 pub(super) fn rewrite_phi3_weight_key(key: &str) -> Option<String> {

@@ -96,6 +96,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         )),
         "phi" | "phi-msft" => Ok(ModelType::Phi),
         "phi3" => Ok(ModelType::Phi3),
+        "phi4-siglip" => Ok(ModelType::Phi4SigLipVLM),
         "phi3_v" => Ok(ModelType::Phi3VLM),
         "phi3small" => Ok(ModelType::Phi3Small),
         "phimoe" => Ok(ModelType::PhiMoe),

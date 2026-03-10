@@ -15,7 +15,8 @@
 use super::{
     cap_molmo2_vit_num_layers, inherit_quantization_if_missing, llama4_mm_tokens_per_image,
     llama4_quantization_params, llama4_token_ids, llama4_vision_prefix, molmo2_max_crops,
-    parse_molmo2_vit_layers, phi3_num_crops, rewrite_molmo2_weight_key, rewrite_phi3_weight_key,
+    parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
+    rewrite_molmo2_weight_key, rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key,
     should_transpose_phi3_patch_embedding,
 };
 use mlxcel_core::dtype;
@@ -75,6 +76,46 @@ fn phi3_num_crops_prefers_preprocessor_then_config_then_default() {
     assert_eq!(phi3_num_crops(&json!({}), None), 16);
 }
 
+#[test]
+fn rewrite_phi4_siglip_weight_key_keeps_text_keys_and_remaps_multimodal_prefixes() {
+    assert_eq!(
+        rewrite_phi4_siglip_weight_key("model.layers.0.self_attn.qkv_proj.weight"),
+        Some("model.layers.0.self_attn.qkv_proj.weight".to_string())
+    );
+    assert_eq!(
+        rewrite_phi4_siglip_weight_key(
+            "model.vision_tower.vision_tower.vision_model.embeddings.patch_embedding.weight"
+        ),
+        Some(
+            "vision_tower.vision_tower.vision_model.embeddings.patch_embedding.weight".to_string()
+        )
+    );
+    assert_eq!(
+        rewrite_phi4_siglip_weight_key("model.mm_projector.0.weight"),
+        Some("mm_projector_linear1.weight".to_string())
+    );
+    assert_eq!(rewrite_phi4_siglip_weight_key("model.position_ids"), None);
+}
+
+#[test]
+fn phi4_siglip_text_config_value_inherits_root_text_fields() {
+    let text_config = phi4_siglip_text_config_value(&json!({
+        "model_type": "phi4-siglip",
+        "hidden_size": 5120,
+        "num_attention_heads": 40,
+        "num_hidden_layers": 40,
+        "intermediate_size": 17920,
+        "vocab_size": 100352,
+        "rope_theta": 500000.0,
+        "quantization": {"group_size": 64, "bits": 4},
+        "vision_config": {"hidden_size": 1152}
+    }))
+    .unwrap();
+
+    assert_eq!(text_config["hidden_size"], 5120);
+    assert_eq!(text_config["num_attention_heads"], 40);
+    assert_eq!(text_config["quantization"]["group_size"], 64);
+}
 #[test]
 fn molmo2_helpers_clamp_layer_count_and_parse_defaults() {
     assert_eq!(cap_molmo2_vit_num_layers(27), 25);
