@@ -58,6 +58,10 @@ class QualityGateScriptTests(unittest.TestCase):
             "cargo test llama4_helpers_tests -- --ignored --test-threads=1",
             output,
         )
+        self.assertIn(
+            "cargo test models::gated_delta::tests -- --ignored --test-threads=1",
+            output,
+        )
 
     def test_dry_run_with_smoke_includes_cpu_only_commands(self) -> None:
         result = subprocess.run(
@@ -96,6 +100,10 @@ class QualityGateScriptTests(unittest.TestCase):
         output = result.stdout
         self.assertIn(
             "cargo test gemma3n_helpers_tests -- --ignored --test-threads=1",
+            output,
+        )
+        self.assertIn(
+            "cargo test models::gated_delta::tests -- --ignored --test-threads=1",
             output,
         )
         self.assertIn("MLXCEL_BUILD_METAL=OFF", output)

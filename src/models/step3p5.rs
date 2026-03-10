@@ -24,11 +24,12 @@
 //! - SwitchGLU experts with shared expert
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 use serde::Deserialize;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::Path;
 
@@ -299,10 +300,10 @@ pub struct Step3p5Attention {
 }
 
 impl Step3p5Attention {
-    pub fn forward(
+    fn forward(
         &self,
         x: &MlxArray,
-        cache: &mut KVCache,
+        cache: &mut dyn CacheInterface,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(x);
@@ -326,7 +327,7 @@ impl Step3p5Attention {
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
         // Apply RoPE
-        let offset = cache.offset;
+        let offset = cache.offset();
         let q = mlxcel_core::fast_rope(&q, self.rope_dims, true, self.rope_base, 1.0, offset);
         let k = mlxcel_core::fast_rope(&k, self.rope_dims, true, self.rope_base, 1.0, offset);
 
@@ -760,6 +761,57 @@ impl Step3p5MoE {
     }
 }
 
+trait CacheInterface {
+    fn offset(&self) -> i32;
+    fn update_and_fetch(
+        &mut self,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>);
+}
+
+impl CacheInterface for KVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        self.update_and_fetch(k, v)
+    }
+}
+
+impl CacheInterface for RotatingKVCache {
+    fn offset(&self) -> i32 {
+        self.offset
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        self.update_and_fetch(k, v)
+    }
+}
+
+enum Cache {
+    Standard(KVCache),
+    Rotating(RotatingKVCache),
+}
+
+impl Cache {
+    fn as_interface(&mut self) -> &mut dyn CacheInterface {
+        match self {
+            Cache::Standard(cache) => cache,
+            Cache::Rotating(cache) => cache,
+        }
+    }
+}
+
 // MLP Type (Dense or MoE).
 pub enum MLPType {
     Dense(Step3p5MLP),
@@ -776,10 +828,10 @@ pub struct Step3p5DecoderLayer {
 }
 
 impl Step3p5DecoderLayer {
-    pub fn forward(
+    fn forward(
         &self,
         x: &MlxArray,
-        cache: &mut KVCache,
+        cache: &mut dyn CacheInterface,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         // Attention with residual
@@ -863,13 +915,30 @@ pub struct Step3p5Model {
     /// Index of first full attention layer (for mask creation)
     full_idx: Option<usize>,
     eos_token_ids: Vec<i32>,
+    internal_caches: RefCell<Vec<Cache>>,
 }
 
 impl Step3p5Model {
-    pub fn forward_impl(
+    fn build_layer_caches(config: &Step3p5Config) -> Vec<Cache> {
+        (0..config.num_hidden_layers)
+            .map(|layer_idx| {
+                if config.is_sliding(layer_idx) {
+                    Cache::Rotating(RotatingKVCache::new(config.sliding_window))
+                } else {
+                    Cache::Standard(KVCache::new())
+                }
+            })
+            .collect()
+    }
+
+    fn reset_internal_caches(&self) {
+        *self.internal_caches.borrow_mut() = Self::build_layer_caches(&self.config);
+    }
+
+    fn forward_with_caches(
         &self,
         input_ids: &MlxArray,
-        caches: &mut [KVCache],
+        caches: &mut [Cache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(input_ids);
@@ -880,7 +949,7 @@ impl Step3p5Model {
         // Create masks for prefill
         let full_mask = if seq_len > 1 {
             self.full_idx.map(|idx| {
-                let offset = caches[idx].offset;
+                let offset = caches[idx].as_interface().offset();
                 create_causal_mask(seq_len, offset)
             })
         } else {
@@ -889,7 +958,7 @@ impl Step3p5Model {
 
         let swa_mask = if seq_len > 1 {
             self.swa_idx.map(|idx| {
-                let offset = caches[idx].offset;
+                let offset = caches[idx].as_interface().offset();
                 create_causal_mask_with_window(seq_len, offset, Some(self.config.sliding_window))
             })
         } else {
@@ -903,16 +972,12 @@ impl Step3p5Model {
             } else {
                 full_mask.as_ref().map(|m| m.as_ref().unwrap() as &MlxArray)
             };
-            h = layer.forward(&h, &mut caches[i], mask);
+            h = layer.forward(&h, caches[i].as_interface(), mask);
         }
 
         // Final norm and lm_head
         let h = self.norm.forward(&h);
         self.lm_head.forward(&h)
-    }
-
-    pub fn make_caches_impl(&self) -> Vec<KVCache> {
-        (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
 
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, Step3p5Config), String> {
@@ -1034,6 +1099,7 @@ impl Step3p5Model {
             swa_idx,
             full_idx,
             eos_token_ids: vec![2], // Default, overridden in load()
+            internal_caches: RefCell::new(Self::build_layer_caches(args)),
         })
     }
 }
@@ -1051,14 +1117,16 @@ impl LanguageModel for Step3p5Model {
     fn forward(
         &self,
         input_ids: &MlxArray,
-        caches: &mut [KVCache],
+        _caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_impl(input_ids, caches, mask)
+        let mut internal_caches = self.internal_caches.borrow_mut();
+        self.forward_with_caches(input_ids, &mut internal_caches, mask)
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
-        self.make_caches_impl()
+        self.reset_internal_caches();
+        (0..self.layers.len()).map(|_| KVCache::new()).collect()
     }
 
     fn num_layers(&self) -> usize {
@@ -1069,3 +1137,7 @@ impl LanguageModel for Step3p5Model {
         self.eos_token_ids.clone()
     }
 }
+
+#[cfg(test)]
+#[path = "step3p5_tests.rs"]
+mod tests;

@@ -309,6 +309,8 @@ impl RMSNormGated {
     }
 
     pub fn forward(&self, x: &MlxArray, gate: Option<&MlxArray>) -> UniquePtr<MlxArray> {
+        let target_dtype = mlxcel_core::array_dtype(x);
+
         // RMS normalization
         let x_sq = mlxcel_core::square(x);
         let mean_sq = mlxcel_core::mean_axis(&x_sq, -1, true);
@@ -318,12 +320,32 @@ impl RMSNormGated {
         let scaled = mlxcel_core::multiply(&normed, &self.weight);
 
         // Apply SwiGLU gating: silu(gate) * x
-        // Python: swiglu(gate, x) = nn.silu(gate) * x
+        // Python mlx-lm promotes the gated path to float32 before restoring the
+        // hidden-state dtype so Qwen3Next/Qwen3.5 keep the expected precision.
         if let Some(g) = gate {
-            let g_silu = silu(g);
-            mlxcel_core::multiply(&scaled, &g_silu)
+            precise_swiglu_gate(&scaled, g, target_dtype)
         } else {
-            scaled
+            restore_dtype(scaled, target_dtype)
         }
     }
 }
+
+fn restore_dtype(value: UniquePtr<MlxArray>, target_dtype: i32) -> UniquePtr<MlxArray> {
+    if mlxcel_core::array_dtype(&value) == target_dtype {
+        value
+    } else {
+        mlxcel_core::astype(&value, target_dtype)
+    }
+}
+
+fn precise_swiglu_gate(x: &MlxArray, gate: &MlxArray, target_dtype: i32) -> UniquePtr<MlxArray> {
+    let gate_f32 = mlxcel_core::astype(gate, dtype::FLOAT32);
+    let gate_silu = silu(&gate_f32);
+    let x_f32 = mlxcel_core::astype(x, dtype::FLOAT32);
+    let product = mlxcel_core::multiply(&gate_silu, &x_f32);
+    restore_dtype(product, target_dtype)
+}
+
+#[cfg(test)]
+#[path = "gated_delta_tests.rs"]
+mod tests;

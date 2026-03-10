@@ -12,6 +12,7 @@ VLM_IMAGE="tests/fixtures/test_image.png"
 SERIAL_HELPER_TESTS=(
   gemma3n_helpers_tests
   llama4_helpers_tests
+  models::gated_delta::tests
 )
 
 usage() {

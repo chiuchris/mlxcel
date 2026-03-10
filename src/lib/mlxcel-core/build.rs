@@ -34,7 +34,10 @@ fn main() {
         .include("cpp")
         .flag_if_supported("-std=c++17")
         .flag_if_supported("-Wno-unused-parameter")
-        .flag_if_supported("-Wno-deprecated-declarations");
+        .flag_if_supported("-Wno-deprecated-declarations")
+        // MLX v0.31.0 triggers a Clang deprecated-copy warning from bf16.h when
+        // included by the generated cxx bridge, so suppress it for all profiles.
+        .flag_if_supported("-Wno-deprecated-copy");
 
     // Add optimization flags for release builds
     #[cfg(not(debug_assertions))]
@@ -44,8 +47,7 @@ fn main() {
             .flag_if_supported("-DNDEBUG")
             .flag_if_supported("-flto")
             .flag_if_supported("-ffast-math")
-            .flag_if_supported("-march=native")
-            .flag_if_supported("-Wno-deprecated-copy");
+            .flag_if_supported("-march=native");
     }
 
     bridge.compile("mlx_cxx_bridge");
