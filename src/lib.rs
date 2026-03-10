@@ -26,6 +26,7 @@ pub mod tokenizer;
 pub mod vision;
 
 mod loaded_model;
+mod loaded_model_capabilities;
 mod loading;
 mod model_metadata;
 
@@ -42,5 +43,6 @@ pub use mlxcel_core::speculative::SpeculativeGenerator;
 pub use multimodal::{phi3v_prompt, qwen_vl, vlm_prompt, vlm_runtime};
 
 // Re-export split modules
-pub use loaded_model::{LoadedModel, VlmRuntimeRef};
+pub use loaded_model::LoadedModel;
+pub use loaded_model_capabilities::VlmRuntimeRef;
 pub use loading::{load_model, load_model_with_adapter, read_eos_token_ids};

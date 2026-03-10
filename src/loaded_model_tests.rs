@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::standard_image_token_block_info;
+use super::{
+    VlmRuntimeRef, image_token_block_info_from_runtime, standard_image_token_block_info,
+    vision_module_from_runtime,
+};
 use crate::vision::connectors::MultiModalConnector;
 use crate::vision::encoders::{VisionEncoder, VisionEncoderOutput};
 use crate::vision::processors::ImageProcessor;
@@ -88,4 +91,23 @@ fn standard_image_token_block_info_disables_boi_eoi_when_tokens_are_absent() {
     assert!(!info.use_boi_eoi);
     assert_eq!(info.boi_token_id, 0);
     assert_eq!(info.eoi_token_id, 0);
+}
+
+#[test]
+fn vision_module_from_runtime_returns_standard_module_reference() {
+    let module = test_vision_module();
+    let returned = vision_module_from_runtime(VlmRuntimeRef::Standard(&module)).unwrap();
+
+    assert_eq!(returned.image_token_id, module.image_token_id);
+    assert_eq!(returned.mm_tokens_per_image, module.mm_tokens_per_image);
+}
+
+#[test]
+fn image_token_block_info_from_runtime_uses_standard_runtime_path() {
+    let module = test_vision_module();
+    let info = image_token_block_info_from_runtime(VlmRuntimeRef::Standard(&module)).unwrap();
+
+    assert_eq!(info.image_token_id, module.image_token_id);
+    assert_eq!(info.mm_tokens_per_image, module.mm_tokens_per_image);
+    assert_eq!(info.separator_token_id, module.separator_token_id);
 }
