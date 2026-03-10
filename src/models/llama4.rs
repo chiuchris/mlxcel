@@ -17,6 +17,9 @@
 //! This is a parallel implementation of Llama 4 using direct C++ bindings
 //! to leverage kernel fusion for the MoE layers.
 
+use crate::models::llama4_helpers::{
+    create_chunked_attention_mask, get_weight_copy, load_quantized_linear,
+};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{ChunkedKVCache, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -1387,87 +1390,6 @@ impl SwitchLinear {
 /// - chunk_size: Size of each attention chunk
 ///
 /// Returns: Boolean mask where True allows attention
-fn create_chunked_attention_mask(
-    seq_len: i32,
-    start_position: i32,
-    offset: i32,
-    chunk_size: usize,
-) -> UniquePtr<MlxArray> {
-    let end = offset + seq_len;
-    let chunk_size = chunk_size as i32;
-
-    // linds: key positions (visible window from start to end)
-    // These are the positions that can be attended TO
-    // Shape: [end - start_position] = visible_window_size
-    let linds = mlxcel_core::arange_i32(start_position, end, 1);
-
-    // rinds: query positions (current tokens being processed)
-    // These are the positions doing the attending
-    // Shape: [seq_len, 1] (column vector for broadcasting)
-    let rinds = mlxcel_core::arange_i32(offset, end, 1);
-    let rinds = mlxcel_core::reshape(&rinds, &[seq_len, 1]);
-
-    let visible_len = end - start_position;
-
-    // block_pos = |floor(linds / chunk_size) - floor(rinds / chunk_size)|
-    // Python uses // which is floor division; we need to explicitly floor
-    let chunk_size_f = mlxcel_core::full_f32(&[1], chunk_size as f32, mlxcel_core::dtype::FLOAT32);
-    let linds_f = mlxcel_core::astype(&linds, mlxcel_core::dtype::FLOAT32);
-    let rinds_f = mlxcel_core::astype(&rinds, mlxcel_core::dtype::FLOAT32);
-    let linds_block = mlxcel_core::floor_divide(&linds_f, &chunk_size_f);
-    let rinds_block = mlxcel_core::floor_divide(&rinds_f, &chunk_size_f);
-
-    // Reshape for broadcasting: linds_block [visible_len] -> [1, visible_len]
-    let linds_block = mlxcel_core::reshape(&linds_block, &[1, visible_len]);
-
-    let block_diff = mlxcel_core::subtract(&rinds_block, &linds_block);
-    let block_pos = mlxcel_core::abs(&block_diff);
-
-    // same_block = (block_pos == 0)
-    let zero_f = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
-    let same_block = mlxcel_core::equal(&block_pos, &zero_f);
-
-    // token_pos = (linds <= rinds) means key position <= query position (causal)
-    // Reshape linds for broadcasting: [visible_len] -> [1, visible_len]
-    // Note: Using the original integer linds and rinds for causal comparison
-    let linds_reshaped = mlxcel_core::reshape(&linds, &[1, visible_len]);
-    let rinds_orig = mlxcel_core::arange_i32(offset, end, 1);
-    let rinds_reshaped = mlxcel_core::reshape(&rinds_orig, &[seq_len, 1]);
-    let causal = mlxcel_core::less_equal(&linds_reshaped, &rinds_reshaped);
-
-    // chunk_mask = same_block & causal
-    let bool_mask = mlxcel_core::logical_and(&same_block, &causal);
-
-    // Convert boolean mask to additive float mask (0.0 for allow, -inf for block)
-    // This is required by SDPA which adds the mask to attention scores
-    let zeros = mlxcel_core::zeros(&[seq_len, visible_len], mlxcel_core::dtype::FLOAT32);
-    let neg_inf = mlxcel_core::full_f32(&[1], f32::NEG_INFINITY, mlxcel_core::dtype::FLOAT32);
-    mlxcel_core::where_cond(&bool_mask, &zeros, &neg_inf)
-}
-
-// Helper functions for weight loading.
-/// Get a copy of a weight from the weight map
-/// NOTE: We create a deep copy by doing identity operation + eval
-fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
-    weights
-        .get(name)
-        .map(|w| {
-            // Use copy to create an independent array
-            // Note: Don't eval here - let MLX batch evaluations
-            mlxcel_core::copy(w)
-        })
-        .ok_or_else(|| format!("Weight not found: {}", name))
-}
-
-/// Load a quantized linear layer from weights (falls back to Linear for non-quantized)
-fn load_quantized_linear(
-    weights: &WeightMap,
-    prefix: &str,
-    args: &TextArgs,
-) -> Result<UnifiedLinear, String> {
-    UnifiedLinear::from_weights(weights, prefix, args.group_size(), args.bits())
-}
-
 // LanguageModel trait implementation.
 impl LanguageModel for Llama4CxxModel {
     fn forward(

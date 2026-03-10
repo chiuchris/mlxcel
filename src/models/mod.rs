@@ -17,6 +17,8 @@
 //! All implementations use mlxcel-core for direct MLX C++ bindings.
 
 mod detection;
+mod gemma3n_helpers;
+mod llama4_helpers;
 mod sanitize;
 
 // Shared modules
@@ -274,6 +276,14 @@ pub enum ModelType {
 #[cfg(test)]
 #[path = "detection_tests.rs"]
 mod detection_tests;
+
+#[cfg(test)]
+#[path = "gemma3n_helpers_tests.rs"]
+mod gemma3n_helpers_tests;
+
+#[cfg(test)]
+#[path = "llama4_helpers_tests.rs"]
+mod llama4_helpers_tests;
 
 #[cfg(test)]
 #[path = "sanitize_tests.rs"]

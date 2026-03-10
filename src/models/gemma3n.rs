@@ -23,6 +23,10 @@
 //! - gelu_topk activation with sparsity pattern
 //! - Logit softcapping
 
+use crate::models::gemma3n_helpers::{
+    apply_softcap, compute_magnitude, mean_arrays, normalize_magnitudes,
+    normalize_magnitudes_from_idx, slice_layer_input, stack_arrays,
+};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
@@ -1416,75 +1420,4 @@ impl Gemma3nMultimodalEmbedder {
             post_projection_norm,
         })
     }
-}
-
-// Helper functions.
-/// Stack arrays along a new axis
-fn stack_arrays(arrays: &[UniquePtr<MlxArray>], axis: i32) -> UniquePtr<MlxArray> {
-    let ptrs: Vec<*const MlxArray> = arrays
-        .iter()
-        .map(|a| a.as_ref().unwrap() as *const _)
-        .collect();
-    mlxcel_core::stack(&ptrs, axis)
-}
-
-/// Compute magnitude (RMS) of array along last axis
-fn compute_magnitude(x: &MlxArray) -> UniquePtr<MlxArray> {
-    let sq = mlxcel_core::square(x);
-    let mean = mlxcel_core::mean_axis(&sq, -1, true);
-    mlxcel_core::sqrt(&mean)
-}
-
-/// Normalize magnitudes of arrays starting from idx 1
-fn normalize_magnitudes(arrays: &mut [UniquePtr<MlxArray>], target_magnitude: &MlxArray) {
-    let eps = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::dtype::FLOAT32);
-    for item in arrays.iter_mut().skip(1) {
-        let mag = compute_magnitude(item);
-        let mag_safe = mlxcel_core::maximum(&mag, &eps);
-        let scale = mlxcel_core::divide(target_magnitude, &mag_safe);
-        *item = mlxcel_core::multiply(item, &scale);
-    }
-}
-
-/// Normalize magnitudes of arrays starting from specified index
-fn normalize_magnitudes_from_idx(
-    arrays: &mut [UniquePtr<MlxArray>],
-    start_idx: usize,
-    target_magnitude: &MlxArray,
-) {
-    let eps = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::dtype::FLOAT32);
-    for item in arrays.iter_mut().skip(start_idx) {
-        let mag = compute_magnitude(item);
-        let mag_safe = mlxcel_core::maximum(&mag, &eps);
-        let scale = mlxcel_core::divide(target_magnitude, &mag_safe);
-        *item = mlxcel_core::multiply(item, &scale);
-    }
-}
-
-/// Mean of arrays
-fn mean_arrays(arrays: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray> {
-    let stacked = stack_arrays(arrays, 0);
-    mlxcel_core::mean_axis(&stacked, 0, false)
-}
-
-/// Apply softcap to logits: cap * tanh(logits / cap)
-fn apply_softcap(logits: &MlxArray, cap: f32) -> UniquePtr<MlxArray> {
-    let cap_arr = mlxcel_core::full_f32(&[1], cap, mlxcel_core::dtype::FLOAT32);
-    let scaled = mlxcel_core::divide(logits, &cap_arr);
-    let tanh_out = mlxcel_core::tanh(&scaled);
-    mlxcel_core::multiply(&tanh_out, &cap_arr)
-}
-
-/// Slice per-layer input for a specific layer
-fn slice_layer_input(
-    per_layer_inputs: &MlxArray,
-    layer_idx: i32,
-    b: i32,
-    l: i32,
-    hidden_size: i32,
-) -> UniquePtr<MlxArray> {
-    let start = vec![0, 0, layer_idx, 0];
-    let stop = vec![b, l, layer_idx + 1, hidden_size];
-    let sliced = mlxcel_core::slice(per_layer_inputs, &start, &stop);
-    mlxcel_core::squeeze_axis(&sliced, 2)
 }
