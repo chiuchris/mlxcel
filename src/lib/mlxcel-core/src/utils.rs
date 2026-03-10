@@ -179,12 +179,13 @@ pub fn silu(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::silu(x)
 }
 
-/// GELU activation (Gaussian Error Linear Unit)
-/// Uses fast approximate GELU: x * sigmoid(1.702 * x)
+/// GELU activation with sigmoid approximation: x * sigmoid(1.702 * x)
+///
+/// NOTE: This is NOT the same as exact GELU or tanh-approximate GELU.
+/// For exact GELU, use `ffi::gelu()` (re-exported as `mlxcel_core::gelu`).
+/// For tanh-approximate GELU, use `gelu_approx()`.
 #[inline]
-pub fn gelu(x: &MlxArray) -> UniquePtr<MlxArray> {
-    // Fast GELU approximation: x * sigmoid(1.702 * x)
-    // This is the approximation used by many frameworks
+pub fn gelu_sigmoid(x: &MlxArray) -> UniquePtr<MlxArray> {
     let coef = ffi::full_f32(&[1], 1.702, dtype::FLOAT32);
     let scaled = ffi::multiply(&coef, x);
     let sigmoid_x = ffi::sigmoid(&scaled);

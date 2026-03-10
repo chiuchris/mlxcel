@@ -161,6 +161,7 @@ struct Moondream3Attention {
     num_heads: i32,
     num_kv_heads: i32,
     head_dim: i32,
+    rope_dims: i32,
     scale: f32,
 }
 
@@ -185,6 +186,7 @@ impl Moondream3Attention {
             num_heads: config.n_heads as i32,
             num_kv_heads: config.n_kv_heads as i32,
             head_dim: config.head_dim() as i32,
+            rope_dims: (config.head_dim() / 2) as i32,
             scale: 1.0 / (config.head_dim() as f32).sqrt(),
         })
     }
@@ -214,10 +216,11 @@ impl Moondream3Attention {
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
         let offset = cache.offset;
+
         let q = self.apply_tau_to_q(&qkv, &q, offset);
         let v = self.apply_tau_to_v(&qkv, &v, offset);
-        let q = mlxcel_core::fast_rope(&q, self.head_dim, false, 10000.0, 1.0, offset);
-        let k = mlxcel_core::fast_rope(&k, self.head_dim, false, 10000.0, 1.0, offset);
+        let q = mlxcel_core::fast_rope(&q, self.rope_dims, true, 1500000.0, 1.0, offset);
+        let k = mlxcel_core::fast_rope(&k, self.rope_dims, true, 1500000.0, 1.0, offset);
 
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
         let attn = if seq_len > 1 && mask.is_none() {
@@ -253,7 +256,8 @@ impl Moondream3Attention {
         let qkv_shape = mlxcel_core::array_shape(qkv);
         let seq_len = qkv_shape[1] as usize;
 
-        let tok_feat = mlxcel_core::gelu_approx(qkv);
+        // Moondream3 tau uses exact GELU (F.gelu), not tanh-approximate
+        let tok_feat = mlxcel_core::gelu(qkv);
         let tau_weight = mlxcel_core::swap_axes(weight, -1, -2);
         let tok = mlxcel_core::matmul(&tok_feat, &tau_weight);
         let tok = mlxcel_core::tanh(&tok);
@@ -378,7 +382,8 @@ impl SparseMoeMlp {
             self.expert_inner_dim as i32,
             (self.expert_inner_dim * 2) as i32,
         );
-        let h = mlxcel_core::gelu_approx(&h);
+        // Moondream3 MoE GeGLU uses exact GELU (F.gelu), not tanh-approximate
+        let h = mlxcel_core::gelu(&h);
         let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
         let one = mlxcel_core::astype(&one, mlxcel_core::array_dtype(&g));
         let g = mlxcel_core::add(&g, &one);

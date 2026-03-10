@@ -141,6 +141,23 @@ pub(crate) fn prepare_request_vlm_embeddings(
     images: &[Vec<u8>],
 ) -> Result<Option<InputEmbeddings>> {
     if images.is_empty() || !model.is_vlm() {
+        // Moondream3 needs special prompt formatting even for text-only
+        if images.is_empty() && matches!(model, LoadedModel::Moondream3VLM(_)) {
+            let prepared = crate::moondream3_prompt::prepare_moondream3_prompt_tokens(
+                prompt,
+                0,
+                |text, add_special| {
+                    tokenizer
+                        .encode(text, add_special)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&t| t as i32)
+                        .collect()
+                },
+            )
+            .map_err(|e| anyhow!("{}", e))?;
+            *prompt_tokens = prepared.tokens;
+        }
         return Ok(None);
     }
 

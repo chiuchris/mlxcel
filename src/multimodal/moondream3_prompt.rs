@@ -14,6 +14,7 @@
 
 //! Prompt shaping for Moondream3 query/caption flows.
 
+pub const MOONDREAM3_BOS_ID: i32 = 0;
 pub const MOONDREAM3_QUERY_PREFIX: &[i32] = &[1, 15381, 2];
 pub const MOONDREAM3_QUERY_SUFFIX: &[i32] = &[3];
 pub const MOONDREAM3_CAPTION_NORMAL: &[i32] = &[1, 32708, 2, 6382, 3];
@@ -38,11 +39,26 @@ pub fn prepare_moondream3_prompt_tokens<E>(
 where
     E: FnMut(&str, bool) -> Vec<i32>,
 {
-    if image_count != 1 {
+    if image_count > 1 {
         return Err(format!(
-            "Moondream3 currently supports exactly one image, got {}",
+            "Moondream3 currently supports at most one image, got {}",
             image_count
         ));
+    }
+
+    if image_count == 0 {
+        // Text-only: [BOS=0] + prefix + question + suffix
+        if prompt.trim().is_empty() {
+            return Err("Moondream3 text-only query requires a non-empty prompt".to_string());
+        }
+        let mut tokens = vec![MOONDREAM3_BOS_ID];
+        tokens.extend(MOONDREAM3_QUERY_PREFIX);
+        tokens.extend(encode(prompt, false));
+        tokens.extend(MOONDREAM3_QUERY_SUFFIX);
+        return Ok(PreparedMoondream3Prompt {
+            tokens,
+            mode: Moondream3PromptMode::Query,
+        });
     }
 
     if prompt.trim().is_empty() {

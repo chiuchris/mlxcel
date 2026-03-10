@@ -112,6 +112,23 @@ pub(crate) fn compute_vlm_embeddings(
     tokenizer: &MlxcelTokenizer,
 ) -> Result<Option<InputEmbeddings>> {
     if image_paths.is_empty() {
+        // Moondream3 needs special prompt formatting even for text-only
+        if matches!(model, LoadedModel::Moondream3VLM(_)) {
+            let prepared = mlxcel::moondream3_prompt::prepare_moondream3_prompt_tokens(
+                prompt,
+                0,
+                |text, add_special| {
+                    tokenizer
+                        .encode(text, add_special)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&t| t as i32)
+                        .collect()
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
+            *prompt_tokens = prepared.tokens;
+        }
         return Ok(None);
     }
 
