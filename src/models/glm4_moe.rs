@@ -32,7 +32,12 @@ use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
+fn default_one() -> usize {
+    1
+}
+
 // Configuration.
+// Used by: GLM4 MoE, Solar Open
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
     pub model_type: String,
@@ -61,7 +66,10 @@ pub struct ModelArgs {
     // MoE parameters
     pub n_routed_experts: usize,
     pub num_experts_per_tok: usize,
+    // Used by: GLM4 MoE, Solar Open
+    #[serde(default = "default_one")]
     pub n_group: usize,
+    #[serde(default = "default_one")]
     pub topk_group: usize,
     pub routed_scaling_factor: f32,
     pub norm_topk_prob: bool,
