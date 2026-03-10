@@ -64,7 +64,7 @@ async fn non_stream_chat_completion(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
 
-    let prepared = prepare_chat_request(&state.chat_template, &request);
+    let prepared = prepare_chat_request(&state.chat_template, &request).await;
     let options = build_generate_options(&request.params, &state.config);
 
     // Generate (blocking call handled by model provider's worker thread)
@@ -98,7 +98,7 @@ async fn stream_chat_completion(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
-    let prepared = prepare_chat_request(&state.chat_template, &request);
+    let prepared = prepare_chat_request(&state.chat_template, &request).await;
     let options = build_generate_options(&request.params, &state.config);
 
     let (events, stream) = sse_channel(100);

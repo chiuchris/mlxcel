@@ -46,7 +46,8 @@ pub enum ContentPart {
     /// Text content
     #[serde(rename = "text")]
     Text { text: String },
-    /// Image URL content (supports base64 data URIs and file:// URLs)
+    /// Image URL content (supports base64 data URIs, `file://`, local paths,
+    /// and `http(s)` URLs)
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
 }
@@ -54,7 +55,8 @@ pub enum ContentPart {
 /// Image URL reference
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageUrl {
-    /// URL: base64 data URI (data:image/...;base64,...) or file:// path
+    /// URL: `data:image/...;base64,...`, `file://...`, bare local path, or
+    /// `http(s)://...`
     pub url: String,
 }
 

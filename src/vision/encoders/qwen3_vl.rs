@@ -20,6 +20,7 @@
 //! - DeepStack multi-layer visual injection
 //! - No windowed attention (simpler than Qwen2.5-VL)
 //! - cu_seqlens = h * w per frame (not multiplied by spatial_merge_unit)
+//! - Fused SDPA head-dim padding to match upstream MLX kernel preferences
 //!
 //! Used by: Qwen3-VL
 //! Reference: references/mlx-vlm/mlx_vlm/models/qwen3_vl/vision.py
@@ -345,6 +346,54 @@ impl PositionEmbedding {
 }
 
 // Vision Attention - fused QKV, same as Qwen2-VL.
+//
+// Qwen3-VL uses head dimensions (e.g. 72/96) that do not always map to the
+// fused MLX SDPA kernel's preferred widths. Matching upstream `mlx-vlm`, pad
+// the head dimension to the next supported fused width, run attention, then
+// slice the result back to the original size.
+fn fused_sdpa_target_dim(head_dim: i32) -> i32 {
+    const SUPPORTED_FUSED_HEAD_DIMS: [i32; 3] = [64, 80, 128];
+    SUPPORTED_FUSED_HEAD_DIMS
+        .into_iter()
+        .find(|&candidate| head_dim <= candidate)
+        .unwrap_or(head_dim)
+}
+
+fn sdpa_pad_width(ndim: usize, original_dim: i32, target_dim: i32) -> Option<Vec<i32>> {
+    if target_dim <= original_dim {
+        return None;
+    }
+
+    let mut pad_width = vec![0; ndim * 2];
+    pad_width[ndim * 2 - 1] = target_dim - original_dim;
+    Some(pad_width)
+}
+
+fn ensure_fused_sdpa(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+) -> UniquePtr<MlxArray> {
+    let head_dim = *mlxcel_core::array_shape(q)
+        .last()
+        .expect("vision attention queries should have a head dimension");
+    let target_dim = fused_sdpa_target_dim(head_dim);
+    let mask_ptr = mask.map_or(std::ptr::null(), |mask| mask as *const MlxArray);
+
+    if let Some(pad_width) = sdpa_pad_width(mlxcel_core::array_ndim(q), head_dim, target_dim) {
+        let q = mlxcel_core::pad(q, &pad_width, 0.0);
+        let k = mlxcel_core::pad(k, &pad_width, 0.0);
+        let v = mlxcel_core::pad(v, &pad_width, 0.0);
+        let attn =
+            unsafe { mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, scale, mask_ptr) };
+        mlxcel_core::slice_last_dim(&attn, 0, head_dim)
+    } else {
+        unsafe { mlxcel_core::fast_scaled_dot_product_attention(q, k, v, scale, mask_ptr) }
+    }
+}
+
 struct VisionAttention {
     qkv: UnifiedLinear,
     proj: UnifiedLinear,
@@ -442,15 +491,7 @@ impl VisionAttention {
                 &[1, self.num_heads, end, self.head_dim],
             );
 
-            let attn = unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
-                    &q_seg,
-                    &k_seg,
-                    &v_seg,
-                    self.scale,
-                    std::ptr::null(),
-                )
-            };
+            let attn = ensure_fused_sdpa(&q_seg, &k_seg, &v_seg, self.scale, None);
             attn_outputs.push(attn);
         }
 
@@ -467,6 +508,10 @@ impl VisionAttention {
         self.proj.forward(&output)
     }
 }
+
+#[cfg(test)]
+#[path = "qwen3_vl_tests.rs"]
+mod tests;
 
 // Vision MLP - GELU (like Qwen2-VL, NOT SwiGLU like Qwen2.5-VL).
 // Weight keys: linear_fc1, linear_fc2 (not fc1/fc2 or gate_proj/up_proj/down_proj).

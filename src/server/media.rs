@@ -15,33 +15,49 @@
 //! Shared request-media helpers for server routes.
 //!
 //! Keeping image-source parsing at the HTTP edge makes it easier to add new
-//! request formats without growing individual route handlers.
+//! request formats without growing individual route handlers. The helpers stay
+//! async so local file reads and remote URL fetches do not block Axum workers.
 
 use base64::Engine;
+use std::{path::Path, sync::OnceLock, time::Duration};
 
 use super::types::ChatCompletionRequest;
 
-pub(crate) fn extract_chat_image_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
-    collect_image_data(request.image_urls())
+pub(crate) async fn extract_chat_image_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
+    collect_image_data(request.image_urls()).await
 }
 
-pub(crate) fn collect_image_data<I, S>(urls: I) -> Vec<Vec<u8>>
+pub(crate) async fn collect_image_data<I, S>(urls: I) -> Vec<Vec<u8>>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    urls.into_iter()
-        .filter_map(|url| read_image_url(url.as_ref()))
-        .collect()
+    let mut images = Vec::new();
+
+    for url in urls {
+        if let Some(bytes) = read_image_url(url.as_ref()).await {
+            images.push(bytes);
+        }
+    }
+
+    images
 }
 
-pub(crate) fn read_image_url(url: &str) -> Option<Vec<u8>> {
-    if url.starts_with("data:") {
+pub(crate) async fn read_image_url(url: &str) -> Option<Vec<u8>> {
+    if url.starts_with("data:image/") {
         return decode_data_uri(url);
     }
 
     if let Some(path) = url.strip_prefix("file://") {
-        return read_local_image(path);
+        return read_local_image(Path::new(path)).await;
+    }
+
+    if is_http_url(url) {
+        return fetch_remote_image(url).await;
+    }
+
+    if Path::new(url).is_file() {
+        return read_local_image(Path::new(url)).await;
     }
 
     tracing::warn!("Unsupported image URL scheme: {}", url);
@@ -68,14 +84,54 @@ fn decode_data_uri(url: &str) -> Option<Vec<u8>> {
     }
 }
 
-fn read_local_image(path: &str) -> Option<Vec<u8>> {
-    match std::fs::read(path) {
-        Ok(bytes) => Some(bytes),
+fn is_http_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
+
+async fn fetch_remote_image(url: &str) -> Option<Vec<u8>> {
+    let response = match http_image_client().get(url).send().await {
+        Ok(response) => response,
         Err(err) => {
-            tracing::warn!("Failed to read image file {}: {}", path, err);
+            tracing::warn!("Failed to fetch image URL {}: {}", url, err);
+            return None;
+        }
+    };
+
+    let response = match response.error_for_status() {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!("Image URL returned error status {}: {}", url, err);
+            return None;
+        }
+    };
+
+    match response.bytes().await {
+        Ok(bytes) => Some(bytes.to_vec()),
+        Err(err) => {
+            tracing::warn!("Failed to read image response body {}: {}", url, err);
             None
         }
     }
+}
+
+async fn read_local_image(path: &Path) -> Option<Vec<u8>> {
+    match tokio::fs::read(path).await {
+        Ok(bytes) => Some(bytes),
+        Err(err) => {
+            tracing::warn!("Failed to read image file {}: {}", path.display(), err);
+            None
+        }
+    }
+}
+
+fn http_image_client() -> &'static reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("server image client should build")
+    })
 }
 
 #[cfg(test)]

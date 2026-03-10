@@ -53,8 +53,8 @@ fn build_chat_messages_flattens_text_parts() {
     assert_eq!(messages[0].content, "Hello world");
 }
 
-#[test]
-fn prepare_chat_request_uses_template_output_and_extracts_images() {
+#[tokio::test]
+async fn prepare_chat_request_uses_template_output_and_extracts_images() {
     let request = request_with_messages(vec![Message {
         role: Role::User,
         content: MessageContent::Parts(vec![
@@ -72,13 +72,13 @@ fn prepare_chat_request_uses_template_output_and_extracts_images() {
     let processor =
         ChatTemplateProcessor::with_template("Prompt: {{ messages[0].content }}".to_string());
 
-    let prepared = prepare_chat_request(&processor, &request);
+    let prepared = prepare_chat_request(&processor, &request).await;
     assert_eq!(prepared.prompt, "Prompt: Look");
     assert_eq!(prepared.image_data, vec![b"hello".to_vec()]);
 }
 
-#[test]
-fn prepare_chat_request_falls_back_to_simple_prompt_on_template_error() {
+#[tokio::test]
+async fn prepare_chat_request_falls_back_to_simple_prompt_on_template_error() {
     let request = request_with_messages(vec![Message {
         role: Role::User,
         content: MessageContent::Text("Hello".to_string()),
@@ -86,6 +86,6 @@ fn prepare_chat_request_falls_back_to_simple_prompt_on_template_error() {
     }]);
     let processor = ChatTemplateProcessor::with_template("{% if %}".to_string());
 
-    let prepared = prepare_chat_request(&processor, &request);
+    let prepared = prepare_chat_request(&processor, &request).await;
     assert_eq!(prepared.prompt, request.to_prompt());
 }

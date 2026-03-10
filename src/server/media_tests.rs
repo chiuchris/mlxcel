@@ -18,6 +18,8 @@ use super::{collect_image_data, extract_chat_image_data, read_image_url};
 use crate::server::types::{
     ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent, Role, SamplingParams,
 };
+use base64::Engine;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
     ChatCompletionRequest {
@@ -32,29 +34,82 @@ fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
     }
 }
 
-#[test]
-fn read_image_url_decodes_base64_data_uri() {
-    let bytes = read_image_url("data:image/png;base64,aGVsbG8=").unwrap();
+fn tiny_png_bytes() -> Vec<u8> {
+    base64::engine::general_purpose::STANDARD
+        .decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO2N1ekAAAAASUVORK5CYII=")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn read_image_url_decodes_base64_data_uri() {
+    let bytes = read_image_url("data:image/png;base64,aGVsbG8=")
+        .await
+        .unwrap();
     assert_eq!(bytes, b"hello");
 }
 
-#[test]
-fn read_image_url_rejects_non_base64_data_uri() {
-    assert!(read_image_url("data:image/png,hello").is_none());
+#[tokio::test]
+async fn read_image_url_rejects_non_base64_data_uri() {
+    assert!(read_image_url("data:image/png,hello").await.is_none());
 }
 
-#[test]
-fn collect_image_data_skips_invalid_entries() {
+#[tokio::test]
+async fn read_image_url_rejects_malformed_data_uri() {
+    assert!(read_image_url("data:image/png;base64").await.is_none());
+}
+
+#[tokio::test]
+async fn read_image_url_reads_bare_local_paths() {
+    let path = std::env::temp_dir().join(format!("mlxcel-media-{}.png", uuid::Uuid::new_v4()));
+    let payload = tiny_png_bytes();
+    fs::write(&path, &payload).unwrap();
+
+    let bytes = read_image_url(path.to_str().unwrap()).await.unwrap();
+    assert_eq!(bytes, payload);
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn read_image_url_fetches_http_urls() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let payload = tiny_png_bytes();
+    let payload_clone = payload.clone();
+
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = [0u8; 1024];
+        let _ = socket.read(&mut request).await.unwrap();
+
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: image/png\r\nConnection: close\r\n\r\n",
+            payload_clone.len()
+        );
+        socket.write_all(header.as_bytes()).await.unwrap();
+        socket.write_all(&payload_clone).await.unwrap();
+    });
+
+    let url = format!("http://{}/image.png", addr);
+    let bytes = read_image_url(&url).await.unwrap();
+    assert_eq!(bytes, payload);
+
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn collect_image_data_skips_invalid_entries() {
     let images = collect_image_data([
         "data:image/png;base64,aGVsbG8=",
-        "https://example.com/image.png",
+        "ftp://example.com/image.png",
         "data:image/png;base64,%%%bad%%%",
-    ]);
+    ])
+    .await;
     assert_eq!(images, vec![b"hello".to_vec()]);
 }
 
-#[test]
-fn extract_chat_image_data_reads_file_urls() {
+#[tokio::test]
+async fn extract_chat_image_data_reads_file_urls() {
     let path = std::env::temp_dir().join(format!("mlxcel-media-{}.bin", uuid::Uuid::new_v4()));
     fs::write(&path, b"image-bytes").unwrap();
 
@@ -64,14 +119,14 @@ fn extract_chat_image_data_reads_file_urls() {
         },
     }]);
 
-    let images = extract_chat_image_data(&request);
+    let images = extract_chat_image_data(&request).await;
     assert_eq!(images, vec![b"image-bytes".to_vec()]);
 
     fs::remove_file(path).unwrap();
 }
 
-#[test]
-fn extract_chat_image_data_collects_images_across_messages() {
+#[tokio::test]
+async fn extract_chat_image_data_collects_images_across_messages() {
     let request = ChatCompletionRequest {
         model: "test-model".to_string(),
         messages: vec![
@@ -104,6 +159,6 @@ fn extract_chat_image_data_collects_images_across_messages() {
         params: SamplingParams::default(),
     };
 
-    let images = extract_chat_image_data(&request);
+    let images = extract_chat_image_data(&request).await;
     assert_eq!(images, vec![b"hello".to_vec(), b"world".to_vec()]);
 }

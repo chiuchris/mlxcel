@@ -26,7 +26,7 @@ pub(crate) struct PreparedChatRequest {
     pub(crate) image_data: Vec<Vec<u8>>,
 }
 
-pub(crate) fn prepare_chat_request(
+pub(crate) async fn prepare_chat_request(
     processor: &ChatTemplateProcessor,
     request: &ChatCompletionRequest,
 ) -> PreparedChatRequest {
@@ -38,7 +38,7 @@ pub(crate) fn prepare_chat_request(
 
     PreparedChatRequest {
         prompt,
-        image_data: extract_chat_image_data(request),
+        image_data: extract_chat_image_data(request).await,
     }
 }
 
