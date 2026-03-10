@@ -195,6 +195,10 @@ impl ModelProvider {
     }
 }
 
+fn send_shutdown_signal(request_tx: &mpsc::Sender<ModelRequest>) -> bool {
+    request_tx.send(ModelRequest::Shutdown).is_ok()
+}
+
 fn drain_generation_events<F>(
     response_rx: mpsc::Receiver<GenerateEvent>,
     mut on_token: F,
@@ -214,14 +218,9 @@ where
 
 impl Drop for ModelProvider {
     fn drop(&mut self) {
-        // Send shutdown signal
-        let _ = self.request_tx.send(ModelRequest::Shutdown);
+        let _ = send_shutdown_signal(&self.request_tx);
     }
 }
-
-// ModelProvider is Send + Sync because it only contains channels and atomics
-unsafe impl Send for ModelProvider {}
-unsafe impl Sync for ModelProvider {}
 
 #[cfg(test)]
 #[path = "model_provider_tests.rs"]

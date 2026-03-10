@@ -14,7 +14,7 @@
 
 use std::sync::mpsc;
 
-use super::{GenerateEvent, GenerationResult, drain_generation_events};
+use super::{GenerateEvent, GenerationResult, ModelProvider, ModelRequest, drain_generation_events, send_shutdown_signal};
 
 fn sample_result() -> GenerationResult {
     GenerationResult {
@@ -58,4 +58,24 @@ fn drain_generation_events_reports_closed_channel() {
     drop(tx);
     let err = drain_generation_events(rx, |_| {}).unwrap_err();
     assert!(err.to_string().contains("Response channel closed"));
+}
+
+#[test]
+fn send_shutdown_signal_enqueues_shutdown_request() {
+    let (tx, rx) = mpsc::channel();
+    assert!(send_shutdown_signal(&tx));
+    assert!(matches!(rx.recv().unwrap(), ModelRequest::Shutdown));
+}
+
+#[test]
+fn send_shutdown_signal_reports_closed_channel() {
+    let (tx, rx) = mpsc::channel::<ModelRequest>();
+    drop(rx);
+    assert!(!send_shutdown_signal(&tx));
+}
+
+#[test]
+fn model_provider_relies_on_auto_traits_for_shared_state() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ModelProvider>();
 }
