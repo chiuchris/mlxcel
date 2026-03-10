@@ -22,26 +22,12 @@ use std::fmt::Display;
 use std::path::Path;
 
 use crate::LoadedModel;
+use crate::model_metadata;
 use crate::models::{self, ModelType};
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_nonstandard_model_type(model_type: ModelType) -> bool {
-    matches!(
-        model_type,
-        ModelType::Qwen35
-            | ModelType::Qwen35Moe
-            | ModelType::Gemma3n
-            | ModelType::Mamba
-            | ModelType::Mamba2
-            | ModelType::Jamba
-            | ModelType::NemotronH
-            | ModelType::NemotronNAS
-            | ModelType::KimiLinear
-            | ModelType::LongcatFlash
-            | ModelType::LongcatFlashNgram
-            | ModelType::Rwkv7
-            | ModelType::RecurrentGemma
-    )
+    model_metadata::is_nonstandard_model_type(model_type)
 }
 
 pub(crate) fn try_load_nonstandard_model_from_dir(

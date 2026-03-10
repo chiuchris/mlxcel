@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::model_metadata::{
-    DirectoryLoadRoute, ModelKind, WeightLoadRoute, is_vlm_model_type, model_load_policy,
+    DirectoryLoadRoute, DirectoryRouteFamily, ModelKind, WeightLoadRoute,
+    adapter_loading_unsupported_message, is_config_backed_model_type, is_nonstandard_model_type,
+    is_special_weight_model_type, is_vlm_model_type, model_load_policy, static_model_descriptor,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -53,4 +55,43 @@ fn is_vlm_model_type_matches_control_plane_capabilities() {
     assert!(is_vlm_model_type(ModelType::Phi3VLM));
     assert!(!is_vlm_model_type(ModelType::Gemma3));
     assert!(!is_vlm_model_type(ModelType::Mamba2));
+}
+
+#[test]
+fn static_model_descriptor_centralizes_directory_and_weight_families() {
+    let llama = static_model_descriptor(ModelType::Llama);
+    assert_eq!(llama.kind, ModelKind::Text);
+    assert_eq!(llama.directory_family, DirectoryRouteFamily::ConfigBacked);
+    assert_eq!(
+        llama.adapter_weight_route,
+        Some(WeightLoadRoute::ConfigBacked)
+    );
+
+    let mistral3 = static_model_descriptor(ModelType::Mistral3);
+    assert_eq!(
+        mistral3.directory_family,
+        DirectoryRouteFamily::Mistral3Dynamic
+    );
+    assert_eq!(
+        mistral3.adapter_weight_route,
+        Some(WeightLoadRoute::LlamaFamily)
+    );
+
+    let qwen_vl = static_model_descriptor(ModelType::Qwen3VL);
+    assert_eq!(qwen_vl.kind, ModelKind::Vlm);
+    assert_eq!(qwen_vl.directory_family, DirectoryRouteFamily::Vlm);
+    assert_eq!(qwen_vl.adapter_weight_route, None);
+}
+
+#[test]
+fn descriptor_backed_support_helpers_stay_in_sync() {
+    assert!(is_config_backed_model_type(ModelType::Gemma3));
+    assert!(is_nonstandard_model_type(ModelType::Gemma3n));
+    assert!(is_special_weight_model_type(ModelType::Qwen35));
+
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Phi3VLM),
+        Some("Phi3V VLM does not support adapter loading; use load_model() instead")
+    );
+    assert_eq!(adapter_loading_unsupported_message(ModelType::Llama), None);
 }

@@ -22,6 +22,7 @@ use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 
 use crate::LoadedModel;
+use crate::model_metadata;
 use crate::models::{self, ModelType};
 
 fn copy_weight_map(weights: &WeightMap) -> WeightMap {
@@ -56,34 +57,9 @@ pub(crate) fn qwen35_text_config(config: &serde_json::Value) -> Result<serde_jso
     Ok(text_config)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn adapter_loading_unsupported_message(model_type: ModelType) -> Option<&'static str> {
-    match model_type {
-        ModelType::Llama4VLM => Some("Llama4 VLM cannot be loaded with LoRA adapters yet"),
-        ModelType::Qwen35VLM | ModelType::Qwen35MoeVLM => {
-            Some("Qwen3.5 VLM does not support adapter loading")
-        }
-        ModelType::Gemma3VLM => Some("Gemma3 VLM cannot be loaded with LoRA adapters yet"),
-        ModelType::LlavaVLM | ModelType::LlavaBunnyVLM => {
-            Some("LLaVA VLM cannot be loaded with LoRA adapters yet")
-        }
-        ModelType::AyaVisionVLM => Some("Aya Vision VLM cannot be loaded with LoRA adapters yet"),
-        ModelType::PaliGemmaVLM => Some("PaliGemma VLM cannot be loaded with LoRA adapters yet"),
-        ModelType::PixtralVLM | ModelType::Mistral3VLM => {
-            Some("Pixtral/Mistral3 VLM cannot be loaded with LoRA adapters yet")
-        }
-        ModelType::Qwen2VL => Some("Qwen2-VL cannot be loaded with LoRA adapters yet"),
-        ModelType::Qwen25VL | ModelType::Qwen3VL | ModelType::Qwen3VLMoe => {
-            Some("Qwen VL models cannot be loaded with LoRA adapters yet")
-        }
-        ModelType::Gemma3nVLM => Some("Gemma3n VLM cannot be loaded with LoRA adapters yet"),
-        ModelType::Phi3VLM => {
-            Some("Phi3V VLM does not support adapter loading; use load_model() instead")
-        }
-        ModelType::Molmo2VLM => {
-            Some("Molmo2 VLM does not support adapter loading; use load_model() instead")
-        }
-        _ => None,
-    }
+    model_metadata::adapter_loading_unsupported_message(model_type)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,8 +92,9 @@ fn special_weight_loader_kind(model_type: ModelType) -> Option<SpecialWeightLoad
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn is_special_weight_model_type(model_type: ModelType) -> bool {
-    special_weight_loader_kind(model_type).is_some()
+    model_metadata::is_special_weight_model_type(model_type)
 }
 
 pub(crate) fn try_load_special_model_from_weights(

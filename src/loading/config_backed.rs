@@ -22,6 +22,7 @@ use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
 
 use crate::LoadedModel;
+use crate::model_metadata;
 use crate::models::{self, ModelType};
 
 macro_rules! for_each_config_backed_model {
@@ -125,7 +126,7 @@ macro_rules! match_config_backed_support {
     ($( $variant:ident, $dir_loader:path, $args_ty:ty, $weight_builder:path, $wrap:expr; )*) => {
         #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) fn is_config_backed_model_type(model_type: ModelType) -> bool {
-            matches!(model_type, $(ModelType::$variant)|*)
+            model_metadata::is_config_backed_model_type(model_type)
         }
     };
 }

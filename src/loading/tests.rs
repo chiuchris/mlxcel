@@ -19,7 +19,7 @@ use super::{
 use crate::model_metadata::{
     DirectoryLoadRoute, ModelCapabilities, ModelKind, ModelLoadPolicy, WeightLoadRoute,
     directory_load_route, is_ministral3_config, is_vlm_model_type, model_capabilities,
-    model_load_policy, weight_load_route,
+    model_load_policy, static_model_descriptor, weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -253,6 +253,7 @@ fn model_load_policy_combines_routes_and_capabilities() {
     assert_eq!(
         text_policy,
         ModelLoadPolicy {
+            descriptor: static_model_descriptor(ModelType::Qwen35),
             capabilities: ModelCapabilities {
                 kind: ModelKind::Text,
                 adapter_unsupported_message: None,
