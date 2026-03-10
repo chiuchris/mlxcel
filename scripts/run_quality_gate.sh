@@ -4,10 +4,15 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 INCLUDE_SMOKE=0
+INCLUDE_SERIAL_HELPERS=0
 DRY_RUN=0
 TEXT_MODEL="models/smollm-135m"
 VLM_MODEL="models/llava-qwen-0.5b"
 VLM_IMAGE="tests/fixtures/test_image.png"
+SERIAL_HELPER_TESTS=(
+  gemma3n_helpers_tests
+  llama4_helpers_tests
+)
 
 usage() {
   cat <<'EOF'
@@ -16,7 +21,10 @@ Usage: scripts/run_quality_gate.sh [options]
 Run the mlxcel quality gate baseline from the repository root.
 
 Options:
+  --include-serial-helpers
+                      Run ignored MLX-heavy helper tests in serial after the core baseline.
   --include-smoke     Run CPU-only text + VLM smoke checks after the build/test baseline.
+  --full              Run both serial helper checks and CPU-only smoke checks.
   --text-model PATH   Override the CPU-only text smoke model path.
   --vlm-model PATH    Override the CPU-only VLM smoke model path.
   --vlm-image PATH    Override the VLM smoke image path.
@@ -39,7 +47,16 @@ run_cmd() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --include-serial-helpers)
+      INCLUDE_SERIAL_HELPERS=1
+      shift
+      ;;
     --include-smoke)
+      INCLUDE_SMOKE=1
+      shift
+      ;;
+    --full)
+      INCLUDE_SERIAL_HELPERS=1
       INCLUDE_SMOKE=1
       shift
       ;;
@@ -80,6 +97,12 @@ run_cmd cargo build --bins --quiet
 run_cmd cargo clippy --all-targets -- -D warnings
 run_cmd cargo test --manifest-path src/lib/mlxcel-core/Cargo.toml -- --test-threads=1
 run_cmd cargo clippy --manifest-path src/lib/mlxcel-core/Cargo.toml --all-targets -- -D warnings
+
+if [[ "$INCLUDE_SERIAL_HELPERS" -eq 1 ]]; then
+  for test_name in "${SERIAL_HELPER_TESTS[@]}"; do
+    run_cmd cargo test "$test_name" -- --ignored --test-threads=1
+  done
+fi
 
 if [[ "$INCLUDE_SMOKE" -eq 1 ]]; then
   if [[ "$DRY_RUN" -eq 0 ]]; then

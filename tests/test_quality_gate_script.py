@@ -40,6 +40,25 @@ class QualityGateScriptTests(unittest.TestCase):
             output,
         )
 
+    def test_dry_run_with_serial_helpers_lists_ignored_tests(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "--dry-run", "--include-serial-helpers"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout
+        self.assertIn(
+            "cargo test gemma3n_helpers_tests -- --ignored --test-threads=1",
+            output,
+        )
+        self.assertIn(
+            "cargo test llama4_helpers_tests -- --ignored --test-threads=1",
+            output,
+        )
+
     def test_dry_run_with_smoke_includes_cpu_only_commands(self) -> None:
         result = subprocess.run(
             [
@@ -64,6 +83,22 @@ class QualityGateScriptTests(unittest.TestCase):
         self.assertIn("models/custom-text", output)
         self.assertIn("models/custom-vlm", output)
         self.assertIn("tests/fixtures/test_image.png", output)
+
+    def test_dry_run_full_mode_includes_serial_helpers_and_smoke(self) -> None:
+        result = subprocess.run(
+            [str(SCRIPT), "--dry-run", "--full"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        output = result.stdout
+        self.assertIn(
+            "cargo test gemma3n_helpers_tests -- --ignored --test-threads=1",
+            output,
+        )
+        self.assertIn("MLXCEL_BUILD_METAL=OFF", output)
 
     def test_unknown_argument_fails(self) -> None:
         result = subprocess.run(
