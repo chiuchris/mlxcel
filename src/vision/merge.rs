@@ -17,9 +17,17 @@
 //! Merges vision encoder output features with text token embeddings
 //! at image token positions.
 //!
-//! Strategies:
-//! - Gemma3: masked_scatter with 4D attention mask (prepare_inputs_for_multimodal)
-//! - LLaVA: simple replacement at image token positions, standard causal masking
+//! Strategies and current family users:
+//! - `prepare_inputs_for_multimodal()`
+//!   - Gemma3 and PaliGemma-style paths that need additive 4D attention masks
+//! - `merge_llava()`
+//!   - LLaVA/Bunny, Aya Vision, Pixtral/Mistral3, Gemma3n, Qwen-VL,
+//!     Phi3V, Molmo2, and similar token-replacement paths
+//!
+//! Contract:
+//! - merge helpers keep output embeddings in the text-model dtype
+//! - Gemma-style merge returns an additive 4D mask (`0` or `f32::MIN`)
+//! - LLaVA-style merge keeps standard causal masking and returns `None`
 //!
 //! Reference: references/mlx-vlm/mlx_vlm/models/gemma3/gemma3.py:121-168
 //! Reference: references/mlx-vlm/mlx_vlm/models/llava/llava.py:85-111
@@ -44,6 +52,8 @@ pub struct InputEmbeddings {
 /// * `inputs_embeds` - Text token embeddings [batch, seq_len, embed_dim]
 /// * `input_ids` - Token IDs [batch, seq_len]
 /// * `attention_mask` - Attention mask [batch, seq_len]
+///
+/// Used by: Gemma3 VLM, PaliGemma
 pub fn prepare_inputs_for_multimodal(
     hidden_size: usize,
     pad_token_id: i32,
@@ -149,6 +159,9 @@ pub fn prepare_inputs_for_multimodal(
 /// * `image_features` - Projected vision features [num_images, num_patches, hidden]
 /// * `inputs_embeds` - Text token embeddings [batch, seq_len, embed_dim]
 /// * `input_ids` - Token IDs [batch, seq_len]
+///
+/// Used by: LLaVA/Bunny, Aya Vision, Pixtral, Mistral3, Gemma3n,
+/// Qwen2/2.5/3/3.5-VL, Phi3V, Molmo2, Llama4
 pub fn merge_llava(
     image_token_index: i32,
     image_features: &MlxArray,
@@ -197,7 +210,7 @@ pub fn merge_llava(
 ///
 /// Port of masked_scatter from gemma3.py:54-72
 ///
-/// Used by: Gemma3 VLM, LLaVA
+/// Used by: all merge helpers in this module
 fn masked_scatter(
     final_embedding: &MlxArray,
     image_mask_expanded: &MlxArray,
@@ -243,3 +256,7 @@ fn masked_scatter(
     // Reshape back
     mlxcel_core::reshape(&result, &final_shape)
 }
+
+#[cfg(test)]
+#[path = "merge_tests.rs"]
+mod tests;
