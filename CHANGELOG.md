@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.4] - 2026-03-10
+
+### Added
+- Tiktoken BPE tokenizer support for models using `.tiktoken` vocabulary files (HunYuan MoE 13B)
+- Quality gate entry point script (`scripts/run_quality_gate.sh`) with `--include-serial-helpers` and `--full` modes
+- Comprehensive model validation: 71/74 local models pass (95.9%)
+
+### Fixed
+- Solar Open 100B-4bit config parsing: add serde defaults for `n_group`/`topk_group` in GLM4 MoE config
+- GatedDeltaNet `RMSNormGated`: promote SwiGLU gate path to float32 before restoring hidden-state dtype (upstream mlx-lm parity for Qwen3Next/Qwen3.5)
+- Step3p5 sliding-window layers now use `RotatingKVCache` instead of plain `KVCache`
+- Suppress deprecated-copy warning in mlxcel-core build for MLX v0.31.0
+
+### Changed
+- Converged model registration: centralized config-backed text model registration in `src/model_metadata.rs`
+- Split mlxcel-core internals into focused modules: `cache.rs`, `ops.rs`, `dtype.rs`, `sampling.rs`, `generation_policy.rs`, `streams.rs`
+- Extracted large-model helper hotspots: `gemma3n_helpers.rs`, `llama4_helpers.rs`, `qwen3_next_helpers.rs`
+- Split `LoadedModel` capabilities into `loaded_model_capabilities.rs` with `VlmRuntimeRef`
+- Separated model detection (`detection.rs`) and sanitization (`sanitize.rs`) helpers
+- Unified model loading descriptors with `StaticModelDescriptor` and `model_load_policy()`
+- Normalized server startup edge inputs into `cli_input.rs`
+- Removed unsafe `Send`/`Sync` auto traits from `ModelProvider`
+- Strengthened vision merge contracts with dedicated tests
+- Refreshed architecture, control-plane guide, and model addition documentation
+
 ## [v0.0.3] - 2026-03-10
 
 ### Fixed
@@ -61,6 +86,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.4]: https://github.com/lablup/mlxcel/compare/v0.0.3...v0.0.4
 [v0.0.3]: https://github.com/lablup/mlxcel/compare/v0.0.2...v0.0.3
 [v0.0.2]: https://github.com/lablup/mlxcel/compare/v0.0.1...v0.0.2
 [v0.0.1]: https://github.com/lablup/mlxcel/releases/tag/v0.0.1
