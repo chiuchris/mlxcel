@@ -12,15 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod tiktoken;
+
 use anyhow::Result;
 use sentencepiece::SentencePieceProcessor;
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Unified tokenizer supporting both HuggingFace (tokenizer.json) and SentencePiece (tokenizer.model)
+pub use tiktoken::TiktokenTokenizer;
+
+/// Unified tokenizer supporting HuggingFace (tokenizer.json), SentencePiece (tokenizer.model),
+/// and Tiktoken (.tiktoken) formats
 pub enum MlxcelTokenizer {
     HuggingFace(tokenizers::Tokenizer),
     SentencePiece(SentencePieceTokenizer),
+    Tiktoken(TiktokenTokenizer),
 }
 
 pub struct SentencePieceTokenizer {
@@ -43,6 +49,7 @@ impl MlxcelTokenizer {
                 Ok(encoding.get_ids().to_vec())
             }
             Self::SentencePiece(t) => t.encode(text, add_special_tokens),
+            Self::Tiktoken(t) => t.encode(text, add_special_tokens),
         }
     }
 
@@ -52,6 +59,7 @@ impl MlxcelTokenizer {
                 .decode(ids, skip_special_tokens)
                 .map_err(|e| anyhow::anyhow!("Decode failed: {}", e)),
             Self::SentencePiece(t) => t.decode(ids, skip_special_tokens),
+            Self::Tiktoken(t) => t.decode(ids, skip_special_tokens),
         }
     }
 }
@@ -242,6 +250,25 @@ fn parse_special_tokens(model_path: &Path) -> (HashMap<String, u32>, bool) {
     (special_tokens, add_bos)
 }
 
+/// Find a `.tiktoken` file in the model directory.
+/// Tries `tiktoken.model` first, then any `*.tiktoken` file.
+fn find_tiktoken_file(model_path: &Path) -> Option<std::path::PathBuf> {
+    // Try tiktoken.model first (standard name used by some models)
+    let tiktoken_model = model_path.join("tiktoken.model");
+    if tiktoken_model.exists() {
+        return Some(tiktoken_model);
+    }
+
+    // Try any *.tiktoken file
+    let pattern = model_path.join("*.tiktoken");
+    if let Ok(paths) = glob::glob(pattern.to_str()?) {
+        for entry in paths.flatten() {
+            return Some(entry);
+        }
+    }
+    None
+}
+
 pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
     // Try HuggingFace tokenizer.json first
     let tokenizer_json_path = model_path.join("tokenizer.json");
@@ -265,8 +292,14 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
         return Ok(MlxcelTokenizer::SentencePiece(sp_tokenizer));
     }
 
+    // Fall back to tiktoken (.tiktoken files)
+    if let Some(tiktoken_path) = find_tiktoken_file(model_path) {
+        let tokenizer = TiktokenTokenizer::from_file(&tiktoken_path, model_path)?;
+        return Ok(MlxcelTokenizer::Tiktoken(tokenizer));
+    }
+
     Err(anyhow::anyhow!(
-        "No tokenizer found in {:?} (tried tokenizer.json and tokenizer.model)",
+        "No tokenizer found in {:?} (tried tokenizer.json, tokenizer.model, and *.tiktoken)",
         model_path
     ))
 }
