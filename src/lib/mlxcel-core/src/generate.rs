@@ -393,6 +393,7 @@ impl CxxGenerator {
     /// embeddings and mask. Decode steps are identical to standard generation.
     ///
     /// Used by: VisionLanguageModel (Gemma3 VLM, etc.)
+    #[allow(clippy::too_many_arguments)]
     pub fn generate_streaming_with_embeddings<M: LanguageModel, F: FnMut(i32) -> bool>(
         &mut self,
         model: &M,

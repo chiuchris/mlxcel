@@ -17,6 +17,7 @@
 //! This crate provides direct bindings to MLX C++ API, bypassing the mlx-c wrapper
 //! for improved performance.
 
+#[allow(clippy::missing_safety_doc, clippy::too_many_arguments)]
 #[cxx::bridge(namespace = "mlx_cxx")]
 mod ffi {
     // Opaque types - these are defined in C++ and we just hold pointers to them
@@ -1689,8 +1690,8 @@ mod tests {
             let gate_data: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.001).sin()).collect();
             let x_data: Vec<f32> = (0..dim).map(|i| (i as f32 * 0.002).cos()).collect();
 
-            let gate = from_slice_f32(&gate_data, &[1, dim as i32]);
-            let x = from_slice_f32(&x_data, &[1, dim as i32]);
+            let gate = from_slice_f32(&gate_data, &[1, dim]);
+            let x = from_slice_f32(&x_data, &[1, dim]);
 
             // Warmup
             for _ in 0..10 {

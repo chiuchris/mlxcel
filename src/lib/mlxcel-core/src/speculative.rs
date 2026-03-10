@@ -194,7 +194,7 @@ impl SpeculativeGenerator {
             let seq_len = main_shape[1]; // Number of logit positions
             let mut accepted = 0;
 
-            for i in 0..draft_tokens.len() {
+            for (i, draft_token) in draft_tokens.iter().copied().enumerate() {
                 if (i as i32) >= seq_len {
                     break;
                 }
@@ -213,18 +213,18 @@ impl SpeculativeGenerator {
                 ffi::eval(&main_tok_arr);
                 let main_token = ffi::item_i32(&main_tok_arr);
 
-                if main_token == draft_tokens[i] {
+                if main_token == draft_token {
                     // Accept draft token
                     accepted += 1;
 
-                    if eos_tokens.contains(&draft_tokens[i]) {
+                    if eos_tokens.contains(&draft_token) {
                         done = true;
                         break;
                     }
 
-                    self.generated_tokens.push(draft_tokens[i]);
+                    self.generated_tokens.push(draft_token);
                     if needs_history {
-                        token_history.push(draft_tokens[i]);
+                        token_history.push(draft_token);
                     }
 
                     if self.generated_tokens.len() >= max_tokens {
@@ -295,7 +295,7 @@ impl SpeculativeGenerator {
             }
 
             // Periodic cache clearing
-            if self.generated_tokens.len() % 256 == 0 {
+            if self.generated_tokens.len().is_multiple_of(256) {
                 ffi::clear_memory_cache();
             }
         }

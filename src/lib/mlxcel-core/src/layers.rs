@@ -767,6 +767,7 @@ pub struct Attention {
 
 impl Attention {
     /// Create a new attention layer
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         q_proj: QuantizedWeight,
         k_proj: QuantizedWeight,

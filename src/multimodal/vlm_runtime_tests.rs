@@ -27,8 +27,8 @@ fn should_prepare_vlm_embeddings_rejects_non_vlm_image_requests() {
 
 #[test]
 fn should_prepare_vlm_embeddings_accepts_vlm_image_requests() {
-    assert_eq!(should_prepare_vlm_embeddings(2, true).unwrap(), true);
-    assert_eq!(should_prepare_vlm_embeddings(0, true).unwrap(), false);
+    assert!(should_prepare_vlm_embeddings(2, true).unwrap());
+    assert!(!should_prepare_vlm_embeddings(0, true).unwrap());
 }
 
 #[test]
