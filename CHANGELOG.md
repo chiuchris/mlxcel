@@ -4,6 +4,30 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.5] - 2026-03-11
+
+### Added
+- Phi4-SigLIP vision-language model support with NaFlex-style patch processor and SigLIP2 vision tower
+- Phi4MM vision-language model support with SigLIP + HD transform + AvgPool2d pipeline
+- MiniCPM-o vision-language model support with SigLIP + Perceiver-style resampler
+- Moondream3 vision-language model support with packed int4 dequantization and BOS-prefix prompting
+- Runtime LoRA support on Linear layers with `Cell<bool>` active toggle for on-the-fly application
+- `after_prefill()` dispatch through LoadedModel enum and LanguageModel trait
+- Server support for data URIs, file URLs, bare local paths, and http(s) image fetches
+
+### Fixed
+- Phi4MM VLM: add SuScaledRoPE (longrope) to Phi3 attention for correct positional encoding
+- Phi4MM VLM: fix image token placement in prompt (insert after `<|user|>` tag, not before entire prompt)
+- Phi4MM VLM: use runtime LoRA instead of weight fusion, matching Python PEFT behavior
+- MiniCPM-o VLM: switch text backbone from Qwen3-VL (MRoPE) to standard Qwen3 (standard RoPE)
+- MiniCPM-o VLM: add automatic Qwen3-style chat template wrapping for models without chat_template
+- Moondream3 VLM: fix RoPE layout (NeoX-style halves), attention mask dtype, and vision tiling
+- Moondream3 VLM: use exact GELU for tau scaling and MoE GeGLU matching Python F.gelu
+
+### Changed
+- Synced mlx-vlm upstream Qwen-VL: fused-SDPA head-dim padding in shared Qwen3-VL vision encoder
+- Refactored server image extraction into async edge helpers with multi-format support
+
 ## [v0.0.4] - 2026-03-10
 
 ### Added
@@ -86,6 +110,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.5]: https://github.com/lablup/mlxcel/compare/v0.0.4...v0.0.5
 [v0.0.4]: https://github.com/lablup/mlxcel/compare/v0.0.3...v0.0.4
 [v0.0.3]: https://github.com/lablup/mlxcel/compare/v0.0.2...v0.0.3
 [v0.0.2]: https://github.com/lablup/mlxcel/compare/v0.0.1...v0.0.2
