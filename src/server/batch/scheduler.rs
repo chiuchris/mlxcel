@@ -374,11 +374,19 @@ impl BatchScheduler {
             return BatchSchedulerAction::Idle;
         }
 
-        // Active sequences always get a decode step before admitting new
-        // prefills. This prevents latency starvation under sustained load.
+        // When active sequences exist:
+        // 1. If batch is NOT full and queue has work → admit one new sequence
+        //    (this grows the batch to improve decode throughput via batching)
+        // 2. If batch is full or queue is empty → decode existing sequences
+        // 3. Preemption overrides when enabled and a higher-priority request waits
         if !self.active_batch.is_empty() {
-            // Check if we should preempt for a higher-priority request
             if self.should_preempt() {
+                return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
+            }
+            if !self.active_batch.is_full() && !self.prefill_queue.is_empty() {
+                // Admit one queued request to grow the batch before decoding.
+                // This is critical for throughput: larger batches amortize
+                // weight-loading bandwidth across more sequences.
                 return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
             }
             return BatchSchedulerAction::Decode(self.active_batch.sequence_ids());
