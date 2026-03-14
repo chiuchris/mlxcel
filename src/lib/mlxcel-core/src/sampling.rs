@@ -34,8 +34,8 @@ use std::collections::HashMap;
 /// Uses fused C++ sampling (temperature + top-k + top-p + min-p + categorical
 /// in a single FFI call) to minimize round-trip overhead.
 ///
-/// Used by: `CxxGenerator`, `SpeculativeGenerator`
-pub(crate) fn sample_token_optimized(
+/// Used by: `CxxGenerator`, `SpeculativeGenerator`, `BatchScheduler`
+pub fn sample_token_optimized(
     logits: &MlxArray,
     config: &SamplingConfig,
     token_history: &[i32],

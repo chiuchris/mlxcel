@@ -139,4 +139,18 @@ fn build_server_config_applies_normalized_startup_values() {
     assert_eq!(config.default_dry_penalty_last_n, 0);
     assert_eq!(config.draft_model_path, Some(PathBuf::from("draft")));
     assert_eq!(config.num_draft_tokens, 5);
+    // max_batch_size is derived from n_parallel; max_queue_depth is fixed
+    assert_eq!(config.max_batch_size, 3);
+    assert_eq!(config.max_queue_depth, 1024);
+}
+
+#[test]
+fn build_server_config_max_batch_size_is_at_least_one() {
+    // n_parallel=0 is nonsensical but must not produce a zero batch size
+    let startup = ServerStartupConfig {
+        n_parallel: 0,
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert_eq!(config.max_batch_size, 1);
 }

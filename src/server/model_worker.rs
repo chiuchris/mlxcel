@@ -30,16 +30,18 @@ use crate::LoadedModel;
 use crate::SamplingConfig;
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::merge::InputEmbeddings;
-use crate::vlm_runtime::{prepare_and_compute_vlm_embeddings, prepared_embedding_refs};
+use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
 
-use super::{GenerateEvent, GenerationResult, ModelRequest};
+use super::{GenerationResult, ModelRequest};
 
-pub(crate) fn spawn_model_worker(
+pub(crate) fn spawn_model_worker_with_batch_config(
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
     request_rx: mpsc::Receiver<ModelRequest>,
     loaded: Arc<AtomicBool>,
     worker_model_id: String,
+    max_batch_size: usize,
+    max_queue_depth: usize,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tracing::info!("Model worker thread starting, loading model...");
@@ -53,12 +55,12 @@ pub(crate) fn spawn_model_worker(
 
         let (model, tokenizer) = match result {
             Ok((model, tokenizer)) => {
-                tracing::info!("Model {} loaded successfully", worker_model_id);
+                tracing::info!("Model {worker_model_id} loaded successfully");
                 loaded.store(true, Ordering::Release);
                 (model, tokenizer)
             }
             Err(err) => {
-                tracing::error!("Failed to load model: {}", err);
+                tracing::error!("Failed to load model: {err}");
                 return;
             }
         };
@@ -68,36 +70,20 @@ pub(crate) fn spawn_model_worker(
             tracing::info!("EOS tokens from config: {:?}", config_eos);
         }
 
-        let num_layers = crate::LanguageModel::num_layers(&model);
-        let mut generator = crate::CxxGenerator::new(num_layers);
+        tracing::info!(
+            "Starting BatchScheduler (max_batch_size={max_batch_size}, \
+             max_queue_depth={max_queue_depth})"
+        );
 
-        loop {
-            match request_rx.recv() {
-                Ok(ModelRequest::Generate {
-                    prompt,
-                    options,
-                    images,
-                    response_tx,
-                }) => handle_generate_request(
-                    &model,
-                    &tokenizer,
-                    &config_eos,
-                    &mut generator,
-                    prompt,
-                    options,
-                    images,
-                    response_tx,
-                ),
-                Ok(ModelRequest::Shutdown) => {
-                    tracing::info!("Model worker thread shutting down");
-                    break;
-                }
-                Err(_) => {
-                    tracing::info!("Request channel closed, worker exiting");
-                    break;
-                }
-            }
-        }
+        let mut scheduler = super::super::batch::BatchScheduler::new(
+            model,
+            tokenizer,
+            config_eos,
+            request_rx,
+            max_batch_size,
+            max_queue_depth,
+        );
+        scheduler.run();
     })
 }
 
@@ -203,87 +189,6 @@ pub(crate) fn build_generation_result(
         generation_only_ms: elapsed_ms.saturating_sub(prompt_eval_ms),
         finish_reason: finish_reason.to_string(),
     }
-}
-
-fn handle_generate_request(
-    model: &LoadedModel,
-    tokenizer: &MlxcelTokenizer,
-    config_eos: &[i32],
-    generator: &mut crate::CxxGenerator,
-    prompt: String,
-    options: crate::server::ServerGenerateOptions,
-    images: Vec<Vec<u8>>,
-    response_tx: mpsc::Sender<GenerateEvent>,
-) {
-    let start = std::time::Instant::now();
-
-    let token_ids = match tokenizer.encode(prompt.as_str(), true) {
-        Ok(ids) => ids,
-        Err(err) => {
-            let _ = response_tx.send(GenerateEvent::Error(format!("Tokenization error: {}", err)));
-            return;
-        }
-    };
-    let mut prompt_tokens: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-    let prompt_token_count = prompt_tokens.len();
-
-    // Uses reset_with_model to also clear model-internal caches
-    // such as sliding-window attention and SSM state.
-    generator.reset_with_model(model);
-
-    let max_tokens = options.max_tokens;
-    let sampling = merge_config_stop_tokens(options.sampling.clone(), config_eos);
-
-    let vlm_embeddings = match prepare_request_vlm_embeddings(
-        model,
-        tokenizer,
-        &prompt,
-        &mut prompt_tokens,
-        &images,
-    ) {
-        Ok(prepared) => prepared,
-        Err(err) => {
-            let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
-            return;
-        }
-    };
-
-    let mut decode_state = StreamingDecodeState::new(tokenizer, &prompt_tokens);
-    let tx_clone = response_tx.clone();
-
-    let on_token = |token_id: i32| {
-        if let Some(new_text) = decode_state.on_token(token_id, tokenizer) {
-            let _ = tx_clone.send(GenerateEvent::Token(new_text));
-        }
-        true
-    };
-
-    if let Some(ref embeddings) = vlm_embeddings {
-        let (input_embeds, mask_ref) = match prepared_embedding_refs(embeddings) {
-            Ok(refs) => refs,
-            Err(err) => {
-                let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
-                return;
-            }
-        };
-        generator.generate_streaming_with_embeddings(
-            model,
-            &prompt_tokens,
-            Some(input_embeds),
-            mask_ref,
-            max_tokens,
-            &sampling,
-            on_token,
-        );
-    } else {
-        generator.generate_streaming(model, &prompt_tokens, max_tokens, &sampling, on_token);
-    }
-
-    // Flush any remaining text buffered due to incomplete UTF-8 sequences
-    decode_state.flush(tokenizer);
-
-    let result = decode_state.finish(start, prompt_token_count, max_tokens);
-    let _ = response_tx.send(GenerateEvent::Done(result));
 }
 
 pub(crate) struct StreamingDecodeState {

@@ -1397,17 +1397,20 @@ pub mod weights;
 // Token generation
 pub mod generate;
 
-// Decode-loop setup helpers shared by standard and speculative generation
-mod generation_policy;
+// Decode-loop setup helpers shared by standard and speculative generation.
+// Public so that the server batch scheduler can reuse seed/EOS/history helpers.
+pub mod generation_policy;
 
-// Shared sampling and token-penalty policy helpers
-mod sampling;
+// Shared sampling and token-penalty policy helpers.
+// Public so that the server batch scheduler can perform step-level sampling.
+pub mod sampling;
 
 // Speculative decoding
 pub mod speculative;
 
-// Generation-time stream selection and installation wrappers
-mod streams;
+// Generation-time stream selection and installation wrappers.
+// Public so that the server batch scheduler can install its own generation stream.
+pub mod streams;
 
 pub mod dtype;
 

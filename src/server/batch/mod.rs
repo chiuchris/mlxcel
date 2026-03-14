@@ -24,11 +24,14 @@
 //! - [`PrefillQueue`] -- FIFO queue for requests waiting to be prefilled.
 //! - [`ActiveBatch`] -- O(1)-lookup map of sequences currently decoding.
 //! - [`BatchSchedulerAction`] -- scheduler decision output.
+//! - [`BatchScheduler`] -- core iteration-level scheduler.
 
 mod active;
 mod queue;
+pub(crate) mod scheduler;
 mod sequence;
 
 pub use active::ActiveBatch;
 pub use queue::PrefillQueue;
+pub use scheduler::BatchScheduler;
 pub use sequence::{BatchSchedulerAction, FinishReason, SequenceInfo, SequenceState};

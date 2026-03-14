@@ -22,15 +22,15 @@ use crate::ffi;
 use crate::generate::{LanguageModel, SamplingConfig};
 use crate::layers::KVCache;
 
-/// Used by: CxxGenerator, SpeculativeGenerator
-pub(crate) fn seed_rng_if_needed(sampling: &SamplingConfig) {
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+pub fn seed_rng_if_needed(sampling: &SamplingConfig) {
     if let Some(seed) = sampling.seed {
         ffi::random_seed(seed);
     }
 }
 
-/// Used by: CxxGenerator, SpeculativeGenerator
-pub(crate) fn merged_eos_token_ids(model_eos: Vec<i32>, stop_token_ids: &[i32]) -> Vec<i32> {
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+pub fn merged_eos_token_ids(model_eos: Vec<i32>, stop_token_ids: &[i32]) -> Vec<i32> {
     let mut eos_tokens = model_eos;
     for &id in stop_token_ids {
         if !eos_tokens.contains(&id) {
@@ -40,8 +40,8 @@ pub(crate) fn merged_eos_token_ids(model_eos: Vec<i32>, stop_token_ids: &[i32]) 
     eos_tokens
 }
 
-/// Used by: CxxGenerator, SpeculativeGenerator
-pub(crate) fn initial_token_history(prompt_tokens: &[i32], needs_history: bool) -> Vec<i32> {
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+pub fn initial_token_history(prompt_tokens: &[i32], needs_history: bool) -> Vec<i32> {
     if needs_history {
         prompt_tokens.to_vec()
     } else {
@@ -49,8 +49,8 @@ pub(crate) fn initial_token_history(prompt_tokens: &[i32], needs_history: bool) 
     }
 }
 
-/// Used by: CxxGenerator
-pub(crate) fn ensure_model_caches<M: LanguageModel + ?Sized>(caches: &mut Vec<KVCache>, model: &M) {
+/// Used by: CxxGenerator, BatchScheduler
+pub fn ensure_model_caches<M: LanguageModel + ?Sized>(caches: &mut Vec<KVCache>, model: &M) {
     if caches.len() != model.num_layers() {
         *caches = model.make_caches();
     }

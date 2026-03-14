@@ -166,9 +166,7 @@ pub struct SequenceInfo {
     /// Accumulated decoded text.
     pub generated_text: String,
     /// Streaming decode helper for incremental text emission.
-    // Field is not read yet -- the batch scheduler will use it when the
-    // decode loop is wired up. Allow dead_code until then.
-    #[allow(dead_code)]
+    /// Used by `BatchScheduler` during prefill and decode steps.
     pub(crate) decode_state: StreamingDecodeState,
 
     // -- Response channel --

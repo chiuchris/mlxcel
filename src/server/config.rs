@@ -60,6 +60,11 @@ pub struct ServerConfig {
     pub default_dry_penalty_last_n: usize,
     pub draft_model_path: Option<PathBuf>,
     pub num_draft_tokens: usize,
+    /// Maximum number of sequences in the active decode batch.
+    /// Defaults to `n_parallel` (typically 1) for backwards compatibility.
+    pub max_batch_size: usize,
+    /// Maximum number of requests waiting in the prefill queue.
+    pub max_queue_depth: usize,
 }
 
 impl Default for ServerConfig {
@@ -89,6 +94,8 @@ impl Default for ServerConfig {
             default_dry_penalty_last_n: 0,
             draft_model_path: None,
             num_draft_tokens: 3,
+            max_batch_size: 1,
+            max_queue_depth: 1024,
         }
     }
 }

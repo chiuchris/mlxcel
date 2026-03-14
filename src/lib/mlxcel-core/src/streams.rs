@@ -18,8 +18,8 @@ use crate::ffi;
 use crate::ffi::MlxStream;
 use crate::UniquePtr;
 
-/// Used by: CxxGenerator, SpeculativeGenerator
-pub(crate) fn new_generation_stream() -> Option<UniquePtr<MlxStream>> {
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+pub fn new_generation_stream() -> Option<UniquePtr<MlxStream>> {
     if ffi::is_gpu_available() {
         Some(ffi::new_gpu_stream())
     } else {
@@ -27,8 +27,8 @@ pub(crate) fn new_generation_stream() -> Option<UniquePtr<MlxStream>> {
     }
 }
 
-/// Used by: CxxGenerator, SpeculativeGenerator
-pub(crate) fn install_default_stream(stream: Option<&UniquePtr<MlxStream>>) {
+/// Used by: CxxGenerator, SpeculativeGenerator, BatchScheduler
+pub fn install_default_stream(stream: Option<&UniquePtr<MlxStream>>) {
     if let Some(stream) = stream {
         ffi::set_default_stream(stream);
     }

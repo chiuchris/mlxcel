@@ -75,8 +75,24 @@ impl ModelProvider {
         Self::new_with_adapter(model_path, None)
     }
 
-    /// Create and start a new model provider with an optional LoRA adapter
+    /// Create and start a new model provider with an optional LoRA adapter.
+    ///
+    /// Uses default batch settings (max_batch_size=1, max_queue_depth=1024).
     pub fn new_with_adapter(model_path: PathBuf, adapter_path: Option<PathBuf>) -> Result<Self> {
+        Self::new_with_batch_config(model_path, adapter_path, 1, 1024)
+    }
+
+    /// Create and start a new model provider with batch scheduling config.
+    ///
+    /// `max_batch_size` controls how many sequences can decode concurrently.
+    /// `max_queue_depth` controls how many requests can wait in the prefill
+    /// queue before the server starts rejecting new ones.
+    pub fn new_with_batch_config(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+    ) -> Result<Self> {
         let model_id = model_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -94,12 +110,14 @@ impl ModelProvider {
         // Clone model_id for the worker thread
         let worker_model_id = model_id.clone();
 
-        let worker_handle = model_worker::spawn_model_worker(
+        let worker_handle = model_worker::spawn_model_worker_with_batch_config(
             model_path,
             adapter_path,
             request_rx,
             loaded_clone,
             worker_model_id,
+            max_batch_size,
+            max_queue_depth,
         );
 
         Ok(Self {

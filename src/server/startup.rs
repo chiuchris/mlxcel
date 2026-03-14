@@ -213,6 +213,8 @@ pub(super) fn build_server_config(
         default_dry_penalty_last_n: resolve_dry_penalty_last_n(startup.dry_penalty_last_n),
         draft_model_path: startup.draft_model_path.clone(),
         num_draft_tokens: startup.draft_max,
+        max_batch_size: startup.n_parallel.max(1),
+        max_queue_depth: 1024,
     }
 }
 
@@ -349,9 +351,11 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         &startup.model_path,
     )?;
     let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
-    let model_provider = Arc::new(ModelProvider::new_with_adapter(
+    let model_provider = Arc::new(ModelProvider::new_with_batch_config(
         startup.model_path.clone(),
         startup.adapter_path.clone(),
+        config.max_batch_size,
+        config.max_queue_depth,
     )?);
 
     if startup.warmup {
