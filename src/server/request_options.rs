@@ -20,6 +20,7 @@
 
 use super::{ServerConfig, ServerGenerateOptions};
 use crate::sampling::{ResolvedSamplingParams, build_sampling_config};
+use crate::server::batch::RequestPriority;
 
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct RequestOptionOverrides {
@@ -38,6 +39,7 @@ pub(crate) struct RequestOptionOverrides {
     pub dry_penalty_last_n: Option<usize>,
     pub dry_sequence_breakers: Option<Vec<i32>>,
     pub stop_sequences: Option<Vec<String>>,
+    pub priority: RequestPriority,
 }
 
 pub(crate) fn build_server_generate_options(
@@ -77,6 +79,7 @@ pub(crate) fn build_server_generate_options(
         max_tokens: overrides.max_tokens.unwrap_or(config.default_max_tokens),
         sampling,
         stop_sequences: overrides.stop_sequences,
+        priority: overrides.priority,
     }
 }
 

@@ -58,6 +58,7 @@ fn build_server_generate_options_applies_request_overrides() {
             dry_penalty_last_n: Some(17),
             dry_sequence_breakers: Some(vec![1, 2]),
             stop_sequences: Some(vec!["stop".to_string()]),
+            priority: crate::server::batch::RequestPriority::High,
         },
     );
 

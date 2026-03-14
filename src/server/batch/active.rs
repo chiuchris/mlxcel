@@ -96,6 +96,16 @@ impl ActiveBatch {
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut SequenceInfo> {
         self.sequences.values_mut()
     }
+
+    /// Iterate over all active sequences immutably.
+    pub fn iter_sequences(&self) -> impl Iterator<Item = &SequenceInfo> {
+        self.sequences.values()
+    }
+
+    /// Find the minimum priority among all active sequences.
+    pub fn iter_min_priority(&self) -> Option<crate::server::batch::sequence::RequestPriority> {
+        self.sequences.values().map(|s| s.priority).min()
+    }
 }
 
 // Manual Debug: SequenceInfo is not Debug-derivable (InputEmbeddings).
@@ -131,11 +141,13 @@ mod tests {
             sampling: SamplingConfig::default(),
             max_tokens: 64,
             eos_token_ids: vec![2],
+            priority: crate::server::batch::RequestPriority::Normal,
             vlm_embeddings: None,
             images: Vec::new(),
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             decode_state,
+            prefill_offset: 0,
             response_tx: tx,
             created_at: Instant::now(),
             prefill_start: None,

@@ -18,14 +18,19 @@
 //!
 //! ```text
 //! Queued --> Prefilling --> Decoding --> Finished(reason)
-//!   \            \                         ^
-//!    \            \--- Finished(Cancelled/Error)
-//!     \----- Finished(Cancelled/Error)
+//!   ^\           \                         ^
+//!   | \           \--- Finished(Cancelled/Error)
+//!   |  \----- Finished(Cancelled/Error)
+//!   |
+//!   +--- (eviction: Decoding -> Queued for re-prefill)
 //! ```
 //!
 //! Any non-terminal state may transition to `Finished(Cancelled)` or
 //! `Finished(Error)` so the scheduler can abort sequences when a client
 //! disconnects or an error occurs during prefill.
+//!
+//! When preemptive eviction is enabled, `Decoding -> Queued` is also a
+//! valid transition so an evicted sequence can be re-queued for re-prefill.
 //!
 //! [`SequenceInfo`] bundles every piece of context needed by the batch
 //! scheduler and generation loop: prompt tokens, sampling config, VLM
@@ -40,6 +45,43 @@ use mlxcel_core::generate::SamplingConfig;
 use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
 use crate::vision::merge::InputEmbeddings;
+
+// ---------------------------------------------------------------------------
+// Request priority
+// ---------------------------------------------------------------------------
+
+/// Priority level for a generation request.
+///
+/// Higher-priority requests are prefilled before lower-priority ones.
+/// Within the decode batch, all sequences receive equal treatment regardless
+/// of priority.
+///
+/// Set via the `X-Priority` HTTP header (default: `Normal`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum RequestPriority {
+    /// Low priority (e.g., batch processing jobs).
+    Low = 0,
+    /// Default priority for interactive requests.
+    #[default]
+    Normal = 1,
+    /// High priority (e.g., latency-sensitive interactive chat).
+    High = 2,
+}
+
+impl RequestPriority {
+    /// Parse a priority string from an HTTP header value.
+    ///
+    /// Accepts "high", "normal", "low" (case-insensitive). Returns `None`
+    /// for unrecognized values so the caller can fall back to the default.
+    pub fn from_header(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "high" => Some(Self::High),
+            "normal" => Some(Self::Normal),
+            "low" => Some(Self::Low),
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // State machine
@@ -96,6 +138,7 @@ impl SequenceState {
     /// - `Queued -> Prefilling` (scheduler begins prefill)
     /// - `Prefilling -> Decoding` (prefill complete, enter decode loop)
     /// - `Decoding -> Finished(*)` (normal completion)
+    /// - `Decoding -> Queued` (preemptive eviction for re-prefill)
     /// - Any non-terminal state -> `Finished(Cancelled | Error)` (early abort)
     pub fn transition_to(&mut self, next: SequenceState) -> Result<(), String> {
         let valid = match (&*self, &next) {
@@ -103,6 +146,9 @@ impl SequenceState {
             (SequenceState::Queued, SequenceState::Prefilling) => true,
             (SequenceState::Prefilling, SequenceState::Decoding) => true,
             (SequenceState::Decoding, SequenceState::Finished(_)) => true,
+            // Preemptive eviction: a decoding sequence can be evicted and
+            // re-queued for re-prefill.
+            (SequenceState::Decoding, SequenceState::Queued) => true,
             // Early abort: any non-terminal state can transition to
             // Finished(Cancelled) or Finished(Error) so the scheduler can
             // clean up sequences when a client disconnects or an error occurs
@@ -153,6 +199,8 @@ pub struct SequenceInfo {
     pub max_tokens: usize,
     /// EOS token IDs that terminate generation.
     pub eos_token_ids: Vec<i32>,
+    /// Request priority for prefill ordering and eviction decisions.
+    pub priority: RequestPriority,
 
     // -- VLM context (optional) --
     /// Pre-computed vision-language embeddings for VLM requests.
@@ -168,6 +216,13 @@ pub struct SequenceInfo {
     /// Streaming decode helper for incremental text emission.
     /// Used by `BatchScheduler` during prefill and decode steps.
     pub(crate) decode_state: StreamingDecodeState,
+
+    // -- Chunked prefill state --
+    /// Token offset into `prompt_tokens` for chunked prefill.
+    /// When 0 the prefill has not started; when == `prompt_tokens.len()` it
+    /// is complete. The scheduler advances this in increments of
+    /// `prefill_chunk_size`.
+    pub prefill_offset: usize,
 
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.
@@ -202,9 +257,11 @@ impl std::fmt::Debug for SequenceInfo {
         f.debug_struct("SequenceInfo")
             .field("seq_id", &self.seq_id)
             .field("state", &self.state)
+            .field("priority", &self.priority)
             .field("prompt_tokens_len", &self.prompt_tokens.len())
             .field("max_tokens", &self.max_tokens)
             .field("generated_tokens_len", &self.generated_tokens.len())
+            .field("prefill_offset", &self.prefill_offset)
             .field("is_vlm", &self.is_vlm_request())
             .field("created_at", &self.created_at)
             .field("prefill_start", &self.prefill_start)
@@ -359,6 +416,28 @@ mod tests {
             state,
             SequenceState::Finished(FinishReason::Error(_))
         ));
+    }
+
+    // -- Preemptive eviction transition --
+
+    #[test]
+    fn valid_transition_decoding_to_queued_for_eviction() {
+        let mut state = SequenceState::Decoding;
+        assert!(state.transition_to(SequenceState::Queued).is_ok());
+        assert!(matches!(state, SequenceState::Queued));
+    }
+
+    #[test]
+    fn eviction_allows_full_re_lifecycle() {
+        // Decoding -> Queued (eviction) -> Prefilling -> Decoding -> Finished
+        let mut state = SequenceState::Decoding;
+        state.transition_to(SequenceState::Queued).unwrap();
+        state.transition_to(SequenceState::Prefilling).unwrap();
+        state.transition_to(SequenceState::Decoding).unwrap();
+        state
+            .transition_to(SequenceState::Finished(FinishReason::Stop))
+            .unwrap();
+        assert!(state.is_finished());
     }
 
     // -- Still-invalid transitions --

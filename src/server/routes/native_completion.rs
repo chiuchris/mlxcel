@@ -23,9 +23,11 @@
 use axum::{
     Json,
     extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Response, sse::Sse},
 };
 
+use crate::server::batch::RequestPriority;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
 use crate::server::types::{
@@ -36,20 +38,30 @@ use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
 /// POST /completion
 pub async fn native_completion(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<NativeCompletionRequest>,
 ) -> Response {
+    let priority = parse_priority_header(&headers);
     if request.stream.unwrap_or(false) {
-        stream_native_completion(state, request).await
+        stream_native_completion(state, request, priority).await
     } else {
-        non_stream_native_completion(state, request)
+        non_stream_native_completion(state, request, priority)
             .await
             .into_response()
     }
 }
 
+/// Extract the `X-Priority` header value, defaulting to `Normal`.
+///
+/// Delegated to the shared implementation in `super::chat`.
+fn parse_priority_header(headers: &HeaderMap) -> RequestPriority {
+    super::chat::parse_priority_header(headers)
+}
+
 async fn non_stream_native_completion(
     state: AppState,
     request: NativeCompletionRequest,
+    priority: RequestPriority,
 ) -> Result<Json<NativeCompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -58,7 +70,8 @@ async fn non_stream_native_completion(
         ));
     }
 
-    let options = build_native_options(&request, &state);
+    let mut options = build_native_options(&request, &state);
+    options.priority = priority;
 
     let result = state
         .model_provider
@@ -110,14 +123,19 @@ async fn non_stream_native_completion(
     }))
 }
 
-async fn stream_native_completion(state: AppState, request: NativeCompletionRequest) -> Response {
+async fn stream_native_completion(
+    state: AppState,
+    request: NativeCompletionRequest,
+    priority: RequestPriority,
+) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
         return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
             .into_response();
     }
 
-    let options = build_native_options(&request, &state);
+    let mut options = build_native_options(&request, &state);
+    options.priority = priority;
     let prompt = request.prompt.clone();
 
     let (events, stream) = sse_channel(100);
@@ -181,6 +199,7 @@ fn build_native_generate_options(
             dry_penalty_last_n: request.dry_penalty_last_n,
             dry_sequence_breakers: request.dry_sequence_breakers.clone(),
             stop_sequences: request.stop.clone(),
+            priority: RequestPriority::default(),
         },
     )
 }

@@ -12,31 +12,43 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FIFO queue for requests awaiting prefill.
+//! Priority queue for requests awaiting prefill.
 //!
-//! [`PrefillQueue`] is a simple `VecDeque`-backed queue that preserves
-//! insertion order. The batch scheduler drains entries one at a time whenever
-//! the active decode batch has capacity. An optional capacity limit prevents
-//! unbounded memory growth under sustained load.
+//! [`PrefillQueue`] uses three priority lanes (high, normal, low) backed by
+//! `VecDeque`s. Within each lane, insertion order is preserved (FIFO).
+//! The scheduler drains entries starting from the highest-priority non-empty
+//! lane. An optional capacity limit (across all lanes) prevents unbounded
+//! memory growth under sustained load.
 
 use std::collections::VecDeque;
 
-use super::sequence::SequenceInfo;
+use super::sequence::{RequestPriority, SequenceInfo};
 
 /// Default maximum queue depth when no explicit limit is given.
 const DEFAULT_MAX_QUEUE_SIZE: usize = 1024;
 
-/// First-in, first-out queue of sequences waiting for prefill.
+/// Priority-aware queue of sequences waiting for prefill.
 ///
-/// New requests are pushed to the back; the scheduler pops from the front.
-/// This guarantees that older requests are served first, preventing starvation
-/// under load.
+/// Requests are routed into one of three lanes based on their
+/// [`RequestPriority`]. The scheduler always dequeues from the
+/// highest-priority non-empty lane first, ensuring that high-priority
+/// requests are prefilled before lower-priority ones.
+///
+/// Within each lane, FIFO order is preserved so older requests of the
+/// same priority are served first.
 ///
 /// An optional `max_size` bound prevents unbounded memory growth. When the
 /// queue is full, `enqueue` returns the rejected `SequenceInfo` (boxed) so
 /// the caller can send an appropriate error response.
+///
+/// **Starvation note:** This queue uses strict priority ordering without
+/// aging. Under sustained high-priority load, lower-priority requests
+/// may wait indefinitely. Callers should apply server-level timeouts
+/// to bound worst-case latency for low-priority requests.
 pub struct PrefillQueue {
-    queue: VecDeque<SequenceInfo>,
+    high: VecDeque<SequenceInfo>,
+    normal: VecDeque<SequenceInfo>,
+    low: VecDeque<SequenceInfo>,
     max_size: usize,
 }
 
@@ -44,7 +56,9 @@ impl PrefillQueue {
     /// Create an empty prefill queue with the default capacity limit (1024).
     pub fn new() -> Self {
         Self {
-            queue: VecDeque::new(),
+            high: VecDeque::new(),
+            normal: VecDeque::new(),
+            low: VecDeque::new(),
             max_size: DEFAULT_MAX_QUEUE_SIZE,
         }
     }
@@ -52,44 +66,69 @@ impl PrefillQueue {
     /// Create an empty prefill queue with a custom capacity limit.
     pub fn with_capacity(max_size: usize) -> Self {
         Self {
-            queue: VecDeque::new(),
+            high: VecDeque::new(),
+            normal: VecDeque::new(),
+            low: VecDeque::new(),
             max_size,
         }
     }
 
-    /// Push a sequence to the back of the queue.
+    /// Push a sequence into the appropriate priority lane.
     ///
-    /// Returns `Err(Box<seq>)` if the queue is at capacity, giving the caller
-    /// ownership back so it can respond with a "server busy" error.
+    /// Returns `Err(Box<seq>)` if the total queue (across all lanes) is at
+    /// capacity, giving the caller ownership back so it can respond with a
+    /// "server busy" error.
     pub fn enqueue(&mut self, seq: SequenceInfo) -> Result<(), Box<SequenceInfo>> {
-        if self.queue.len() >= self.max_size {
+        if self.len() >= self.max_size {
             return Err(Box::new(seq));
         }
-        self.queue.push_back(seq);
+        match seq.priority {
+            RequestPriority::High => self.high.push_back(seq),
+            RequestPriority::Normal => self.normal.push_back(seq),
+            RequestPriority::Low => self.low.push_back(seq),
+        }
         Ok(())
     }
 
-    /// Pop the oldest sequence from the front of the queue.
+    /// Pop the highest-priority, oldest sequence from the queue.
+    ///
+    /// Drains from the high lane first, then normal, then low.
     pub fn dequeue(&mut self) -> Option<SequenceInfo> {
-        self.queue.pop_front()
+        self.high
+            .pop_front()
+            .or_else(|| self.normal.pop_front())
+            .or_else(|| self.low.pop_front())
     }
 
-    /// Number of sequences currently waiting.
+    /// Peek at the priority of the next sequence that would be dequeued.
+    pub fn peek_priority(&self) -> Option<RequestPriority> {
+        if !self.high.is_empty() {
+            Some(RequestPriority::High)
+        } else if !self.normal.is_empty() {
+            Some(RequestPriority::Normal)
+        } else if !self.low.is_empty() {
+            Some(RequestPriority::Low)
+        } else {
+            None
+        }
+    }
+
+    /// Total number of sequences across all priority lanes.
     pub fn len(&self) -> usize {
-        self.queue.len()
+        self.high.len() + self.normal.len() + self.low.len()
     }
 
-    /// Returns `true` when the queue is empty.
+    /// Returns `true` when all lanes are empty.
     pub fn is_empty(&self) -> bool {
-        self.queue.is_empty()
+        self.high.is_empty() && self.normal.is_empty() && self.low.is_empty()
     }
 
-    /// Returns `true` when the queue has reached its capacity limit.
+    /// Returns `true` when the total queue has reached its capacity limit.
     pub fn is_full(&self) -> bool {
-        self.queue.len() >= self.max_size
+        self.len() >= self.max_size
     }
 
-    /// Maximum number of entries this queue will hold.
+    /// Maximum number of entries this queue will hold (across all lanes).
     pub fn max_size(&self) -> usize {
         self.max_size
     }
@@ -105,7 +144,9 @@ impl Default for PrefillQueue {
 impl std::fmt::Debug for PrefillQueue {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PrefillQueue")
-            .field("len", &self.queue.len())
+            .field("high", &self.high.len())
+            .field("normal", &self.normal.len())
+            .field("low", &self.low.len())
             .field("max_size", &self.max_size)
             .finish()
     }
@@ -122,12 +163,11 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Instant;
 
-    /// Build a minimal `SequenceInfo` for testing.
-    ///
-    /// The `StreamingDecodeState` requires a tokenizer, but for queue-level
-    /// tests we only need structural correctness, not actual decode behavior.
-    /// We use a stub tokenizer that returns empty strings.
-    fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEvent>) {
+    /// Build a minimal `SequenceInfo` for testing with a given priority.
+    fn make_test_sequence_with_priority(
+        id_val: u64,
+        priority: RequestPriority,
+    ) -> (SequenceInfo, mpsc::Receiver<GenerateEvent>) {
         let (tx, rx) = mpsc::channel();
         let tokenizer = crate::tokenizer::MlxcelTokenizer::stub();
         let prompt_tokens = vec![1, 2, 3];
@@ -140,11 +180,13 @@ mod tests {
             sampling: SamplingConfig::default(),
             max_tokens: 100,
             eos_token_ids: vec![2],
+            priority,
             vlm_embeddings: None,
             images: Vec::new(),
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             decode_state,
+            prefill_offset: 0,
             response_tx: tx,
             created_at: Instant::now(),
             prefill_start: None,
@@ -152,6 +194,10 @@ mod tests {
         };
 
         (seq, rx)
+    }
+
+    fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEvent>) {
+        make_test_sequence_with_priority(id_val, RequestPriority::Normal)
     }
 
     #[test]
@@ -178,7 +224,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_ordering() {
+    fn fifo_ordering_within_same_priority() {
         let mut queue = PrefillQueue::new();
 
         let (s1, _r1) = make_test_sequence(10);
@@ -191,16 +237,65 @@ mod tests {
 
         assert_eq!(queue.len(), 3);
 
-        let d1 = queue.dequeue().unwrap();
-        assert_eq!(d1.seq_id.as_u64(), 10);
-
-        let d2 = queue.dequeue().unwrap();
-        assert_eq!(d2.seq_id.as_u64(), 20);
-
-        let d3 = queue.dequeue().unwrap();
-        assert_eq!(d3.seq_id.as_u64(), 30);
-
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 10);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 20);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 30);
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn priority_ordering_high_before_normal_before_low() {
+        let mut queue = PrefillQueue::new();
+
+        // Enqueue in reverse priority order
+        let (s_low, _r1) = make_test_sequence_with_priority(1, RequestPriority::Low);
+        let (s_norm, _r2) = make_test_sequence_with_priority(2, RequestPriority::Normal);
+        let (s_high, _r3) = make_test_sequence_with_priority(3, RequestPriority::High);
+
+        assert!(queue.enqueue(s_low).is_ok());
+        assert!(queue.enqueue(s_norm).is_ok());
+        assert!(queue.enqueue(s_high).is_ok());
+
+        // Should dequeue high first, then normal, then low
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 3); // High
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 2); // Normal
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 1); // Low
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn priority_with_fifo_within_lanes() {
+        let mut queue = PrefillQueue::new();
+
+        let (s_high1, _r1) = make_test_sequence_with_priority(10, RequestPriority::High);
+        let (s_norm1, _r2) = make_test_sequence_with_priority(20, RequestPriority::Normal);
+        let (s_high2, _r3) = make_test_sequence_with_priority(11, RequestPriority::High);
+        let (s_norm2, _r4) = make_test_sequence_with_priority(21, RequestPriority::Normal);
+
+        assert!(queue.enqueue(s_high1).is_ok());
+        assert!(queue.enqueue(s_norm1).is_ok());
+        assert!(queue.enqueue(s_high2).is_ok());
+        assert!(queue.enqueue(s_norm2).is_ok());
+
+        // High lane: 10, 11 (FIFO), then Normal lane: 20, 21 (FIFO)
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 10);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 11);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 20);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 21);
+    }
+
+    #[test]
+    fn peek_priority_reflects_head() {
+        let mut queue = PrefillQueue::new();
+        assert!(queue.peek_priority().is_none());
+
+        let (s_low, _r1) = make_test_sequence_with_priority(1, RequestPriority::Low);
+        queue.enqueue(s_low).unwrap();
+        assert_eq!(queue.peek_priority(), Some(RequestPriority::Low));
+
+        let (s_high, _r2) = make_test_sequence_with_priority(2, RequestPriority::High);
+        queue.enqueue(s_high).unwrap();
+        assert_eq!(queue.peek_priority(), Some(RequestPriority::High));
     }
 
     #[test]
@@ -232,12 +327,12 @@ mod tests {
     }
 
     #[test]
-    fn capacity_enforcement() {
+    fn capacity_enforcement_across_lanes() {
         let mut queue = PrefillQueue::with_capacity(2);
 
-        let (s1, _r1) = make_test_sequence(1);
-        let (s2, _r2) = make_test_sequence(2);
-        let (s3, _r3) = make_test_sequence(3);
+        let (s1, _r1) = make_test_sequence_with_priority(1, RequestPriority::High);
+        let (s2, _r2) = make_test_sequence_with_priority(2, RequestPriority::Low);
+        let (s3, _r3) = make_test_sequence_with_priority(3, RequestPriority::Normal);
 
         assert!(queue.enqueue(s1).is_ok());
         assert!(!queue.is_full());
@@ -245,7 +340,7 @@ mod tests {
         assert!(queue.enqueue(s2).is_ok());
         assert!(queue.is_full());
 
-        // Third enqueue should fail and return the sequence back
+        // Third enqueue should fail regardless of priority
         let rejected = queue.enqueue(s3);
         assert!(rejected.is_err());
         let returned_seq = rejected.unwrap_err();

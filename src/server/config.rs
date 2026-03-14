@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 
 use crate::SamplingConfig;
+use crate::server::batch::RequestPriority;
 
 /// Bridge between server request params and `mlxcel-core` `SamplingConfig`.
 #[derive(Debug, Clone)]
@@ -28,6 +29,19 @@ pub struct ServerGenerateOptions {
     pub max_tokens: usize,
     pub sampling: SamplingConfig,
     pub stop_sequences: Option<Vec<String>>,
+    /// Request priority for prefill queue ordering.
+    pub priority: RequestPriority,
+}
+
+/// Policy for selecting which sequence to evict when preemption is enabled
+/// and the batch is full.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PreemptionPolicy {
+    /// Evict the sequence that has generated the most tokens.
+    #[default]
+    LongestFirst,
+    /// Evict the lowest-priority sequence; break ties by longest running.
+    LowestPriority,
 }
 
 /// Server configuration derived from CLI-compatible startup arguments.
@@ -65,6 +79,15 @@ pub struct ServerConfig {
     pub max_batch_size: usize,
     /// Maximum number of requests waiting in the prefill queue.
     pub max_queue_depth: usize,
+    /// Number of tokens per prefill chunk. When 0, chunking is disabled and
+    /// the full prompt is prefilled in a single pass.
+    pub prefill_chunk_size: usize,
+    /// Whether preemptive eviction is enabled. When true and the batch is
+    /// full, a high-priority incoming request may evict a lower-priority
+    /// or longer-running active sequence.
+    pub enable_preemption: bool,
+    /// Policy used to select the eviction victim.
+    pub preemption_policy: PreemptionPolicy,
 }
 
 impl Default for ServerConfig {
@@ -96,6 +119,9 @@ impl Default for ServerConfig {
             num_draft_tokens: 3,
             max_batch_size: 1,
             max_queue_depth: 1024,
+            prefill_chunk_size: 512,
+            enable_preemption: false,
+            preemption_policy: PreemptionPolicy::default(),
         }
     }
 }

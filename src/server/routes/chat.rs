@@ -21,9 +21,11 @@
 use axum::{
     Json,
     extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Response, sse::Sse},
 };
 
+use crate::server::batch::RequestPriority;
 use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
@@ -36,20 +38,32 @@ use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
 /// POST /v1/chat/completions
 pub async fn chat_completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_chat_completion(state, request).await
+        stream_chat_completion(state, request, priority).await
     } else {
-        non_stream_chat_completion(state, request)
+        non_stream_chat_completion(state, request, priority)
             .await
             .into_response()
     }
 }
 
+/// Extract the `X-Priority` header value, defaulting to `Normal`.
+pub(crate) fn parse_priority_header(headers: &HeaderMap) -> RequestPriority {
+    headers
+        .get("x-priority")
+        .and_then(|v| v.to_str().ok())
+        .and_then(RequestPriority::from_header)
+        .unwrap_or_default()
+}
+
 async fn non_stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
+    priority: RequestPriority,
 ) -> Result<Json<ChatCompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -62,7 +76,8 @@ async fn non_stream_chat_completion(
     let model_id = state.display_model_id().to_string();
 
     let prepared = prepare_chat_request(&state.chat_template, &request).await;
-    let options = build_generate_options(&request.params, &state.config);
+    let mut options = build_generate_options(&request.params, &state.config);
+    options.priority = priority;
 
     // Generate (blocking call handled by model provider's worker thread)
     let result = state
@@ -86,7 +101,11 @@ async fn non_stream_chat_completion(
     )))
 }
 
-async fn stream_chat_completion(state: AppState, request: ChatCompletionRequest) -> Response {
+async fn stream_chat_completion(
+    state: AppState,
+    request: ChatCompletionRequest,
+    priority: RequestPriority,
+) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
         return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
@@ -96,7 +115,8 @@ async fn stream_chat_completion(state: AppState, request: ChatCompletionRequest)
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
     let prepared = prepare_chat_request(&state.chat_template, &request).await;
-    let options = build_generate_options(&request.params, &state.config);
+    let mut options = build_generate_options(&request.params, &state.config);
+    options.priority = priority;
 
     let (events, stream) = sse_channel(100);
 
@@ -167,6 +187,7 @@ pub(crate) fn build_generate_options(
             dry_penalty_last_n: params.dry_penalty_last_n,
             dry_sequence_breakers: params.dry_sequence_breakers.clone(),
             stop_sequences: params.stop.clone(),
+            priority: RequestPriority::default(),
         },
     )
 }

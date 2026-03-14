@@ -35,14 +35,23 @@ use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
 
 use super::{GenerationResult, ModelRequest};
 
+/// Configuration for the scheduler, passed from `ModelProvider` to the
+/// worker thread.
+pub(crate) struct WorkerSchedulerConfig {
+    pub max_batch_size: usize,
+    pub max_queue_depth: usize,
+    pub prefill_chunk_size: usize,
+    pub enable_preemption: bool,
+    pub preemption_policy: crate::server::config::PreemptionPolicy,
+}
+
 pub(crate) fn spawn_model_worker_with_batch_config(
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
     request_rx: mpsc::Receiver<ModelRequest>,
     loaded: Arc<AtomicBool>,
     worker_model_id: String,
-    max_batch_size: usize,
-    max_queue_depth: usize,
+    sched_config: WorkerSchedulerConfig,
     batch_metrics: Arc<BatchMetrics>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -72,19 +81,29 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             tracing::info!("EOS tokens from config: {:?}", config_eos);
         }
 
+        let chunk_info = if sched_config.prefill_chunk_size > 0 {
+            format!(", prefill_chunk_size={}", sched_config.prefill_chunk_size)
+        } else {
+            String::new()
+        };
         tracing::info!(
-            "Starting BatchScheduler (max_batch_size={max_batch_size}, \
-             max_queue_depth={max_queue_depth})"
+            "Starting BatchScheduler (max_batch_size={}, \
+             max_queue_depth={}{chunk_info})",
+            sched_config.max_batch_size,
+            sched_config.max_queue_depth,
         );
 
-        let mut scheduler = super::super::batch::BatchScheduler::new(
+        let mut scheduler = super::super::batch::BatchScheduler::with_config(
             model,
             tokenizer,
             config_eos,
             request_rx,
-            max_batch_size,
-            max_queue_depth,
+            sched_config.max_batch_size,
+            sched_config.max_queue_depth,
             batch_metrics,
+            sched_config.prefill_chunk_size,
+            sched_config.enable_preemption,
+            sched_config.preemption_policy,
         );
         scheduler.run();
     })

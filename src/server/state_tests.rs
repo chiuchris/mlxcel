@@ -41,10 +41,7 @@ fn batch_metrics_initializes_to_zero() {
     let m = BatchMetrics::new();
     assert_eq!(m.active_count(), 0);
     assert_eq!(m.queue_depth(), 0);
-    assert_eq!(
-        m.total_sequences_processed.load(Ordering::Relaxed),
-        0
-    );
+    assert_eq!(m.total_sequences_processed.load(Ordering::Relaxed), 0);
     assert_eq!(m.total_tokens_generated.load(Ordering::Relaxed), 0);
 }
 
@@ -71,10 +68,7 @@ fn batch_metrics_record_sequence_completed_accumulates() {
     let m = BatchMetrics::new();
     m.record_sequence_completed(10);
     m.record_sequence_completed(25);
-    assert_eq!(
-        m.total_sequences_processed.load(Ordering::Relaxed),
-        2
-    );
+    assert_eq!(m.total_sequences_processed.load(Ordering::Relaxed), 2);
     assert_eq!(m.total_tokens_generated.load(Ordering::Relaxed), 35);
 }
 

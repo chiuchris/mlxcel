@@ -20,30 +20,37 @@
 use axum::{
     Json,
     extract::State,
+    http::HeaderMap,
     response::{IntoResponse, Response, sse::Sse},
 };
 
 use crate::server::AppState;
+use crate::server::batch::RequestPriority;
 use crate::server::streaming::sse_channel;
 use crate::server::types::{CompletionChunk, CompletionRequest, CompletionResponse, ErrorResponse};
 
-use super::chat::build_generate_options;
+use super::chat::{build_generate_options, parse_priority_header};
 
 /// POST /v1/completions
 pub async fn completions(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(request): Json<CompletionRequest>,
 ) -> Response {
+    let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_completion(state, request).await
+        stream_completion(state, request, priority).await
     } else {
-        non_stream_completion(state, request).await.into_response()
+        non_stream_completion(state, request, priority)
+            .await
+            .into_response()
     }
 }
 
 async fn non_stream_completion(
     state: AppState,
     request: CompletionRequest,
+    priority: RequestPriority,
 ) -> Result<Json<CompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -56,7 +63,8 @@ async fn non_stream_completion(
     let model_id = state.display_model_id().to_string();
 
     let prompt = request.prompt.clone();
-    let options = build_generate_options(&request.params, &state.config);
+    let mut options = build_generate_options(&request.params, &state.config);
+    options.priority = priority;
 
     // Generate (blocking call handled by model provider's worker thread)
     let result = state
@@ -80,7 +88,11 @@ async fn non_stream_completion(
     )))
 }
 
-async fn stream_completion(state: AppState, request: CompletionRequest) -> Response {
+async fn stream_completion(
+    state: AppState,
+    request: CompletionRequest,
+    priority: RequestPriority,
+) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
         return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
@@ -90,7 +102,8 @@ async fn stream_completion(state: AppState, request: CompletionRequest) -> Respo
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
     let prompt = request.prompt.clone();
-    let options = build_generate_options(&request.params, &state.config);
+    let mut options = build_generate_options(&request.params, &state.config);
+    options.priority = priority;
 
     let (events, stream) = sse_channel(100);
 

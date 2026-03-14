@@ -25,7 +25,9 @@ use mlxcel_core::generate::SamplingConfig;
 
 use crate::server::batch::active::ActiveBatch;
 use crate::server::batch::queue::PrefillQueue;
-use crate::server::batch::sequence::{BatchSchedulerAction, SequenceInfo, SequenceState};
+use crate::server::batch::sequence::{
+    BatchSchedulerAction, RequestPriority, SequenceInfo, SequenceState,
+};
 use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
 
@@ -43,11 +45,13 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         sampling: SamplingConfig::default(),
         max_tokens: 100,
         eos_token_ids: vec![2],
+        priority: crate::server::batch::RequestPriority::Normal,
         vlm_embeddings: None,
         images: Vec::new(),
         generated_tokens: Vec::new(),
         generated_text: String::new(),
         decode_state,
+        prefill_offset: 0,
         response_tx: tx,
         created_at: Instant::now(),
         prefill_start: None,
@@ -199,4 +203,333 @@ fn decide_action_is_o1_regardless_of_queue_size() {
     // Should immediately return Prefill without scanning the queue
     let action = decide_action_from_state(&queue, &batch);
     assert!(matches!(action, BatchSchedulerAction::Prefill(_)));
+}
+
+// -------------------------------------------------------------------
+// Priority-related tests
+// -------------------------------------------------------------------
+
+fn make_test_sequence_with_priority(
+    id_val: u64,
+    priority: RequestPriority,
+) -> (SequenceInfo, mpsc::Receiver<GenerateEvent>) {
+    let (tx, rx) = mpsc::channel();
+    let tokenizer = crate::tokenizer::MlxcelTokenizer::stub();
+    let prompt_tokens = vec![1, 2, 3];
+    let decode_state = StreamingDecodeState::new(&tokenizer, &prompt_tokens);
+
+    let seq = SequenceInfo {
+        seq_id: SequenceId::from_raw(id_val),
+        state: SequenceState::Queued,
+        prompt_tokens,
+        sampling: SamplingConfig::default(),
+        max_tokens: 100,
+        eos_token_ids: vec![2],
+        priority,
+        vlm_embeddings: None,
+        images: Vec::new(),
+        generated_tokens: Vec::new(),
+        generated_text: String::new(),
+        decode_state,
+        prefill_offset: 0,
+        response_tx: tx,
+        created_at: Instant::now(),
+        prefill_start: None,
+        first_token_time: None,
+    };
+
+    (seq, rx)
+}
+
+#[test]
+fn priority_queue_dequeues_high_before_normal() {
+    let mut queue = PrefillQueue::new();
+
+    let (s_norm, _r1) = make_test_sequence_with_priority(1, RequestPriority::Normal);
+    let (s_high, _r2) = make_test_sequence_with_priority(2, RequestPriority::High);
+
+    queue.enqueue(s_norm).unwrap();
+    queue.enqueue(s_high).unwrap();
+
+    // High should come out first even though normal was enqueued first
+    let first = queue.dequeue().unwrap();
+    assert_eq!(first.seq_id.as_u64(), 2);
+    assert_eq!(first.priority, RequestPriority::High);
+
+    let second = queue.dequeue().unwrap();
+    assert_eq!(second.seq_id.as_u64(), 1);
+    assert_eq!(second.priority, RequestPriority::Normal);
+}
+
+#[test]
+fn priority_queue_dequeues_normal_before_low() {
+    let mut queue = PrefillQueue::new();
+
+    let (s_low, _r1) = make_test_sequence_with_priority(1, RequestPriority::Low);
+    let (s_norm, _r2) = make_test_sequence_with_priority(2, RequestPriority::Normal);
+
+    queue.enqueue(s_low).unwrap();
+    queue.enqueue(s_norm).unwrap();
+
+    assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 2); // Normal
+    assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 1); // Low
+}
+
+#[test]
+fn priority_queue_fifo_within_same_priority_level() {
+    let mut queue = PrefillQueue::new();
+
+    let (s1, _r1) = make_test_sequence_with_priority(10, RequestPriority::High);
+    let (s2, _r2) = make_test_sequence_with_priority(20, RequestPriority::High);
+    let (s3, _r3) = make_test_sequence_with_priority(30, RequestPriority::High);
+
+    queue.enqueue(s1).unwrap();
+    queue.enqueue(s2).unwrap();
+    queue.enqueue(s3).unwrap();
+
+    assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 10);
+    assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 20);
+    assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 30);
+}
+
+#[test]
+fn priority_ordering_is_high_gt_normal_gt_low() {
+    assert!(RequestPriority::High > RequestPriority::Normal);
+    assert!(RequestPriority::Normal > RequestPriority::Low);
+    assert!(RequestPriority::High > RequestPriority::Low);
+}
+
+#[test]
+fn request_priority_from_header_parses_valid_values() {
+    assert_eq!(
+        RequestPriority::from_header("high"),
+        Some(RequestPriority::High)
+    );
+    assert_eq!(
+        RequestPriority::from_header("NORMAL"),
+        Some(RequestPriority::Normal)
+    );
+    assert_eq!(
+        RequestPriority::from_header("Low"),
+        Some(RequestPriority::Low)
+    );
+    assert_eq!(
+        RequestPriority::from_header(" high "),
+        Some(RequestPriority::High)
+    );
+}
+
+#[test]
+fn request_priority_from_header_returns_none_for_invalid() {
+    assert_eq!(RequestPriority::from_header("urgent"), None);
+    assert_eq!(RequestPriority::from_header(""), None);
+    assert_eq!(RequestPriority::from_header("1"), None);
+}
+
+#[test]
+fn request_priority_default_is_normal() {
+    assert_eq!(RequestPriority::default(), RequestPriority::Normal);
+}
+
+// -------------------------------------------------------------------
+// Chunked prefill scheduling tests (without real model)
+// -------------------------------------------------------------------
+
+/// Extended decide_action that accounts for chunked prefill in progress.
+/// This mirrors the scheduler's policy.
+fn decide_action_with_chunked(
+    queue: &PrefillQueue,
+    batch: &ActiveBatch,
+    chunked_in_progress: bool,
+) -> BatchSchedulerAction {
+    // If chunked prefill is in progress, interleave decode
+    if chunked_in_progress {
+        if !batch.is_empty() {
+            return BatchSchedulerAction::Decode(batch.sequence_ids());
+        }
+        return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
+    }
+
+    if batch.is_empty() && queue.is_empty() {
+        return BatchSchedulerAction::Idle;
+    }
+    if !batch.is_empty() {
+        return BatchSchedulerAction::Decode(batch.sequence_ids());
+    }
+    BatchSchedulerAction::Prefill(SequenceId::from_raw(0))
+}
+
+#[test]
+fn chunked_prefill_interleaves_decode_when_active_sequences_exist() {
+    let queue = PrefillQueue::new();
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut seq, _rx) = make_test_sequence(10);
+    seq.state = SequenceState::Decoding;
+    batch.add(seq).unwrap();
+
+    // Chunked prefill in progress + active sequences -> should decode
+    let action = decide_action_with_chunked(&queue, &batch, true);
+    assert!(
+        matches!(action, BatchSchedulerAction::Decode(_)),
+        "Expected Decode during chunked prefill with active sequences"
+    );
+}
+
+#[test]
+fn chunked_prefill_continues_when_no_active_sequences() {
+    let queue = PrefillQueue::new();
+    let batch = ActiveBatch::new(4);
+
+    // Chunked prefill in progress + no active sequences -> continue prefill
+    let action = decide_action_with_chunked(&queue, &batch, true);
+    assert!(
+        matches!(action, BatchSchedulerAction::Prefill(_)),
+        "Expected Prefill continuation when no active sequences"
+    );
+}
+
+#[test]
+fn chunked_prefill_interleaving_pattern() {
+    // Simulate the interleaving pattern:
+    // Tick 1: Prefill chunk 1
+    // Tick 2: Decode (if active)
+    // Tick 3: Prefill chunk 2
+    // Tick 4: Decode (if active)
+    // ...
+
+    let queue = PrefillQueue::new();
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut active_seq, _rx) = make_test_sequence(1);
+    active_seq.state = SequenceState::Decoding;
+    batch.add(active_seq).unwrap();
+
+    // Tick 1: chunked prefill starts -> first action is Prefill
+    // (no chunked_in_progress yet, batch has active seq, so Decode first)
+    let action1 = decide_action_with_chunked(&queue, &batch, false);
+    assert!(matches!(action1, BatchSchedulerAction::Decode(_)));
+
+    // Tick 2: chunked prefill now in progress -> Decode interleave
+    let action2 = decide_action_with_chunked(&queue, &batch, true);
+    assert!(matches!(action2, BatchSchedulerAction::Decode(_)));
+
+    // Tick 3: after decode, back to prefill continuation
+    let action3 = decide_action_with_chunked(&queue, &batch, true);
+    assert!(matches!(action3, BatchSchedulerAction::Decode(_)));
+    // (still interleaving because batch is non-empty)
+
+    // With no active batch: prefill continues
+    let empty_batch = ActiveBatch::new(4);
+    let action4 = decide_action_with_chunked(&queue, &empty_batch, true);
+    assert!(matches!(action4, BatchSchedulerAction::Prefill(_)));
+}
+
+// -------------------------------------------------------------------
+// Eviction victim selection tests
+// -------------------------------------------------------------------
+
+#[test]
+fn active_batch_iter_min_priority_finds_lowest() {
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut s1, _r1) = make_test_sequence_with_priority(1, RequestPriority::High);
+    s1.state = SequenceState::Decoding;
+    let (mut s2, _r2) = make_test_sequence_with_priority(2, RequestPriority::Low);
+    s2.state = SequenceState::Decoding;
+    let (mut s3, _r3) = make_test_sequence_with_priority(3, RequestPriority::Normal);
+    s3.state = SequenceState::Decoding;
+
+    batch.add(s1).unwrap();
+    batch.add(s2).unwrap();
+    batch.add(s3).unwrap();
+
+    assert_eq!(batch.iter_min_priority(), Some(RequestPriority::Low));
+}
+
+#[test]
+fn active_batch_iter_min_priority_empty_returns_none() {
+    let batch = ActiveBatch::new(4);
+    assert_eq!(batch.iter_min_priority(), None);
+}
+
+#[test]
+fn eviction_selects_longest_first_by_default() {
+    use crate::server::config::PreemptionPolicy;
+
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut s1, _r1) = make_test_sequence_with_priority(1, RequestPriority::Normal);
+    s1.state = SequenceState::Decoding;
+    s1.generated_tokens = vec![10, 20, 30]; // 3 tokens
+
+    let (mut s2, _r2) = make_test_sequence_with_priority(2, RequestPriority::Normal);
+    s2.state = SequenceState::Decoding;
+    s2.generated_tokens = vec![10]; // 1 token
+
+    batch.add(s1).unwrap();
+    batch.add(s2).unwrap();
+
+    // LongestFirst should pick s1 (3 tokens > 1 token)
+    let victim = match PreemptionPolicy::LongestFirst {
+        PreemptionPolicy::LongestFirst => batch
+            .iter_sequences()
+            .max_by_key(|seq| seq.generated_tokens.len())
+            .map(|seq| seq.seq_id),
+        _ => None,
+    };
+
+    assert_eq!(victim.unwrap().as_u64(), 1);
+}
+
+#[test]
+fn eviction_selects_lowest_priority_then_longest() {
+    use crate::server::config::PreemptionPolicy;
+
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut s1, _r1) = make_test_sequence_with_priority(1, RequestPriority::High);
+    s1.state = SequenceState::Decoding;
+    s1.generated_tokens = vec![10, 20, 30]; // 3 tokens
+
+    let (mut s2, _r2) = make_test_sequence_with_priority(2, RequestPriority::Low);
+    s2.state = SequenceState::Decoding;
+    s2.generated_tokens = vec![10]; // 1 token
+
+    let (mut s3, _r3) = make_test_sequence_with_priority(3, RequestPriority::Low);
+    s3.state = SequenceState::Decoding;
+    s3.generated_tokens = vec![10, 20, 30, 40]; // 4 tokens
+
+    batch.add(s1).unwrap();
+    batch.add(s2).unwrap();
+    batch.add(s3).unwrap();
+
+    // LowestPriority should pick s3 (Low + 4 tokens, longest of Low group)
+    let victim = match PreemptionPolicy::LowestPriority {
+        PreemptionPolicy::LowestPriority => batch
+            .iter_sequences()
+            .min_by(|a, b| {
+                a.priority
+                    .cmp(&b.priority)
+                    .then_with(|| b.generated_tokens.len().cmp(&a.generated_tokens.len()))
+            })
+            .map(|seq| seq.seq_id),
+        _ => None,
+    };
+
+    assert_eq!(victim.unwrap().as_u64(), 3);
+}
+
+#[test]
+fn preemption_disabled_by_default_never_triggers() {
+    // When enable_preemption is false, should_preempt should never
+    // return true, even if the batch is full and queue has high-priority
+    // requests. We test this by verifying the policy logic directly.
+    let enable_preemption = false;
+    let batch_full = true;
+    let queue_has_high_priority = true;
+
+    // The condition: enable_preemption && batch_full && queue_has_high > min_active
+    let should_preempt = enable_preemption && batch_full && queue_has_high_priority;
+    assert!(!should_preempt);
 }

@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Core batch scheduler with iteration-level scheduling.
+//! Core batch scheduler with iteration-level scheduling and chunked prefill.
 //!
 //! [`BatchScheduler`] replaces the sequential `loop { request_rx.recv() }`
 //! pattern in the model worker. At each tick it decides whether to:
 //!
-//! - **Prefill** a new queued request (prompt processing + first token),
+//! - **Prefill** (or continue a chunked prefill of) a queued request,
 //! - **Decode** one token for each active sequence, or
 //! - **Idle** (block until the next request arrives).
 //!
-//! Phase 1 uses a sequential loop for decode: one `forward()` call per
-//! active sequence. Sub-issue 4 (#16) upgrades this to batched decode.
+//! When `prefill_chunk_size > 0`, long prompts are broken into chunks and
+//! decode steps are interleaved between chunks so active sequences are not
+//! starved during prefill of large prompts.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -40,6 +41,7 @@ use mlxcel_core::{MlxStream, UniquePtr};
 
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
+use crate::server::config::PreemptionPolicy;
 use crate::server::model_provider::model_worker::{
     StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
     prepare_request_vlm_embeddings,
@@ -51,13 +53,18 @@ use crate::vlm_runtime::prepared_embedding_refs;
 
 use super::active::ActiveBatch;
 use super::queue::PrefillQueue;
-use super::sequence::{BatchSchedulerAction, FinishReason, SequenceInfo, SequenceState};
+use super::sequence::{
+    BatchSchedulerAction, FinishReason, RequestPriority, SequenceInfo, SequenceState,
+};
 
 /// Core batch scheduler that drives the model worker loop.
 ///
 /// Replaces the old sequential `recv()` loop with an iteration-level scheduler
 /// that interleaves prefill and decode operations. When `max_batch_size == 1`
 /// (the default), behavior is identical to the pre-scheduler worker loop.
+///
+/// When `prefill_chunk_size > 0`, long prompts are processed in chunks with
+/// decode interleaving to prevent latency spikes for active sequences.
 pub struct BatchScheduler {
     // -- Pool & scheduling structures --
     cache_pool: CachePool,
@@ -80,19 +87,24 @@ pub struct BatchScheduler {
 
     // -- Configuration --
     config_eos: Vec<i32>,
+    /// Number of prompt tokens per prefill chunk. 0 = chunking disabled.
+    prefill_chunk_size: usize,
+    /// Whether preemptive eviction is enabled.
+    enable_preemption: bool,
+    /// Policy for selecting the eviction victim.
+    preemption_policy: PreemptionPolicy,
+
+    // -- Chunked prefill in-progress state --
+    /// Sequence currently undergoing chunked prefill. `None` when no chunked
+    /// prefill is in progress.
+    chunked_prefill_seq: Option<SequenceInfo>,
 
     // -- Shutdown flag --
-    /// Set to `true` when a `Shutdown` message is received during the
-    /// non-blocking drain phase, so the main loop can observe it and exit.
     shutdown_requested: bool,
 }
 
 impl BatchScheduler {
     /// Create a new batch scheduler, taking ownership of the model and channel.
-    ///
-    /// `max_batch_size` controls the maximum number of concurrent decode
-    /// sequences. `max_queue_depth` controls the maximum number of pending
-    /// prefill requests.
     pub fn new(
         model: LoadedModel,
         tokenizer: MlxcelTokenizer,
@@ -101,6 +113,34 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_queue_depth: usize,
         batch_metrics: Arc<BatchMetrics>,
+    ) -> Self {
+        Self::with_config(
+            model,
+            tokenizer,
+            config_eos,
+            request_rx,
+            max_batch_size,
+            max_queue_depth,
+            batch_metrics,
+            0,
+            false,
+            PreemptionPolicy::default(),
+        )
+    }
+
+    /// Create a new batch scheduler with chunked-prefill and preemption config.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_config(
+        model: LoadedModel,
+        tokenizer: MlxcelTokenizer,
+        config_eos: Vec<i32>,
+        request_rx: mpsc::Receiver<ModelRequest>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        batch_metrics: Arc<BatchMetrics>,
+        prefill_chunk_size: usize,
+        enable_preemption: bool,
+        preemption_policy: PreemptionPolicy,
     ) -> Self {
         let generation_stream = new_generation_stream();
         let max_batch_size = max_batch_size.max(1);
@@ -114,16 +154,15 @@ impl BatchScheduler {
             request_rx,
             batch_metrics,
             config_eos,
+            prefill_chunk_size,
+            enable_preemption,
+            preemption_policy,
+            chunked_prefill_seq: None,
             shutdown_requested: false,
         }
     }
 
     /// Run the scheduler loop until shutdown or channel close.
-    ///
-    /// This is the main entry point, called from the worker thread. It never
-    /// returns under normal operation; it exits when:
-    /// - A `ModelRequest::Shutdown` is received, or
-    /// - The request channel is closed (all senders dropped).
     pub fn run(&mut self) {
         install_default_stream(self.generation_stream.as_ref());
 
@@ -131,12 +170,10 @@ impl BatchScheduler {
             // 1. Non-blocking drain of all pending requests
             self.drain_incoming_requests();
 
-            // Exit if shutdown was received during drain
             if self.shutdown_requested {
                 break;
             }
 
-            // Publish metrics after ingestion
             self.publish_metrics();
 
             // 2. Decide what to do this tick
@@ -151,22 +188,18 @@ impl BatchScheduler {
                 BatchSchedulerAction::Decode(ids) => {
                     self.execute_decode_step(&ids);
                 }
-                BatchSchedulerAction::Idle => {
-                    // Block until next request arrives
-                    match self.request_rx.recv() {
-                        Ok(req) => {
-                            if self.handle_incoming(req) {
-                                // Shutdown requested
-                                break;
-                            }
-                            self.publish_metrics();
-                        }
-                        Err(_) => {
-                            tracing::info!("Request channel closed, scheduler exiting");
+                BatchSchedulerAction::Idle => match self.request_rx.recv() {
+                    Ok(req) => {
+                        if self.handle_incoming(req) {
                             break;
                         }
+                        self.publish_metrics();
                     }
-                }
+                    Err(_) => {
+                        tracing::info!("Request channel closed, scheduler exiting");
+                        break;
+                    }
+                },
             }
 
             // 4. Clean up completed sequences
@@ -174,10 +207,6 @@ impl BatchScheduler {
         }
     }
 
-    /// Publish current queue and batch sizes to shared atomic metrics.
-    ///
-    /// Called after state-changing operations so HTTP handlers see
-    /// up-to-date values for admission control and status reporting.
     fn publish_metrics(&self) {
         self.batch_metrics.set_active_count(self.active_batch.len());
         self.batch_metrics.set_queue_depth(self.prefill_queue.len());
@@ -187,10 +216,6 @@ impl BatchScheduler {
     // Request ingestion
     // ------------------------------------------------------------------
 
-    /// Non-blocking drain: pull all pending requests from the channel.
-    ///
-    /// Sets `self.shutdown_requested = true` if a `Shutdown` message is
-    /// received, so the caller can break out of the main loop.
     fn drain_incoming_requests(&mut self) {
         loop {
             match self.request_rx.try_recv() {
@@ -209,7 +234,6 @@ impl BatchScheduler {
         }
     }
 
-    /// Process a single incoming request. Returns `true` if shutdown.
     fn handle_incoming(&mut self, req: ModelRequest) -> bool {
         match req {
             ModelRequest::Generate {
@@ -228,7 +252,6 @@ impl BatchScheduler {
         }
     }
 
-    /// Convert a `ModelRequest::Generate` into a `SequenceInfo` and enqueue.
     fn enqueue_request(
         &mut self,
         prompt: String,
@@ -236,7 +259,6 @@ impl BatchScheduler {
         images: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
     ) {
-        // Tokenize
         let token_ids = match self.tokenizer.encode(&prompt, true) {
             Ok(ids) => ids,
             Err(err) => {
@@ -246,11 +268,8 @@ impl BatchScheduler {
             }
         };
         let mut prompt_tokens: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
-
-        // Merge config-level EOS tokens into sampling
         let sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
 
-        // Allocate a sequence ID from the cache pool
         let seq_id = match self.cache_pool.allocate(&self.model) {
             Ok(id) => id,
             Err(err) => {
@@ -260,7 +279,6 @@ impl BatchScheduler {
             }
         };
 
-        // Prepare VLM embeddings (if applicable)
         let vlm_embeddings = match prepare_request_vlm_embeddings(
             &self.model,
             &self.tokenizer,
@@ -285,11 +303,13 @@ impl BatchScheduler {
             sampling,
             max_tokens: options.max_tokens,
             eos_token_ids: self.config_eos.clone(),
+            priority: options.priority,
             vlm_embeddings,
             images,
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             decode_state,
+            prefill_offset: 0,
             response_tx,
             created_at: Instant::now(),
             prefill_start: None,
@@ -310,62 +330,119 @@ impl BatchScheduler {
 
     /// Determine the next action. Runs in O(1) time.
     ///
-    /// Policy (designed to prevent starvation of active sequences):
-    /// - If both the active batch and prefill queue are empty, idle.
-    /// - If the active batch has sequences, always decode first. This
-    ///   ensures active sequences make progress every tick and are not
-    ///   starved by a continuous stream of incoming prefill requests.
-    /// - If the active batch is empty but the prefill queue is not, prefill
-    ///   the next queued request.
-    /// - If the batch is full and the queue is non-empty, decode (the queued
-    ///   requests will be prefilled once a slot opens).
+    /// Policy:
+    /// 1. If a chunked prefill is in progress and active sequences exist,
+    ///    decode first (interleave).
+    /// 2. If a chunked prefill is in progress and no active sequences,
+    ///    continue the prefill.
+    /// 3. If active sequences exist, decode first.
+    /// 4. If the batch is not full and the queue has work, prefill.
+    /// 5. Otherwise idle.
     fn decide_action(&self) -> BatchSchedulerAction {
+        // Chunked prefill in progress: interleave decode with prefill
+        if self.chunked_prefill_seq.is_some() {
+            if !self.active_batch.is_empty() {
+                // Interleave: decode active sequences first, then continue
+                // prefill on the next tick.
+                return BatchSchedulerAction::Decode(self.active_batch.sequence_ids());
+            }
+            // No active sequences, continue the prefill
+            return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
+        }
+
         if self.active_batch.is_empty() && self.prefill_queue.is_empty() {
             return BatchSchedulerAction::Idle;
         }
+
         // Active sequences always get a decode step before admitting new
         // prefills. This prevents latency starvation under sustained load.
         if !self.active_batch.is_empty() {
+            // Check if we should preempt for a higher-priority request
+            if self.should_preempt() {
+                return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
+            }
             return BatchSchedulerAction::Decode(self.active_batch.sequence_ids());
         }
-        // Batch is empty but queue has work -- prefill the next request.
-        // The sentinel ID is informational; execute_prefill dequeues
-        // from the front of the queue regardless.
+
+        // Batch is empty but queue has work
         BatchSchedulerAction::Prefill(SequenceId::from_raw(0))
     }
 
+    /// Check if preemption should occur: batch is full, preemption is
+    /// enabled, and a higher-priority request is waiting.
+    fn should_preempt(&self) -> bool {
+        if !self.enable_preemption || !self.active_batch.is_full() {
+            return false;
+        }
+        // Only preempt if waiting request has higher priority than some
+        // active sequence.
+        let waiting_priority = match self.prefill_queue.peek_priority() {
+            Some(p) => p,
+            None => return false,
+        };
+        // Find the lowest-priority active sequence
+        let min_active_priority = self
+            .active_batch
+            .iter_min_priority()
+            .unwrap_or(RequestPriority::High);
+
+        waiting_priority > min_active_priority
+    }
+
     // ------------------------------------------------------------------
-    // Prefill execution
+    // Prefill execution (chunked or full)
     // ------------------------------------------------------------------
 
-    /// Prefill a single sequence: run the full prompt through the model,
-    /// sample the first token, and move the sequence to the active batch.
+    /// Prefill a sequence. If `prefill_chunk_size > 0` and the prompt
+    /// exceeds one chunk, the prefill is split across multiple ticks with
+    /// decode interleaving.
     fn execute_prefill(&mut self, _action_id: SequenceId) {
+        // Resume a chunked prefill already in progress?
+        if self.chunked_prefill_seq.is_some() {
+            self.continue_chunked_prefill();
+            return;
+        }
+
+        // Preemption: if batch is full and preemption is enabled, evict
+        // a lower-priority sequence to make room.
+        if self.active_batch.is_full() && self.enable_preemption && !self.try_evict_for_preemption()
+        {
+            // Cannot evict -- skip prefill this tick
+            return;
+        }
+
         let mut seq = match self.prefill_queue.dequeue() {
             Some(s) => s,
             None => return,
         };
 
-        // Transition state
         if let Err(err) = seq.state.transition_to(SequenceState::Prefilling) {
             tracing::error!("State transition error: {err}");
             self.abort_sequence(seq, &err);
             return;
         }
         seq.prefill_start = Some(Instant::now());
-
-        // Set up sampling RNG
         seed_rng_if_needed(&seq.sampling);
 
-        // Build merged EOS list for this sequence
+        let prompt_len = seq.prompt_tokens.len();
+
+        // Decide: chunked vs full prefill
+        if self.prefill_chunk_size > 0 && prompt_len > self.prefill_chunk_size {
+            // Start chunked prefill: process first chunk
+            self.start_chunked_prefill(seq);
+        } else {
+            // Full-prompt prefill (original path)
+            self.execute_full_prefill(seq);
+        }
+    }
+
+    /// Full-prompt prefill: process the entire prompt in one pass.
+    fn execute_full_prefill(&mut self, mut seq: SequenceInfo) {
         let eos_tokens =
             merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
-
-        // Build token history for penalty sampling
         let needs_history = seq.sampling.needs_token_history();
-        let mut token_history = initial_token_history(&seq.prompt_tokens, needs_history);
+        let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
 
-        // Get per-sequence caches
         let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
             Some(c) => c,
             None => {
@@ -374,7 +451,6 @@ impl BatchScheduler {
             }
         };
 
-        // Prepare input tensor
         let prompt_len = seq.prompt_tokens.len() as i32;
         let input = mlxcel_core::from_slice_i32(&seq.prompt_tokens, &[1, prompt_len]);
 
@@ -388,7 +464,6 @@ impl BatchScheduler {
                         caches,
                         mask_ref,
                     );
-                    // Force evaluation before after_prefill modifications
                     mlxcel_core::eval(&logits);
                     self.model.after_prefill();
                     logits
@@ -402,10 +477,128 @@ impl BatchScheduler {
             self.model.forward(&input, caches, None)
         };
 
-        // Clear intermediate prefill tensors
+        mlxcel_core::clear_memory_cache();
+        seq.prefill_offset = seq.prompt_tokens.len();
+
+        self.finish_prefill(seq, logits, eos_tokens, token_history, needs_history);
+    }
+
+    /// Begin a chunked prefill: process the first chunk and store the
+    /// sequence for continuation on subsequent ticks.
+    fn start_chunked_prefill(&mut self, mut seq: SequenceInfo) {
+        let chunk_size = self.prefill_chunk_size;
+        let end = chunk_size.min(seq.prompt_tokens.len());
+        let chunk = &seq.prompt_tokens[..end];
+
+        let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+            Some(c) => c,
+            None => {
+                self.abort_sequence(seq, "Cache not found for sequence during chunked prefill");
+                return;
+            }
+        };
+
+        let chunk_len = chunk.len() as i32;
+        let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk_len]);
+
+        // VLM embeddings are applied only on the first chunk
+        if let Some(ref embeddings) = seq.vlm_embeddings {
+            match prepared_embedding_refs(embeddings) {
+                Ok((input_embeds, mask_ref)) => {
+                    let logits = self.model.forward_with_embeddings(
+                        &input,
+                        Some(input_embeds),
+                        caches,
+                        mask_ref,
+                    );
+                    mlxcel_core::eval(&logits);
+                    self.model.after_prefill();
+                }
+                Err(err) => {
+                    self.abort_sequence(seq, &err.to_string());
+                    return;
+                }
+            }
+        } else {
+            let logits = self.model.forward(&input, caches, None);
+            mlxcel_core::eval(&logits);
+        }
+
+        mlxcel_core::clear_memory_cache();
+        seq.prefill_offset = end;
+
+        tracing::debug!(
+            "Chunked prefill: seq {} chunk 0..{end}/{} tokens",
+            seq.seq_id,
+            seq.prompt_tokens.len()
+        );
+
+        // Store the sequence for continuation
+        self.chunked_prefill_seq = Some(seq);
+    }
+
+    /// Continue a chunked prefill that is already in progress.
+    fn continue_chunked_prefill(&mut self) {
+        let mut seq = match self.chunked_prefill_seq.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        let chunk_size = self.prefill_chunk_size;
+        let offset = seq.prefill_offset;
+        let total = seq.prompt_tokens.len();
+        let end = (offset + chunk_size).min(total);
+        let chunk = &seq.prompt_tokens[offset..end];
+
+        let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+            Some(c) => c,
+            None => {
+                self.abort_sequence(seq, "Cache not found during chunked prefill continuation");
+                return;
+            }
+        };
+
+        let chunk_len = chunk.len() as i32;
+        let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk_len]);
+        let logits = self.model.forward(&input, caches, None);
+
+        seq.prefill_offset = end;
+
+        tracing::debug!(
+            "Chunked prefill: seq {} chunk {offset}..{end}/{total} tokens",
+            seq.seq_id,
+        );
+
+        if end < total {
+            // More chunks remain -- store and yield back to the scheduler
+            mlxcel_core::eval(&logits);
+            mlxcel_core::clear_memory_cache();
+            self.chunked_prefill_seq = Some(seq);
+            return;
+        }
+
+        // Final chunk -- complete the prefill and sample the first token
         mlxcel_core::clear_memory_cache();
 
-        // Sample first token
+        let eos_tokens =
+            merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
+        let needs_history = seq.sampling.needs_token_history();
+        let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
+
+        self.finish_prefill(seq, logits, eos_tokens, token_history, needs_history);
+    }
+
+    /// Complete a prefill (full or chunked): sample the first token,
+    /// handle EOS, and either finish immediately or move to the active
+    /// decode batch.
+    fn finish_prefill(
+        &mut self,
+        mut seq: SequenceInfo,
+        logits: UniquePtr<mlxcel_core::MlxArray>,
+        eos_tokens: Vec<i32>,
+        mut token_history: Vec<i32>,
+        needs_history: bool,
+    ) {
         let (first_token_arr, _logprobs) =
             sample_token_optimized(&logits, &seq.sampling, &token_history);
         mlxcel_core::eval(&first_token_arr);
@@ -421,7 +614,6 @@ impl BatchScheduler {
             {
                 tracing::error!("State transition error: {err}");
             }
-            // Emit done immediately (no tokens generated)
             let result = build_generation_result(
                 String::new(),
                 seq.prompt_tokens.len(),
@@ -437,18 +629,15 @@ impl BatchScheduler {
             return;
         }
 
-        // Record the generated token
         seq.generated_tokens.push(first_token);
         if needs_history {
             token_history.push(first_token);
         }
 
-        // Emit the first token via streaming
         if let Some(new_text) = seq.decode_state.on_token(first_token, &self.tokenizer) {
             let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
         }
 
-        // Check max_tokens (unlikely after just 1 token, but be correct)
         if seq.generated_tokens.len() >= seq.max_tokens {
             if let Err(err) = seq
                 .state
@@ -456,8 +645,6 @@ impl BatchScheduler {
             {
                 tracing::error!("State transition error: {err}");
             }
-            // Will be cleaned up in finalize_completed via active batch
-            // But since we haven't added to active batch yet, handle inline
             seq.decode_state.flush(&self.tokenizer);
             let result =
                 seq.decode_state
@@ -467,17 +654,16 @@ impl BatchScheduler {
             return;
         }
 
-        // Transition to Decoding and add to active batch
         if let Err(err) = seq.state.transition_to(SequenceState::Decoding) {
             tracing::error!("State transition error: {err}");
             self.abort_sequence(seq, &err);
             return;
         }
 
-        // Update cache metadata
+        let prompt_len = seq.prompt_tokens.len() as i32;
         if let Some(cache_set) = self.cache_pool.get_mut(seq.seq_id) {
             cache_set.prompt_len = seq.prompt_tokens.len();
-            cache_set.current_offset = prompt_len + 1; // prompt + first token
+            cache_set.current_offset = prompt_len + 1;
         }
 
         if let Err(err) = self.active_batch.add(seq) {
@@ -486,18 +672,111 @@ impl BatchScheduler {
     }
 
     // ------------------------------------------------------------------
+    // Preemptive eviction
+    // ------------------------------------------------------------------
+
+    /// Attempt to evict one sequence from the active batch to make room
+    /// for a higher-priority queued request.
+    ///
+    /// Returns `true` if eviction succeeded (a slot is now free).
+    ///
+    /// **Streaming caveat:** Tokens already streamed to the client via
+    /// `GenerateEvent::Token` are not recalled. When the evicted sequence
+    /// is re-prefilled, duplicate tokens may be streamed. This is
+    /// acceptable for preemptive scheduling (the client sees a retry)
+    /// and is consistent with vLLM's eviction semantics.
+    fn try_evict_for_preemption(&mut self) -> bool {
+        let victim_id = match self.select_eviction_victim() {
+            Some(id) => id,
+            None => return false,
+        };
+
+        if let Some(mut victim) = self.active_batch.remove(victim_id) {
+            tracing::info!(
+                "Preempting sequence {} (priority={:?}, {} tokens generated)",
+                victim.seq_id,
+                victim.priority,
+                victim.generated_tokens.len()
+            );
+
+            // Release its KV cache
+            self.cache_pool.release(victim.seq_id);
+
+            // Reset the sequence for re-prefill: clear generated tokens,
+            // reset decode state, and re-allocate a cache slot.
+            victim.generated_tokens.clear();
+            victim.generated_text.clear();
+            victim.prefill_offset = 0;
+            victim.decode_state = StreamingDecodeState::new(&self.tokenizer, &victim.prompt_tokens);
+
+            // Allocate a fresh cache slot
+            match self.cache_pool.allocate(&self.model) {
+                Ok(new_id) => {
+                    victim.seq_id = new_id;
+                    if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
+                        tracing::error!("Eviction state transition error: {err}");
+                        self.cache_pool.release(new_id);
+                        let _ = victim
+                            .response_tx
+                            .send(GenerateEvent::Error(format!("Eviction state error: {err}")));
+                        return true; // Slot is still freed
+                    }
+                }
+                Err(err) => {
+                    tracing::warn!("Re-allocation failed for evicted sequence: {err}");
+                    let _ = victim.response_tx.send(GenerateEvent::Error(format!(
+                        "Preemption re-queue failed: {err}"
+                    )));
+                    return true; // Slot is still freed
+                }
+            }
+
+            // Re-queue the evicted sequence (it will re-prefill when admitted)
+            if let Err(rejected) = self.prefill_queue.enqueue(victim) {
+                self.cache_pool.release(rejected.seq_id);
+                let _ = rejected.response_tx.send(GenerateEvent::Error(
+                    "Preemption re-queue failed: prefill queue full".to_string(),
+                ));
+            }
+
+            self.batch_metrics.record_preemption();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Select the eviction victim based on the configured policy.
+    fn select_eviction_victim(&self) -> Option<SequenceId> {
+        match self.preemption_policy {
+            PreemptionPolicy::LongestFirst => {
+                // Evict the sequence with the most generated tokens
+                self.active_batch
+                    .iter_sequences()
+                    .max_by_key(|seq| seq.generated_tokens.len())
+                    .map(|seq| seq.seq_id)
+            }
+            PreemptionPolicy::LowestPriority => {
+                // Evict the lowest-priority sequence; break ties by longest
+                self.active_batch
+                    .iter_sequences()
+                    .min_by(|a, b| {
+                        a.priority
+                            .cmp(&b.priority)
+                            .then_with(|| b.generated_tokens.len().cmp(&a.generated_tokens.len()))
+                    })
+                    .map(|seq| seq.seq_id)
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
     // Decode execution (batched when B > 1, sequential fallback otherwise)
     // ------------------------------------------------------------------
 
     /// Run one decode step for the active sequences.
-    ///
-    /// When the model supports batching and there are multiple sequences,
-    /// this uses `forward_batched()` to amortize weight-loading bandwidth.
-    /// For single-sequence decode or models without batching support, it
-    /// falls back to the sequential path.
     fn execute_decode_step(&mut self, seq_ids: &[SequenceId]) {
         if seq_ids.len() <= 1 || !self.model.supports_batching() {
-            // Sequential fallback
             for &seq_id in seq_ids {
                 self.decode_single_step(seq_id);
             }
@@ -508,15 +787,9 @@ impl BatchScheduler {
     }
 
     /// Batched decode: one forward_batched() call for all active sequences.
-    ///
-    /// Builds a [B, 1] token tensor, collects per-sequence caches,
-    /// runs the batched forward pass, and independently samples + updates
-    /// each sequence from the resulting [B, 1, vocab_size] logits.
     fn execute_batched_decode(&mut self, seq_ids: &[SequenceId]) {
         let b = seq_ids.len();
 
-        // --- Phase 1: Gather per-sequence data ---
-        // Collect last tokens and token histories before borrowing caches.
         let mut last_tokens: Vec<i32> = Vec::with_capacity(b);
         let mut token_histories: Vec<Vec<i32>> = Vec::with_capacity(b);
 
@@ -524,8 +797,6 @@ impl BatchScheduler {
             let seq = match self.active_batch.get_mut(seq_id) {
                 Some(s) => s,
                 None => {
-                    // Sequence vanished between decide_action and execution.
-                    // Fall back to sequential for remaining sequences.
                     self.execute_decode_step_sequential_remaining(seq_ids, last_tokens.len());
                     return;
                 }
@@ -543,16 +814,8 @@ impl BatchScheduler {
             }
         }
 
-        // --- Phase 2: Build batched input [B, 1] ---
         let input = mlxcel_core::from_slice_i32(&last_tokens, &[b as i32, 1]);
 
-        // --- Phase 3: Collect mutable cache slices ---
-        // We need &mut [KVCache] for each sequence, gathered from the pool.
-        // Since CachePool requires &mut self per lookup, we extract all
-        // cache pointers in a single pass using raw pointer arithmetic to
-        // avoid double-mutable-borrow issues.
-        //
-        // Verify no duplicate SequenceIds exist (which would cause aliasing).
         debug_assert!(
             {
                 let unique: HashSet<_> = seq_ids.iter().collect();
@@ -585,16 +848,11 @@ impl BatchScheduler {
             .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
             .collect();
 
-        // --- Phase 4: Batched forward pass ---
         let logits = self.model.forward_batched(&input, &mut batch_caches, None);
 
-        // --- Phase 5: Per-sequence sampling and state update ---
-        // Sample independently using each sequence's own SamplingConfig.
-        // Hoist model EOS tokens outside the loop to avoid cloning per-sequence.
         let model_eos = self.model.eos_token_ids();
 
         for (i, &seq_id) in seq_ids.iter().enumerate() {
-            // Slice logits for this sequence: [B, 1, vocab] -> [1, 1, vocab]
             let seq_logits =
                 mlxcel_core::slice(&logits, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
 
@@ -609,7 +867,6 @@ impl BatchScheduler {
                 mlxcel_core::eval(&token_arr);
                 let val = mlxcel_core::item_i32(&token_arr);
                 let eos = if seq.sampling.stop_token_ids.is_empty() {
-                    // Common case: no per-request stop tokens, reuse model_eos directly
                     model_eos.clone()
                 } else {
                     merged_eos_token_ids(model_eos.clone(), &seq.sampling.stop_token_ids)
@@ -617,7 +874,6 @@ impl BatchScheduler {
                 (val, eos)
             };
 
-            // Update the sequence
             let seq = match self.active_batch.get_mut(seq_id) {
                 Some(s) => s,
                 None => continue,
@@ -657,8 +913,6 @@ impl BatchScheduler {
         }
     }
 
-    /// Sequential fallback for remaining sequences when batched decode
-    /// cannot be completed (e.g. a sequence vanished mid-gather).
     fn execute_decode_step_sequential_remaining(
         &mut self,
         seq_ids: &[SequenceId],
@@ -669,14 +923,7 @@ impl BatchScheduler {
         }
     }
 
-    /// Decode one token for a single sequence.
     fn decode_single_step(&mut self, seq_id: SequenceId) {
-        // We need to split borrows: get the caches from the pool first,
-        // then the sequence from the batch. Since both need &mut self,
-        // we extract what we need in stages.
-
-        // Extract only cheap, Copy/non-owning data from the sequence to
-        // avoid cloning SamplingConfig every decode step.
         let (last_token, needs_history) = {
             let seq = match self.active_batch.get_mut(seq_id) {
                 Some(s) => s,
@@ -686,10 +933,6 @@ impl BatchScheduler {
             (last, seq.sampling.needs_token_history())
         };
 
-        // Build a token history snapshot. This is only needed when penalty
-        // sampling is active (repetition, frequency, or presence penalties).
-        // We build it only when required to avoid O(prompt+gen) allocation
-        // on every step.
         let token_history = if needs_history {
             let seq = self.active_batch.get_mut(seq_id).unwrap();
             let mut history =
@@ -701,7 +944,6 @@ impl BatchScheduler {
             Vec::new()
         };
 
-        // Get caches and run forward
         let caches = match self.cache_pool.get_caches_mut(seq_id) {
             Some(c) => c,
             None => {
@@ -710,14 +952,9 @@ impl BatchScheduler {
             }
         };
 
-        // Build input: single token reshaped to [1, 1]
         let input = mlxcel_core::from_slice_i32(&[last_token], &[1, 1]);
-
-        // Forward pass
         let logits = self.model.forward(&input, caches, None);
 
-        // Sample -- borrow sampling by reference from the sequence to avoid
-        // cloning the SamplingConfig (which contains Vecs and Strings).
         let (token_val, eos_tokens) = {
             let seq = self.active_batch.get_mut(seq_id).unwrap();
             let (token_arr, _logprobs) =
@@ -730,13 +967,11 @@ impl BatchScheduler {
             (val, eos)
         };
 
-        // Update the sequence
         let seq = match self.active_batch.get_mut(seq_id) {
             Some(s) => s,
             None => return,
         };
 
-        // Check EOS
         if eos_tokens.contains(&token_val) {
             if let Err(err) = seq
                 .state
@@ -747,15 +982,12 @@ impl BatchScheduler {
             return;
         }
 
-        // Record token
         seq.generated_tokens.push(token_val);
 
-        // Stream the decoded text
         if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
             let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
         }
 
-        // Check max_tokens
         if seq.generated_tokens.len() >= seq.max_tokens
             && let Err(err) = seq
                 .state
@@ -764,12 +996,10 @@ impl BatchScheduler {
             tracing::error!("State transition error: {err}");
         }
 
-        // Periodic cache clearing
         if seq.generated_tokens.len() % 512 == 0 {
             mlxcel_core::clear_memory_cache();
         }
 
-        // Update cache pool metadata
         if let Some(cache_set) = self.cache_pool.get_mut(seq_id) {
             cache_set.current_offset += 1;
         }
@@ -779,9 +1009,7 @@ impl BatchScheduler {
     // Completion and cleanup
     // ------------------------------------------------------------------
 
-    /// Collect and finalize all finished sequences.
     fn finalize_completed(&mut self) {
-        // Collect finished IDs first to avoid borrow issues
         let finished_ids: Vec<SequenceId> = self
             .active_batch
             .sequence_ids()
@@ -799,10 +1027,7 @@ impl BatchScheduler {
             if let Some(mut seq) = self.active_batch.remove(id) {
                 let tokens_generated = seq.generated_tokens.len();
 
-                // Flush any remaining buffered text
                 seq.decode_state.flush(&self.tokenizer);
-
-                // Build and send result
                 let result = seq.decode_state.finish(
                     seq.created_at,
                     seq.prompt_tokens.len(),
@@ -810,10 +1035,7 @@ impl BatchScheduler {
                 );
                 let _ = seq.response_tx.send(GenerateEvent::Done(result));
 
-                // Release cache
                 self.cache_pool.release(id);
-
-                // Update batch metrics
                 self.batch_metrics
                     .record_sequence_completed(tokens_generated);
 
@@ -821,14 +1043,11 @@ impl BatchScheduler {
             }
         }
 
-        // Publish metrics after finalization so admission control sees
-        // freed slots immediately.
         if has_completed {
             self.publish_metrics();
         }
     }
 
-    /// Abort a sequence with an error, releasing resources.
     fn abort_sequence(&mut self, seq: SequenceInfo, error: &str) {
         let _ = seq
             .response_tx

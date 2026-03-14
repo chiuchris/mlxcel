@@ -34,4 +34,6 @@ mod sequence;
 pub use active::ActiveBatch;
 pub use queue::PrefillQueue;
 pub use scheduler::BatchScheduler;
-pub use sequence::{BatchSchedulerAction, FinishReason, SequenceInfo, SequenceState};
+pub use sequence::{
+    BatchSchedulerAction, FinishReason, RequestPriority, SequenceInfo, SequenceState,
+};

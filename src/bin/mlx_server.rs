@@ -119,6 +119,18 @@ struct Args {
     #[arg(long = "max-queue-depth", default_value_t = 32)]
     max_queue_depth: usize,
 
+    /// Prefill chunk size in tokens (0 = disabled, default: 512)
+    #[arg(long = "prefill-chunk-size", default_value_t = 512)]
+    prefill_chunk_size: usize,
+
+    /// Enable preemptive eviction of lower-priority sequences
+    #[arg(long = "enable-preemption")]
+    enable_preemption: bool,
+
+    /// Preemption policy: "longest-first" (default) or "lowest-priority"
+    #[arg(long = "preemption-policy", default_value = "longest-first")]
+    preemption_policy: String,
+
     /// Override chat template (Jinja2 template string)
     #[arg(long = "chat-template", value_name = "TEMPLATE")]
     chat_template: Option<String>,
@@ -279,6 +291,9 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         draft_max: args.draft,
         max_batch_size: args.max_batch_size,
         max_queue_depth: args.max_queue_depth,
+        prefill_chunk_size: args.prefill_chunk_size,
+        enable_preemption: args.enable_preemption,
+        preemption_policy: args.preemption_policy,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
         slots: args.slots,

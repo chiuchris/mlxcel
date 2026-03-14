@@ -79,6 +79,8 @@ pub struct BatchMetrics {
     pub total_sequences_processed: AtomicU64,
     /// Cumulative number of tokens generated across all sequences.
     pub total_tokens_generated: AtomicU64,
+    /// Cumulative number of preemptive evictions.
+    pub preemptions_total: AtomicU64,
 }
 
 impl Default for BatchMetrics {
@@ -94,6 +96,7 @@ impl BatchMetrics {
             queue_depth: AtomicUsize::new(0),
             total_sequences_processed: AtomicU64::new(0),
             total_tokens_generated: AtomicU64::new(0),
+            preemptions_total: AtomicU64::new(0),
         }
     }
 
@@ -123,6 +126,11 @@ impl BatchMetrics {
             .fetch_add(1, Ordering::Relaxed);
         self.total_tokens_generated
             .fetch_add(tokens_generated as u64, Ordering::Relaxed);
+    }
+
+    /// Record a preemptive eviction (called by scheduler thread).
+    pub fn record_preemption(&self) {
+        self.preemptions_total.fetch_add(1, Ordering::Relaxed);
     }
 }
 

@@ -217,6 +217,31 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 32)]
     max_queue_depth: usize,
 
+    /// Prefill chunk size in tokens (0 = disabled, default: 512)
+    ///
+    /// When set, long prompts are broken into chunks of this size and
+    /// decode steps are interleaved between chunks to prevent latency
+    /// spikes for active sequences.
+    #[arg(long, default_value_t = 512)]
+    prefill_chunk_size: usize,
+
+    /// Enable preemptive eviction of lower-priority sequences
+    ///
+    /// When enabled and the batch is full, a high-priority incoming
+    /// request may evict a lower-priority active sequence (which will
+    /// be re-queued for re-prefill).
+    #[arg(long)]
+    enable_preemption: bool,
+
+    /// Preemption policy: "longest-first" (default) or "lowest-priority"
+    ///
+    /// Controls which active sequence is evicted when preemption is
+    /// triggered. "longest-first" evicts the sequence with the most
+    /// generated tokens; "lowest-priority" evicts the lowest-priority
+    /// sequence (ties broken by longest).
+    #[arg(long, default_value = "longest-first")]
+    preemption_policy: String,
+
     /// Request timeout in seconds
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,

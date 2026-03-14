@@ -69,6 +69,12 @@ pub struct ServerStartupConfig {
     // Batch scheduling
     pub max_batch_size: Option<usize>,
     pub max_queue_depth: usize,
+    /// Prefill chunk size in tokens (0 = disabled).
+    pub prefill_chunk_size: usize,
+    /// Enable preemptive eviction when batch is full.
+    pub enable_preemption: bool,
+    /// Preemption policy string from CLI (parsed into enum at build_server_config).
+    pub preemption_policy: String,
 
     // Warmup
     pub warmup: bool,
@@ -115,6 +121,9 @@ impl Default for ServerStartupConfig {
             draft_max: 16,
             max_batch_size: None,
             max_queue_depth: 32,
+            prefill_chunk_size: 512,
+            enable_preemption: false,
+            preemption_policy: "longest-first".to_string(),
             chat_template: None,
             chat_template_file: None,
             enable_slots: true,
@@ -191,6 +200,16 @@ pub(super) fn resolve_chat_template(
     Ok(ChatTemplateProcessor::from_model_path(model_path)?.unwrap_or_default())
 }
 
+/// Parse a preemption policy string from CLI into the enum.
+///
+/// Accepts "longest-first" (default) and "lowest-priority" (case-insensitive).
+fn parse_preemption_policy(s: &str) -> crate::server::PreemptionPolicy {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "lowest-priority" | "lowestpriority" => crate::server::PreemptionPolicy::LowestPriority,
+        _ => crate::server::PreemptionPolicy::LongestFirst,
+    }
+}
+
 pub(super) fn build_server_config(
     startup: &ServerStartupConfig,
     api_key: Option<String>,
@@ -222,6 +241,9 @@ pub(super) fn build_server_config(
         num_draft_tokens: startup.draft_max,
         max_batch_size: startup.max_batch_size.unwrap_or(startup.n_parallel).max(1),
         max_queue_depth: startup.max_queue_depth,
+        prefill_chunk_size: startup.prefill_chunk_size,
+        enable_preemption: startup.enable_preemption,
+        preemption_policy: parse_preemption_policy(&startup.preemption_policy),
     }
 }
 
@@ -258,6 +280,7 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
             max_tokens: 1,
             sampling: SamplingConfig::greedy(),
             stop_sequences: None,
+            priority: crate::server::batch::RequestPriority::Normal,
         },
     )?;
     Ok(())
@@ -362,11 +385,10 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     // Create shared batch metrics that both ModelProvider and AppState read/write.
     let batch_metrics = Arc::new(BatchMetrics::new());
 
-    let model_provider = Arc::new(ModelProvider::new_with_metrics(
+    let model_provider = Arc::new(ModelProvider::new_with_server_config(
         startup.model_path.clone(),
         startup.adapter_path.clone(),
-        config.max_batch_size,
-        config.max_queue_depth,
+        &config,
         batch_metrics.clone(),
     )?);
 

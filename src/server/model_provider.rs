@@ -85,10 +85,6 @@ impl ModelProvider {
     }
 
     /// Create and start a new model provider with batch scheduling config.
-    ///
-    /// `max_batch_size` controls how many sequences can decode concurrently.
-    /// `max_queue_depth` controls how many requests can wait in the prefill
-    /// queue before the server starts rejecting new ones.
     pub fn new_with_batch_config(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
@@ -105,11 +101,79 @@ impl ModelProvider {
         )
     }
 
+    /// Create and start a new model provider with full server config.
+    pub fn new_with_server_config(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        config: &crate::server::ServerConfig,
+        batch_metrics: Arc<BatchMetrics>,
+    ) -> Result<Self> {
+        Self::new_with_full_config(
+            model_path,
+            adapter_path,
+            config.max_batch_size,
+            config.max_queue_depth,
+            config.prefill_chunk_size,
+            config.enable_preemption,
+            config.preemption_policy,
+            batch_metrics,
+        )
+    }
+
+    /// Create and start a new model provider with full scheduler config
+    /// and shared batch metrics.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_full_config(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        prefill_chunk_size: usize,
+        enable_preemption: bool,
+        preemption_policy: crate::server::config::PreemptionPolicy,
+        batch_metrics: Arc<BatchMetrics>,
+    ) -> Result<Self> {
+        let model_id = model_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let created_at = chrono::Utc::now().timestamp();
+        let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+        let loaded = Arc::new(AtomicBool::new(false));
+        let loaded_clone = loaded.clone();
+        let worker_model_id = model_id.clone();
+        let metrics_clone = batch_metrics.clone();
+
+        let sched_config = model_worker::WorkerSchedulerConfig {
+            max_batch_size,
+            max_queue_depth,
+            prefill_chunk_size,
+            enable_preemption,
+            preemption_policy,
+        };
+
+        let worker_handle = model_worker::spawn_model_worker_with_batch_config(
+            model_path,
+            adapter_path,
+            request_rx,
+            loaded_clone,
+            worker_model_id,
+            sched_config,
+            metrics_clone,
+        );
+
+        Ok(Self {
+            request_tx,
+            model_id,
+            created_at,
+            loaded,
+            batch_metrics,
+            _worker_handle: worker_handle,
+        })
+    }
+
     /// Create and start a new model provider with shared batch metrics.
-    ///
-    /// The `batch_metrics` arc is shared with `AppState` so HTTP handlers can
-    /// read queue depth and active count for admission control and status
-    /// reporting without locking.
     pub fn new_with_metrics(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
@@ -135,14 +199,21 @@ impl ModelProvider {
         let worker_model_id = model_id.clone();
         let metrics_clone = batch_metrics.clone();
 
+        let sched_config = model_worker::WorkerSchedulerConfig {
+            max_batch_size,
+            max_queue_depth,
+            prefill_chunk_size: 0,
+            enable_preemption: false,
+            preemption_policy: crate::server::config::PreemptionPolicy::default(),
+        };
+
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
             model_path,
             adapter_path,
             request_rx,
             loaded_clone,
             worker_model_id,
-            max_batch_size,
-            max_queue_depth,
+            sched_config,
             metrics_clone,
         );
 
