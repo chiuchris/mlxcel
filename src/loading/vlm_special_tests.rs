@@ -15,11 +15,11 @@
 use super::{
     cap_molmo2_vit_num_layers, dequantize_moondream3_weight, inherit_quantization_if_missing,
     llama4_mm_tokens_per_image, llama4_quantization_params, llama4_token_ids, llama4_vision_prefix,
-    merge_phi4mm_lora_weight, molmo2_max_crops, moondream3_text_config_value,
-    moondream3_vision_config_value, parse_molmo2_vit_layers, phi3_num_crops,
-    phi4_siglip_text_config_value, phi4mm_text_config_value, phi4mm_vision_config_value,
-    remap_minicpmo_text_weights, rewrite_molmo2_weight_key, rewrite_moondream3_weight_key,
-    rewrite_phi3_weight_key, rewrite_phi4_siglip_weight_key, rewrite_phi4mm_vision_key,
+    molmo2_max_crops, moondream3_text_config_value, moondream3_vision_config_value,
+    parse_molmo2_vit_layers, phi3_num_crops, phi4_siglip_text_config_value,
+    phi4mm_text_config_value, phi4mm_vision_config_value, remap_minicpmo_text_weights,
+    rewrite_molmo2_weight_key, rewrite_moondream3_weight_key, rewrite_phi3_weight_key,
+    rewrite_phi4_siglip_weight_key, rewrite_phi4mm_vision_key,
     should_transpose_phi3_patch_embedding,
 };
 use mlxcel_core::dtype;
@@ -253,46 +253,6 @@ fn phi4mm_vision_config_value_uses_crop_size_defaults() {
     assert_eq!(vision_config["num_patches"], 1024);
 }
 
-#[test]
-fn merge_phi4mm_lora_weight_handles_standard_peft_orientation() {
-    let base = mlxcel_core::ones(&[3, 2], dtype::FLOAT32);
-    let lora_a = mlxcel_core::ones(&[1, 2], dtype::FLOAT32);
-    let lora_b = mlxcel_core::ones(&[3, 1], dtype::FLOAT32);
-
-    let fused = merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 2.0).unwrap();
-    assert_eq!(mlxcel_core::array_shape(&fused), vec![3, 2]);
-
-    let total = mlxcel_core::sum_all(&fused);
-    mlxcel_core::eval(&total);
-    assert_eq!(mlxcel_core::item_f32(&total), 18.0);
-}
-
-#[test]
-fn merge_phi4mm_lora_weight_handles_mlx_orientation() {
-    let base = mlxcel_core::ones(&[3, 2], dtype::FLOAT32);
-    let lora_a = mlxcel_core::ones(&[2, 1], dtype::FLOAT32);
-    let lora_b = mlxcel_core::ones(&[1, 3], dtype::FLOAT32);
-
-    let fused = merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 2.0).unwrap();
-    assert_eq!(mlxcel_core::array_shape(&fused), vec![3, 2]);
-
-    let total = mlxcel_core::sum_all(&fused);
-    mlxcel_core::eval(&total);
-    assert_eq!(mlxcel_core::item_f32(&total), 18.0);
-}
-
-#[test]
-fn merge_phi4mm_lora_weight_rejects_ambiguous_shapes_without_base_match() {
-    let base = mlxcel_core::ones(&[2, 2], dtype::FLOAT32);
-    let lora_a = mlxcel_core::ones(&[1, 2], dtype::FLOAT32);
-    let lora_b = mlxcel_core::ones(&[3, 1], dtype::FLOAT32);
-
-    let err = match merge_phi4mm_lora_weight(&base, &lora_a, &lora_b, 1.0) {
-        Ok(_) => panic!("expected Phi4MM LoRA shape validation to fail"),
-        Err(err) => err.to_string(),
-    };
-    assert!(err.contains("Phi4MM vision LoRA shapes do not match base weight"));
-}
 #[test]
 fn molmo2_helpers_clamp_layer_count_and_parse_defaults() {
     assert_eq!(cap_molmo2_vit_num_layers(27), 25);

@@ -58,7 +58,7 @@ pub struct GenerationResult {
 }
 
 #[path = "model_worker.rs"]
-mod model_worker;
+pub(crate) mod model_worker;
 
 /// Thread-safe model provider using channels
 pub struct ModelProvider {

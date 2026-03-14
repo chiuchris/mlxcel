@@ -41,6 +41,20 @@ pub struct SentencePieceTokenizer {
 }
 
 impl MlxcelTokenizer {
+    /// Create a stub tokenizer for unit tests.
+    ///
+    /// The stub returns empty/identity results; it exists so that types like
+    /// `StreamingDecodeState` can be constructed without loading a real model.
+    #[cfg(test)]
+    pub(crate) fn stub() -> Self {
+        // Build a minimal HuggingFace tokenizer with a single-character
+        // alphabet so encode/decode never panic.
+        use tokenizers::models::bpe::BPE;
+        let model = BPE::default();
+        let tokenizer = tokenizers::Tokenizer::new(model);
+        Self::HuggingFace(tokenizer)
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         match self {
             Self::HuggingFace(t) => {

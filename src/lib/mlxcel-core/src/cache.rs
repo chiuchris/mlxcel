@@ -682,6 +682,14 @@ use std::time::Instant;
 pub struct SequenceId(u64);
 
 impl SequenceId {
+    /// Construct a `SequenceId` from a raw `u64` value.
+    ///
+    /// In production code, IDs are assigned by `CachePool::allocate`. This
+    /// constructor is provided for tests, builders, and deserialization.
+    pub fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
+
     /// Return the raw numeric identifier.
     pub fn as_u64(self) -> u64 {
         self.0
