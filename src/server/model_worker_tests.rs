@@ -16,7 +16,9 @@ use std::io::Cursor;
 
 use image::{DynamicImage, ImageBuffer, ImageFormat, Rgb};
 
-use super::{build_generation_result, decode_request_images, merge_config_stop_tokens};
+use super::{
+    build_generation_result, decode_request_images, merge_config_stop_tokens, safe_emit_boundary,
+};
 use crate::SamplingConfig;
 
 fn encode_png_bytes() -> Vec<u8> {
@@ -55,4 +57,25 @@ fn build_generation_result_computes_finish_reason_and_generation_split() {
     let length = build_generation_result("ok".to_string(), 10, 8, 50, 60, 8);
     assert_eq!(length.finish_reason, "length");
     assert_eq!(length.generation_only_ms, 0);
+}
+
+#[test]
+fn safe_emit_boundary_stops_before_trailing_replacement_chars() {
+    // ASCII string: boundary is at the end.
+    assert_eq!(safe_emit_boundary("hello"), 5);
+
+    // Replacement char at end: boundary stops before it.
+    let with_replacement = "ok\u{FFFD}";
+    let expected = "ok".len();
+    assert_eq!(safe_emit_boundary(with_replacement), expected);
+
+    // All replacement chars: boundary is 0.
+    assert_eq!(safe_emit_boundary("\u{FFFD}\u{FFFD}"), 0);
+
+    // Empty string: boundary is 0.
+    assert_eq!(safe_emit_boundary(""), 0);
+
+    // Multi-byte character followed by replacement char.
+    let mixed = "\u{AC00}\u{FFFD}"; // Korean syllable + replacement
+    assert_eq!(safe_emit_boundary(mixed), "\u{AC00}".len()); // 3 bytes
 }

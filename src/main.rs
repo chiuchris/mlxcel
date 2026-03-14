@@ -213,6 +213,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "N")]
     max_batch_size: Option<usize>,
 
+    /// Disable continuous batching and use the legacy sequential worker.
+    ///
+    /// When set, requests are processed one at a time in FIFO order with no
+    /// batch scheduler overhead. Equivalent to using `--max-batch-size 1` but
+    /// with explicit sequential semantics and no prefill chunking.
+    #[arg(long)]
+    no_batch: bool,
+
     /// Maximum number of requests waiting in the prefill queue (default: 32)
     #[arg(long, default_value_t = 32)]
     max_queue_depth: usize,

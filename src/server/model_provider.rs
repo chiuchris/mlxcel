@@ -102,22 +102,70 @@ impl ModelProvider {
     }
 
     /// Create and start a new model provider with full server config.
+    ///
+    /// When `config.no_batch` is true, the legacy sequential worker is spawned
+    /// instead of the batch scheduler, regardless of `max_batch_size`.
     pub fn new_with_server_config(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
         config: &crate::server::ServerConfig,
         batch_metrics: Arc<BatchMetrics>,
     ) -> Result<Self> {
-        Self::new_with_full_config(
+        if config.no_batch {
+            Self::new_with_legacy_worker(model_path, adapter_path, batch_metrics)
+        } else {
+            Self::new_with_full_config(
+                model_path,
+                adapter_path,
+                config.max_batch_size,
+                config.max_queue_depth,
+                config.prefill_chunk_size,
+                config.enable_preemption,
+                config.preemption_policy,
+                batch_metrics,
+            )
+        }
+    }
+
+    /// Create and start a new model provider using the legacy sequential worker.
+    ///
+    /// This is activated by `--no-batch`. The worker uses the `BatchScheduler`
+    /// in size-1 mode (no interleaving, no chunked prefill) which is equivalent
+    /// to the pre-scheduler sequential request loop.
+    pub(crate) fn new_with_legacy_worker(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        batch_metrics: Arc<BatchMetrics>,
+    ) -> Result<Self> {
+        let model_id = model_path
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+
+        let created_at = chrono::Utc::now().timestamp();
+        let (request_tx, request_rx) = mpsc::channel::<ModelRequest>();
+        let loaded = Arc::new(AtomicBool::new(false));
+        let loaded_clone = loaded.clone();
+        let worker_model_id = model_id.clone();
+        let metrics_clone = batch_metrics.clone();
+
+        let worker_handle = model_worker::spawn_legacy_model_worker(
             model_path,
             adapter_path,
-            config.max_batch_size,
-            config.max_queue_depth,
-            config.prefill_chunk_size,
-            config.enable_preemption,
-            config.preemption_policy,
+            request_rx,
+            loaded_clone,
+            worker_model_id,
+            metrics_clone,
+        );
+
+        Ok(Self {
+            request_tx,
+            model_id,
+            created_at,
+            loaded,
             batch_metrics,
-        )
+            _worker_handle: worker_handle,
+        })
     }
 
     /// Create and start a new model provider with full scheduler config

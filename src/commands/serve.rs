@@ -43,6 +43,7 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         draft_model_path: args.draft_model,
         draft_max: args.draft_max,
         max_batch_size: args.max_batch_size,
+        no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,
         prefill_chunk_size: args.prefill_chunk_size,
         enable_preemption: args.enable_preemption,

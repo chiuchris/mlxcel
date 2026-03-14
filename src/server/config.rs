@@ -88,6 +88,10 @@ pub struct ServerConfig {
     pub enable_preemption: bool,
     /// Policy used to select the eviction victim.
     pub preemption_policy: PreemptionPolicy,
+    /// When true, disable the batch scheduler and use the legacy sequential
+    /// worker. Equivalent to `max_batch_size <= 1` for scheduling purposes
+    /// but makes the intent explicit and guarantees zero scheduler overhead.
+    pub no_batch: bool,
 }
 
 impl Default for ServerConfig {
@@ -122,6 +126,7 @@ impl Default for ServerConfig {
             prefill_chunk_size: 512,
             enable_preemption: false,
             preemption_policy: PreemptionPolicy::default(),
+            no_batch: false,
         }
     }
 }

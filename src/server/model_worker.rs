@@ -109,6 +109,80 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     })
 }
 
+/// Spawn the legacy sequential model worker.
+///
+/// This worker processes one request at a time using the `BatchScheduler` with
+/// `max_batch_size=1` and no chunked prefill, which is functionally equivalent
+/// to the pre-scheduler sequential `recv()` loop. It is activated when
+/// `--no-batch` is passed on the CLI.
+///
+/// Choosing this path explicitly guarantees:
+/// - No batch scheduling data structures are allocated beyond size-1.
+/// - No prefill chunking interleaving occurs.
+/// - Log output clearly indicates the sequential execution mode.
+///
+/// The CLI `generate` command is unaffected and uses `CxxGenerator` directly.
+pub(crate) fn spawn_legacy_model_worker(
+    model_path: PathBuf,
+    adapter_path: Option<PathBuf>,
+    request_rx: mpsc::Receiver<ModelRequest>,
+    loaded: Arc<AtomicBool>,
+    worker_model_id: String,
+    batch_metrics: Arc<BatchMetrics>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        tracing::info!(
+            "Model worker thread starting (legacy sequential mode, --no-batch), loading model..."
+        );
+
+        let result = if let Some(adapter) = adapter_path {
+            tracing::info!("Loading LoRA adapter from {:?}", adapter);
+            crate::load_model_with_adapter(&model_path, &adapter)
+        } else {
+            crate::load_model(&model_path)
+        };
+
+        let (model, tokenizer) = match result {
+            Ok((model, tokenizer)) => {
+                tracing::info!("Model {worker_model_id} loaded successfully");
+                loaded.store(true, Ordering::Release);
+                (model, tokenizer)
+            }
+            Err(err) => {
+                tracing::error!("Failed to load model: {err}");
+                return;
+            }
+        };
+
+        let config_eos = crate::read_eos_token_ids(&model_path);
+        if !config_eos.is_empty() {
+            tracing::info!("EOS tokens from config: {:?}", config_eos);
+        }
+
+        tracing::info!(
+            "Starting legacy sequential worker \
+             (max_batch_size=1, prefill_chunk_size=disabled)"
+        );
+
+        // Reuse BatchScheduler with max_batch_size=1 and chunking disabled.
+        // Per the scheduler docs, size-1 behavior is identical to the old
+        // sequential recv() loop, with no extra overhead.
+        let mut scheduler = super::super::batch::BatchScheduler::with_config(
+            model,
+            tokenizer,
+            config_eos,
+            request_rx,
+            1,          // max_batch_size = 1 → sequential, no interleaving
+            usize::MAX, // max_queue_depth: unbounded (one at a time anyway)
+            batch_metrics,
+            0,     // prefill_chunk_size = 0 → chunking disabled
+            false, // enable_preemption = false
+            crate::server::config::PreemptionPolicy::default(),
+        );
+        scheduler.run();
+    })
+}
+
 pub(crate) fn merge_config_stop_tokens(
     mut sampling: SamplingConfig,
     config_eos: &[i32],

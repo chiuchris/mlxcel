@@ -36,6 +36,7 @@ fn sample_input() -> ServerStartupInput {
         prefill_chunk_size: 512,
         enable_preemption: false,
         preemption_policy: "longest-first".to_string(),
+        no_batch: false,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),
         slots: true,
@@ -95,4 +96,18 @@ fn into_startup_config_normalizes_edge_only_flags() {
         Some(PathBuf::from("models/draft"))
     );
     assert_eq!(startup.log_file, Some(PathBuf::from("server.log")));
+}
+
+#[test]
+fn into_startup_config_propagates_no_batch_flag() {
+    let mut input = sample_input();
+    input.no_batch = true;
+
+    let startup = input.into_startup_config();
+    assert!(startup.no_batch);
+
+    let mut input2 = sample_input();
+    input2.no_batch = false;
+    let startup2 = input2.into_startup_config();
+    assert!(!startup2.no_batch);
 }

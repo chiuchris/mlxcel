@@ -38,4 +38,5 @@ fn server_config_default_matches_llama_server_compatibility_defaults() {
     assert_eq!(config.num_draft_tokens, 3);
     assert_eq!(config.max_batch_size, 1);
     assert_eq!(config.max_queue_depth, 1024);
+    assert!(!config.no_batch);
 }

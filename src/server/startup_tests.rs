@@ -155,3 +155,13 @@ fn build_server_config_max_batch_size_is_at_least_one() {
     let config = build_server_config(&startup, None);
     assert_eq!(config.max_batch_size, 1);
 }
+
+#[test]
+fn build_server_config_propagates_no_batch_flag() {
+    let startup = ServerStartupConfig {
+        no_batch: true,
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert!(config.no_batch);
+}

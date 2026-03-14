@@ -115,6 +115,14 @@ struct Args {
     #[arg(long = "max-batch-size", value_name = "N")]
     max_batch_size: Option<usize>,
 
+    /// Disable continuous batching and use the legacy sequential worker.
+    ///
+    /// When set, requests are processed one at a time in FIFO order with no
+    /// batch scheduler overhead. Equivalent to using `--max-batch-size 1` but
+    /// with explicit sequential semantics and no prefill chunking.
+    #[arg(long = "no-batch")]
+    no_batch: bool,
+
     /// Maximum number of requests waiting in the prefill queue (default: 32)
     #[arg(long = "max-queue-depth", default_value_t = 32)]
     max_queue_depth: usize,
@@ -290,6 +298,7 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         draft_model_path: args.model_draft,
         draft_max: args.draft,
         max_batch_size: args.max_batch_size,
+        no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,
         prefill_chunk_size: args.prefill_chunk_size,
         enable_preemption: args.enable_preemption,

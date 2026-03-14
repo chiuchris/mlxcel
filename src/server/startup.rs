@@ -75,6 +75,8 @@ pub struct ServerStartupConfig {
     pub enable_preemption: bool,
     /// Preemption policy string from CLI (parsed into enum at build_server_config).
     pub preemption_policy: String,
+    /// Force the legacy sequential worker, bypassing the batch scheduler.
+    pub no_batch: bool,
 
     // Warmup
     pub warmup: bool,
@@ -124,6 +126,7 @@ impl Default for ServerStartupConfig {
             prefill_chunk_size: 512,
             enable_preemption: false,
             preemption_policy: "longest-first".to_string(),
+            no_batch: false,
             chat_template: None,
             chat_template_file: None,
             enable_slots: true,
@@ -244,6 +247,7 @@ pub(super) fn build_server_config(
         prefill_chunk_size: startup.prefill_chunk_size,
         enable_preemption: startup.enable_preemption,
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
+        no_batch: startup.no_batch,
     }
 }
 

@@ -48,6 +48,8 @@ pub struct ServerStartupInput {
     pub prefill_chunk_size: usize,
     pub enable_preemption: bool,
     pub preemption_policy: String,
+    /// Disable continuous batching; force the legacy sequential worker.
+    pub no_batch: bool,
     pub chat_template: Option<String>,
     pub chat_template_file: Option<PathBuf>,
     pub slots: bool,
@@ -97,6 +99,7 @@ impl ServerStartupInput {
             prefill_chunk_size: self.prefill_chunk_size,
             enable_preemption: self.enable_preemption,
             preemption_policy: self.preemption_policy,
+            no_batch: self.no_batch,
             chat_template: self.chat_template,
             chat_template_file: self.chat_template_file,
             enable_slots: resolve_compat_toggle(self.slots, self.no_slots),
