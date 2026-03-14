@@ -24,6 +24,7 @@
 //! Phase 1 uses a sequential loop for decode: one `forward()` call per
 //! active sequence. Sub-issue 4 (#16) upgrades this to batched decode.
 
+use std::collections::HashSet;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -463,14 +464,185 @@ impl BatchScheduler {
     }
 
     // ------------------------------------------------------------------
-    // Decode execution (Phase 1: loop-based, one forward per sequence)
+    // Decode execution (batched when B > 1, sequential fallback otherwise)
     // ------------------------------------------------------------------
 
-    /// Run one decode step for each active sequence.
+    /// Run one decode step for the active sequences.
     ///
-    /// Phase 1: sequential loop. Each sequence gets its own `forward()` call.
+    /// When the model supports batching and there are multiple sequences,
+    /// this uses `forward_batched()` to amortize weight-loading bandwidth.
+    /// For single-sequence decode or models without batching support, it
+    /// falls back to the sequential path.
     fn execute_decode_step(&mut self, seq_ids: &[SequenceId]) {
+        if seq_ids.len() <= 1 || !self.model.supports_batching() {
+            // Sequential fallback
+            for &seq_id in seq_ids {
+                self.decode_single_step(seq_id);
+            }
+            return;
+        }
+
+        self.execute_batched_decode(seq_ids);
+    }
+
+    /// Batched decode: one forward_batched() call for all active sequences.
+    ///
+    /// Builds a [B, 1] token tensor, collects per-sequence caches,
+    /// runs the batched forward pass, and independently samples + updates
+    /// each sequence from the resulting [B, 1, vocab_size] logits.
+    fn execute_batched_decode(&mut self, seq_ids: &[SequenceId]) {
+        let b = seq_ids.len();
+
+        // --- Phase 1: Gather per-sequence data ---
+        // Collect last tokens and token histories before borrowing caches.
+        let mut last_tokens: Vec<i32> = Vec::with_capacity(b);
+        let mut token_histories: Vec<Vec<i32>> = Vec::with_capacity(b);
+
         for &seq_id in seq_ids {
+            let seq = match self.active_batch.get_mut(seq_id) {
+                Some(s) => s,
+                None => {
+                    // Sequence vanished between decide_action and execution.
+                    // Fall back to sequential for remaining sequences.
+                    self.execute_decode_step_sequential_remaining(seq_ids, last_tokens.len());
+                    return;
+                }
+            };
+            last_tokens.push(*seq.generated_tokens.last().unwrap_or(&0));
+
+            if seq.sampling.needs_token_history() {
+                let mut hist =
+                    Vec::with_capacity(seq.prompt_tokens.len() + seq.generated_tokens.len());
+                hist.extend_from_slice(&seq.prompt_tokens);
+                hist.extend_from_slice(&seq.generated_tokens);
+                token_histories.push(hist);
+            } else {
+                token_histories.push(Vec::new());
+            }
+        }
+
+        // --- Phase 2: Build batched input [B, 1] ---
+        let input = mlxcel_core::from_slice_i32(&last_tokens, &[b as i32, 1]);
+
+        // --- Phase 3: Collect mutable cache slices ---
+        // We need &mut [KVCache] for each sequence, gathered from the pool.
+        // Since CachePool requires &mut self per lookup, we extract all
+        // cache pointers in a single pass using raw pointer arithmetic to
+        // avoid double-mutable-borrow issues.
+        //
+        // Verify no duplicate SequenceIds exist (which would cause aliasing).
+        debug_assert!(
+            {
+                let unique: HashSet<_> = seq_ids.iter().collect();
+                unique.len() == seq_ids.len()
+            },
+            "execute_batched_decode: duplicate SequenceId in seq_ids"
+        );
+
+        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> = Vec::with_capacity(b);
+        for &seq_id in seq_ids {
+            match self.cache_pool.get_caches_mut(seq_id) {
+                Some(caches) => {
+                    cache_ptrs.push((caches.as_mut_ptr(), caches.len()));
+                }
+                None => {
+                    tracing::error!("Cache not found for {seq_id} during batched decode");
+                    return;
+                }
+            }
+        }
+
+        // SAFETY: CachePool stores each SequenceId in a separate HashMap entry
+        // (SequenceCacheSet), so the Vec<KVCache> backing each slice is a
+        // distinct heap allocation. The debug_assert above verifies no
+        // duplicate SequenceIds are present, guaranteeing no two slices alias
+        // the same memory. The raw pointers remain valid because cache_pool is
+        // not mutated between pointer extraction and the forward_batched call.
+        let mut batch_caches: Vec<&mut [mlxcel_core::layers::KVCache]> = cache_ptrs
+            .iter()
+            .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+            .collect();
+
+        // --- Phase 4: Batched forward pass ---
+        let logits = self.model.forward_batched(&input, &mut batch_caches, None);
+
+        // --- Phase 5: Per-sequence sampling and state update ---
+        // Sample independently using each sequence's own SamplingConfig.
+        // Hoist model EOS tokens outside the loop to avoid cloning per-sequence.
+        let model_eos = self.model.eos_token_ids();
+
+        for (i, &seq_id) in seq_ids.iter().enumerate() {
+            // Slice logits for this sequence: [B, 1, vocab] -> [1, 1, vocab]
+            let seq_logits =
+                mlxcel_core::slice(&logits, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
+
+            let (token_val, eos_tokens) = {
+                let seq = match self.active_batch.get_mut(seq_id) {
+                    Some(s) => s,
+                    None => continue,
+                };
+                let history_ref: &[i32] = &token_histories[i];
+                let (token_arr, _logprobs) =
+                    sample_token_optimized(&seq_logits, &seq.sampling, history_ref);
+                mlxcel_core::eval(&token_arr);
+                let val = mlxcel_core::item_i32(&token_arr);
+                let eos = if seq.sampling.stop_token_ids.is_empty() {
+                    // Common case: no per-request stop tokens, reuse model_eos directly
+                    model_eos.clone()
+                } else {
+                    merged_eos_token_ids(model_eos.clone(), &seq.sampling.stop_token_ids)
+                };
+                (val, eos)
+            };
+
+            // Update the sequence
+            let seq = match self.active_batch.get_mut(seq_id) {
+                Some(s) => s,
+                None => continue,
+            };
+
+            if eos_tokens.contains(&token_val) {
+                if let Err(err) = seq
+                    .state
+                    .transition_to(SequenceState::Finished(FinishReason::Stop))
+                {
+                    tracing::error!("State transition error: {err}");
+                }
+                continue;
+            }
+
+            seq.generated_tokens.push(token_val);
+
+            if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
+                let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
+            }
+
+            if seq.generated_tokens.len() >= seq.max_tokens
+                && let Err(err) = seq
+                    .state
+                    .transition_to(SequenceState::Finished(FinishReason::Length))
+            {
+                tracing::error!("State transition error: {err}");
+            }
+
+            if seq.generated_tokens.len() % 512 == 0 {
+                mlxcel_core::clear_memory_cache();
+            }
+
+            if let Some(cache_set) = self.cache_pool.get_mut(seq_id) {
+                cache_set.current_offset += 1;
+            }
+        }
+    }
+
+    /// Sequential fallback for remaining sequences when batched decode
+    /// cannot be completed (e.g. a sequence vanished mid-gather).
+    fn execute_decode_step_sequential_remaining(
+        &mut self,
+        seq_ids: &[SequenceId],
+        start_from: usize,
+    ) {
+        for &seq_id in &seq_ids[start_from..] {
             self.decode_single_step(seq_id);
         }
     }

@@ -193,6 +193,75 @@ impl Attention {
         self.o_proj.forward(&attn_out)
     }
 
+    /// Split-attention forward for batched decode.
+    ///
+    /// Receives pre-projected Q/K/V tensors of shape [B, 1, proj_dim],
+    /// splits them per-sequence for attention with individual KV caches,
+    /// then concatenates the results back into [B, 1, hidden_dim].
+    ///
+    /// Used by: Llama3 batched decode (TransformerBlock::forward_batched)
+    pub fn forward_split_attention(
+        &self,
+        q_batched: &MlxArray,
+        k_batched: &MlxArray,
+        v_batched: &MlxArray,
+        caches: &mut [&mut KVCache],
+    ) -> UniquePtr<MlxArray> {
+        let b = caches.len();
+        let mut attn_outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(b);
+
+        for (i, cache) in caches.iter_mut().enumerate() {
+            // Slice [B, 1, proj_dim] -> [1, 1, proj_dim] for sequence i
+            let q_i =
+                mlxcel_core::slice(q_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
+            let k_i =
+                mlxcel_core::slice(k_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
+            let v_i =
+                mlxcel_core::slice(v_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
+
+            // Reshape to [1, 1, n_heads, head_dim] then transpose to [1, n_heads, 1, head_dim]
+            let q_i = mlxcel_core::reshape(&q_i, &[1, 1, self.num_heads, self.head_dim]);
+            let k_i = mlxcel_core::reshape(&k_i, &[1, 1, self.num_kv_heads, self.head_dim]);
+            let v_i = mlxcel_core::reshape(&v_i, &[1, 1, self.num_kv_heads, self.head_dim]);
+
+            let q_i = mlxcel_core::transpose_axes(&q_i, &[0, 2, 1, 3]);
+            let k_i = mlxcel_core::transpose_axes(&k_i, &[0, 2, 1, 3]);
+            let v_i = mlxcel_core::transpose_axes(&v_i, &[0, 2, 1, 3]);
+
+            let offset = cache.offset;
+
+            // Apply RoPE per-sequence (each has different offset)
+            let q_i =
+                mlxcel_core::fast_rope(&q_i, self.rope_dims, false, self.rope_base, 1.0, offset);
+            let k_i =
+                mlxcel_core::fast_rope(&k_i, self.rope_dims, false, self.rope_base, 1.0, offset);
+
+            // Update KV cache
+            let (cache_k, cache_v) = cache.update_and_fetch(k_i, v_i);
+
+            // Scaled dot-product attention (single token decode, no mask needed)
+            let mask_ptr = std::ptr::null();
+            let attn_out = unsafe {
+                mlxcel_core::fast_scaled_dot_product_attention(
+                    &q_i, &cache_k, &cache_v, self.scale, mask_ptr,
+                )
+            };
+
+            // Transpose back: [1, n_heads, 1, head_dim] -> [1, 1, n_heads * head_dim]
+            let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+            let attn_out = mlxcel_core::reshape(&attn_out, &[1, 1, self.num_heads * self.head_dim]);
+
+            attn_outputs.push(attn_out);
+        }
+
+        // Concatenate along batch dim: B * [1, 1, hidden] -> [B, 1, hidden]
+        let mut result = attn_outputs.remove(0);
+        for attn_out in attn_outputs {
+            result = mlxcel_core::concatenate(&result, &attn_out, 0);
+        }
+        result
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -303,6 +372,40 @@ impl TransformerBlock {
         mlxcel_core::add(&h, &ff_out)
     }
 
+    /// Batched decode forward: batch norms + projections + FFN, per-sequence attention.
+    ///
+    /// `x` has shape `[B, 1, hidden_dim]`, `caches[i]` is the KVCache for
+    /// the i-th sequence. Returns `[B, 1, hidden_dim]`.
+    ///
+    /// Used by: Llama3Model::forward_batched
+    pub fn forward_batched(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut KVCache],
+    ) -> UniquePtr<MlxArray> {
+        // Batched pre-attention norm
+        let normed = self.input_layernorm.forward(x);
+
+        // Batched Q/K/V projection
+        let q = self.self_attn.q_proj.forward(&normed);
+        let k = self.self_attn.k_proj.forward(&normed);
+        let v = self.self_attn.v_proj.forward(&normed);
+
+        // Per-sequence attention with individual KV caches
+        let attn_concat = self.self_attn.forward_split_attention(&q, &k, &v, caches);
+
+        // Batched output projection
+        let attn_out = self.self_attn.o_proj.forward(&attn_concat);
+
+        // Residual connection
+        let h = mlxcel_core::add(x, &attn_out);
+
+        // Batched post-attention norm + FFN
+        let normed = self.post_attention_layernorm.forward(&h);
+        let ff_out = self.mlp.forward(&normed);
+        mlxcel_core::add(&h, &ff_out)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -388,6 +491,50 @@ impl Llama3Model {
 
         // LM head
         self.lm_head.forward(&h)
+    }
+
+    /// Batched decode forward pass: batch compute-bound layers, per-sequence attention.
+    ///
+    /// `input_ids` has shape `[B, 1]`. `batch_caches[i]` is the per-layer
+    /// KV cache slice for the i-th sequence. Returns `[B, 1, vocab_size]`.
+    ///
+    /// This is the explicit batched implementation that amortizes weight-loading
+    /// bandwidth for embedding, normalization, linear projections, and FFN/MLP
+    /// across all B sequences, while running attention per-sequence to handle
+    /// different KV cache lengths.
+    ///
+    /// Used by: LanguageModel::forward_batched (overrides the loop-based default)
+    pub fn forward_batched_impl(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+    ) -> UniquePtr<MlxArray> {
+        let b = batch_caches.len();
+
+        // Batched embedding lookup: [B, 1] -> [B, 1, hidden_dim]
+        let mut h = self.embed_tokens.forward(input_ids);
+
+        // Pass through transformer layers with split-attention
+        for layer_idx in 0..self.layers.len() {
+            // Collect per-sequence caches for this layer
+            let mut layer_caches: Vec<&mut KVCache> = batch_caches
+                .iter_mut()
+                .map(|caches| &mut caches[layer_idx])
+                .collect();
+
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches);
+        }
+
+        // Batched final norm: [B, 1, hidden_dim]
+        let h = self.norm.forward(&h);
+
+        // Batched lm_head: [B, 1, vocab_size]
+        let logits = self.lm_head.forward(&h);
+
+        // Sanity check in debug builds
+        debug_assert_eq!(mlxcel_core::array_shape(&logits)[0], b as i32);
+
+        logits
     }
 
     /// Get token embeddings (no sqrt scaling, unlike Gemma3)
@@ -501,5 +648,14 @@ impl LanguageModel for Llama3Model {
     fn eos_token_ids(&self) -> Vec<i32> {
         // Llama 3.1 EOS tokens: <|end_of_text|>, <|eot_id|>
         vec![128001, 128009]
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_impl(input_ids, batch_caches)
     }
 }

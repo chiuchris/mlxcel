@@ -91,6 +91,51 @@ pub trait LanguageModel {
     fn supports_batching(&self) -> bool {
         true
     }
+
+    /// Batched decode: process B sequences in one forward pass.
+    ///
+    /// `input_ids` has shape `[B, 1]` where B is the batch size (one new
+    /// token per active sequence). `batch_caches[i]` is the per-layer KV
+    /// cache slice for the i-th sequence.
+    ///
+    /// Returns logits of shape `[B, 1, vocab_size]`.
+    ///
+    /// The default implementation falls back to a loop that calls
+    /// `forward()` once per sequence and stacks the results. Models that
+    /// override this (e.g. Llama3) batch the compute-bound layers
+    /// (embedding, norm, FFN) and only run attention per-sequence, which
+    /// amortizes weight-loading bandwidth across the batch.
+    ///
+    /// Used by: BatchScheduler (server continuous batching)
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let b = batch_caches.len();
+        if b == 0 {
+            return ffi::zeros(&[0, 1, 1], crate::dtype::FLOAT32);
+        }
+        if b == 1 {
+            // Fast path: single sequence, no slicing/stacking overhead
+            let logits = self.forward(input_ids, batch_caches[0], None);
+            return logits;
+        }
+
+        // Default fallback: loop over batch dimension, calling forward()
+        // once per sequence and concatenating the results into [B, 1, vocab].
+        // Each forward() returns [1, 1, vocab]; concatenate along axis 0
+        // yields [B, 1, vocab].
+        let token_0 = ffi::slice(input_ids, &[0, 0], &[1, 1]);
+        let mut result = self.forward(&token_0, batch_caches[0], None);
+        for i in 1..b {
+            let token_i = ffi::slice(input_ids, &[i as i32, 0], &[i as i32 + 1, 1]);
+            let logits_i = self.forward(&token_i, batch_caches[i], None);
+            result = crate::concatenate(&result, &logits_i, 0);
+        }
+        result
+    }
 }
 
 /// Sampling configuration
@@ -796,5 +841,162 @@ pub fn run_benchmark<M: LanguageModel>(
         } else {
             0.0
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::layers::KVCache;
+
+    /// Minimal model stub for testing forward_batched default implementation.
+    /// Produces logits that are just the input token ID broadcast to a small
+    /// vocab, so results are deterministic and verifiable.
+    struct StubModel;
+
+    impl LanguageModel for StubModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            // Return logits where the token ID position has the highest value.
+            // Input shape: [1, 1], output shape: [1, 1, 4] (vocab=4)
+            ffi::eval(input_ids);
+            let tok = ffi::item_i32(input_ids);
+            let mut logits = vec![0.0f32; 4];
+            if tok >= 0 && (tok as usize) < 4 {
+                logits[tok as usize] = 10.0;
+            }
+            ffi::from_slice_f32(&logits, &[1, 1, 4])
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+    }
+
+    #[test]
+    fn forward_batched_default_matches_sequential() {
+        let model = StubModel;
+
+        // Sequential: forward each token independently
+        let mut caches_0 = model.make_caches();
+        let mut caches_1 = model.make_caches();
+
+        let input_0 = ffi::from_slice_i32(&[1], &[1, 1]);
+        let input_1 = ffi::from_slice_i32(&[2], &[1, 1]);
+
+        let logits_0 = model.forward(&input_0, &mut caches_0, None);
+        let logits_1 = model.forward(&input_1, &mut caches_1, None);
+
+        ffi::eval(&logits_0);
+        ffi::eval(&logits_1);
+
+        // Batched: forward_batched with [2, 1] input
+        let mut batch_caches_0 = model.make_caches();
+        let mut batch_caches_1 = model.make_caches();
+        let mut batch_caches: Vec<&mut [KVCache]> =
+            vec![&mut batch_caches_0, &mut batch_caches_1];
+
+        let batched_input = ffi::from_slice_i32(&[1, 2], &[2, 1]);
+        let batched_logits = model.forward_batched(&batched_input, &mut batch_caches, None);
+        ffi::eval(&batched_logits);
+
+        // Verify shapes
+        assert_eq!(ffi::array_shape(&batched_logits), vec![2, 1, 4]);
+        assert_eq!(ffi::array_shape(&logits_0), vec![1, 1, 4]);
+        assert_eq!(ffi::array_shape(&logits_1), vec![1, 1, 4]);
+
+        // Verify content matches: slice batched results and compare
+        let batch_seq0 = ffi::slice(&batched_logits, &[0, 0, 0], &[1, 1, 4]);
+        let batch_seq1 = ffi::slice(&batched_logits, &[1, 0, 0], &[2, 1, 4]);
+
+        ffi::eval(&batch_seq0);
+        ffi::eval(&batch_seq1);
+
+        // Token 1 should have highest logit at position 1
+        // Token 2 should have highest logit at position 2
+        let seq0_logits = ffi::reshape(&batch_seq0, &[4]);
+        let seq1_logits = ffi::reshape(&batch_seq1, &[4]);
+        ffi::eval(&seq0_logits);
+        ffi::eval(&seq1_logits);
+
+        assert_eq!(ffi::item_i32(&ffi::argmax_last_axis(&seq0_logits)), 1);
+        assert_eq!(ffi::item_i32(&ffi::argmax_last_axis(&seq1_logits)), 2);
+    }
+
+    #[test]
+    fn forward_batched_single_sequence_no_overhead() {
+        let model = StubModel;
+
+        let mut caches = model.make_caches();
+        let mut batch_caches: Vec<&mut [KVCache]> = vec![&mut caches];
+
+        let input = ffi::from_slice_i32(&[3], &[1, 1]);
+        let logits = model.forward_batched(&input, &mut batch_caches, None);
+        ffi::eval(&logits);
+
+        assert_eq!(ffi::array_shape(&logits), vec![1, 1, 4]);
+
+        // Token 3 should have highest logit at position 3
+        let flat = ffi::reshape(&logits, &[4]);
+        ffi::eval(&flat);
+        assert_eq!(ffi::item_i32(&ffi::argmax_last_axis(&flat)), 3);
+    }
+
+    /// Stub model that does NOT support batching (like SSM models).
+    struct NonBatchModel;
+
+    impl LanguageModel for NonBatchModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::zeros(&[1, 1, 4], crate::dtype::FLOAT32)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+
+        fn supports_batching(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn non_batching_model_uses_default_loop_fallback() {
+        let model = NonBatchModel;
+        assert!(!model.supports_batching());
+
+        // forward_batched still works via the default loop fallback
+        let mut caches = model.make_caches();
+        let mut batch_caches: Vec<&mut [KVCache]> = vec![&mut caches];
+
+        let input = ffi::from_slice_i32(&[0], &[1, 1]);
+        let logits = model.forward_batched(&input, &mut batch_caches, None);
+        ffi::eval(&logits);
+
+        assert_eq!(ffi::array_shape(&logits), vec![1, 1, 4]);
     }
 }

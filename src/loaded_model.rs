@@ -264,4 +264,13 @@ impl LanguageModel for LoadedModel {
     fn supports_batching(&self) -> bool {
         delegate_language_model!(self, supports_batching())
     }
+
+    fn forward_batched(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
+        mask: Option<&mlxcel_core::MlxArray>,
+    ) -> UniquePtr<mlxcel_core::MlxArray> {
+        delegate_language_model!(self, forward_batched(input_ids, batch_caches, mask))
+    }
 }

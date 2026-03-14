@@ -78,6 +78,40 @@ pub fn sample_token_optimized(
     (token, last_logits)
 }
 
+/// Batch-parallel sampling: sample one token per sequence from batched logits.
+///
+/// `logits` has shape `[B, 1, vocab_size]`. Each sequence is sampled
+/// independently using its own `SamplingConfig` and token history.
+///
+/// Returns a vector of B sampled token IDs.
+///
+/// Available for callers that need standalone batched sampling without
+/// per-sequence state interleaving. The BatchScheduler currently inlines
+/// equivalent logic to interleave sampling with EOS/state/streaming updates.
+pub fn batched_sample(
+    logits: &MlxArray,
+    configs: &[&SamplingConfig],
+    token_histories: &[&[i32]],
+) -> Vec<i32> {
+    let b = configs.len();
+    debug_assert_eq!(b, token_histories.len());
+
+    let mut tokens = Vec::with_capacity(b);
+    for i in 0..b {
+        // Slice [B, 1, vocab] -> [1, 1, vocab] for sequence i
+        let seq_logits = ffi::slice(
+            logits,
+            &[i as i32, 0, 0],
+            &[i as i32 + 1, 1, i32::MAX],
+        );
+        let (token_arr, _logprobs) =
+            sample_token_optimized(&seq_logits, configs[i], token_histories[i]);
+        ffi::eval(&token_arr);
+        tokens.push(ffi::item_i32(&token_arr));
+    }
+    tokens
+}
+
 /// Apply repetition penalty to logits.
 ///
 /// For tokens in history:
@@ -350,5 +384,38 @@ mod tests {
         ffi::eval(&token);
         assert_eq!(ffi::item_i32(&token), 2);
         assert_eq!(ffi::array_shape(&processed_logits), vec![1, 3]);
+    }
+
+    #[test]
+    fn batched_sample_greedy_selects_argmax_per_sequence() {
+        // Two sequences with different argmax positions
+        // Seq 0: logits [0.1, 0.9, 1.2] -> argmax = 2
+        // Seq 1: logits [2.0, 0.5, 0.1] -> argmax = 0
+        let logits = ffi::from_slice_f32(
+            &[0.1, 0.9, 1.2, 2.0, 0.5, 0.1],
+            &[2, 1, 3],
+        );
+
+        let config0 = SamplingConfig::greedy();
+        let config1 = SamplingConfig::greedy();
+        let configs: Vec<&SamplingConfig> = vec![&config0, &config1];
+        let histories: Vec<&[i32]> = vec![&[], &[]];
+
+        let tokens = batched_sample(&logits, &configs, &histories);
+        assert_eq!(tokens.len(), 2);
+        assert_eq!(tokens[0], 2);
+        assert_eq!(tokens[1], 0);
+    }
+
+    #[test]
+    fn batched_sample_single_sequence_matches_unbatched() {
+        let logits = ffi::from_slice_f32(&[0.5, 1.5, 0.3], &[1, 1, 3]);
+        let config = SamplingConfig::greedy();
+        let configs: Vec<&SamplingConfig> = vec![&config];
+        let histories: Vec<&[i32]> = vec![&[]];
+
+        let tokens = batched_sample(&logits, &configs, &histories);
+        assert_eq!(tokens.len(), 1);
+        assert_eq!(tokens[0], 1); // argmax of [0.5, 1.5, 0.3] is index 1
     }
 }
