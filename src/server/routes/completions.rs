@@ -17,17 +17,11 @@
 //! Policy for defaults, sampling, and streaming stays in shared server helpers;
 //! this module only translates the HTTP request/response shape.
 
-use std::convert::Infallible;
-
 use axum::{
     Json,
     extract::State,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Sse},
 };
-use futures::stream::Stream;
 
 use crate::server::AppState;
 use crate::server::streaming::sse_channel;
@@ -41,7 +35,7 @@ pub async fn completions(
     Json(request): Json<CompletionRequest>,
 ) -> Response {
     if request.stream {
-        stream_completion(state, request).await.into_response()
+        stream_completion(state, request).await
     } else {
         non_stream_completion(state, request).await.into_response()
     }
@@ -51,10 +45,12 @@ async fn non_stream_completion(
     state: AppState,
     request: CompletionRequest,
 ) -> Result<Json<CompletionResponse>, ErrorResponse> {
-    // Try to acquire a slot permit (non-blocking check for available slots)
-    let _permit = state.slot_semaphore.try_acquire().map_err(|_| {
-        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
-    })?;
+    // Queue-depth admission control: reject when prefill queue is full
+    if !state.can_accept_request() {
+        return Err(ErrorResponse::service_unavailable(
+            "All slots are busy. Please try again later.",
+        ));
+    }
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
@@ -84,12 +80,12 @@ async fn non_stream_completion(
     )))
 }
 
-async fn stream_completion(
-    state: AppState,
-    request: CompletionRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Try to acquire a slot permit for streaming
-    let permit = state.slot_semaphore.clone().try_acquire_owned().ok();
+async fn stream_completion(state: AppState, request: CompletionRequest) -> Response {
+    // Queue-depth admission control: return 503 before opening SSE stream
+    if !state.can_accept_request() {
+        return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+            .into_response();
+    }
 
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
@@ -105,19 +101,6 @@ async fn stream_completion(
 
     // Spawn a blocking task to handle generation
     tokio::task::spawn_blocking(move || {
-        // Check if we got a permit
-        let _permit = match permit {
-            Some(p) => p,
-            None => {
-                // Send error and return
-                let error_chunk =
-                    CompletionChunk::finish(request_id_clone, model_id_clone, "error".to_string());
-                let _ = finish_events.json(&error_chunk);
-                finish_events.done();
-                return;
-            }
-        };
-
         // Use model provider's streaming API
         let token_events = finish_events.clone();
         let request_id_inner = request_id_clone.clone();
@@ -142,9 +125,7 @@ async fn stream_completion(
         let finish = CompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
         let _ = finish_events.json(&finish);
         finish_events.done();
-
-        // _permit is dropped here, releasing the slot
     });
 
-    Sse::new(stream)
+    Sse::new(stream).into_response()
 }

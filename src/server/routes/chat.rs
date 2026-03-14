@@ -21,13 +21,8 @@
 use axum::{
     Json,
     extract::State,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Sse},
 };
-use futures::stream::Stream;
-use std::convert::Infallible;
 
 use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
@@ -44,7 +39,7 @@ pub async fn chat_completions(
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
     if request.stream {
-        stream_chat_completion(state, request).await.into_response()
+        stream_chat_completion(state, request).await
     } else {
         non_stream_chat_completion(state, request)
             .await
@@ -56,10 +51,12 @@ async fn non_stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
 ) -> Result<Json<ChatCompletionResponse>, ErrorResponse> {
-    // Try to acquire a slot permit (non-blocking check for available slots)
-    let _permit = state.slot_semaphore.try_acquire().map_err(|_| {
-        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
-    })?;
+    // Queue-depth admission control: reject when prefill queue is full
+    if !state.can_accept_request() {
+        return Err(ErrorResponse::service_unavailable(
+            "All slots are busy. Please try again later.",
+        ));
+    }
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
@@ -89,12 +86,12 @@ async fn non_stream_chat_completion(
     )))
 }
 
-async fn stream_chat_completion(
-    state: AppState,
-    request: ChatCompletionRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Try to acquire a slot permit for streaming
-    let permit = state.slot_semaphore.clone().try_acquire_owned().ok();
+async fn stream_chat_completion(state: AppState, request: ChatCompletionRequest) -> Response {
+    // Queue-depth admission control: return 503 before opening SSE stream
+    if !state.can_accept_request() {
+        return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+            .into_response();
+    }
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
@@ -110,22 +107,6 @@ async fn stream_chat_completion(
 
     // Spawn a blocking task to handle generation
     tokio::task::spawn_blocking(move || {
-        // Check if we got a permit
-        let _permit = match permit {
-            Some(p) => p,
-            None => {
-                // Send error and return
-                let error_chunk = ChatCompletionChunk::finish(
-                    request_id_clone,
-                    model_id_clone,
-                    "error".to_string(),
-                );
-                let _ = finish_events.json(&error_chunk);
-                finish_events.done();
-                return;
-            }
-        };
-
         // Send initial chunk with role
         let initial =
             ChatCompletionChunk::initial(request_id_clone.clone(), model_id_clone.clone());
@@ -158,11 +139,9 @@ async fn stream_chat_completion(
         let finish = ChatCompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
         let _ = finish_events.json(&finish);
         finish_events.done();
-
-        // _permit is dropped here, releasing the slot
     });
 
-    Sse::new(stream)
+    Sse::new(stream).into_response()
 }
 
 /// Build ServerGenerateOptions using request params with server config as defaults

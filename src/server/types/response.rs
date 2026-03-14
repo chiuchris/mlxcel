@@ -150,6 +150,16 @@ pub struct HealthResponse {
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub batch: Option<BatchStatusInfo>,
+}
+
+/// Batch status included in the health check response.
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchStatusInfo {
+    pub active_sequences: usize,
+    pub queue_depth: usize,
+    pub max_batch_size: usize,
 }
 
 /// Error response
@@ -247,7 +257,13 @@ pub struct PropsResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct SlotInfo {
     pub id: usize,
-    pub state: u8,
+    pub state: String,
     pub model: String,
     pub is_processing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub generated_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
 }

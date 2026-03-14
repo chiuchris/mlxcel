@@ -25,6 +25,7 @@
 //! active sequence. Sub-issue 4 (#16) upgrades this to batched decode.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -44,6 +45,7 @@ use crate::server::model_provider::model_worker::{
     prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
+use crate::server::state::BatchMetrics;
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vlm_runtime::prepared_embedding_refs;
 
@@ -72,6 +74,10 @@ pub struct BatchScheduler {
     // -- Request channel --
     request_rx: mpsc::Receiver<ModelRequest>,
 
+    // -- Metrics --
+    /// Shared metrics updated atomically for HTTP handlers to read.
+    batch_metrics: Arc<BatchMetrics>,
+
     // -- Configuration --
     config_eos: Vec<i32>,
 
@@ -94,6 +100,7 @@ impl BatchScheduler {
         request_rx: mpsc::Receiver<ModelRequest>,
         max_batch_size: usize,
         max_queue_depth: usize,
+        batch_metrics: Arc<BatchMetrics>,
     ) -> Self {
         let generation_stream = new_generation_stream();
         let max_batch_size = max_batch_size.max(1);
@@ -105,6 +112,7 @@ impl BatchScheduler {
             tokenizer,
             generation_stream,
             request_rx,
+            batch_metrics,
             config_eos,
             shutdown_requested: false,
         }
@@ -128,6 +136,9 @@ impl BatchScheduler {
                 break;
             }
 
+            // Publish metrics after ingestion
+            self.publish_metrics();
+
             // 2. Decide what to do this tick
             let action = self.decide_action();
 
@@ -135,6 +146,7 @@ impl BatchScheduler {
             match action {
                 BatchSchedulerAction::Prefill(seq_id) => {
                     self.execute_prefill(seq_id);
+                    self.publish_metrics();
                 }
                 BatchSchedulerAction::Decode(ids) => {
                     self.execute_decode_step(&ids);
@@ -147,6 +159,7 @@ impl BatchScheduler {
                                 // Shutdown requested
                                 break;
                             }
+                            self.publish_metrics();
                         }
                         Err(_) => {
                             tracing::info!("Request channel closed, scheduler exiting");
@@ -159,6 +172,15 @@ impl BatchScheduler {
             // 4. Clean up completed sequences
             self.finalize_completed();
         }
+    }
+
+    /// Publish current queue and batch sizes to shared atomic metrics.
+    ///
+    /// Called after state-changing operations so HTTP handlers see
+    /// up-to-date values for admission control and status reporting.
+    fn publish_metrics(&self) {
+        self.batch_metrics.set_active_count(self.active_batch.len());
+        self.batch_metrics.set_queue_depth(self.prefill_queue.len());
     }
 
     // ------------------------------------------------------------------
@@ -772,8 +794,11 @@ impl BatchScheduler {
             })
             .collect();
 
+        let has_completed = !finished_ids.is_empty();
         for id in finished_ids {
             if let Some(mut seq) = self.active_batch.remove(id) {
+                let tokens_generated = seq.generated_tokens.len();
+
                 // Flush any remaining buffered text
                 seq.decode_state.flush(&self.tokenizer);
 
@@ -788,11 +813,18 @@ impl BatchScheduler {
                 // Release cache
                 self.cache_pool.release(id);
 
-                tracing::debug!(
-                    "Sequence {id} completed ({} tokens)",
-                    seq.generated_tokens.len()
-                );
+                // Update batch metrics
+                self.batch_metrics
+                    .record_sequence_completed(tokens_generated);
+
+                tracing::debug!("Sequence {id} completed ({tokens_generated} tokens)");
             }
+        }
+
+        // Publish metrics after finalization so admission control sees
+        // freed slots immediately.
+        if has_completed {
+            self.publish_metrics();
         }
     }
 

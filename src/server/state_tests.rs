@@ -14,7 +14,7 @@
 
 use std::sync::atomic::Ordering;
 
-use super::Metrics;
+use super::{BatchMetrics, Metrics};
 
 #[test]
 fn metrics_record_request_accumulates_counters() {
@@ -30,4 +30,89 @@ fn metrics_record_request_accumulates_counters() {
         metrics.generation_time_ms_total.load(Ordering::Relaxed),
         150
     );
+}
+
+// ------------------------------------------------------------------
+// BatchMetrics
+// ------------------------------------------------------------------
+
+#[test]
+fn batch_metrics_initializes_to_zero() {
+    let m = BatchMetrics::new();
+    assert_eq!(m.active_count(), 0);
+    assert_eq!(m.queue_depth(), 0);
+    assert_eq!(
+        m.total_sequences_processed.load(Ordering::Relaxed),
+        0
+    );
+    assert_eq!(m.total_tokens_generated.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn batch_metrics_set_active_count_is_reflected_by_getter() {
+    let m = BatchMetrics::new();
+    m.set_active_count(4);
+    assert_eq!(m.active_count(), 4);
+    m.set_active_count(0);
+    assert_eq!(m.active_count(), 0);
+}
+
+#[test]
+fn batch_metrics_set_queue_depth_is_reflected_by_getter() {
+    let m = BatchMetrics::new();
+    m.set_queue_depth(7);
+    assert_eq!(m.queue_depth(), 7);
+    m.set_queue_depth(0);
+    assert_eq!(m.queue_depth(), 0);
+}
+
+#[test]
+fn batch_metrics_record_sequence_completed_accumulates() {
+    let m = BatchMetrics::new();
+    m.record_sequence_completed(10);
+    m.record_sequence_completed(25);
+    assert_eq!(
+        m.total_sequences_processed.load(Ordering::Relaxed),
+        2
+    );
+    assert_eq!(m.total_tokens_generated.load(Ordering::Relaxed), 35);
+}
+
+#[test]
+fn batch_metrics_default_equals_new() {
+    let a = BatchMetrics::new();
+    let b = BatchMetrics::default();
+    assert_eq!(a.active_count(), b.active_count());
+    assert_eq!(a.queue_depth(), b.queue_depth());
+}
+
+// ------------------------------------------------------------------
+// can_accept_request logic (tested via BatchMetrics + ServerConfig)
+// ------------------------------------------------------------------
+
+/// The admission-control predicate is:
+///   queue_depth < max_queue_depth
+/// Test this boundary without constructing a full AppState.
+#[test]
+fn admission_control_accepts_when_queue_below_limit() {
+    let m = BatchMetrics::new();
+    let max = 4usize;
+
+    m.set_queue_depth(0);
+    assert!(m.queue_depth() < max, "empty queue should accept");
+
+    m.set_queue_depth(3);
+    assert!(m.queue_depth() < max, "queue below limit should accept");
+}
+
+#[test]
+fn admission_control_rejects_when_queue_at_or_above_limit() {
+    let m = BatchMetrics::new();
+    let max = 4usize;
+
+    m.set_queue_depth(4);
+    assert!(!(m.queue_depth() < max), "queue at limit should reject");
+
+    m.set_queue_depth(10);
+    assert!(!(m.queue_depth() < max), "queue above limit should reject");
 }

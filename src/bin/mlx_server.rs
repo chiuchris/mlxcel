@@ -111,6 +111,14 @@ struct Args {
     )]
     draft: usize,
 
+    /// Maximum number of concurrent decode sequences (default: --parallel value)
+    #[arg(long = "max-batch-size", value_name = "N")]
+    max_batch_size: Option<usize>,
+
+    /// Maximum number of requests waiting in the prefill queue (default: 32)
+    #[arg(long = "max-queue-depth", default_value_t = 32)]
+    max_queue_depth: usize,
+
     /// Override chat template (Jinja2 template string)
     #[arg(long = "chat-template", value_name = "TEMPLATE")]
     chat_template: Option<String>,
@@ -269,6 +277,8 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         timeout: args.timeout,
         draft_model_path: args.model_draft,
         draft_max: args.draft,
+        max_batch_size: args.max_batch_size,
+        max_queue_depth: args.max_queue_depth,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
         slots: args.slots,

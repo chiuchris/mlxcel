@@ -20,17 +20,11 @@
 //! Like the OpenAI-compatible routes, this file stays as an HTTP adapter while
 //! generation policy and SSE plumbing live in shared server modules.
 
-use std::convert::Infallible;
-
 use axum::{
     Json,
     extract::State,
-    response::{
-        IntoResponse, Response,
-        sse::{Event, Sse},
-    },
+    response::{IntoResponse, Response, sse::Sse},
 };
-use futures::stream::Stream;
 
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
@@ -45,9 +39,7 @@ pub async fn native_completion(
     Json(request): Json<NativeCompletionRequest>,
 ) -> Response {
     if request.stream.unwrap_or(false) {
-        stream_native_completion(state, request)
-            .await
-            .into_response()
+        stream_native_completion(state, request).await
     } else {
         non_stream_native_completion(state, request)
             .await
@@ -59,9 +51,12 @@ async fn non_stream_native_completion(
     state: AppState,
     request: NativeCompletionRequest,
 ) -> Result<Json<NativeCompletionResponse>, ErrorResponse> {
-    let _permit = state.slot_semaphore.try_acquire().map_err(|_| {
-        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
-    })?;
+    // Queue-depth admission control: reject when prefill queue is full
+    if !state.can_accept_request() {
+        return Err(ErrorResponse::service_unavailable(
+            "All slots are busy. Please try again later.",
+        ));
+    }
 
     let options = build_native_options(&request, &state);
 
@@ -115,11 +110,12 @@ async fn non_stream_native_completion(
     }))
 }
 
-async fn stream_native_completion(
-    state: AppState,
-    request: NativeCompletionRequest,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    let permit = state.slot_semaphore.clone().try_acquire_owned().ok();
+async fn stream_native_completion(state: AppState, request: NativeCompletionRequest) -> Response {
+    // Queue-depth admission control: return 503 before opening SSE stream
+    if !state.can_accept_request() {
+        return ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+            .into_response();
+    }
 
     let options = build_native_options(&request, &state);
     let prompt = request.prompt.clone();
@@ -128,15 +124,6 @@ async fn stream_native_completion(
     let finish_events = events.clone();
 
     tokio::task::spawn_blocking(move || {
-        let _permit = match permit {
-            Some(p) => p,
-            None => {
-                let err = serde_json::json!({"content": "", "stop": true});
-                let _ = finish_events.json(&err);
-                return;
-            }
-        };
-
         let token_events = finish_events.clone();
 
         let result = state
@@ -162,7 +149,7 @@ async fn stream_native_completion(
         let _ = finish_events.json(&final_chunk);
     });
 
-    Sse::new(stream)
+    Sse::new(stream).into_response()
 }
 
 fn build_native_options(

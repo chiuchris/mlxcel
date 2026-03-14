@@ -25,6 +25,7 @@ use std::thread;
 use anyhow::Result;
 
 use crate::server::ServerGenerateOptions;
+use crate::server::state::BatchMetrics;
 
 /// Request to the model thread
 pub enum ModelRequest {
@@ -66,6 +67,7 @@ pub struct ModelProvider {
     model_id: String,
     created_at: i64,
     loaded: Arc<AtomicBool>,
+    batch_metrics: Arc<BatchMetrics>,
     _worker_handle: thread::JoinHandle<()>,
 }
 
@@ -93,6 +95,28 @@ impl ModelProvider {
         max_batch_size: usize,
         max_queue_depth: usize,
     ) -> Result<Self> {
+        let batch_metrics = Arc::new(BatchMetrics::new());
+        Self::new_with_metrics(
+            model_path,
+            adapter_path,
+            max_batch_size,
+            max_queue_depth,
+            batch_metrics,
+        )
+    }
+
+    /// Create and start a new model provider with shared batch metrics.
+    ///
+    /// The `batch_metrics` arc is shared with `AppState` so HTTP handlers can
+    /// read queue depth and active count for admission control and status
+    /// reporting without locking.
+    pub fn new_with_metrics(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        batch_metrics: Arc<BatchMetrics>,
+    ) -> Result<Self> {
         let model_id = model_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -109,6 +133,7 @@ impl ModelProvider {
 
         // Clone model_id for the worker thread
         let worker_model_id = model_id.clone();
+        let metrics_clone = batch_metrics.clone();
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
             model_path,
@@ -118,6 +143,7 @@ impl ModelProvider {
             worker_model_id,
             max_batch_size,
             max_queue_depth,
+            metrics_clone,
         );
 
         Ok(Self {
@@ -125,8 +151,14 @@ impl ModelProvider {
             model_id,
             created_at,
             loaded,
+            batch_metrics,
             _worker_handle: worker_handle,
         })
+    }
+
+    /// Get a reference to the shared batch metrics.
+    pub fn batch_metrics(&self) -> &Arc<BatchMetrics> {
+        &self.batch_metrics
     }
 
     /// Get model ID

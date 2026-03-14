@@ -35,8 +35,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let completion_tokens = m.completion_tokens_total.load(Ordering::Relaxed);
     let gen_time_ms = m.generation_time_ms_total.load(Ordering::Relaxed);
 
-    let slots_total = state.config.n_parallel;
-    let slots_available = state.slot_semaphore.available_permits();
+    let slots_total = state.config.max_batch_size;
+    let active = state.batch_metrics.active_count();
+    let slots_available = slots_total.saturating_sub(active);
+    let queue_depth = state.batch_metrics.queue_depth();
 
     let body = format!(
         "# HELP mlxcel_requests_total Total number of generation requests\n\
@@ -56,7 +58,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_slots_total {slots_total}\n\
          # HELP mlxcel_slots_available Available parallel slots\n\
          # TYPE mlxcel_slots_available gauge\n\
-         mlxcel_slots_available {slots_available}\n",
+         mlxcel_slots_available {slots_available}\n\
+         # HELP mlxcel_queue_depth Current prefill queue depth\n\
+         # TYPE mlxcel_queue_depth gauge\n\
+         mlxcel_queue_depth {queue_depth}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
     );
 

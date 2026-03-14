@@ -209,6 +209,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, env = "LLAMA_ARG_DRAFT_MAX", default_value_t = 16)]
     draft_max: usize,
 
+    /// Maximum number of concurrent decode sequences (default: --n-parallel value)
+    #[arg(long, value_name = "N")]
+    max_batch_size: Option<usize>,
+
+    /// Maximum number of requests waiting in the prefill queue (default: 32)
+    #[arg(long, default_value_t = 32)]
+    max_queue_depth: usize,
+
     /// Request timeout in seconds
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,

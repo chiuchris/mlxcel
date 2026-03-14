@@ -42,6 +42,8 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         timeout: args.timeout,
         draft_model_path: args.draft_model,
         draft_max: args.draft_max,
+        max_batch_size: args.max_batch_size,
+        max_queue_depth: args.max_queue_depth,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
         slots: args.slots,

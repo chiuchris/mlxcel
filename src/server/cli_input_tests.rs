@@ -31,6 +31,8 @@ fn sample_input() -> ServerStartupInput {
         timeout: 600,
         draft_model_path: Some(PathBuf::from("models/draft")),
         draft_max: 8,
+        max_batch_size: Some(4),
+        max_queue_depth: 32,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),
         slots: true,

@@ -35,4 +35,4 @@ pub use cli_input::ServerStartupInput;
 pub use config::{ServerConfig, ServerGenerateOptions};
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use startup::{ServerStartupConfig, start_server};
-pub use state::{AppState, Metrics};
+pub use state::{AppState, BatchMetrics, Metrics};

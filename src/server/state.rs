@@ -20,9 +20,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-
-use tokio::sync::Semaphore;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::tokenizer::MlxcelTokenizer;
 
@@ -68,6 +66,66 @@ impl Metrics {
     }
 }
 
+/// Batch-level metrics updated by the scheduler thread.
+///
+/// All fields are atomic for lock-free reads from HTTP handlers and
+/// writes from the single scheduler thread.
+pub struct BatchMetrics {
+    /// Number of sequences currently in the active decode batch.
+    pub active_count: AtomicUsize,
+    /// Number of requests waiting in the prefill queue.
+    pub queue_depth: AtomicUsize,
+    /// Cumulative number of sequences that have completed generation.
+    pub total_sequences_processed: AtomicU64,
+    /// Cumulative number of tokens generated across all sequences.
+    pub total_tokens_generated: AtomicU64,
+}
+
+impl Default for BatchMetrics {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BatchMetrics {
+    pub fn new() -> Self {
+        Self {
+            active_count: AtomicUsize::new(0),
+            queue_depth: AtomicUsize::new(0),
+            total_sequences_processed: AtomicU64::new(0),
+            total_tokens_generated: AtomicU64::new(0),
+        }
+    }
+
+    /// Current number of active decode sequences.
+    pub fn active_count(&self) -> usize {
+        self.active_count.load(Ordering::Relaxed)
+    }
+
+    /// Current prefill queue depth.
+    pub fn queue_depth(&self) -> usize {
+        self.queue_depth.load(Ordering::Relaxed)
+    }
+
+    /// Update active count (called by scheduler thread).
+    pub fn set_active_count(&self, count: usize) {
+        self.active_count.store(count, Ordering::Relaxed);
+    }
+
+    /// Update queue depth (called by scheduler thread).
+    pub fn set_queue_depth(&self, depth: usize) {
+        self.queue_depth.store(depth, Ordering::Relaxed);
+    }
+
+    /// Record a completed sequence (called by scheduler thread).
+    pub fn record_sequence_completed(&self, tokens_generated: usize) {
+        self.total_sequences_processed
+            .fetch_add(1, Ordering::Relaxed);
+        self.total_tokens_generated
+            .fetch_add(tokens_generated as u64, Ordering::Relaxed);
+    }
+}
+
 /// Shared application state passed into route handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -78,8 +136,9 @@ pub struct AppState {
     pub tokenizer: Arc<MlxcelTokenizer>,
     /// Model directory path (for props/info).
     pub model_path: PathBuf,
-    /// Semaphore limiting concurrent generation requests.
-    pub slot_semaphore: Arc<Semaphore>,
+    /// Batch-level metrics (active sequences, queue depth) for admission
+    /// control and status reporting.
+    pub batch_metrics: Arc<BatchMetrics>,
     /// Server metrics (request counts, token throughput).
     pub metrics: Arc<Metrics>,
 }
@@ -92,15 +151,15 @@ impl AppState {
         chat_template: ChatTemplateProcessor,
         tokenizer: MlxcelTokenizer,
         model_path: PathBuf,
+        batch_metrics: Arc<BatchMetrics>,
     ) -> Self {
-        let n_parallel = config.n_parallel.max(1);
         Self {
             model_provider,
-            slot_semaphore: Arc::new(Semaphore::new(n_parallel)),
             config: Arc::new(config),
             chat_template: Arc::new(chat_template),
             tokenizer: Arc::new(tokenizer),
             model_path,
+            batch_metrics,
             metrics: Arc::new(Metrics::new()),
         }
     }
@@ -111,6 +170,13 @@ impl AppState {
             .model_alias
             .as_deref()
             .unwrap_or_else(|| self.model_provider.model_id())
+    }
+
+    /// Check whether the server can accept a new request based on queue depth.
+    ///
+    /// Returns `true` if the current queue depth is below `max_queue_depth`.
+    pub fn can_accept_request(&self) -> bool {
+        self.batch_metrics.queue_depth() < self.config.max_queue_depth
     }
 }
 

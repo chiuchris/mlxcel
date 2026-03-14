@@ -27,7 +27,8 @@ use tower::Service;
 use crate::SamplingConfig;
 
 use super::{
-    AppState, ChatTemplateProcessor, ModelProvider, ServerConfig, ServerGenerateOptions, create_app,
+    AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, ServerConfig,
+    ServerGenerateOptions, create_app,
 };
 
 /// Startup configuration for the server (shared between `mlxcel serve` and `mlxcel-server`).
@@ -64,6 +65,10 @@ pub struct ServerStartupConfig {
     pub enable_slots: bool,
     pub enable_props: bool,
     pub enable_metrics: bool,
+
+    // Batch scheduling
+    pub max_batch_size: Option<usize>,
+    pub max_queue_depth: usize,
 
     // Warmup
     pub warmup: bool,
@@ -108,6 +113,8 @@ impl Default for ServerStartupConfig {
             timeout: 600,
             draft_model_path: None,
             draft_max: 16,
+            max_batch_size: None,
+            max_queue_depth: 32,
             chat_template: None,
             chat_template_file: None,
             enable_slots: true,
@@ -213,8 +220,8 @@ pub(super) fn build_server_config(
         default_dry_penalty_last_n: resolve_dry_penalty_last_n(startup.dry_penalty_last_n),
         draft_model_path: startup.draft_model_path.clone(),
         num_draft_tokens: startup.draft_max,
-        max_batch_size: startup.n_parallel.max(1),
-        max_queue_depth: 1024,
+        max_batch_size: startup.max_batch_size.unwrap_or(startup.n_parallel).max(1),
+        max_queue_depth: startup.max_queue_depth,
     }
 }
 
@@ -351,11 +358,16 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         &startup.model_path,
     )?;
     let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
-    let model_provider = Arc::new(ModelProvider::new_with_batch_config(
+
+    // Create shared batch metrics that both ModelProvider and AppState read/write.
+    let batch_metrics = Arc::new(BatchMetrics::new());
+
+    let model_provider = Arc::new(ModelProvider::new_with_metrics(
         startup.model_path.clone(),
         startup.adapter_path.clone(),
         config.max_batch_size,
         config.max_queue_depth,
+        batch_metrics.clone(),
     )?);
 
     if startup.warmup {
@@ -372,6 +384,7 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         chat_template,
         tokenizer,
         startup.model_path.clone(),
+        batch_metrics,
     );
     let app = create_app(state);
 

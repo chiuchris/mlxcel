@@ -28,6 +28,7 @@ use image::DynamicImage;
 
 use crate::LoadedModel;
 use crate::SamplingConfig;
+use crate::server::state::BatchMetrics;
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::merge::InputEmbeddings;
 use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
@@ -42,6 +43,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     worker_model_id: String,
     max_batch_size: usize,
     max_queue_depth: usize,
+    batch_metrics: Arc<BatchMetrics>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tracing::info!("Model worker thread starting, loading model...");
@@ -82,6 +84,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             request_rx,
             max_batch_size,
             max_queue_depth,
+            batch_metrics,
         );
         scheduler.run();
     })

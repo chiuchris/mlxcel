@@ -139,9 +139,10 @@ fn build_server_config_applies_normalized_startup_values() {
     assert_eq!(config.default_dry_penalty_last_n, 0);
     assert_eq!(config.draft_model_path, Some(PathBuf::from("draft")));
     assert_eq!(config.num_draft_tokens, 5);
-    // max_batch_size is derived from n_parallel; max_queue_depth is fixed
+    // max_batch_size derived from n_parallel (no explicit override);
+    // max_queue_depth comes from the startup config default (32).
     assert_eq!(config.max_batch_size, 3);
-    assert_eq!(config.max_queue_depth, 1024);
+    assert_eq!(config.max_queue_depth, 32);
 }
 
 #[test]

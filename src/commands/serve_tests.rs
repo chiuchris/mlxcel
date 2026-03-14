@@ -30,6 +30,8 @@ fn sample_args() -> crate::ServeArgs {
         n_predict: 128,
         draft_model: Some(PathBuf::from("models/draft")),
         draft_max: 4,
+        max_batch_size: Some(4),
+        max_queue_depth: 32,
         timeout: 30,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),

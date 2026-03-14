@@ -14,19 +14,18 @@
 
 //! Health check endpoint (llama-server compatible).
 //!
-//! This route only reports server liveness and slot availability. Slot policy
-//! itself stays in shared server state.
+//! Reports server liveness, model loading status, and batch scheduler metrics.
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
 use crate::server::AppState;
-use crate::server::types::HealthResponse;
+use crate::server::types::{BatchStatusInfo, HealthResponse};
 
 /// GET /health
 ///
-/// Returns llama-server compatible status:
-/// - `{"status": "ok"}` when model is loaded and slots available
-/// - `{"status": "no slot available"}` when all slots are busy
+/// Returns status with batch metrics:
+/// - `{"status": "ok", "batch": {...}}` when model is loaded
+/// - `{"status": "no slot available", ...}` when all slots are busy and queue is full
 /// - `{"status": "loading model"}` when model is still loading
 pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
     if !state.model_provider.is_loaded() {
@@ -35,17 +34,25 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
             Json(HealthResponse {
                 status: "loading model".to_string(),
                 model: None,
+                batch: None,
             }),
         );
     }
 
-    let has_slots = state.slot_semaphore.available_permits() > 0;
-    if !has_slots {
+    let batch_info = BatchStatusInfo {
+        active_sequences: state.batch_metrics.active_count(),
+        queue_depth: state.batch_metrics.queue_depth(),
+        max_batch_size: state.config.max_batch_size,
+    };
+
+    let has_capacity = state.can_accept_request();
+    if !has_capacity {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(HealthResponse {
                 status: "no slot available".to_string(),
                 model: Some(state.display_model_id().to_string()),
+                batch: Some(batch_info),
             }),
         );
     }
@@ -55,6 +62,7 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         Json(HealthResponse {
             status: "ok".to_string(),
             model: Some(state.display_model_id().to_string()),
+            batch: Some(batch_info),
         }),
     )
 }
