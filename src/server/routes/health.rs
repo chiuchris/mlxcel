@@ -14,7 +14,8 @@
 
 //! Health check endpoint (llama-server compatible).
 //!
-//! Reports server liveness, model loading status, and batch scheduler metrics.
+//! Reports server liveness, model loading status, batch scheduler metrics,
+//! and detailed observability counters.
 
 use axum::{Json, extract::State, http::StatusCode, response::IntoResponse};
 
@@ -23,8 +24,8 @@ use crate::server::types::{BatchStatusInfo, HealthResponse};
 
 /// GET /health
 ///
-/// Returns status with batch metrics:
-/// - `{"status": "ok", "batch": {...}}` when model is loaded
+/// Returns status with batch metrics and observability counters:
+/// - `{"status": "ok", "batch": {...}, "observability": {...}}` when model is loaded
 /// - `{"status": "no slot available", ...}` when all slots are busy and queue is full
 /// - `{"status": "loading model"}` when model is still loading
 pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
@@ -35,6 +36,7 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
                 status: "loading model".to_string(),
                 model: None,
                 batch: None,
+                observability: None,
             }),
         );
     }
@@ -45,6 +47,8 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
         max_batch_size: state.config.max_batch_size,
     };
 
+    let obs_snapshot = state.batch_observability.snapshot();
+
     let has_capacity = state.can_accept_request();
     if !has_capacity {
         return (
@@ -53,6 +57,7 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
                 status: "no slot available".to_string(),
                 model: Some(state.display_model_id().to_string()),
                 batch: Some(batch_info),
+                observability: Some(obs_snapshot),
             }),
         );
     }
@@ -63,6 +68,7 @@ pub async fn health_check(State(state): State<AppState>) -> impl IntoResponse {
             status: "ok".to_string(),
             model: Some(state.display_model_id().to_string()),
             batch: Some(batch_info),
+            observability: Some(obs_snapshot),
         }),
     )
 }

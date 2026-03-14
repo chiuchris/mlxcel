@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use crate::tokenizer::MlxcelTokenizer;
 
+use super::batch::BatchObservability;
 use super::{ChatTemplateProcessor, ModelProvider, ServerConfig};
 
 /// Server-wide metrics counters (atomic, lock-free).
@@ -147,6 +148,8 @@ pub struct AppState {
     /// Batch-level metrics (active sequences, queue depth) for admission
     /// control and status reporting.
     pub batch_metrics: Arc<BatchMetrics>,
+    /// Detailed batch observability counters (prefill, decode, cache).
+    pub batch_observability: Arc<BatchObservability>,
     /// Server metrics (request counts, token throughput).
     pub metrics: Arc<Metrics>,
 }
@@ -168,6 +171,32 @@ impl AppState {
             tokenizer: Arc::new(tokenizer),
             model_path,
             batch_metrics,
+            batch_observability: Arc::new(BatchObservability::new()),
+            metrics: Arc::new(Metrics::new()),
+        }
+    }
+
+    /// Create `AppState` with a pre-existing `BatchObservability` instance.
+    ///
+    /// Use this when the scheduler owns the same `Arc<BatchObservability>`
+    /// so that scheduler writes are visible to HTTP handlers.
+    pub fn with_observability(
+        model_provider: Arc<ModelProvider>,
+        config: ServerConfig,
+        chat_template: ChatTemplateProcessor,
+        tokenizer: MlxcelTokenizer,
+        model_path: PathBuf,
+        batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
+    ) -> Self {
+        Self {
+            model_provider,
+            config: Arc::new(config),
+            chat_template: Arc::new(chat_template),
+            tokenizer: Arc::new(tokenizer),
+            model_path,
+            batch_metrics,
+            batch_observability,
             metrics: Arc::new(Metrics::new()),
         }
     }

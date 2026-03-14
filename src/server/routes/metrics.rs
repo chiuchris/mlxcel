@@ -15,6 +15,7 @@
 //! Prometheus-compatible metrics endpoint.
 //!
 //! This route is read-only and should remain separate from generation policy.
+//! Includes both server-level request counters and batch observability gauges.
 
 use std::sync::atomic::Ordering;
 
@@ -26,7 +27,7 @@ use axum::{
 
 use crate::server::AppState;
 
-/// GET /metrics — Prometheus text format
+/// GET /metrics -- Prometheus text format
 pub async fn metrics(State(state): State<AppState>) -> Response {
     let m = &state.metrics;
 
@@ -39,6 +40,9 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let active = state.batch_metrics.active_count();
     let slots_available = slots_total.saturating_sub(active);
     let queue_depth = state.batch_metrics.queue_depth();
+
+    // Batch observability counters
+    let obs = state.batch_observability.snapshot();
 
     let body = format!(
         "# HELP mlxcel_requests_total Total number of generation requests\n\
@@ -61,8 +65,40 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_slots_available {slots_available}\n\
          # HELP mlxcel_queue_depth Current prefill queue depth\n\
          # TYPE mlxcel_queue_depth gauge\n\
-         mlxcel_queue_depth {queue_depth}\n",
+         mlxcel_queue_depth {queue_depth}\n\
+         # HELP mlxcel_batch_sequences_started Total sequences that entered prefill\n\
+         # TYPE mlxcel_batch_sequences_started counter\n\
+         mlxcel_batch_sequences_started {seq_started}\n\
+         # HELP mlxcel_batch_sequences_completed Total sequences that completed generation\n\
+         # TYPE mlxcel_batch_sequences_completed counter\n\
+         mlxcel_batch_sequences_completed {seq_completed}\n\
+         # HELP mlxcel_batch_prefill_tokens_total Cumulative prefill tokens processed\n\
+         # TYPE mlxcel_batch_prefill_tokens_total counter\n\
+         mlxcel_batch_prefill_tokens_total {prefill_tokens}\n\
+         # HELP mlxcel_batch_decode_tokens_total Cumulative decode tokens generated\n\
+         # TYPE mlxcel_batch_decode_tokens_total counter\n\
+         mlxcel_batch_decode_tokens_total {decode_tokens}\n\
+         # HELP mlxcel_batch_decode_steps_total Total decode steps executed\n\
+         # TYPE mlxcel_batch_decode_steps_total counter\n\
+         mlxcel_batch_decode_steps_total {decode_steps}\n\
+         # HELP mlxcel_batch_prefill_chunks_total Total prefill chunks processed\n\
+         # TYPE mlxcel_batch_prefill_chunks_total counter\n\
+         mlxcel_batch_prefill_chunks_total {prefill_chunks}\n\
+         # HELP mlxcel_batch_current_size Current active batch size\n\
+         # TYPE mlxcel_batch_current_size gauge\n\
+         mlxcel_batch_current_size {batch_size}\n\
+         # HELP mlxcel_cache_pool_active Active cache entries\n\
+         # TYPE mlxcel_cache_pool_active gauge\n\
+         mlxcel_cache_pool_active {cache_active}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
+        seq_started = obs.sequences_started,
+        seq_completed = obs.sequences_completed,
+        prefill_tokens = obs.total_prefill_tokens,
+        decode_tokens = obs.total_decode_tokens,
+        decode_steps = obs.decode_steps_processed,
+        prefill_chunks = obs.prefill_chunks_processed,
+        batch_size = obs.current_batch_size,
+        cache_active = obs.cache_pool_active,
     );
 
     (

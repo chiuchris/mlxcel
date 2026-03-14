@@ -25,6 +25,7 @@ use std::thread;
 use anyhow::Result;
 
 use crate::server::ServerGenerateOptions;
+use crate::server::batch::BatchObservability;
 use crate::server::state::BatchMetrics;
 
 /// Request to the model thread
@@ -68,6 +69,7 @@ pub struct ModelProvider {
     created_at: i64,
     loaded: Arc<AtomicBool>,
     batch_metrics: Arc<BatchMetrics>,
+    batch_observability: Arc<BatchObservability>,
     _worker_handle: thread::JoinHandle<()>,
 }
 
@@ -110,9 +112,15 @@ impl ModelProvider {
         adapter_path: Option<PathBuf>,
         config: &crate::server::ServerConfig,
         batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
         if config.no_batch {
-            Self::new_with_legacy_worker(model_path, adapter_path, batch_metrics)
+            Self::new_with_legacy_worker(
+                model_path,
+                adapter_path,
+                batch_metrics,
+                batch_observability,
+            )
         } else {
             Self::new_with_full_config(
                 model_path,
@@ -123,6 +131,7 @@ impl ModelProvider {
                 config.enable_preemption,
                 config.preemption_policy,
                 batch_metrics,
+                batch_observability,
             )
         }
     }
@@ -136,6 +145,7 @@ impl ModelProvider {
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
         batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
         let model_id = model_path
             .file_name()
@@ -148,6 +158,7 @@ impl ModelProvider {
         let loaded_clone = loaded.clone();
         let worker_model_id = model_id.clone();
         let metrics_clone = batch_metrics.clone();
+        let obs_clone = batch_observability.clone();
 
         let worker_handle = model_worker::spawn_legacy_model_worker(
             model_path,
@@ -156,6 +167,7 @@ impl ModelProvider {
             loaded_clone,
             worker_model_id,
             metrics_clone,
+            obs_clone,
         );
 
         Ok(Self {
@@ -164,6 +176,7 @@ impl ModelProvider {
             created_at,
             loaded,
             batch_metrics,
+            batch_observability,
             _worker_handle: worker_handle,
         })
     }
@@ -180,6 +193,7 @@ impl ModelProvider {
         enable_preemption: bool,
         preemption_policy: crate::server::config::PreemptionPolicy,
         batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
         let model_id = model_path
             .file_name()
@@ -192,6 +206,7 @@ impl ModelProvider {
         let loaded_clone = loaded.clone();
         let worker_model_id = model_id.clone();
         let metrics_clone = batch_metrics.clone();
+        let obs_clone = batch_observability.clone();
 
         let sched_config = model_worker::WorkerSchedulerConfig {
             max_batch_size,
@@ -209,6 +224,7 @@ impl ModelProvider {
             worker_model_id,
             sched_config,
             metrics_clone,
+            obs_clone,
         );
 
         Ok(Self {
@@ -217,6 +233,7 @@ impl ModelProvider {
             created_at,
             loaded,
             batch_metrics,
+            batch_observability,
             _worker_handle: worker_handle,
         })
     }
@@ -246,6 +263,8 @@ impl ModelProvider {
         // Clone model_id for the worker thread
         let worker_model_id = model_id.clone();
         let metrics_clone = batch_metrics.clone();
+        let batch_observability = Arc::new(BatchObservability::new());
+        let obs_clone = batch_observability.clone();
 
         let sched_config = model_worker::WorkerSchedulerConfig {
             max_batch_size,
@@ -263,6 +282,7 @@ impl ModelProvider {
             worker_model_id,
             sched_config,
             metrics_clone,
+            obs_clone,
         );
 
         Ok(Self {
@@ -271,6 +291,7 @@ impl ModelProvider {
             created_at,
             loaded,
             batch_metrics,
+            batch_observability,
             _worker_handle: worker_handle,
         })
     }
@@ -278,6 +299,11 @@ impl ModelProvider {
     /// Get a reference to the shared batch metrics.
     pub fn batch_metrics(&self) -> &Arc<BatchMetrics> {
         &self.batch_metrics
+    }
+
+    /// Get a reference to the shared batch observability counters.
+    pub fn batch_observability(&self) -> &Arc<BatchObservability> {
+        &self.batch_observability
     }
 
     /// Get model ID

@@ -152,6 +152,8 @@ pub struct HealthResponse {
     pub model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub batch: Option<BatchStatusInfo>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observability: Option<crate::server::batch::ObservabilitySnapshot>,
 }
 
 /// Batch status included in the health check response.

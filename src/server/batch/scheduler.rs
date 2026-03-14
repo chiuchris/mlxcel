@@ -41,6 +41,7 @@ use mlxcel_core::{MlxStream, UniquePtr};
 
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
+use crate::server::batch::observability::BatchObservability;
 use crate::server::config::PreemptionPolicy;
 use crate::server::model_provider::model_worker::{
     StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
@@ -84,6 +85,8 @@ pub struct BatchScheduler {
     // -- Metrics --
     /// Shared metrics updated atomically for HTTP handlers to read.
     batch_metrics: Arc<BatchMetrics>,
+    /// Detailed observability counters (prefill, decode, cache).
+    batch_observability: Arc<BatchObservability>,
 
     // -- Configuration --
     config_eos: Vec<i32>,
@@ -122,6 +125,7 @@ impl BatchScheduler {
             max_batch_size,
             max_queue_depth,
             batch_metrics,
+            Arc::new(BatchObservability::new()),
             0,
             false,
             PreemptionPolicy::default(),
@@ -138,6 +142,7 @@ impl BatchScheduler {
         max_batch_size: usize,
         max_queue_depth: usize,
         batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
         prefill_chunk_size: usize,
         enable_preemption: bool,
         preemption_policy: PreemptionPolicy,
@@ -153,6 +158,7 @@ impl BatchScheduler {
             generation_stream,
             request_rx,
             batch_metrics,
+            batch_observability,
             config_eos,
             prefill_chunk_size,
             enable_preemption,
@@ -208,8 +214,16 @@ impl BatchScheduler {
     }
 
     fn publish_metrics(&self) {
-        self.batch_metrics.set_active_count(self.active_batch.len());
-        self.batch_metrics.set_queue_depth(self.prefill_queue.len());
+        let active = self.active_batch.len();
+        let queued = self.prefill_queue.len();
+        self.batch_metrics.set_active_count(active);
+        self.batch_metrics.set_queue_depth(queued);
+        self.batch_observability.update_gauges(
+            active,
+            queued,
+            self.cache_pool.active_count(),
+            0, // cache bytes estimation not yet implemented
+        );
     }
 
     // ------------------------------------------------------------------
@@ -339,6 +353,12 @@ impl BatchScheduler {
     /// 4. If the batch is not full and the queue has work, prefill.
     /// 5. Otherwise idle.
     fn decide_action(&self) -> BatchSchedulerAction {
+        tracing::debug!(
+            active = self.active_batch.len(),
+            queued = self.prefill_queue.len(),
+            chunked_in_progress = self.chunked_prefill_seq.is_some(),
+            "scheduler tick"
+        );
         // Chunked prefill in progress: interleave decode with prefill
         if self.chunked_prefill_seq.is_some() {
             if !self.active_batch.is_empty() {
@@ -438,6 +458,15 @@ impl BatchScheduler {
 
     /// Full-prompt prefill: process the entire prompt in one pass.
     fn execute_full_prefill(&mut self, mut seq: SequenceInfo) {
+        let _span = tracing::info_span!(
+            "prefill",
+            seq_id = %seq.seq_id,
+            prompt_len = seq.prompt_tokens.len(),
+        )
+        .entered();
+        self.batch_observability
+            .record_prefill_start(seq.prompt_tokens.len());
+
         let eos_tokens =
             merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
         let needs_history = seq.sampling.needs_token_history();
@@ -486,6 +515,16 @@ impl BatchScheduler {
     /// Begin a chunked prefill: process the first chunk and store the
     /// sequence for continuation on subsequent ticks.
     fn start_chunked_prefill(&mut self, mut seq: SequenceInfo) {
+        let _span = tracing::info_span!(
+            "chunked_prefill_start",
+            seq_id = %seq.seq_id,
+            prompt_len = seq.prompt_tokens.len(),
+            chunk_size = self.prefill_chunk_size,
+        )
+        .entered();
+        self.batch_observability
+            .record_prefill_start(seq.prompt_tokens.len());
+
         let chunk_size = self.prefill_chunk_size;
         let end = chunk_size.min(seq.prompt_tokens.len());
         let chunk = &seq.prompt_tokens[..end];
@@ -543,6 +582,15 @@ impl BatchScheduler {
             Some(s) => s,
             None => return,
         };
+
+        let _span = tracing::info_span!(
+            "chunked_prefill_continue",
+            seq_id = %seq.seq_id,
+            offset = seq.prefill_offset,
+            total = seq.prompt_tokens.len(),
+        )
+        .entered();
+        self.batch_observability.record_prefill_chunk();
 
         let chunk_size = self.prefill_chunk_size;
         let offset = seq.prefill_offset;
@@ -776,6 +824,9 @@ impl BatchScheduler {
 
     /// Run one decode step for the active sequences.
     fn execute_decode_step(&mut self, seq_ids: &[SequenceId]) {
+        let _span = tracing::info_span!("decode_step", batch_size = seq_ids.len(),).entered();
+        self.batch_observability.record_decode_step(seq_ids.len());
+
         if seq_ids.len() <= 1 || !self.model.supports_batching() {
             for &seq_id in seq_ids {
                 self.decode_single_step(seq_id);
@@ -1038,6 +1089,7 @@ impl BatchScheduler {
                 self.cache_pool.release(id);
                 self.batch_metrics
                     .record_sequence_completed(tokens_generated);
+                self.batch_observability.record_sequence_completed();
 
                 tracing::debug!("Sequence {id} completed ({tokens_generated} tokens)");
             }

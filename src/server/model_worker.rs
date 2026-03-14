@@ -28,6 +28,7 @@ use image::DynamicImage;
 
 use crate::LoadedModel;
 use crate::SamplingConfig;
+use crate::server::batch::BatchObservability;
 use crate::server::state::BatchMetrics;
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::merge::InputEmbeddings;
@@ -53,6 +54,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     worker_model_id: String,
     sched_config: WorkerSchedulerConfig,
     batch_metrics: Arc<BatchMetrics>,
+    batch_observability: Arc<BatchObservability>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tracing::info!("Model worker thread starting, loading model...");
@@ -101,6 +103,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.max_batch_size,
             sched_config.max_queue_depth,
             batch_metrics,
+            batch_observability,
             sched_config.prefill_chunk_size,
             sched_config.enable_preemption,
             sched_config.preemption_policy,
@@ -129,6 +132,7 @@ pub(crate) fn spawn_legacy_model_worker(
     loaded: Arc<AtomicBool>,
     worker_model_id: String,
     batch_metrics: Arc<BatchMetrics>,
+    batch_observability: Arc<BatchObservability>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         tracing::info!(
@@ -175,6 +179,7 @@ pub(crate) fn spawn_legacy_model_worker(
             1,          // max_batch_size = 1 → sequential, no interleaving
             usize::MAX, // max_queue_depth: unbounded (one at a time anyway)
             batch_metrics,
+            batch_observability,
             0,     // prefill_chunk_size = 0 → chunking disabled
             false, // enable_preemption = false
             crate::server::config::PreemptionPolicy::default(),

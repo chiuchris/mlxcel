@@ -26,6 +26,7 @@ use tower::Service;
 
 use crate::SamplingConfig;
 
+use super::batch::BatchObservability;
 use super::{
     AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, ServerConfig,
     ServerGenerateOptions, create_app,
@@ -386,14 +387,17 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     )?;
     let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
 
-    // Create shared batch metrics that both ModelProvider and AppState read/write.
+    // Create shared batch metrics and observability that both ModelProvider
+    // and AppState read/write.
     let batch_metrics = Arc::new(BatchMetrics::new());
+    let batch_observability = Arc::new(BatchObservability::new());
 
     let model_provider = Arc::new(ModelProvider::new_with_server_config(
         startup.model_path.clone(),
         startup.adapter_path.clone(),
         &config,
         batch_metrics.clone(),
+        batch_observability.clone(),
     )?);
 
     if startup.warmup {
@@ -404,13 +408,14 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         }
     }
 
-    let state = AppState::new(
+    let state = AppState::with_observability(
         model_provider,
         config,
         chat_template,
         tokenizer,
         startup.model_path.clone(),
         batch_metrics,
+        batch_observability,
     );
     let app = create_app(state);
 

@@ -27,11 +27,13 @@
 //! - [`BatchScheduler`] -- core iteration-level scheduler.
 
 mod active;
+pub mod observability;
 mod queue;
 pub(crate) mod scheduler;
 mod sequence;
 
 pub use active::ActiveBatch;
+pub use observability::{BatchObservability, ObservabilitySnapshot};
 pub use queue::PrefillQueue;
 pub use scheduler::BatchScheduler;
 pub use sequence::{
