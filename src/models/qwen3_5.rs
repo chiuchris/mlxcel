@@ -1145,6 +1145,10 @@ impl LanguageModel for Qwen35Model {
         self.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Qwen3.5 uses internal RefCell mixed caches, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![248046, 248044] // Qwen 3.5 EOS tokens
     }

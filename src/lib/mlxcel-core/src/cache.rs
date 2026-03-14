@@ -667,6 +667,154 @@ impl Default for ChunkedKVCache {
     }
 }
 
+// --- Per-sequence cache isolation for continuous batching ---
+
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
+
+/// Unique identifier for a sequence in the batch.
+///
+/// Each active generation sequence receives a unique monotonically increasing
+/// ID from the owning `CachePool`. The inner `u64` never wraps within any
+/// reasonable server lifetime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SequenceId(u64);
+
+impl SequenceId {
+    /// Return the raw numeric identifier.
+    pub fn as_u64(self) -> u64 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for SequenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "seq-{}", self.0)
+    }
+}
+
+/// One sequence's full set of layer caches.
+///
+/// Created by `CachePool::allocate` and tied to a single generation request.
+/// The caller owns mutable access while the sequence is active and must call
+/// `CachePool::release` when generation finishes.
+pub struct SequenceCacheSet {
+    /// Per-layer KV caches (one entry per model layer).
+    pub caches: Vec<KVCache>,
+    /// Unique identifier assigned by the pool.
+    pub seq_id: SequenceId,
+    /// Number of prompt tokens originally prefilled.
+    pub prompt_len: usize,
+    /// Current generation position (incremented during decode).
+    pub current_offset: i32,
+    /// Wall-clock time when this cache set was allocated.
+    pub created_at: Instant,
+}
+
+impl SequenceCacheSet {
+    /// Total memory footprint of all layer caches in bytes.
+    pub fn nbytes(&self) -> usize {
+        self.caches.iter().map(|c| c.nbytes()).sum()
+    }
+}
+
+/// Pool that allocates and recycles per-sequence cache sets.
+///
+/// Designed for use by a continuous-batching scheduler. The pool assigns
+/// monotonically increasing `SequenceId` values and enforces a hard upper
+/// bound on concurrent active sequences.
+///
+/// Thread safety: `CachePool` itself is **not** `Sync`; callers in async
+/// server code should wrap it in an appropriate lock (`Mutex` or `RwLock`).
+pub struct CachePool {
+    next_id: AtomicU64,
+    active: HashMap<SequenceId, SequenceCacheSet>,
+    max_sequences: usize,
+}
+
+impl CachePool {
+    /// Create a new pool allowing up to `max_sequences` concurrent cache sets.
+    pub fn new(max_sequences: usize) -> Self {
+        Self {
+            next_id: AtomicU64::new(0),
+            active: HashMap::new(),
+            max_sequences,
+        }
+    }
+
+    /// Allocate a fresh cache set for a new sequence.
+    ///
+    /// Calls `model.make_caches()` to build per-layer caches, assigns a
+    /// unique `SequenceId`, and stores the set in the pool.
+    ///
+    /// Returns `Err` if the model does not support batching (i.e.
+    /// `supports_batching()` returns `false`) or the pool already has
+    /// `max_sequences` active entries.
+    pub fn allocate(
+        &mut self,
+        model: &dyn crate::generate::LanguageModel,
+    ) -> Result<SequenceId, String> {
+        if !model.supports_batching() {
+            return Err(
+                "CachePool: model does not support batching (internal recurrent/SSM state)".into(),
+            );
+        }
+        if self.active.len() >= self.max_sequences {
+            return Err(format!(
+                "CachePool: max capacity ({}) reached, cannot allocate new sequence",
+                self.max_sequences
+            ));
+        }
+
+        let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let caches = model.make_caches();
+        let entry = SequenceCacheSet {
+            caches,
+            seq_id: id,
+            prompt_len: 0,
+            current_offset: 0,
+            created_at: Instant::now(),
+        };
+        self.active.insert(id, entry);
+        Ok(id)
+    }
+
+    /// Return a mutable reference to the full `SequenceCacheSet` for the
+    /// given sequence, or `None` if the ID is not active.
+    pub fn get_mut(&mut self, id: SequenceId) -> Option<&mut SequenceCacheSet> {
+        self.active.get_mut(&id)
+    }
+
+    /// Return a mutable slice of the per-layer KV caches for direct use
+    /// in `model.forward()`, or `None` if the ID is not active.
+    pub fn get_caches_mut(&mut self, id: SequenceId) -> Option<&mut [KVCache]> {
+        self.active.get_mut(&id).map(|s| s.caches.as_mut_slice())
+    }
+
+    /// Release a sequence's caches, reclaiming the pool slot.
+    ///
+    /// This is a no-op if `id` is not currently active.
+    pub fn release(&mut self, id: SequenceId) {
+        self.active.remove(&id);
+    }
+
+    /// Number of sequences currently holding active cache sets.
+    pub fn active_count(&self) -> usize {
+        self.active.len()
+    }
+
+    /// Sum of `nbytes()` across all active cache sets.
+    pub fn memory_usage_bytes(&self) -> usize {
+        self.active.values().map(|s| s.nbytes()).sum()
+    }
+
+    /// Maximum number of concurrent sequences this pool allows.
+    pub fn max_sequences(&self) -> usize {
+        self.max_sequences
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -716,5 +864,227 @@ mod tests {
             ffi::array_shape(cache.keys.as_ref().unwrap()),
             vec![1, 1, 2, 1]
         );
+    }
+
+    // --- CachePool tests ---
+
+    /// Minimal model stub for CachePool tests. Produces N empty KVCaches.
+    struct StubModel {
+        num_layers: usize,
+    }
+
+    impl crate::generate::LanguageModel for StubModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::zeros(&[1], 0)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            (0..self.num_layers).map(|_| KVCache::new()).collect()
+        }
+
+        fn num_layers(&self) -> usize {
+            self.num_layers
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+    }
+
+    #[test]
+    fn cache_pool_allocate_and_release() {
+        let model = StubModel { num_layers: 4 };
+        let mut pool = CachePool::new(8);
+
+        let id1 = pool.allocate(&model).expect("should allocate");
+        let id2 = pool.allocate(&model).expect("should allocate");
+
+        assert_ne!(id1, id2);
+        assert_eq!(pool.active_count(), 2);
+
+        // Each sequence should have 4 layer caches
+        assert_eq!(pool.get_caches_mut(id1).unwrap().len(), 4);
+        assert_eq!(pool.get_caches_mut(id2).unwrap().len(), 4);
+
+        pool.release(id1);
+        assert_eq!(pool.active_count(), 1);
+        assert!(pool.get_mut(id1).is_none());
+        assert!(pool.get_mut(id2).is_some());
+
+        pool.release(id2);
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn cache_pool_refuses_allocation_when_full() {
+        let model = StubModel { num_layers: 2 };
+        let mut pool = CachePool::new(2);
+
+        pool.allocate(&model).expect("first");
+        pool.allocate(&model).expect("second");
+
+        let result = pool.allocate(&model);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("max capacity"));
+    }
+
+    #[test]
+    fn cache_pool_release_reopens_slot() {
+        let model = StubModel { num_layers: 1 };
+        let mut pool = CachePool::new(1);
+
+        let id = pool.allocate(&model).expect("first");
+        assert!(pool.allocate(&model).is_err());
+
+        pool.release(id);
+        assert_eq!(pool.active_count(), 0);
+
+        // Slot should be available again
+        let id2 = pool.allocate(&model).expect("after release");
+        assert_ne!(id, id2); // IDs are monotonic, never reused
+        assert_eq!(pool.active_count(), 1);
+    }
+
+    #[test]
+    fn cache_pool_independent_state() {
+        let model = StubModel { num_layers: 2 };
+        let mut pool = CachePool::new(4);
+
+        let id1 = pool.allocate(&model).unwrap();
+        let id2 = pool.allocate(&model).unwrap();
+
+        // Mutate caches for sequence 1 only
+        {
+            let caches = pool.get_caches_mut(id1).unwrap();
+            let keys = ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]);
+            let values = ffi::from_slice_f32(&[3.0, 4.0], &[1, 1, 2, 1]);
+            caches[0].update(keys, values);
+        }
+
+        // Sequence 2 caches should still be empty
+        {
+            let caches = pool.get_caches_mut(id2).unwrap();
+            assert!(caches[0].is_empty());
+            assert!(caches[1].is_empty());
+        }
+
+        // Sequence 1 cache should have data
+        {
+            let caches = pool.get_caches_mut(id1).unwrap();
+            assert!(!caches[0].is_empty());
+            assert_eq!(caches[0].seq_len(), 2);
+            // Second layer still empty
+            assert!(caches[1].is_empty());
+        }
+    }
+
+    #[test]
+    fn cache_pool_memory_usage() {
+        let model = StubModel { num_layers: 2 };
+        let mut pool = CachePool::new(4);
+
+        // Empty pool
+        assert_eq!(pool.memory_usage_bytes(), 0);
+
+        let id1 = pool.allocate(&model).unwrap();
+
+        // Freshly allocated caches have no data
+        assert_eq!(pool.memory_usage_bytes(), 0);
+
+        // Add some data to one cache
+        {
+            let caches = pool.get_caches_mut(id1).unwrap();
+            let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+            let values = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+            caches[0].update(keys, values);
+        }
+
+        let mem_after = pool.memory_usage_bytes();
+        assert!(mem_after > 0);
+
+        // Release should bring memory tracking back to zero
+        pool.release(id1);
+        assert_eq!(pool.memory_usage_bytes(), 0);
+    }
+
+    #[test]
+    fn cache_pool_sequence_metadata() {
+        let model = StubModel { num_layers: 1 };
+        let mut pool = CachePool::new(4);
+
+        let id = pool.allocate(&model).unwrap();
+        let entry = pool.get_mut(id).unwrap();
+
+        assert_eq!(entry.seq_id, id);
+        assert_eq!(entry.prompt_len, 0);
+        assert_eq!(entry.current_offset, 0);
+
+        // Simulate prefill state update
+        entry.prompt_len = 42;
+        entry.current_offset = 42;
+
+        let entry = pool.get_mut(id).unwrap();
+        assert_eq!(entry.prompt_len, 42);
+        assert_eq!(entry.current_offset, 42);
+    }
+
+    #[test]
+    fn cache_pool_release_nonexistent_is_noop() {
+        let mut pool = CachePool::new(4);
+        let fake_id = SequenceId(9999);
+        pool.release(fake_id); // should not panic
+        assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn sequence_id_display() {
+        let id = SequenceId(42);
+        assert_eq!(format!("{id}"), "seq-42");
+        assert_eq!(id.as_u64(), 42);
+    }
+
+    #[test]
+    fn cache_pool_rejects_non_batching_model() {
+        struct NonBatchModel;
+
+        impl crate::generate::LanguageModel for NonBatchModel {
+            fn forward(
+                &self,
+                _input_ids: &MlxArray,
+                _caches: &mut [KVCache],
+                _mask: Option<&MlxArray>,
+            ) -> UniquePtr<MlxArray> {
+                ffi::zeros(&[1], 0)
+            }
+
+            fn make_caches(&self) -> Vec<KVCache> {
+                vec![KVCache::new()]
+            }
+
+            fn num_layers(&self) -> usize {
+                1
+            }
+
+            fn eos_token_ids(&self) -> Vec<i32> {
+                vec![0]
+            }
+
+            fn supports_batching(&self) -> bool {
+                false
+            }
+        }
+
+        let model = NonBatchModel;
+        let mut pool = CachePool::new(8);
+
+        let result = pool.allocate(&model);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not support batching"));
+        assert_eq!(pool.active_count(), 0);
     }
 }

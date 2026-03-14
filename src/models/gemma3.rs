@@ -667,6 +667,10 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
         self.model.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Gemma3 uses internal RefCell mixed caches (KV + Rotating), not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![0, 1, 106] // Gemma3: <pad> (0), <eos> (1), <end_of_turn> (106)
     }

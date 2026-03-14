@@ -1480,6 +1480,10 @@ impl LanguageModel for Llama4Wrapper {
         self.model.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Llama4 uses internal RefCell ChunkedKVCaches, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         // Llama 4 EOS tokens: <|end_of_text|>, <|eom_id|>, <|eot_id|>
         vec![200001, 200007, 200008]

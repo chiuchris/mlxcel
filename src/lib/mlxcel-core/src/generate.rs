@@ -78,6 +78,19 @@ pub trait LanguageModel {
     /// Used by models that need to adjust internal state between phases,
     /// e.g. Phi4MM unfuses vision LoRA so decode uses base weights.
     fn after_prefill(&self) {}
+
+    /// Whether this model supports batched decode for continuous batching.
+    ///
+    /// Standard transformer models return `true` (the default) because their
+    /// state lives entirely in the external `KVCache` slice. SSM and hybrid
+    /// models (Mamba, Jamba, NemotronH, etc.) maintain internal recurrent
+    /// state that is not compatible with independent per-sequence cache
+    /// isolation, so they override this to return `false`.
+    ///
+    /// Used by: CachePool (to reject unsupported models), server scheduler
+    fn supports_batching(&self) -> bool {
+        true
+    }
 }
 
 /// Sampling configuration

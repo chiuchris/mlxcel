@@ -987,6 +987,10 @@ impl LanguageModel for Rwkv7 {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // RWKV7 uses internal RNN-like state, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         // Default EOS token ID, should be loaded from tokenizer config
         vec![0]

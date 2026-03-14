@@ -1241,6 +1241,10 @@ impl LanguageModel for JambaModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Jamba is a hybrid Mamba+Transformer, internal MambaCache not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![519] // Jamba EOS token: <|im_end|>
     }

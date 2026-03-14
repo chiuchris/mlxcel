@@ -1484,6 +1484,10 @@ impl LanguageModel for NemotronHModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // NemotronH is a hybrid Mamba+Transformer, internal caches not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![11] // <|im_end|>
     }

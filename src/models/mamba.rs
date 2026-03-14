@@ -650,6 +650,10 @@ impl LanguageModel for MambaModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Mamba uses internal MambaCache state, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         // Default EOS token ID - typically needs to be set from tokenizer
         vec![2] // Common EOS token ID

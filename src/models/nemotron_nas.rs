@@ -693,6 +693,10 @@ impl LanguageModel for NemotronNASModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // NemotronNAS is a hybrid architecture, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![2] // Standard EOS token for most models
     }

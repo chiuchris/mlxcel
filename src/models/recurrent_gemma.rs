@@ -1006,6 +1006,10 @@ impl LanguageModel for GriffinModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // RecurrentGemma uses internal RGLRUCache state, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![1] // Gemma EOS token
     }

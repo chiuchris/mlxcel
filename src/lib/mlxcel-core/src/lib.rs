@@ -1381,8 +1381,9 @@ pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
 // High-level layer abstractions
 pub mod layers;
 
-// Cache state machines shared by attention families
-mod cache;
+// Cache state machines shared by attention families.
+// Public so that `server` and `CachePool` consumers can import directly.
+pub mod cache;
 
 // Pure-Rust wrappers around frequently used FFI entry points.
 mod ops;

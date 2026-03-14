@@ -260,4 +260,8 @@ impl LanguageModel for LoadedModel {
     fn after_prefill(&self) {
         delegate_language_model!(self, after_prefill())
     }
+
+    fn supports_batching(&self) -> bool {
+        delegate_language_model!(self, supports_batching())
+    }
 }

@@ -896,6 +896,10 @@ impl LanguageModel for Mamba2Model {
         self.config.num_hidden_layers
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Mamba2 uses internal recurrent state, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![0] // Mamba2 EOS token: <|endoftext|>
     }

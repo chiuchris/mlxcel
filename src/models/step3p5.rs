@@ -1133,6 +1133,10 @@ impl LanguageModel for Step3p5Model {
         self.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Step3p5 uses internal RefCell caches, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         self.eos_token_ids.clone()
     }

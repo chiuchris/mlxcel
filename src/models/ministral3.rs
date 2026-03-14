@@ -675,6 +675,10 @@ impl mlxcel_core::generate::LanguageModel for Ministral3Wrapper {
         self.model.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Ministral3 uses internal RefCell mixed caches, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![2] // Mistral/Ministral EOS token
     }

@@ -704,6 +704,10 @@ impl mlxcel_core::generate::LanguageModel for ExaOne4Wrapper {
         self.model.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // ExaOne4 uses internal RefCell mixed caches, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![361] // ExaOne4 EOS token: [|endofturn|]
     }

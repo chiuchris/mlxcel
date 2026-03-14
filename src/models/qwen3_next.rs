@@ -1342,6 +1342,10 @@ impl LanguageModel for Qwen3NextModel {
         self.layers.len()
     }
 
+    fn supports_batching(&self) -> bool {
+        false // Qwen3Next uses internal mixed cache types, not compatible with per-sequence KV isolation
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![151645] // Qwen3 EOS token
     }
