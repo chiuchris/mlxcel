@@ -87,11 +87,8 @@ pub struct ServerStartupInput {
 impl ServerStartupInput {
     /// Normalize edge-only CLI conventions into runtime startup policy.
     pub fn into_startup_config(self) -> ServerStartupConfig {
-        let resolution = resolve_prefill_chunk_size(
-            self.prefill_chunk_size,
-            self.batch_size,
-            self.ubatch_size,
-        );
+        let resolution =
+            resolve_prefill_chunk_size(self.prefill_chunk_size, self.batch_size, self.ubatch_size);
         ServerStartupConfig {
             model_path: self.model_path,
             adapter_path: self.adapter_path,
@@ -187,7 +184,11 @@ pub fn resolve_prefill_chunk_size(
             let explicit_prefill = prefill_chunk_size != DEFAULT_PREFILL_CHUNK_SIZE;
             let conflict = explicit_prefill && bs != prefill_chunk_size;
             PrefillChunkResolution {
-                prefill_chunk_size: if explicit_prefill { prefill_chunk_size } else { bs },
+                prefill_chunk_size: if explicit_prefill {
+                    prefill_chunk_size
+                } else {
+                    bs
+                },
                 ubatch_size_provided,
                 batch_size_conflict: conflict,
             }

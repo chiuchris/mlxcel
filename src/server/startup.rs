@@ -364,9 +364,7 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
 
     if startup.ubatch_size_provided {
-        tracing::info!(
-            "--ubatch-size is not applicable on Apple Silicon unified memory; ignored"
-        );
+        tracing::info!("--ubatch-size is not applicable on Apple Silicon unified memory; ignored");
     }
     if startup.batch_size_conflict {
         tracing::warn!(

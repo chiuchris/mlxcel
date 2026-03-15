@@ -243,11 +243,7 @@ pub(crate) struct ServeArgs {
     batch_size: Option<usize>,
 
     /// Physical micro-batch size [not applicable on Apple Silicon unified memory; ignored]
-    #[arg(
-        long = "ubatch-size",
-        env = "LLAMA_ARG_UBATCH_SIZE",
-        value_name = "N"
-    )]
+    #[arg(long = "ubatch-size", env = "LLAMA_ARG_UBATCH_SIZE", value_name = "N")]
     ubatch_size: Option<usize>,
 
     /// Enable preemptive eviction of lower-priority sequences

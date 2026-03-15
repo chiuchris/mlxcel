@@ -19,7 +19,29 @@ FetchContent_Declare(
   mlx
   GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
   GIT_TAG v0.31.1)
-FetchContent_MakeAvailable(mlx)
+
+# Use FetchContent_Populate + add_subdirectory so we can apply source overlays
+# before the MLX build system processes the files.
+FetchContent_GetProperties(mlx)
+if(NOT mlx_POPULATED)
+  FetchContent_Populate(mlx)
+
+  # Apply CUDA backend patches (overlay modified/new files onto fetched source)
+  if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
+    file(GLOB_RECURSE _patch_files
+         RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
+         "${CMAKE_CURRENT_SOURCE_DIR}/patches/*")
+    foreach(_patch_file ${_patch_files})
+      configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
+        "${mlx_SOURCE_DIR}/${_patch_file}"
+        COPYONLY)
+    endforeach()
+    message(STATUS "Applied ${CMAKE_CURRENT_SOURCE_DIR}/patches to MLX source")
+  endif()
+
+  add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
+endif()
 
 # ----------------------------- CUDA CCCL ---------------------------------
 # Ensure MLX_CCCL_DIR is defined for CUDA JIT kernel compilation at runtime.
