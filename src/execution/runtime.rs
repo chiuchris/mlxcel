@@ -38,8 +38,15 @@ impl RuntimeDevice {
 impl fmt::Display for RuntimeDevice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Cpu => write!(f, "cpu"),
-            Self::Gpu => write!(f, "gpu"),
+            Self::Cpu => write!(f, "CPU"),
+            Self::Gpu => {
+                #[cfg(feature = "cuda")]
+                return write!(f, "NVIDIA GPU (CUDA)");
+                #[cfg(target_os = "macos")]
+                return write!(f, "Apple GPU (Metal)");
+                #[cfg(not(any(feature = "cuda", target_os = "macos")))]
+                write!(f, "GPU")
+            }
         }
     }
 }

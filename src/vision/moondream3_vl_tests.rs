@@ -16,6 +16,9 @@ use super::moondream3_vl::build_moondream3_attention_mask;
 
 fn mask_value(mask: &mlxcel_core::MlxArray, row: i32, col: i32) -> f32 {
     let value = mlxcel_core::slice(mask, &[0, 0, row, col], &[1, 1, row + 1, col + 1]);
+    // Cast to f32 before reading — MLX item<float>() on bfloat16 scalars
+    // returns wrong values (confirmed in both v0.31.0 and v0.31.1).
+    let value = mlxcel_core::astype(&value, mlxcel_core::dtype::FLOAT32);
     mlxcel_core::eval(&value);
     mlxcel_core::item_f32(&value)
 }

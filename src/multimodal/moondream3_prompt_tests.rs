@@ -44,5 +44,5 @@ fn prepare_moondream3_prompt_tokens_wraps_query_prompt_without_special_tokens() 
 #[test]
 fn prepare_moondream3_prompt_tokens_rejects_non_single_image_requests() {
     let err = prepare_moondream3_prompt_tokens("hello", 2, |_text, _| vec![]).unwrap_err();
-    assert!(err.contains("exactly one image"));
+    assert!(err.contains("at most one image"));
 }
