@@ -46,6 +46,13 @@ pub struct ServerStartupInput {
     pub max_batch_size: Option<usize>,
     pub max_queue_depth: usize,
     pub prefill_chunk_size: usize,
+    /// llama-server alias for `--prefill-chunk-size` (`--batch-size` / `-b`).
+    ///
+    /// When set, maps to `prefill_chunk_size`. If both this and `prefill_chunk_size`
+    /// differ from the default, `prefill_chunk_size` takes precedence with a warning.
+    pub batch_size: Option<usize>,
+    /// llama-server `--ubatch-size`. Accepted but ignored on Apple Silicon.
+    pub ubatch_size: Option<usize>,
     pub enable_preemption: bool,
     pub preemption_policy: String,
     /// Disable continuous batching; force the legacy sequential worker.
@@ -80,6 +87,11 @@ pub struct ServerStartupInput {
 impl ServerStartupInput {
     /// Normalize edge-only CLI conventions into runtime startup policy.
     pub fn into_startup_config(self) -> ServerStartupConfig {
+        let resolution = resolve_prefill_chunk_size(
+            self.prefill_chunk_size,
+            self.batch_size,
+            self.ubatch_size,
+        );
         ServerStartupConfig {
             model_path: self.model_path,
             adapter_path: self.adapter_path,
@@ -96,7 +108,9 @@ impl ServerStartupInput {
             draft_max: self.draft_max,
             max_batch_size: self.max_batch_size,
             max_queue_depth: self.max_queue_depth,
-            prefill_chunk_size: self.prefill_chunk_size,
+            prefill_chunk_size: resolution.prefill_chunk_size,
+            batch_size_conflict: resolution.batch_size_conflict,
+            ubatch_size_provided: resolution.ubatch_size_provided,
             enable_preemption: self.enable_preemption,
             preemption_policy: self.preemption_policy,
             no_batch: self.no_batch,
@@ -135,6 +149,50 @@ pub fn resolve_compat_toggle(enabled: bool, disabled: bool) -> bool {
 /// Convert the CLI seed sentinel into the runtime representation.
 pub fn resolve_seed(seed: i64) -> Option<u64> {
     if seed < 0 { None } else { Some(seed as u64) }
+}
+
+/// Result of resolving the prefill chunk size from the explicit flag and llama-server aliases.
+pub struct PrefillChunkResolution {
+    /// The effective prefill chunk size to use.
+    pub prefill_chunk_size: usize,
+    /// True when `--ubatch-size` was provided (always ignored; caller should log a notice).
+    pub ubatch_size_provided: bool,
+    /// True when both `--batch-size` and an explicit `--prefill-chunk-size` were supplied
+    /// with different values (caller should log a warning that `--prefill-chunk-size` wins).
+    pub batch_size_conflict: bool,
+}
+
+/// Resolve the effective prefill chunk size from the explicit flag and llama-server aliases.
+///
+/// Resolution rules:
+/// - `--ubatch-size` is always ignored on Apple Silicon unified memory (logged at info level).
+/// - `--batch-size` is an alias for `--prefill-chunk-size`. If both are provided with
+///   different non-default values, `--prefill-chunk-size` takes precedence with a warning.
+pub fn resolve_prefill_chunk_size(
+    prefill_chunk_size: usize,
+    batch_size: Option<usize>,
+    ubatch_size: Option<usize>,
+) -> PrefillChunkResolution {
+    const DEFAULT_PREFILL_CHUNK_SIZE: usize = 512;
+
+    let ubatch_size_provided = ubatch_size.is_some();
+
+    match batch_size {
+        None => PrefillChunkResolution {
+            prefill_chunk_size,
+            ubatch_size_provided,
+            batch_size_conflict: false,
+        },
+        Some(bs) => {
+            let explicit_prefill = prefill_chunk_size != DEFAULT_PREFILL_CHUNK_SIZE;
+            let conflict = explicit_prefill && bs != prefill_chunk_size;
+            PrefillChunkResolution {
+                prefill_chunk_size: if explicit_prefill { prefill_chunk_size } else { bs },
+                ubatch_size_provided,
+                batch_size_conflict: conflict,
+            }
+        }
+    }
 }
 
 #[cfg(test)]

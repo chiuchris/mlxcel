@@ -131,6 +131,23 @@ struct Args {
     #[arg(long = "prefill-chunk-size", default_value_t = 512)]
     prefill_chunk_size: usize,
 
+    /// Prefill batch size [llama-server alias for --prefill-chunk-size] [default: 512]
+    #[arg(
+        short = 'b',
+        long = "batch-size",
+        env = "LLAMA_ARG_BATCH_SIZE",
+        value_name = "N"
+    )]
+    batch_size: Option<usize>,
+
+    /// Physical micro-batch size [not applicable on Apple Silicon unified memory; ignored]
+    #[arg(
+        long = "ubatch-size",
+        env = "LLAMA_ARG_UBATCH_SIZE",
+        value_name = "N"
+    )]
+    ubatch_size: Option<usize>,
+
     /// Enable preemptive eviction of lower-priority sequences
     #[arg(long = "enable-preemption")]
     enable_preemption: bool,
@@ -301,6 +318,8 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,
         prefill_chunk_size: args.prefill_chunk_size,
+        batch_size: args.batch_size,
+        ubatch_size: args.ubatch_size,
         enable_preemption: args.enable_preemption,
         preemption_policy: args.preemption_policy,
         chat_template: args.chat_template,

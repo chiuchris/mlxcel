@@ -72,6 +72,10 @@ pub struct ServerStartupConfig {
     pub max_queue_depth: usize,
     /// Prefill chunk size in tokens (0 = disabled).
     pub prefill_chunk_size: usize,
+    /// Set when `--batch-size` and `--prefill-chunk-size` conflict; triggers a startup warning.
+    pub batch_size_conflict: bool,
+    /// Set when `--ubatch-size` was provided; triggers a startup info notice.
+    pub ubatch_size_provided: bool,
     /// Enable preemptive eviction when batch is full.
     pub enable_preemption: bool,
     /// Preemption policy string from CLI (parsed into enum at build_server_config).
@@ -125,6 +129,8 @@ impl Default for ServerStartupConfig {
             max_batch_size: None,
             max_queue_depth: 32,
             prefill_chunk_size: 512,
+            batch_size_conflict: false,
+            ubatch_size_provided: false,
             enable_preemption: false,
             preemption_policy: "longest-first".to_string(),
             no_batch: false,
@@ -356,6 +362,18 @@ async fn serve_tcp(startup: &ServerStartupConfig, app: axum::Router) -> Result<(
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+
+    if startup.ubatch_size_provided {
+        tracing::info!(
+            "--ubatch-size is not applicable on Apple Silicon unified memory; ignored"
+        );
+    }
+    if startup.batch_size_conflict {
+        tracing::warn!(
+            "--batch-size and --prefill-chunk-size both provided; \
+             --prefill-chunk-size takes precedence"
+        );
+    }
 
     let runtime = crate::initialize_runtime();
     if let Some(invalid) = runtime.invalid_device_override.as_deref() {

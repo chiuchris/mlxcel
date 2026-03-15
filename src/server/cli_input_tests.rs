@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use super::{ServerStartupInput, resolve_compat_toggle, resolve_seed};
+use super::{ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed};
 
 fn sample_input() -> ServerStartupInput {
     ServerStartupInput {
@@ -34,6 +34,8 @@ fn sample_input() -> ServerStartupInput {
         max_batch_size: Some(4),
         max_queue_depth: 32,
         prefill_chunk_size: 512,
+        batch_size: None,
+        ubatch_size: None,
         enable_preemption: false,
         preemption_policy: "longest-first".to_string(),
         no_batch: false,
@@ -99,6 +101,42 @@ fn into_startup_config_normalizes_edge_only_flags() {
 }
 
 #[test]
+fn resolve_prefill_chunk_size_batch_size_alias_takes_effect() {
+    let r = resolve_prefill_chunk_size(512, Some(1024), None);
+    assert_eq!(r.prefill_chunk_size, 1024);
+    assert!(!r.batch_size_conflict);
+    assert!(!r.ubatch_size_provided);
+}
+
+#[test]
+fn resolve_prefill_chunk_size_explicit_prefill_wins_with_conflict() {
+    let r = resolve_prefill_chunk_size(256, Some(1024), None);
+    assert_eq!(r.prefill_chunk_size, 256);
+    assert!(r.batch_size_conflict);
+}
+
+#[test]
+fn resolve_prefill_chunk_size_no_batch_size_returns_prefill() {
+    let r = resolve_prefill_chunk_size(768, None, None);
+    assert_eq!(r.prefill_chunk_size, 768);
+    assert!(!r.batch_size_conflict);
+}
+
+#[test]
+fn resolve_prefill_chunk_size_ubatch_sets_provided_flag() {
+    let r = resolve_prefill_chunk_size(512, None, Some(256));
+    assert!(r.ubatch_size_provided);
+    assert_eq!(r.prefill_chunk_size, 512);
+}
+
+#[test]
+fn resolve_prefill_chunk_size_both_same_value_no_conflict() {
+    let r = resolve_prefill_chunk_size(1024, Some(1024), None);
+    assert_eq!(r.prefill_chunk_size, 1024);
+    assert!(!r.batch_size_conflict);
+}
+
+#[test]
 fn into_startup_config_propagates_no_batch_flag() {
     let mut input = sample_input();
     input.no_batch = true;
@@ -110,4 +148,26 @@ fn into_startup_config_propagates_no_batch_flag() {
     input2.no_batch = false;
     let startup2 = input2.into_startup_config();
     assert!(!startup2.no_batch);
+}
+
+#[test]
+fn into_startup_config_resolves_batch_size_alias() {
+    let mut input = sample_input();
+    input.batch_size = Some(1024);
+    let startup = input.into_startup_config();
+    assert_eq!(startup.prefill_chunk_size, 1024);
+    assert!(!startup.batch_size_conflict);
+    assert!(!startup.ubatch_size_provided);
+}
+
+#[test]
+fn into_startup_config_detects_batch_size_conflict() {
+    let mut input = sample_input();
+    input.prefill_chunk_size = 256;
+    input.batch_size = Some(1024);
+    input.ubatch_size = Some(64);
+    let startup = input.into_startup_config();
+    assert_eq!(startup.prefill_chunk_size, 256);
+    assert!(startup.batch_size_conflict);
+    assert!(startup.ubatch_size_provided);
 }

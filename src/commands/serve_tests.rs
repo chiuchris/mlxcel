@@ -34,6 +34,8 @@ fn sample_args() -> crate::ServeArgs {
         no_batch: false,
         max_queue_depth: 32,
         prefill_chunk_size: 512,
+        batch_size: None,
+        ubatch_size: None,
         enable_preemption: false,
         preemption_policy: "longest-first".to_string(),
         timeout: 30,
