@@ -89,10 +89,7 @@ fn main() {
     // Load model
     let load_start = Instant::now();
     let (model, _tokenizer) = mlxcel::load_model(&args.model).expect("Failed to load model");
-    println!(
-        "Model loaded in {:.1}s",
-        load_start.elapsed().as_secs_f64()
-    );
+    println!("Model loaded in {:.1}s", load_start.elapsed().as_secs_f64());
     println!("  supports_batching: {}", model.supports_batching());
     println!("  num_layers: {}", model.num_layers());
     println!();
@@ -112,9 +109,8 @@ fn main() {
 
         for _run in 0..args.runs {
             // Create B independent cache sets and prefill each
-            let mut all_caches: Vec<Vec<mlxcel_core::layers::KVCache>> = (0..batch_size)
-                .map(|_| model.make_caches())
-                .collect();
+            let mut all_caches: Vec<Vec<mlxcel_core::layers::KVCache>> =
+                (0..batch_size).map(|_| model.make_caches()).collect();
 
             // Prefill each sequence
             let prompt_array =
@@ -129,11 +125,7 @@ fn main() {
             };
 
             for caches in &mut all_caches {
-                let logits = model.forward(
-                    &prompt_array,
-                    caches.as_mut_slice(),
-                    mask.as_deref(),
-                );
+                let logits = model.forward(&prompt_array, caches.as_mut_slice(), mask.as_deref());
                 mlxcel_core::eval(&logits);
             }
 
@@ -171,9 +163,8 @@ fn main() {
 
         if model.supports_batching() && batch_size > 1 {
             for _run in 0..args.runs {
-                let mut all_caches: Vec<Vec<mlxcel_core::layers::KVCache>> = (0..batch_size)
-                    .map(|_| model.make_caches())
-                    .collect();
+                let mut all_caches: Vec<Vec<mlxcel_core::layers::KVCache>> =
+                    (0..batch_size).map(|_| model.make_caches()).collect();
 
                 // Prefill each sequence
                 let prompt_array =
@@ -188,11 +179,8 @@ fn main() {
                 };
 
                 for caches in &mut all_caches {
-                    let logits = model.forward(
-                        &prompt_array,
-                        caches.as_mut_slice(),
-                        mask.as_deref(),
-                    );
+                    let logits =
+                        model.forward(&prompt_array, caches.as_mut_slice(), mask.as_deref());
                     mlxcel_core::eval(&logits);
                 }
 
@@ -200,8 +188,7 @@ fn main() {
 
                 // Warmup with batched decode
                 for _step in 0..args.warmup {
-                    let input =
-                        mlxcel_core::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
+                    let input = mlxcel_core::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
                     let mut batch_cache_refs: Vec<&mut [mlxcel_core::layers::KVCache]> =
                         all_caches.iter_mut().map(|c| c.as_mut_slice()).collect();
                     let logits = model.forward_batched(&input, &mut batch_cache_refs, None);
@@ -211,8 +198,7 @@ fn main() {
                 // Timed batched decode steps (1 × forward_batched per step)
                 let start = Instant::now();
                 for _step in 0..args.decode_steps {
-                    let input =
-                        mlxcel_core::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
+                    let input = mlxcel_core::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
                     let mut batch_cache_refs: Vec<&mut [mlxcel_core::layers::KVCache]> =
                         all_caches.iter_mut().map(|c| c.as_mut_slice()).collect();
                     let logits = model.forward_batched(&input, &mut batch_cache_refs, None);
