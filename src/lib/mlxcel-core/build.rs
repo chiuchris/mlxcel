@@ -32,7 +32,7 @@ fn main() {
         .file("cpp/mlx_cxx_bridge.cpp")
         .include(&mlx_include)
         .include("cpp")
-        .flag_if_supported("-std=c++17")
+        .flag_if_supported("-std=c++20")
         .flag_if_supported("-Wno-unused-parameter")
         .flag_if_supported("-Wno-deprecated-declarations")
         // MLX v0.31.0 triggers a Clang deprecated-copy warning from bf16.h when
@@ -45,9 +45,11 @@ fn main() {
         bridge
             .flag_if_supported("-O3")
             .flag_if_supported("-DNDEBUG")
-            .flag_if_supported("-flto")
             .flag_if_supported("-ffast-math")
             .flag_if_supported("-march=native");
+        // Note: do NOT pass -flto to the C++ bridge. GCC's -flto produces
+        // GIMPLE IR objects that are incompatible with Rust/LLVM LTO, causing
+        // undefined-reference errors at link time on Linux.
     }
 
     bridge.compile("mlx_cxx_bridge");
