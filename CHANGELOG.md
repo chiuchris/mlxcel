@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.6] - 2026-03-14
+
+### Added
+- Continuous batching with iteration-level BatchScheduler for concurrent request handling
+- Request lifecycle types and sequence state machine for batch management
+- Per-sequence KV cache isolation and CachePool for independent request processing
+- Tensor-batched decode forward pass for efficient multi-sequence generation
+- Preemptive scheduling and chunked prefill for better latency and throughput
+- HTTP server integration with batch scheduler and concurrency support
+- Explicit `forward_batched()` for Qwen3 with split-attention support
+- Continuous batching benchmarks and observability instrumentation
+- Feature gate for batching to preserve CLI single-request path
+
+### Fixed
+- Scheduling policy now admits queued requests to grow batch beyond initial size
+
+### Changed
+- Added continuous batching development guide and benchmark comparison documentation
+- Benchmark results for 84 models with scheduler fix improvements
+
 ## [v0.0.5] - 2026-03-11
 
 ### Added
@@ -110,6 +130,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.6]: https://github.com/lablup/mlxcel/compare/v0.0.5...v0.0.6
 [v0.0.5]: https://github.com/lablup/mlxcel/compare/v0.0.4...v0.0.5
 [v0.0.4]: https://github.com/lablup/mlxcel/compare/v0.0.3...v0.0.4
 [v0.0.3]: https://github.com/lablup/mlxcel/compare/v0.0.2...v0.0.3
