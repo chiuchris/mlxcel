@@ -47,9 +47,11 @@ fn main() {
             .flag_if_supported("-DNDEBUG")
             .flag_if_supported("-ffast-math")
             .flag_if_supported("-march=native");
-        // Note: do NOT pass -flto to the C++ bridge. GCC's -flto produces
-        // GIMPLE IR objects that are incompatible with Rust/LLVM LTO, causing
-        // undefined-reference errors at link time on Linux.
+        // On macOS, Clang produces LLVM bitcode with -flto, which is compatible
+        // with Rust's LLVM LTO. On Linux with GCC, -flto produces GIMPLE IR
+        // objects that are incompatible, causing undefined-reference linker errors.
+        #[cfg(target_os = "macos")]
+        bridge.flag_if_supported("-flto");
     }
 
     bridge.compile("mlx_cxx_bridge");
