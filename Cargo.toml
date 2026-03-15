@@ -4,7 +4,7 @@ version = "0.0.6"
 edition = "2024"
 description = "High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs"
 repository = "https://github.com/lablup/mlxcel"
-license = "MIT"
+license = "Apache-2.0"
 keywords = ["mlx", "llm", "vlm", "inference"]
 categories = ["science", "command-line-utilities"]
 
@@ -72,24 +72,11 @@ async-stream = "0.3"
 fancy-regex = "0.17.0"
 
 [profile.release]
-# Remove debug info but keep symbol table for Tauri updater compatibility
-# "debuginfo" strips debug info only, "symbols" would break the updater plugin
-strip = "debuginfo"
-
-# Link-Time Optimization for smaller binary and better optimization
-# "thin" provides good balance between build time and optimization
-lto = "thin"
-
-# Abort on panic instead of unwinding
-# Reduces binary size, but lose stack traces on panic
-panic = "abort"
-
-# Single codegen unit for maximum optimization
-# Trade-off: slower compilation
-codegen-units = 1
-
-# Maximum optimization level (explicit for clarity)
-opt-level = 3
+strip = true              # Strip all symbols for smaller binary
+lto = true                # Full (fat) LTO for best size and performance
+codegen-units = 1         # Single codegen unit for maximum optimization
+opt-level = 3             # Maximum speed optimization (inference is compute-bound)
+panic = "abort"           # Remove panic unwinding code
 
 [lints.clippy]
 upper_case_acronyms = "allow"
