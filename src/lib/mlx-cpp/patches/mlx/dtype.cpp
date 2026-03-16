@@ -52,10 +52,11 @@ constexpr Dtype::Kind type_kinds[num_types] = {
 // https://jax.readthedocs.io/en/latest/type_promotion.html
 //
 // CUDA modifications (marked with /* PATCHED */):
-//   float16 row: bfloat16 column changed from float32 → bfloat16
-//   float32 row: bfloat16 column changed from float32 → bfloat16
-//   bfloat16 row: float16 column changed from float32 → bfloat16
 //   bfloat16 row: float32 column changed from float32 → bfloat16
+//
+// NOTE: Only the bf16+fp32 promotion is changed (bf16 row, fp32 col and
+// fp32 row, bf16 col). The fp16+bf16 promotions are left at float32
+// to avoid breaking float16 models (e.g., quantized Qwen-MoE, DeepSeek).
 // clang-format off
 constexpr Dtype type_rules[num_types][num_types] = {
 // bool       uint8      uint16     uint32     uint64     int8       int16      int32      int64      float16    float32   float64    bfloat16   complex64
@@ -68,10 +69,10 @@ constexpr Dtype type_rules[num_types][num_types] = {
   {int16,     int16,     int32,     int64,     float32,   int16,     int16,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int16
   {int32,     int32,     int32,     int64,     float32,   int32,     int32,     int32,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int32
   {int64,     int64,     int64,     int64,     float32,   int64,     int64,     int64,     int64,     float16,   float32,  float64,   bfloat16,  complex64}, // int64
-  {float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float32,  float64,   bfloat16,  complex64}, // float16  /* PATCHED: bf16 col */
-  {float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,  float64,   bfloat16,  complex64}, // float32  /* PATCHED: bf16 col */
+  {float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float16,   float32,  float64,   float32,   complex64}, // float16
+  {float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,   float32,  float64,   bfloat16,  complex64}, // float32  /* PATCHED: bf16 col only */
   {float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,   float64,  float64,   float64,   complex64}, // float64
-  {bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16, float64,   bfloat16,  complex64}, // bfloat16 /* PATCHED: fp16+fp32 cols */
+  {bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  bfloat16,  float32,   bfloat16, float64,   bfloat16,  complex64}, // bfloat16 /* PATCHED: fp32 col only, fp16 stays float32 */
   {complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64, complex64,complex64, complex64, complex64}, // complex64
 };
 

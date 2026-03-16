@@ -244,16 +244,11 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
             array(bf16_src, mlx_shape, mlx::core::bfloat16));
     }
 
-    if (use_native && !is_bfloat16) {
-        // Native fp16: create array directly with float16 dtype.
-        // SAFETY: float16_t is a trivial struct wrapping uint16_t (2-byte aligned).
-        // Same alignment guarantees as bf16 above apply.
-        // MLX's array constructor copies the data immediately via std::copy.
-        const mlx::core::float16_t* fp16_src =
-            reinterpret_cast<const mlx::core::float16_t*>(data.data());
-        return std::make_unique<MlxArray>(
-            array(fp16_src, mlx_shape, mlx::core::float16));
-    }
+    // NOTE: fp16 (float16) models are NOT kept in native fp16 even when
+    // use_native is true. MLX's CUDA SDPA doesn't support fp16 output with
+    // fp32 mask, causing "Mask type must promote to output type float16" errors.
+    // Only bfloat16 benefits from native dtype (with the type promotion patch).
+    // fp16 models fall through to the fp32 conversion path below.
 
     // Legacy fp32 conversion path
     std::vector<float> float_data(num_elements);
