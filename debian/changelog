@@ -1,3 +1,16 @@
+mlxcel (0.0.7-1~jammy1) jammy; urgency=medium
+
+  * Feat: GatherMM/GatherQMM for MoE model support on CUDA
+  * Feat: CUDA bf16 support with mixed-precision binary kernels and validation
+  * Feat: Add --batch-size and --ubatch-size as llama-server compatible aliases
+  * Feat: Debian packaging, man pages, and optimized release profile
+  * Feat: GB10 vs M1 Ultra benchmark comparison and CUDA build guide
+  * Fix: CUDA qmv shared-mem optimization with block.sync() fix
+  * Fix: C++ bridge build fixes (LTO, C++20)
+  * Update: Bump MLX to v0.31.1, show GPU backend in runtime display
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 16 Mar 2026 12:00:00 +0900
+
 mlxcel (0.0.6-1~jammy1) jammy; urgency=medium
 
   * Feat: Implement explicit forward_batched() for Qwen3 with split-attention

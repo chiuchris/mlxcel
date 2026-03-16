@@ -4,6 +4,29 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.7] - 2026-03-16
+
+### Added
+- GatherMM/GatherQMM for MoE model support on CUDA (#34)
+- CUDA bf16 support: type promotion table patching, mixed-precision binary kernels, normalization ops, reduce accumulation with fp32 precision, native bf16 array creation in bridge layer (#42-#46)
+- CUDA bf16 validation scripts and documentation (#47)
+- CUDA GB10 benchmark results for 57 models
+- GB10 vs M1 Ultra benchmark comparison report
+- `--batch-size` and `--ubatch-size` as llama-server compatible aliases (#32)
+- Debian packaging, man pages, and optimized release profile
+- CUDA build guide and build troubleshooting documentation (#33)
+
+### Fixed
+- CUDA qmv shared-memory optimization with block.sync() fix
+- CUDA dtype and fp16 bridge fixes
+- C++ bridge build: removed `-flto`, upgraded to C++20
+- C++ bridge LTO enabled only on macOS
+
+### Changed
+- Bumped MLX to v0.31.1, GPU backend now shown in runtime display
+- CUDA qmv kernel optimized with shared memory x-broadcast and `__restrict__`
+- Phase 19 CUDA optimization report and final benchmarks
+
 ## [v0.0.6] - 2026-03-14
 
 ### Added
@@ -130,6 +153,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.7]: https://github.com/lablup/mlxcel/compare/v0.0.6...v0.0.7
 [v0.0.6]: https://github.com/lablup/mlxcel/compare/v0.0.5...v0.0.6
 [v0.0.5]: https://github.com/lablup/mlxcel/compare/v0.0.4...v0.0.5
 [v0.0.4]: https://github.com/lablup/mlxcel/compare/v0.0.3...v0.0.4
