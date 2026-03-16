@@ -13,20 +13,13 @@ permissions:
   contents: write
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
-    runs-on: ${{ matrix.os }}
+  # ============================================================================
+  # macOS ARM64 (Apple Silicon) build
+  # ============================================================================
+  build-macos:
+    name: Build macOS (Apple Silicon)
+    runs-on: macos-14
     environment: packaging
-
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # macOS ARM64 (Apple Silicon - primary target)
-          - target: aarch64-apple-darwin
-            os: macos-14
-            asset_name: mlxcel-macos-aarch64
-            archive_ext: ".zip"
 
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -42,43 +35,38 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          key: macos-cargo-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.target }}-${{ hashFiles('**/Cargo.toml') }}
-            ${{ runner.os }}-cargo-${{ matrix.target }}-
+            macos-cargo-aarch64-apple-darwin-${{ hashFiles('**/Cargo.toml') }}
+            macos-cargo-aarch64-apple-darwin-
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: aarch64-apple-darwin
 
       - name: Build release binaries
-        run: cargo build --release --target ${{ matrix.target }} --locked
+        run: cargo build --release --target aarch64-apple-darwin --locked
         env:
           RUSTFLAGS: "-C target-cpu=apple-m1"
 
-      # macOS code signing
       - name: Import Distribution certificate
-        if: runner.os == 'macOS'
         uses: apple-actions/import-codesign-certs@v3
         with:
           p12-file-base64: ${{ secrets.DEV_ID_CERT_P12 }}
           p12-password: ${{ secrets.DEV_ID_CERT_PASSWORD }}
 
       - name: Code sign macOS binaries
-        if: runner.os == 'macOS'
         run: |
-          BIN_DIR="target/${{ matrix.target }}/release"
+          BIN_DIR="target/aarch64-apple-darwin/release"
           for BIN in mlxcel mlxcel-server; do
             codesign --force --timestamp --options runtime \
                      --sign "Distribution" "$BIN_DIR/$BIN"
           done
 
-      # Find mlx.metallib from build output
       - name: Locate mlx.metallib
-        if: runner.os == 'macOS'
         run: |
-          METALLIB=$(find target/${{ matrix.target }}/release/build/mlxcel-core-*/out/build/lib -name "mlx.metallib" 2>/dev/null | head -1)
+          METALLIB=$(find target/aarch64-apple-darwin/release/build/mlxcel-core-*/out/build/lib -name "mlx.metallib" 2>/dev/null | head -1)
           if [ -z "$METALLIB" ]; then
             echo "::error::mlx.metallib not found in build output"
             exit 1
@@ -86,30 +74,89 @@ jobs:
           echo "METALLIB_PATH=$METALLIB" >> $GITHUB_ENV
           echo "Found mlx.metallib at: $METALLIB ($(du -h "$METALLIB" | cut -f1))"
 
-      # Package binaries
-      - name: Package macOS binaries (zip)
-        if: runner.os == 'macOS'
+      - name: Package binaries
         run: |
-          BIN_DIR="target/${{ matrix.target }}/release"
+          BIN_DIR="target/aarch64-apple-darwin/release"
           mkdir -p package
           cp "$BIN_DIR/mlxcel" package/
           cp "$BIN_DIR/mlxcel-server" package/
           cp "$METALLIB_PATH" package/mlx.metallib
-          ditto -c -k --sequesterRsrc package "${{ matrix.asset_name }}.zip"
+          ditto -c -k --sequesterRsrc package mlxcel-macos-aarch64.zip
 
-      # Generate checksum
-      - name: Generate checksum (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          FILE="${{ matrix.asset_name }}${{ matrix.archive_ext }}"
-          shasum -a 256 "$FILE" > "$FILE.sha256"
+      - name: Generate checksum
+        run: shasum -a 256 mlxcel-macos-aarch64.zip > mlxcel-macos-aarch64.zip.sha256
 
-      # Upload release artifacts
       - name: Upload release artifacts
         if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
           files: |
-            ${{ matrix.asset_name }}${{ matrix.archive_ext }}
-            ${{ matrix.asset_name }}${{ matrix.archive_ext }}.sha256
+            mlxcel-macos-aarch64.zip
+            mlxcel-macos-aarch64.zip.sha256
+
+  # ============================================================================
+  # Linux ARM64 + CUDA builds (self-hosted GB10 runner)
+  # ============================================================================
+  build-linux-cuda:
+    name: Build Linux ARM64 CUDA (${{ matrix.variant }})
+    runs-on: GB10
+    environment: packaging
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # NVIDIA DGX Spark / GB10 (Blackwell, SM 121)
+          - variant: gb10
+            cuda_arch: "121"
+            asset_name: mlxcel-linux-aarch64-cuda13-gb10
+
+          # NVIDIA GH200 (Grace Hopper, SM 90a) — cross-compiled on GB10 runner
+          - variant: gh200
+            cuda_arch: "90a"
+            asset_name: mlxcel-linux-aarch64-cuda13-gh200
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: linux-cargo-cuda-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            linux-cargo-cuda-${{ matrix.variant }}-${{ hashFiles('**/Cargo.toml') }}
+            linux-cargo-cuda-${{ matrix.variant }}-
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build release binaries
+        run: cargo build --release --features cuda --locked
+        env:
+          MLX_CUDA_ARCHITECTURES: ${{ matrix.cuda_arch }}
+
+      - name: Package binaries
+        run: |
+          BIN_DIR="target/release"
+          mkdir -p package
+          cp "$BIN_DIR/mlxcel" package/
+          cp "$BIN_DIR/mlxcel-server" package/
+          cd package && zip -r "../${{ matrix.asset_name }}.zip" . && cd ..
+
+      - name: Generate checksum
+        run: sha256sum "${{ matrix.asset_name }}.zip" > "${{ matrix.asset_name }}.zip.sha256"
+
+      - name: Upload release artifacts
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.event.release.tag_name || github.event.inputs.release_tag }}
+          files: |
+            ${{ matrix.asset_name }}.zip
+            ${{ matrix.asset_name }}.zip.sha256
