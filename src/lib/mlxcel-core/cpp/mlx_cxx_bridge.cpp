@@ -211,16 +211,23 @@ inline float bf16_to_f32_bits(uint16_t h) {
     return result;
 }
 
-// Create half-precision array from raw bytes (bfloat16 or float16)
-// Convert through float32 for correct handling, keep as float32 since MLX float16 array creation has issues
+// Create half-precision array from raw bytes (bfloat16 or float16).
+//
+// Converts to float32 at load time. MLX's CUDA backend internally operates
+// in float32 and would insert bf16→fp32 copy kernels (copy_v) at every
+// operation boundary if weights were kept in bf16, causing severe overhead
+// for large models (58% of GPU time on 9B models).
+//
+// By converting upfront on CPU during weight loading, we avoid repeated
+// GPU-side conversion. This trades 2x memory for consistent performance.
+// A future MLX version with native bf16 compute support would allow
+// keeping weights in bf16.
 std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool is_bfloat16) {
     auto mlx_shape = to_shape(shape);
 
-    // Calculate number of elements
     size_t num_elements = 1;
     for (auto s : mlx_shape) num_elements *= s;
 
-    // Convert to float32
     std::vector<float> float_data(num_elements);
     const uint16_t* src = reinterpret_cast<const uint16_t*>(data.data());
 
@@ -234,7 +241,6 @@ std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::
         }
     }
 
-    // Create float32 array - keep as float32 for now due to MLX float16 issues
     return std::make_unique<MlxArray>(array(float_data.data(), mlx_shape));
 }
 
