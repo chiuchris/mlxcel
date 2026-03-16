@@ -18,7 +18,7 @@ jobs:
   # ============================================================================
   build-macos:
     name: Build macOS (Apple Silicon)
-    runs-on: macos-14
+    runs-on: macos-15
     environment: packaging
 
     env:
