@@ -14,6 +14,7 @@
 #include "mlx/backend/metal/metal.h"
 #endif
 #include <cstring>
+#include <cstdlib>
 #include <iostream>
 
 namespace mlx_cxx {
@@ -213,21 +214,48 @@ inline float bf16_to_f32_bits(uint16_t h) {
 
 // Create half-precision array from raw bytes (bfloat16 or float16).
 //
-// Converts to float32 at load time. MLX's CUDA backend internally operates
-// in float32 and would insert bf16→fp32 copy kernels (copy_v) at every
-// operation boundary if weights were kept in bf16, causing severe overhead
-// for large models (58% of GPU time on 9B models).
+// Native bf16/fp16 mode (default): Creates arrays in their native dtype.
+// The CUDA backend patches (#36-#39) ensure bf16 tensors compute natively
+// without copy_v conversion overhead, halving memory usage for bf16 models.
 //
-// By converting upfront on CPU during weight loading, we avoid repeated
-// GPU-side conversion. This trades 2x memory for consistent performance.
-// A future MLX version with native bf16 compute support would allow
-// keeping weights in bf16.
+// Legacy fp32 mode (MLX_BF16_NATIVE=0): Converts to fp32 at load time.
+// Use when running on hardware/configurations without bf16 compute patches.
 std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool is_bfloat16) {
     auto mlx_shape = to_shape(shape);
 
     size_t num_elements = 1;
     for (auto s : mlx_shape) num_elements *= s;
 
+    // Check for legacy fp32 conversion mode
+    static bool use_native = []() {
+        const char* env = std::getenv("MLX_BF16_NATIVE");
+        return env == nullptr || std::string(env) != "0";
+    }();
+
+    if (use_native && is_bfloat16) {
+        // Native bf16: create array directly with bfloat16 dtype.
+        // SAFETY: bfloat16_t is a trivial struct wrapping uint16_t (2-byte aligned).
+        // Safetensors data is memory-mapped with naturally aligned tensor offsets,
+        // so the uint8_t* pointer is guaranteed to be 2-byte aligned for bf16 data.
+        // MLX's array constructor copies the data immediately via std::copy.
+        const mlx::core::bfloat16_t* bf16_src =
+            reinterpret_cast<const mlx::core::bfloat16_t*>(data.data());
+        return std::make_unique<MlxArray>(
+            array(bf16_src, mlx_shape, mlx::core::bfloat16));
+    }
+
+    if (use_native && !is_bfloat16) {
+        // Native fp16: create array directly with float16 dtype.
+        // SAFETY: float16_t is a trivial struct wrapping uint16_t (2-byte aligned).
+        // Same alignment guarantees as bf16 above apply.
+        // MLX's array constructor copies the data immediately via std::copy.
+        const mlx::core::float16_t* fp16_src =
+            reinterpret_cast<const mlx::core::float16_t*>(data.data());
+        return std::make_unique<MlxArray>(
+            array(fp16_src, mlx_shape, mlx::core::float16));
+    }
+
+    // Legacy fp32 conversion path
     std::vector<float> float_data(num_elements);
     const uint16_t* src = reinterpret_cast<const uint16_t*>(data.data());
 

@@ -905,8 +905,7 @@ mod tests {
         // Batched: forward_batched with [2, 1] input
         let mut batch_caches_0 = model.make_caches();
         let mut batch_caches_1 = model.make_caches();
-        let mut batch_caches: Vec<&mut [KVCache]> =
-            vec![&mut batch_caches_0, &mut batch_caches_1];
+        let mut batch_caches: Vec<&mut [KVCache]> = vec![&mut batch_caches_0, &mut batch_caches_1];
 
         let batched_input = ffi::from_slice_i32(&[1, 2], &[2, 1]);
         let batched_logits = model.forward_batched(&batched_input, &mut batch_caches, None);

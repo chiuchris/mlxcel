@@ -172,8 +172,8 @@ fn gptq_to_mlx_tensors(
     let mlx_weight = pack_mlx_4bit(&transposed, in_features, out_features);
 
     // Step 4: Transpose scales from [n_groups, out] to [out, n_groups]
-    // Cast back to FLOAT16 (from_bytes_f16 promotes to FLOAT32 but we want FP16
-    // for efficient quantized_matmul/gather_qmm compute paths)
+    // Explicitly cast to FLOAT16 (scales may be loaded as native fp16, but
+    // astype ensures the correct dtype for quantized_matmul/gather_qmm paths)
     let mlx_scales = mlxcel_core::transpose_axes(scales, &[1, 0]);
     let mlx_scales = mlxcel_core::astype(&mlx_scales, mlxcel_core::dtype::FLOAT16);
     let mlx_scales = mlxcel_core::contiguous(&mlx_scales, false);

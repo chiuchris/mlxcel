@@ -99,11 +99,7 @@ pub fn batched_sample(
     let mut tokens = Vec::with_capacity(b);
     for i in 0..b {
         // Slice [B, 1, vocab] -> [1, 1, vocab] for sequence i
-        let seq_logits = ffi::slice(
-            logits,
-            &[i as i32, 0, 0],
-            &[i as i32 + 1, 1, i32::MAX],
-        );
+        let seq_logits = ffi::slice(logits, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
         let (token_arr, _logprobs) =
             sample_token_optimized(&seq_logits, configs[i], token_histories[i]);
         ffi::eval(&token_arr);
@@ -391,10 +387,7 @@ mod tests {
         // Two sequences with different argmax positions
         // Seq 0: logits [0.1, 0.9, 1.2] -> argmax = 2
         // Seq 1: logits [2.0, 0.5, 0.1] -> argmax = 0
-        let logits = ffi::from_slice_f32(
-            &[0.1, 0.9, 1.2, 2.0, 0.5, 0.1],
-            &[2, 1, 3],
-        );
+        let logits = ffi::from_slice_f32(&[0.1, 0.9, 1.2, 2.0, 0.5, 0.1], &[2, 1, 3]);
 
         let config0 = SamplingConfig::greedy();
         let config1 = SamplingConfig::greedy();

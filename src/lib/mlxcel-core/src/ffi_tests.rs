@@ -287,6 +287,117 @@ fn test_gather_mm() {
     assert_eq!(array_shape(&result), vec![2, 3, 5]);
 }
 
+/// Verify that `from_bytes_f16` creates a native bf16 array by default.
+///
+/// The bridge function now uses `MLX_BF16_NATIVE=1` (default) to pass raw
+/// bfloat16 bytes directly to MLX rather than converting to fp32.  This test
+/// confirms the dtype is `BFLOAT16` and the shape is preserved.
+#[test]
+fn test_from_bytes_bf16_native_dtype() {
+    // 1.0 in bfloat16 is 0x3F80 (same upper 16 bits as 1.0f32 = 0x3F800000)
+    let bf16_bytes: Vec<u8> = vec![0x80, 0x3F, 0x80, 0x3F, 0x80, 0x3F, 0x80, 0x3F];
+    let shape = vec![2, 2];
+    let arr = from_bytes_f16(&bf16_bytes, &shape, true);
+    assert!(!arr.is_null());
+    eval(arr.as_ref().unwrap());
+
+    // Default (MLX_BF16_NATIVE != "0") must yield bfloat16, not float32.
+    assert_eq!(
+        array_dtype(arr.as_ref().unwrap()),
+        dtype::BFLOAT16,
+        "from_bytes_f16 with is_bfloat16=true should produce BFLOAT16 array in native mode"
+    );
+    assert_eq!(array_shape(arr.as_ref().unwrap()), vec![2, 2]);
+    assert_eq!(array_size(arr.as_ref().unwrap()), 4);
+    // itemsize for bfloat16 is 2 bytes.
+    assert_eq!(array_itemsize(arr.as_ref().unwrap()), 2);
+
+    // Numerical check: cast to f32 and verify values are ~1.0
+    let arr_f32 = astype(arr.as_ref().unwrap(), dtype::FLOAT32);
+    eval(arr_f32.as_ref().unwrap());
+    let total = sum_all(arr_f32.as_ref().unwrap());
+    eval(&total);
+    assert!(
+        (item_f32(&total) - 4.0).abs() < 0.01,
+        "four bf16 1.0 values should sum to ~4.0, got {}",
+        item_f32(&total)
+    );
+}
+
+/// Verify that `from_bytes_f16` creates a native fp16 array by default.
+///
+/// Mirrors the bf16 test for the float16 code path (`is_bfloat16 = false`).
+#[test]
+fn test_from_bytes_fp16_native_dtype() {
+    // 1.0 in float16 is 0x3C00
+    let fp16_bytes: Vec<u8> = vec![0x00, 0x3C, 0x00, 0x3C];
+    let shape = vec![1, 2];
+    let arr = from_bytes_f16(&fp16_bytes, &shape, false);
+    assert!(!arr.is_null());
+    eval(arr.as_ref().unwrap());
+
+    // Default mode must yield float16.
+    assert_eq!(
+        array_dtype(arr.as_ref().unwrap()),
+        dtype::FLOAT16,
+        "from_bytes_f16 with is_bfloat16=false should produce FLOAT16 array in native mode"
+    );
+    assert_eq!(array_shape(arr.as_ref().unwrap()), vec![1, 2]);
+    assert_eq!(array_itemsize(arr.as_ref().unwrap()), 2);
+
+    // Numerical check: cast to f32 and verify values are ~1.0
+    let arr_f32 = astype(arr.as_ref().unwrap(), dtype::FLOAT32);
+    eval(arr_f32.as_ref().unwrap());
+    let total = sum_all(arr_f32.as_ref().unwrap());
+    eval(&total);
+    assert!(
+        (item_f32(&total) - 2.0).abs() < 0.01,
+        "two fp16 1.0 values should sum to ~2.0, got {}",
+        item_f32(&total)
+    );
+}
+
+/// Verify that bf16 bit patterns round-trip through `from_bytes_f16`.
+///
+/// Constructs a known bf16 value (2.0 = 0x4000) and checks that the array
+/// holds the correct value after dtype promotion to f32.
+#[test]
+fn test_from_bytes_bf16_bit_pattern_roundtrip() {
+    // 2.0 in bfloat16: upper 16 bits of 2.0f32 (0x40000000) → 0x4000
+    let bf16_bytes: Vec<u8> = vec![0x00, 0x40];
+    let shape = vec![1];
+    let arr = from_bytes_f16(&bf16_bytes, &shape, true);
+    eval(arr.as_ref().unwrap());
+
+    let arr_f32 = astype(arr.as_ref().unwrap(), dtype::FLOAT32);
+    eval(arr_f32.as_ref().unwrap());
+    assert!(
+        (item_f32(&arr_f32) - 2.0).abs() < 0.01,
+        "bf16 0x4000 should decode to ~2.0f32, got {}",
+        item_f32(&arr_f32)
+    );
+}
+
+/// Verify that fp16 bit patterns round-trip through `from_bytes_f16`.
+///
+/// Uses -1.0 in float16 (0xBC00) as a non-trivial test value.
+#[test]
+fn test_from_bytes_fp16_bit_pattern_roundtrip() {
+    // -1.0 in float16 is 0xBC00
+    let fp16_bytes: Vec<u8> = vec![0x00, 0xBC];
+    let shape = vec![1];
+    let arr = from_bytes_f16(&fp16_bytes, &shape, false);
+    eval(arr.as_ref().unwrap());
+
+    let arr_f32 = astype(arr.as_ref().unwrap(), dtype::FLOAT32);
+    eval(arr_f32.as_ref().unwrap());
+    assert!(
+        (item_f32(&arr_f32) - (-1.0)).abs() < 0.01,
+        "fp16 0xBC00 should decode to ~-1.0f32, got {}",
+        item_f32(&arr_f32)
+    );
+}
+
 #[test]
 fn test_memory_functions() {
     let max_size = gpu_max_memory_size();
