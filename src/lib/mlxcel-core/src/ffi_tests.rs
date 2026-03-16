@@ -89,6 +89,104 @@ fn test_rms_norm() {
     assert!((item_f32(&total) - 4.0).abs() < 1e-4);
 }
 
+/// Verify that rms_norm with bf16 input preserves bf16 output dtype.
+///
+/// The CUDA patch in `patches/mlx/fast.cpp` selects `compute_type = bfloat16`
+/// when `out_type == bfloat16`, avoiding unnecessary fp32 promotion and
+/// copy_v kernels.  This test confirms the invariant holds at the Rust FFI
+/// boundary.
+#[test]
+fn test_rms_norm_bf16_dtype_preserved() {
+    let x_f32 = ones(&[1, 4], dtype::FLOAT32);
+    let x_bf16 = astype(&x_f32, dtype::BFLOAT16);
+    eval(&x_bf16);
+
+    let weight_f32 = ones(&[4], dtype::FLOAT32);
+    let weight_bf16 = astype(&weight_f32, dtype::BFLOAT16);
+    eval(&weight_bf16);
+
+    let normed = rms_norm(
+        x_bf16.as_ref().unwrap(),
+        weight_bf16.as_ref().unwrap(),
+        1e-5,
+    );
+    eval(&normed);
+
+    // Output dtype must remain bf16 — no implicit upcast to fp32.
+    assert_eq!(
+        array_dtype(normed.as_ref().unwrap()),
+        dtype::BFLOAT16,
+        "rms_norm output dtype should be bfloat16 when input is bfloat16"
+    );
+
+    // Shape must be unchanged.
+    assert_eq!(array_shape(normed.as_ref().unwrap()), vec![1, 4]);
+
+    // Numerical sanity: rms_norm of an all-ones vector with weight=1 is 1.0.
+    // Cast back to f32 to read the scalar.
+    let normed_f32 = astype(normed.as_ref().unwrap(), dtype::FLOAT32);
+    eval(&normed_f32);
+    let total = sum_all(normed_f32.as_ref().unwrap());
+    eval(&total);
+    // bf16 has ~3 decimal digits of precision; allow slightly wider tolerance.
+    assert!(
+        (item_f32(&total) - 4.0).abs() < 0.1,
+        "rms_norm(ones, ones) should be ~4.0, got {}",
+        item_f32(&total)
+    );
+}
+
+/// Verify that layer_norm with bf16 input preserves bf16 output dtype.
+///
+/// Mirrors the rms_norm bf16 test but exercises the layer_norm fallback path
+/// patched in `patches/mlx/fast.cpp`.
+#[test]
+fn test_layer_norm_bf16_dtype_preserved() {
+    let x_f32 = from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let x_bf16 = astype(&x_f32, dtype::BFLOAT16);
+    eval(&x_bf16);
+
+    let weight_f32 = ones(&[4], dtype::FLOAT32);
+    let weight_bf16 = astype(&weight_f32, dtype::BFLOAT16);
+    eval(&weight_bf16);
+
+    let bias_f32 = zeros(&[4], dtype::FLOAT32);
+    let bias_bf16 = astype(&bias_f32, dtype::BFLOAT16);
+    eval(&bias_bf16);
+
+    let normed = unsafe {
+        fast_layer_norm(
+            x_bf16.as_ref().unwrap(),
+            weight_bf16.as_ref().unwrap() as *const _,
+            bias_bf16.as_ref().unwrap() as *const _,
+            1e-5,
+        )
+    };
+    eval(&normed);
+
+    // Output dtype must remain bf16 — no implicit upcast to fp32.
+    assert_eq!(
+        array_dtype(normed.as_ref().unwrap()),
+        dtype::BFLOAT16,
+        "layer_norm output dtype should be bfloat16 when input is bfloat16"
+    );
+
+    // Shape must be unchanged.
+    assert_eq!(array_shape(normed.as_ref().unwrap()), vec![1, 4]);
+
+    // layer_norm of [1,2,3,4] should produce zero-mean, unit-variance output.
+    // Sum should be ~0; cast back to f32 to read.
+    let normed_f32 = astype(normed.as_ref().unwrap(), dtype::FLOAT32);
+    eval(&normed_f32);
+    let total = sum_all(normed_f32.as_ref().unwrap());
+    eval(&total);
+    assert!(
+        item_f32(&total).abs() < 0.2,
+        "layer_norm output should sum to ~0, got {}",
+        item_f32(&total)
+    );
+}
+
 #[test]
 fn test_argmax() {
     let a = from_slice_f32(&[1.0, 3.0, 2.0, 4.0], &[1, 4]);
