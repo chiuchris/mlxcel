@@ -97,15 +97,18 @@ fn resolve_runtime_device(value: Option<&str>) -> (RuntimeDevice, Option<String>
 
 /// Resolve wired memory limit from MLXCEL_WIRED_LIMIT env var.
 ///
-/// - Not set or "0": no wired limit (default, matches Python mlx-lm behavior)
-/// - "max": set to gpu_max_memory_size (previous default behavior)
+/// Default: set to gpu_max_memory_size (matches Python mlx-lm's wired_limit context manager).
+/// This is critical for large models (>50% of GPU memory) to avoid weight eviction.
+///
+/// - Not set or "max": set to gpu_max_memory_size (default, matches Python mlx-lm)
+/// - "0" or "none": disable wired limit
 /// - Number (bytes) or "NGB"/"NMB": explicit limit
 fn resolve_wired_limit() -> Option<usize> {
     let raw = std::env::var(WIRED_LIMIT_ENV).ok();
     let limit = match raw.as_deref() {
-        None | Some("") | Some("0") => return None,
-        Some("max") => mlxcel_core::gpu_max_memory_size(),
-        Some(s) => parse_memory_size(s).unwrap_or(0),
+        Some("0") | Some("none") | Some("NONE") => return None,
+        None | Some("") | Some("max") | Some("MAX") => mlxcel_core::gpu_max_memory_size(),
+        Some(s) => parse_memory_size(s).unwrap_or(mlxcel_core::gpu_max_memory_size()),
     };
     if limit > 0 {
         mlxcel_core::set_wired_limit(limit);
