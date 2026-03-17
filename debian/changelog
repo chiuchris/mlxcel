@@ -1,3 +1,11 @@
+mlxcel (0.0.8-1~jammy1) jammy; urgency=medium
+
+  * Fix: Support explicit head_dim in Qwen VL/MoE configs (Qwen3-VL-32B)
+  * Fix: Switch macOS CI runner to macos-15 for Xcode 16+ C++20 ranges support
+  * Update: Add CUDA release pipeline and refresh benchmark report with MoE results
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 17 Mar 2026 12:00:00 +0900
+
 mlxcel (0.0.7-1~jammy1) jammy; urgency=medium
 
   * Feat: GatherMM/GatherQMM for MoE model support on CUDA

@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.8] - 2026-03-17
+
+### Fixed
+- Support explicit `head_dim` config field in Qwen3-VL, Qwen2-VL, and Qwen2-MoE models — fixes Qwen3-VL-32B crash where `head_dim(128) != hidden_size/num_heads(80)`
+- Switch macOS CI runner to macos-15 for Xcode 16+ C++20 ranges support
+
+### Changed
+- Add CUDA release pipeline and refresh benchmark report with MoE results
+
 ## [v0.0.7] - 2026-03-16
 
 ### Added
@@ -153,6 +162,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.8]: https://github.com/lablup/mlxcel/compare/v0.0.7...v0.0.8
 [v0.0.7]: https://github.com/lablup/mlxcel/compare/v0.0.6...v0.0.7
 [v0.0.6]: https://github.com/lablup/mlxcel/compare/v0.0.5...v0.0.6
 [v0.0.5]: https://github.com/lablup/mlxcel/compare/v0.0.4...v0.0.5
