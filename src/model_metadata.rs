@@ -118,6 +118,7 @@ macro_rules! for_each_model_registration {
             Qwen3VLMoe => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Qwen VL models cannot be loaded with LoRA adapters yet") };
             MiniCPMOVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("MiniCPM-o VLM does not support adapter loading; use load_model() instead") };
             Moondream3VLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Moondream3 VLM does not support adapter loading; use load_model() instead") };
+            GptOss => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::GptOssModel::load, args: models::gpt_oss::ModelArgs, weight_builder: models::GptOssModel::from_weights, wrap: |m| LoadedModel::GptOss(models::GptOssWrapper::new(m)) } };
             Qwen2Moe => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Qwen2MoeModel::load, args: models::qwen2_moe::ModelArgs, weight_builder: models::Qwen2MoeModel::from_weights, wrap: LoadedModel::Qwen2Moe } };
             Gemma3n => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Gemma3nVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Gemma3n VLM cannot be loaded with LoRA adapters yet") };

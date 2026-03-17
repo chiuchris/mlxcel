@@ -561,6 +561,17 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     const MlxArray* mask  // nullable
 );
 
+// Fast SDPA with optional sinks (per-head attention bias for first position)
+// Used by: GptOss
+std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    const MlxArray* mask,
+    const MlxArray* sinks
+);
+
 // SDPA with explicit causal masking for prefill (no mask array needed)
 std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     const MlxArray& q,

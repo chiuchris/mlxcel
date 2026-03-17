@@ -828,6 +828,18 @@ mod ffi {
             mask: *const MlxArray,
         ) -> UniquePtr<MlxArray>;
 
+        /// Fast SDPA with optional sinks (per-head attention bias for first position)
+        /// Used by: GptOss
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn fast_scaled_dot_product_attention_with_sinks(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            scale: f32,
+            mask: *const MlxArray,
+            sinks: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
         /// SDPA with explicit causal masking for prefill
         fn fast_scaled_dot_product_attention_causal(
             q: &MlxArray,

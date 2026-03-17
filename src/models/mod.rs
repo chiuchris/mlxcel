@@ -46,6 +46,7 @@ pub mod glm4;
 pub mod glm4_moe;
 pub mod glm4_moe_lite;
 pub mod glm_moe_dsa;
+pub mod gpt_oss;
 pub mod hunyuan_moe;
 pub mod hunyuan_v1_dense;
 pub mod internlm2;
@@ -116,6 +117,7 @@ pub use glm_moe_dsa::GlmMoeDsaModel;
 pub use glm4::Glm4Model;
 pub use glm4_moe::Glm4MoeModel;
 pub use glm4_moe_lite::Glm4MoeLiteModel;
+pub use gpt_oss::{GptOssModel, GptOssWrapper};
 pub use hunyuan_moe::HunyuanMoeModel;
 pub use hunyuan_v1_dense::HunyuanV1DenseModel;
 pub use internlm2::InternLM2Model;
@@ -208,6 +210,7 @@ pub enum ModelType {
     PhiMoe,        // Phi MoE
 
     // MoE models
+    GptOss,
     MiniMax,
     Mixtral,
     Qwen2Moe,

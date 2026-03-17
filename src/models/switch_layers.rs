@@ -172,7 +172,8 @@ impl SwitchGLU {
 }
 
 /// Sort tokens by expert index for efficient gather_qmm/gather_mm
-fn gather_sort(
+/// Used by: SwitchGLU, GptOss
+pub fn gather_sort(
     x: &MlxArray,
     indices: &MlxArray,
 ) -> (
