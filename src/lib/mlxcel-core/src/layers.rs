@@ -28,16 +28,19 @@ use cxx::UniquePtr;
 pub use crate::cache::{ChunkedKVCache, KVCache, RotatingKVCache};
 
 /// Quantized weight structure for 4-bit/8-bit quantized layers
+/// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
+/// For mxfp4/nvfp4/mxfp8 modes, biases is None.
 pub struct QuantizedWeight {
     pub weight: UniquePtr<MlxArray>,
     pub scales: UniquePtr<MlxArray>,
-    pub biases: UniquePtr<MlxArray>,
+    pub biases: Option<UniquePtr<MlxArray>>,
     pub group_size: i32,
     pub bits: i32,
+    pub mode: String,
 }
 
 impl QuantizedWeight {
-    /// Create a new quantized weight from raw components
+    /// Create a new quantized weight from raw components (affine mode)
     pub fn new(
         weight: UniquePtr<MlxArray>,
         scales: UniquePtr<MlxArray>,
@@ -48,9 +51,37 @@ impl QuantizedWeight {
         Self {
             weight,
             scales,
+            biases: Some(biases),
+            group_size,
+            bits,
+            mode: "affine".to_string(),
+        }
+    }
+
+    /// Create a new quantized weight with explicit mode
+    pub fn new_with_mode(
+        weight: UniquePtr<MlxArray>,
+        scales: UniquePtr<MlxArray>,
+        biases: Option<UniquePtr<MlxArray>>,
+        group_size: i32,
+        bits: i32,
+        mode: String,
+    ) -> Self {
+        Self {
+            weight,
+            scales,
             biases,
             group_size,
             bits,
+            mode,
+        }
+    }
+
+    /// Get raw pointer to biases (null if not present, e.g. mxfp4/nvfp4/mxfp8)
+    pub fn biases_ptr(&self) -> *const MlxArray {
+        match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
         }
     }
 }
@@ -91,16 +122,18 @@ impl Embedding {
 }
 
 /// Quantized embedding layer (4-bit/8-bit)
+/// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
 pub struct QuantizedEmbedding {
     pub weight: UniquePtr<MlxArray>,
     pub scales: UniquePtr<MlxArray>,
-    pub biases: UniquePtr<MlxArray>,
+    pub biases: Option<UniquePtr<MlxArray>>,
     pub group_size: i32,
     pub bits: i32,
+    pub mode: String,
 }
 
 impl QuantizedEmbedding {
-    /// Create a new quantized embedding layer
+    /// Create a new quantized embedding layer (affine mode)
     pub fn new(
         weight: UniquePtr<MlxArray>,
         scales: UniquePtr<MlxArray>,
@@ -111,9 +144,10 @@ impl QuantizedEmbedding {
         Self {
             weight,
             scales,
-            biases,
+            biases: Some(biases),
             group_size,
             bits,
+            mode: "affine".to_string(),
         }
     }
 
@@ -123,6 +157,17 @@ impl QuantizedEmbedding {
         prefix: &str,
         group_size: i32,
         bits: i32,
+    ) -> Result<Self, String> {
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, "affine")
+    }
+
+    /// Load from weight map with explicit quantization mode
+    pub fn from_weights_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
     ) -> Result<Self, String> {
         let weight_name = format!("{}.weight", prefix);
         let scales_name = format!("{}.scales", prefix);
@@ -136,10 +181,8 @@ impl QuantizedEmbedding {
             .get(&scales_name)
             .map(|w| ffi::copy(w))
             .ok_or_else(|| format!("Scales not found: {}", scales_name))?;
-        let biases = weights
-            .get(&biases_name)
-            .map(|w| ffi::copy(w))
-            .ok_or_else(|| format!("Biases not found: {}", biases_name))?;
+        // biases may not exist for mxfp4/nvfp4/mxfp8 modes
+        let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
 
         Ok(Self {
             weight,
@@ -147,19 +190,30 @@ impl QuantizedEmbedding {
             biases,
             group_size,
             bits,
+            mode: mode.to_string(),
         })
+    }
+
+    fn biases_ptr(&self) -> *const MlxArray {
+        match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        }
     }
 
     /// Quantized embedding lookup with dequantization
     pub fn forward(&self, indices: &MlxArray) -> UniquePtr<MlxArray> {
-        ffi::quantized_embedding(
-            &self.weight,
-            &self.scales,
-            &self.biases,
-            indices,
-            self.group_size,
-            self.bits,
-        )
+        unsafe {
+            ffi::quantized_embedding(
+                &self.weight,
+                &self.scales,
+                self.biases_ptr(),
+                indices,
+                self.group_size,
+                self.bits,
+                &self.mode,
+            )
+        }
     }
 
     /// Use embedding as linear projection (for tied embeddings/lm_head)
@@ -169,10 +223,11 @@ impl QuantizedEmbedding {
                 x,
                 &self.weight,
                 &self.scales,
-                &self.biases,
+                self.biases_ptr(),
                 std::ptr::null(),
                 self.group_size,
                 self.bits,
+                &self.mode,
             )
         }
     }
@@ -413,7 +468,7 @@ impl UnifiedLinear {
         Self::Quantized { weight, bias }
     }
 
-    /// Load from weight map, auto-detecting quantization
+    /// Load from weight map, auto-detecting quantization (affine mode)
     ///
     /// Detects quantization by checking for `.scales` key in weights.
     /// Falls back to regular Linear if scales are absent.
@@ -422,6 +477,21 @@ impl UnifiedLinear {
         prefix: &str,
         group_size: i32,
         bits: i32,
+    ) -> Result<Self, String> {
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, "affine")
+    }
+
+    /// Load from weight map with explicit quantization mode
+    ///
+    /// Detects quantization by checking for `.scales` key in weights.
+    /// Falls back to regular Linear if scales are absent.
+    /// For mxfp4/nvfp4/mxfp8 modes, biases are optional.
+    pub fn from_weights_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
     ) -> Result<Self, String> {
         let scales_name = format!("{}.scales", prefix);
 
@@ -438,10 +508,8 @@ impl UnifiedLinear {
                 .get(&scales_name)
                 .map(|w| ffi::copy(w))
                 .ok_or_else(|| format!("Scales not found: {}", scales_name))?;
-            let biases = weights
-                .get(&biases_name)
-                .map(|w| ffi::copy(w))
-                .ok_or_else(|| format!("Biases not found: {}", biases_name))?;
+            // biases may not exist for mxfp4/nvfp4/mxfp8 modes
+            let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
 
             let qweight = QuantizedWeight {
                 weight,
@@ -449,6 +517,7 @@ impl UnifiedLinear {
                 biases,
                 group_size,
                 bits,
+                mode: mode.to_string(),
             };
 
             let bias_name = format!("{}.bias", prefix);
@@ -478,10 +547,11 @@ impl UnifiedLinear {
                         x,
                         &weight.weight,
                         &weight.scales,
-                        &weight.biases,
+                        weight.biases_ptr(),
                         bias_ptr,
                         weight.group_size,
                         weight.bits,
+                        &weight.mode,
                     )
                 }
             }
@@ -572,7 +642,6 @@ impl QuantizedMultiLinear {
     /// x: [batch, heads, seq, input_dim]
     /// Returns: [batch, heads, seq, output_dim]
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // Get raw pointer to biases if present
         let biases_ptr: *const MlxArray = match &self.biases {
             Some(b) => b.as_ref().unwrap() as *const MlxArray,
             None => std::ptr::null(),
@@ -587,6 +656,7 @@ impl QuantizedMultiLinear {
                 true, // transpose
                 self.group_size,
                 self.bits,
+                "affine",
             )
         }
     }
@@ -608,6 +678,7 @@ impl QuantizedMultiLinear {
                 false, // no transpose
                 self.group_size,
                 self.bits,
+                "affine",
             )
         }
     }
@@ -615,19 +686,21 @@ impl QuantizedMultiLinear {
     /// Dequantize weights to full precision
     /// Returns: [num_heads, output_dim, input_dim]
     pub fn dequantize(&self) -> UniquePtr<MlxArray> {
-        let biases = self
-            .biases
-            .as_ref()
-            .map(|b| ffi::copy(b))
-            .unwrap_or_else(|| ffi::zeros(&[1], crate::dtype::FLOAT16));
+        let biases_ptr: *const MlxArray = match &self.biases {
+            Some(b) => b.as_ref().unwrap() as *const MlxArray,
+            None => std::ptr::null(),
+        };
 
-        ffi::dequantize(
-            &self.weight,
-            &self.scales,
-            &biases,
-            self.group_size,
-            self.bits,
-        )
+        unsafe {
+            ffi::dequantize(
+                &self.weight,
+                &self.scales,
+                biases_ptr,
+                self.group_size,
+                self.bits,
+                "affine",
+            )
+        }
     }
 }
 
@@ -659,62 +732,65 @@ impl SwiGLUMLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         if self.use_compiled {
             // Use compiled version with kernel fusion
-            ffi::compiled_moe_expert_forward(
-                x,
-                &self.gate_proj.weight,
-                &self.gate_proj.scales,
-                &self.gate_proj.biases,
-                &self.up_proj.weight,
-                &self.up_proj.scales,
-                &self.up_proj.biases,
-                &self.down_proj.weight,
-                &self.down_proj.scales,
-                &self.down_proj.biases,
-                self.gate_proj.group_size,
-                self.gate_proj.bits,
-            )
+            // Falls back to non-compiled for non-affine modes inside C++
+            unsafe {
+                ffi::compiled_moe_expert_forward(
+                    x,
+                    &self.gate_proj.weight,
+                    &self.gate_proj.scales,
+                    self.gate_proj.biases_ptr(),
+                    &self.up_proj.weight,
+                    &self.up_proj.scales,
+                    self.up_proj.biases_ptr(),
+                    &self.down_proj.weight,
+                    &self.down_proj.scales,
+                    self.down_proj.biases_ptr(),
+                    self.gate_proj.group_size,
+                    self.gate_proj.bits,
+                    &self.gate_proj.mode,
+                )
+            }
         } else {
             // Non-compiled version
-            // gate = quantized_matmul(x, gate_proj)
             let gate = unsafe {
                 ffi::quantized_linear_forward(
                     x,
                     &self.gate_proj.weight,
                     &self.gate_proj.scales,
-                    &self.gate_proj.biases,
+                    self.gate_proj.biases_ptr(),
                     std::ptr::null(),
                     self.gate_proj.group_size,
                     self.gate_proj.bits,
+                    &self.gate_proj.mode,
                 )
             };
 
-            // up = quantized_matmul(x, up_proj)
             let up = unsafe {
                 ffi::quantized_linear_forward(
                     x,
                     &self.up_proj.weight,
                     &self.up_proj.scales,
-                    &self.up_proj.biases,
+                    self.up_proj.biases_ptr(),
                     std::ptr::null(),
                     self.up_proj.group_size,
                     self.up_proj.bits,
+                    &self.up_proj.mode,
                 )
             };
 
-            // activated = silu(gate) * up
             let silu_gate = ffi::silu(&gate);
             let activated = ffi::multiply(&silu_gate, &up);
 
-            // down = quantized_matmul(activated, down_proj)
             unsafe {
                 ffi::quantized_linear_forward(
                     &activated,
                     &self.down_proj.weight,
                     &self.down_proj.scales,
-                    &self.down_proj.biases,
+                    self.down_proj.biases_ptr(),
                     std::ptr::null(),
                     self.down_proj.group_size,
                     self.down_proj.bits,
+                    &self.down_proj.mode,
                 )
             }
         }
@@ -750,67 +826,53 @@ impl MoESwitch {
     /// x: [batch, seq_len, hidden_dim]
     /// indices: [batch, seq_len] - expert index for each token
     pub fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
-        // Use gather_qmm for efficient MoE computation
-        // gate = gather_qmm(x, gate_proj, indices)
         let gate = unsafe {
             ffi::gather_qmm(
                 x,
                 &self.gate_proj.weight,
                 &self.gate_proj.scales,
-                self.gate_proj
-                    .biases
-                    .as_ref()
-                    .map(|b| b as *const _)
-                    .unwrap_or(std::ptr::null()),
+                self.gate_proj.biases_ptr(),
                 std::ptr::null(),    // lhs_indices
                 indices as *const _, // rhs_indices
                 true,                // transpose
                 self.gate_proj.group_size,
                 self.gate_proj.bits,
                 false, // sorted_indices
+                &self.gate_proj.mode,
             )
         };
 
-        // up = gather_qmm(x, up_proj, indices)
         let up = unsafe {
             ffi::gather_qmm(
                 x,
                 &self.up_proj.weight,
                 &self.up_proj.scales,
-                self.up_proj
-                    .biases
-                    .as_ref()
-                    .map(|b| b as *const _)
-                    .unwrap_or(std::ptr::null()),
+                self.up_proj.biases_ptr(),
                 std::ptr::null(),
                 indices as *const _,
                 true,
                 self.up_proj.group_size,
                 self.up_proj.bits,
                 false,
+                &self.up_proj.mode,
             )
         };
 
-        // activated = silu(gate) * up (using compiled version for kernel fusion)
         let activated = ffi::compiled_swiglu_activation(&gate, &up);
 
-        // down = gather_qmm(activated, down_proj, indices)
         unsafe {
             ffi::gather_qmm(
                 &activated,
                 &self.down_proj.weight,
                 &self.down_proj.scales,
-                self.down_proj
-                    .biases
-                    .as_ref()
-                    .map(|b| b as *const _)
-                    .unwrap_or(std::ptr::null()),
+                self.down_proj.biases_ptr(),
                 std::ptr::null(),
                 indices as *const _,
                 true,
                 self.down_proj.group_size,
                 self.down_proj.bits,
                 false,
+                &self.down_proj.mode,
             )
         }
     }
@@ -876,10 +938,11 @@ impl Attention {
                 x,
                 &self.q_proj.weight,
                 &self.q_proj.scales,
-                &self.q_proj.biases,
+                self.q_proj.biases_ptr(),
                 std::ptr::null(),
                 self.q_proj.group_size,
                 self.q_proj.bits,
+                &self.q_proj.mode,
             )
         };
 
@@ -888,10 +951,11 @@ impl Attention {
                 x,
                 &self.k_proj.weight,
                 &self.k_proj.scales,
-                &self.k_proj.biases,
+                self.k_proj.biases_ptr(),
                 std::ptr::null(),
                 self.k_proj.group_size,
                 self.k_proj.bits,
+                &self.k_proj.mode,
             )
         };
 
@@ -900,10 +964,11 @@ impl Attention {
                 x,
                 &self.v_proj.weight,
                 &self.v_proj.scales,
-                &self.v_proj.biases,
+                self.v_proj.biases_ptr(),
                 std::ptr::null(),
                 self.v_proj.group_size,
                 self.v_proj.bits,
+                &self.v_proj.mode,
             )
         };
 
@@ -960,10 +1025,11 @@ impl Attention {
                 &attn_out,
                 &self.o_proj.weight,
                 &self.o_proj.scales,
-                &self.o_proj.biases,
+                self.o_proj.biases_ptr(),
                 std::ptr::null(),
                 self.o_proj.group_size,
                 self.o_proj.bits,
+                &self.o_proj.mode,
             )
         }
     }

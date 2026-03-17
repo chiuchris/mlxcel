@@ -184,6 +184,7 @@ impl SwitchLinear {
                     *group_size,
                     *bits,
                     sorted_indices,
+                    "affine",
                 )
             },
             Self::Regular { weight } => {

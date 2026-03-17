@@ -26,14 +26,16 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
 /// Per-expert 3D linear layer (falls back to gather_mm for non-quantized models)
+/// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
 pub enum SwitchLinear {
     /// Quantized path: uses gather_qmm
     Quantized {
         weight: UniquePtr<MlxArray>,
         scales: UniquePtr<MlxArray>,
-        biases: UniquePtr<MlxArray>,
+        biases: Option<UniquePtr<MlxArray>>,
         group_size: i32,
         bits: i32,
+        mode: String,
     },
     /// Non-quantized path: uses gather_mm
     Regular { weight: UniquePtr<MlxArray> },
@@ -48,20 +50,28 @@ impl SwitchLinear {
                 biases,
                 group_size,
                 bits,
-            } => unsafe {
-                mlxcel_core::gather_qmm(
-                    x,
-                    weight,
-                    scales,
-                    biases.as_ref().unwrap(),
-                    std::ptr::null(),
-                    indices as *const _,
-                    true,
-                    *group_size,
-                    *bits,
-                    sorted,
-                )
-            },
+                mode,
+            } => {
+                let biases_ptr: *const MlxArray = match biases {
+                    Some(b) => b.as_ref().unwrap() as *const MlxArray,
+                    None => std::ptr::null(),
+                };
+                unsafe {
+                    mlxcel_core::gather_qmm(
+                        x,
+                        weight,
+                        scales,
+                        biases_ptr,
+                        std::ptr::null(),
+                        indices as *const _,
+                        true,
+                        *group_size,
+                        *bits,
+                        sorted,
+                        mode,
+                    )
+                }
+            }
             Self::Regular { weight } => {
                 // Python: gather_mm(x, weight.swapaxes(-1, -2), rhs_indices=indices)
                 let wt = mlxcel_core::swap_axes(weight, -1, -2);
@@ -78,6 +88,16 @@ impl SwitchLinear {
         group_size: i32,
         bits: i32,
     ) -> Result<Self, String> {
+        Self::from_weights_with_mode(weights, prefix, group_size, bits, "affine")
+    }
+
+    pub fn from_weights_with_mode(
+        weights: &WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        mode: &str,
+    ) -> Result<Self, String> {
         let weight = weights
             .get(&format!("{}.weight", prefix))
             .map(|w| mlxcel_core::copy(w))
@@ -90,10 +110,10 @@ impl SwitchLinear {
                 .get(&scales_key)
                 .map(|w| mlxcel_core::copy(w))
                 .unwrap();
+            // biases may not exist for mxfp4/nvfp4/mxfp8 modes
             let biases = weights
                 .get(&format!("{}.biases", prefix))
-                .map(|w| mlxcel_core::copy(w))
-                .ok_or_else(|| format!("Missing biases: {}", prefix))?;
+                .map(|w| mlxcel_core::copy(w));
 
             Ok(Self::Quantized {
                 weight,
@@ -101,6 +121,7 @@ impl SwitchLinear {
                 biases,
                 group_size,
                 bits,
+                mode: mode.to_string(),
             })
         } else {
             // Non-quantized fallback

@@ -530,6 +530,7 @@ impl SwitchLinear {
                     *group_size,
                     *bits,
                     false,
+                    "affine",
                 )
             },
             Self::Regular { weight } => {

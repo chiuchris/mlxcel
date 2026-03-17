@@ -461,14 +461,16 @@ mod ffi {
         ) -> UniquePtr<MlxArray>;
 
         /// Quantized linear layer forward
+        /// biases: nullable for mxfp4/nvfp4/mxfp8 modes
         unsafe fn quantized_linear_forward(
             x: &MlxArray,
             weight: &MlxArray,
             scales: &MlxArray,
-            biases: &MlxArray,
+            biases: *const MlxArray,
             linear_bias: *const MlxArray,
             group_size: i32,
             bits: i32,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         /// SwiGLU MLP forward
@@ -750,6 +752,7 @@ mod ffi {
             group_size: i32,
             bits: i32,
             sorted_indices: bool,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         /// Direct quantized matrix multiplication
@@ -762,15 +765,18 @@ mod ffi {
             transpose: bool,
             group_size: i32,
             bits: i32,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         /// Dequantize quantized weights to full precision
-        fn dequantize(
+        /// biases: nullable for mxfp4/nvfp4/mxfp8 modes
+        unsafe fn dequantize(
             w: &MlxArray,
             scales: &MlxArray,
-            biases: &MlxArray,
+            biases: *const MlxArray,
             group_size: i32,
             bits: i32,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         // Embedding.
@@ -778,13 +784,15 @@ mod ffi {
         fn embedding(weight: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// Quantized embedding lookup with dequantization
-        fn quantized_embedding(
+        /// biases: nullable for mxfp4/nvfp4/mxfp8 modes
+        unsafe fn quantized_embedding(
             weight: &MlxArray,
             scales: &MlxArray,
-            biases: &MlxArray,
+            biases: *const MlxArray,
             indices: &MlxArray,
             group_size: i32,
             bits: i32,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         // Fast operations (using MLX fast kernels).
@@ -851,11 +859,11 @@ mod ffi {
         /// Fused QKV projection + reshape + transpose + RoPE
         /// Reduces ~5 FFI calls (projection, reshape, transpose, rope) to 1
         #[allow(clippy::too_many_arguments)]
-        fn fused_qkv_project_and_rope(
+        unsafe fn fused_qkv_project_and_rope(
             x: &MlxArray,
             weight: &MlxArray,
             scales: &MlxArray,
-            biases: &MlxArray,
+            biases: *const MlxArray,
             num_heads: i32,
             head_dim: i32,
             rope_dims: i32,
@@ -864,23 +872,26 @@ mod ffi {
             group_size: i32,
             bits: i32,
             apply_rope: bool,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         // Compiled operations (with kernel fusion).
         /// Compiled MoE expert forward with quantized weights
-        fn compiled_moe_expert_forward(
+        /// Falls back to non-compiled for non-affine modes (mxfp4/nvfp4/mxfp8)
+        unsafe fn compiled_moe_expert_forward(
             x: &MlxArray,
             gate_proj: &MlxArray,
             gate_scales: &MlxArray,
-            gate_biases: &MlxArray,
+            gate_biases: *const MlxArray,
             up_proj: &MlxArray,
             up_scales: &MlxArray,
-            up_biases: &MlxArray,
+            up_biases: *const MlxArray,
             down_proj: &MlxArray,
             down_scales: &MlxArray,
-            down_biases: &MlxArray,
+            down_biases: *const MlxArray,
             group_size: i32,
             bits: i32,
+            mode: &str,
         ) -> UniquePtr<MlxArray>;
 
         // Memory management.

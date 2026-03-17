@@ -583,6 +583,7 @@ impl SwitchGLU {
                 self.group_size,
                 self.bits,
                 false, // sorted_indices
+                "affine",
             )
         };
 
@@ -599,6 +600,7 @@ impl SwitchGLU {
                 self.group_size,
                 self.bits,
                 false,
+                "affine",
             )
         };
 
@@ -619,6 +621,7 @@ impl SwitchGLU {
                 self.group_size,
                 self.bits,
                 false,
+                "affine",
             )
         };
 
@@ -949,7 +952,16 @@ impl DeepSeekV3Model {
                 let inferred_bits = (w_shape[w_shape.len() - 1] * 32) / kv_lora_rank;
                 let inferred_gs = kv_lora_rank / s_shape[s_shape.len() - 1];
 
-                mlxcel_core::dequantize(&w, &s, &b, inferred_gs, inferred_bits)
+                unsafe {
+                    mlxcel_core::dequantize(
+                        &w,
+                        &s,
+                        &*b as *const _,
+                        inferred_gs,
+                        inferred_bits,
+                        "affine",
+                    )
+                }
             } else {
                 mlxcel_core::copy(&w)
             };

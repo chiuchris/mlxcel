@@ -294,14 +294,16 @@ std::unique_ptr<MlxArray> linear_forward(
 );
 
 // Quantized linear layer forward
+// biases: nullable for mxfp4/nvfp4/mxfp8 modes (no per-group bias)
 std::unique_ptr<MlxArray> quantized_linear_forward(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,       // nullable for mxfp4/nvfp4/mxfp8
     const MlxArray* linear_bias,  // nullable
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 );
 
 // SwiGLU MLP forward (common in LLMs like Llama)
@@ -478,7 +480,8 @@ std::unique_ptr<MlxArray> gather_qmm(
     bool transpose,
     int32_t group_size,
     int32_t bits,
-    bool sorted_indices
+    bool sorted_indices,
+    rust::Str mode
 );
 
 // Direct quantized matrix multiplication
@@ -490,7 +493,8 @@ std::unique_ptr<MlxArray> quantized_matmul(
     const MlxArray* biases,         // nullable for no-bias quantization
     bool transpose,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 );
 
 // Dequantize quantized weights
@@ -498,9 +502,10 @@ std::unique_ptr<MlxArray> quantized_matmul(
 std::unique_ptr<MlxArray> dequantize(
     const MlxArray& w,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,     // nullable for mxfp4/nvfp4/mxfp8
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 );
 
 // Embedding.
@@ -510,10 +515,11 @@ std::unique_ptr<MlxArray> embedding(const MlxArray& weight, const MlxArray& indi
 std::unique_ptr<MlxArray> quantized_embedding(
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,     // nullable for mxfp4/nvfp4/mxfp8
     const MlxArray& indices,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 );
 
 // Fast operations (using MLX fast kernels).
@@ -586,7 +592,7 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,     // nullable for mxfp4/nvfp4/mxfp8
     int32_t num_heads,
     int32_t head_dim,
     int32_t rope_dims,
@@ -594,25 +600,28 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     int32_t cache_offset,
     int32_t group_size,
     int32_t bits,
-    bool apply_rope
+    bool apply_rope,
+    rust::Str mode
 );
 
 // Compiled operations (with kernel fusion).
 // Compiled full MoE expert forward
 // Compiles: silu(gate_proj(x)) * up_proj(x), then down_proj
+// Note: compiled path only supports affine mode; non-affine modes fall back to non-compiled
 std::unique_ptr<MlxArray> compiled_moe_expert_forward(
     const MlxArray& x,
     const MlxArray& gate_proj,
     const MlxArray& gate_scales,
-    const MlxArray& gate_biases,
+    const MlxArray* gate_biases,    // nullable for mxfp4/nvfp4/mxfp8
     const MlxArray& up_proj,
     const MlxArray& up_scales,
-    const MlxArray& up_biases,
+    const MlxArray* up_biases,      // nullable for mxfp4/nvfp4/mxfp8
     const MlxArray& down_proj,
     const MlxArray& down_scales,
-    const MlxArray& down_biases,
+    const MlxArray* down_biases,    // nullable for mxfp4/nvfp4/mxfp8
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 );
 
 // Memory and stream management.

@@ -800,6 +800,7 @@ impl QuantizedSwitchLinear {
                         *group_size,
                         *bits,
                         sorted_indices,
+                        "affine",
                     )
                 }
             }

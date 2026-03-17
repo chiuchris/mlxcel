@@ -239,12 +239,16 @@ where
 
 // Quantization Configuration.
 /// Common quantization arguments
+/// Supports affine (default), mxfp4, nvfp4, and mxfp8 quantization modes.
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct QuantizationArgs {
     #[serde(default)]
     pub group_size: Option<i32>,
     #[serde(default)]
     pub bits: Option<i32>,
+    /// Quantization mode: "affine" (default), "mxfp4", "nvfp4", "mxfp8"
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 impl QuantizationArgs {
@@ -258,6 +262,11 @@ impl QuantizationArgs {
 
     pub fn get_bits(&self) -> i32 {
         self.bits.unwrap_or(4)
+    }
+
+    /// Get quantization mode, defaulting to "affine"
+    pub fn get_mode(&self) -> &str {
+        self.mode.as_deref().unwrap_or("affine")
     }
 }
 

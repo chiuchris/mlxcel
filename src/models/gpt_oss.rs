@@ -92,28 +92,37 @@ pub enum Quantization {
 }
 
 impl Quantization {
-    /// Get group_size/bits for a specific weight prefix
-    fn params_for(&self, prefix: &str) -> (i32, i32) {
+    /// Get (group_size, bits, mode) for a specific weight prefix
+    fn params_for(&self, prefix: &str) -> (i32, i32, String) {
         let Quantization::Full(map) = self;
         // Check for per-layer override (e.g., "model.layers.0.self_attn.q_proj")
         if let Some(v) = map.get(prefix)
-            && let Some(obj) = v.as_object() {
-                let gs = obj.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-                let b = obj.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-                return (gs, b);
-            }
+            && let Some(obj) = v.as_object()
+        {
+            let gs = obj.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
+            let b = obj.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
+            let mode = obj
+                .get("mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or("affine")
+                .to_string();
+            return (gs, b, mode);
+        }
         // Fall back to top-level defaults
-        let gs = map.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
-        let b = map.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-        (gs, b)
+        self.defaults()
     }
 
     /// Top-level defaults
-    fn defaults(&self) -> (i32, i32) {
+    fn defaults(&self) -> (i32, i32, String) {
         let Quantization::Full(map) = self;
         let gs = map.get("group_size").and_then(|v| v.as_i64()).unwrap_or(64) as i32;
         let b = map.get("bits").and_then(|v| v.as_i64()).unwrap_or(4) as i32;
-        (gs, b)
+        let mode = map
+            .get("mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("affine")
+            .to_string();
+        (gs, b, mode)
     }
 }
 
@@ -134,10 +143,10 @@ impl ModelArgs {
             .unwrap_or(4)
     }
 
-    /// Get quantization params for a specific weight prefix.
+    /// Get quantization params (group_size, bits, mode) for a specific weight prefix.
     /// Tries exact match first, then tries layer 0 as a pattern (since all layers
     /// in gpt_oss use the same quantization per component type).
-    fn quant_for(&self, prefix: &str) -> (i32, i32) {
+    fn quant_for(&self, prefix: &str) -> (i32, i32, String) {
         self.quantization
             .as_ref()
             .map(|q| {
@@ -154,7 +163,7 @@ impl ModelArgs {
                 }
                 result
             })
-            .unwrap_or((64, 4))
+            .unwrap_or_else(|| (64, 4, "affine".to_string()))
     }
 
     /// Get the layer_types list, defaulting to alternating sliding/full pattern
@@ -262,7 +271,7 @@ impl ModelArgs {
 }
 
 // Expert Linear Layer for GptOss
-// Handles both affine quantization (with quant biases) and MXFP4 (U8 scales, no quant biases),
+// Handles both affine quantization (with quant biases) and MXFP4 (E8M0 scales, no quant biases),
 // plus optional per-expert linear bias.
 enum ExpertLinear {
     Quantized {
@@ -272,6 +281,7 @@ enum ExpertLinear {
         linear_bias: Option<UniquePtr<MlxArray>>,
         group_size: i32,
         bits: i32,
+        mode: String,
     },
     Regular {
         weight: UniquePtr<MlxArray>,
@@ -288,6 +298,7 @@ impl ExpertLinear {
                 quant_biases,
                 group_size,
                 bits,
+                mode,
                 ..
             } => {
                 let biases_ptr = quant_biases
@@ -306,6 +317,7 @@ impl ExpertLinear {
                         *group_size,
                         *bits,
                         sorted,
+                        mode,
                     )
                 }
             }
@@ -323,12 +335,7 @@ impl ExpertLinear {
             }
         };
         if let Some(bias) = linear_bias {
-            // bias: [num_experts, out_dim] -> gather per selected expert
             let gathered_bias = mlxcel_core::take(bias, indices, 0);
-            // Match shape to gather_qmm output:
-            //   sorted:     out is [n_sorted, 1, out_dim], bias is [n_sorted, out_dim]
-            //   non-sorted: out is [n_tokens, top_k, 1, out_dim], bias is [n_tokens, top_k, out_dim]
-            // In both cases, expand_dims(-2) adds the missing axis
             let gathered_bias = mlxcel_core::expand_dims(&gathered_bias, -2);
             mlxcel_core::add(&out, &gathered_bias)
         } else {
@@ -341,6 +348,7 @@ impl ExpertLinear {
         prefix: &str,
         group_size: i32,
         bits: i32,
+        mode: &str,
     ) -> Result<Self, String> {
         let weight = weights
             .get(&format!("{}.weight", prefix))
@@ -359,38 +367,20 @@ impl ExpertLinear {
                 .map(|w| mlxcel_core::copy(w))
                 .unwrap();
 
-            // Check if this is MXFP4 (U8 scales) vs affine (float scales)
-            let scales_dtype = mlxcel_core::array_dtype(&scales);
-            let is_mxfp4 = scales_dtype == mlxcel_core::dtype::UINT8;
+            // Quantized biases (only present for affine mode)
+            let quant_biases = weights
+                .get(&format!("{}.biases", prefix))
+                .map(|w| mlxcel_core::copy(w));
 
-            if is_mxfp4 {
-                // MXFP4: gather_qmm doesn't support U8 scales
-                // Dequantize at load time and use Regular (gather_mm) path
-                let zero_biases = {
-                    let s = mlxcel_core::array_shape(&scales);
-                    mlxcel_core::zeros(&s, mlxcel_core::dtype::BFLOAT16)
-                };
-                let dequantized =
-                    mlxcel_core::dequantize(&weight, &scales, &zero_biases, group_size, bits);
-                Ok(Self::Regular {
-                    weight: dequantized,
-                    linear_bias,
-                })
-            } else {
-                // Affine quantization: use gather_qmm path
-                let quant_biases = weights
-                    .get(&format!("{}.biases", prefix))
-                    .map(|w| mlxcel_core::copy(w));
-
-                Ok(Self::Quantized {
-                    weight,
-                    scales,
-                    quant_biases,
-                    linear_bias,
-                    group_size,
-                    bits,
-                })
-            }
+            Ok(Self::Quantized {
+                weight,
+                scales,
+                quant_biases,
+                linear_bias,
+                group_size,
+                bits,
+                mode: mode.to_string(),
+            })
         } else {
             Ok(Self::Regular {
                 weight,
@@ -472,6 +462,7 @@ impl GptOssSwitchGLU {
         group_size: i32,
         bits: i32,
         swiglu_limit: f32,
+        mode: &str,
     ) -> Result<Self, String> {
         Ok(Self {
             gate_proj: ExpertLinear::from_weights(
@@ -479,18 +470,21 @@ impl GptOssSwitchGLU {
                 &format!("{}.gate_proj", prefix),
                 group_size,
                 bits,
+                mode,
             )?,
             up_proj: ExpertLinear::from_weights(
                 weights,
                 &format!("{}.up_proj", prefix),
                 group_size,
                 bits,
+                mode,
             )?,
             down_proj: ExpertLinear::from_weights(
                 weights,
                 &format!("{}.down_proj", prefix),
                 group_size,
                 bits,
+                mode,
             )?,
             swiglu_limit,
         })
@@ -564,15 +558,23 @@ impl MLPBlock {
     fn from_weights(weights: &WeightMap, args: &ModelArgs, prefix: &str) -> Result<Self, String> {
         // Router has its own quantization params (typically group_size=64, bits=8)
         let router_prefix = format!("{}.router", prefix);
-        let (r_gs, r_bits) = args.quant_for(&router_prefix);
-        let router = UnifiedLinear::from_weights(weights, &router_prefix, r_gs, r_bits)?;
+        let (r_gs, r_bits, r_mode) = args.quant_for(&router_prefix);
+        let router =
+            UnifiedLinear::from_weights_with_mode(weights, &router_prefix, r_gs, r_bits, &r_mode)?;
 
+        // Experts use the default quantization mode (typically MXFP4 for this model)
+        let (exp_gs, exp_bits, exp_mode) = args
+            .quantization
+            .as_ref()
+            .map(|q| q.defaults())
+            .unwrap_or((64, 4, "affine".to_string()));
         let experts = GptOssSwitchGLU::from_weights(
             weights,
             &format!("{}.experts", prefix),
-            args.group_size(),
-            args.bits(),
+            exp_gs,
+            exp_bits,
             args.swiglu_limit,
+            &exp_mode,
         )?;
 
         Ok(Self {
@@ -680,20 +682,24 @@ impl Attention {
     ) -> Result<Self, String> {
         // Use per-component quantization params (attention uses affine, not MXFP4)
         let q_prefix = format!("{}.q_proj", prefix);
-        let (q_gs, q_bits) = args.quant_for(&q_prefix);
-        let q_proj = UnifiedLinear::from_weights(weights, &q_prefix, q_gs, q_bits)?;
+        let (q_gs, q_bits, q_mode) = args.quant_for(&q_prefix);
+        let q_proj =
+            UnifiedLinear::from_weights_with_mode(weights, &q_prefix, q_gs, q_bits, &q_mode)?;
 
         let k_prefix = format!("{}.k_proj", prefix);
-        let (k_gs, k_bits) = args.quant_for(&k_prefix);
-        let k_proj = UnifiedLinear::from_weights(weights, &k_prefix, k_gs, k_bits)?;
+        let (k_gs, k_bits, k_mode) = args.quant_for(&k_prefix);
+        let k_proj =
+            UnifiedLinear::from_weights_with_mode(weights, &k_prefix, k_gs, k_bits, &k_mode)?;
 
         let v_prefix = format!("{}.v_proj", prefix);
-        let (v_gs, v_bits) = args.quant_for(&v_prefix);
-        let v_proj = UnifiedLinear::from_weights(weights, &v_prefix, v_gs, v_bits)?;
+        let (v_gs, v_bits, v_mode) = args.quant_for(&v_prefix);
+        let v_proj =
+            UnifiedLinear::from_weights_with_mode(weights, &v_prefix, v_gs, v_bits, &v_mode)?;
 
         let o_prefix = format!("{}.o_proj", prefix);
-        let (o_gs, o_bits) = args.quant_for(&o_prefix);
-        let o_proj = UnifiedLinear::from_weights(weights, &o_prefix, o_gs, o_bits)?;
+        let (o_gs, o_bits, o_mode) = args.quant_for(&o_prefix);
+        let o_proj =
+            UnifiedLinear::from_weights_with_mode(weights, &o_prefix, o_gs, o_bits, &o_mode)?;
 
         let head_dim = args.head_dim as i32;
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -903,8 +909,6 @@ impl GptOssModel {
 
         let h = self.norm.forward(&h);
 
-        
-
         if let Some(ref head) = self.lm_head {
             head.forward(&h)
         } else {
@@ -942,7 +946,7 @@ impl GptOssModel {
 
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
         // Embedding may have different quantization than the top-level default
-        let (embed_gs, embed_bits) = args.quant_for("model.embed_tokens");
+        let (embed_gs, embed_bits, _embed_mode) = args.quant_for("model.embed_tokens");
         let embed_tokens =
             UnifiedEmbedding::from_weights(weights, "model.embed_tokens", embed_gs, embed_bits)?;
 
@@ -966,9 +970,9 @@ impl GptOssModel {
         let norm = RMSNorm::new(norm_weight, args.rms_norm_eps);
 
         let lm_head = if !args.tie_word_embeddings {
-            let (lm_gs, lm_bits) = args.quant_for("lm_head");
-            Some(UnifiedLinear::from_weights(
-                weights, "lm_head", lm_gs, lm_bits,
+            let (lm_gs, lm_bits, lm_mode) = args.quant_for("lm_head");
+            Some(UnifiedLinear::from_weights_with_mode(
+                weights, "lm_head", lm_gs, lm_bits, &lm_mode,
             )?)
         } else {
             None

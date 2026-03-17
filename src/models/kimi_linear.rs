@@ -182,6 +182,7 @@ impl MultiLinear {
                     transpose,
                     self.group_size,
                     self.bits,
+                    "affine",
                 )
             }
         } else if transpose {
@@ -1276,7 +1277,16 @@ impl KimiLinearModel {
                     let bits = (w_shape[w_shape.len() - 1] * 32) / dims;
                     let s_shape = mlxcel_core::array_shape(&scales);
                     let group_size = dims / s_shape[s_shape.len() - 1];
-                    mlxcel_core::dequantize(&w, &scales, &biases, group_size, bits)
+                    unsafe {
+                        mlxcel_core::dequantize(
+                            &w,
+                            &scales,
+                            &*biases as *const _,
+                            group_size,
+                            bits,
+                            "affine",
+                        )
+                    }
                 } else {
                     weights.remove(&kv_b_key).unwrap()
                 };

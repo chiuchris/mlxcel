@@ -927,16 +927,20 @@ std::unique_ptr<MlxArray> quantized_linear_forward(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,
     const MlxArray* linear_bias,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 ) {
-    // Pass scales/biases directly to quantized_matmul (matching Python nn.QuantizedLinear)
+    std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
+
     auto result = mlx::core::quantized_matmul(
-        x.inner, weight.inner, scales.inner, biases.inner,
+        x.inner, weight.inner, scales.inner, biases_opt,
         true,  // transpose
-        group_size, bits
+        std::optional<int>(group_size), std::optional<int>(bits),
+        mode_str
     );
 
     if (linear_bias != nullptr) {
@@ -1447,17 +1451,19 @@ std::unique_ptr<MlxArray> gather_qmm(
     bool transpose,
     int32_t group_size,
     int32_t bits,
-    bool sorted_indices
+    bool sorted_indices,
+    rust::Str mode
 ) {
     std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
     std::optional<array> lhs_opt = lhs_indices ? std::optional(lhs_indices->inner) : std::nullopt;
     std::optional<array> rhs_opt = rhs_indices ? std::optional(rhs_indices->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
 
     return std::make_unique<MlxArray>(mlx::core::gather_qmm(
         x.inner, w.inner, scales.inner, biases_opt,
         lhs_opt, rhs_opt, transpose,
         std::optional<int>(group_size), std::optional<int>(bits),
-        "affine", sorted_indices
+        mode_str, sorted_indices
     ));
 }
 
@@ -1468,28 +1474,35 @@ std::unique_ptr<MlxArray> quantized_matmul(
     const MlxArray* biases,
     bool transpose,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 ) {
     std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
 
     return std::make_unique<MlxArray>(mlx::core::quantized_matmul(
         x.inner, w.inner, scales.inner, biases_opt,
         transpose,
         std::optional<int>(group_size), std::optional<int>(bits),
-        "affine"
+        mode_str
     ));
 }
 
 std::unique_ptr<MlxArray> dequantize(
     const MlxArray& w,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 ) {
+    std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
+
     return std::make_unique<MlxArray>(mlx::core::dequantize(
-        w.inner, scales.inner, biases.inner,
-        group_size, bits, "affine"
+        w.inner, scales.inner, biases_opt,
+        std::optional<int>(group_size), std::optional<int>(bits),
+        mode_str
     ));
 }
 
@@ -1501,10 +1514,11 @@ std::unique_ptr<MlxArray> embedding(const MlxArray& weight, const MlxArray& indi
 std::unique_ptr<MlxArray> quantized_embedding(
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,
     const MlxArray& indices,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 ) {
     // Save original indices shape for reshaping later
     auto idx_shape = indices.inner.shape();
@@ -1515,16 +1529,22 @@ std::unique_ptr<MlxArray> quantized_embedding(
     // Take rows from quantized weights using flattened indices
     auto w_indexed = mlx::core::take(weight.inner, flat_indices, 0);
     auto scales_indexed = mlx::core::take(scales.inner, flat_indices, 0);
-    auto biases_indexed = mlx::core::take(biases.inner, flat_indices, 0);
+
+    std::optional<mlx::core::array> biases_opt = std::nullopt;
+    if (biases) {
+        biases_opt = mlx::core::take(biases->inner, flat_indices, 0);
+    }
+
+    std::string mode_str(mode.data(), mode.size());
 
     // Dequantize with explicit optional wrapping
     auto result = mlx::core::dequantize(
         w_indexed,
         scales_indexed,
-        std::optional<mlx::core::array>(biases_indexed),
+        biases_opt,
         std::optional<int>(group_size),
         std::optional<int>(bits),
-        "affine",
+        mode_str,
         std::nullopt  // use default dtype
     );
 
@@ -1645,7 +1665,7 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     const MlxArray& x,
     const MlxArray& weight,
     const MlxArray& scales,
-    const MlxArray& biases,
+    const MlxArray* biases,
     int32_t num_heads,
     int32_t head_dim,
     int32_t rope_dims,
@@ -1653,13 +1673,18 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     int32_t cache_offset,
     int32_t group_size,
     int32_t bits,
-    bool apply_rope
+    bool apply_rope,
+    rust::Str mode
 ) {
     auto batch_size = x.inner.shape()[0];
     auto seq_len = x.inner.shape()[1];
 
     // Projection
-    auto proj = quantized_matmul(x.inner, weight.inner, scales.inner, biases.inner, true, group_size, bits);
+    std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
+    auto proj = mlx::core::quantized_matmul(
+        x.inner, weight.inner, scales.inner, biases_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
 
     // Reshape to [batch, seq_len, n_heads, head_dim]
     proj = reshape(proj, {batch_size, seq_len, num_heads, head_dim});
@@ -1718,26 +1743,53 @@ std::unique_ptr<MlxArray> compiled_moe_expert_forward(
     const MlxArray& x,
     const MlxArray& gate_proj,
     const MlxArray& gate_scales,
-    const MlxArray& gate_biases,
+    const MlxArray* gate_biases,
     const MlxArray& up_proj,
     const MlxArray& up_scales,
-    const MlxArray& up_biases,
+    const MlxArray* up_biases,
     const MlxArray& down_proj,
     const MlxArray& down_scales,
-    const MlxArray& down_biases,
+    const MlxArray* down_biases,
     int32_t group_size,
-    int32_t bits
+    int32_t bits,
+    rust::Str mode
 ) {
-    static auto compiled_fn = get_compiled_qmoe_expert();
+    std::string mode_str(mode.data(), mode.size());
 
-    auto result = compiled_fn({
-        x.inner,
-        gate_proj.inner, gate_scales.inner, gate_biases.inner,
-        up_proj.inner, up_scales.inner, up_biases.inner,
-        down_proj.inner, down_scales.inner, down_biases.inner
-    });
+    // Compiled path only supports affine mode with biases present
+    if (mode_str == "affine" && gate_biases && up_biases && down_biases) {
+        static auto compiled_fn = get_compiled_qmoe_expert();
 
-    return std::make_unique<MlxArray>(std::move(result[0]));
+        auto result = compiled_fn({
+            x.inner,
+            gate_proj.inner, gate_scales.inner, gate_biases->inner,
+            up_proj.inner, up_scales.inner, up_biases->inner,
+            down_proj.inner, down_scales.inner, down_biases->inner
+        });
+
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    // Non-compiled fallback for mxfp4/nvfp4/mxfp8 or missing biases
+    std::optional<array> gb_opt = gate_biases ? std::optional(gate_biases->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_biases ? std::optional(up_biases->inner) : std::nullopt;
+    std::optional<array> db_opt = down_biases ? std::optional(down_biases->inner) : std::nullopt;
+
+    auto gate = mlx::core::quantized_matmul(
+        x.inner, gate_proj.inner, gate_scales.inner, gb_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+    auto up = mlx::core::quantized_matmul(
+        x.inner, up_proj.inner, up_scales.inner, ub_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    auto silu_gate = mlx::core::multiply(gate, mlx::core::sigmoid(gate));
+    auto activated = mlx::core::multiply(silu_gate, up);
+
+    auto down = mlx::core::quantized_matmul(
+        activated, down_proj.inner, down_scales.inner, db_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    return std::make_unique<MlxArray>(std::move(down));
 }
 
 // Memory management.

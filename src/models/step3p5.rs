@@ -606,6 +606,7 @@ impl Step3p5SwitchGLU {
                 self.group_size,
                 self.bits,
                 false,
+                "affine",
             )
         };
 
@@ -622,6 +623,7 @@ impl Step3p5SwitchGLU {
                 self.group_size,
                 self.bits,
                 false,
+                "affine",
             )
         };
 
@@ -645,6 +647,7 @@ impl Step3p5SwitchGLU {
                 self.group_size,
                 self.bits,
                 false,
+                "affine",
             )
         };
 
