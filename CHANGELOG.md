@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.9] - 2026-03-17
+
+### Added
+- GptOss MoE model with sinks SDPA support
+- MXFP4/NVFP4/MXFP8 quantization mode support across FFI bridge and model layers
+- GPT-OSS benchmark results to model test documentation
+
+### Fixed
+- Set wired memory limit to `gpu_max_memory_size` by default
+
+### Changed
+- Re-benchmark all models after wired limit fix
+
 ## [v0.0.8] - 2026-03-17
 
 ### Fixed
@@ -162,6 +175,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.9]: https://github.com/lablup/mlxcel/compare/v0.0.8...v0.0.9
 [v0.0.8]: https://github.com/lablup/mlxcel/compare/v0.0.7...v0.0.8
 [v0.0.7]: https://github.com/lablup/mlxcel/compare/v0.0.6...v0.0.7
 [v0.0.6]: https://github.com/lablup/mlxcel/compare/v0.0.5...v0.0.6
