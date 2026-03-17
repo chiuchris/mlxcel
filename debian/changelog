@@ -1,3 +1,11 @@
+mlxcel (0.0.10-1~jammy1) jammy; urgency=medium
+
+  * Fix: ExaOne4 causal mask dtype mismatch with bfloat16 model weights
+  * Fix: StableLM EOS token now read from config.json instead of hardcoded 0
+  * Update: Add static mode string pool for quantized ops hot path
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Tue, 17 Mar 2026 21:00:00 +0900
+
 mlxcel (0.0.9-1~jammy1) jammy; urgency=medium
 
   * Feat: Add GptOss MoE model with sinks SDPA support

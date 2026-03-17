@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.10] - 2026-03-17
+
+### Fixed
+- ExaOne4: Cast causal mask to bfloat16 to match model weights dtype (MLX SDPA requires mask type to promote to output type)
+- StableLM: Read `eos_token_id` from config.json instead of hardcoding 0, fixing premature 1-token generation
+
+### Changed
+- Add static mode string pool for quantized ops to avoid per-call heap allocation in C++ bridge hot path
+
 ## [v0.0.9] - 2026-03-17
 
 ### Added
@@ -175,6 +184,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.10]: https://github.com/lablup/mlxcel/compare/v0.0.9...v0.0.10
 [v0.0.9]: https://github.com/lablup/mlxcel/compare/v0.0.8...v0.0.9
 [v0.0.8]: https://github.com/lablup/mlxcel/compare/v0.0.7...v0.0.8
 [v0.0.7]: https://github.com/lablup/mlxcel/compare/v0.0.6...v0.0.7
