@@ -633,21 +633,20 @@ impl ExaOne4Model {
         let local_offset = caches[local_idx].as_interface().offset();
         let global_offset = caches[global_idx].as_interface().offset();
 
-        // Create masks
+        // Create masks (cast to bfloat16 to match model weights dtype for SDPA)
         let mask_local = if self.sliding_window.is_some() {
-            // Clamp offset so mask shape matches RotatingKVCache output
             let max_cache = self.sliding_window.map(|w| w as i32).unwrap_or(i32::MAX);
             let effective_offset = local_offset.min((max_cache - seq_len).max(0));
-            Some(create_causal_mask_with_window(
-                seq_len,
-                effective_offset,
-                Some(max_cache),
-            ))
+            let mask = create_causal_mask_with_window(seq_len, effective_offset, Some(max_cache));
+            Some(mlxcel_core::astype(&mask, mlxcel_core::dtype::BFLOAT16))
         } else {
             None
         };
 
-        let mask_global = Some(create_causal_mask(seq_len, global_offset));
+        let mask_global = Some(mlxcel_core::astype(
+            &create_causal_mask(seq_len, global_offset),
+            mlxcel_core::dtype::BFLOAT16,
+        ));
 
         self.forward(
             input_ids,

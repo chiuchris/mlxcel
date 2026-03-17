@@ -49,6 +49,9 @@ pub struct ModelArgs {
 
     #[serde(default)]
     pub quantization: Option<Quantization>,
+
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -400,6 +403,7 @@ pub struct StableLMModel {
     pub layers: Vec<TransformerBlock>,
     pub norm: LayerNorm,
     pub lm_head: UnifiedLinear,
+    eos_token_ids: Vec<i32>,
 }
 
 impl StableLMModel {
@@ -478,11 +482,24 @@ impl StableLMModel {
         // Load LM head
         let lm_head = UnifiedLinear::from_weights(weights, "lm_head", group_size, bits)?;
 
+        // Parse EOS token IDs from config
+        let eos_token_ids = match &args.eos_token_id {
+            Some(serde_json::Value::Number(n)) => {
+                vec![n.as_i64().unwrap_or(0) as i32]
+            }
+            Some(serde_json::Value::Array(arr)) => arr
+                .iter()
+                .filter_map(|v| v.as_i64().map(|n| n as i32))
+                .collect(),
+            _ => vec![0],
+        };
+
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             lm_head,
+            eos_token_ids,
         })
     }
 }
@@ -507,6 +524,6 @@ impl LanguageModel for StableLMModel {
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
-        vec![0] // Default EOS token
+        self.eos_token_ids.clone()
     }
 }
