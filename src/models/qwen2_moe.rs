@@ -60,6 +60,9 @@ pub struct ModelArgs {
 
     #[serde(default)]
     pub bits: Option<i32>,
+
+    #[serde(default)]
+    pub head_dim: Option<usize>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -72,7 +75,8 @@ impl ModelArgs {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn group_size(&self) -> i32 {

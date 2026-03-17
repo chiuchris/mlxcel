@@ -48,6 +48,8 @@ pub struct Qwen3VLConfig {
     #[serde(default)]
     pub tie_word_embeddings: bool,
     #[serde(default)]
+    pub head_dim: Option<usize>,
+    #[serde(default)]
     pub attention_bias: bool, // false for Qwen3-VL
     #[serde(default)]
     pub quantization: Option<QuantConfig>,
@@ -87,7 +89,8 @@ impl Qwen3VLConfig {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
     fn head_dim(&self) -> usize {
-        self.hidden_size / self.num_attention_heads
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
     fn group_size(&self) -> i32 {
         self.quantization
