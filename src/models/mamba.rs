@@ -320,25 +320,30 @@ impl MambaBlock {
             .and_then(|c| c.ssm_state.as_ref())
             .and_then(|s| s.as_ref());
 
-        let mut current_state = state_cache.map(mlxcel_core::copy);
-        let mut y_steps = Vec::with_capacity(t);
-
-        for t_idx in 0..t {
-            let x_t = slice_axis(&x_conv, 1, t_idx as i32, (t_idx + 1) as i32);
-            let x_t = mlxcel_core::squeeze_axis(&x_t, 1);
-
-            let state_ref = current_state.as_ref().and_then(|s| s.as_ref());
+        // For single-token decode (t=1), avoid copy + stack overhead
+        let (y, current_state) = if t == 1 {
+            let x_t = mlxcel_core::squeeze_axis(&x_conv, 1);
+            let state_ref = state_cache;
             let (y_t, new_state) = self.ssm_step(&x_t, &a, state_ref);
-            y_steps.push(y_t);
-            current_state = Some(new_state);
-        }
-
-        // Stack all y steps
-        let y_ptrs: Vec<*const MlxArray> = y_steps
-            .iter()
-            .map(|arr| arr.as_ref().unwrap() as *const MlxArray)
-            .collect();
-        let y = mlxcel_core::stack(&y_ptrs, 1);
+            let y = mlxcel_core::expand_dims(&y_t, 1); // restore seq dim
+            (y, Some(new_state))
+        } else {
+            let mut current_state = state_cache.map(mlxcel_core::copy);
+            let mut y_steps = Vec::with_capacity(t);
+            for t_idx in 0..t {
+                let x_t = slice_axis(&x_conv, 1, t_idx as i32, (t_idx + 1) as i32);
+                let x_t = mlxcel_core::squeeze_axis(&x_t, 1);
+                let state_ref = current_state.as_ref().and_then(|s| s.as_ref());
+                let (y_t, new_state) = self.ssm_step(&x_t, &a, state_ref);
+                y_steps.push(y_t);
+                current_state = Some(new_state);
+            }
+            let y_ptrs: Vec<*const MlxArray> = y_steps
+                .iter()
+                .map(|arr| arr.as_ref().unwrap() as *const MlxArray)
+                .collect();
+            (mlxcel_core::stack(&y_ptrs, 1), current_state)
+        };
 
         // z = out_proj(silu(z) * y)
         let z_activated = silu(&z);

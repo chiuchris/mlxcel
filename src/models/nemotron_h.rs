@@ -399,13 +399,12 @@ impl NemotronHMamba2Mixer {
         let seq_len = shape[1];
         let k = self.conv_kernel_size;
 
-        let conv_state = cache.as_ref().and_then(|c| {
-            c.conv_state
-                .as_ref()
-                .and_then(|s| s.as_ref().map(mlxcel_core::copy))
-        });
+        let conv_state_ref = cache
+            .as_ref()
+            .and_then(|c| c.conv_state.as_ref())
+            .and_then(|s| s.as_ref());
 
-        let padded_input = if let Some(ref conv_st) = conv_state {
+        let padded_input = if let Some(conv_st) = conv_state_ref {
             concatenate(conv_st, &conv_input, 1)
         } else {
             let pad_arr = mlxcel_core::zeros(
@@ -462,18 +461,17 @@ impl NemotronHMamba2Mixer {
         );
 
         // SSM computation
-        let ssm_state = cache.as_ref().and_then(|c| {
-            c.ssm_state
-                .as_ref()
-                .and_then(|s| s.as_ref().map(mlxcel_core::copy))
-        });
+        let ssm_state_ref = cache
+            .as_ref()
+            .and_then(|c| c.ssm_state.as_ref())
+            .and_then(|s| s.as_ref());
 
         // Use fused Metal kernel for single-token decode when state is available
         let (y, new_state) =
-            if seq_len == 1 && ssm_state.is_some() && mlxcel_core::ssm_kernel_available() {
-                self.ssm_step_kernel(&hidden_ssm, &b, &c, &dt, ssm_state.as_ref().unwrap())
+            if seq_len == 1 && ssm_state_ref.is_some() && mlxcel_core::ssm_kernel_available() {
+                self.ssm_step_kernel(&hidden_ssm, &b, &c, &dt, ssm_state_ref.unwrap())
             } else {
-                self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state.as_deref())
+                self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state_ref)
             };
 
         // Update SSM state
