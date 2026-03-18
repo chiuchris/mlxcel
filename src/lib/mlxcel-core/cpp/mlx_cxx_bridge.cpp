@@ -1688,8 +1688,18 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     float scale,
     const MlxArray* mask
 ) {
-    std::optional<array> mask_opt = mask ? std::optional(mask->inner) : std::nullopt;
-    std::string mask_mode = mask ? "array" : "";
+    // Cast mask to Q's dtype to avoid "Mask type must promote to output type" errors
+    // when mask is float32 but Q/K/V are float16 or bfloat16
+    std::optional<array> mask_opt = std::nullopt;
+    std::string mask_mode = "";
+    if (mask) {
+        auto m = mask->inner;
+        if (m.dtype() != q.inner.dtype()) {
+            m = mlx::core::astype(m, q.inner.dtype());
+        }
+        mask_opt = m;
+        mask_mode = "array";
+    }
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
     ));
@@ -1705,8 +1715,14 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     const MlxArray* mask,
     const MlxArray* sinks
 ) {
-    std::optional<array> mask_opt = mask ? std::optional(mask->inner) : std::nullopt;
-    std::string mask_mode = mask ? "array" : "";
+    std::optional<array> mask_opt = std::nullopt;
+    std::string mask_mode = "";
+    if (mask) {
+        auto m = mask->inner;
+        if (m.dtype() != q.inner.dtype()) m = mlx::core::astype(m, q.inner.dtype());
+        mask_opt = m;
+        mask_mode = "array";
+    }
     std::optional<array> sinks_opt = sinks ? std::optional(sinks->inner) : std::nullopt;
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, mask_mode, mask_opt, sinks_opt
