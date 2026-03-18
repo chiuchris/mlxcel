@@ -371,6 +371,8 @@ impl CxxGenerator {
         // 3. Extract current value (syncs current only)
         // 4. Yield/store current
         // 5. Move next to current
+        let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
+
         let mut n = 0;
         loop {
             // Start next step (if not at max)
@@ -379,7 +381,11 @@ impl CxxGenerator {
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
                 let (next_tok, next_log) =
                     sample_token_optimized(&next_logits, sampling, &token_history);
-                ffi::async_eval_pair(&next_tok, &next_log);
+                if force_sync {
+                    ffi::eval(&next_tok);
+                } else {
+                    ffi::async_eval_pair(&next_tok, &next_log);
+                }
                 (Some(next_tok), Some(next_log))
             } else {
                 (None, None)
