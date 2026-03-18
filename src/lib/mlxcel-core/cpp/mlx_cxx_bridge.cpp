@@ -2626,8 +2626,10 @@ namespace {
     static array compute_dt_fn(const array& dt, const array& dt_bias, float min_val, float max_val) {
         auto result = mlx::core::add(dt, dt_bias);
         result = mlx::core::log1p(mlx::core::exp(result));
-        auto lo = mlx::core::array(min_val);
-        auto hi = mlx::core::array(max_val);
+        // Use input dtype for clip bounds to avoid float32 promotion
+        auto dt_dtype = dt.dtype();
+        auto lo = mlx::core::astype(mlx::core::array(min_val), dt_dtype);
+        auto hi = mlx::core::astype(mlx::core::array(max_val), dt_dtype);
         return mlx::core::clip(result, lo, hi);
     }
 }
@@ -2750,16 +2752,17 @@ std::unique_ptr<MlxArray> fused_moe_forward(
         std::nullopt, topk_indices,
         true, group_size, bits, "affine", false);
     // relu² = relu(x)²
-    h = square(maximum(h, array(0.0f)));
+    h = square(maximum(h, mlx::core::zeros_like(h)));
     h = gather_qmm(
         h, fc2_weight.inner, fc2_scales.inner, fc2_biases.inner,
         std::nullopt, topk_indices,
         true, group_size, bits, "affine", false);
     h = squeeze(h, -2);  // [tokens, top_k, hidden]
 
-    // 3. Score weighting: weighted sum over experts
+    // 3. Score weighting: weighted sum over experts, cast back to input dtype
+    // (scores are float32 from sigmoid, must cast result back like Python does)
     auto scores_exp = reshape(topk_scores, {topk_scores.shape()[0], top_k, 1});
-    auto result = sum(multiply(h, scores_exp), -2, false);
+    auto result = astype(sum(multiply(h, scores_exp), -2, false), x.inner.dtype());
 
     // 4. Optional shared expert
     if (shared_up_weight && shared_down_weight) {
@@ -2767,7 +2770,7 @@ std::unique_ptr<MlxArray> fused_moe_forward(
             x.inner, shared_up_weight->inner, shared_up_scales->inner,
             shared_up_biases ? std::optional(shared_up_biases->inner) : std::nullopt,
             true, group_size, bits);
-        shared_h = square(maximum(shared_h, array(0.0f)));
+        shared_h = square(maximum(shared_h, mlx::core::zeros_like(shared_h)));
         shared_h = quantized_matmul(
             shared_h, shared_down_weight->inner, shared_down_scales->inner,
             shared_down_biases ? std::optional(shared_down_biases->inner) : std::nullopt,
@@ -2909,6 +2912,11 @@ void fused_mamba2_forward(
     // Restore to [batch, seq_len, proj_cols]
     auto projected = reshape(projected_flat, {batch, seq_len, proj_cols});
 
+    // Dtype trace (temporary)
+    if (std::getenv("MLXCEL_TRACE_DTYPE")) {
+        mlx::core::eval(projected);
+        std::cerr << "[C++ DTYPE] after in_proj: " << projected.dtype() << std::endl;
+    }
     // --- Step 2: Split projected into gate, conv_input, dt ---
     // gate:       [batch, seq_len, intermediate_size]
     // conv_input: [batch, seq_len, conv_dim]
@@ -2990,6 +2998,10 @@ void fused_mamba2_forward(
         ssm_y, new_ssm_state);
 
     // ssm_y: [batch, 1, num_heads, head_dim] -> [batch, seq_len, intermediate_size]
+    if (std::getenv("MLXCEL_TRACE_DTYPE")) {
+        mlx::core::eval(ssm_y->inner);
+        std::cerr << "[C++ DTYPE] ssm_y: " << ssm_y->inner.dtype() << std::endl;
+    }
     auto y = reshape(ssm_y->inner, {batch, seq_len, intermediate_size});
 
     // --- Step 7: MambaRMSNormGated ---
@@ -2999,7 +3011,7 @@ void fused_mamba2_forward(
     // 7b. Grouped RMS norm: reshape last dim into [batch, seq_len, num_heads, head_dim]
     //     (norm group_size == head_dim, i.e. one RMS norm group per head)
     auto y_grouped = reshape(y_gated, {batch, seq_len, num_heads, head_dim});
-    auto unit_weight = mlx::core::ones({head_dim}, float32);
+    auto unit_weight = mlx::core::ones({head_dim}, hidden_states.inner.dtype());
     auto y_normed_grouped = mlx::core::fast::rms_norm(y_grouped, unit_weight, norm_eps);
 
     // 7c. Flatten back and apply learned norm weight
@@ -3014,6 +3026,10 @@ void fused_mamba2_forward(
         : quantized_matmul(y_proj_flat, out_proj_weight.inner, out_proj_scales.inner,
                           std::nullopt, true, group_size, bits);
     auto out = reshape(out_flat, {batch, seq_len, hidden});
+    if (std::getenv("MLXCEL_TRACE_DTYPE")) {
+        mlx::core::eval(out);
+        std::cerr << "[C++ DTYPE] final out: " << out.dtype() << std::endl;
+    }
 
     // --- Write outputs ---
     output         = std::make_unique<MlxArray>(std::move(out));

@@ -326,7 +326,7 @@ impl MambaRMSNormGated {
 
         // Apply RMS norm per group
         let group_weight =
-            mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::FLOAT32);
+            mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::BFLOAT16);
         let x_normed = mlxcel_core::fast_rms_norm(&x_grouped, &group_weight, self.eps);
 
         // Flatten back and apply weight
@@ -409,7 +409,7 @@ impl NemotronHMamba2Mixer {
         } else {
             let pad_arr = mlxcel_core::zeros(
                 &[batch, (k - 1) as i32, self.conv_dim as i32],
-                mlxcel_core::dtype::FLOAT32,
+                mlxcel_core::dtype::BFLOAT16,
             );
             concatenate(&pad_arr, &conv_input, 1)
         };
@@ -534,13 +534,15 @@ impl NemotronHMamba2Mixer {
         let dt_biased = mlxcel_core::add(dt, &self.dt_bias);
         let dt_soft = mlxcel_core::softplus(&dt_biased);
         let min_val =
-            mlxcel_core::full_f32(&[1], self.time_step_limit.0, mlxcel_core::dtype::FLOAT32);
+            mlxcel_core::full_f32(&[1], self.time_step_limit.0, mlxcel_core::dtype::BFLOAT16);
         let max_val =
-            mlxcel_core::full_f32(&[1], self.time_step_limit.1, mlxcel_core::dtype::FLOAT32);
+            mlxcel_core::full_f32(&[1], self.time_step_limit.1, mlxcel_core::dtype::BFLOAT16);
         let dt = mlxcel_core::clip(&dt_soft, &min_val, &max_val);
 
-        // A = -exp(A_log)
+        // A = -exp(A_log), cast to input dtype (A_log is float32 in safetensors,
+        // but Python does .astype(dt.dtype) to keep hidden states in bfloat16)
         let a = mlxcel_core::negative(&mlxcel_core::exp(&self.a_log));
+        let a = mlxcel_core::astype(&a, mlxcel_core::array_dtype(hidden_states));
         let a_reshaped = mlxcel_core::reshape(&a, &[1, 1, num_heads]);
 
         // dtA = dt * A
@@ -883,7 +885,7 @@ impl NemotronHAttention {
         // Scaled dot-product attention
         let keys_t = mlxcel_core::transpose_axes(&keys, &[0, 1, 3, 2]);
         let mut scores = mlxcel_core::matmul(&queries, &keys_t);
-        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::dtype::FLOAT32);
+        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::dtype::BFLOAT16);
         scores = mlxcel_core::multiply(&scores, &scale_arr);
 
         if let Some(m) = mask {
@@ -1877,7 +1879,7 @@ impl NemotronHModel {
                     let e_score_bias = weights
                         .remove(&format!("{}.gate.e_score_correction_bias", mixer_prefix))
                         .unwrap_or_else(|| {
-                            mlxcel_core::zeros(&[n_routed as i32], mlxcel_core::dtype::FLOAT32)
+                            mlxcel_core::zeros(&[n_routed as i32], mlxcel_core::dtype::BFLOAT16)
                         });
 
                     // Switch MLP (quantized or regular)
