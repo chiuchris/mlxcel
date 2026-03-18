@@ -358,7 +358,10 @@ impl MoEGate {
         // Normalize if needed
         let topk_scores = if self.top_k > 1 && self.norm_topk_prob {
             let sum = mlxcel_core::sum_axis(&topk_scores, -1, true);
-            let denom = mlxcel_core::add(&sum, &mlxcel_core::full_f32(&[1], 1e-20, dtype::FLOAT32));
+            let denom = mlxcel_core::add(
+                &sum,
+                &mlxcel_core::full_f32(&[1], 1e-20, mlxcel_core::array_dtype(&topk_scores)),
+            );
             mlxcel_core::divide(&topk_scores, &denom)
         } else {
             topk_scores

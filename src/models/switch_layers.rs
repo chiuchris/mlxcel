@@ -257,7 +257,7 @@ pub fn group_mask_scores(scores: &MlxArray, n_group: i32, topk_group: i32) -> Un
     let group_idx = slice_axis(&group_idx, -2, 0, k); // [n, k, 1]
 
     // Zero out experts in non-selected groups
-    let zero = mlxcel_core::full_f32(&[1], 0.0, dtype::FLOAT32);
+    let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::array_dtype(&grouped));
     let grouped = mlxcel_core::put_along_axis(&grouped, &group_idx, &zero, -2);
 
     // Flatten back: [n, n_group, experts_per_group] -> [n, n_experts]

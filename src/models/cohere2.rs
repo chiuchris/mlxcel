@@ -21,7 +21,6 @@
 //! - Parallel attention + MLP (both on same normalized input)
 //! - Logit scaling
 
-use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
@@ -403,7 +402,8 @@ impl Cohere2Model {
         let logits = self.lm_head.forward(&h);
 
         // Apply logit scaling
-        let scale_arr = mlxcel_core::full_f32(&[1], self.logit_scale, dtype::FLOAT32);
+        let scale_arr =
+            mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::array_dtype(&logits));
         mlxcel_core::multiply(&logits, &scale_arr)
     }
 
@@ -454,7 +454,8 @@ impl Cohere2Model {
 
         let h = self.norm.forward(&h);
         let logits = self.lm_head.forward(&h);
-        let scale_arr = mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::dtype::FLOAT32);
+        let scale_arr =
+            mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::array_dtype(&logits));
         mlxcel_core::multiply(&logits, &scale_arr)
     }
 

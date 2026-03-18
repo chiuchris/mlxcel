@@ -272,8 +272,9 @@ impl Moondream3Attention {
         let alpha = mlxcel_core::reshape(&self.tau_alpha, &[self.num_heads, 1]);
         let tau_pos = mlxcel_core::multiply(&alpha, &positions);
         let tau_pos = mlxcel_core::sigmoid(&tau_pos);
-        let half = mlxcel_core::full_f32(&[1], 0.5, mlxcel_core::dtype::FLOAT32);
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+        let qkv_dtype = mlxcel_core::array_dtype(qkv);
+        let half = mlxcel_core::full_f32(&[1], 0.5, qkv_dtype);
+        let one = mlxcel_core::full_f32(&[1], 1.0, qkv_dtype);
         let tau_pos = mlxcel_core::subtract(&tau_pos, &half);
         let tau_pos = mlxcel_core::add(&tau_pos, &one);
         let tau = mlxcel_core::expand_dims(&tok, -1);
@@ -384,8 +385,7 @@ impl SparseMoeMlp {
         );
         // Moondream3 MoE GeGLU uses exact GELU (F.gelu), not tanh-approximate
         let h = mlxcel_core::gelu(&h);
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
-        let one = mlxcel_core::astype(&one, mlxcel_core::array_dtype(&g));
+        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(&g));
         let g = mlxcel_core::add(&g, &one);
         let hidden = mlxcel_core::multiply(&h, &g);
         let hidden = mlxcel_core::expand_dims(&hidden, -2);

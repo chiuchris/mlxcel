@@ -276,7 +276,7 @@ impl SparseMoeBlock {
 
         // Normalize scores to sum to 1
         let score_sum = mlxcel_core::sum_axis(&topk_scores, -1, true);
-        let eps = mlxcel_core::full_f32(&[1], 1e-20, mlxcel_core::dtype::FLOAT32);
+        let eps = mlxcel_core::full_f32(&[1], 1e-20, mlxcel_core::array_dtype(&topk_scores));
         let score_sum = mlxcel_core::add(&score_sum, &eps);
         let norm_scores = mlxcel_core::divide(&topk_scores, &score_sum);
         let norm_scores = mlxcel_core::astype(&norm_scores, mlxcel_core::array_dtype(&x_flat));

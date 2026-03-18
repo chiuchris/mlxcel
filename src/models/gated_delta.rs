@@ -170,7 +170,7 @@ pub fn gated_delta_ops(
     let mut current_state = if let Some(s) = state {
         mlxcel_core::copy(s)
     } else {
-        mlxcel_core::zeros(&[b, hv, dv, dk], dtype::FLOAT32)
+        mlxcel_core::zeros(&[b, hv, dv, dk], mlxcel_core::array_dtype(v))
     };
 
     // Compute repeat factor for GQA
@@ -314,7 +314,7 @@ impl RMSNormGated {
         // RMS normalization
         let x_sq = mlxcel_core::square(x);
         let mean_sq = mlxcel_core::mean_axis(&x_sq, -1, true);
-        let eps_arr = mlxcel_core::full_f32(&[1], self.eps, dtype::FLOAT32);
+        let eps_arr = mlxcel_core::full_f32(&[1], self.eps, mlxcel_core::array_dtype(&mean_sq));
         let rms = mlxcel_core::sqrt(&mlxcel_core::add(&mean_sq, &eps_arr));
         let normed = mlxcel_core::divide(x, &rms);
         let scaled = mlxcel_core::multiply(&normed, &self.weight);

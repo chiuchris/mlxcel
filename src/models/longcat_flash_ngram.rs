@@ -208,7 +208,7 @@ impl LongcatFlashMLA {
 
         // Apply Q LoRA scaling
         if let Some(scale) = self.mla_scale_q_lora {
-            let s = mlxcel_core::full_f32(&[1], scale, dtype::FLOAT32);
+            let s = mlxcel_core::full_f32(&[1], scale, mlxcel_core::array_dtype(&q));
             q = mlxcel_core::multiply(&q, &s);
         }
 
@@ -228,7 +228,7 @@ impl LongcatFlashMLA {
         // KV latent with layernorm and optional scaling
         let mut kv_latent = self.kv_a_layernorm.forward(&compressed);
         if let Some(scale) = self.mla_scale_kv_lora {
-            let s = mlxcel_core::full_f32(&[1], scale, dtype::FLOAT32);
+            let s = mlxcel_core::full_f32(&[1], scale, mlxcel_core::array_dtype(&kv_latent));
             kv_latent = mlxcel_core::multiply(&kv_latent, &s);
         }
 
@@ -258,7 +258,7 @@ impl LongcatFlashMLA {
         let (kv_latent, k_pe) = cache.update_and_fetch(kv_latent, k_pe);
 
         // Compute PE scores: (q_pe * scale) @ k_pe^T
-        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, dtype::FLOAT32);
+        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::array_dtype(&q_pe));
         let scaled_q_pe = mlxcel_core::multiply(&q_pe, &scale_arr);
         let k_pe_t = mlxcel_core::transpose_axes(&k_pe, &[0, 1, 3, 2]);
         let mut pe_scores = mlxcel_core::matmul(&scaled_q_pe, &k_pe_t);
@@ -455,7 +455,8 @@ impl LongcatFlashTopkRouter {
         // Normalize if needed
         let topk_weights = if self.norm_topk_prob {
             let sum = mlxcel_core::sum_axis(&topk_weights, -1, true);
-            let eps = mlxcel_core::full_f32(&[1], 1e-20, dtype::FLOAT32);
+            let w_dtype = mlxcel_core::array_dtype(&topk_weights);
+            let eps = mlxcel_core::full_f32(&[1], 1e-20, w_dtype);
             let denom = mlxcel_core::add(&sum, &eps);
             mlxcel_core::divide(&topk_weights, &denom)
         } else {
@@ -463,7 +464,11 @@ impl LongcatFlashTopkRouter {
         };
 
         // Scale
-        let scale_arr = mlxcel_core::full_f32(&[1], self.routed_scaling_factor, dtype::FLOAT32);
+        let scale_arr = mlxcel_core::full_f32(
+            &[1],
+            self.routed_scaling_factor,
+            mlxcel_core::array_dtype(&topk_weights),
+        );
         let topk_weights = mlxcel_core::multiply(&topk_weights, &scale_arr);
 
         // Cast back to input dtype
@@ -825,7 +830,7 @@ impl NgramEmbedding {
 
         // Normalize by (1 + k * (n-1))
         let divisor = (1 + self.k * (self.n - 1)) as f32;
-        let div_arr = mlxcel_core::full_f32(&[1], divisor, dtype::FLOAT32);
+        let div_arr = mlxcel_core::full_f32(&[1], divisor, mlxcel_core::array_dtype(&x));
         mlxcel_core::divide(&x, &div_arr)
     }
 

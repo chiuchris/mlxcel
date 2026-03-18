@@ -275,8 +275,9 @@ fn parse_eos_token_ids(config: &serde_json::Value) -> Vec<i32> {
 /// clip(silu(gate), max=limit) * clip(x, -limit, limit)
 fn clamped_swiglu(x: &MlxArray, gate: &MlxArray, limit: f32) -> UniquePtr<MlxArray> {
     let silu_gate = mlxcel_core::silu(gate);
-    let limit_arr = mlxcel_core::full_f32(&[1], limit, dtype::FLOAT32);
-    let neg_limit_arr = mlxcel_core::full_f32(&[1], -limit, dtype::FLOAT32);
+    let x_dtype = mlxcel_core::array_dtype(x);
+    let limit_arr = mlxcel_core::full_f32(&[1], limit, x_dtype);
+    let neg_limit_arr = mlxcel_core::full_f32(&[1], -limit, x_dtype);
     let clamped_gate = mlxcel_core::minimum(&silu_gate, &limit_arr);
     let clamped_x = mlxcel_core::clip(x, &neg_limit_arr, &limit_arr);
     mlxcel_core::multiply(&clamped_gate, &clamped_x)
@@ -521,7 +522,8 @@ impl Step3p5MoEGate {
 
         // Normalize if configured
         let topk_weights = if self.norm_topk_prob {
-            let eps = mlxcel_core::full_f32(&[1], 1e-20, dtype::FLOAT32);
+            let w_dtype = mlxcel_core::array_dtype(&topk_weights);
+            let eps = mlxcel_core::full_f32(&[1], 1e-20, w_dtype);
             let sum = mlxcel_core::sum_axis(&topk_weights, -1, true);
             let sum_eps = mlxcel_core::add(&sum, &eps);
             mlxcel_core::divide(&topk_weights, &sum_eps)
@@ -530,7 +532,11 @@ impl Step3p5MoEGate {
         };
 
         // Scale
-        let scale = mlxcel_core::full_f32(&[1], self.routed_scaling_factor, dtype::FLOAT32);
+        let scale = mlxcel_core::full_f32(
+            &[1],
+            self.routed_scaling_factor,
+            mlxcel_core::array_dtype(&topk_weights),
+        );
         let topk_weights = mlxcel_core::multiply(&topk_weights, &scale);
 
         (topk_indices, topk_weights)

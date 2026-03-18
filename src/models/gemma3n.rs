@@ -165,7 +165,7 @@ impl RMSNoScale {
         // Create unit weight (all ones) for fast_rms_norm
         Self {
             eps,
-            unit_weight: mlxcel_core::ones(&[dim], mlxcel_core::dtype::FLOAT32),
+            unit_weight: mlxcel_core::ones(&[dim], mlxcel_core::dtype::BFLOAT16),
         }
     }
 
@@ -247,7 +247,7 @@ impl AltUp {
     fn compute_router_modalities(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let normed = self.router_norm.forward(x);
         let scale_val = (self.hidden_size as f32).powf(-1.0);
-        let scale = mlxcel_core::full_f32(&[1], scale_val, mlxcel_core::dtype::FLOAT32);
+        let scale = mlxcel_core::full_f32(&[1], scale_val, mlxcel_core::array_dtype(&normed));
         let scaled = mlxcel_core::multiply(&normed, &scale);
         let routed = self.modality_router.forward(&scaled);
         mlxcel_core::tanh(&routed)
@@ -318,7 +318,7 @@ impl AltUp {
 
         // correction_coefs output shape: [B, L, altup_num_inputs]
         let all_coefs = self.correction_coefs.forward(&modalities);
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(&all_coefs));
         let all_coefs = mlxcel_core::add(&all_coefs, &one);
 
         // Get active prediction
@@ -618,8 +618,8 @@ impl MLP {
         let std = mlxcel_core::sqrt(&var);
 
         // cutoff = mean + std * std_multiplier
-        let std_mult =
-            mlxcel_core::full_f32(&[1], self.std_multiplier, mlxcel_core::dtype::FLOAT32);
+        let x_dtype = mlxcel_core::array_dtype(x);
+        let std_mult = mlxcel_core::full_f32(&[1], self.std_multiplier, x_dtype);
         let std_scaled = mlxcel_core::multiply(&std, &std_mult);
         let cutoff = mlxcel_core::add(&mean, &std_scaled);
 
@@ -627,7 +627,7 @@ impl MLP {
         let shifted = mlxcel_core::subtract(x, &cutoff);
 
         // zeroed = max(shifted, 0)
-        let zero = mlxcel_core::zeros(&[1], mlxcel_core::dtype::FLOAT32);
+        let zero = mlxcel_core::zeros(&[1], x_dtype);
         let zeroed = mlxcel_core::maximum(&shifted, &zero);
 
         // Apply gelu
@@ -732,11 +732,8 @@ impl DecoderLayer {
 
         // Residual + LAUREL
         let attn_gated = mlxcel_core::add(active_prediction, &attn);
-        let sqrt_half = mlxcel_core::full_f32(
-            &[1],
-            std::f32::consts::FRAC_1_SQRT_2,
-            mlxcel_core::dtype::FLOAT32,
-        );
+        let h_dtype = mlxcel_core::array_dtype(active_prediction);
+        let sqrt_half = mlxcel_core::full_f32(&[1], std::f32::consts::FRAC_1_SQRT_2, h_dtype);
 
         let sum = mlxcel_core::add(&attn_gated, &laurel_output);
         let attn_laurel = mlxcel_core::multiply(&sum, &sqrt_half);
@@ -892,7 +889,7 @@ impl Gemma3nLanguageModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.config.hidden_size as f32).sqrt(),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&h),
         );
         let h = mlxcel_core::multiply(&h, &scale);
 
@@ -1009,7 +1006,7 @@ impl Gemma3nLanguageModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.config.hidden_size_per_layer_input as f32).sqrt(),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&embedded),
         );
         let result = mlxcel_core::multiply(&embedded, &scale);
 
@@ -1037,7 +1034,7 @@ impl Gemma3nLanguageModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.config.hidden_size as f32).powf(-0.5),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&proj),
         );
         let proj = mlxcel_core::multiply(&proj, &scale);
 
@@ -1059,7 +1056,7 @@ impl Gemma3nLanguageModel {
         let sqrt_half = mlxcel_core::full_f32(
             &[1],
             std::f32::consts::FRAC_1_SQRT_2,
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&proj_normed),
         );
         let sum = mlxcel_core::add(&proj_normed, per_layer_inputs);
         mlxcel_core::multiply(&sum, &sqrt_half)
@@ -1071,7 +1068,7 @@ impl Gemma3nLanguageModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.config.hidden_size as f32).sqrt(),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&h),
         );
         mlxcel_core::multiply(&h, &scale)
     }

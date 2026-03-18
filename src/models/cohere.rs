@@ -400,7 +400,8 @@ impl CohereModel {
 
         // Apply logit scaling
         if self.logit_scale != 1.0 {
-            let scale = mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::dtype::FLOAT32);
+            let scale =
+                mlxcel_core::full_f32(&[1], self.logit_scale, mlxcel_core::array_dtype(&logits));
             mlxcel_core::multiply(&logits, &scale)
         } else {
             logits

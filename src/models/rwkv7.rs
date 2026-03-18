@@ -107,7 +107,7 @@ fn addcmul(x: &MlxArray, y: &MlxArray, z: &MlxArray) -> UniquePtr<MlxArray> {
 /// L2 normalization with epsilon for numerical stability
 fn l2_norm(x: &MlxArray) -> UniquePtr<MlxArray> {
     let norm = mlxcel_core::linalg_norm(x, -1, true);
-    let eps = mlxcel_core::full_f32(&[1], 1e-7, mlxcel_core::dtype::FLOAT32);
+    let eps = mlxcel_core::full_f32(&[1], 1e-7, mlxcel_core::array_dtype(&norm));
     let max_norm = mlxcel_core::maximum(&norm, &eps);
     mlxcel_core::divide(x, &max_norm)
 }
@@ -206,7 +206,7 @@ impl LayerNormPerHead {
         let x_centered = mlxcel_core::subtract(x, &mean);
         let x_sq = mlxcel_core::square(&x_centered);
         let var = mlxcel_core::mean_axis(&x_sq, -1, true);
-        let eps_arr = mlxcel_core::full_f32(&[1], self.eps, mlxcel_core::dtype::FLOAT32);
+        let eps_arr = mlxcel_core::full_f32(&[1], self.eps, mlxcel_core::array_dtype(&var));
         let var_eps = mlxcel_core::add(&var, &eps_arr);
         let std = mlxcel_core::sqrt(&var_eps);
         let normalized = mlxcel_core::divide(&x_centered, &std);
@@ -705,20 +705,22 @@ impl Rwkv7TimeMixing {
         );
         let decay = mlxcel_core::sigmoid(&decay_raw);
 
-        let neg_coef = mlxcel_core::full_f32(&[1], -0.606531, mlxcel_core::dtype::FLOAT32);
+        let decay_dtype = mlxcel_core::array_dtype(&decay);
+        let neg_coef = mlxcel_core::full_f32(&[1], -0.606531, decay_dtype);
         let decay_scaled = mlxcel_core::multiply(&neg_coef, &decay);
         let decay_exp = mlxcel_core::exp(&decay_scaled);
 
         // Compute k normalization and adjustments
         let k_kk = mlxcel_core::multiply(&key, &self.k_k);
         let kk = l2_norm(&k_kk);
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+        let key_dtype = mlxcel_core::array_dtype(&key);
+        let one = mlxcel_core::full_f32(&[1], 1.0, key_dtype);
         let iclr_minus_one = mlxcel_core::subtract(&iclr, &one);
         let k_adj = mlxcel_core::multiply(&iclr_minus_one, &self.k_a);
         let one_plus_k_adj = mlxcel_core::add(&one, &k_adj);
         let key_adjusted = mlxcel_core::multiply(&key, &one_plus_k_adj);
 
-        let neg_one = mlxcel_core::full_f32(&[1], -1.0, mlxcel_core::dtype::FLOAT32);
+        let neg_one = mlxcel_core::full_f32(&[1], -1.0, mlxcel_core::array_dtype(&kk));
         let a = mlxcel_core::multiply(&neg_one, &kk);
         let b_val = mlxcel_core::multiply(&kk, &iclr);
 

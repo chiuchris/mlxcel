@@ -55,7 +55,9 @@ pub fn stack_owned(arrays: &[UniquePtr<ffi::MlxArray>], axis: i32) -> UniquePtr<
 /// Used by: shared softcap helpers, Gemma/DeepSeek/MiniCPM scaling, vision
 /// merge paths, and other policy code that needs scalar broadcasting.
 pub fn multiply_scalar(a: &ffi::MlxArray, scalar: f32) -> UniquePtr<ffi::MlxArray> {
-    let scalar_array = ffi::full_f32(&[1], scalar, dtype::FLOAT32);
+    // Use input dtype for scalar to avoid float32 type promotion
+    let a_dtype = ffi::array_dtype(a);
+    let scalar_array = ffi::full_f32(&[1], scalar, a_dtype);
     ffi::multiply(a, &scalar_array)
 }
 
@@ -63,6 +65,7 @@ pub fn multiply_scalar(a: &ffi::MlxArray, scalar: f32) -> UniquePtr<ffi::MlxArra
 ///
 /// Used by: shared softcap helpers and model families with output scaling.
 pub fn divide_scalar(a: &ffi::MlxArray, scalar: f32) -> UniquePtr<ffi::MlxArray> {
-    let scalar_array = ffi::full_f32(&[1], scalar, dtype::FLOAT32);
+    let a_dtype = ffi::array_dtype(a);
+    let scalar_array = ffi::full_f32(&[1], scalar, a_dtype);
     ffi::divide(a, &scalar_array)
 }

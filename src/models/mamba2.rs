@@ -200,8 +200,9 @@ fn compute_dt(
     let dt_soft = mlxcel_core::softplus(&dt_biased);
 
     // Clip to time step limits
-    let min_val = mlxcel_core::full_f32(&[1], time_step_limit.0, mlxcel_core::dtype::FLOAT32);
-    let max_val = mlxcel_core::full_f32(&[1], time_step_limit.1, mlxcel_core::dtype::FLOAT32);
+    let dt_dtype = mlxcel_core::array_dtype(&dt_soft);
+    let min_val = mlxcel_core::full_f32(&[1], time_step_limit.0, dt_dtype);
+    let max_val = mlxcel_core::full_f32(&[1], time_step_limit.1, dt_dtype);
     mlxcel_core::clip(&dt_soft, &min_val, &max_val)
 }
 
@@ -448,14 +449,14 @@ impl Mamba2Block {
             } else {
                 let pad_arr = mlxcel_core::zeros(
                     &[shape[0], (k - 1) as i32, shape[2]],
-                    mlxcel_core::dtype::FLOAT32,
+                    mlxcel_core::array_dtype(conv_input),
                 );
                 concatenate(&pad_arr, conv_input, 1)
             }
         } else {
             let pad_arr = mlxcel_core::zeros(
                 &[shape[0], (k - 1) as i32, shape[2]],
-                mlxcel_core::dtype::FLOAT32,
+                mlxcel_core::array_dtype(conv_input),
             );
             concatenate(&pad_arr, conv_input, 1)
         };

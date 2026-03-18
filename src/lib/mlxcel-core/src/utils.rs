@@ -186,7 +186,8 @@ pub fn silu(x: &MlxArray) -> UniquePtr<MlxArray> {
 /// For tanh-approximate GELU, use `gelu_approx()`.
 #[inline]
 pub fn gelu_sigmoid(x: &MlxArray) -> UniquePtr<MlxArray> {
-    let coef = ffi::full_f32(&[1], 1.702, dtype::FLOAT32);
+    let x_dtype = ffi::array_dtype(x);
+    let coef = ffi::full_f32(&[1], 1.702, x_dtype);
     let scaled = ffi::multiply(&coef, x);
     let sigmoid_x = ffi::sigmoid(&scaled);
     ffi::multiply(x, &sigmoid_x)

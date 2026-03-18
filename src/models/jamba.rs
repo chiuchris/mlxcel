@@ -482,7 +482,7 @@ impl JambaAttention {
         // Scaled dot-product attention
         let keys_t = mlxcel_core::transpose_axes(&keys, &[0, 1, 3, 2]);
         let mut scores = mlxcel_core::matmul(&queries, &keys_t);
-        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::dtype::FLOAT32);
+        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::array_dtype(&scores));
         scores = mlxcel_core::multiply(&scores, &scale_arr);
 
         // Apply mask
@@ -658,7 +658,7 @@ impl JambaMambaMixer {
         } else {
             let pad_arr = mlxcel_core::zeros(
                 &[shape[0], (k - 1) as i32, shape[2]],
-                mlxcel_core::dtype::FLOAT32,
+                mlxcel_core::array_dtype(&x_part),
             );
             concatenate(&pad_arr, &x_part, 1)
         };

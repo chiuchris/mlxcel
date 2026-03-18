@@ -50,7 +50,7 @@ pub(crate) fn normalize_magnitudes_from_idx(
     start_idx: usize,
     target_magnitude: &MlxArray,
 ) {
-    let eps = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::dtype::FLOAT32);
+    let eps = mlxcel_core::full_f32(&[1], 1e-6, mlxcel_core::array_dtype(target_magnitude));
     for item in arrays.iter_mut().skip(start_idx) {
         let mag = compute_magnitude(item);
         let mag_safe = mlxcel_core::maximum(&mag, &eps);
@@ -67,7 +67,7 @@ pub(crate) fn mean_arrays(arrays: &[UniquePtr<MlxArray>]) -> UniquePtr<MlxArray>
 
 /// Apply softcap to logits: `cap * tanh(logits / cap)`.
 pub(crate) fn apply_softcap(logits: &MlxArray, cap: f32) -> UniquePtr<MlxArray> {
-    let cap_arr = mlxcel_core::full_f32(&[1], cap, mlxcel_core::dtype::FLOAT32);
+    let cap_arr = mlxcel_core::full_f32(&[1], cap, mlxcel_core::array_dtype(logits));
     let scaled = mlxcel_core::divide(logits, &cap_arr);
     let tanh_out = mlxcel_core::tanh(&scaled);
     mlxcel_core::multiply(&tanh_out, &cap_arr)

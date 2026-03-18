@@ -19,7 +19,7 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{silu, slice_axis};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, concatenate, dtype};
+use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -142,7 +142,7 @@ impl Default for MambaCache {
 fn rms_norm_no_scale(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray> {
     let x_sq = mlxcel_core::multiply(x, x);
     let mean_sq = mlxcel_core::mean_axis(&x_sq, -1, true);
-    let eps_arr = mlxcel_core::full_f32(&[1], eps, dtype::FLOAT32);
+    let eps_arr = mlxcel_core::full_f32(&[1], eps, mlxcel_core::array_dtype(&mean_sq));
     let mean_plus_eps = mlxcel_core::add(&mean_sq, &eps_arr);
     let rms = mlxcel_core::sqrt(&mean_plus_eps);
     mlxcel_core::divide(x, &rms)
@@ -193,12 +193,17 @@ impl MambaBlock {
             if let Some(ref conv_state) = c.conv_state {
                 concatenate(conv_state.as_ref().unwrap(), conv_input, 1)
             } else {
-                let pad_arr =
-                    mlxcel_core::zeros(&[shape[0], (k - 1) as i32, shape[2]], dtype::FLOAT32);
+                let pad_arr = mlxcel_core::zeros(
+                    &[shape[0], (k - 1) as i32, shape[2]],
+                    mlxcel_core::array_dtype(conv_input),
+                );
                 concatenate(&pad_arr, conv_input, 1)
             }
         } else {
-            let pad_arr = mlxcel_core::zeros(&[shape[0], (k - 1) as i32, shape[2]], dtype::FLOAT32);
+            let pad_arr = mlxcel_core::zeros(
+                &[shape[0], (k - 1) as i32, shape[2]],
+                mlxcel_core::array_dtype(conv_input),
+            );
             concatenate(&pad_arr, conv_input, 1)
         };
 

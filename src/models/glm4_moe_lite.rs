@@ -26,7 +26,7 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, slice_axis};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, dtype};
+use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -219,7 +219,7 @@ impl MlaAttention {
         let (kv_latent, k_pe) = cache.update_and_fetch(kv_latent, k_pe);
 
         // Compute positional encoding scores: pe_scores = (q_pe * scale) @ k_pe.T
-        let scale_scalar = mlxcel_core::full_f32(&[1], self.scale, dtype::FLOAT32);
+        let scale_scalar = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::array_dtype(&q_pe));
         let q_pe_scaled = mlxcel_core::multiply(&q_pe, &scale_scalar);
         let k_pe_t = mlxcel_core::transpose_axes(&k_pe, &[0, 1, 3, 2]);
         let pe_scores = mlxcel_core::matmul(&q_pe_scaled, &k_pe_t);

@@ -253,6 +253,7 @@ impl Qwen35GatedDeltaNet {
         let a = self.in_proj_a.forward(inputs);
 
         // Get conv state from cache
+        let input_dtype = mlxcel_core::array_dtype(&qkv);
         let conv_state = if let Some(ref c) = cache {
             c.conv_state
                 .as_ref()
@@ -260,20 +261,20 @@ impl Qwen35GatedDeltaNet {
                 .unwrap_or_else(|| {
                     mlxcel_core::zeros(
                         &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
-                        dtype::FLOAT32,
+                        input_dtype,
                     )
                 })
         } else {
             mlxcel_core::zeros(
                 &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
-                dtype::FLOAT32,
+                input_dtype,
             )
         };
 
         // Apply mask if present (mask qkv before conv)
         let qkv = if let Some(m) = mask {
             let m_exp = mlxcel_core::expand_dims(m, -1);
-            let zero = mlxcel_core::full_f32(&[1], 0.0, dtype::FLOAT32);
+            let zero = mlxcel_core::full_f32(&[1], 0.0, input_dtype);
             mlxcel_core::where_cond(&m_exp, &qkv, &zero)
         } else {
             qkv
@@ -345,18 +346,19 @@ impl Qwen35GatedDeltaNet {
 
         // Apply RMS norm with scaling (same as Qwen3Next)
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, dtype::FLOAT32);
+        let q_dtype = mlxcel_core::array_dtype(&q);
+        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, q_dtype);
 
         let q_sq = mlxcel_core::square(&q);
         let q_sq_mean = mlxcel_core::mean_axis(&q_sq, -1, true);
         let q_rms = mlxcel_core::sqrt(&mlxcel_core::add(&q_sq_mean, &eps_arr));
-        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, dtype::FLOAT32);
+        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, q_dtype);
         let q = mlxcel_core::multiply(&mlxcel_core::divide(&q, &q_rms), &scale_q);
 
         let k_sq = mlxcel_core::square(&k);
         let k_sq_mean = mlxcel_core::mean_axis(&k_sq, -1, true);
         let k_rms = mlxcel_core::sqrt(&mlxcel_core::add(&k_sq_mean, &eps_arr));
-        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, dtype::FLOAT32);
+        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, q_dtype);
         let k = mlxcel_core::multiply(&mlxcel_core::divide(&k, &k_rms), &scale_k);
 
         // Run gated delta update

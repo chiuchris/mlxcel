@@ -500,13 +500,15 @@ impl CxxAttention {
 
         // Apply QK normalization if enabled
         if self.use_qk_norm {
-            let norm_weight = mlxcel_core::ones(&[self.head_dim], mlxcel_core::dtype::FLOAT32);
+            let q_dtype = mlxcel_core::array_dtype(&q);
+            let norm_weight = mlxcel_core::ones(&[self.head_dim], q_dtype);
             q = mlxcel_core::fast_rms_norm(&q, &norm_weight, 1e-6);
             k = mlxcel_core::fast_rms_norm(&k, &norm_weight, 1e-6);
         }
 
         // Temperature tuning for dense layers (no RoPE)
         if self.attn_temperature_tuning != 0 && !self.use_rope {
+            let q_dtype = mlxcel_core::array_dtype(&q);
             let positions =
                 mlxcel_core::arange_f32((offset + 1) as f32, (offset + l + 1) as f32, 1.0);
             let floor_scale_arr =
@@ -520,6 +522,7 @@ impl CxxAttention {
             let scaled = mlxcel_core::multiply(&log_val, &attn_scale_arr);
             let attn_scales = mlxcel_core::add(&scaled, &one);
             let attn_scales = mlxcel_core::reshape(&attn_scales, &[1, 1, l, 1]);
+            let attn_scales = mlxcel_core::astype(&attn_scales, q_dtype);
             q = mlxcel_core::multiply(&q, &attn_scales);
         }
 
@@ -609,12 +612,14 @@ impl CxxAttention {
         }
 
         if self.use_qk_norm {
-            let norm_weight = mlxcel_core::ones(&[self.head_dim], mlxcel_core::dtype::FLOAT32);
+            let q_dtype = mlxcel_core::array_dtype(&q);
+            let norm_weight = mlxcel_core::ones(&[self.head_dim], q_dtype);
             q = mlxcel_core::fast_rms_norm(&q, &norm_weight, 1e-6);
             k = mlxcel_core::fast_rms_norm(&k, &norm_weight, 1e-6);
         }
 
         if self.attn_temperature_tuning != 0 && !self.use_rope {
+            let q_dtype = mlxcel_core::array_dtype(&q);
             let positions =
                 mlxcel_core::arange_f32((offset + 1) as f32, (offset + l + 1) as f32, 1.0);
             let floor_scale_arr =
@@ -628,6 +633,7 @@ impl CxxAttention {
             let scaled = mlxcel_core::multiply(&log_val, &attn_scale_arr);
             let attn_scales = mlxcel_core::add(&scaled, &one);
             let attn_scales = mlxcel_core::reshape(&attn_scales, &[1, 1, l, 1]);
+            let attn_scales = mlxcel_core::astype(&attn_scales, q_dtype);
             q = mlxcel_core::multiply(&q, &attn_scales);
         }
 
@@ -740,7 +746,8 @@ impl CxxAttention {
 
         // Apply QK normalization if enabled
         if self.use_qk_norm {
-            let norm_weight = mlxcel_core::ones(&[self.head_dim], mlxcel_core::dtype::FLOAT32);
+            let q_dtype = mlxcel_core::array_dtype(&q);
+            let norm_weight = mlxcel_core::ones(&[self.head_dim], q_dtype);
             q = mlxcel_core::fast_rms_norm(&q, &norm_weight, 1e-6);
             if check_nan("q_after_qknorm", &q) {
                 return q;

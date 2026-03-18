@@ -86,7 +86,7 @@ impl GemmaRMSNorm {
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // Gemma uses (1.0 + weight) for normalization
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(&self.weight));
         let adjusted_weight = mlxcel_core::add(&one, &self.weight);
         mlxcel_core::fast_rms_norm(x, &adjusted_weight, self.eps)
     }
@@ -333,7 +333,7 @@ impl GemmaModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.hidden_size as f32).sqrt(),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&h),
         );
         h = mlxcel_core::multiply(&h, &scale);
 
@@ -352,7 +352,7 @@ impl GemmaModel {
         let scale = mlxcel_core::full_f32(
             &[1],
             (self.hidden_size as f32).sqrt(),
-            mlxcel_core::dtype::FLOAT32,
+            mlxcel_core::array_dtype(&h),
         );
         mlxcel_core::multiply(&h, &scale)
     }

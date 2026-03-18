@@ -248,7 +248,7 @@ impl ShortConv1d {
         // Apply mask: zero out masked positions
         let x = if let Some(m) = mask {
             let m_exp = mlxcel_core::expand_dims(m, -1);
-            let zero = mlxcel_core::full_f32(&[1], 0.0, dtype::FLOAT32);
+            let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::array_dtype(x));
             mlxcel_core::where_cond(&m_exp, x, &zero)
         } else {
             mlxcel_core::copy(x)
@@ -260,7 +260,7 @@ impl ShortConv1d {
         } else {
             mlxcel_core::zeros(
                 &[b, (self.kernel_size - 1) as i32, self.channels as i32],
-                dtype::FLOAT32,
+                mlxcel_core::array_dtype(&x),
             )
         };
 
@@ -433,7 +433,7 @@ impl KimiMLAAttention {
         let (cached_latent, cached_k_pe) = cache.update_and_fetch(kv_latent, k_pe);
 
         // PE scoring: (q_pe * scale) @ k_pe^T -> [B, H, L, S]
-        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, dtype::FLOAT32);
+        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::array_dtype(&q_pe));
         let q_pe_scaled = mlxcel_core::multiply(&q_pe, &scale_arr);
         let k_pe_t = mlxcel_core::swap_axes(&cached_k_pe, -1, -2);
         let mut pe_scores = mlxcel_core::matmul(&q_pe_scaled, &k_pe_t);
@@ -586,19 +586,20 @@ impl KimiDeltaAttention {
         let v = mlxcel_core::reshape(&v_conv, &[b, t, self.num_heads, self.head_dim]);
 
         // RMS normalize Q and K (without learned weight)
-        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, dtype::FLOAT32);
+        let q_dtype = mlxcel_core::array_dtype(&q);
+        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, q_dtype);
         let inv_scale = self.scale;
 
         let q_sq = mlxcel_core::square(&q);
         let q_sq_mean = mlxcel_core::mean_axis(&q_sq, -1, true);
         let q_rms = mlxcel_core::sqrt(&mlxcel_core::add(&q_sq_mean, &eps_arr));
-        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, dtype::FLOAT32);
+        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, q_dtype);
         let q = mlxcel_core::multiply(&mlxcel_core::divide(&q, &q_rms), &scale_q);
 
         let k_sq = mlxcel_core::square(&k);
         let k_sq_mean = mlxcel_core::mean_axis(&k_sq, -1, true);
         let k_rms = mlxcel_core::sqrt(&mlxcel_core::add(&k_sq_mean, &eps_arr));
-        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, dtype::FLOAT32);
+        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, q_dtype);
         let k = mlxcel_core::multiply(&mlxcel_core::divide(&k, &k_rms), &scale_k);
 
         // Compute gating logits
@@ -818,14 +819,19 @@ impl KimiSparseMoE {
 
         // Renormalize
         if k > 1 && self.renormalize {
-            let eps = mlxcel_core::full_f32(&[1], 1e-20, dtype::FLOAT32);
+            let s_dtype = mlxcel_core::array_dtype(&topk_scores);
+            let eps = mlxcel_core::full_f32(&[1], 1e-20, s_dtype);
             let sum = mlxcel_core::add(&mlxcel_core::sum_axis(&topk_scores, -1, true), &eps);
             topk_scores = mlxcel_core::divide(&topk_scores, &sum);
         }
 
         // Apply scaling factor
         if self.routed_scaling_factor != 1.0 {
-            let scale = mlxcel_core::full_f32(&[1], self.routed_scaling_factor, dtype::FLOAT32);
+            let scale = mlxcel_core::full_f32(
+                &[1],
+                self.routed_scaling_factor,
+                mlxcel_core::array_dtype(&topk_scores),
+            );
             topk_scores = mlxcel_core::multiply(&topk_scores, &scale);
         }
 
