@@ -2826,4 +2826,186 @@ void ssm_update_kernel(
     next_state = std::make_unique<MlxArray>(std::move(results[1]));
 }
 
+// Fused Mamba2 mixer forward for single-token decode.
+// Combines in_proj + conv1d + SSM kernel + MambaRMSNormGated + out_proj into one C++ call.
+// Used by: NemotronH
+void fused_mamba2_forward(
+    const MlxArray& hidden_states,
+    const MlxArray& in_proj_weight,
+    const MlxArray& in_proj_scales,
+    const MlxArray* in_proj_biases,
+    const MlxArray& conv_weight,
+    const MlxArray* conv_bias,
+    const MlxArray& A_log,
+    const MlxArray& D,
+    const MlxArray& dt_bias,
+    const MlxArray& norm_weight,
+    const MlxArray& out_proj_weight,
+    const MlxArray& out_proj_scales,
+    const MlxArray* out_proj_biases,
+    const MlxArray& conv_state_in,
+    const MlxArray& ssm_state_in,
+    int32_t intermediate_size,
+    int32_t conv_dim,
+    int32_t conv_kernel_size,
+    int32_t num_heads,
+    int32_t head_dim,
+    int32_t n_groups,
+    int32_t ssm_state_size,
+    float time_step_min,
+    float time_step_max,
+    float norm_eps,
+    int32_t group_size,
+    int32_t bits,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& conv_state_out,
+    std::unique_ptr<MlxArray>& ssm_state_out
+) {
+    using namespace mlx::core;
+
+    // --- Shape extraction ---
+    auto hs_shape = hidden_states.inner.shape();
+    int batch    = (int)hs_shape[0];
+    int seq_len  = (int)hs_shape[1];   // always 1 for decode
+    int hidden   = (int)hs_shape[2];
+    int bc_size  = n_groups * ssm_state_size;
+    int proj_cols = intermediate_size + conv_dim + num_heads;
+
+    // --- Step 1: in_proj (quantized matmul, affine mode) ---
+    // Flatten to [batch*seq_len, hidden] for matmul
+    auto x_flat = reshape(hidden_states.inner, {batch * seq_len, hidden});
+    std::optional<array> in_biases_opt =
+        in_proj_biases ? std::optional(in_proj_biases->inner) : std::nullopt;
+    auto projected_flat = quantized_matmul(
+        x_flat,
+        in_proj_weight.inner,
+        in_proj_scales.inner,
+        in_biases_opt,
+        /*transpose=*/true,
+        std::optional<int>(group_size),
+        std::optional<int>(bits),
+        std::string("affine")
+    );
+    // Restore to [batch, seq_len, proj_cols]
+    auto projected = reshape(projected_flat, {batch, seq_len, proj_cols});
+
+    // --- Step 2: Split projected into gate, conv_input, dt ---
+    // gate:       [batch, seq_len, intermediate_size]
+    // conv_input: [batch, seq_len, conv_dim]
+    // dt:         [batch, seq_len, num_heads]
+    auto gate       = slice(projected,
+                            {0, 0, 0},
+                            {batch, seq_len, intermediate_size});
+    auto conv_input = slice(projected,
+                            {0, 0, intermediate_size},
+                            {batch, seq_len, intermediate_size + conv_dim});
+    auto dt_raw     = slice(projected,
+                            {0, 0, intermediate_size + conv_dim},
+                            {batch, seq_len, proj_cols});
+
+    // --- Step 3: Depthwise conv1d with sliding state ---
+    // Concatenate conv_state_in [batch, k-1, conv_dim] with conv_input [batch, 1, conv_dim]
+    // -> padded_input [batch, k, conv_dim]  (k = conv_kernel_size)
+    auto padded_input = concatenate(std::vector<array>{conv_state_in.inner, conv_input}, 1);
+
+    // New conv state: last (k-1) elements of padded_input on axis 1
+    int padded_len      = conv_kernel_size - 1 + seq_len;
+    int new_state_start = padded_len - (conv_kernel_size - 1);
+    auto new_conv_state = slice(padded_input,
+                                {0, new_state_start, 0},
+                                {batch, padded_len, conv_dim});
+
+    // Depthwise conv1d: stride=1, padding=0, dilation=1, groups=conv_dim
+    auto conv_out = mlx::core::conv1d(
+        padded_input, conv_weight.inner,
+        /*stride=*/1, /*padding=*/0, /*dilation=*/1, /*groups=*/conv_dim);
+
+    // Optional bias: reshape [conv_dim] -> [1, 1, conv_dim] for broadcast
+    if (conv_bias) {
+        auto bias_r = reshape(conv_bias->inner, {1, 1, conv_dim});
+        conv_out = add(conv_out, bias_r);
+    }
+
+    // SiLU: x * sigmoid(x)
+    auto conv_output = multiply(conv_out, sigmoid(conv_out));
+
+    // --- Step 4: Split conv_output into hidden_ssm, B, C ---
+    // conv_output: [batch, seq_len, conv_dim]
+    // hidden_ssm:  [batch, seq_len, intermediate_size]
+    // B, C:        [batch, seq_len, n_groups * ssm_state_size] each
+    auto hidden_ssm = slice(conv_output,
+                            {0, 0, 0},
+                            {batch, seq_len, intermediate_size});
+    auto B          = slice(conv_output,
+                            {0, 0, intermediate_size},
+                            {batch, seq_len, intermediate_size + bc_size});
+    auto C          = slice(conv_output,
+                            {0, 0, intermediate_size + bc_size},
+                            {batch, seq_len, conv_dim});
+
+    // --- Step 5: Reshape inputs for SSM kernel ---
+    // x:  [batch, seq_len, num_heads, head_dim]
+    // B:  [batch, seq_len, n_groups, ssm_state_size]
+    // C:  [batch, seq_len, n_groups, ssm_state_size]
+    // dt: [batch, seq_len, num_heads]   (already the right last dim)
+    auto x_ssm = reshape(hidden_ssm, {batch, seq_len, num_heads, head_dim});
+    auto B_r    = reshape(B,         {batch, seq_len, n_groups,  ssm_state_size});
+    auto C_r    = reshape(C,         {batch, seq_len, n_groups,  ssm_state_size});
+
+    // --- Step 6: Fused SSM Metal kernel ---
+    // Wrap plain arrays in MlxArray for the kernel call
+    MlxArray x_ssm_w{x_ssm};
+    MlxArray B_w{B_r};
+    MlxArray C_w{C_r};
+    MlxArray dt_w{dt_raw};
+
+    std::unique_ptr<MlxArray> ssm_y;
+    std::unique_ptr<MlxArray> new_ssm_state;
+
+    // ssm_update_kernel is defined above in this translation unit
+    ssm_update_kernel(
+        x_ssm_w, A_log, B_w, C_w, D, dt_w, dt_bias,
+        ssm_state_in,
+        time_step_min, time_step_max,
+        ssm_y, new_ssm_state);
+
+    // ssm_y: [batch, 1, num_heads, head_dim] -> [batch, seq_len, intermediate_size]
+    auto y = reshape(ssm_y->inner, {batch, seq_len, intermediate_size});
+
+    // --- Step 7: MambaRMSNormGated ---
+    // 7a. Gate: y_gated = y * silu(gate)
+    auto y_gated = multiply(y, multiply(gate, sigmoid(gate)));
+
+    // 7b. Grouped RMS norm: reshape last dim into [batch, seq_len, num_heads, head_dim]
+    //     (norm group_size == head_dim, i.e. one RMS norm group per head)
+    auto y_grouped = reshape(y_gated, {batch, seq_len, num_heads, head_dim});
+    auto unit_weight = mlx::core::ones({head_dim}, float32);
+    auto y_normed_grouped = mlx::core::fast::rms_norm(y_grouped, unit_weight, norm_eps);
+
+    // 7c. Flatten back and apply learned norm weight
+    auto y_normed_flat = reshape(y_normed_grouped, {batch, seq_len, intermediate_size});
+    auto y_normed = multiply(norm_weight.inner, y_normed_flat);
+
+    // --- Step 8: out_proj (quantized matmul, affine mode) ---
+    auto y_proj_flat = reshape(y_normed, {batch * seq_len, intermediate_size});
+    std::optional<array> out_biases_opt =
+        out_proj_biases ? std::optional(out_proj_biases->inner) : std::nullopt;
+    auto out_flat = quantized_matmul(
+        y_proj_flat,
+        out_proj_weight.inner,
+        out_proj_scales.inner,
+        out_biases_opt,
+        /*transpose=*/true,
+        std::optional<int>(group_size),
+        std::optional<int>(bits),
+        std::string("affine")
+    );
+    auto out = reshape(out_flat, {batch, seq_len, hidden});
+
+    // --- Write outputs ---
+    output         = std::make_unique<MlxArray>(std::move(out));
+    conv_state_out = std::make_unique<MlxArray>(std::move(new_conv_state));
+    ssm_state_out  = std::move(new_ssm_state);
+}
+
 } // namespace mlx_cxx

@@ -948,4 +948,61 @@ void compiled_moe_gate(
     std::unique_ptr<MlxArray>& scores_out
 );
 
+// Fused Mamba2 mixer forward for single-token decode.
+// Replaces ~23 FFI calls with a single C++ function call.
+// Used by: NemotronH (and any other model with quantized Mamba2Mixer).
+// Assumes seq_len == 1 (decode step with existing conv/SSM state).
+//
+// hidden_states:   [batch, 1, hidden_size]
+// conv_state_in:   [batch, conv_kernel_size-1, conv_dim]
+// ssm_state_in:    [batch, n_groups, num_heads/n_groups, head_dim, ssm_state_size]
+//
+// output:          [batch, 1, hidden_size]
+// conv_state_out:  [batch, conv_kernel_size-1, conv_dim]
+// ssm_state_out:   same shape as ssm_state_in
+//
+// Quantization mode is "affine" (standard mlx-community models).
+void fused_mamba2_forward(
+    // Input
+    const MlxArray& hidden_states,
+    // in_proj weights (quantized, affine mode)
+    const MlxArray& in_proj_weight,
+    const MlxArray& in_proj_scales,
+    const MlxArray* in_proj_biases,      // nullable for no-bias quantization
+    // conv1d weights
+    const MlxArray& conv_weight,
+    const MlxArray* conv_bias,           // nullable
+    // SSM parameters
+    const MlxArray& A_log,               // [num_heads]
+    const MlxArray& D,                   // [num_heads]
+    const MlxArray& dt_bias,             // [num_heads]
+    // Norm weight for MambaRMSNormGated
+    const MlxArray& norm_weight,         // [intermediate_size]
+    // out_proj weights (quantized, affine mode)
+    const MlxArray& out_proj_weight,
+    const MlxArray& out_proj_scales,
+    const MlxArray* out_proj_biases,     // nullable for no-bias quantization
+    // Cache state inputs
+    const MlxArray& conv_state_in,       // [batch, conv_kernel_size-1, conv_dim]
+    const MlxArray& ssm_state_in,        // [batch, n_groups, heads/groups, head_dim, state_dim]
+    // Mamba2 config
+    int32_t intermediate_size,
+    int32_t conv_dim,
+    int32_t conv_kernel_size,
+    int32_t num_heads,
+    int32_t head_dim,
+    int32_t n_groups,
+    int32_t ssm_state_size,
+    float time_step_min,
+    float time_step_max,
+    float norm_eps,
+    // Quantization config
+    int32_t group_size,
+    int32_t bits,
+    // Outputs
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& conv_state_out,
+    std::unique_ptr<MlxArray>& ssm_state_out
+);
+
 } // namespace mlx_cxx

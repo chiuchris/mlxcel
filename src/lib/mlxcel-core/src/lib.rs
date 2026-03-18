@@ -954,6 +954,53 @@ mod ffi {
             next_state: &mut UniquePtr<MlxArray>,
         );
 
+        // Fused Mamba2 mixer forward for single-token decode.
+        /// Combines in_proj + conv1d + SSM kernel + MambaRMSNormGated + out_proj into one C++ call.
+        /// Replaces ~23 FFI round-trips for the hot decode path.
+        /// Used by: NemotronH
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn fused_mamba2_forward(
+            hidden_states: &MlxArray,
+            // in_proj (quantized)
+            in_proj_weight: &MlxArray,
+            in_proj_scales: &MlxArray,
+            in_proj_biases: *const MlxArray,     // nullable
+            // conv1d
+            conv_weight: &MlxArray,
+            conv_bias: *const MlxArray,           // nullable
+            // SSM parameters
+            a_log: &MlxArray,
+            d: &MlxArray,
+            dt_bias: &MlxArray,
+            // norm weight
+            norm_weight: &MlxArray,
+            // out_proj (quantized)
+            out_proj_weight: &MlxArray,
+            out_proj_scales: &MlxArray,
+            out_proj_biases: *const MlxArray,    // nullable
+            // cache state inputs
+            conv_state_in: &MlxArray,
+            ssm_state_in: &MlxArray,
+            // mamba2 config
+            intermediate_size: i32,
+            conv_dim: i32,
+            conv_kernel_size: i32,
+            num_heads: i32,
+            head_dim: i32,
+            n_groups: i32,
+            ssm_state_size: i32,
+            time_step_min: f32,
+            time_step_max: f32,
+            norm_eps: f32,
+            // quantization config
+            group_size: i32,
+            bits: i32,
+            // outputs
+            output: &mut UniquePtr<MlxArray>,
+            conv_state_out: &mut UniquePtr<MlxArray>,
+            ssm_state_out: &mut UniquePtr<MlxArray>,
+        );
+
         // Memory management.
         /// Clear memory cache
         fn clear_memory_cache();

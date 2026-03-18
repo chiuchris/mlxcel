@@ -364,6 +364,18 @@ impl NemotronHMamba2Mixer {
         hidden_states: &MlxArray,
         mut cache: Option<&mut NemotronMambaCache>,
     ) -> UniquePtr<MlxArray> {
+        // Use fused C++ forward for single-token decode with existing cache
+        let shape = mlxcel_core::array_shape(hidden_states);
+        let seq_len = shape[1];
+        if seq_len == 1
+            && mlxcel_core::ssm_kernel_available()
+            && cache
+                .as_ref()
+                .map_or(false, |c| c.conv_state.is_some() && c.ssm_state.is_some())
+        {
+            return self.forward_fused(hidden_states, cache.as_deref_mut().unwrap());
+        }
+
         let projected = self.in_proj.forward(hidden_states);
 
         // Split: gate, conv_input, dt
@@ -687,6 +699,89 @@ impl NemotronHMamba2Mixer {
 
         (output, next_state)
     }
+
+    /// Fully fused Mamba2 forward for single-token decode.
+    /// Combines in_proj + conv + SSM kernel + gated norm + out_proj into one C++ call.
+    fn forward_fused(
+        &self,
+        hidden_states: &MlxArray,
+        cache: &mut NemotronMambaCache,
+    ) -> UniquePtr<MlxArray> {
+        let conv_state = cache.conv_state.as_ref().unwrap();
+        let ssm_state = cache.ssm_state.as_ref().unwrap();
+
+        let conv_bias_ptr = self
+            .conv_bias
+            .as_ref()
+            .map(|b| b.as_ref().unwrap() as *const MlxArray)
+            .unwrap_or(std::ptr::null());
+
+        let mut output = mlxcel_core::UniquePtr::null();
+        let mut new_conv_state = mlxcel_core::UniquePtr::null();
+        let mut new_ssm_state = mlxcel_core::UniquePtr::null();
+
+        // Extract weight references from UnifiedLinear quantized variants
+        let (ip_w, ip_s, ip_b) = match &self.in_proj {
+            UnifiedLinear::Quantized { weight, .. } => {
+                (&weight.weight, &weight.scales, weight.biases_ptr())
+            }
+            _ => panic!("fused_mamba2_forward requires quantized in_proj"),
+        };
+        let (op_w, op_s, op_b) = match &self.out_proj {
+            UnifiedLinear::Quantized { weight, .. } => {
+                (&weight.weight, &weight.scales, weight.biases_ptr())
+            }
+            _ => panic!("fused_mamba2_forward requires quantized out_proj"),
+        };
+
+        unsafe {
+            mlxcel_core::fused_mamba2_forward(
+                hidden_states,
+                // in_proj
+                ip_w,
+                ip_s,
+                ip_b,
+                // conv
+                &self.conv_weight,
+                conv_bias_ptr,
+                // SSM params
+                &self.a_log,
+                &self.d_param,
+                &self.dt_bias,
+                // norm
+                &self.norm.weight,
+                // out_proj
+                op_w,
+                op_s,
+                op_b,
+                // cache
+                conv_state.as_ref().unwrap(),
+                ssm_state.as_ref().unwrap(),
+                // config
+                self.intermediate_size as i32,
+                self.conv_dim as i32,
+                self.conv_kernel_size as i32,
+                self.num_heads as i32,
+                self.head_dim as i32,
+                self.n_groups as i32,
+                self.ssm_state_size as i32,
+                self.time_step_limit.0,
+                self.time_step_limit.1,
+                self.norm.eps,
+                self.in_proj.group_size(),
+                self.in_proj.bits(),
+                // outputs
+                &mut output,
+                &mut new_conv_state,
+                &mut new_ssm_state,
+            );
+        }
+
+        cache.conv_state = Some(new_conv_state);
+        cache.ssm_state = Some(new_ssm_state);
+
+        output
+    }
 }
 
 /// Repeat array along axis by broadcasting (for Nemotron)
@@ -850,6 +945,26 @@ impl QuantizedWeightPtrs for UnifiedLinear {
         match self {
             UnifiedLinear::Quantized { weight, .. } => weight.biases_ptr(),
             _ => std::ptr::null(),
+        }
+    }
+}
+
+trait QuantConfigAccessors {
+    fn group_size(&self) -> i32;
+    fn bits(&self) -> i32;
+}
+
+impl QuantConfigAccessors for UnifiedLinear {
+    fn group_size(&self) -> i32 {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => weight.group_size,
+            _ => 64,
+        }
+    }
+    fn bits(&self) -> i32 {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => weight.bits,
+            _ => 4,
         }
     }
 }
