@@ -2658,15 +2658,28 @@ namespace {
         return holder;
     }
 
-    // Compute dt with softplus + clip (matching Python @mx.compile compute_dt)
-    static array compute_dt_fn(const array& dt, const array& dt_bias, float min_val, float max_val) {
-        auto result = mlx::core::add(dt, dt_bias);
-        result = mlx::core::log1p(mlx::core::exp(result));
-        // Use input dtype for clip bounds to avoid float32 promotion
+    // Compiled compute_dt: softplus + clip → single fused kernel
+    // Matches Python's @mx.compile compute_dt (CompiledBroadcastAddBroadcastLogAddExpMaximumBroadcastMinimum)
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_compute_dt() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& dt = inputs[0];
+            const auto& dt_bias = inputs[1];
+            const auto& lo = inputs[2];
+            const auto& hi = inputs[3];
+            auto result = mlx::core::add(dt, dt_bias);
+            result = mlx::core::log1p(mlx::core::exp(result));
+            return {mlx::core::clip(result, lo, hi)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+
+    static array compute_dt_compiled(const array& dt, const array& dt_bias, float min_val, float max_val) {
+        static auto compiled_fn = get_compiled_compute_dt();
         auto dt_dtype = dt.dtype();
         auto lo = mlx::core::astype(mlx::core::array(min_val), dt_dtype);
         auto hi = mlx::core::astype(mlx::core::array(max_val), dt_dtype);
-        return mlx::core::clip(result, lo, hi);
+        return compiled_fn({dt, dt_bias, lo, hi})[0];
     }
 }
 
@@ -2703,6 +2716,37 @@ namespace {
     }
 }
 
+// Compiled MoE gate: sigmoid + bias + topk + normalize + scale
+// Uses mx::core::compile for kernel fusion matching Python's @mx.compile group_expert_select
+namespace {
+    // Pre-sigmoid + bias + negative: compiled into fused kernel
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_gate_scores() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& gates = inputs[0];
+            const auto& bias = inputs[1];
+            auto orig = mlx::core::sigmoid(mlx::core::astype(gates, mlx::core::float32));
+            auto biased = mlx::core::add(orig, bias);
+            auto neg = mlx::core::negative(biased);
+            return {orig, neg};
+        };
+        return mlx::core::compile(fn, true);
+    }
+
+    // Post-topk normalize + scale: compiled into fused kernel
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_gate_normalize() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& scores = inputs[0];
+            const auto& scale = inputs[1];
+            auto denom = mlx::core::sum(scores, -1, true);
+            auto normed = mlx::core::divide(scores, mlx::core::add(denom, mlx::core::array(1e-20f)));
+            return {mlx::core::multiply(normed, scale)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
 void compiled_moe_gate(
     const MlxArray& gates,
     const MlxArray& correction_bias,
@@ -2714,27 +2758,26 @@ void compiled_moe_gate(
 ) {
     using namespace mlx::core;
 
-    // Non-compiled path (compiled path has shape issues with variable top_k)
-    // Still fuses into single graph evaluation
-    auto orig_scores = sigmoid(astype(gates.inner, float32));
-    auto scores = add(orig_scores, correction_bias.inner);
+    // Step 1: compiled sigmoid + bias + negative
+    static auto gate_scores_fn = get_compiled_gate_scores();
+    auto gate_results = gate_scores_fn({gates.inner, correction_bias.inner});
+    auto orig_scores = gate_results[0];  // sigmoid(float32)
+    auto neg_biased = gate_results[1];   // negative(sigmoid + bias)
 
-    // Top-k via argpartition
-    auto neg_scores = negative(scores);
-    auto indices = argpartition(neg_scores, top_k - 1, -1);
+    // Step 2: argpartition + slice (not compilable due to dynamic shapes)
+    auto indices = argpartition(neg_biased, top_k - 1, -1);
     auto topk_indices = slice(indices, {0, 0}, {(int)indices.shape()[0], top_k});
-
-    // Get original scores for selected experts
     auto topk_scores = take_along_axis(orig_scores, topk_indices, -1);
 
-    // Normalize if needed
+    // Step 3: compiled normalize + scale
     if (top_k > 1 && norm_topk_prob) {
-        auto denom = sum(topk_scores, -1, true);
-        topk_scores = divide(topk_scores, add(denom, array(1e-20f)));
+        static auto normalize_fn = get_compiled_gate_normalize();
+        auto scale = array(scaling_factor);
+        auto norm_results = normalize_fn({topk_scores, scale});
+        topk_scores = norm_results[0];
+    } else {
+        topk_scores = multiply(topk_scores, array(scaling_factor));
     }
-
-    // Scale
-    topk_scores = multiply(topk_scores, array(scaling_factor));
 
     indices_out = std::make_unique<MlxArray>(std::move(topk_indices));
     scores_out = std::make_unique<MlxArray>(std::move(topk_scores));
@@ -2765,19 +2808,26 @@ std::unique_ptr<MlxArray> fused_moe_forward(
 ) {
     using namespace mlx::core;
 
-    // 1. Gate: sigmoid + topk + normalize + scale
+    // 1. Gate: compiled sigmoid + topk + compiled normalize + scale
     auto gates = matmul(x.inner, transpose(gate_weight.inner));
-    auto orig_scores = sigmoid(astype(gates, float32));
-    auto biased = add(orig_scores, correction_bias.inner);
-    auto neg_biased = negative(biased);
+
+    // Compiled: sigmoid(astype(gates, f32)) + add(bias) + negative
+    static auto gate_scores_fn = get_compiled_gate_scores();
+    auto gate_results = gate_scores_fn({gates, correction_bias.inner});
+    auto orig_scores = gate_results[0];
+    auto neg_biased = gate_results[1];
+
     auto all_indices = argpartition(neg_biased, top_k - 1, -1);
     auto topk_indices = slice(all_indices, {0, 0}, {(int)all_indices.shape()[0], top_k});
     auto topk_scores = take_along_axis(orig_scores, topk_indices, -1);
+
     if (top_k > 1 && norm_topk_prob) {
-        auto denom = sum(topk_scores, -1, true);
-        topk_scores = divide(topk_scores, add(denom, array(1e-20f)));
+        // Compiled: normalize + scale
+        static auto normalize_fn = get_compiled_gate_normalize();
+        topk_scores = normalize_fn({topk_scores, array(scaling_factor)})[0];
+    } else {
+        topk_scores = multiply(topk_scores, array(scaling_factor));
     }
-    topk_scores = multiply(topk_scores, array(scaling_factor));
 
     // 2. SwitchMLP: expand + gather_qmm(fc1) + relu² + gather_qmm(fc2) + squeeze
     auto x_shape = x.inner.shape();
@@ -2853,7 +2903,7 @@ void ssm_update_kernel(
     auto input_type = hidden_states.inner.dtype();
 
     // Compute dt with softplus + clip
-    auto dt_result = compute_dt_fn(dt.inner, dt_bias.inner, time_step_min, time_step_max);
+    auto dt_result = compute_dt_compiled(dt.inner, dt_bias.inner, time_step_min, time_step_max);
 
     // Call the Metal kernel
     auto& kernel = get_ssm_kernel().get();
