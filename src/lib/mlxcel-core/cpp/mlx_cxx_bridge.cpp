@@ -2532,4 +2532,152 @@ std::unique_ptr<MlxArray> quantize_weights_biases(const MlxArray& w, int32_t gro
     return std::make_unique<MlxArray>(std::move(result[2]));
 }
 
+// SSM (Mamba2) fused Metal kernel for single-token decode.
+// Port of Python mlx-lm ssm.py make_ssm_kernel() + ssm_update_kernel()
+namespace {
+    static const char* SSM_METAL_SOURCE = R"(
+        auto n = thread_position_in_grid.z;
+        auto h_idx = n % H;
+        auto g_idx = n / G;
+        constexpr int n_per_t = Ds / 32;
+
+        auto x = X + n * Dh;
+        out += n * Dh;
+        auto i_state = state_in + n * Dh * Ds;
+        auto o_state = state_out + n * Dh * Ds;
+
+        auto C_ = C + g_idx * Ds;
+        auto B_ = B + g_idx * Ds;
+
+        auto ds_idx = thread_position_in_threadgroup.x;
+        auto d_idx = thread_position_in_grid.y;
+
+        auto dt_ = static_cast<float>(dt[n]);
+        auto A = -fast::exp(static_cast<float>(A_log[h_idx]));
+        auto dA = fast::exp(A * dt_);
+
+        float acc = 0.0;
+        auto x_ = static_cast<float>(x[d_idx]);
+
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * ds_idx + i;
+            auto idx = d_idx * Ds + s_idx;
+            auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
+            auto state = dA * i_state[idx] + dB_by_x;
+            o_state[idx] = static_cast<T>(state);
+            acc += state * C_[s_idx];
+        }
+        acc = simd_sum(acc);
+        if (thread_index_in_simdgroup == 0) {
+            out[d_idx] = static_cast<T>(acc + x_ * D[h_idx]);
+        }
+    )";
+
+    struct SsmKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+
+        mlx::core::fast::CustomKernelFunction& get() {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    "ssm_kernel",
+                    {"X", "A_log", "B", "C", "D", "dt", "state_in"},
+                    {"out", "state_out"},
+                    SSM_METAL_SOURCE
+                );
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static SsmKernelHolder& get_ssm_kernel() {
+        static SsmKernelHolder holder;
+        return holder;
+    }
+
+    // Compute dt with softplus + clip (matching Python @mx.compile compute_dt)
+    static array compute_dt_fn(const array& dt, const array& dt_bias, float min_val, float max_val) {
+        auto result = mlx::core::add(dt, dt_bias);
+        result = mlx::core::log1p(mlx::core::exp(result));
+        auto lo = mlx::core::array(min_val);
+        auto hi = mlx::core::array(max_val);
+        return mlx::core::clip(result, lo, hi);
+    }
+}
+
+bool ssm_kernel_available() {
+#ifdef __APPLE__
+    return mlx::core::metal::is_available();
+#else
+    return false;
+#endif
+}
+
+void ssm_update_kernel(
+    const MlxArray& hidden_states,
+    const MlxArray& A_log,
+    const MlxArray& B,
+    const MlxArray& C,
+    const MlxArray& D,
+    const MlxArray& dt,
+    const MlxArray& dt_bias,
+    const MlxArray& state_in,
+    float time_step_min,
+    float time_step_max,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& next_state
+) {
+    using namespace mlx::core;
+
+    auto shape = hidden_states.inner.shape();
+    int n = shape[0];  // batch
+    int h = shape[2];  // num_heads
+    int dh = shape[3]; // head_dim
+    auto b_shape = B.inner.shape();
+    int hb = b_shape[2]; // n_groups
+    int ds = b_shape[3]; // state_dim
+    int g = h / hb;      // heads per group
+
+    auto input_type = hidden_states.inner.dtype();
+
+    // Compute dt with softplus + clip
+    auto dt_result = compute_dt_fn(dt.inner, dt_bias.inner, time_step_min, time_step_max);
+
+    // Call the Metal kernel
+    auto& kernel = get_ssm_kernel().get();
+
+    // CustomKernelFunction signature:
+    // (inputs, output_shapes, output_dtypes, grid, threadgroup, template_args, init_value, verbose, stream)
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+        {"T", input_type},
+        {"Dh", dh},
+        {"Ds", ds},
+        {"H", h},
+        {"G", g},
+    };
+
+    std::vector<array> inputs = {
+        hidden_states.inner, A_log.inner, B.inner, C.inner,
+        mlx::core::astype(D.inner, input_type), dt_result, state_in.inner
+    };
+    std::vector<Shape> output_shapes = {Shape{n, 1, h, dh}, state_in.inner.shape()};
+    std::vector<Dtype> output_dtypes = {input_type, input_type};
+
+    auto results = kernel(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(32, dh, h * n),    // grid
+        std::make_tuple(32, 8, 1),          // threadgroup
+        template_args,
+        std::nullopt,  // init_value
+        false,         // verbose
+        {}             // stream (default)
+    );
+
+    output = std::make_unique<MlxArray>(std::move(results[0]));
+    next_state = std::make_unique<MlxArray>(std::move(results[1]));
+}
+
 } // namespace mlx_cxx

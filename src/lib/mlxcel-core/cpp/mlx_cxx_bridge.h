@@ -885,4 +885,28 @@ std::unique_ptr<MlxArray> quantize_weights_w(const MlxArray& w, int32_t group_si
 std::unique_ptr<MlxArray> quantize_weights_scales(const MlxArray& w, int32_t group_size, int32_t bits);
 std::unique_ptr<MlxArray> quantize_weights_biases(const MlxArray& w, int32_t group_size, int32_t bits);
 
+// SSM (Mamba2) fused Metal kernel for single-token decode.
+// Replaces ~55 individual ops with a single Metal kernel call.
+// Used by: NemotronH, NemotronNAS, Mamba2
+// Returns (output, next_state) packed as a pair via output pointers.
+// output: [batch, 1, num_heads, head_dim]
+// next_state: same shape as state_in
+void ssm_update_kernel(
+    const MlxArray& hidden_states,   // [batch, 1, num_heads, head_dim]
+    const MlxArray& A_log,           // [num_heads]
+    const MlxArray& B,               // [batch, 1, n_groups, state_dim]
+    const MlxArray& C,               // [batch, 1, n_groups, state_dim]
+    const MlxArray& D,               // [num_heads]
+    const MlxArray& dt,              // [batch, 1, num_heads]
+    const MlxArray& dt_bias,         // [num_heads]
+    const MlxArray& state_in,        // [batch, n_groups, n_heads/n_groups, head_dim, state_dim]
+    float time_step_min,
+    float time_step_max,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& next_state
+);
+
+// Check if SSM Metal kernel is available (Metal GPU only)
+bool ssm_kernel_available();
+
 } // namespace mlx_cxx

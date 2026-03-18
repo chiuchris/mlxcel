@@ -456,7 +456,13 @@ impl NemotronHMamba2Mixer {
                 .and_then(|s| s.as_ref().map(mlxcel_core::copy))
         });
 
-        let (y, new_state) = self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state.as_deref());
+        // Use fused Metal kernel for single-token decode when state is available
+        let (y, new_state) =
+            if seq_len == 1 && ssm_state.is_some() && mlxcel_core::ssm_kernel_available() {
+                self.ssm_step_kernel(&hidden_ssm, &b, &c, &dt, ssm_state.as_ref().unwrap())
+            } else {
+                self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state.as_deref())
+            };
 
         // Update SSM state
         if let Some(c) = cache {
@@ -621,6 +627,65 @@ impl NemotronHMamba2Mixer {
         let y = mlxcel_core::add(&y, &d_contrib);
 
         (y, next_state)
+    }
+
+    /// Fused SSM step using Metal kernel (single-token decode only)
+    /// Replaces ~55 individual FFI calls with a single Metal kernel invocation
+    fn ssm_step_kernel(
+        &self,
+        hidden_states: &MlxArray,
+        b: &MlxArray,
+        c: &MlxArray,
+        dt: &MlxArray,
+        state: &MlxArray,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let shape = mlxcel_core::array_shape(hidden_states);
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        // Reshape inputs for multi-head processing (matching Python's shapes)
+        let x = mlxcel_core::reshape(
+            hidden_states,
+            &[batch, seq_len, self.num_heads as i32, self.head_dim as i32],
+        );
+        let b = mlxcel_core::reshape(
+            b,
+            &[
+                batch,
+                seq_len,
+                self.n_groups as i32,
+                self.ssm_state_size as i32,
+            ],
+        );
+        let c = mlxcel_core::reshape(
+            c,
+            &[
+                batch,
+                seq_len,
+                self.n_groups as i32,
+                self.ssm_state_size as i32,
+            ],
+        );
+
+        let mut output = mlxcel_core::UniquePtr::null();
+        let mut next_state = mlxcel_core::UniquePtr::null();
+
+        mlxcel_core::ssm_update_kernel(
+            &x,
+            &self.a_log,
+            &b,
+            &c,
+            &self.d_param,
+            &dt,
+            &self.dt_bias,
+            state,
+            self.time_step_limit.0,
+            self.time_step_limit.1,
+            &mut output,
+            &mut next_state,
+        );
+
+        (output, next_state)
     }
 }
 

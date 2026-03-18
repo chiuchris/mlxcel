@@ -894,6 +894,28 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        // SSM (Mamba2) fused Metal kernel.
+        /// Check if SSM Metal kernel is available
+        fn ssm_kernel_available() -> bool;
+
+        /// Fused SSM update kernel for single-token decode
+        /// Replaces ~55 individual ops with a single Metal kernel call
+        /// Used by: NemotronH, NemotronNAS, Mamba2
+        fn ssm_update_kernel(
+            hidden_states: &MlxArray,
+            a_log: &MlxArray,
+            b: &MlxArray,
+            c: &MlxArray,
+            d: &MlxArray,
+            dt: &MlxArray,
+            dt_bias: &MlxArray,
+            state_in: &MlxArray,
+            time_step_min: f32,
+            time_step_max: f32,
+            output: &mut UniquePtr<MlxArray>,
+            next_state: &mut UniquePtr<MlxArray>,
+        );
+
         // Memory management.
         /// Clear memory cache
         fn clear_memory_cache();
