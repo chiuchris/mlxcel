@@ -906,6 +906,32 @@ mod ffi {
             scores_out: &mut UniquePtr<MlxArray>,
         );
 
+        // Fused MoE forward: gate + switch_mlp + score weighting + shared expert
+        /// Combines ~25 FFI calls into a single C++ function
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn fused_moe_forward(
+            x: &MlxArray,
+            gate_weight: &MlxArray,
+            correction_bias: &MlxArray,
+            fc1_weight: &MlxArray,
+            fc1_scales: &MlxArray,
+            fc1_biases: &MlxArray,
+            fc2_weight: &MlxArray,
+            fc2_scales: &MlxArray,
+            fc2_biases: &MlxArray,
+            shared_up_weight: *const MlxArray,
+            shared_up_scales: *const MlxArray,
+            shared_up_biases: *const MlxArray,
+            shared_down_weight: *const MlxArray,
+            shared_down_scales: *const MlxArray,
+            shared_down_biases: *const MlxArray,
+            top_k: i32,
+            scaling_factor: f32,
+            norm_topk_prob: bool,
+            group_size: i32,
+            bits: i32,
+        ) -> UniquePtr<MlxArray>;
+
         // SSM (Mamba2) fused Metal kernel.
         /// Check if SSM Metal kernel is available
         fn ssm_kernel_available() -> bool;

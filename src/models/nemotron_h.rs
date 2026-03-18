@@ -821,6 +821,39 @@ impl NemotronHMLP {
     }
 }
 
+/// Helper to extract raw weight/scales/biases pointers from UnifiedLinear
+/// Returns null pointers for non-quantized linear layers
+trait QuantizedWeightPtrs {
+    fn weight_ptr(&self) -> *const MlxArray;
+    fn scales_ptr(&self) -> *const MlxArray;
+    fn biases_ptr(&self) -> *const MlxArray;
+}
+
+impl QuantizedWeightPtrs for UnifiedLinear {
+    fn weight_ptr(&self) -> *const MlxArray {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => {
+                weight.weight.as_ref().unwrap() as *const MlxArray
+            }
+            UnifiedLinear::Regular(l) => l.weight.as_ref().unwrap() as *const MlxArray,
+        }
+    }
+    fn scales_ptr(&self) -> *const MlxArray {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => {
+                weight.scales.as_ref().unwrap() as *const MlxArray
+            }
+            _ => std::ptr::null(),
+        }
+    }
+    fn biases_ptr(&self) -> *const MlxArray {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => weight.biases_ptr(),
+            _ => std::ptr::null(),
+        }
+    }
+}
+
 // QuantizedSwitchLinear and SwitchMLP for MoE (using gather_qmm).
 // Kept local: uses weights.remove() (ownership), different naming (QuantizedSwitchLinear)
 enum QuantizedSwitchLinear {
@@ -959,24 +992,84 @@ impl NemotronHMoE {
             mlxcel_core::copy(x)
         };
 
-        // Get expert indices and scores
-        let (indices, scores) = self.gate.forward(&x_flat);
+        // Try fused MoE forward (quantized path only)
+        let result = if let (
+            QuantizedSwitchLinear::Quantized {
+                weight: fc1_w,
+                scales: fc1_s,
+                biases: fc1_b,
+                group_size,
+                bits,
+            },
+            QuantizedSwitchLinear::Quantized {
+                weight: fc2_w,
+                scales: fc2_s,
+                biases: fc2_b,
+                ..
+            },
+        ) = (&self.switch_mlp.fc1, &self.switch_mlp.fc2)
+        {
+            // Get shared expert weight pointers (nullable)
+            let (sup_w, sup_s, sup_b, sdn_w, sdn_s, sdn_b) =
+                if let Some(ref shared) = self.shared_experts {
+                    (
+                        shared.up_proj.weight_ptr(),
+                        shared.up_proj.scales_ptr(),
+                        shared.up_proj.biases_ptr(),
+                        shared.down_proj.weight_ptr(),
+                        shared.down_proj.scales_ptr(),
+                        shared.down_proj.biases_ptr(),
+                    )
+                } else {
+                    (
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                    )
+                };
 
-        // Route through experts
-        let y = self.switch_mlp.forward(&x_flat, &indices);
-
-        // Weight by scores
-        let mut scores_shape = mlxcel_core::array_shape(&scores);
-        scores_shape.push(1);
-        let scores_exp = mlxcel_core::reshape(&scores, &scores_shape);
-        let weighted = mlxcel_core::multiply(&y, &scores_exp);
-        let mut result = mlxcel_core::sum_axis(&weighted, -2, false);
-
-        // Add shared experts output
-        if let Some(ref shared) = self.shared_experts {
-            let shared_out = shared.forward(&x_flat);
-            result = mlxcel_core::add(&result, &shared_out);
-        }
+            unsafe {
+                mlxcel_core::fused_moe_forward(
+                    &x_flat,
+                    &self.gate.weight,
+                    &self.gate.e_score_correction_bias,
+                    fc1_w,
+                    fc1_s,
+                    fc1_b,
+                    fc2_w,
+                    fc2_s,
+                    fc2_b,
+                    sup_w,
+                    sup_s,
+                    sup_b,
+                    sdn_w,
+                    sdn_s,
+                    sdn_b,
+                    self.gate.top_k as i32,
+                    self.gate.routed_scaling_factor,
+                    self.gate.norm_topk_prob,
+                    *group_size,
+                    *bits,
+                )
+            }
+        } else {
+            // Fallback: non-quantized path (individual calls)
+            let (indices, scores) = self.gate.forward(&x_flat);
+            let y = self.switch_mlp.forward(&x_flat, &indices);
+            let mut scores_shape = mlxcel_core::array_shape(&scores);
+            scores_shape.push(1);
+            let scores_exp = mlxcel_core::reshape(&scores, &scores_shape);
+            let weighted = mlxcel_core::multiply(&y, &scores_exp);
+            let mut result = mlxcel_core::sum_axis(&weighted, -2, false);
+            if let Some(ref shared) = self.shared_experts {
+                let shared_out = shared.forward(&x_flat);
+                result = mlxcel_core::add(&result, &shared_out);
+            }
+            result
+        };
 
         // Reshape back
         if orig_shape.len() > 2 {

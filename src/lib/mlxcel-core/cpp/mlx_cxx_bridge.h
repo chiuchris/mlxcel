@@ -906,6 +906,32 @@ void ssm_update_kernel(
     std::unique_ptr<MlxArray>& next_state
 );
 
+// Fused MoE forward: gate + switch_mlp + score weighting + optional shared expert
+// Combines ~25 FFI calls into a single C++ function
+// Used by: NemotronH, NemotronNAS
+std::unique_ptr<MlxArray> fused_moe_forward(
+    const MlxArray& x,                  // [tokens, hidden]
+    const MlxArray& gate_weight,         // [num_experts, hidden]
+    const MlxArray& correction_bias,     // [num_experts]
+    const MlxArray& fc1_weight,          // [num_experts, intermediate, packed_hidden]
+    const MlxArray& fc1_scales,
+    const MlxArray& fc1_biases,
+    const MlxArray& fc2_weight,          // [num_experts, hidden, packed_intermediate]
+    const MlxArray& fc2_scales,
+    const MlxArray& fc2_biases,
+    const MlxArray* shared_up_weight,    // nullable: [intermediate, hidden]
+    const MlxArray* shared_up_scales,
+    const MlxArray* shared_up_biases,
+    const MlxArray* shared_down_weight,  // nullable: [hidden, intermediate]
+    const MlxArray* shared_down_scales,
+    const MlxArray* shared_down_biases,
+    int32_t top_k,
+    float scaling_factor,
+    bool norm_topk_prob,
+    int32_t group_size,
+    int32_t bits
+);
+
 // Check if SSM Metal kernel is available (Metal GPU only)
 bool ssm_kernel_available();
 

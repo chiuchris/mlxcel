@@ -2676,6 +2676,82 @@ void compiled_moe_gate(
     scores_out = std::make_unique<MlxArray>(std::move(topk_scores));
 }
 
+// Fused MoE forward: combines gate + switch_mlp + score weighting + shared expert
+std::unique_ptr<MlxArray> fused_moe_forward(
+    const MlxArray& x,
+    const MlxArray& gate_weight,
+    const MlxArray& correction_bias,
+    const MlxArray& fc1_weight,
+    const MlxArray& fc1_scales,
+    const MlxArray& fc1_biases,
+    const MlxArray& fc2_weight,
+    const MlxArray& fc2_scales,
+    const MlxArray& fc2_biases,
+    const MlxArray* shared_up_weight,
+    const MlxArray* shared_up_scales,
+    const MlxArray* shared_up_biases,
+    const MlxArray* shared_down_weight,
+    const MlxArray* shared_down_scales,
+    const MlxArray* shared_down_biases,
+    int32_t top_k,
+    float scaling_factor,
+    bool norm_topk_prob,
+    int32_t group_size,
+    int32_t bits
+) {
+    using namespace mlx::core;
+
+    // 1. Gate: sigmoid + topk + normalize + scale
+    auto gates = matmul(x.inner, transpose(gate_weight.inner));
+    auto orig_scores = sigmoid(astype(gates, float32));
+    auto biased = add(orig_scores, correction_bias.inner);
+    auto neg_biased = negative(biased);
+    auto all_indices = argpartition(neg_biased, top_k - 1, -1);
+    auto topk_indices = slice(all_indices, {0, 0}, {(int)all_indices.shape()[0], top_k});
+    auto topk_scores = take_along_axis(orig_scores, topk_indices, -1);
+    if (top_k > 1 && norm_topk_prob) {
+        auto denom = sum(topk_scores, -1, true);
+        topk_scores = divide(topk_scores, add(denom, array(1e-20f)));
+    }
+    topk_scores = multiply(topk_scores, array(scaling_factor));
+
+    // 2. SwitchMLP: expand + gather_qmm(fc1) + relu² + gather_qmm(fc2) + squeeze
+    auto x_shape = x.inner.shape();
+    auto x_exp = reshape(x.inner, {x_shape[0], 1, 1, x_shape[1]});
+
+    auto h = gather_qmm(
+        x_exp, fc1_weight.inner, fc1_scales.inner, fc1_biases.inner,
+        std::nullopt, topk_indices,
+        true, group_size, bits, "affine", false);
+    // relu² = relu(x)²
+    h = square(maximum(h, array(0.0f)));
+    h = gather_qmm(
+        h, fc2_weight.inner, fc2_scales.inner, fc2_biases.inner,
+        std::nullopt, topk_indices,
+        true, group_size, bits, "affine", false);
+    h = squeeze(h, -2);  // [tokens, top_k, hidden]
+
+    // 3. Score weighting: weighted sum over experts
+    auto scores_exp = reshape(topk_scores, {topk_scores.shape()[0], top_k, 1});
+    auto result = sum(multiply(h, scores_exp), -2, false);
+
+    // 4. Optional shared expert
+    if (shared_up_weight && shared_down_weight) {
+        auto shared_h = quantized_matmul(
+            x.inner, shared_up_weight->inner, shared_up_scales->inner,
+            shared_up_biases ? std::optional(shared_up_biases->inner) : std::nullopt,
+            true, group_size, bits);
+        shared_h = square(maximum(shared_h, array(0.0f)));
+        shared_h = quantized_matmul(
+            shared_h, shared_down_weight->inner, shared_down_scales->inner,
+            shared_down_biases ? std::optional(shared_down_biases->inner) : std::nullopt,
+            true, group_size, bits);
+        result = add(result, shared_h);
+    }
+
+    return std::make_unique<MlxArray>(std::move(result));
+}
+
 bool ssm_kernel_available() {
 #ifdef __APPLE__
     return mlx::core::metal::is_available();
