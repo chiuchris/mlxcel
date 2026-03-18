@@ -354,6 +354,11 @@ impl CxxGenerator {
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
         let logits = model.forward(&input, &mut self.caches, None);
 
+        if std::env::var("MLXCEL_TRACE_DTYPE").is_ok() {
+            ffi::eval(&logits);
+            eprintln!("[LOGITS] prefill dtype={}", ffi::array_dtype(&logits));
+        }
+
         // Clear intermediate tensors from prefill to free memory
         ffi::clear_memory_cache();
 
@@ -389,6 +394,10 @@ impl CxxGenerator {
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
+                if std::env::var("MLXCEL_TRACE_DTYPE").is_ok() && n == 0 {
+                    ffi::eval(&next_logits);
+                    eprintln!("[LOGITS] decode dtype={}", ffi::array_dtype(&next_logits));
+                }
                 let (next_tok, next_log) =
                     sample_token_optimized(&next_logits, sampling, &token_history);
                 if force_sync {
