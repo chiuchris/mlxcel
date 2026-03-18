@@ -315,6 +315,12 @@ std::unique_ptr<MlxArray> swiglu_mlp_forward(
     const MlxArray& down_proj
 );
 
+// Compiled relu_squared: square(maximum(x, 0)) — single fused kernel
+std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
+
+// Compiled silu: x * sigmoid(x) — single fused kernel
+std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
+
 // SwiGLU activation only - compiled with kernel fusion (shapeless=true)
 // output = silu(gate) * x
 // Uses mlx::core::compile for kernel fusion (like Python's @mx.compile)

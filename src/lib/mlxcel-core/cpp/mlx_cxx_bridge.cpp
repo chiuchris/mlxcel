@@ -1004,6 +1004,42 @@ namespace {
     }
 }
 
+// Compiled relu_squared: square(maximum(x, 0)) → single fused kernel
+// Python equivalent: CompiledBroadcastMaximumSquare
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_relu_squared() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            return {mlx::core::square(mlx::core::maximum(x, mlx::core::array(0)))};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x) {
+    static auto compiled_fn = get_compiled_relu_squared();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled silu: x * sigmoid(x) → single fused kernel
+// Python equivalent: CompiledSigmoidMultiply
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_silu() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            return {mlx::core::multiply(x, mlx::core::sigmoid(x))};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x) {
+    static auto compiled_fn = get_compiled_silu();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 std::unique_ptr<MlxArray> compiled_swiglu_activation(
     const MlxArray& gate,
     const MlxArray& x
@@ -2752,7 +2788,7 @@ std::unique_ptr<MlxArray> fused_moe_forward(
         std::nullopt, topk_indices,
         true, group_size, bits, "affine", false);
     // relu² = relu(x)²
-    h = square(maximum(h, mlx::core::zeros_like(h)));
+    { MlxArray h_w{h}; h = compiled_relu_squared(h_w)->inner; }
     h = gather_qmm(
         h, fc2_weight.inner, fc2_scales.inner, fc2_biases.inner,
         std::nullopt, topk_indices,
@@ -2770,7 +2806,7 @@ std::unique_ptr<MlxArray> fused_moe_forward(
             x.inner, shared_up_weight->inner, shared_up_scales->inner,
             shared_up_biases ? std::optional(shared_up_biases->inner) : std::nullopt,
             true, group_size, bits);
-        shared_h = square(maximum(shared_h, mlx::core::zeros_like(shared_h)));
+        { MlxArray sh_w{shared_h}; shared_h = compiled_relu_squared(sh_w)->inner; }
         shared_h = quantized_matmul(
             shared_h, shared_down_weight->inner, shared_down_scales->inner,
             shared_down_biases ? std::optional(shared_down_biases->inner) : std::nullopt,
@@ -2954,8 +2990,9 @@ void fused_mamba2_forward(
         conv_out = add(conv_out, bias_r);
     }
 
-    // SiLU: x * sigmoid(x)
-    auto conv_output = multiply(conv_out, sigmoid(conv_out));
+    // SiLU: x * sigmoid(x) — compiled kernel fusion
+    MlxArray co_w{conv_out};
+    auto conv_output = compiled_silu(co_w)->inner;
 
     // --- Step 4: Split conv_output into hidden_ssm, B, C ---
     // conv_output: [batch, seq_len, conv_dim]
@@ -3006,7 +3043,9 @@ void fused_mamba2_forward(
 
     // --- Step 7: MambaRMSNormGated ---
     // 7a. Gate: y_gated = y * silu(gate)
-    auto y_gated = multiply(y, multiply(gate, sigmoid(gate)));
+    // gate_activated = silu(gate), then y_gated = y * gate_activated
+    MlxArray gate_w{gate};
+    auto y_gated = multiply(y, compiled_silu(gate_w)->inner);
 
     // 7b. Grouped RMS norm: reshape last dim into [batch, seq_len, num_heads, head_dim]
     //     (norm group_size == head_dim, i.e. one RMS norm group per head)

@@ -486,6 +486,12 @@ mod ffi {
         /// output = silu(gate) * x
         fn compiled_swiglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled relu_squared: square(maximum(x, 0)) — single fused kernel
+        fn compiled_relu_squared(x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled silu: x * sigmoid(x) — single fused kernel
+        fn compiled_silu(x: &MlxArray) -> UniquePtr<MlxArray>;
+
         /// Full transformer layer forward (maximum FFI reduction)
         unsafe fn transformer_layer_forward(
             x: &MlxArray,

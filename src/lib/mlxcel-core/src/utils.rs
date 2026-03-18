@@ -173,10 +173,10 @@ pub fn repeat_kv(x: &MlxArray, n_rep: i32) -> UniquePtr<MlxArray> {
 }
 
 // Activation Functions.
-/// SiLU (Swish) activation: x * sigmoid(x)
+/// SiLU (Swish) activation: x * sigmoid(x) — compiled kernel fusion
 #[inline]
 pub fn silu(x: &MlxArray) -> UniquePtr<MlxArray> {
-    ffi::silu(x)
+    ffi::compiled_silu(x)
 }
 
 /// GELU activation with sigmoid approximation: x * sigmoid(1.702 * x)
@@ -192,11 +192,10 @@ pub fn gelu_sigmoid(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::multiply(x, &sigmoid_x)
 }
 
-/// ReLU squared activation: max(0, x)^2
+/// ReLU squared activation: max(0, x)^2 — compiled kernel fusion
 #[inline]
 pub fn relu_squared(x: &MlxArray) -> UniquePtr<MlxArray> {
-    let relu = ffi::relu(x);
-    ffi::square(&relu)
+    ffi::compiled_relu_squared(x)
 }
 
 /// Softplus activation: log(1 + exp(x))
