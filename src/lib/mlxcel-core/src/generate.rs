@@ -372,10 +372,20 @@ impl CxxGenerator {
         // 4. Yield/store current
         // 5. Move next to current
         let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
+        let profile_pipeline = std::env::var("MLXCEL_PROFILE_PIPELINE").is_ok();
+        let mut build_ns_total = 0u128;
+        let mut wait_ns_total = 0u128;
+        let mut profile_count = 0u32;
 
         let mut n = 0;
         loop {
             // Start next step (if not at max)
+            let build_start = if profile_pipeline {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
@@ -391,6 +401,10 @@ impl CxxGenerator {
                 (None, None)
             };
 
+            if let Some(bs) = build_start {
+                build_ns_total += bs.elapsed().as_nanos();
+            }
+
             // First iteration: explicit eval
             if n == 0 {
                 ffi::eval(&y);
@@ -402,8 +416,16 @@ impl CxxGenerator {
             }
 
             // Extract current token value - this syncs y
-            // (item_i32 implicitly evals if needed)
+            let wait_start = if profile_pipeline {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let token_val = ffi::item_i32(&y);
+            if let Some(ws) = wait_start {
+                wait_ns_total += ws.elapsed().as_nanos();
+                profile_count += 1;
+            }
 
             // Check EOS before sending to callback (avoid outputting stop tokens)
             if eos_tokens.contains(&token_val) {
@@ -434,6 +456,18 @@ impl CxxGenerator {
             }
 
             n += 1;
+        }
+
+        if profile_pipeline && profile_count > 3 {
+            let build_avg = build_ns_total as f64 / profile_count as f64;
+            let wait_avg = wait_ns_total as f64 / profile_count as f64;
+            eprintln!(
+                "[PIPELINE] build: {:.2}ms/tok, item_wait: {:.2}ms/tok, sum: {:.2}ms/tok ({} tokens)",
+                build_avg / 1e6,
+                wait_avg / 1e6,
+                (build_avg + wait_avg) / 1e6,
+                profile_count,
+            );
         }
 
         self.generated_tokens.clone()
