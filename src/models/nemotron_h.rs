@@ -1324,7 +1324,11 @@ impl NemotronHModel {
         */
 
         // Standard Rust path (prefill or fallback).
-        self.forward_rust(inputs, caches)
+        if std::env::var("MLXCEL_PROFILE_FORWARD").is_ok() && shape[1] == 1 {
+            self.forward_profiled(inputs, caches)
+        } else {
+            self.forward_rust(inputs, caches)
+        }
     }
 
     /// Full-model single-token decode via `nemotron_decode_step`.
@@ -1522,12 +1526,40 @@ impl NemotronHModel {
         cpp_logits
     }
 
+    /// Measure graph build + GPU eval separately (debug only)
+    fn forward_profiled(
+        &self,
+        inputs: &MlxArray,
+        caches: &mut [NemotronLayerCache],
+    ) -> UniquePtr<MlxArray> {
+        let t0 = std::time::Instant::now();
+        let logits = self.forward_rust(inputs, caches);
+        let build_ms = t0.elapsed().as_nanos() as f64 / 1e6;
+
+        let t1 = std::time::Instant::now();
+        mlxcel_core::eval(&logits);
+        let eval_ms = t1.elapsed().as_nanos() as f64 / 1e6;
+
+        eprintln!(
+            "[FORWARD] build: {:.2}ms, eval: {:.2}ms, total: {:.2}ms",
+            build_ms,
+            eval_ms,
+            build_ms + eval_ms,
+        );
+        logits
+    }
+
     /// Standard Rust layer-by-layer forward pass.
     fn forward_rust(
         &self,
         inputs: &MlxArray,
         caches: &mut [NemotronLayerCache],
     ) -> UniquePtr<MlxArray> {
+        let profile_blocks = std::env::var("MLXCEL_PROFILE_BLOCKS").is_ok();
+        let mut mamba_ns = 0u128;
+        let mut attn_ns = 0u128;
+        let mut moe_ns = 0u128;
+
         let mut h = self.embeddings.forward(inputs);
 
         // Find first attention cache offset
@@ -1547,6 +1579,13 @@ impl NemotronHModel {
 
         let mut cache_idx = 0;
         for (layer, &block_type) in self.layers.iter().zip(self.block_types.iter()) {
+            let t0 = if profile_blocks {
+                mlxcel_core::eval(&h);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+
             if block_type.needs_cache() {
                 let cache_entry = &mut caches[cache_idx];
                 match (block_type, cache_entry) {
@@ -1562,6 +1601,31 @@ impl NemotronHModel {
             } else {
                 h = layer.forward(&h, None, None, None);
             }
+
+            if let Some(t0) = t0 {
+                mlxcel_core::eval(&h);
+                let e = t0.elapsed().as_nanos();
+                match block_type {
+                    BlockType::Mamba => mamba_ns += e,
+                    BlockType::Attention => attn_ns += e,
+                    BlockType::MoE => moe_ns += e,
+                    _ => {}
+                }
+            }
+        }
+
+        if profile_blocks {
+            let total = (mamba_ns + attn_ns + moe_ns).max(1);
+            eprintln!(
+                "[BLOCKS] M:{:.1}ms({:.0}%) A:{:.1}ms({:.0}%) E:{:.1}ms({:.0}%) T:{:.1}ms",
+                mamba_ns as f64 / 1e6,
+                mamba_ns as f64 * 100.0 / total as f64,
+                attn_ns as f64 / 1e6,
+                attn_ns as f64 * 100.0 / total as f64,
+                moe_ns as f64 / 1e6,
+                moe_ns as f64 * 100.0 / total as f64,
+                total as f64 / 1e6,
+            );
         }
 
         let h = self.norm_f.forward(&h);
