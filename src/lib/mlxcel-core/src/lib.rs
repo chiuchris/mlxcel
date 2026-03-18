@@ -894,6 +894,18 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        // Compiled MoE gate (sigmoid + topk + normalize + scale in one graph)
+        /// Matches Python @mx.compile group_expert_select()
+        fn compiled_moe_gate(
+            gates: &MlxArray,
+            correction_bias: &MlxArray,
+            top_k: i32,
+            scaling_factor: f32,
+            norm_topk_prob: bool,
+            indices_out: &mut UniquePtr<MlxArray>,
+            scores_out: &mut UniquePtr<MlxArray>,
+        );
+
         // SSM (Mamba2) fused Metal kernel.
         /// Check if SSM Metal kernel is available
         fn ssm_kernel_available() -> bool;

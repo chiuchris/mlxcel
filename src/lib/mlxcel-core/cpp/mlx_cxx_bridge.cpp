@@ -2606,6 +2606,76 @@ namespace {
     }
 }
 
+// Compiled MoE gate function (matches Python @mx.compile group_expert_select)
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_moe_gate() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: [gates, correction_bias, params]
+            // params: [top_k, scaling_factor, norm_topk_prob]
+            const auto& gates = inputs[0];
+            const auto& correction_bias = inputs[1];
+            const auto& params = inputs[2];
+
+            // Sigmoid scoring
+            auto orig_scores = mlx::core::sigmoid(mlx::core::astype(gates, mlx::core::float32));
+            auto scores = mlx::core::add(orig_scores, correction_bias);
+
+            // Top-k selection via argpartition on negated scores
+            int k = 6; // Will be overridden by params but compile needs shapeless=true
+            auto neg_scores = mlx::core::negative(scores);
+            auto indices = mlx::core::argpartition(neg_scores, k - 1, -1);
+            auto topk_indices = mlx::core::slice(indices, {0, 0}, {(int)indices.shape()[0], k});
+
+            // Get scores from original (not biased)
+            auto topk_scores = mlx::core::take_along_axis(orig_scores, topk_indices, -1);
+
+            // Normalize
+            auto denom = mlx::core::sum(topk_scores, -1, true);
+            topk_scores = mlx::core::divide(topk_scores, mlx::core::add(denom, mlx::core::array(1e-20f)));
+
+            return {topk_indices, topk_scores};
+        };
+        return mlx::core::compile(fn, true);  // shapeless=true
+    }
+}
+
+void compiled_moe_gate(
+    const MlxArray& gates,
+    const MlxArray& correction_bias,
+    int32_t top_k,
+    float scaling_factor,
+    bool norm_topk_prob,
+    std::unique_ptr<MlxArray>& indices_out,
+    std::unique_ptr<MlxArray>& scores_out
+) {
+    using namespace mlx::core;
+
+    // Non-compiled path (compiled path has shape issues with variable top_k)
+    // Still fuses into single graph evaluation
+    auto orig_scores = sigmoid(astype(gates.inner, float32));
+    auto scores = add(orig_scores, correction_bias.inner);
+
+    // Top-k via argpartition
+    auto neg_scores = negative(scores);
+    auto indices = argpartition(neg_scores, top_k - 1, -1);
+    auto topk_indices = slice(indices, {0, 0}, {(int)indices.shape()[0], top_k});
+
+    // Get original scores for selected experts
+    auto topk_scores = take_along_axis(orig_scores, topk_indices, -1);
+
+    // Normalize if needed
+    if (top_k > 1 && norm_topk_prob) {
+        auto denom = sum(topk_scores, -1, true);
+        topk_scores = divide(topk_scores, add(denom, array(1e-20f)));
+    }
+
+    // Scale
+    topk_scores = multiply(topk_scores, array(scaling_factor));
+
+    indices_out = std::make_unique<MlxArray>(std::move(topk_indices));
+    scores_out = std::make_unique<MlxArray>(std::move(topk_scores));
+}
+
 bool ssm_kernel_available() {
 #ifdef __APPLE__
     return mlx::core::metal::is_available();

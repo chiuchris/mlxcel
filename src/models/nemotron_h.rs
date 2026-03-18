@@ -920,45 +920,24 @@ struct NemotronHMoEGate {
 
 impl NemotronHMoEGate {
     fn forward(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        // Gate projection: x @ W^T
         let w_t = mlxcel_core::transpose(&self.weight);
         let gates = mlxcel_core::matmul(x, &w_t);
 
-        // Sigmoid scoring
-        let scores = mlxcel_core::sigmoid(&gates);
-        let orig_scores = mlxcel_core::copy(&scores);
+        // Use fused C++ gate function (matches Python @mx.compile group_expert_select)
+        let mut indices = mlxcel_core::UniquePtr::null();
+        let mut scores = mlxcel_core::UniquePtr::null();
+        mlxcel_core::compiled_moe_gate(
+            &gates,
+            &self.e_score_correction_bias,
+            self.top_k as i32,
+            self.routed_scaling_factor,
+            self.norm_topk_prob,
+            &mut indices,
+            &mut scores,
+        );
 
-        // Add correction bias
-        let scores = mlxcel_core::add(&scores, &self.e_score_correction_bias);
-
-        // Top-k selection
-        let k = self.top_k as i32;
-        let neg_scores = mlxcel_core::negative(&scores);
-        let indices = mlxcel_core::argpartition(&neg_scores, k - 1, -1);
-        let topk_indices = slice_axis(&indices, -1, 0, k);
-
-        // Get scores from original
-        let topk_scores = mlxcel_core::take_along_axis(&orig_scores, &topk_indices, -1);
-
-        // Normalize if needed
-        let topk_scores = if self.top_k > 1 && self.norm_topk_prob {
-            let sum = mlxcel_core::sum_axis(&topk_scores, -1, true);
-            let normalized = mlxcel_core::divide(&topk_scores, &sum);
-            let scale = mlxcel_core::full_f32(
-                &[1],
-                self.routed_scaling_factor,
-                mlxcel_core::dtype::FLOAT32,
-            );
-            mlxcel_core::multiply(&normalized, &scale)
-        } else {
-            let scale = mlxcel_core::full_f32(
-                &[1],
-                self.routed_scaling_factor,
-                mlxcel_core::dtype::FLOAT32,
-            );
-            mlxcel_core::multiply(&topk_scores, &scale)
-        };
-
-        (topk_indices, topk_scores)
+        (indices, scores)
     }
 }
 

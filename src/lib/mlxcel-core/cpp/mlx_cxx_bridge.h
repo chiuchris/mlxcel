@@ -909,4 +909,17 @@ void ssm_update_kernel(
 // Check if SSM Metal kernel is available (Metal GPU only)
 bool ssm_kernel_available();
 
+// Compiled MoE gate: sigmoid scoring + bias + topk + normalize + scale
+// Matches Python @mx.compile group_expert_select()
+// Returns (topk_indices, topk_scores) via output pointers
+void compiled_moe_gate(
+    const MlxArray& gates,           // [tokens, num_experts] - already matmul'd
+    const MlxArray& correction_bias, // [num_experts]
+    int32_t top_k,
+    float scaling_factor,
+    bool norm_topk_prob,
+    std::unique_ptr<MlxArray>& indices_out,
+    std::unique_ptr<MlxArray>& scores_out
+);
+
 } // namespace mlx_cxx
