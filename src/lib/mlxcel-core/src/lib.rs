@@ -1001,6 +1001,42 @@ mod ffi {
             ssm_state_out: &mut UniquePtr<MlxArray>,
         );
 
+        // NemotronH full-forward decode (opaque handle pattern).
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn nemotron_register_model(
+            embed_w: &MlxArray, embed_s: &MlxArray, embed_b: &MlxArray,
+            final_norm_w: &MlxArray,
+            lm_head_w: &MlxArray, lm_head_s: &MlxArray, lm_head_b: *const MlxArray,
+            norm_weights: &[*const MlxArray],
+            block_types: &[i32],
+            mamba_weights: &[*const MlxArray],
+            moe_weights: &[*const MlxArray],
+            attn_weights: &[*const MlxArray],
+            norm_eps: f32, group_size: i32, bits: i32,
+            m_inter: i32, m_cdim: i32, m_ck: i32,
+            m_heads: i32, m_hdim: i32, m_groups: i32, m_state: i32,
+            m_ts_min: f32, m_ts_max: f32, m_neps: f32,
+            moe_tk: i32, moe_sc: f32, moe_norm: bool,
+            a_heads: i32, a_kvh: i32, a_hdim: i32,
+            a_rope: f32, a_scale: f32,
+        ) -> u64;
+
+        fn nemotron_free_model(handle: u64);
+
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn nemotron_decode_step(
+            handle: u64,
+            input_ids: &MlxArray,
+            mamba_conv_in: &[*const MlxArray],
+            mamba_ssm_in: &[*const MlxArray],
+            attn_kv_keys: &[*const MlxArray],
+            attn_kv_values: &[*const MlxArray],
+            attn_kv_offsets: &[i32],
+            logits: &mut UniquePtr<MlxArray>,
+            mamba_conv_out: &mut [UniquePtr<MlxArray>],
+            mamba_ssm_out: &mut [UniquePtr<MlxArray>],
+        );
+
         // Memory management.
         /// Clear memory cache
         fn clear_memory_cache();

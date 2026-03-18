@@ -1005,8 +1005,63 @@ void fused_mamba2_forward(
     std::unique_ptr<MlxArray>& ssm_state_out
 );
 
-// [REMOVED - nemotron_full_forward was too complex, using targeted approach instead]
-// Placeholder to keep namespace valid
+// NemotronH opaque model handle for C++-side full forward decode.
+// Weights are registered once, then nemotron_decode_step builds the full
+// computation graph within C++ (zero Rust↔C++ round-trips during layer loop).
+//
+// Register: pass all weight pointers as flat arrays per block type.
+// Returns an opaque handle (uint64_t) used for subsequent decode calls.
+uint64_t nemotron_register_model(
+    // Embedding (quantized)
+    const MlxArray& embed_w, const MlxArray& embed_s, const MlxArray& embed_b,
+    // Final norm + lm_head
+    const MlxArray& final_norm_w,
+    const MlxArray& lm_head_w, const MlxArray& lm_head_s, const MlxArray* lm_head_b,
+    // Per-layer norm weights
+    rust::Slice<const MlxArray* const> norm_weights,
+    // Block types per layer: 0=Mamba, 1=Attention, 3=MoE
+    rust::Slice<const int32_t> block_types,
+    // Mamba layer weights (indexed by mamba_layer_idx, not global)
+    rust::Slice<const MlxArray* const> mamba_weights,   // 13 ptrs per layer: in(w,s,b), conv(w,b), a_log, d, dt_bias, norm, out(w,s,b)
+    // MoE layer weights (indexed by moe_layer_idx)
+    rust::Slice<const MlxArray* const> moe_weights,     // 14 ptrs per layer: gate_w, bias, fc1(w,s,b), fc2(w,s,b), shared_up(w,s,b), shared_down(w,s,b)
+    // Attention layer weights (indexed by attn_layer_idx)
+    rust::Slice<const MlxArray* const> attn_weights,    // 12 ptrs per layer: q(w,s,b), k(w,s,b), v(w,s,b), o(w,s,b)
+    // Config
+    float norm_eps, int32_t group_size, int32_t bits,
+    // Mamba config
+    int32_t m_inter, int32_t m_conv_dim, int32_t m_conv_k,
+    int32_t m_heads, int32_t m_head_dim, int32_t m_groups, int32_t m_state_size,
+    float m_ts_min, float m_ts_max, float m_norm_eps,
+    // MoE config
+    int32_t moe_top_k, float moe_scale, bool moe_norm,
+    // Attention config
+    int32_t a_heads, int32_t a_kv_heads, int32_t a_head_dim,
+    float a_rope_theta, float a_scale
+);
+
+// Single decode step using registered model handle.
+// Builds full graph in C++ — one FFI call per token.
+void nemotron_decode_step(
+    uint64_t handle,
+    const MlxArray& input_ids,
+    // Mamba cache states (in): conv[num_mamba], ssm[num_mamba]
+    rust::Slice<const MlxArray* const> mamba_conv_in,
+    rust::Slice<const MlxArray* const> mamba_ssm_in,
+    // Attention KV cache pointers (managed by Rust KVCache, just pass current state)
+    rust::Slice<const MlxArray* const> attn_kv_keys,
+    rust::Slice<const MlxArray* const> attn_kv_values,
+    rust::Slice<const int32_t> attn_kv_offsets,
+    // Outputs
+    std::unique_ptr<MlxArray>& logits,
+    // Updated Mamba cache states
+    rust::Slice<std::unique_ptr<MlxArray>> mamba_conv_out,
+    rust::Slice<std::unique_ptr<MlxArray>> mamba_ssm_out
+);
+
+// Free registered model
+void nemotron_free_model(uint64_t handle);
+
 #if 0
 void nemotron_full_forward(
     // Input
