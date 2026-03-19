@@ -36,6 +36,9 @@ tokenizers = "0.22.2"
 sentencepiece = "0.13"
 hf-hub = "0.5.0"
 
+# Zero-copy buffers
+bytes = "1.9"
+
 # Error Handling
 anyhow = "1.0.100"
 thiserror = "2.0.11"
