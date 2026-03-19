@@ -13,7 +13,7 @@
 // limitations under the License.
 
 //! Distributed inference: node discovery, cluster configuration, transport,
-//! and health monitoring.
+//! health monitoring, and request scheduling.
 //!
 //! This module provides the building blocks for multi-node inference:
 //!
@@ -29,18 +29,28 @@
 //! - [`metrics`] — per-node metrics collection (throughput, latency, memory, network)
 //! - [`correlation`] — cluster-wide correlation IDs for cross-node request tracing
 //! - [`bench`] — throughput and latency benchmarking harness
+//! - [`scheduler`] — distributed scheduler coordinator with pluggable routing
+//! - [`routing`] — trait-based routing strategies (role-based, load-balanced, round-robin, PP)
+//! - [`request_tracker`] — request lifecycle tracking with unique IDs and state transitions
+//! - [`backpressure`] — per-node load tracking with configurable thresholds and overflow policies
+//! - [`handoff_queue`] — bounded cross-node request handoff queues
 
+pub mod backpressure;
 pub mod bench;
 pub mod config;
 pub mod connection_pool;
 pub mod correlation;
 pub mod discovery;
 pub mod failure_detector;
+pub mod handoff_queue;
 pub mod heartbeat;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
 pub mod registry;
+pub mod request_tracker;
+pub mod routing;
+pub mod scheduler;
 pub mod tcp_transport;
 pub mod tensor_chunked;
 pub mod tensor_compress;
@@ -52,16 +62,30 @@ pub mod test_harness;
 pub mod thunderbolt_transport;
 pub mod transport;
 
+pub use backpressure::{
+    BackpressureConfig, BackpressureMonitor, BackpressurePolicy, BackpressureSignal, LoadLevel,
+};
 pub use config::{ClusterConfig, ClusterMeta, NodeConfig, NodeResources, NodeRole};
 pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use correlation::{CorrelationId, RequestContext};
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureEvent};
+pub use handoff_queue::{
+    HandoffItem, HandoffQueue, HandoffQueueConfig, HandoffQueueManager, OverflowPolicy, QueueStats,
+};
 pub use heartbeat::{HEARTBEAT_OPERATION, HeartbeatConfig, HeartbeatPayload, HeartbeatService};
 pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
+pub use request_tracker::{
+    RequestId, RequestLifecycle, RequestState, RequestTracker, RequestTrackerConfig,
+};
+pub use routing::{
+    LoadBalancedRouter, NodeCandidate, PipelineStageRouter, RoleBasedRouter, RoundRobinRouter,
+    RoutingDecision, RoutingRequest, RoutingStrategy,
+};
+pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
 pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
 pub use tensor_protocol::{

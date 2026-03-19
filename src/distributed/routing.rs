@@ -1,0 +1,345 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Routing strategies for distributed request scheduling.
+//!
+//! Provides a trait-based extensibility point for routing decisions. Built-in
+//! strategies include role-based routing, load-balanced routing, and
+//! round-robin. Pipeline Parallel (PP), Disaggregated Inference (DI), and
+//! Tensor Parallel (TP) strategies can be plugged in by implementing the
+//! [`RoutingStrategy`] trait.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use anyhow::Result;
+
+use super::config::NodeRole;
+use super::metrics::NodeMetrics;
+use super::registry::NodeStatus;
+
+/// Information about a candidate node available for routing.
+#[derive(Debug, Clone)]
+pub struct NodeCandidate {
+    /// Unique node identifier.
+    pub node_id: String,
+    /// Node role in the cluster.
+    pub role: NodeRole,
+    /// Current health status.
+    pub status: NodeStatus,
+    /// Latest metrics snapshot (if available).
+    pub metrics: Option<NodeMetrics>,
+    /// Pipeline stage index (for PP routing).
+    pub stage: Option<u32>,
+    /// Tensor-parallel rank (for TP routing).
+    pub rank: Option<u32>,
+}
+
+/// A request to be routed to a node.
+#[derive(Debug, Clone)]
+pub struct RoutingRequest {
+    /// The request identifier.
+    pub request_id: String,
+    /// Preferred node role for this request (e.g., Prefill for DI).
+    pub preferred_role: Option<NodeRole>,
+    /// Preferred pipeline stage (for PP routing).
+    pub preferred_stage: Option<u32>,
+    /// Optional hint for sticky routing (route to same node as before).
+    pub affinity_node: Option<String>,
+}
+
+/// Result of a routing decision.
+#[derive(Debug, Clone)]
+pub struct RoutingDecision {
+    /// ID of the selected target node.
+    pub target_node: String,
+    /// Name of the strategy that made this decision.
+    pub strategy: String,
+    /// Optional reason for the selection (useful for debugging).
+    pub reason: Option<String>,
+}
+
+/// Trait for pluggable routing strategies.
+///
+/// Implementations decide which node should handle a given request based on
+/// the request properties and available candidates. This is the main
+/// extensibility point for PP, DI, and TP custom routing logic.
+///
+/// Used by: Scheduler
+pub trait RoutingStrategy: Send + Sync {
+    /// Select a target node for the given request from the candidates.
+    ///
+    /// Returns the node ID of the selected candidate, or an error if no
+    /// suitable candidate is found.
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision>;
+
+    /// Return the human-readable name of this strategy.
+    fn strategy_name(&self) -> &str;
+}
+
+/// Routes requests to nodes based on their role.
+///
+/// If the request has a `preferred_role`, only nodes with that role (or Hybrid)
+/// are considered. Among matching nodes, the first online node is selected.
+///
+/// Used by: Scheduler (default for DI routing)
+pub struct RoleBasedRouter;
+
+impl RoutingStrategy for RoleBasedRouter {
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision> {
+        // If affinity is set, try that node first.
+        if let Some(ref affinity) = request.affinity_node
+            && let Some(c) = candidates
+                .iter()
+                .find(|c| c.node_id == *affinity && c.status == NodeStatus::Online)
+        {
+            return Ok(RoutingDecision {
+                target_node: c.node_id.clone(),
+                strategy: self.strategy_name().to_string(),
+                reason: Some("affinity match".to_string()),
+            });
+        }
+
+        let online: Vec<&NodeCandidate> = candidates
+            .iter()
+            .filter(|c| c.status == NodeStatus::Online)
+            .collect();
+
+        if online.is_empty() {
+            anyhow::bail!("no online nodes available for routing");
+        }
+
+        // Filter by preferred role if specified.
+        if let Some(role) = request.preferred_role {
+            let matching: Vec<&&NodeCandidate> = online
+                .iter()
+                .filter(|c| c.role == role || c.role == NodeRole::Hybrid)
+                .collect();
+
+            if let Some(node) = matching.first() {
+                return Ok(RoutingDecision {
+                    target_node: node.node_id.clone(),
+                    strategy: self.strategy_name().to_string(),
+                    reason: Some(format!("role match: {role}")),
+                });
+            }
+        }
+
+        // Fallback: first online node.
+        Ok(RoutingDecision {
+            target_node: online[0].node_id.clone(),
+            strategy: self.strategy_name().to_string(),
+            reason: Some("fallback to first online".to_string()),
+        })
+    }
+
+    fn strategy_name(&self) -> &str {
+        "role-based"
+    }
+}
+
+/// Routes requests to the least-loaded online node.
+///
+/// Load is measured by `active_requests` from the node metrics. Nodes without
+/// metrics are treated as having zero load (optimistic assumption for new nodes).
+///
+/// Used by: Scheduler (default load balancing)
+pub struct LoadBalancedRouter;
+
+impl RoutingStrategy for LoadBalancedRouter {
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision> {
+        let mut online: Vec<&NodeCandidate> = candidates
+            .iter()
+            .filter(|c| c.status == NodeStatus::Online)
+            .collect();
+
+        if online.is_empty() {
+            anyhow::bail!("no online nodes available for routing");
+        }
+
+        // Filter by preferred role if specified.
+        if let Some(role) = request.preferred_role {
+            let matching: Vec<&NodeCandidate> = online
+                .iter()
+                .filter(|c| c.role == role || c.role == NodeRole::Hybrid)
+                .copied()
+                .collect();
+            if !matching.is_empty() {
+                online = matching;
+            }
+        }
+
+        // Sort by active requests (ascending), with memory usage as tiebreaker.
+        online.sort_by(|a, b| {
+            let load_a = a.metrics.as_ref().map(|m| m.active_requests).unwrap_or(0);
+            let load_b = b.metrics.as_ref().map(|m| m.active_requests).unwrap_or(0);
+            load_a.cmp(&load_b).then_with(|| {
+                let mem_a = a.metrics.as_ref().map(|m| m.memory_used_bytes).unwrap_or(0);
+                let mem_b = b.metrics.as_ref().map(|m| m.memory_used_bytes).unwrap_or(0);
+                mem_a.cmp(&mem_b)
+            })
+        });
+
+        let selected = online[0];
+        let active = selected
+            .metrics
+            .as_ref()
+            .map(|m| m.active_requests)
+            .unwrap_or(0);
+
+        Ok(RoutingDecision {
+            target_node: selected.node_id.clone(),
+            strategy: self.strategy_name().to_string(),
+            reason: Some(format!("least loaded (active_requests={active})")),
+        })
+    }
+
+    fn strategy_name(&self) -> &str {
+        "load-balanced"
+    }
+}
+
+/// Routes requests in round-robin order among online nodes.
+///
+/// Maintains an atomic counter to distribute requests evenly. If a preferred
+/// role is specified, only matching nodes participate in the rotation.
+///
+/// Used by: Scheduler (simple even distribution)
+pub struct RoundRobinRouter {
+    counter: AtomicUsize,
+}
+
+impl RoundRobinRouter {
+    /// Create a new round-robin router.
+    pub fn new() -> Self {
+        Self {
+            counter: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for RoundRobinRouter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl RoutingStrategy for RoundRobinRouter {
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision> {
+        let mut online: Vec<&NodeCandidate> = candidates
+            .iter()
+            .filter(|c| c.status == NodeStatus::Online)
+            .collect();
+
+        if online.is_empty() {
+            anyhow::bail!("no online nodes available for routing");
+        }
+
+        // Filter by preferred role if specified.
+        if let Some(role) = request.preferred_role {
+            let matching: Vec<&NodeCandidate> = online
+                .iter()
+                .filter(|c| c.role == role || c.role == NodeRole::Hybrid)
+                .copied()
+                .collect();
+            if !matching.is_empty() {
+                online = matching;
+            }
+        }
+
+        // Sort by node_id for deterministic ordering.
+        online.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+        let idx = self.counter.fetch_add(1, Ordering::Relaxed) % online.len();
+        let selected = online[idx];
+
+        Ok(RoutingDecision {
+            target_node: selected.node_id.clone(),
+            strategy: self.strategy_name().to_string(),
+            reason: Some(format!("round-robin index={idx}")),
+        })
+    }
+
+    fn strategy_name(&self) -> &str {
+        "round-robin"
+    }
+}
+
+/// Routes requests to a specific pipeline stage.
+///
+/// Selects nodes with `PipelineStage` role matching the requested stage index.
+/// Falls back to load-based selection if multiple nodes serve the same stage.
+///
+/// Used by: Pipeline Parallel scheduling
+pub struct PipelineStageRouter;
+
+impl RoutingStrategy for PipelineStageRouter {
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision> {
+        let target_stage = request
+            .preferred_stage
+            .ok_or_else(|| anyhow::anyhow!("pipeline stage router requires preferred_stage"))?;
+
+        let matching: Vec<&NodeCandidate> = candidates
+            .iter()
+            .filter(|c| {
+                c.status == NodeStatus::Online
+                    && c.role == NodeRole::PipelineStage
+                    && c.stage == Some(target_stage)
+            })
+            .collect();
+
+        if matching.is_empty() {
+            anyhow::bail!("no online node found for pipeline stage {target_stage}");
+        }
+
+        // If multiple nodes serve the same stage, pick the least loaded.
+        let selected = matching
+            .iter()
+            .min_by_key(|c| c.metrics.as_ref().map(|m| m.active_requests).unwrap_or(0))
+            .unwrap();
+
+        Ok(RoutingDecision {
+            target_node: selected.node_id.clone(),
+            strategy: self.strategy_name().to_string(),
+            reason: Some(format!("pipeline stage {target_stage}")),
+        })
+    }
+
+    fn strategy_name(&self) -> &str {
+        "pipeline-stage"
+    }
+}
+
+#[cfg(test)]
+#[path = "routing_tests.rs"]
+mod tests;
