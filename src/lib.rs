@@ -17,6 +17,7 @@
 //! This crate provides efficient inference for Large Language Models using
 //! direct MLX C++ bindings via mlxcel-core.
 
+pub mod distributed;
 pub mod execution;
 pub mod lora;
 pub mod models;

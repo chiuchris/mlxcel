@@ -19,6 +19,7 @@
 //! negative seed sentinels at the edge so server startup and request handling do
 //! not need to remember llama-server compatibility rules.
 
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
 use super::ServerStartupConfig;
@@ -82,6 +83,16 @@ pub struct ServerStartupInput {
     pub verbose: bool,
     pub log_disable: bool,
     pub log_file: Option<PathBuf>,
+
+    // Distributed inference.
+    /// Path to a TOML cluster configuration file.
+    pub distributed_config: Option<PathBuf>,
+    /// Role this node plays in the cluster (CLI shorthand).
+    pub node_role: Option<String>,
+    /// Unique identifier for this node (CLI shorthand).
+    pub node_id: Option<String>,
+    /// Comma-separated list of peer addresses (CLI shorthand).
+    pub peers: Vec<SocketAddr>,
 }
 
 impl ServerStartupInput {
@@ -134,6 +145,10 @@ impl ServerStartupInput {
             verbose: self.verbose,
             log_disable: self.log_disable,
             log_file: self.log_file,
+            distributed_config: self.distributed_config,
+            node_role: self.node_role,
+            node_id: self.node_id,
+            peers: self.peers,
         }
     }
 }

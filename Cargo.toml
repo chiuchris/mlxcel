@@ -70,6 +70,7 @@ hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-stream = "0.3"
 fancy-regex = "0.17.0"
+toml = "0.8"
 
 [profile.release]
 strip = true              # Strip all symbols for smaller binary

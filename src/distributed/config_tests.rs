@@ -1,0 +1,246 @@
+use super::*;
+
+#[test]
+fn parse_node_role_from_str() {
+    assert_eq!("prefill".parse::<NodeRole>().unwrap(), NodeRole::Prefill);
+    assert_eq!("decode".parse::<NodeRole>().unwrap(), NodeRole::Decode);
+    assert_eq!(
+        "pipeline_stage".parse::<NodeRole>().unwrap(),
+        NodeRole::PipelineStage
+    );
+    assert_eq!(
+        "pipeline-stage".parse::<NodeRole>().unwrap(),
+        NodeRole::PipelineStage
+    );
+    assert_eq!(
+        "tensor_parallel_rank".parse::<NodeRole>().unwrap(),
+        NodeRole::TensorParallelRank
+    );
+    assert_eq!(
+        "tp".parse::<NodeRole>().unwrap(),
+        NodeRole::TensorParallelRank
+    );
+    assert_eq!("hybrid".parse::<NodeRole>().unwrap(), NodeRole::Hybrid);
+    assert!("unknown".parse::<NodeRole>().is_err());
+}
+
+#[test]
+fn node_role_display_roundtrip() {
+    let roles = [
+        NodeRole::Prefill,
+        NodeRole::Decode,
+        NodeRole::PipelineStage,
+        NodeRole::TensorParallelRank,
+        NodeRole::Hybrid,
+    ];
+    for role in roles {
+        let s = role.to_string();
+        let parsed: NodeRole = s.parse().unwrap();
+        assert_eq!(parsed, role);
+    }
+}
+
+#[test]
+fn node_role_serialization() {
+    let role = NodeRole::TensorParallelRank;
+    let json = serde_json::to_string(&role).unwrap();
+    assert_eq!(json, "\"tensor_parallel_rank\"");
+    let deserialized: NodeRole = serde_json::from_str(&json).unwrap();
+    assert_eq!(deserialized, role);
+}
+
+#[test]
+fn parse_cluster_config_toml() {
+    let toml_str = r#"
+[cluster]
+name = "test-cluster"
+tensor_parallel_size = 2
+pipeline_parallel_size = 1
+
+[[nodes]]
+id = "node-0"
+address = "192.168.1.10:8080"
+role = "tensor_parallel_rank"
+rank = 0
+
+[[nodes]]
+id = "node-1"
+address = "192.168.1.11:8080"
+role = "tensor_parallel_rank"
+rank = 1
+"#;
+    let config = ClusterConfig::from_toml(toml_str).unwrap();
+    assert_eq!(config.cluster.name, "test-cluster");
+    assert_eq!(config.cluster.tensor_parallel_size, 2);
+    assert_eq!(config.nodes.len(), 2);
+    assert_eq!(config.nodes[0].role, NodeRole::TensorParallelRank);
+    assert_eq!(config.nodes[0].rank, Some(0));
+    assert_eq!(config.nodes[1].rank, Some(1));
+}
+
+#[test]
+fn reject_duplicate_node_ids() {
+    let toml_str = r#"
+[cluster]
+name = "dup"
+
+[[nodes]]
+id = "same"
+address = "127.0.0.1:8080"
+role = "hybrid"
+
+[[nodes]]
+id = "same"
+address = "127.0.0.1:8081"
+role = "hybrid"
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("duplicate node id"));
+}
+
+#[test]
+fn reject_duplicate_addresses() {
+    let toml_str = r#"
+[cluster]
+name = "dup"
+
+[[nodes]]
+id = "a"
+address = "127.0.0.1:8080"
+role = "hybrid"
+
+[[nodes]]
+id = "b"
+address = "127.0.0.1:8080"
+role = "hybrid"
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("duplicate address"));
+}
+
+#[test]
+fn reject_empty_nodes() {
+    let toml_str = r#"
+[cluster]
+name = "empty"
+nodes = []
+"#;
+    // toml may parse this differently; either parse error or validation error is fine
+    let result = ClusterConfig::from_toml(toml_str);
+    assert!(result.is_err());
+}
+
+#[test]
+fn from_cli_builds_single_node() {
+    let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let config = ClusterConfig::from_cli("local".to_string(), addr, NodeRole::Hybrid, vec![]);
+    assert_eq!(config.nodes.len(), 1);
+    assert_eq!(config.nodes[0].id, "local");
+    assert_eq!(config.nodes[0].role, NodeRole::Hybrid);
+}
+
+#[test]
+fn from_cli_with_peers() {
+    let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let peer1: std::net::SocketAddr = "192.168.1.2:9000".parse().unwrap();
+    let peer2: std::net::SocketAddr = "192.168.1.3:9000".parse().unwrap();
+    let config = ClusterConfig::from_cli(
+        "node-0".to_string(),
+        addr,
+        NodeRole::Prefill,
+        vec![peer1, peer2],
+    );
+    assert_eq!(config.nodes.len(), 3);
+    assert_eq!(config.nodes[0].role, NodeRole::Prefill);
+    assert_eq!(config.nodes[1].address, peer1);
+    assert_eq!(config.nodes[2].address, peer2);
+}
+
+#[test]
+fn find_node_by_id() {
+    let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    let config = ClusterConfig::from_cli("local".to_string(), addr, NodeRole::Hybrid, vec![]);
+    assert!(config.find_node("local").is_some());
+    assert!(config.find_node("nonexistent").is_none());
+}
+
+#[test]
+fn topology_summary_contains_all_nodes() {
+    let toml_str = r#"
+[cluster]
+name = "summary-test"
+
+[[nodes]]
+id = "alpha"
+address = "10.0.0.1:8080"
+role = "prefill"
+
+[[nodes]]
+id = "beta"
+address = "10.0.0.2:8080"
+role = "decode"
+"#;
+    let config = ClusterConfig::from_toml(toml_str).unwrap();
+    let summary = config.topology_summary();
+    assert!(summary.contains("summary-test"));
+    assert!(summary.contains("alpha"));
+    assert!(summary.contains("beta"));
+    assert!(summary.contains("prefill"));
+    assert!(summary.contains("decode"));
+}
+
+#[test]
+fn reject_empty_node_id() {
+    let toml_str = r#"
+[cluster]
+name = "test"
+
+[[nodes]]
+id = ""
+address = "127.0.0.1:8080"
+role = "hybrid"
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("node id must not be empty"));
+}
+
+#[test]
+fn reject_control_characters_in_node_id() {
+    let toml_str = "
+[cluster]
+name = \"test\"
+
+[[nodes]]
+id = \"bad\\nid\"
+address = \"127.0.0.1:8080\"
+role = \"hybrid\"
+";
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("control characters"));
+}
+
+#[test]
+fn reject_control_characters_in_cluster_name() {
+    let toml_str = "[cluster]\nname = \"bad\\nname\"\n\n[[nodes]]\nid = \"node-0\"\naddress = \"127.0.0.1:8080\"\nrole = \"hybrid\"";
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("control characters"));
+}
+
+#[test]
+fn from_cli_deduplicates_local_address_in_peers() {
+    let addr: std::net::SocketAddr = "127.0.0.1:9000".parse().unwrap();
+    // Pass the local address as a peer — should be silently dropped.
+    let config = ClusterConfig::from_cli(
+        "local".to_string(),
+        addr,
+        NodeRole::Hybrid,
+        vec![addr, "192.168.1.2:9000".parse().unwrap()],
+    );
+    // Only local + 1 real peer, the duplicate local address was filtered.
+    assert_eq!(config.nodes.len(), 2);
+    assert_eq!(config.nodes[0].address, addr);
+    assert_eq!(
+        config.nodes[1].address,
+        "192.168.1.2:9000".parse::<std::net::SocketAddr>().unwrap()
+    );
+}

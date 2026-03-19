@@ -18,6 +18,7 @@
 //! chat-template resolution, model warmup, and socket binding out of
 //! `server/mod.rs` so the server root can focus on shared types and state.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -108,6 +109,16 @@ pub struct ServerStartupConfig {
     pub verbose: bool,
     pub log_disable: bool,
     pub log_file: Option<PathBuf>,
+
+    // Distributed inference
+    /// Path to a TOML cluster configuration file.
+    pub distributed_config: Option<PathBuf>,
+    /// Node role (CLI shorthand, parsed into `NodeRole` at startup).
+    pub node_role: Option<String>,
+    /// Unique node identifier (CLI shorthand).
+    pub node_id: Option<String>,
+    /// Static peer addresses (CLI shorthand).
+    pub peers: Vec<SocketAddr>,
 }
 
 impl Default for ServerStartupConfig {
@@ -157,6 +168,10 @@ impl Default for ServerStartupConfig {
             verbose: false,
             log_disable: false,
             log_file: None,
+            distributed_config: None,
+            node_role: None,
+            node_id: None,
+            peers: Vec::new(),
         }
     }
 }
@@ -357,6 +372,55 @@ async fn serve_tcp(startup: &ServerStartupConfig, app: axum::Router) -> Result<(
     Ok(())
 }
 
+/// Resolve distributed cluster configuration from CLI arguments.
+///
+/// Returns `Some(NodeRegistry)` when distributed mode is active, `None` for
+/// standalone operation.
+async fn resolve_distributed_config(
+    startup: &ServerStartupConfig,
+) -> Result<Option<crate::distributed::NodeRegistry>> {
+    use crate::distributed::{ClusterConfig, NodeRole};
+
+    if let Some(ref config_path) = startup.distributed_config {
+        let cluster_config = ClusterConfig::from_file(config_path)?;
+        let local_id = startup
+            .node_id
+            .as_deref()
+            .or_else(|| cluster_config.nodes.first().map(|n| n.id.as_str()))
+            .unwrap_or("node-0");
+        let registry = crate::distributed::initialize_distributed(
+            &cluster_config,
+            local_id,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+        return Ok(Some(registry));
+    }
+
+    // CLI shorthand: --node-role + optional --node-id / --peers
+    if let Some(ref role_str) = startup.node_role {
+        let role: NodeRole = role_str.parse()?;
+        let node_id = startup
+            .node_id
+            .clone()
+            .unwrap_or_else(|| "node-0".to_string());
+        let listen_addr: std::net::SocketAddr = format!("{}:{}", startup.host, startup.port)
+            .parse()
+            .context("failed to parse local listen address for distributed config")?;
+        let cluster_config =
+            ClusterConfig::from_cli(node_id.clone(), listen_addr, role, startup.peers.clone());
+        let registry = crate::distributed::initialize_distributed(
+            &cluster_config,
+            &node_id,
+            std::time::Duration::from_secs(5),
+        )
+        .await?;
+        return Ok(Some(registry));
+    }
+
+    Ok(None)
+}
+
 /// Start the server with the given startup configuration.
 ///
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
@@ -393,6 +457,9 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
             max_memory as f64 / (1024.0 * 1024.0 * 1024.0)
         );
     }
+
+    // -- Distributed mode initialization --
+    let _node_registry = resolve_distributed_config(&startup).await?;
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
     let config = build_server_config(&startup, api_key);

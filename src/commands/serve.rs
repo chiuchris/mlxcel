@@ -75,6 +75,10 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         verbose: args.verbose,
         log_disable: args.log_disable,
         log_file: args.log_file,
+        distributed_config: args.distributed_config,
+        node_role: args.node_role,
+        node_id: args.node_id,
+        peers: args.peers,
     }
 }
 

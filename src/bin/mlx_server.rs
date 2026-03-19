@@ -255,6 +255,23 @@ struct Args {
     #[arg(long = "log-file", env = "LLAMA_LOG_FILE", value_name = "PATH")]
     log_file: Option<PathBuf>,
 
+    // Distributed inference.
+    /// Path to TOML cluster configuration file for distributed inference
+    #[arg(long, value_name = "PATH")]
+    distributed_config: Option<PathBuf>,
+
+    /// Role this node plays in the cluster (prefill, decode, pipeline_stage, tensor_parallel_rank, hybrid)
+    #[arg(long, value_name = "ROLE")]
+    node_role: Option<String>,
+
+    /// Unique identifier for this node in the cluster
+    #[arg(long, value_name = "ID")]
+    node_id: Option<String>,
+
+    /// Comma-separated list of peer addresses (host:port) for static discovery
+    #[arg(long, value_delimiter = ',', value_name = "ADDR")]
+    peers: Vec<std::net::SocketAddr>,
+
     // llama-server compatibility arguments (accepted but ignored).
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
     #[arg(long, hide = true)]
@@ -343,5 +360,9 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         verbose: args.verbose,
         log_disable: args.log_disable,
         log_file: args.log_file,
+        distributed_config: args.distributed_config,
+        node_role: args.node_role,
+        node_id: args.node_id,
+        peers: args.peers,
     }
 }

@@ -64,6 +64,10 @@ fn sample_input() -> ServerStartupInput {
         verbose: true,
         log_disable: false,
         log_file: Some(PathBuf::from("server.log")),
+        distributed_config: None,
+        node_role: None,
+        node_id: None,
+        peers: Vec::new(),
     }
 }
 
