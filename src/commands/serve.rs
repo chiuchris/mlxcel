@@ -79,6 +79,7 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         node_role: args.node_role,
         node_id: args.node_id,
         peers: args.peers,
+        pp_layers: args.pp_layers,
     }
 }
 

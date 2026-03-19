@@ -387,6 +387,14 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_delimiter = ',', value_name = "ADDR")]
     peers: Vec<std::net::SocketAddr>,
 
+    /// Manual pipeline-parallel layer partition (e.g. "0-15,16-31")
+    ///
+    /// Specifies explicit layer ranges per pipeline stage. Each range is
+    /// inclusive on both ends. When omitted, layers are auto-partitioned
+    /// proportionally to device memory.
+    #[arg(long = "pp-layers", value_name = "RANGES")]
+    pp_layers: Option<String>,
+
     // llama-server compatibility arguments (accepted but ignored).
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
     #[arg(long, hide = true)]

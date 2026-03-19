@@ -68,6 +68,7 @@ fn sample_args() -> crate::ServeArgs {
         node_role: None,
         node_id: None,
         peers: vec![],
+        pp_layers: None,
         _no_webui: false,
         _jinja: false,
         _n_gpu_layers: None,
@@ -95,4 +96,18 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
         input.dry_sequence_breakers,
         vec!["\n".to_string(), "\t".to_string()]
     );
+}
+
+#[test]
+fn build_startup_input_propagates_pp_layers() {
+    let mut args = sample_args();
+    args.pp_layers = Some("0-15,16-31".to_string());
+    let input = build_startup_input(args);
+    assert_eq!(input.pp_layers, Some("0-15,16-31".to_string()));
+}
+
+#[test]
+fn build_startup_input_pp_layers_none_by_default() {
+    let input = build_startup_input(sample_args());
+    assert_eq!(input.pp_layers, None);
 }

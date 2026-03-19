@@ -34,6 +34,7 @@
 //! - [`request_tracker`] — request lifecycle tracking with unique IDs and state transitions
 //! - [`backpressure`] — per-node load tracking with configurable thresholds and overflow policies
 //! - [`handoff_queue`] — bounded cross-node request handoff queues
+//! - [`pipeline`] — layer partitioning strategy and configuration for pipeline parallelism
 
 pub mod backpressure;
 pub mod bench;
@@ -47,6 +48,7 @@ pub mod heartbeat;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
+pub mod pipeline;
 pub mod registry;
 pub mod request_tracker;
 pub mod routing;
@@ -76,6 +78,10 @@ pub use handoff_queue::{
 pub use heartbeat::{HEARTBEAT_OPERATION, HeartbeatConfig, HeartbeatPayload, HeartbeatService};
 pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
+};
+pub use pipeline::{
+    DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
+    build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use request_tracker::{

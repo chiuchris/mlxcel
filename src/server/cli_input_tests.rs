@@ -68,6 +68,7 @@ fn sample_input() -> ServerStartupInput {
         node_role: None,
         node_id: None,
         peers: Vec::new(),
+        pp_layers: None,
     }
 }
 
@@ -174,4 +175,18 @@ fn into_startup_config_detects_batch_size_conflict() {
     assert_eq!(startup.prefill_chunk_size, 256);
     assert!(startup.batch_size_conflict);
     assert!(startup.ubatch_size_provided);
+}
+
+#[test]
+fn into_startup_config_propagates_pp_layers() {
+    let mut input = sample_input();
+    input.pp_layers = Some("0-15,16-31".to_string());
+    let startup = input.into_startup_config();
+    assert_eq!(startup.pp_layers, Some("0-15,16-31".to_string()));
+}
+
+#[test]
+fn into_startup_config_pp_layers_none_by_default() {
+    let startup = sample_input().into_startup_config();
+    assert_eq!(startup.pp_layers, None);
 }

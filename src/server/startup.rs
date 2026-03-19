@@ -119,6 +119,9 @@ pub struct ServerStartupConfig {
     pub node_id: Option<String>,
     /// Static peer addresses (CLI shorthand).
     pub peers: Vec<SocketAddr>,
+    /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
+    /// When `None`, auto-partition mode is used.
+    pub pp_layers: Option<String>,
 }
 
 impl Default for ServerStartupConfig {
@@ -172,6 +175,7 @@ impl Default for ServerStartupConfig {
             node_role: None,
             node_id: None,
             peers: Vec::new(),
+            pp_layers: None,
         }
     }
 }

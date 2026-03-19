@@ -93,6 +93,8 @@ pub struct ServerStartupInput {
     pub node_id: Option<String>,
     /// Comma-separated list of peer addresses (CLI shorthand).
     pub peers: Vec<SocketAddr>,
+    /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
+    pub pp_layers: Option<String>,
 }
 
 impl ServerStartupInput {
@@ -149,6 +151,7 @@ impl ServerStartupInput {
             node_role: self.node_role,
             node_id: self.node_id,
             peers: self.peers,
+            pp_layers: self.pp_layers,
         }
     }
 }
