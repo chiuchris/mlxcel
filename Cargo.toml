@@ -64,6 +64,7 @@ minijinja = { version = "2.5", features = ["loop_controls"] }
 tokio = { version = "1.35", features = ["full"] }
 axum = { version = "0.7", features = ["json", "macros"] }
 tokio-stream = "0.1"
+tokio-util = "0.7"
 futures = "0.3"
 uuid = { version = "1.6", features = ["v4"] }
 chrono = "0.4"
