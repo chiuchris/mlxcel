@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.11] - 2026-03-18
+
+### Added
+- Compiled kernel fusion for `relu_squared` and `silu` activation functions
+- Compiled kernel fusion for MoE gate and `compute_dt` operations
+- Fused SSM Metal kernel for Mamba2 single-token decode
+- Compiled MoE gate function for NemotronH
+- Fused MoE forward function for NemotronH
+- Fused Mamba2 mixer forward for NemotronH
+- NemotronH full-forward C++ decode path (experimental, disabled)
+- `MLXCEL_FORCE_SYNC` debug flag for pipelining analysis
+- `MLXCEL_PROFILE_PIPELINE` for precise build/wait timing
+- Per-block and build/eval profiling for NemotronH
+
+### Fixed
+- Auto-cast SDPA mask to Q dtype, preventing mask type errors across models
+- Load float16 weights natively on Metal (was converting to float32)
+- Eliminate float32 type promotion across all models
+- Prevent float32 type promotion in NemotronH hidden states
+- Add affine fast-path for quantized_matmul (omit mode parameter)
+- Correct mlx-lm benchmark baselines and update nemotron/mamba results
+
+### Changed
+- Optimize Mamba single-token decode path and remove unnecessary copies
+
 ## [v0.0.10] - 2026-03-17
 
 ### Fixed
@@ -184,6 +209,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.11]: https://github.com/lablup/mlxcel/compare/v0.0.10...v0.0.11
 [v0.0.10]: https://github.com/lablup/mlxcel/compare/v0.0.9...v0.0.10
 [v0.0.9]: https://github.com/lablup/mlxcel/compare/v0.0.8...v0.0.9
 [v0.0.8]: https://github.com/lablup/mlxcel/compare/v0.0.7...v0.0.8

@@ -1,3 +1,19 @@
+mlxcel (0.0.11-1~jammy1) jammy; urgency=medium
+
+  * Feat: Add compiled kernel fusion for relu_squared, silu, MoE gate, and compute_dt
+  * Feat: Add fused SSM Metal kernel for Mamba2 single-token decode
+  * Feat: Add fused MoE forward and compiled MoE gate for NemotronH
+  * Feat: Add fused Mamba2 mixer forward for NemotronH
+  * Feat: Add MLXCEL_PROFILE_PIPELINE and MLXCEL_FORCE_SYNC debug flags
+  * Fix: Auto-cast SDPA mask to Q dtype preventing mask type errors
+  * Fix: Load float16 weights natively on Metal (was converting to float32)
+  * Fix: Eliminate float32 type promotion across all models
+  * Fix: Prevent float32 type promotion in NemotronH hidden states
+  * Fix: Add affine fast-path for quantized_matmul
+  * Update: Optimize Mamba single-token decode path
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 18 Mar 2026 12:00:00 +0900
+
 mlxcel (0.0.10-1~jammy1) jammy; urgency=medium
 
   * Fix: ExaOne4 causal mask dtype mismatch with bfloat16 model weights
