@@ -371,7 +371,7 @@ impl NemotronHMamba2Mixer {
             && mlxcel_core::ssm_kernel_available()
             && cache
                 .as_ref()
-                .map_or(false, |c| c.conv_state.is_some() && c.ssm_state.is_some())
+                .is_some_and(|c| c.conv_state.is_some() && c.ssm_state.is_some())
         {
             return self.forward_fused(hidden_states, cache.as_deref_mut().unwrap());
         }
@@ -467,12 +467,15 @@ impl NemotronHMamba2Mixer {
             .and_then(|s| s.as_ref());
 
         // Use fused Metal kernel for single-token decode when state is available
-        let (y, new_state) =
-            if seq_len == 1 && ssm_state_ref.is_some() && mlxcel_core::ssm_kernel_available() {
-                self.ssm_step_kernel(&hidden_ssm, &b, &c, &dt, ssm_state_ref.unwrap())
+        let (y, new_state) = if seq_len == 1 && mlxcel_core::ssm_kernel_available() {
+            if let Some(state) = ssm_state_ref {
+                self.ssm_step_kernel(&hidden_ssm, &b, &c, &dt, state)
             } else {
                 self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state_ref)
-            };
+            }
+        } else {
+            self.ssm_step(&hidden_ssm, &b, &c, &dt, ssm_state_ref)
+        };
 
         // Update SSM state
         if let Some(c) = cache {
@@ -688,7 +691,7 @@ impl NemotronHMamba2Mixer {
             &b,
             &c,
             &self.d_param,
-            &dt,
+            dt,
             &self.dt_bias,
             state,
             self.time_step_limit.0,
@@ -1308,7 +1311,7 @@ impl NemotronHModel {
         // All Mamba layers are fused into one C++ call; attention KV is supplied from
         // (and updated back into) the Rust caches after the call.
         let shape = mlxcel_core::array_shape(inputs);
-        let seq_len = shape[1];
+        let _seq_len = shape[1];
         // C++ full-forward decode available but disabled: hypothesis test showed
         // no speedup (19.2ms C++ vs 18.9ms Rust) — the bottleneck is GPU ops,
         // not graph build CPU overhead.
@@ -1342,12 +1345,15 @@ impl NemotronHModel {
     /// the post-decode hidden state from a lightweight Rust pass.
     ///
     /// # Known limitation
+    ///
     /// The Rust-side KV update below requires per-attention-layer hidden states
     /// which are not returned by `nemotron_decode_step`.  Until C++ exposes KV
     /// output parameters, we run the full Rust forward after the C++ call and
     /// use *its* KV updates.  This doubles compute but keeps both paths
     /// consistent for the hypothesis / correctness test.  Once the C++ API is
     /// extended to return updated KV arrays, the Rust forward can be removed.
+    // Retained for hypothesis testing; not called in production paths.
+    #[allow(dead_code)]
     fn forward_decode_cpp(
         &self,
         inputs: &MlxArray,

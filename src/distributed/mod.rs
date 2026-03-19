@@ -31,6 +31,11 @@ pub mod connection_pool;
 pub mod discovery;
 pub mod registry;
 pub mod tcp_transport;
+pub mod tensor_chunked;
+pub mod tensor_compress;
+pub mod tensor_protocol;
+pub mod tensor_quantize;
+pub mod tensor_serialize;
 pub mod thunderbolt_transport;
 pub mod transport;
 
@@ -39,5 +44,13 @@ pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
+pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
+pub use tensor_protocol::{
+    PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
+};
+pub use tensor_serialize::{
+    DeserializedTensor, SerializeOptions, deserialize_tensor, serialize_tensor,
+    serialize_tensor_to_bytes,
+};
 pub use thunderbolt_transport::{ThunderboltTransport, ThunderboltTransportConfig};
 pub use transport::{Transport, TransportBackend, TransportMessage};
