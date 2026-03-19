@@ -21,6 +21,7 @@ default = []
 metal = ["mlxcel-core/metal"]
 accelerate = ["mlxcel-core/accelerate"]
 cuda = ["mlxcel-core/cuda"]
+test-utils = []
 
 [dependencies]
 # MLX - mlxcel-core (direct C++ bindings via cxx)
@@ -92,3 +93,7 @@ too_many_arguments = "allow"
 type_complexity = "allow"
 large_enum_variant = "allow"
 should_implement_trait = "allow"
+
+[[test]]
+name = "distributed_integration"
+required-features = ["test-utils"]

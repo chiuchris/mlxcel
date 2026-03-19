@@ -38,6 +38,8 @@ pub mod discovery;
 pub mod failure_detector;
 pub mod heartbeat;
 pub mod metrics;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod mock_transport;
 pub mod registry;
 pub mod tcp_transport;
 pub mod tensor_chunked;
@@ -45,6 +47,8 @@ pub mod tensor_compress;
 pub mod tensor_protocol;
 pub mod tensor_quantize;
 pub mod tensor_serialize;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_harness;
 pub mod thunderbolt_transport;
 pub mod transport;
 
