@@ -69,6 +69,7 @@ fn sample_args() -> crate::ServeArgs {
         node_id: None,
         peers: vec![],
         pp_layers: None,
+        pp_micro_batch_size: 1,
         tp_size: 1,
         tp_moe_mode: "expert_parallel".to_string(),
         tp_embedding_mode: "replicated".to_string(),

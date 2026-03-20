@@ -37,12 +37,14 @@
 //! - [`pipeline`] — layer partitioning, activation transfer, and configuration for pipeline parallelism
 //! - [`tensor_parallel`] — weight sharding strategy and configuration for tensor parallelism
 //! - [`kv_cache_transfer`] — optimized KV cache transfer (streamed, quantized, parallel)
+//! - [`disaggregated`] — prefill/decode separation: prefill scheduler, handoff protocol, chunked prefill
 
 pub mod backpressure;
 pub mod bench;
 pub mod config;
 pub mod connection_pool;
 pub mod correlation;
+pub mod disaggregated;
 pub mod discovery;
 pub mod failure_detector;
 pub mod handoff_queue;
@@ -75,6 +77,10 @@ pub use backpressure::{
 pub use config::{ClusterConfig, ClusterMeta, NodeConfig, NodeResources, NodeRole};
 pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use correlation::{CorrelationId, RequestContext};
+pub use disaggregated::{
+    ChunkedPrefillCoordinator, HandoffProtocol, HandoffStatus, PrefillHandoff, PrefillRequest,
+    PrefillResult, PrefillScheduler, PrefillSchedulerConfig,
+};
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureEvent};
 pub use handoff_queue::{
