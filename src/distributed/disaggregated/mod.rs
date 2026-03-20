@@ -21,9 +21,12 @@
 //!   and hands off KV cache + first token to decode nodes.
 //! - [`decode_scheduler`] — Decode-only scheduler that receives KV caches
 //!   from prefill nodes and manages batched token generation.
+//! - [`request_router`] — Request router and load balancer that orchestrates
+//!   the full disaggregated pipeline with configurable routing strategies.
 
 pub mod decode_scheduler;
 pub mod prefill_scheduler;
+pub mod request_router;
 
 pub use decode_scheduler::{
     CompletionEvent, CompletionNotifier, CompletionReason, DecodeRequest, DecodeScheduler,
@@ -32,4 +35,8 @@ pub use decode_scheduler::{
 pub use prefill_scheduler::{
     ChunkedPrefillCoordinator, HandoffProtocol, HandoffStatus, PrefillHandoff, PrefillRequest,
     PrefillResult, PrefillScheduler, PrefillSchedulerConfig,
+};
+pub use request_router::{
+    BackpressureAction, DisaggRoutingStrategy, NodeLoadInfo, RequestPhase, RequestRouter,
+    RouterConfig, RouterMetrics, TrackedRequest,
 };
