@@ -25,9 +25,23 @@
 //! - [`auto_partition`] — memory-proportional layer assignment algorithm
 //! - [`parse_manual_partition`] — parse `--pp-layers 0-15,16-31` syntax
 //! - [`validate_partition`] — reject gaps, overlaps, and memory violations
+//!
+//! Partial-loading support for pipeline stages:
+//!
+//! - [`LayerFilter`] — describes which model subset a stage needs
+//! - [`classify_weight_key`] — categorise a weight key (layer/embedding/lm_head/norm/other)
+//! - [`SafeTensorsIndex`] — parse `model.safetensors.index.json` to map keys → shard files
+//! - [`filter_weight_map`] — drop unneeded tensors from an already-loaded weight map
+//! - [`estimate_partial_memory`] / [`validate_partial_memory`] — memory budget helpers
 
+pub mod partial_loading;
 pub mod partition;
 
+pub use partial_loading::{
+    LayerFilter, SafeTensorsIndex, WeightClass, classify_weight_key, estimate_partial_memory,
+    filter_weight_keys, filter_weight_map, identify_required_shards, should_load_key,
+    validate_partial_memory,
+};
 pub use partition::{
     DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
     build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,

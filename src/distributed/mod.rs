@@ -90,8 +90,11 @@ pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
 };
 pub use pipeline::{
-    DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
-    build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,
+    DeviceSpec, LayerFilter, ModelProfile, PartitionConfig, SafeTensorsIndex, StageAssignment,
+    WeightClass, auto_partition, build_manual_assignments, classify_weight_key,
+    estimate_partial_memory, filter_weight_keys, filter_weight_map, identify_required_shards,
+    parse_manual_partition, should_load_key, validate_memory_fit, validate_partial_memory,
+    validate_partition,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use request_tracker::{
