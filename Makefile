@@ -121,17 +121,17 @@ debug: build ## Alias for build (debug mode)
 .PHONY: test
 test: ## Run all tests
 	@echo "$(CYAN)Running tests...$(RESET)"
-	$(CARGO) test
+	$(CARGO) test -- --test-threads=1
 	@echo "$(GREEN)All tests passed!$(RESET)"
 
 .PHONY: test-verbose
 test-verbose: ## Run tests with verbose output
 	@echo "$(CYAN)Running tests (verbose)...$(RESET)"
-	$(CARGO) test -- --nocapture
+	$(CARGO) test -- --nocapture --test-threads=1
 
 .PHONY: test-lib
 test-lib: ## Run library tests only
-	$(CARGO) test --lib
+	$(CARGO) test --lib -- --test-threads=1
 
 .PHONY: test-doc
 test-doc: ## Run documentation tests
@@ -515,3 +515,57 @@ bench-report: ## Show last benchmark results summary
 bench-clean: ## Remove benchmark log
 	@rm -f $(BENCH_LOG)
 	@echo "Benchmark log removed."
+
+# ============================================================================
+# Documentation (MkDocs)
+# ============================================================================
+
+.PHONY: docs-install
+docs-install: ## Install MkDocs dependencies and create shared symlinks
+	@command -v uv >/dev/null 2>&1 || { \
+		echo "Error: uv is not installed. Install it from https://docs.astral.sh/uv/"; \
+		exit 1; \
+	}
+	uv pip install -r docs/requirements.txt
+	rm -rf docs/en/shared docs/ko/shared
+	ln -s ../shared docs/en/shared
+	ln -s ../shared docs/ko/shared
+	@echo "MkDocs dependencies installed and symlinks created. Run 'make docs-serve' to start the server."
+
+.PHONY: docs-serve
+docs-serve: docs-build-all ## Serve all docs locally (builds first, then serves EN)
+	uv run mkdocs serve --config-file mkdocs.yml
+
+.PHONY: docs-serve-en
+docs-serve-en: ## Serve English docs with live reload
+	uv run mkdocs serve --config-file mkdocs.yml
+
+.PHONY: docs-serve-ko
+docs-serve-ko: ## Serve Korean docs with live reload
+	uv run mkdocs serve --config-file mkdocs.ko.yml
+
+.PHONY: docs-build
+docs-build: ## Build English docs
+	uv run mkdocs build --config-file mkdocs.yml
+
+.PHONY: docs-build-ko
+docs-build-ko: ## Build Korean docs
+	uv run mkdocs build --config-file mkdocs.ko.yml
+
+.PHONY: docs-build-all
+docs-build-all: ## Build all docs (EN + KO)
+	@echo "Building English docs..."
+	uv run mkdocs build --config-file mkdocs.yml -d site/en/manual
+	@echo "Building Korean docs..."
+	uv run mkdocs build --config-file mkdocs.ko.yml -d site/ko/manual
+	@echo "All docs built in site/"
+
+.PHONY: docs-build-strict
+docs-build-strict: ## Build all docs with strict mode (for CI)
+	uv run mkdocs build --strict --config-file mkdocs.yml -d site/en/manual
+	uv run mkdocs build --strict --config-file mkdocs.ko.yml -d site/ko/manual
+
+.PHONY: docs-clean
+docs-clean: ## Remove built docs
+	rm -rf site/
+	@echo "Built docs removed."
