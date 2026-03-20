@@ -34,7 +34,7 @@
 //! - [`request_tracker`] — request lifecycle tracking with unique IDs and state transitions
 //! - [`backpressure`] — per-node load tracking with configurable thresholds and overflow policies
 //! - [`handoff_queue`] — bounded cross-node request handoff queues
-//! - [`pipeline`] — layer partitioning strategy and configuration for pipeline parallelism
+//! - [`pipeline`] — layer partitioning, activation transfer, and configuration for pipeline parallelism
 //! - [`tensor_parallel`] — weight sharding strategy and configuration for tensor parallelism
 
 pub mod backpressure;
@@ -90,10 +90,12 @@ pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
 };
 pub use pipeline::{
-    DeviceSpec, LayerFilter, ModelProfile, PartitionConfig, SafeTensorsIndex, StageAssignment,
-    WeightClass, auto_partition, build_manual_assignments, classify_weight_key,
-    estimate_partial_memory, filter_weight_keys, filter_weight_map, identify_required_shards,
-    parse_manual_partition, should_load_key, validate_memory_fit, validate_partial_memory,
+    ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, DeviceSpec,
+    LayerFilter, ModelProfile, PartitionConfig, PipelineChannel, SafeTensorsIndex, StageAssignment,
+    StageEndpoint, StageLink, WeightClass, activation_channel, activation_latency, auto_partition,
+    build_manual_assignments, build_pipeline_links, classify_weight_key, estimate_partial_memory,
+    filter_weight_keys, filter_weight_map, identify_required_shards, parse_manual_partition,
+    should_load_key, validate_activation, validate_memory_fit, validate_partial_memory,
     validate_partition,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};

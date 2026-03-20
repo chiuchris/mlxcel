@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Pipeline parallelism layer partitioning and configuration.
+//! Pipeline parallelism layer partitioning, configuration, and activation transfer.
 //!
 //! Provides the algorithm and types for distributing model layers across
 //! multiple devices in a pipeline-parallel topology:
@@ -33,10 +33,23 @@
 //! - [`SafeTensorsIndex`] — parse `model.safetensors.index.json` to map keys → shard files
 //! - [`filter_weight_map`] — drop unneeded tensors from an already-loaded weight map
 //! - [`estimate_partial_memory`] / [`validate_partial_memory`] — memory budget helpers
+//!
+//! Activation transfer between pipeline stages:
+//!
+//! - [`ActivationMessage`] — structured payload with tensor, mask, position IDs
+//! - [`ActivationSender`] / [`ActivationReceiver`] — async channels with back-pressure
+//! - [`PipelineChannel`] — bidirectional channel between adjacent stages
+//! - [`StageLink`] / [`build_pipeline_links`] — connect N stages into a pipeline
 
+pub mod activation_transfer;
 pub mod partial_loading;
 pub mod partition;
 
+pub use activation_transfer::{
+    ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
+    StageEndpoint, StageLink, activation_channel, activation_latency, build_pipeline_links,
+    validate_activation,
+};
 pub use partial_loading::{
     LayerFilter, SafeTensorsIndex, WeightClass, classify_weight_key, estimate_partial_memory,
     filter_weight_keys, filter_weight_map, identify_required_shards, should_load_key,
