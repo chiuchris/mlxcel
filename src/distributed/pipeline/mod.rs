@@ -50,6 +50,15 @@
 //! - [`PipelineConfig`] — schedule configuration (stages, micro-batch size)
 //! - [`ScheduleAction`] — actions emitted by the schedule to drive execution
 //!
+//! Pipeline-aware KV cache management:
+//!
+//! - [`PipelineCacheConfig`] — per-stage cache configuration
+//! - [`PipelineCacheManager`] — per-stage cache tracking and admission
+//! - [`CacheAdmissionRequest`] / [`AdmissionDecision`] — coordinated admission
+//! - [`EvictionEvent`] / [`PreemptionSignal`] — eviction and preemption
+//! - [`CacheMetadataSync`] — cross-stage cache state consistency
+//! - [`coordinated_admission`] / [`broadcast_eviction`] — multi-stage coordination
+//!
 //! Pipeline metrics:
 //!
 //! - [`StageMetrics`] — per-stage timing breakdown
@@ -57,6 +66,7 @@
 //! - [`MetricsCollector`] — accumulates metrics across pipeline steps
 
 pub mod activation_transfer;
+pub mod cache_manager;
 pub mod metrics;
 pub mod micro_batch;
 pub mod partial_loading;
@@ -67,6 +77,12 @@ pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
     StageEndpoint, StageLink, activation_channel, activation_latency, build_pipeline_links,
     validate_activation,
+};
+pub use cache_manager::{
+    AdmissionDecision, CacheAdmissionRequest, CacheMetadataSync, EvictionEvent, EvictionReason,
+    PipelineCacheConfig, PipelineCacheManager, PreemptionPolicy, PreemptionReason,
+    PreemptionSignal, RejectionReason, SequenceId, StageCacheAllocation, broadcast_eviction,
+    check_pipeline_pressure, coordinated_admission, sync_metadata,
 };
 pub use metrics::{
     MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics, StageMetrics,
