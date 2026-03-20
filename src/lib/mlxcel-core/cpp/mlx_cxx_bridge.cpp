@@ -319,6 +319,22 @@ bool item_bool(const MlxArray& arr) {
     return const_cast<array&>(arr.inner).item<bool>();
 }
 
+rust::Vec<uint8_t> array_to_raw_bytes(const MlxArray& arr) {
+    // Ensure the array is evaluated and contiguous
+    auto a = mlx::core::contiguous(arr.inner);
+    mlx::core::eval(a);
+
+    size_t nbytes = a.nbytes();
+    const auto* data = reinterpret_cast<const uint8_t*>(a.data<void>());
+
+    rust::Vec<uint8_t> result;
+    result.reserve(nbytes);
+    for (size_t i = 0; i < nbytes; ++i) {
+        result.push_back(data[i]);
+    }
+    return result;
+}
+
 // Evaluation.
 void eval(const MlxArray& arr) {
     const_cast<array&>(arr.inner).eval();

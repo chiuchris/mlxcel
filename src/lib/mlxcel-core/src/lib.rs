@@ -121,6 +121,10 @@ mod ffi {
         /// Extract bool scalar value
         fn item_bool(arr: &MlxArray) -> bool;
 
+        /// Copy evaluated array data to a raw byte buffer.
+        /// Used by: KV cache serialization for disaggregated inference
+        fn array_to_raw_bytes(arr: &MlxArray) -> Vec<u8>;
+
         // Evaluation.
         /// Evaluate an array
         fn eval(arr: &MlxArray);

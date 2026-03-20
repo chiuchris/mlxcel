@@ -81,6 +81,10 @@ int32_t item_i32(const MlxArray& arr);
 int64_t item_i64(const MlxArray& arr);
 bool item_bool(const MlxArray& arr);
 
+// Copy evaluated array data to a byte buffer.
+// Used by: KV cache serialization for disaggregated inference
+rust::Vec<uint8_t> array_to_raw_bytes(const MlxArray& arr);
+
 // Evaluation.
 void eval(const MlxArray& arr);
 void eval_all(rust::Slice<const MlxArray* const> arrays);

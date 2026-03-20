@@ -46,6 +46,7 @@ pub mod discovery;
 pub mod failure_detector;
 pub mod handoff_queue;
 pub mod heartbeat;
+pub mod kv_cache_serde;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
@@ -78,6 +79,13 @@ pub use handoff_queue::{
     HandoffItem, HandoffQueue, HandoffQueueConfig, HandoffQueueManager, OverflowPolicy, QueueStats,
 };
 pub use heartbeat::{HEARTBEAT_OPERATION, HeartbeatConfig, HeartbeatPayload, HeartbeatService};
+pub use kv_cache_serde::{
+    CACHE_FORMAT_VERSION, CacheMetadata, CacheType, RawTensorData, SerializableCacheEntry,
+    SerializableCacheState, SerializableSamplingState, deserialize_cache_state,
+    extract_chunked_cache_entry, extract_kv_cache_entry, extract_rotating_cache_entry,
+    reconstruct_mlx_array, restore_into_kv_caches, restore_into_sequence_cache_set,
+    serialize_cache_state, serialize_sequence_cache_set, validate_raw_tensor,
+};
 pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
 };
