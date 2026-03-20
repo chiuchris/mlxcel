@@ -66,6 +66,14 @@
 //! - [`EvictionPolicy`] — LRU or LeastTokens eviction strategy
 //! - [`compute_per_rank_cache_size`] — estimate memory per sequence per rank
 //! - [`coordinate_eviction`] — synchronized eviction across TP ranks
+//! - [`TPExecutionConfig`] — per-rank execution parameters for synchronized TP
+//! - [`StepDecision`] — scheduling decisions broadcast from rank 0
+//! - [`SamplingMode`] — vocab-parallel or replicated LM head sampling
+//! - [`TPBarrier`] — barrier synchronization with timeout and deadlock prevention
+//! - [`RankStatus`] — individual rank health tracking
+//! - [`TPGroupHealth`] — aggregate TP group health
+//! - [`TPScheduler`] — rank 0 continuous batching scheduler
+//! - [`TPExecutor`] — per-rank lockstep execution engine
 
 pub mod cache_manager;
 pub mod collective;
@@ -76,6 +84,9 @@ pub mod parallel_moe;
 pub mod plan_generator;
 pub mod shard_strategy;
 pub mod sharded_loading;
+pub mod synchronized;
+pub mod tp_executor;
+pub mod tp_scheduler;
 
 pub use cache_manager::{
     AggregateMemoryReport, CacheSizeEstimate, EvictionPolicy, EvictionReason as TPEvictionReason,
@@ -108,3 +119,9 @@ pub use sharded_loading::{
     ByteRangeSpec, ShardSpec, ShardedMemoryReport, compute_byte_ranges, compute_shard_spec,
     compute_sharded_shape, dtype_byte_size, shard_tensor_data, validate_sharded_memory,
 };
+pub use synchronized::{
+    EvictionReason as StepEvictionReason, RankStatus, SampledTokens, SamplingMode, StepDecision,
+    StepId, TPBarrier, TPExecutionConfig, TPGroupHealth,
+};
+pub use tp_executor::{ExecutorSequenceState, StepOutcome, TPExecutor};
+pub use tp_scheduler::{SequenceInfo, SequenceState, TPScheduler};

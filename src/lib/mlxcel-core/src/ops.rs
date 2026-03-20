@@ -18,7 +18,6 @@
 //! outside the `cxx::bridge` root so the FFI boundary stays focused on raw
 //! bindings instead of policy code.
 
-use crate::dtype;
 use crate::ffi;
 use cxx::UniquePtr;
 
