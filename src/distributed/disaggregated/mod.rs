@@ -19,9 +19,16 @@
 //!
 //! - [`prefill_scheduler`] — Prefill-only scheduler that processes prompts
 //!   and hands off KV cache + first token to decode nodes.
+//! - [`decode_scheduler`] — Decode-only scheduler that receives KV caches
+//!   from prefill nodes and manages batched token generation.
 
+pub mod decode_scheduler;
 pub mod prefill_scheduler;
 
+pub use decode_scheduler::{
+    CompletionEvent, CompletionNotifier, CompletionReason, DecodeRequest, DecodeScheduler,
+    DecodeSchedulerConfig, DecodeSequence, IngestionStats, SequenceStatus,
+};
 pub use prefill_scheduler::{
     ChunkedPrefillCoordinator, HandoffProtocol, HandoffStatus, PrefillHandoff, PrefillRequest,
     PrefillResult, PrefillScheduler, PrefillSchedulerConfig,
