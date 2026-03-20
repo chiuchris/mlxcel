@@ -36,6 +36,7 @@
 //! - [`handoff_queue`] — bounded cross-node request handoff queues
 //! - [`pipeline`] — layer partitioning, activation transfer, and configuration for pipeline parallelism
 //! - [`tensor_parallel`] — weight sharding strategy and configuration for tensor parallelism
+//! - [`kv_cache_transfer`] — optimized KV cache transfer (streamed, quantized, parallel)
 
 pub mod backpressure;
 pub mod bench;
@@ -47,6 +48,7 @@ pub mod failure_detector;
 pub mod handoff_queue;
 pub mod heartbeat;
 pub mod kv_cache_serde;
+pub mod kv_cache_transfer;
 pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
@@ -85,6 +87,12 @@ pub use kv_cache_serde::{
     extract_chunked_cache_entry, extract_kv_cache_entry, extract_rotating_cache_entry,
     reconstruct_mlx_array, restore_into_kv_caches, restore_into_sequence_cache_set,
     serialize_cache_state, serialize_sequence_cache_set, validate_raw_tensor,
+};
+pub use kv_cache_transfer::{
+    AdaptiveSelector, BandwidthEstimator, BandwidthSample, CacheQuantizationConfig,
+    CacheQuantizationLevel, LayerTransferHeader, LayerTransferResult, ParallelLayerTransfer,
+    QuantizedCacheTransfer, StreamedCacheTransfer, TransferBenchConfig, TransferBenchResult,
+    TransferBenchmark, TransferConfig, TransferResult, TransferStrategy,
 };
 pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
