@@ -107,16 +107,19 @@ pub use metrics::{
     ClusterMetrics, LatencyPercentiles, MetricsCollector, MetricsConfig, NodeMetrics,
 };
 pub use pipeline::{
-    ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, DeviceSpec,
-    GPipeSchedule, LayerFilter, MetricsSummary as PipelineMetricsSummary, MicroBatch,
-    MicroBatchSpec, ModelProfile, PartitionConfig, PipelineChannel, PipelineConfig,
-    PipelineMetrics, PipelineMetricsCollector, PipelineSchedule, SafeTensorsIndex, ScheduleAction,
-    StageAssignment, StageEndpoint, StageLink, StageMetrics, WeightClass, activation_channel,
+    ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, ChunkedPrefillPipeline,
+    DeviceSpec, FailedRequest, GPipeSchedule, LayerFilter,
+    MetricsSummary as PipelineMetricsSummary, MicroBatch, MicroBatchSpec, ModelProfile,
+    PartitionConfig, PipelineChannel, PipelineConfig, PipelineCoordinator, PipelineMetrics,
+    PipelineMetricsCollector, PipelineRequest, PipelineResponse, PipelineSchedule,
+    PipelineServingConfig, SafeTensorsIndex, ScheduleAction, StageAssignment, StageEndpoint,
+    StageHealth, StageLink, StageMetrics, StageRole, WeightClass, activation_channel,
     activation_latency, auto_partition, build_manual_assignments, build_pipeline_links,
-    classify_weight_key, create_gpipe_schedule, estimate_partial_memory, filter_weight_keys,
-    filter_weight_map, identify_required_shards, parse_manual_partition, should_load_key,
-    split_into_micro_batches, suggested_micro_batch_size, validate_activation, validate_memory_fit,
-    validate_partial_memory, validate_partition,
+    classify_weight_key, create_gpipe_schedule, detect_pipeline_config, estimate_partial_memory,
+    filter_weight_keys, filter_weight_map, identify_required_shards, parse_manual_partition,
+    should_load_key, should_use_pipeline, split_into_micro_batches, suggested_micro_batch_size,
+    to_pipeline_schedule_config, validate_activation, validate_memory_fit, validate_partial_memory,
+    validate_partition,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use request_tracker::{

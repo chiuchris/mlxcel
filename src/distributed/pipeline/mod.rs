@@ -72,6 +72,7 @@ pub mod micro_batch;
 pub mod partial_loading;
 pub mod partition;
 pub mod schedule;
+pub mod serving;
 
 pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
@@ -101,4 +102,9 @@ pub use partition::{
 };
 pub use schedule::{
     GPipeSchedule, PipelineConfig, PipelineSchedule, ScheduleAction, create_gpipe_schedule,
+};
+pub use serving::{
+    ChunkedPrefillPipeline, FailedRequest, PipelineCoordinator, PipelineRequest, PipelineResponse,
+    PipelineServingConfig, StageHealth, StageRole, detect_pipeline_config, should_use_pipeline,
+    to_pipeline_schedule_config,
 };
