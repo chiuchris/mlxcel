@@ -25,11 +25,23 @@
 //! - [`MoeShardMode`] — expert-parallel vs within-expert sharding
 //! - [`EmbeddingMode`] — vocab-parallel vs replicated embedding/LM head
 //! - [`generate_shard_plan`] — architecture-aware shard plan generator
+//! - [`ShardSpec`] — per-rank shard boundaries for a weight tensor
+//! - [`ByteRangeSpec`] — byte ranges for efficient partial file reads
+//! - [`ShardedMemoryReport`] — memory accounting across TP ranks
+//! - [`compute_shard_spec`] — determine shard boundaries for a weight on a rank
+//! - [`shard_tensor_data`] — extract shard bytes from raw tensor data
+//! - [`compute_byte_ranges`] — byte-range specs for safetensors partial reads
+//! - [`validate_sharded_memory`] — verify memory consistency across ranks
 
 pub mod config;
 pub mod plan_generator;
 pub mod shard_strategy;
+pub mod sharded_loading;
 
 pub use config::{EmbeddingMode, MoeShardMode, ShardConfig};
 pub use plan_generator::generate_shard_plan;
 pub use shard_strategy::{CommPattern, LayerShardPlan, ModelShardPlan, ShardStrategy};
+pub use sharded_loading::{
+    ByteRangeSpec, ShardSpec, ShardedMemoryReport, compute_byte_ranges, compute_shard_spec,
+    compute_sharded_shape, dtype_byte_size, shard_tensor_data, validate_sharded_memory,
+};

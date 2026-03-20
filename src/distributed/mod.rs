@@ -110,8 +110,10 @@ pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
 pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
 pub use tensor_parallel::{
-    CommPattern, EmbeddingMode, LayerShardPlan, ModelShardPlan, MoeShardMode, ShardConfig,
-    ShardStrategy, generate_shard_plan,
+    ByteRangeSpec, CommPattern, EmbeddingMode, LayerShardPlan, ModelShardPlan, MoeShardMode,
+    ShardConfig, ShardSpec, ShardStrategy, ShardedMemoryReport, compute_byte_ranges,
+    compute_shard_spec, compute_sharded_shape, dtype_byte_size, generate_shard_plan,
+    shard_tensor_data, validate_sharded_memory,
 };
 pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
