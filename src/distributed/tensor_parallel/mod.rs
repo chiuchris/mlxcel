@@ -46,10 +46,24 @@
 //! - [`kv_head_assignment`] — KV head mapping with GQA replication
 //! - [`compute_local_attention_shapes`] — derive per-rank attention dimensions
 //! - [`verify_head_coverage`] — validate all heads are covered across ranks
+//! - [`FFNActivationType`] — supported FFN activation functions
+//! - [`TPFFNConfig`] — per-model FFN parallelism parameters
+//! - [`TPFFNMetadata`] — per-rank FFN shape information
+//! - [`compute_local_ffn_shapes`] — derive per-rank FFN dimensions
+//! - [`verify_intermediate_coverage`] — validate FFN intermediate coverage
+//! - [`MoEParallelMode`] — expert-parallel vs within-expert sharding
+//! - [`TPMoEConfig`] — per-model MoE parallelism parameters
+//! - [`TPMoEMetadata`] — per-rank MoE shape information
+//! - [`ExpertAssignment`] — which experts a rank owns
+//! - [`compute_expert_assignment`] — round-robin expert-to-rank mapping
+//! - [`compute_local_moe_shapes`] — derive per-rank MoE dimensions
+//! - [`verify_expert_coverage`] — validate all experts are covered
 
 pub mod collective;
 pub mod config;
 pub mod parallel_attention;
+pub mod parallel_ffn;
+pub mod parallel_moe;
 pub mod plan_generator;
 pub mod shard_strategy;
 pub mod sharded_loading;
@@ -63,6 +77,15 @@ pub use parallel_attention::{
     AttentionType, KVAssignment, TPAttentionConfig, TPAttentionMetadata, compute_all_rank_metadata,
     compute_local_attention_shapes, head_assignment, kv_head_assignment,
     requires_allreduce_after_o_proj, validate_tp_attention_config, verify_head_coverage,
+};
+pub use parallel_ffn::{
+    FFNActivationType, TPFFNConfig, TPFFNMetadata, compute_all_rank_ffn_metadata,
+    compute_local_ffn_shapes, validate_tp_ffn_config, verify_intermediate_coverage,
+};
+pub use parallel_moe::{
+    ExpertAssignment, MoEParallelMode, TPMoEConfig, TPMoEMetadata, compute_all_rank_moe_metadata,
+    compute_expert_assignment, compute_local_moe_shapes, validate_tp_moe_config,
+    verify_expert_coverage,
 };
 pub use plan_generator::generate_shard_plan;
 pub use shard_strategy::{CommPattern, LayerShardPlan, ModelShardPlan, ShardStrategy};
