@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Tensor parallelism: weight sharding strategy and configuration.
+//! Tensor parallelism: weight sharding, collective communication, and configuration.
 //!
 //! This module provides the types and algorithms for distributing model weights
 //! across multiple tensor-parallel ranks:
@@ -32,12 +32,23 @@
 //! - [`shard_tensor_data`] — extract shard bytes from raw tensor data
 //! - [`compute_byte_ranges`] — byte-range specs for safetensors partial reads
 //! - [`validate_sharded_memory`] — verify memory consistency across ranks
+//! - [`all_reduce_sum`] — ring all-reduce (sum) across TP ranks
+//! - [`all_gather`] — gather sharded outputs into full tensor
+//! - [`reduce_scatter`] — scatter-reduce for bandwidth-efficient communication
+//! - [`CollectiveGroup`] — group of ranks with exchange function
+//! - [`RingTopology`] — ring neighbor computation
+//! - [`BenchmarkResult`] — benchmark measurement container
 
+pub mod collective;
 pub mod config;
 pub mod plan_generator;
 pub mod shard_strategy;
 pub mod sharded_loading;
 
+pub use collective::{
+    BenchmarkResult, CollectiveConfig, CollectiveGroup, RingTopology, all_gather, all_reduce_sum,
+    reduce_scatter, ring_allreduce_data_volume,
+};
 pub use config::{EmbeddingMode, MoeShardMode, ShardConfig};
 pub use plan_generator::generate_shard_plan;
 pub use shard_strategy::{CommPattern, LayerShardPlan, ModelShardPlan, ShardStrategy};
