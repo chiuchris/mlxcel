@@ -58,7 +58,16 @@
 //! - [`compute_expert_assignment`] — round-robin expert-to-rank mapping
 //! - [`compute_local_moe_shapes`] — derive per-rank MoE dimensions
 //! - [`verify_expert_coverage`] — validate all experts are covered
+//! - [`TPCacheConfig`] — per-rank KV cache configuration
+//! - [`TPCacheManager`] — per-rank sharded KV cache tracking and eviction
+//! - [`ShardedCacheAllocation`] — per-sequence cache allocation on one rank
+//! - [`TPCacheMemoryReport`] — per-rank memory accounting
+//! - [`EvictionSignal`] — coordinated eviction broadcast from rank 0
+//! - [`EvictionPolicy`] — LRU or LeastTokens eviction strategy
+//! - [`compute_per_rank_cache_size`] — estimate memory per sequence per rank
+//! - [`coordinate_eviction`] — synchronized eviction across TP ranks
 
+pub mod cache_manager;
 pub mod collective;
 pub mod config;
 pub mod parallel_attention;
@@ -68,6 +77,12 @@ pub mod plan_generator;
 pub mod shard_strategy;
 pub mod sharded_loading;
 
+pub use cache_manager::{
+    AggregateMemoryReport, CacheSizeEstimate, EvictionPolicy, EvictionReason as TPEvictionReason,
+    EvictionSignal, SequenceId as TPSequenceId, ShardedCacheAllocation, TPCacheConfig,
+    TPCacheManager, TPCacheMemoryReport, aggregate_memory_reports, check_tp_pressure,
+    collect_memory_reports, compute_per_rank_cache_size, coordinate_eviction,
+};
 pub use collective::{
     BenchmarkResult, CollectiveConfig, CollectiveGroup, RingTopology, all_gather, all_reduce_sum,
     reduce_scatter, ring_allreduce_data_volume,
