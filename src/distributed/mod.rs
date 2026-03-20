@@ -35,6 +35,7 @@
 //! - [`backpressure`] — per-node load tracking with configurable thresholds and overflow policies
 //! - [`handoff_queue`] — bounded cross-node request handoff queues
 //! - [`pipeline`] — layer partitioning strategy and configuration for pipeline parallelism
+//! - [`tensor_parallel`] — weight sharding strategy and configuration for tensor parallelism
 
 pub mod backpressure;
 pub mod bench;
@@ -56,6 +57,7 @@ pub mod scheduler;
 pub mod tcp_transport;
 pub mod tensor_chunked;
 pub mod tensor_compress;
+pub mod tensor_parallel;
 pub mod tensor_protocol;
 pub mod tensor_quantize;
 pub mod tensor_serialize;
@@ -94,6 +96,10 @@ pub use routing::{
 pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
 pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
+pub use tensor_parallel::{
+    CommPattern, EmbeddingMode, LayerShardPlan, ModelShardPlan, MoeShardMode, ShardConfig,
+    ShardStrategy, generate_shard_plan,
+};
 pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
 };

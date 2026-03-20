@@ -80,6 +80,10 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         node_id: args.node_id,
         peers: args.peers,
         pp_layers: args.pp_layers,
+        tp_size: args.tp_size,
+        tp_moe_mode: args.tp_moe_mode,
+        tp_embedding_mode: args.tp_embedding_mode,
+        tp_lm_head_mode: args.tp_lm_head_mode,
     }
 }
 

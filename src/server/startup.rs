@@ -122,6 +122,14 @@ pub struct ServerStartupConfig {
     /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
     /// When `None`, auto-partition mode is used.
     pub pp_layers: Option<String>,
+    /// Number of tensor-parallel ranks (1 = disabled).
+    pub tp_size: usize,
+    /// MoE expert sharding mode string (parsed into `MoeShardMode` at plan generation).
+    pub tp_moe_mode: String,
+    /// Embedding sharding mode string (parsed into `EmbeddingMode` at plan generation).
+    pub tp_embedding_mode: String,
+    /// LM head sharding mode string (parsed into `EmbeddingMode` at plan generation).
+    pub tp_lm_head_mode: String,
 }
 
 impl Default for ServerStartupConfig {
@@ -176,6 +184,10 @@ impl Default for ServerStartupConfig {
             node_id: None,
             peers: Vec::new(),
             pp_layers: None,
+            tp_size: 1,
+            tp_moe_mode: "expert_parallel".to_string(),
+            tp_embedding_mode: "replicated".to_string(),
+            tp_lm_head_mode: "replicated".to_string(),
         }
     }
 }

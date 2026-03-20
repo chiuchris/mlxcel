@@ -95,6 +95,14 @@ pub struct ServerStartupInput {
     pub peers: Vec<SocketAddr>,
     /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
     pub pp_layers: Option<String>,
+    /// Number of tensor-parallel ranks.
+    pub tp_size: usize,
+    /// MoE expert sharding mode string (parsed at startup).
+    pub tp_moe_mode: String,
+    /// Embedding sharding mode string (parsed at startup).
+    pub tp_embedding_mode: String,
+    /// LM head sharding mode string (parsed at startup).
+    pub tp_lm_head_mode: String,
 }
 
 impl ServerStartupInput {
@@ -152,6 +160,10 @@ impl ServerStartupInput {
             node_id: self.node_id,
             peers: self.peers,
             pp_layers: self.pp_layers,
+            tp_size: self.tp_size,
+            tp_moe_mode: self.tp_moe_mode,
+            tp_embedding_mode: self.tp_embedding_mode,
+            tp_lm_head_mode: self.tp_lm_head_mode,
         }
     }
 }

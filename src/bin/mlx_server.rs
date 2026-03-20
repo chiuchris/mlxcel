@@ -280,6 +280,34 @@ struct Args {
     #[arg(long = "pp-layers", value_name = "RANGES")]
     pp_layers: Option<String>,
 
+    /// Number of tensor-parallel ranks (must be a power of 2)
+    #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
+    tp_size: usize,
+
+    /// MoE expert sharding mode: "expert_parallel" or "within_expert"
+    #[arg(
+        long = "tp-moe-mode",
+        default_value = "expert_parallel",
+        value_name = "MODE"
+    )]
+    tp_moe_mode: String,
+
+    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    #[arg(
+        long = "tp-embedding-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    tp_embedding_mode: String,
+
+    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    #[arg(
+        long = "tp-lm-head-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    tp_lm_head_mode: String,
+
     // llama-server compatibility arguments (accepted but ignored).
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
     #[arg(long, hide = true)]
@@ -373,5 +401,9 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         node_id: args.node_id,
         peers: args.peers,
         pp_layers: args.pp_layers,
+        tp_size: args.tp_size,
+        tp_moe_mode: args.tp_moe_mode,
+        tp_embedding_mode: args.tp_embedding_mode,
+        tp_lm_head_mode: args.tp_lm_head_mode,
     }
 }
