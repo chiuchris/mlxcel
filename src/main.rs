@@ -395,6 +395,14 @@ pub(crate) struct ServeArgs {
     #[arg(long = "pp-layers", value_name = "RANGES")]
     pp_layers: Option<String>,
 
+    /// Micro-batch size for pipeline parallelism
+    ///
+    /// Splits incoming batches into micro-batches of this size to fill the
+    /// pipeline and reduce bubble time. Smaller values improve pipeline
+    /// utilization but add scheduling overhead. Default: 1.
+    #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
+    pp_micro_batch_size: usize,
+
     /// Number of tensor-parallel ranks (must be a power of 2)
     ///
     /// When set to N > 1, model weights are sharded across N ranks using
