@@ -28,12 +28,18 @@
 //! - [`stream_bridge`] — Seamless SSE stream bridging across the
 //!   prefill→decode boundary.
 
+pub mod benchmark;
 pub mod decode_scheduler;
 pub mod prefill_scheduler;
 pub mod request_router;
 pub mod serving;
 pub mod stream_bridge;
 
+pub use benchmark::{
+    CacheTransferProfile, DIBenchmarkConfig, DIBenchmarkResult, DICrossoverAnalysis,
+    DICrossoverEntry, PromptLengthAnalysis, format_di_report, run_di_benchmark,
+    run_di_crossover_analysis, run_prompt_length_analysis,
+};
 pub use decode_scheduler::{
     CompletionEvent, CompletionNotifier, CompletionReason, DecodeRequest, DecodeScheduler,
     DecodeSchedulerConfig, DecodeSequence, IngestionStats, SequenceStatus,

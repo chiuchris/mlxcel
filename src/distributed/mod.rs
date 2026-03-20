@@ -78,14 +78,16 @@ pub use config::{ClusterConfig, ClusterMeta, NodeConfig, NodeResources, NodeRole
 pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};
 pub use correlation::{CorrelationId, RequestContext};
 pub use disaggregated::{
-    BackpressureAction, ChunkedPrefillCoordinator, CompletionEvent, CompletionNotifier,
-    CompletionReason, DecodeRequest, DecodeScheduler, DecodeSchedulerConfig, DecodeSequence,
-    DisaggRoutingStrategy, DisaggregatedMetrics, DisaggregatedMetricsSnapshot, DisaggregatedServer,
-    DisaggregatedServingConfig, HandoffProtocol, HandoffStatus, HybridModeGuard, IngestionStats,
-    NodeLoadInfo, PrefillHandoff, PrefillRequest, PrefillResult, PrefillScheduler,
-    PrefillSchedulerConfig, RequestPhase, RequestRouter, RouterConfig, RouterMetrics,
-    SequenceStatus, ServingMode, StreamBridge, StreamBridgeError, StreamPhase, TokenEvent,
-    TokenSource, TrackedRequest,
+    BackpressureAction, CacheTransferProfile, ChunkedPrefillCoordinator, CompletionEvent,
+    CompletionNotifier, CompletionReason, DIBenchmarkConfig, DIBenchmarkResult,
+    DICrossoverAnalysis, DICrossoverEntry, DecodeRequest, DecodeScheduler, DecodeSchedulerConfig,
+    DecodeSequence, DisaggRoutingStrategy, DisaggregatedMetrics, DisaggregatedMetricsSnapshot,
+    DisaggregatedServer, DisaggregatedServingConfig, HandoffProtocol, HandoffStatus,
+    HybridModeGuard, IngestionStats, NodeLoadInfo, PrefillHandoff, PrefillRequest, PrefillResult,
+    PrefillScheduler, PrefillSchedulerConfig, PromptLengthAnalysis, RequestPhase, RequestRouter,
+    RouterConfig, RouterMetrics, SequenceStatus, ServingMode, StreamBridge, StreamBridgeError,
+    StreamPhase, TokenEvent, TokenSource, TrackedRequest, format_di_report, run_di_benchmark,
+    run_di_crossover_analysis, run_prompt_length_analysis,
 };
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureEvent};
