@@ -38,9 +38,18 @@
 //! - [`CollectiveGroup`] — group of ranks with exchange function
 //! - [`RingTopology`] — ring neighbor computation
 //! - [`BenchmarkResult`] — benchmark measurement container
+//! - [`TPAttentionConfig`] — per-model attention parallelism parameters
+//! - [`TPAttentionMetadata`] — per-rank attention shapes for the forward pass
+//! - [`KVAssignment`] — GQA-aware KV head mapping (sharded or replicated)
+//! - [`AttentionType`] — MHA / GQA / MQA classification
+//! - [`head_assignment`] — Q head range for a rank
+//! - [`kv_head_assignment`] — KV head mapping with GQA replication
+//! - [`compute_local_attention_shapes`] — derive per-rank attention dimensions
+//! - [`verify_head_coverage`] — validate all heads are covered across ranks
 
 pub mod collective;
 pub mod config;
+pub mod parallel_attention;
 pub mod plan_generator;
 pub mod shard_strategy;
 pub mod sharded_loading;
@@ -50,6 +59,11 @@ pub use collective::{
     reduce_scatter, ring_allreduce_data_volume,
 };
 pub use config::{EmbeddingMode, MoeShardMode, ShardConfig};
+pub use parallel_attention::{
+    AttentionType, KVAssignment, TPAttentionConfig, TPAttentionMetadata, compute_all_rank_metadata,
+    compute_local_attention_shapes, head_assignment, kv_head_assignment,
+    requires_allreduce_after_o_proj, validate_tp_attention_config, verify_head_coverage,
+};
 pub use plan_generator::generate_shard_plan;
 pub use shard_strategy::{CommPattern, LayerShardPlan, ModelShardPlan, ShardStrategy};
 pub use sharded_loading::{
