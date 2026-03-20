@@ -74,7 +74,19 @@
 //! - [`TPGroupHealth`] — aggregate TP group health
 //! - [`TPScheduler`] — rank 0 continuous batching scheduler
 //! - [`TPExecutor`] — per-rank lockstep execution engine
+//! - [`TPBenchmarkConfig`] — benchmark parameters (tp_sizes, model sizes, etc.)
+//! - [`TPBenchmarkResult`] — throughput, TTFT, ITL, all-reduce overhead, scaling efficiency
+//! - [`AllReduceProfile`] — communication overhead breakdown
+//! - [`CrossoverAnalysis`] — model size vs TP benefit analysis
+//! - [`ScalingAnalysis`] — scaling efficiency across TP sizes
+//! - [`LockstepBenchmarkResult`] — scheduler/executor lockstep benchmark result
+//! - [`run_tp_benchmark`] — execute a single TP benchmark scenario
+//! - [`run_scaling_analysis`] — compare performance across TP sizes
+//! - [`run_crossover_analysis`] — determine when TP becomes beneficial
+//! - [`run_lockstep_benchmark`] — verify scheduler/executor lockstep correctness
+//! - [`format_tp_benchmark_report`] — human-readable benchmark report
 
+pub mod benchmark;
 pub mod cache_manager;
 pub mod collective;
 pub mod config;
@@ -88,6 +100,11 @@ pub mod synchronized;
 pub mod tp_executor;
 pub mod tp_scheduler;
 
+pub use benchmark::{
+    AllReduceProfile, CrossoverAnalysis, CrossoverEntry, LockstepBenchmarkResult, ScalingAnalysis,
+    TPBenchmarkConfig, TPBenchmarkResult, format_tp_benchmark_report, run_crossover_analysis,
+    run_lockstep_benchmark, run_scaling_analysis, run_tp_benchmark,
+};
 pub use cache_manager::{
     AggregateMemoryReport, CacheSizeEstimate, EvictionPolicy, EvictionReason as TPEvictionReason,
     EvictionSignal, SequenceId as TPSequenceId, ShardedCacheAllocation, TPCacheConfig,

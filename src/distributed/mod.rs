@@ -134,11 +134,14 @@ pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
 pub use tensor_chunked::{ChunkAssembler, ChunkedTensor, ChunkedTransferConfig};
 pub use tensor_parallel::{
-    BenchmarkResult, ByteRangeSpec, CollectiveConfig, CollectiveGroup, CommPattern, EmbeddingMode,
-    LayerShardPlan, ModelShardPlan, MoeShardMode, RingTopology, ShardConfig, ShardSpec,
-    ShardStrategy, ShardedMemoryReport, all_gather, all_reduce_sum, compute_byte_ranges,
-    compute_shard_spec, compute_sharded_shape, dtype_byte_size, generate_shard_plan,
-    reduce_scatter, ring_allreduce_data_volume, shard_tensor_data, validate_sharded_memory,
+    AllReduceProfile, BenchmarkResult, ByteRangeSpec, CollectiveConfig, CollectiveGroup,
+    CommPattern, CrossoverAnalysis, CrossoverEntry, EmbeddingMode, LayerShardPlan,
+    LockstepBenchmarkResult, ModelShardPlan, MoeShardMode, RingTopology, ScalingAnalysis,
+    ShardConfig, ShardSpec, ShardStrategy, ShardedMemoryReport, TPBenchmarkConfig,
+    TPBenchmarkResult, all_gather, all_reduce_sum, compute_byte_ranges, compute_shard_spec,
+    compute_sharded_shape, dtype_byte_size, format_tp_benchmark_report, generate_shard_plan,
+    reduce_scatter, ring_allreduce_data_volume, run_crossover_analysis, run_lockstep_benchmark,
+    run_scaling_analysis, run_tp_benchmark, shard_tensor_data, validate_sharded_memory,
 };
 pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,
