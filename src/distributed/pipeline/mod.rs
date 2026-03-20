@@ -66,6 +66,7 @@
 //! - [`MetricsCollector`] — accumulates metrics across pipeline steps
 
 pub mod activation_transfer;
+pub mod benchmark;
 pub mod cache_manager;
 pub mod metrics;
 pub mod micro_batch;
@@ -78,6 +79,10 @@ pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
     StageEndpoint, StageLink, activation_channel, activation_latency, build_pipeline_links,
     validate_activation,
+};
+pub use benchmark::{
+    PipelineBenchmarkConfig, PipelineBenchmarkResult, ScalingResult, format_benchmark_report,
+    run_pipeline_benchmark, run_scaling_benchmark,
 };
 pub use cache_manager::{
     AdmissionDecision, CacheAdmissionRequest, CacheMetadataSync, EvictionEvent, EvictionReason,

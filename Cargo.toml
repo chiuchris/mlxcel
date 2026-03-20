@@ -97,3 +97,7 @@ should_implement_trait = "allow"
 [[test]]
 name = "distributed_integration"
 required-features = ["test-utils"]
+
+[[test]]
+name = "pipeline_e2e"
+required-features = ["test-utils"]
