@@ -37,7 +37,7 @@
 //! - [`pipeline`] — layer partitioning, activation transfer, and configuration for pipeline parallelism
 //! - [`tensor_parallel`] — weight sharding strategy and configuration for tensor parallelism
 //! - [`kv_cache_transfer`] — optimized KV cache transfer (streamed, quantized, parallel)
-//! - [`disaggregated`] — prefill/decode separation: prefill scheduler, decode scheduler, request router, handoff protocol, chunked prefill
+//! - [`disaggregated`] — prefill/decode separation: prefill scheduler, decode scheduler, request router, handoff protocol, chunked prefill, API server integration, SSE stream bridging
 
 pub mod backpressure;
 pub mod bench;
@@ -80,9 +80,12 @@ pub use correlation::{CorrelationId, RequestContext};
 pub use disaggregated::{
     BackpressureAction, ChunkedPrefillCoordinator, CompletionEvent, CompletionNotifier,
     CompletionReason, DecodeRequest, DecodeScheduler, DecodeSchedulerConfig, DecodeSequence,
-    DisaggRoutingStrategy, HandoffProtocol, HandoffStatus, IngestionStats, NodeLoadInfo,
-    PrefillHandoff, PrefillRequest, PrefillResult, PrefillScheduler, PrefillSchedulerConfig,
-    RequestPhase, RequestRouter, RouterConfig, RouterMetrics, SequenceStatus, TrackedRequest,
+    DisaggRoutingStrategy, DisaggregatedMetrics, DisaggregatedMetricsSnapshot, DisaggregatedServer,
+    DisaggregatedServingConfig, HandoffProtocol, HandoffStatus, HybridModeGuard, IngestionStats,
+    NodeLoadInfo, PrefillHandoff, PrefillRequest, PrefillResult, PrefillScheduler,
+    PrefillSchedulerConfig, RequestPhase, RequestRouter, RouterConfig, RouterMetrics,
+    SequenceStatus, ServingMode, StreamBridge, StreamBridgeError, StreamPhase, TokenEvent,
+    TokenSource, TrackedRequest,
 };
 pub use discovery::{initialize_distributed, log_cluster_topology, probe_peers};
 pub use failure_detector::{FailureDetector, FailureDetectorConfig, FailureEvent};

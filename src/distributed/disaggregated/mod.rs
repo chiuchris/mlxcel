@@ -23,10 +23,16 @@
 //!   from prefill nodes and manages batched token generation.
 //! - [`request_router`] — Request router and load balancer that orchestrates
 //!   the full disaggregated pipeline with configurable routing strategies.
+//! - [`serving`] — API server integration: `DisaggregatedServer`,
+//!   `ServingMode`, `HybridModeGuard`, configuration, and metrics.
+//! - [`stream_bridge`] — Seamless SSE stream bridging across the
+//!   prefill→decode boundary.
 
 pub mod decode_scheduler;
 pub mod prefill_scheduler;
 pub mod request_router;
+pub mod serving;
+pub mod stream_bridge;
 
 pub use decode_scheduler::{
     CompletionEvent, CompletionNotifier, CompletionReason, DecodeRequest, DecodeScheduler,
@@ -40,3 +46,8 @@ pub use request_router::{
     BackpressureAction, DisaggRoutingStrategy, NodeLoadInfo, RequestPhase, RequestRouter,
     RouterConfig, RouterMetrics, TrackedRequest,
 };
+pub use serving::{
+    DisaggregatedMetrics, DisaggregatedMetricsSnapshot, DisaggregatedServer,
+    DisaggregatedServingConfig, HybridModeGuard, ServingMode,
+};
+pub use stream_bridge::{StreamBridge, StreamBridgeError, StreamPhase, TokenEvent, TokenSource};
