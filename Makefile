@@ -565,6 +565,35 @@ docs-build-strict: ## Build all docs with strict mode (for CI)
 	uv run mkdocs build --strict --config-file mkdocs.yml -d site/en/manual
 	uv run mkdocs build --strict --config-file mkdocs.ko.yml -d site/ko/manual
 
+.PHONY: docs-pdf-setup
+docs-pdf-setup: ## Install Playwright browser for PDF export (one-time setup)
+	uv venv --python 3.13
+	uv pip install -r docs/requirements.txt
+	uv run python -m playwright install chromium
+	@echo "PDF export dependencies ready."
+
+.PHONY: docs-pdf-en
+docs-pdf-en: ## Export English documentation as PDF
+	@echo "Building English documentation as PDF..."
+	uv run mkdocs build --config-file mkdocs.pdf.yml -d site/en/manual
+	@echo "Fixing PDF internal links..."
+	uv run python docs/scripts/fix_pdf_links.py mkdocs.pdf.yml site/en/manual/mlxcel-Manual-en.pdf
+	@echo "PDF generated: site/en/manual/mlxcel-Manual-en.pdf"
+
+.PHONY: docs-pdf-ko
+docs-pdf-ko: ## Export Korean documentation as PDF
+	@echo "Building Korean documentation as PDF..."
+	uv run mkdocs build --config-file mkdocs.ko.pdf.yml -d site/ko/manual
+	@echo "Fixing PDF internal links..."
+	uv run python docs/scripts/fix_pdf_links.py mkdocs.ko.pdf.yml site/ko/manual/mlxcel-Manual-ko.pdf
+	@echo "PDF generated: site/ko/manual/mlxcel-Manual-ko.pdf"
+
+.PHONY: docs-pdf
+docs-pdf: docs-pdf-en docs-pdf-ko ## Export all documentation as PDF
+	@echo "All PDFs generated:"
+	@echo "  - site/en/manual/mlxcel-Manual-en.pdf"
+	@echo "  - site/ko/manual/mlxcel-Manual-ko.pdf"
+
 .PHONY: docs-clean
 docs-clean: ## Remove built docs
 	rm -rf site/

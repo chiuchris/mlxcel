@@ -1,0 +1,39 @@
+INHERIT: mkdocs.ko.yml
+
+site_url: ""
+edit_uri: ""
+
+extra:
+  alternate: []
+  version: "0.1.0"
+
+plugins:
+  - search:
+      enabled: false
+  - mermaid2
+  - minify:
+      minify_html: true
+      minify_js: true
+      minify_css: true
+      htmlmin_opts:
+        remove_comments: true
+  - macros:
+      include_dir: docs/shared/snippets
+  - exporter:
+      formats:
+        pdf:
+          enabled: true
+          concurrency: 8
+          browser:
+            debug: true
+          stylesheets:
+            - docs/resources/stylesheets/pdf.css
+          scripts:
+            - docs/resources/scripts/mermaid-init.js
+          covers:
+            front: docs/resources/templates/covers/front.html.j2
+            back: docs/resources/templates/covers/back.html.j2
+          aggregator:
+            enabled: true
+            output: mlxcel-Manual-ko.pdf
+            covers: limits

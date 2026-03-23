@@ -55,6 +55,12 @@ theme:
 extra_css:
   - shared/stylesheets/extra.css
 
+hooks:
+  - docs/hooks/diagram_replacer.py
+  - docs/hooks/section_numbering.py
+  - docs/hooks/pdf_header.py
+  - docs/hooks/pdf_links.py
+
 plugins:
   - search:
       separator: '[\s\-,:!=\[\]()`"/]+|\.(?!\d)|&[lg]t;|(?!\b)(?=[A-Z][a-z])'

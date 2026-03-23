@@ -24,3 +24,10 @@ CLAUDE.md
 /TECHNICAL_REPORTS/
 /docs_internal/
 /docs/analysis/
+
+# MkDocs build output
+site/
+
+# Python bytecode
+__pycache__/
+*.pyc
