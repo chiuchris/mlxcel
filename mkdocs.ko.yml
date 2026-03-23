@@ -1,5 +1,5 @@
 site_name: mlxcel
-site_description: Apple Silicon 및 CUDA GPU를 위한 고성능 LLM/VLM 추론 엔진. Rust와 네이티브 MLX C++ 바인딩으로 구축.
+site_description: Apple Silicon과 CUDA GPU에서 동작하는 고성능 LLM/VLM 추론 엔진. Rust와 MLX C++ 네이티브 바인딩 기반.
 site_url: https://mlxcel.lablup.ai/ko/manual/
 repo_name: lablup/mlxcel
 repo_url: https://github.com/lablup/mlxcel

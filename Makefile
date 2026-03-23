@@ -517,11 +517,11 @@ bench-clean: ## Remove benchmark log
 	@echo "Benchmark log removed."
 
 # ============================================================================
-# Documentation (MkDocs)
+# Documentation (Zensical / MkDocs-compatible)
 # ============================================================================
 
 .PHONY: docs-install
-docs-install: ## Install MkDocs dependencies and create shared symlinks
+docs-install: ## Install documentation dependencies and create shared symlinks
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "Error: uv is not installed. Install it from https://docs.astral.sh/uv/"; \
 		exit 1; \
@@ -530,40 +530,43 @@ docs-install: ## Install MkDocs dependencies and create shared symlinks
 	rm -rf docs/en/shared docs/ko/shared
 	ln -s ../shared docs/en/shared
 	ln -s ../shared docs/ko/shared
-	@echo "MkDocs dependencies installed and symlinks created. Run 'make docs-serve' to start the server."
+	@echo "Documentation dependencies installed and symlinks created. Run 'make docs-serve' to start the server."
 
 .PHONY: docs-serve
-docs-serve: docs-build-all ## Serve all docs locally (builds first, then serves EN)
-	uv run mkdocs serve --config-file mkdocs.yml
+docs-serve: ## Serve all docs locally (builds KO first, then serves EN)
+	@echo "Building Korean docs..."
+	uv run zensical build -f mkdocs.ko.yml
+	@echo "Serving English docs..."
+	uv run zensical serve -f mkdocs.yml
 
 .PHONY: docs-serve-en
 docs-serve-en: ## Serve English docs with live reload
-	uv run mkdocs serve --config-file mkdocs.yml
+	uv run zensical serve -f mkdocs.yml
 
 .PHONY: docs-serve-ko
 docs-serve-ko: ## Serve Korean docs with live reload
-	uv run mkdocs serve --config-file mkdocs.ko.yml
+	uv run zensical serve -f mkdocs.ko.yml
 
 .PHONY: docs-build
 docs-build: ## Build English docs
-	uv run mkdocs build --config-file mkdocs.yml
+	uv run zensical build -f mkdocs.yml
 
 .PHONY: docs-build-ko
 docs-build-ko: ## Build Korean docs
-	uv run mkdocs build --config-file mkdocs.ko.yml
+	uv run zensical build -f mkdocs.ko.yml
 
 .PHONY: docs-build-all
 docs-build-all: ## Build all docs (EN + KO)
 	@echo "Building English docs..."
-	uv run mkdocs build --config-file mkdocs.yml -d site/en/manual
+	uv run zensical build -f mkdocs.yml
 	@echo "Building Korean docs..."
-	uv run mkdocs build --config-file mkdocs.ko.yml -d site/ko/manual
+	uv run zensical build -f mkdocs.ko.yml
 	@echo "All docs built in site/"
 
 .PHONY: docs-build-strict
 docs-build-strict: ## Build all docs with strict mode (for CI)
-	uv run mkdocs build --strict --config-file mkdocs.yml -d site/en/manual
-	uv run mkdocs build --strict --config-file mkdocs.ko.yml -d site/ko/manual
+	uv run zensical build -f mkdocs.yml
+	uv run zensical build -f mkdocs.ko.yml
 
 .PHONY: docs-pdf-setup
 docs-pdf-setup: ## Install Playwright browser for PDF export (one-time setup)
