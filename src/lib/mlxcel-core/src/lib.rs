@@ -1544,6 +1544,26 @@ mod ffi {
         /// Quantize weights — biases
         fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
             -> UniquePtr<MlxArray>;
+
+        // Native safetensors loading (MLX-managed mmap, lazy arrays).
+        /// Opaque holder for weights loaded via MLX's native load_safetensors()
+        type MlxLoadedWeights;
+
+        /// Load safetensors file using MLX's native loader (lazy arrays, MLX-managed mmap).
+        /// Returns Result so C++ exceptions (bad path, corrupt file) become recoverable errors.
+        fn mlx_load_safetensors(path: &str) -> Result<UniquePtr<MlxLoadedWeights>>;
+
+        /// Number of weight entries in the loaded weights
+        fn loaded_weights_len(w: &MlxLoadedWeights) -> usize;
+
+        /// Get the name of the i-th weight entry
+        fn loaded_weights_name(w: &MlxLoadedWeights, index: usize) -> String;
+
+        /// Take (move out) the i-th weight array, leaving the slot empty
+        fn loaded_weights_take(
+            w: Pin<&mut MlxLoadedWeights>,
+            index: usize,
+        ) -> UniquePtr<MlxArray>;
     }
 }
 

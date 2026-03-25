@@ -1151,4 +1151,19 @@ void nemotron_full_forward(
 );
 #endif
 
+// Opaque holder for weights loaded via MLX's native load_safetensors().
+// Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
+struct MlxLoadedWeights {
+    std::vector<std::string> names;
+    std::vector<std::unique_ptr<MlxArray>> arrays;
+};
+
+// Load safetensors file using MLX's native loader (lazy arrays, MLX-managed mmap)
+std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path);
+
+// Access loaded weights
+size_t loaded_weights_len(const MlxLoadedWeights& w);
+rust::String loaded_weights_name(const MlxLoadedWeights& w, size_t index);
+std::unique_ptr<MlxArray> loaded_weights_take(MlxLoadedWeights& w, size_t index);
+
 } // namespace mlx_cxx

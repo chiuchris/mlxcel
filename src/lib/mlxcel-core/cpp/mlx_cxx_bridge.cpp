@@ -3425,4 +3425,34 @@ void nemotron_decode_step(
     logits = std::make_unique<MlxArray>(std::move(lm_out));
 }
 
+// ── Native safetensors loading ────────────────────────────────────────
+
+std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
+    std::string path_str(path.data(), path.size());
+    auto [weights_map, metadata] = mlx::core::load_safetensors(path_str);
+
+    auto result = std::make_unique<MlxLoadedWeights>();
+    result->names.reserve(weights_map.size());
+    result->arrays.reserve(weights_map.size());
+
+    for (auto& [name, arr] : weights_map) {
+        result->names.push_back(std::move(name));
+        result->arrays.push_back(std::make_unique<MlxArray>(std::move(arr)));
+    }
+
+    return result;
+}
+
+size_t loaded_weights_len(const MlxLoadedWeights& w) {
+    return w.names.size();
+}
+
+rust::String loaded_weights_name(const MlxLoadedWeights& w, size_t index) {
+    return rust::String(w.names.at(index));
+}
+
+std::unique_ptr<MlxArray> loaded_weights_take(MlxLoadedWeights& w, size_t index) {
+    return std::move(w.arrays.at(index));
+}
+
 } // namespace mlx_cxx

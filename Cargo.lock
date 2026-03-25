@@ -1531,15 +1531,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "memmap2"
-version = "0.9.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
-dependencies = [
- "libc",
-]
-
-[[package]]
 name = "memo-map"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1611,7 +1602,7 @@ dependencies = [
  "mlxcel-core",
  "path-clean",
  "reqwest",
- "safetensors 0.7.0",
+ "safetensors",
  "sentencepiece",
  "serde",
  "serde_json",
@@ -1635,8 +1626,6 @@ dependencies = [
  "cmake",
  "cxx",
  "cxx-build",
- "memmap2",
- "safetensors 0.4.5",
  "serde",
  "serde_json",
 ]
@@ -2326,16 +2315,6 @@ name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
-
-[[package]]
-name = "safetensors"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44560c11236a6130a46ce36c836a62936dc81ebf8c36a37947423571be0e55b6"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "safetensors"
