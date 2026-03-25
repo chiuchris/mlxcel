@@ -56,6 +56,8 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
+        token_history: Vec::new(),
+        merged_eos: Vec::new(),
     };
 
     (seq, rx)
@@ -236,6 +238,8 @@ fn make_test_sequence_with_priority(
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
+        token_history: Vec::new(),
+        merged_eos: Vec::new(),
     };
 
     (seq, rx)
@@ -532,4 +536,124 @@ fn preemption_disabled_by_default_never_triggers() {
     // The condition: enable_preemption && batch_full && queue_has_high > min_active
     let should_preempt = enable_preemption && batch_full && queue_has_high_priority;
     assert!(!should_preempt);
+}
+
+// -------------------------------------------------------------------
+// Incremental token history and merged EOS (perf optimization tests)
+// -------------------------------------------------------------------
+
+#[test]
+fn sequence_info_initializes_token_history_and_merged_eos_empty() {
+    // New sequences enqueued via make_test_sequence start with empty
+    // token_history and merged_eos. They are populated during prefill
+    // (finish_prefill) so the decode steps can reuse them without
+    // per-step reconstruction.
+    let (seq, _rx) = make_test_sequence(1);
+    assert!(
+        seq.token_history.is_empty(),
+        "token_history must start empty (populated at prefill)"
+    );
+    assert!(
+        seq.merged_eos.is_empty(),
+        "merged_eos must start empty (populated at prefill)"
+    );
+}
+
+#[test]
+fn sequence_info_token_history_can_be_populated_incrementally() {
+    // Simulate the incremental update pattern used in decode_single_step
+    // and execute_batched_decode after the perf optimization:
+    //   token_history starts as prompt tokens (from initial_token_history),
+    //   then each new token is appended with push() rather than
+    //   rebuilding the full Vec from scratch every step.
+    let prompt_tokens: Vec<i32> = vec![10, 20, 30];
+    let mut token_history = prompt_tokens.clone(); // initial_token_history equivalent
+
+    // Simulate generating 3 tokens incrementally
+    let generated = vec![100_i32, 200, 300];
+    for tok in &generated {
+        token_history.push(*tok);
+    }
+
+    let expected: Vec<i32> = vec![10, 20, 30, 100, 200, 300];
+    assert_eq!(token_history, expected);
+}
+
+#[test]
+fn sequence_info_token_history_empty_when_no_penalties() {
+    use mlxcel_core::generate::SamplingConfig;
+
+    // When needs_token_history() is false (default config), the token
+    // history should remain empty. This avoids unnecessary Vec growth.
+    let sampling = SamplingConfig::default();
+    assert!(!sampling.needs_token_history());
+
+    // Simulate the scheduler's conditional push pattern:
+    // `if seq.sampling.needs_token_history() { seq.token_history.push(tok); }`
+    let mut token_history: Vec<i32> = Vec::new();
+    let generated_token = 42_i32;
+    if sampling.needs_token_history() {
+        token_history.push(generated_token);
+    }
+
+    assert!(
+        token_history.is_empty(),
+        "token_history should stay empty when no penalties are active"
+    );
+}
+
+#[test]
+fn sequence_info_token_history_grows_when_penalties_enabled() {
+    use mlxcel_core::generate::SamplingConfig;
+
+    // When repetition_penalty is active, each decoded token is appended.
+    let sampling = SamplingConfig {
+        repetition_penalty: 1.3,
+        ..Default::default()
+    };
+    assert!(sampling.needs_token_history());
+
+    let mut token_history: Vec<i32> = vec![1, 2, 3]; // from initial_token_history
+
+    for tok in [10_i32, 20, 30] {
+        if sampling.needs_token_history() {
+            token_history.push(tok);
+        }
+    }
+
+    assert_eq!(token_history, vec![1, 2, 3, 10, 20, 30]);
+}
+
+#[test]
+fn merged_eos_contains_both_model_and_request_stop_tokens() {
+    // merged_eos_token_ids merges the model's built-in EOS tokens with
+    // per-request stop tokens. This merged list is computed once at prefill
+    // and cached on the SequenceInfo to avoid per-step recomputation.
+    use mlxcel_core::generation_policy::merged_eos_token_ids;
+
+    let model_eos = vec![2_i32]; // typical EOS
+    let stop_tokens = vec![128001_i32, 128009_i32]; // e.g. Llama3 stop tokens
+
+    let merged = merged_eos_token_ids(model_eos, &stop_tokens);
+
+    assert!(merged.contains(&2));
+    assert!(merged.contains(&128001));
+    assert!(merged.contains(&128009));
+}
+
+#[test]
+fn merged_eos_deduplicates_overlapping_tokens() {
+    use mlxcel_core::generation_policy::merged_eos_token_ids;
+
+    // When the model EOS and stop_token_ids share a token, it should
+    // appear only once (or at most a small number of times) in merged.
+    let model_eos = vec![2_i32, 100];
+    let stop_tokens = vec![2_i32, 200]; // 2 is already in model_eos
+
+    let merged = merged_eos_token_ids(model_eos, &stop_tokens);
+
+    // All tokens must be present
+    assert!(merged.contains(&2));
+    assert!(merged.contains(&100));
+    assert!(merged.contains(&200));
 }

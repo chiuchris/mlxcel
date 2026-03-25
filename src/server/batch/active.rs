@@ -152,6 +152,8 @@ mod tests {
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
+            token_history: Vec::new(),
+            merged_eos: Vec::new(),
         };
 
         (seq, rx)

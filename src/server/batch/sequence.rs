@@ -216,6 +216,15 @@ pub struct SequenceInfo {
     /// Streaming decode helper for incremental text emission.
     /// Used by `BatchScheduler` during prefill and decode steps.
     pub(crate) decode_state: StreamingDecodeState,
+    /// Incrementally maintained token history for penalty-based sampling.
+    /// Initialized from prompt tokens during prefill, then appended per decode
+    /// step. Avoids O(prompt_len + generated_len) Vec reconstruction on every
+    /// decode step. Empty when `sampling.needs_token_history()` is false.
+    pub(crate) token_history: Vec<i32>,
+    /// Merged EOS token IDs (model + per-request stop tokens), computed once
+    /// during prefill and reused for every decode step. Avoids redundant
+    /// allocation on every step.
+    pub(crate) merged_eos: Vec<i32>,
 
     // -- Chunked prefill state --
     /// Token offset into `prompt_tokens` for chunked prefill.

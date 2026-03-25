@@ -350,11 +350,16 @@ impl CxxGenerator {
         // Get EOS tokens for this model
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
+        // Hoist env var checks out of the hot loop to avoid per-token syscalls.
+        let trace_dtype = std::env::var("MLXCEL_TRACE_DTYPE").is_ok();
+        let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
+        let profile_pipeline = std::env::var("MLXCEL_PROFILE_PIPELINE").is_ok();
+
         // Prefill: process all prompt tokens at once
         let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
         let logits = model.forward(&input, &mut self.caches, None);
 
-        if std::env::var("MLXCEL_TRACE_DTYPE").is_ok() {
+        if trace_dtype {
             ffi::eval(&logits);
             eprintln!("[LOGITS] prefill dtype={}", ffi::array_dtype(&logits));
         }
@@ -376,8 +381,6 @@ impl CxxGenerator {
         // 3. Extract current value (syncs current only)
         // 4. Yield/store current
         // 5. Move next to current
-        let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
-        let profile_pipeline = std::env::var("MLXCEL_PROFILE_PIPELINE").is_ok();
         let mut build_ns_total = 0u128;
         let mut wait_ns_total = 0u128;
         let mut profile_count = 0u32;
@@ -394,7 +397,7 @@ impl CxxGenerator {
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
                 let next_input = ffi::reshape_token_for_forward(&y);
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
-                if std::env::var("MLXCEL_TRACE_DTYPE").is_ok() && n == 0 {
+                if trace_dtype && n == 0 {
                     ffi::eval(&next_logits);
                     eprintln!("[LOGITS] decode dtype={}", ffi::array_dtype(&next_logits));
                 }
@@ -451,8 +454,8 @@ impl CxxGenerator {
                 break;
             }
 
-            // Periodic cache clearing
-            if n % 512 == 0 && n > 0 {
+            // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+            if n % 256 == 0 && n > 0 {
                 ffi::clear_memory_cache();
             }
 
@@ -570,7 +573,8 @@ impl CxxGenerator {
                 break;
             }
 
-            if n % 512 == 0 && n > 0 {
+            // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+            if n % 256 == 0 && n > 0 {
                 ffi::clear_memory_cache();
             }
 
@@ -651,7 +655,8 @@ impl CxxGenerator {
             if needs_history {
                 token_history.push(token_val);
             }
-            if n % 512 == 0 && n > 0 {
+            // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+            if n % 256 == 0 && n > 0 {
                 ffi::clear_memory_cache();
             }
             if let Some(ny) = next_y {
@@ -776,8 +781,8 @@ impl CxxGenerator {
                 token_history.push(token_val);
             }
 
-            // Periodic cache clearing
-            if n % 512 == 0 && n > 0 {
+            // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+            if n % 256 == 0 && n > 0 {
                 ffi::clear_memory_cache();
             }
 
@@ -1046,5 +1051,143 @@ mod tests {
         ffi::eval(&logits);
 
         assert_eq!(ffi::array_shape(&logits), vec![1, 1, 4]);
+    }
+
+    // -- SamplingConfig::needs_token_history (incremental history optimization) --
+
+    #[test]
+    fn needs_token_history_false_for_default_config() {
+        // Default config: all penalties disabled, should not need history.
+        let cfg = SamplingConfig::default();
+        assert!(!cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_false_for_greedy_config() {
+        let cfg = SamplingConfig::greedy();
+        assert!(!cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_repetition_penalty_enabled() {
+        let cfg = SamplingConfig {
+            repetition_penalty: 1.2,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_false_when_repetition_penalty_is_one() {
+        // Exactly 1.0 means "no penalty" (identity multiplication).
+        let cfg = SamplingConfig {
+            repetition_penalty: 1.0,
+            ..Default::default()
+        };
+        assert!(!cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_dry_multiplier_positive() {
+        let cfg = SamplingConfig {
+            dry_multiplier: 0.5,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_false_when_dry_multiplier_zero() {
+        let cfg = SamplingConfig {
+            dry_multiplier: 0.0,
+            ..Default::default()
+        };
+        assert!(!cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_frequency_penalty_nonzero() {
+        let cfg = SamplingConfig {
+            frequency_penalty: 0.1,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_frequency_penalty_negative() {
+        // Negative frequency penalty is valid (encourages repetition).
+        let cfg = SamplingConfig {
+            frequency_penalty: -0.1,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_presence_penalty_nonzero() {
+        let cfg = SamplingConfig {
+            presence_penalty: 0.2,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    #[test]
+    fn needs_token_history_true_when_multiple_penalties_enabled() {
+        let cfg = SamplingConfig {
+            repetition_penalty: 1.1,
+            dry_multiplier: 0.3,
+            frequency_penalty: 0.05,
+            ..Default::default()
+        };
+        assert!(cfg.needs_token_history());
+    }
+
+    // -- Cache clearing interval (aligned with Python mlx-lm) --
+
+    /// Verify that the cache clearing interval (256 tokens) matches Python
+    /// mlx-lm. The condition `n % 256 == 0 && n > 0` fires at n=256, 512, ...
+    #[test]
+    fn cache_clearing_triggers_every_256_tokens() {
+        let clears: Vec<usize> = (1..=512).filter(|&n| n % 256 == 0).collect();
+        assert_eq!(clears, vec![256, 512]);
+    }
+
+    #[test]
+    fn cache_clearing_does_not_trigger_on_token_zero() {
+        // n=0 is the very first decode iteration after prefill. Clearing here
+        // would discard tensors needed for the pipelined next-step computation.
+        let n = 0_usize;
+        assert!(!(n % 256 == 0 && n > 0));
+    }
+
+    #[test]
+    fn cache_clearing_first_trigger_is_at_256() {
+        let first_clear = (1_usize..).find(|&n| n % 256 == 0 && n > 0);
+        assert_eq!(first_clear, Some(256));
+    }
+
+    // -- SamplingConfig construction helpers --
+
+    #[test]
+    fn sampling_config_with_temperature_only_changes_temperature() {
+        let cfg = SamplingConfig::with_temperature(0.7);
+        assert_eq!(cfg.temperature, 0.7);
+        assert_eq!(cfg.top_k, 0);
+        assert_eq!(cfg.top_p, 1.0);
+        assert_eq!(cfg.repetition_penalty, 1.0);
+        assert_eq!(cfg.dry_multiplier, 0.0);
+        assert_eq!(cfg.frequency_penalty, 0.0);
+        assert_eq!(cfg.presence_penalty, 0.0);
+        assert!(!cfg.needs_token_history());
+    }
+
+    #[test]
+    fn greedy_config_has_zero_temperature_and_no_history_needed() {
+        let cfg = SamplingConfig::greedy();
+        assert_eq!(cfg.temperature, 0.0);
+        assert_eq!(cfg.top_k, 1);
+        assert!(!cfg.needs_token_history());
     }
 }

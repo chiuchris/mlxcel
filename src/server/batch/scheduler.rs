@@ -328,6 +328,8 @@ impl BatchScheduler {
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
+            token_history: Vec::new(),
+            merged_eos: Vec::new(),
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
@@ -690,6 +692,11 @@ impl BatchScheduler {
             token_history.push(first_token);
         }
 
+        // Store merged EOS and token history on the sequence so decode_single_step
+        // can reuse them without per-step reconstruction.
+        seq.merged_eos = eos_tokens;
+        seq.token_history = token_history;
+
         if let Some(new_text) = seq.decode_state.on_token(first_token, &self.tokenizer) {
             let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
         }
@@ -764,6 +771,8 @@ impl BatchScheduler {
             victim.generated_text.clear();
             victim.prefill_offset = 0;
             victim.decode_state = StreamingDecodeState::new(&self.tokenizer, &victim.prompt_tokens);
+            victim.token_history.clear();
+            victim.merged_eos.clear();
 
             // Allocate a fresh cache slot
             match self.cache_pool.allocate(&self.model) {
@@ -850,7 +859,6 @@ impl BatchScheduler {
         let b = seq_ids.len();
 
         let mut last_tokens: Vec<i32> = Vec::with_capacity(b);
-        let mut token_histories: Vec<Vec<i32>> = Vec::with_capacity(b);
 
         for &seq_id in seq_ids {
             let seq = match self.active_batch.get_mut(seq_id) {
@@ -861,16 +869,6 @@ impl BatchScheduler {
                 }
             };
             last_tokens.push(*seq.generated_tokens.last().unwrap_or(&0));
-
-            if seq.sampling.needs_token_history() {
-                let mut hist =
-                    Vec::with_capacity(seq.prompt_tokens.len() + seq.generated_tokens.len());
-                hist.extend_from_slice(&seq.prompt_tokens);
-                hist.extend_from_slice(&seq.generated_tokens);
-                token_histories.push(hist);
-            } else {
-                token_histories.push(Vec::new());
-            }
         }
 
         let input = mlxcel_core::from_slice_i32(&last_tokens, &[b as i32, 1]);
@@ -909,28 +907,21 @@ impl BatchScheduler {
 
         let logits = self.model.forward_batched(&input, &mut batch_caches, None);
 
-        let model_eos = self.model.eos_token_ids();
-
         for (i, &seq_id) in seq_ids.iter().enumerate() {
             let seq_logits =
                 mlxcel_core::slice(&logits, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
 
-            let (token_val, eos_tokens) = {
+            // Use cached token_history (incrementally maintained) instead of
+            // rebuilding per step. Use cached merged_eos computed once at prefill.
+            let token_val = {
                 let seq = match self.active_batch.get_mut(seq_id) {
                     Some(s) => s,
                     None => continue,
                 };
-                let history_ref: &[i32] = &token_histories[i];
                 let (token_arr, _logprobs) =
-                    sample_token_optimized(&seq_logits, &seq.sampling, history_ref);
+                    sample_token_optimized(&seq_logits, &seq.sampling, &seq.token_history);
                 mlxcel_core::eval(&token_arr);
-                let val = mlxcel_core::item_i32(&token_arr);
-                let eos = if seq.sampling.stop_token_ids.is_empty() {
-                    model_eos.clone()
-                } else {
-                    merged_eos_token_ids(model_eos.clone(), &seq.sampling.stop_token_ids)
-                };
-                (val, eos)
+                mlxcel_core::item_i32(&token_arr)
             };
 
             let seq = match self.active_batch.get_mut(seq_id) {
@@ -938,7 +929,7 @@ impl BatchScheduler {
                 None => continue,
             };
 
-            if eos_tokens.contains(&token_val) {
+            if seq.merged_eos.contains(&token_val) {
                 if let Err(err) = seq
                     .state
                     .transition_to(SequenceState::Finished(FinishReason::Stop))
@@ -949,6 +940,11 @@ impl BatchScheduler {
             }
 
             seq.generated_tokens.push(token_val);
+
+            // Incrementally update token_history
+            if seq.sampling.needs_token_history() {
+                seq.token_history.push(token_val);
+            }
 
             if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
                 let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
@@ -962,7 +958,8 @@ impl BatchScheduler {
                 tracing::error!("State transition error: {err}");
             }
 
-            if seq.generated_tokens.len() % 512 == 0 {
+            // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+            if seq.generated_tokens.len() % 256 == 0 {
                 mlxcel_core::clear_memory_cache();
             }
 
@@ -983,24 +980,12 @@ impl BatchScheduler {
     }
 
     fn decode_single_step(&mut self, seq_id: SequenceId) {
-        let (last_token, needs_history) = {
+        let last_token = {
             let seq = match self.active_batch.get_mut(seq_id) {
                 Some(s) => s,
                 None => return,
             };
-            let last = *seq.generated_tokens.last().unwrap_or(&0);
-            (last, seq.sampling.needs_token_history())
-        };
-
-        let token_history = if needs_history {
-            let seq = self.active_batch.get_mut(seq_id).unwrap();
-            let mut history =
-                Vec::with_capacity(seq.prompt_tokens.len() + seq.generated_tokens.len());
-            history.extend_from_slice(&seq.prompt_tokens);
-            history.extend_from_slice(&seq.generated_tokens);
-            history
-        } else {
-            Vec::new()
+            *seq.generated_tokens.last().unwrap_or(&0)
         };
 
         let caches = match self.cache_pool.get_caches_mut(seq_id) {
@@ -1014,16 +999,15 @@ impl BatchScheduler {
         let input = mlxcel_core::from_slice_i32(&[last_token], &[1, 1]);
         let logits = self.model.forward(&input, caches, None);
 
-        let (token_val, eos_tokens) = {
+        // Use cached token_history from SequenceInfo (incrementally maintained)
+        // and cached merged_eos (computed once during prefill) to avoid
+        // per-step allocation and reconstruction overhead.
+        let token_val = {
             let seq = self.active_batch.get_mut(seq_id).unwrap();
             let (token_arr, _logprobs) =
-                sample_token_optimized(&logits, &seq.sampling, &token_history);
+                sample_token_optimized(&logits, &seq.sampling, &seq.token_history);
             mlxcel_core::eval(&token_arr);
-            let val = mlxcel_core::item_i32(&token_arr);
-
-            let eos =
-                merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
-            (val, eos)
+            mlxcel_core::item_i32(&token_arr)
         };
 
         let seq = match self.active_batch.get_mut(seq_id) {
@@ -1031,7 +1015,7 @@ impl BatchScheduler {
             None => return,
         };
 
-        if eos_tokens.contains(&token_val) {
+        if seq.merged_eos.contains(&token_val) {
             if let Err(err) = seq
                 .state
                 .transition_to(SequenceState::Finished(FinishReason::Stop))
@@ -1042,6 +1026,11 @@ impl BatchScheduler {
         }
 
         seq.generated_tokens.push(token_val);
+
+        // Incrementally update token_history instead of rebuilding from scratch
+        if seq.sampling.needs_token_history() {
+            seq.token_history.push(token_val);
+        }
 
         if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
             let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
@@ -1055,7 +1044,8 @@ impl BatchScheduler {
             tracing::error!("State transition error: {err}");
         }
 
-        if seq.generated_tokens.len() % 512 == 0 {
+        // Periodic cache clearing (matches Python mlx-lm which clears every 256)
+        if seq.generated_tokens.len() % 256 == 0 {
             mlxcel_core::clear_memory_cache();
         }
 
@@ -1069,16 +1059,13 @@ impl BatchScheduler {
     // ------------------------------------------------------------------
 
     fn finalize_completed(&mut self) {
+        // Collect finished IDs by scanning active sequences. Uses iter_sequences()
+        // to avoid allocating a full key snapshot when no sequences are finished.
         let finished_ids: Vec<SequenceId> = self
             .active_batch
-            .sequence_ids()
-            .into_iter()
-            .filter(|id| {
-                self.active_batch
-                    .get_mut(*id)
-                    .map(|s| s.state.is_finished())
-                    .unwrap_or(false)
-            })
+            .iter_sequences()
+            .filter(|s| s.state.is_finished())
+            .map(|s| s.seq_id)
             .collect();
 
         let has_completed = !finished_ids.is_empty();
