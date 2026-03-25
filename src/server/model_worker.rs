@@ -59,6 +59,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     thread::spawn(move || {
         tracing::info!("Model worker thread starting, loading model...");
 
+        let load_start = Instant::now();
         let result = if let Some(adapter) = adapter_path {
             tracing::info!("Loading LoRA adapter from {:?}", adapter);
             crate::load_model_with_adapter(&model_path, &adapter)
@@ -68,7 +69,11 @@ pub(crate) fn spawn_model_worker_with_batch_config(
 
         let (model, tokenizer) = match result {
             Ok((model, tokenizer)) => {
-                tracing::info!("Model {worker_model_id} loaded successfully");
+                let load_elapsed = load_start.elapsed();
+                tracing::info!(
+                    "Model {worker_model_id} loaded in {:.3}s",
+                    load_elapsed.as_secs_f64()
+                );
                 loaded.store(true, Ordering::Release);
                 (model, tokenizer)
             }
@@ -139,6 +144,7 @@ pub(crate) fn spawn_legacy_model_worker(
             "Model worker thread starting (legacy sequential mode, --no-batch), loading model..."
         );
 
+        let load_start = Instant::now();
         let result = if let Some(adapter) = adapter_path {
             tracing::info!("Loading LoRA adapter from {:?}", adapter);
             crate::load_model_with_adapter(&model_path, &adapter)
@@ -148,7 +154,11 @@ pub(crate) fn spawn_legacy_model_worker(
 
         let (model, tokenizer) = match result {
             Ok((model, tokenizer)) => {
-                tracing::info!("Model {worker_model_id} loaded successfully");
+                let load_elapsed = load_start.elapsed();
+                tracing::info!(
+                    "Model {worker_model_id} loaded in {:.3}s",
+                    load_elapsed.as_secs_f64()
+                );
                 loaded.store(true, Ordering::Release);
                 (model, tokenizer)
             }

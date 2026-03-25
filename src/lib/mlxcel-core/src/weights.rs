@@ -30,23 +30,61 @@ use std::path::Path;
 /// Loaded model weights as a map of tensor names to mlx-cxx arrays
 pub type WeightMap = HashMap<String, UniquePtr<MlxArray>>;
 
-/// Load all weights from a directory containing safetensors files
+/// Load all weights from a directory containing safetensors files.
+///
+/// Collects all `.safetensors` shard files, mmap + deserializes all tensors
+/// with `async_eval` across every shard, then issues a single
+/// `synchronize_default()` barrier.  For N-shard models this reduces GPU
+/// synchronization overhead from O(N) to O(1) compared to calling
+/// `load_safetensors()` per file.
 pub fn load_weights_from_dir<P: AsRef<Path>>(dir: P) -> Result<WeightMap, String> {
     let dir = dir.as_ref();
     let mut weights = HashMap::new();
 
-    // Find all safetensors files in the directory
-    let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read directory: {}", e))?;
+    // Collect and sort shard paths for deterministic ordering
+    let mut shard_paths: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory: {}", e))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "safetensors") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    shard_paths.sort(); // deterministic order
 
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read entry: {}", e))?;
-        let path = entry.path();
+    // Keep all mmaps alive until after synchronize_default().
+    // The async_eval'd MLX arrays reference mmap memory; dropping before sync
+    // would invalidate those pointers while the GPU graph is still pending.
+    let mut _mmaps = Vec::with_capacity(shard_paths.len());
 
-        if path.extension().is_some_and(|ext| ext == "safetensors") {
-            let file_weights = load_safetensors(&path)?;
-            weights.extend(file_weights);
+    for path in &shard_paths {
+        let file = File::open(path)
+            .map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
+        // SAFETY: The mmap is kept alive in `_mmaps` until after
+        // `synchronize_default()`, ensuring no use-after-unmap by async MLX ops.
+        // The file is a regular safetensors file opened read-only; concurrent
+        // modification/truncation is not expected in this context.
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| format!("Failed to mmap file {}: {}", path.display(), e))?;
+
+        let tensors = SafeTensors::deserialize(&mmap)
+            .map_err(|e| format!("Failed to deserialize {}: {}", path.display(), e))?;
+
+        for (name, tensor_view) in tensors.tensors() {
+            let array = tensor_to_mlx_array(&tensor_view)?;
+            ffi::async_eval(&array);
+            weights.insert(name.to_string(), array);
         }
+
+        _mmaps.push(mmap);
     }
+
+    // Single synchronization barrier for ALL shards
+    ffi::synchronize_default();
 
     Ok(weights)
 }
@@ -57,6 +95,9 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<WeightMap, String> {
     let file =
         File::open(path).map_err(|e| format!("Failed to open file {}: {}", path.display(), e))?;
 
+    // SAFETY: The mmap is kept alive until after `synchronize_default()` below,
+    // ensuring all async_eval'd arrays have materialized before the mapping is dropped.
+    // The file is opened read-only; concurrent modification is not expected.
     let mmap = unsafe { Mmap::map(&file) }.map_err(|e| format!("Failed to mmap file: {}", e))?;
 
     let tensors = SafeTensors::deserialize(&mmap)

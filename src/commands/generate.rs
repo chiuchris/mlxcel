@@ -82,13 +82,15 @@ fn load_generation_model(
     args: &GenerateArgs,
 ) -> Result<(mlxcel::LoadedModel, mlxcel::tokenizer::MlxcelTokenizer)> {
     println!("Loading model from {:?}...", args.model.model);
+    let load_start = Instant::now();
     let result = if let Some(ref adapter_path) = args.model.adapter {
         println!("Loading LoRA adapter from {:?}...", adapter_path);
         load_model_with_adapter(&args.model.model, adapter_path)
     } else {
         load_model(&args.model.model)
     }?;
-    println!("Model loaded.");
+    let load_elapsed = load_start.elapsed();
+    println!("Model loaded in {:.3}s.", load_elapsed.as_secs_f64());
     Ok(result)
 }
 
