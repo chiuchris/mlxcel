@@ -15,6 +15,7 @@
 //! OpenAI and llama-server compatible response types
 
 use serde::Serialize;
+use serde_json::Value;
 
 /// Token usage statistics
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +31,8 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
+    /// Always null for now; present to satisfy strict client parsers
+    pub logprobs: Option<Value>,
 }
 
 /// Chat message in response
@@ -46,6 +49,7 @@ pub struct ChatCompletionResponse {
     pub object: String,
     pub created: i64,
     pub model: String,
+    pub system_fingerprint: Option<String>,
     pub choices: Vec<ChatChoice>,
     pub usage: Usage,
 }
@@ -64,6 +68,7 @@ impl ChatCompletionResponse {
             object: "chat.completion".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![ChatChoice {
                 index: 0,
                 message: ChatMessage {
@@ -71,6 +76,7 @@ impl ChatCompletionResponse {
                     content,
                 },
                 finish_reason,
+                logprobs: None,
             }],
             usage: Usage {
                 prompt_tokens,
@@ -87,6 +93,8 @@ pub struct CompletionChoice {
     pub index: usize,
     pub text: String,
     pub finish_reason: Option<String>,
+    /// Always null for now; present to satisfy strict client parsers
+    pub logprobs: Option<Value>,
 }
 
 /// Text completion response
@@ -96,6 +104,7 @@ pub struct CompletionResponse {
     pub object: String,
     pub created: i64,
     pub model: String,
+    pub system_fingerprint: Option<String>,
     pub choices: Vec<CompletionChoice>,
     pub usage: Usage,
 }
@@ -114,10 +123,12 @@ impl CompletionResponse {
             object: "text_completion".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![CompletionChoice {
                 index: 0,
                 text,
                 finish_reason,
+                logprobs: None,
             }],
             usage: Usage {
                 prompt_tokens,

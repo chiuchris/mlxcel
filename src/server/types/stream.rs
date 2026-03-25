@@ -15,6 +15,7 @@
 //! SSE streaming response types
 
 use serde::Serialize;
+use serde_json::Value;
 
 /// Delta content for streaming
 #[derive(Debug, Clone, Serialize)]
@@ -26,12 +27,18 @@ pub struct Delta {
 }
 
 /// Streaming choice
+///
+/// `finish_reason` is always serialized (as `null` in content chunks, as a
+/// string value in the final chunk). This is required by the OpenAI spec and
+/// expected by clients such as opencode, Continue, and Cursor.
 #[derive(Debug, Clone, Serialize)]
 pub struct StreamChoice {
     pub index: usize,
     pub delta: Delta,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized: `null` in content chunks, "stop"/"length" in final
     pub finish_reason: Option<String>,
+    /// Always null for now; present to satisfy strict client parsers
+    pub logprobs: Option<Value>,
 }
 
 /// Chat completion chunk for streaming
@@ -41,7 +48,13 @@ pub struct ChatCompletionChunk {
     pub object: String,
     pub created: i64,
     pub model: String,
+    /// Always null for now; present to satisfy strict client parsers
+    pub system_fingerprint: Option<String>,
     pub choices: Vec<StreamChoice>,
+    /// Only present in the final usage chunk (when stream_options.include_usage
+    /// is true). Omitted from all other chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<super::response::Usage>,
 }
 
 impl ChatCompletionChunk {
@@ -52,6 +65,7 @@ impl ChatCompletionChunk {
             object: "chat.completion.chunk".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![StreamChoice {
                 index: 0,
                 delta: Delta {
@@ -59,7 +73,9 @@ impl ChatCompletionChunk {
                     content: None,
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
+            usage: None,
         }
     }
 
@@ -70,6 +86,7 @@ impl ChatCompletionChunk {
             object: "chat.completion.chunk".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![StreamChoice {
                 index: 0,
                 delta: Delta {
@@ -77,7 +94,9 @@ impl ChatCompletionChunk {
                     content: Some(content),
                 },
                 finish_reason: None,
+                logprobs: None,
             }],
+            usage: None,
         }
     }
 
@@ -88,6 +107,7 @@ impl ChatCompletionChunk {
             object: "chat.completion.chunk".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![StreamChoice {
                 index: 0,
                 delta: Delta {
@@ -95,7 +115,34 @@ impl ChatCompletionChunk {
                     content: None,
                 },
                 finish_reason: Some(finish_reason),
+                logprobs: None,
             }],
+            usage: None,
+        }
+    }
+
+    /// Create usage chunk sent when `stream_options.include_usage` is true.
+    ///
+    /// The OpenAI spec requires this to be a separate chunk with an empty
+    /// `choices` array and a populated `usage` object.
+    pub fn usage(
+        id: String,
+        model: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![],
+            usage: Some(super::response::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
         }
     }
 }
@@ -107,15 +154,27 @@ pub struct CompletionChunk {
     pub object: String,
     pub created: i64,
     pub model: String,
+    /// Always null for now; present to satisfy strict client parsers
+    pub system_fingerprint: Option<String>,
     pub choices: Vec<CompletionStreamChoice>,
+    /// Only present in the final usage chunk (when stream_options.include_usage
+    /// is true). Omitted from all other chunks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<super::response::Usage>,
 }
 
+/// Streaming choice for text completions
+///
+/// `finish_reason` is always serialized (as `null` in content chunks) per the
+/// OpenAI spec.
 #[derive(Debug, Clone, Serialize)]
 pub struct CompletionStreamChoice {
     pub index: usize,
     pub text: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Always serialized: `null` in content chunks, "stop"/"length" in final
     pub finish_reason: Option<String>,
+    /// Always null for now; present to satisfy strict client parsers
+    pub logprobs: Option<Value>,
 }
 
 impl CompletionChunk {
@@ -126,11 +185,14 @@ impl CompletionChunk {
             object: "text_completion".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![CompletionStreamChoice {
                 index: 0,
                 text,
                 finish_reason: None,
+                logprobs: None,
             }],
+            usage: None,
         }
     }
 
@@ -141,11 +203,36 @@ impl CompletionChunk {
             object: "text_completion".to_string(),
             created: chrono::Utc::now().timestamp(),
             model,
+            system_fingerprint: None,
             choices: vec![CompletionStreamChoice {
                 index: 0,
                 text: String::new(),
                 finish_reason: Some(finish_reason),
+                logprobs: None,
             }],
+            usage: None,
+        }
+    }
+
+    /// Create usage chunk sent when `stream_options.include_usage` is true.
+    pub fn usage(
+        id: String,
+        model: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+    ) -> Self {
+        Self {
+            id,
+            object: "text_completion".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![],
+            usage: Some(super::response::Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            }),
         }
     }
 }

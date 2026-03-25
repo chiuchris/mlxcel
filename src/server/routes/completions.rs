@@ -105,6 +105,13 @@ async fn stream_completion(
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
 
+    // Extract include_usage before request is moved into the closure
+    let include_usage = request
+        .stream_options
+        .as_ref()
+        .map(|o| o.include_usage)
+        .unwrap_or(false);
+
     let (events, stream) = sse_channel(100);
 
     // Clone for the spawned task
@@ -135,8 +142,24 @@ async fn stream_completion(
             Ok(r) => r.finish_reason.clone(),
             Err(_) => "error".to_string(),
         };
-        let finish = CompletionChunk::finish(request_id_clone, model_id_clone, finish_reason);
+        let finish = CompletionChunk::finish(
+            request_id_clone.clone(),
+            model_id_clone.clone(),
+            finish_reason,
+        );
         let _ = finish_events.json(&finish);
+
+        // Send usage chunk if requested (stream_options.include_usage)
+        if include_usage && let Ok(ref r) = result {
+            let usage_chunk = CompletionChunk::usage(
+                request_id_clone.clone(),
+                model_id_clone.clone(),
+                r.prompt_tokens,
+                r.completion_tokens,
+            );
+            let _ = finish_events.json(&usage_chunk);
+        }
+
         finish_events.done();
     });
 

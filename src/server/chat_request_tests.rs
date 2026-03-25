@@ -23,6 +23,7 @@ fn request_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
         model: "test-model".to_string(),
         messages,
         stream: false,
+        stream_options: None,
         params: SamplingParams::default(),
     }
 }

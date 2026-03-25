@@ -30,6 +30,7 @@ fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
             name: None,
         }],
         stream: false,
+        stream_options: None,
         params: SamplingParams::default(),
     }
 }
@@ -156,6 +157,7 @@ async fn extract_chat_image_data_collects_images_across_messages() {
             },
         ],
         stream: false,
+        stream_options: None,
         params: SamplingParams::default(),
     };
 

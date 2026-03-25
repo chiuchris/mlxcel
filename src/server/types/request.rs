@@ -164,6 +164,14 @@ pub struct SamplingParams {
     pub presence_penalty: Option<f32>,
 }
 
+/// Stream options for controlling streaming behavior
+#[derive(Debug, Clone, Deserialize)]
+pub struct StreamOptions {
+    /// Include token usage statistics in the final streaming chunk
+    #[serde(default)]
+    pub include_usage: bool,
+}
+
 /// Chat completion request (POST /v1/chat/completions)
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -174,6 +182,9 @@ pub struct ChatCompletionRequest {
     /// Whether to stream the response
     #[serde(default)]
     pub stream: bool,
+    /// Options controlling streaming behavior (only used when stream=true)
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
@@ -189,6 +200,9 @@ pub struct CompletionRequest {
     /// Whether to stream the response
     #[serde(default)]
     pub stream: bool,
+    /// Options controlling streaming behavior (only used when stream=true)
+    #[serde(default)]
+    pub stream_options: Option<StreamOptions>,
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
