@@ -76,19 +76,24 @@ impl ModelArgs {
 // Gemma RMSNorm (uses 1.0 + weight).
 pub struct GemmaRMSNorm {
     pub weight: UniquePtr<MlxArray>,
+    /// Pre-computed (1 + weight) to avoid per-forward allocation
+    adjusted_weight: UniquePtr<MlxArray>,
     pub eps: f32,
 }
 
 impl GemmaRMSNorm {
     pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
-        Self { weight, eps }
+        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(&weight));
+        let adjusted_weight = mlxcel_core::add(&one, &weight);
+        Self {
+            weight,
+            adjusted_weight,
+            eps,
+        }
     }
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // Gemma uses (1.0 + weight) for normalization
-        let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::array_dtype(&self.weight));
-        let adjusted_weight = mlxcel_core::add(&one, &self.weight);
-        mlxcel_core::fast_rms_norm(x, &adjusted_weight, self.eps)
+        mlxcel_core::fast_rms_norm(x, &self.adjusted_weight, self.eps)
     }
 }
 

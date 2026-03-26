@@ -153,7 +153,9 @@ pub fn create_causal_mask_with_window(
 /// Tensor of shape [batch, n_heads, seq_len, head_dim]
 pub fn repeat_kv(x: &MlxArray, n_rep: i32) -> UniquePtr<MlxArray> {
     if n_rep == 1 {
-        return ffi::copy(x);
+        // No repetition needed — return a zero-copy view via reshape
+        let shape = ffi::array_shape(x);
+        return ffi::reshape(x, &shape);
     }
 
     let shape = ffi::array_shape(x);

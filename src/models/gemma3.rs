@@ -136,19 +136,18 @@ impl Attention {
         let k = self.k_proj.forward(x);
         let v = self.v_proj.forward(x);
 
-        // Reshape to [batch, seq_len, n_heads, head_dim]
+        // Reshape and transpose to [batch, n_heads, seq_len, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
         let k = mlxcel_core::reshape(&k, &[b, l, self.num_kv_heads, self.head_dim]);
         let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
 
-        // Apply Q/K normalization BEFORE transpose
-        let q = self.q_norm.forward(&q);
-        let k = self.k_norm.forward(&k);
-
-        // Transpose to [batch, n_heads, seq_len, head_dim]
         let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
         let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        // Apply Q/K normalization AFTER transpose (matches Python mlx-lm)
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
 
         let offset = cache.offset();
 
@@ -159,30 +158,15 @@ impl Attention {
         // Update KV cache and get sliced views
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        // Repeat KV heads for GQA (if num_kv_heads < num_heads)
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let cache_k = mlxcel_core::utils::repeat_kv(&cache_k, n_rep);
-        let cache_v = mlxcel_core::utils::repeat_kv(&cache_v, n_rep);
-
-        // Compute attention scores
-        let k_t = mlxcel_core::transpose_axes(&cache_k, &[0, 1, 3, 2]);
-        let scores = mlxcel_core::matmul(&q, &k_t);
-
-        // Scale scores
-        let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
-
-        // Apply mask if provided
-        let scores = if let Some(m) = mask {
-            mlxcel_core::add(&scores, m)
-        } else {
-            scores
+        // Use fused scaled dot-product attention (handles GQA internally)
+        let mask_ptr = mask
+            .map(|m| m as *const _)
+            .unwrap_or(std::ptr::null());
+        let attn_out = unsafe {
+            mlxcel_core::fast_scaled_dot_product_attention(
+                &q, &cache_k, &cache_v, self.scale, mask_ptr,
+            )
         };
-
-        // Softmax
-        let probs = mlxcel_core::softmax(&scores, -1);
-
-        // Multiply by values
-        let attn_out = mlxcel_core::matmul(&probs, &cache_v);
 
         // Transpose back and reshape
         let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
@@ -470,8 +454,15 @@ impl Gemma3Model {
             for (i, layer) in self.layers.iter().enumerate() {
                 h = layer.forward(&h, caches[i].as_interface(), Some(ext_mask));
             }
+        } else if seq_len == 1 {
+            // Decode path (seq_len=1): no mask needed — matches Python mlx-lm
+            // which returns None from create_attention_mask when N=1.
+            // The fused SDPA handles single-token attention without explicit masks.
+            for (i, layer) in self.layers.iter().enumerate() {
+                h = layer.forward(&h, caches[i].as_interface(), None);
+            }
         } else {
-            // Standard causal mask path (text-only)
+            // Prefill path (seq_len > 1): create causal masks
             let global_idx = self.sliding_window_pattern - 1;
             let global_offset = caches[global_idx].as_interface().offset();
             let global_mask = Some(create_causal_mask(seq_len, global_offset));

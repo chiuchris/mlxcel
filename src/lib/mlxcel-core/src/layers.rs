@@ -303,26 +303,34 @@ impl RMSNorm {
 }
 
 /// Gemma-style RMS Normalization layer with (1 + weight) pattern
+/// Gemma-style RMS normalization with (1 + weight) adjustment.
+/// Used by: Gemma, Gemma2, Gemma3, Gemma3n
 pub struct GemmaRMSNorm {
     pub weight: UniquePtr<MlxArray>,
+    /// Pre-computed (1 + weight) to avoid per-forward allocation
+    adjusted_weight: UniquePtr<MlxArray>,
     pub eps: f32,
 }
 
 impl GemmaRMSNorm {
-    /// Create a new Gemma RMS norm layer
+    /// Create a new Gemma RMS norm layer.
+    /// Pre-computes (1 + weight) once at construction time.
     pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
-        Self { weight, eps }
+        let ones = ffi::ones(
+            &[ffi::array_shape(&weight)[0]],
+            ffi::array_dtype(&weight),
+        );
+        let adjusted_weight = ffi::add(&ones, &weight);
+        Self {
+            weight,
+            adjusted_weight,
+            eps,
+        }
     }
 
-    /// Forward pass using fast RMS norm kernel with (1 + weight)
+    /// Forward pass using fast RMS norm kernel with pre-computed (1 + weight)
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // Gemma models use (1 + weight) instead of just weight
-        let ones = ffi::ones(
-            &[ffi::array_shape(&self.weight)[0]],
-            ffi::array_dtype(&self.weight),
-        );
-        let adjusted_weight = ffi::add(&ones, &self.weight);
-        ffi::fast_rms_norm(x, &adjusted_weight, self.eps)
+        ffi::fast_rms_norm(x, &self.adjusted_weight, self.eps)
     }
 }
 
