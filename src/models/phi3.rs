@@ -143,6 +143,8 @@ pub struct Phi3Attention {
     /// SuScaledRoPE: input scaling factor applied to Q/K before rotation.
     /// = sqrt(1 + log(max_pos/orig_max_pos) / log(orig_max_pos))
     pub su_rope_scale: f32,
+    /// Pre-computed scale array to avoid per-token allocation in su_scale_rotary_dims
+    su_rope_scale_arr: Option<UniquePtr<MlxArray>>,
 }
 
 impl Phi3Attention {
@@ -183,9 +185,18 @@ impl Phi3Attention {
         // Apply RoPE (SuScaledRoPE for longrope models, plain RoPE otherwise)
         let (q, k) = if let Some(ref freqs) = self.su_rope_freqs {
             // SuScaledRoPE: pre-scale the rotary dimensions, then apply with custom freqs
-            let s = self.su_rope_scale;
-            let q = su_scale_rotary_dims(&q, s, self.rope_dims);
-            let k = su_scale_rotary_dims(&k, s, self.rope_dims);
+            // Use pre-computed scale array to avoid per-token from_slice_f32 allocation
+            let (q, k) = if let Some(ref scale_arr) = self.su_rope_scale_arr {
+                (
+                    mlxcel_core::multiply(&q, scale_arr),
+                    mlxcel_core::multiply(&k, scale_arr),
+                )
+            } else {
+                (
+                    mlxcel_core::reshape(&q, &mlxcel_core::array_shape(&q)),
+                    mlxcel_core::reshape(&k, &mlxcel_core::array_shape(&k)),
+                )
+            };
             let q =
                 mlxcel_core::fast_rope_with_freqs(&q, self.rope_dims, false, 1.0, offset, freqs);
             let k =
@@ -255,6 +266,7 @@ impl Phi3Attention {
             rope_base: args.rope_theta,
             su_rope_freqs: None,
             su_rope_scale: 1.0,
+            su_rope_scale_arr: None,
         };
 
         // Configure SuScaledRoPE if longrope scaling is present
@@ -299,11 +311,16 @@ impl Phi3Attention {
         let orig_max = scaling.original_max_position_embeddings.unwrap_or(4096) as f64;
         let max_pos = args.max_position_embeddings as f64;
         let factor = max_pos / orig_max;
-        self.su_rope_scale = if factor <= 1.0 {
+        let scale = if factor <= 1.0 {
             1.0
         } else {
             (1.0 + factor.ln() / orig_max.ln()).sqrt() as f32
         };
+        self.su_rope_scale = scale;
+        // Pre-compute scale array to avoid per-token from_slice_f32 allocation
+        if (scale - 1.0).abs() > 1e-6 {
+            self.su_rope_scale_arr = Some(mlxcel_core::from_slice_f32(&[scale], &[1]));
+        }
     }
 }
 

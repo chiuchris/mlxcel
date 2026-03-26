@@ -163,21 +163,19 @@ impl Attention {
         // Update KV cache and get sliced views
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        // Repeat KV heads for GQA (if num_kv_heads < num_heads)
+        // Compiled softcap SDPA with GQA: fuses repeat_kv + Q@K^T + scale + softcap + mask + softmax + @V
+        // Uses compiled_softcap_sdpa_gqa which handles KV head expansion internally,
+        // avoiding 2 separate repeat_kv FFI calls and intermediate tensor allocations
         let n_rep = self.num_heads / self.num_kv_heads;
-        let cache_k = mlxcel_core::utils::repeat_kv(&cache_k, n_rep);
-        let cache_v = mlxcel_core::utils::repeat_kv(&cache_v, n_rep);
-
-        // Compiled softcap SDPA: fuses Q@K^T, scale, softcap, mask, softmax, @V
-        // Replaces ~10 separate operations with a single compiled graph
         let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
         let attn_out = unsafe {
-            mlxcel_core::compiled_softcap_sdpa(
+            mlxcel_core::compiled_softcap_sdpa_gqa(
                 &q,
                 &cache_k,
                 &cache_v,
                 self.scale,
                 self.softcapping,
+                n_rep,
                 mask_ptr,
             )
         };
