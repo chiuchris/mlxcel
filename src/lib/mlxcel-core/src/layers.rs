@@ -585,6 +585,15 @@ impl UnifiedLinear {
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized { .. })
     }
+
+    /// Get a reference to the inner QuantizedWeight (if quantized)
+    /// Used by compiled MLP operations that need direct access to weight/scales/biases
+    pub fn quantized_weight(&self) -> Option<&QuantizedWeight> {
+        match self {
+            Self::Quantized { weight, .. } => Some(weight),
+            Self::Regular(_) => None,
+        }
+    }
 }
 
 /// Quantized per-head linear layer for MLA (Multi-head Latent Attention)

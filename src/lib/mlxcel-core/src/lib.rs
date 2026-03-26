@@ -496,6 +496,71 @@ mod ffi {
         /// Compiled silu: x * sigmoid(x) — single fused kernel
         fn compiled_silu(x: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
+        /// Used by: Gemma2, Gemma3, StarCoder2, and other GELU-based models
+        fn compiled_gelu(x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled gelu_approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+        /// Matches Python nn.gelu_approx — single fused kernel
+        /// Used by: Gemma2, Gemma3 (Python uses gelu_approx)
+        fn compiled_gelu_approx(x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled GeGLU activation: gelu(gate) * x — single fused kernel
+        /// Used by: Gemma2, Gemma3 MLP layers
+        fn compiled_geglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled softcap: tanh(scores / cap) * cap — single fused kernel
+        /// Used by: Gemma2 attention with logit softcapping
+        fn compiled_softcap(scores: &MlxArray, cap: f32) -> UniquePtr<MlxArray>;
+
+        /// Compiled clip_residual for float16 overflow prevention
+        /// Used by: Gemma3 residual connections
+        fn compiled_clip_residual(x: &MlxArray, y: &MlxArray) -> UniquePtr<MlxArray>;
+
+        /// Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
+        /// Fuses the entire manual attention path into one compiled call
+        /// Used by: Gemma2 attention with logit softcapping
+        unsafe fn compiled_softcap_sdpa(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            scale: f32,
+            softcap: f32,
+            mask: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled softcap SDPA with GQA: fuses repeat_kv + attention
+        /// Avoids separate repeat_kv FFI calls by incorporating GQA internally
+        /// Used by: Gemma2 attention (GQA + softcap)
+        unsafe fn compiled_softcap_sdpa_gqa(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            scale: f32,
+            softcap: f32,
+            n_rep: i32,
+            mask: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled GELU MLP forward: down_proj(gelu(gate_proj(x)) * up_proj(x))
+        /// Fuses entire MLP into a single compiled graph
+        /// Used by: Gemma2, Gemma3 and other GELU-gated MLP models
+        unsafe fn compiled_gelu_mlp_forward(
+            x: &MlxArray,
+            gate_proj: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: *const MlxArray,
+            up_proj: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: *const MlxArray,
+            down_proj: &MlxArray,
+            down_scales: &MlxArray,
+            down_biases: *const MlxArray,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
         /// Full transformer layer forward (maximum FFI reduction)
         unsafe fn transformer_layer_forward(
             x: &MlxArray,

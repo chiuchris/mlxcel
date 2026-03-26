@@ -1073,6 +1073,378 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
+// Compiled GELU: x * 0.5 * (1 + erf(x / sqrt(2)))
+// Used by: Gemma2, Gemma3, StarCoder2
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(x, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            return {mlx::core::multiply(x, scale)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x) {
+    static auto compiled_fn = get_compiled_gelu();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled GELU approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+// Matches Python nn.gelu_approx
+// Used by: Gemma2, Gemma3 (Python uses gelu_approx)
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_approx() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            auto sqrt_2_pi = array(std::sqrt(2.0f / M_PI));
+            auto coef = array(0.044715f);
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto x3 = mlx::core::power(x, array(3.0f));
+            auto inner = mlx::core::add(x, mlx::core::multiply(coef, x3));
+            auto tanh_val = mlx::core::tanh(mlx::core::multiply(sqrt_2_pi, inner));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, tanh_val));
+            return {mlx::core::multiply(x, scale)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x) {
+    static auto compiled_fn = get_compiled_gelu_approx();
+    auto result = compiled_fn({x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled GeGLU: gelu(gate) * x
+// Used by: Gemma2, Gemma3 MLP layers
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_geglu() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& gate = inputs[0];
+            const auto& x = inputs[1];
+            // gelu(gate) = gate * 0.5 * (1 + erf(gate / sqrt(2)))
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            auto gelu_gate = mlx::core::multiply(gate, scale);
+            return {mlx::core::multiply(gelu_gate, x)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_geglu_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+) {
+    static auto compiled_fn = get_compiled_geglu();
+    auto result = compiled_fn({gate.inner, x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled softcap: tanh(scores / cap) * cap
+// Used by: Gemma2 attention with logit softcapping
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_softcap() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& scores = inputs[0];
+            const auto& cap = inputs[1];
+            auto scaled = mlx::core::divide(scores, cap);
+            auto tanhed = mlx::core::tanh(scaled);
+            return {mlx::core::multiply(tanhed, cap)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_softcap(
+    const MlxArray& scores,
+    float cap
+) {
+    if (cap <= 0.0f) {
+        return std::make_unique<MlxArray>(scores.inner);
+    }
+    static auto compiled_fn = get_compiled_softcap();
+    auto cap_arr = array(cap);
+    auto result = compiled_fn({scores.inner, cap_arr});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled clip_residual for float16 overflow prevention
+// Used by: Gemma3 residual connections
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_clip_residual_f16() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            const auto& y = inputs[1];
+            auto x_f32 = mlx::core::astype(x, mlx::core::float32);
+            auto y_f32 = mlx::core::astype(y, mlx::core::float32);
+            auto sum = mlx::core::add(x_f32, y_f32);
+            auto bound = array(65504.0f);
+            auto neg_bound = mlx::core::negative(bound);
+            auto clipped = mlx::core::clip(sum, neg_bound, bound);
+            return {mlx::core::astype(clipped, mlx::core::float16)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_clip_residual(
+    const MlxArray& x,
+    const MlxArray& y
+) {
+    // Check if float16 (dtype code 9 in MLX enum order)
+    if (x.inner.dtype() != mlx::core::float16) {
+        return std::make_unique<MlxArray>(mlx::core::add(x.inner, y.inner));
+    }
+    static auto compiled_fn = get_compiled_clip_residual_f16();
+    auto result = compiled_fn({x.inner, y.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
+// Fuses the entire attention score computation into a compiled graph
+// Used by: Gemma2 attention with logit softcapping
+namespace {
+    // Compiled version without mask (single-token decode path)
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_softcap_sdpa_nomask() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& q = inputs[0];       // [B, H, 1, D]
+            const auto& k = inputs[1];       // [B, H, S, D]
+            const auto& v = inputs[2];       // [B, H, S, D]
+            const auto& scale_arr = inputs[3];
+            const auto& cap_arr = inputs[4];
+
+            // scores = Q @ K^T
+            auto k_t = mlx::core::transpose(k, {0, 1, 3, 2});
+            auto scores = mlx::core::matmul(q, k_t);
+
+            // scores = scores * scale
+            scores = mlx::core::multiply(scores, scale_arr);
+
+            // softcap: tanh(scores / cap) * cap
+            scores = mlx::core::multiply(mlx::core::tanh(mlx::core::divide(scores, cap_arr)), cap_arr);
+
+            // softmax
+            auto probs = mlx::core::softmax(scores, -1);
+
+            // probs @ V
+            return {mlx::core::matmul(probs, v)};
+        };
+        return mlx::core::compile(fn, true);  // shapeless=true
+    }
+
+    // Compiled version with mask (prefill path)
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_softcap_sdpa_masked() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& q = inputs[0];
+            const auto& k = inputs[1];
+            const auto& v = inputs[2];
+            const auto& scale_arr = inputs[3];
+            const auto& cap_arr = inputs[4];
+            const auto& mask = inputs[5];
+
+            auto k_t = mlx::core::transpose(k, {0, 1, 3, 2});
+            auto scores = mlx::core::matmul(q, k_t);
+            scores = mlx::core::multiply(scores, scale_arr);
+            scores = mlx::core::multiply(mlx::core::tanh(mlx::core::divide(scores, cap_arr)), cap_arr);
+            scores = mlx::core::add(scores, mask);
+            auto probs = mlx::core::softmax(scores, -1);
+            return {mlx::core::matmul(probs, v)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_softcap_sdpa(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    float softcap,
+    const MlxArray* mask
+) {
+    auto scale_arr = array(scale);
+    auto cap_arr = array(softcap);
+
+    if (mask) {
+        static auto compiled_fn = get_compiled_softcap_sdpa_masked();
+        // Cast mask to Q's dtype if needed
+        auto m = mask->inner;
+        if (m.dtype() != q.inner.dtype()) {
+            m = mlx::core::astype(m, q.inner.dtype());
+        }
+        auto result = compiled_fn({q.inner, k.inner, v.inner, scale_arr, cap_arr, m});
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    } else {
+        static auto compiled_fn = get_compiled_softcap_sdpa_nomask();
+        auto result = compiled_fn({q.inner, k.inner, v.inner, scale_arr, cap_arr});
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+}
+
+// Softcap SDPA with GQA: do repeat_kv outside compiled graph, then call compiled SDPA
+// This avoids shape issues in compiled functions while still fusing the attention math
+// Used by: Gemma2 attention (GQA + softcap)
+std::unique_ptr<MlxArray> compiled_softcap_sdpa_gqa(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    float softcap,
+    int32_t n_rep,
+    const MlxArray* mask
+) {
+    // repeat_kv outside compiled graph (uses shape-dependent operations)
+    auto do_repeat_kv = [n_rep](const array& x) -> array {
+        if (n_rep == 1) return x;
+        auto shape = x.shape();
+        int B = shape[0], H = shape[1], S = shape[2], D = shape[3];
+        auto expanded = mlx::core::reshape(x, {B, H, 1, S, D});
+        auto broadcasted = mlx::core::broadcast_to(expanded, {B, H, n_rep, S, D});
+        return mlx::core::reshape(broadcasted, {B, H * n_rep, S, D});
+    };
+
+    auto rk = do_repeat_kv(k.inner);
+    auto rv = do_repeat_kv(v.inner);
+
+    auto scale_arr = array(scale);
+    auto cap_arr = array(softcap);
+
+    if (mask) {
+        static auto compiled_fn = get_compiled_softcap_sdpa_masked();
+        auto m = mask->inner;
+        if (m.dtype() != q.inner.dtype()) m = mlx::core::astype(m, q.inner.dtype());
+        auto result = compiled_fn({q.inner, rk, rv, scale_arr, cap_arr, m});
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    } else {
+        static auto compiled_fn = get_compiled_softcap_sdpa_nomask();
+        auto result = compiled_fn({q.inner, rk, rv, scale_arr, cap_arr});
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+}
+
+// Compiled GELU MLP forward: down_proj(gelu(gate_proj(x)) * up_proj(x))
+// Compiles entire MLP into a single cached graph
+// Used by: Gemma2, Gemma3 and other GELU-gated models
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_qgelu_mlp() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b
+            const auto& x = inputs[0];
+            const auto& gate_w = inputs[1];
+            const auto& gate_s = inputs[2];
+            const auto& gate_b = inputs[3];
+            const auto& up_w = inputs[4];
+            const auto& up_s = inputs[5];
+            const auto& up_b = inputs[6];
+            const auto& down_w = inputs[7];
+            const auto& down_s = inputs[8];
+            const auto& down_b = inputs[9];
+
+            int group_size = 64;
+            int bits = 4;
+
+            // gate = quantized_matmul(x, gate_w, gate_s, gate_b)
+            auto gate = mlx::core::quantized_matmul(x, gate_w, gate_s, gate_b, true, group_size, bits);
+
+            // up = quantized_matmul(x, up_w, up_s, up_b)
+            auto up = mlx::core::quantized_matmul(x, up_w, up_s, up_b, true, group_size, bits);
+
+            // GELU(gate): gate * 0.5 * (1 + erf(gate / sqrt(2)))
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            auto gelu_gate = mlx::core::multiply(gate, scale);
+
+            // activated = gelu(gate) * up
+            auto activated = mlx::core::multiply(gelu_gate, up);
+
+            // down = quantized_matmul(activated, down_w, down_s, down_b)
+            auto down = mlx::core::quantized_matmul(activated, down_w, down_s, down_b, true, group_size, bits);
+
+            return {down};
+        };
+        return mlx::core::compile(fn, true);  // shapeless=true
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+
+    // Compiled path only supports affine mode with group_size=64, bits=4, and biases present.
+    // The compiled lambda hardcodes these quantization parameters for graph caching.
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_biases && up_biases && down_biases) {
+        static auto compiled_fn = get_compiled_qgelu_mlp();
+
+        auto result = compiled_fn({
+            x.inner,
+            gate_proj.inner, gate_scales.inner, gate_biases->inner,
+            up_proj.inner, up_scales.inner, up_biases->inner,
+            down_proj.inner, down_scales.inner, down_biases->inner
+        });
+
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    // Non-compiled fallback for mxfp4/nvfp4/mxfp8 or missing biases
+    std::optional<array> gb_opt = gate_biases ? std::optional(gate_biases->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_biases ? std::optional(up_biases->inner) : std::nullopt;
+    std::optional<array> db_opt = down_biases ? std::optional(down_biases->inner) : std::nullopt;
+
+    auto gate = mlx::core::quantized_matmul(
+        x.inner, gate_proj.inner, gate_scales.inner, gb_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+    auto up = mlx::core::quantized_matmul(
+        x.inner, up_proj.inner, up_scales.inner, ub_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    // GELU(gate) * up
+    auto sqrt2 = array(std::sqrt(2.0f));
+    auto half = array(0.5f);
+    auto one = array(1.0f);
+    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+    auto gelu_gate = mlx::core::multiply(gate, scale);
+    auto activated = mlx::core::multiply(gelu_gate, up);
+
+    auto down = mlx::core::quantized_matmul(
+        activated, down_proj.inner, down_scales.inner, db_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    return std::make_unique<MlxArray>(std::move(down));
+}
+
 std::unique_ptr<MlxArray> transformer_layer_forward(
     const MlxArray& x,
     const MlxArray& attn_norm_weight,
@@ -1855,8 +2227,10 @@ std::unique_ptr<MlxArray> compiled_moe_expert_forward(
 ) {
     std::string mode_str(mode.data(), mode.size());
 
-    // Compiled path only supports affine mode with biases present
-    if (mode_str == "affine" && gate_biases && up_biases && down_biases) {
+    // Compiled path only supports affine mode with group_size=64, bits=4, and biases present.
+    // The compiled lambda hardcodes these quantization parameters for graph caching.
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_biases && up_biases && down_biases) {
         static auto compiled_fn = get_compiled_qmoe_expert();
 
         auto result = compiled_fn({

@@ -325,12 +325,89 @@ std::unique_ptr<MlxArray> compiled_relu_squared(const MlxArray& x);
 // Compiled silu: x * sigmoid(x) — single fused kernel
 std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
 
+// Compiled gelu: x * 0.5 * (1 + erf(x / sqrt(2))) — single fused kernel
+// Used by: Gemma2, Gemma3, StarCoder2, and other GELU-based models
+std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x);
+
+// Compiled gelu_approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) — fused kernel
+// Used by: Gemma2, Gemma3 (matches Python nn.gelu_approx)
+std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x);
+
 // SwiGLU activation only - compiled with kernel fusion (shapeless=true)
 // output = silu(gate) * x
 // Uses mlx::core::compile for kernel fusion (like Python's @mx.compile)
 std::unique_ptr<MlxArray> compiled_swiglu_activation(
     const MlxArray& gate,
     const MlxArray& x
+);
+
+// GeGLU activation - compiled with kernel fusion (shapeless=true)
+// output = gelu(gate) * x
+// Used by: Gemma2, Gemma3 MLP layers
+std::unique_ptr<MlxArray> compiled_geglu_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+);
+
+// Compiled softcap attention scores: tanh(scores * inv_cap) * cap
+// Fuses divide + tanh + multiply into single compiled kernel
+// Used by: Gemma2 attention with logit softcapping
+std::unique_ptr<MlxArray> compiled_softcap(
+    const MlxArray& scores,
+    float cap
+);
+
+// Compiled clip_residual for float16 overflow prevention
+// When float16: cast to f32, add, clip to f16 range, cast back
+// When other dtype: simple addition
+// Used by: Gemma3 residual connections
+std::unique_ptr<MlxArray> compiled_clip_residual(
+    const MlxArray& x,
+    const MlxArray& y
+);
+
+// Softcap SDPA: Q@K^T * scale -> softcap -> mask -> softmax -> @V
+// Combines the entire manual attention path into one compiled call
+// Used by: Gemma2 attention with logit softcapping
+std::unique_ptr<MlxArray> compiled_softcap_sdpa(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    float softcap,
+    const MlxArray* mask
+);
+
+// Softcap SDPA with GQA: handles repeat_kv + attention in compiled graph
+// Avoids separate repeat_kv FFI calls by incorporating GQA internally
+// Used by: Gemma2 attention (GQA + softcap)
+std::unique_ptr<MlxArray> compiled_softcap_sdpa_gqa(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    float softcap,
+    int32_t n_rep,
+    const MlxArray* mask
+);
+
+// Compiled GELU MLP forward: down_proj(gelu(gate_proj(x)) * up_proj(x))
+// Fuses gate_proj + gelu + up_proj + multiply + down_proj into compiled graph
+// Used by: Gemma2, Gemma3 and other GELU-gated MLP models
+std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
 );
 
 // Full transformer layer forward (maximum FFI reduction)

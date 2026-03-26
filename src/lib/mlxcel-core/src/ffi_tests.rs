@@ -410,6 +410,218 @@ fn test_memory_functions() {
 }
 
 #[test]
+fn test_compiled_gelu() {
+    let x = from_slice_f32(&[0.0, 1.0, -1.0, 2.0], &[1, 4]);
+
+    let out = compiled_gelu(&x);
+    eval(&out);
+
+    assert_eq!(array_shape(&out), vec![1, 4]);
+
+    // gelu(0) = 0, gelu(x) > 0 for x > 0, gelu(x) < 0 for x < 0 (slightly)
+    let total = sum_all(&out);
+    eval(&total);
+    // sum of gelu([0, 1, -1, 2]) should be positive (1 and 2 dominate)
+    assert!(item_f32(&total) > 0.0);
+}
+
+#[test]
+fn test_compiled_gelu_approx() {
+    let x = from_slice_f32(&[0.0, 1.0, -1.0, 2.0], &[1, 4]);
+
+    let out = compiled_gelu_approx(&x);
+    eval(&out);
+
+    assert_eq!(array_shape(&out), vec![1, 4]);
+
+    // gelu_approx should also be positive-sum for these inputs
+    let total = sum_all(&out);
+    eval(&total);
+    assert!(item_f32(&total) > 0.0);
+}
+
+#[test]
+fn test_compiled_gelu_matches_gelu() {
+    // Verify compiled_gelu gives same result as non-compiled gelu
+    let x = from_slice_f32(&[0.5, -0.5, 1.5, -1.5], &[1, 4]);
+
+    let compiled_out = compiled_gelu(&x);
+    let regular_out = gelu(&x);
+
+    eval(&compiled_out);
+    eval(&regular_out);
+
+    let compiled_sum = sum_all(&compiled_out);
+    let regular_sum = sum_all(&regular_out);
+    eval(&compiled_sum);
+    eval(&regular_sum);
+
+    let diff = (item_f32(&compiled_sum) - item_f32(&regular_sum)).abs();
+    assert!(diff < 1e-4, "compiled_gelu and gelu should give same result, diff={diff}");
+}
+
+#[test]
+fn test_compiled_geglu_activation() {
+    let gate = from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let x = from_slice_f32(&[1.0, 1.0, 1.0, 1.0], &[1, 4]);
+
+    let out = compiled_geglu_activation(&gate, &x);
+    eval(&out);
+
+    assert_eq!(array_shape(&out), vec![1, 4]);
+
+    // GeGLU: gelu(gate) * x — output must be positive for positive inputs
+    let total = sum_all(&out);
+    eval(&total);
+    assert!(item_f32(&total) > 0.0);
+}
+
+#[test]
+fn test_compiled_geglu_matches_manual() {
+    // compiled_geglu_activation(gate, x) == gelu(gate) * x
+    let gate = from_slice_f32(&[0.5, -0.5, 1.0, 2.0], &[1, 4]);
+    let x = from_slice_f32(&[2.0, 3.0, 1.0, 0.5], &[1, 4]);
+
+    let compiled_out = compiled_geglu_activation(&gate, &x);
+    let manual_out = multiply(&gelu(&gate), &x);
+
+    eval(&compiled_out);
+    eval(&manual_out);
+
+    let compiled_sum = sum_all(&compiled_out);
+    let manual_sum = sum_all(&manual_out);
+    eval(&compiled_sum);
+    eval(&manual_sum);
+
+    let diff = (item_f32(&compiled_sum) - item_f32(&manual_sum)).abs();
+    assert!(diff < 1e-4, "compiled_geglu and manual gelu*x should match, diff={diff}");
+}
+
+#[test]
+fn test_compiled_softcap() {
+    let scores = from_slice_f32(&[0.0, 10.0, -10.0, 50.0, -50.0], &[1, 5]);
+    let cap = 30.0_f32;
+
+    let out = compiled_softcap(&scores, cap);
+    eval(&out);
+
+    assert_eq!(array_shape(&out), vec![1, 5]);
+
+    // softcap output must be bounded in [-cap, cap]
+    let min_val = {
+        let min_arr = min_all(&out);
+        eval(&min_arr);
+        item_f32(&min_arr)
+    };
+    let max_val = {
+        let max_arr = max_all(&out);
+        eval(&max_arr);
+        item_f32(&max_arr)
+    };
+    assert!(min_val >= -cap - 1e-5, "softcap output must be >= -cap, got {min_val}");
+    assert!(max_val <= cap + 1e-5, "softcap output must be <= cap, got {max_val}");
+}
+
+#[test]
+fn test_compiled_softcap_zero_input() {
+    // softcap(0) = tanh(0/cap)*cap = 0
+    let scores = from_slice_f32(&[0.0], &[1, 1]);
+    let out = compiled_softcap(&scores, 30.0);
+    eval(&out);
+    assert!((item_f32(&out)).abs() < 1e-5, "softcap(0) should be 0");
+}
+
+#[test]
+fn test_compiled_clip_residual() {
+    let x = from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+    let y = from_slice_f32(&[0.5, 0.5, 0.5, 0.5], &[1, 4]);
+
+    let out = compiled_clip_residual(&x, &y);
+    eval(&out);
+
+    assert_eq!(array_shape(&out), vec![1, 4]);
+
+    // clip_residual(x, y) = clip(x + y, fp16_min, fp16_max)
+    // For small positive inputs the result should be close to x + y = [1.5, 2.5, 3.5, 4.5] -> sum = 12.0
+    let total = sum_all(&out);
+    eval(&total);
+    assert!(
+        (item_f32(&total) - 12.0).abs() < 1e-3,
+        "clip_residual([1,2,3,4], [0.5,0.5,0.5,0.5]) should sum to ~12.0, got {}",
+        item_f32(&total)
+    );
+}
+
+#[test]
+fn test_compiled_softcap_sdpa_shape() {
+    // Verify that compiled_softcap_sdpa returns the correct output shape.
+    // Shape: [batch=1, heads=2, seq=4, head_dim=8]
+    let q = ones(&[1, 2, 4, 8], dtype::FLOAT32);
+    let k = ones(&[1, 2, 4, 8], dtype::FLOAT32);
+    let v = ones(&[1, 2, 4, 8], dtype::FLOAT32);
+
+    let out = unsafe { compiled_softcap_sdpa(&q, &k, &v, 0.125, 30.0, std::ptr::null()) };
+    eval(&out);
+
+    // Output shape should be [batch, heads, seq, head_dim] = [1, 2, 4, 8]
+    assert_eq!(array_shape(&out), vec![1, 2, 4, 8]);
+}
+
+#[test]
+fn test_compiled_softcap_sdpa_gqa_shape() {
+    // Verify compiled_softcap_sdpa_gqa: Q has n_heads, K/V have n_kv_heads
+    // Shape: q=[1, 4, 2, 8], k/v=[1, 2, 2, 8], n_rep=2
+    let q = ones(&[1, 4, 2, 8], dtype::FLOAT32);
+    let k = ones(&[1, 2, 2, 8], dtype::FLOAT32);
+    let v = ones(&[1, 2, 2, 8], dtype::FLOAT32);
+
+    let out = unsafe {
+        compiled_softcap_sdpa_gqa(&q, &k, &v, 0.125, 30.0, 2, std::ptr::null())
+    };
+    eval(&out);
+
+    // Output shape should match q shape [1, 4, 2, 8]
+    assert_eq!(array_shape(&out), vec![1, 4, 2, 8]);
+}
+
+#[test]
+fn test_unified_linear_quantized_weight_accessor() {
+    use crate::layers::{QuantizedWeight, UnifiedLinear};
+
+    // Build a minimal quantized weight (group_size=64, bits=4)
+    let weight = from_slice_f32(&[0.0; 8], &[2, 4]);
+    let scales = from_slice_f32(&[1.0; 2], &[2, 1]);
+    let biases = from_slice_f32(&[0.0; 2], &[2, 1]);
+
+    let qweight = QuantizedWeight::new(weight, scales, biases, 64, 4);
+    let linear = UnifiedLinear::new(qweight, None);
+
+    // quantized_weight() must return Some for quantized variant
+    assert!(
+        linear.quantized_weight().is_some(),
+        "quantized_weight() should return Some for Quantized variant"
+    );
+    let qw = linear.quantized_weight().unwrap();
+    assert_eq!(qw.group_size, 64);
+    assert_eq!(qw.bits, 4);
+    assert_eq!(qw.mode, "affine");
+    assert!(qw.biases.is_some(), "affine mode should have biases");
+}
+
+#[test]
+fn test_unified_linear_regular_has_no_quantized_weight() {
+    use crate::layers::{Linear, UnifiedLinear};
+
+    let weight = from_slice_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]);
+    let linear = UnifiedLinear::Regular(Linear::new(weight, None));
+
+    assert!(
+        linear.quantized_weight().is_none(),
+        "quantized_weight() should return None for Regular variant"
+    );
+}
+
+#[test]
 fn bench_compiled_vs_uncompiled_swiglu() {
     use std::time::Instant;
 

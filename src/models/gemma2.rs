@@ -24,7 +24,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{GemmaRMSNorm, KVCache, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::softcap;
+// softcap is now handled by compiled_softcap for better kernel fusion
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -168,28 +168,19 @@ impl Attention {
         let cache_k = mlxcel_core::utils::repeat_kv(&cache_k, n_rep);
         let cache_v = mlxcel_core::utils::repeat_kv(&cache_v, n_rep);
 
-        // Compute attention scores
-        let k_t = mlxcel_core::transpose_axes(&cache_k, &[0, 1, 3, 2]);
-        let scores = mlxcel_core::matmul(&q, &k_t);
-
-        // Scale scores
-        let scores = mlxcel_core::multiply_scalar(&scores, self.scale);
-
-        // Apply softcapping: tanh(scores / cap) * cap
-        let scores = softcap(&scores, self.softcapping);
-
-        // Apply mask if provided
-        let scores = if let Some(m) = mask {
-            mlxcel_core::add(&scores, m)
-        } else {
-            scores
+        // Compiled softcap SDPA: fuses Q@K^T, scale, softcap, mask, softmax, @V
+        // Replaces ~10 separate operations with a single compiled graph
+        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+        let attn_out = unsafe {
+            mlxcel_core::compiled_softcap_sdpa(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                self.softcapping,
+                mask_ptr,
+            )
         };
-
-        // Softmax
-        let probs = mlxcel_core::softmax(&scores, -1);
-
-        // Multiply by values
-        let attn_out = mlxcel_core::matmul(&probs, &cache_v);
 
         // Transpose back and reshape
         let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
@@ -245,17 +236,36 @@ pub struct MLP {
 
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // GELU(gate_proj(x)) * up_proj(x)
+        // GeGLU: gelu(gate_proj(x)) * up_proj(x), then down_proj
+        // Use compiled GELU MLP when possible for kernel fusion
+        if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
+            self.gate_proj.quantized_weight(),
+            self.up_proj.quantized_weight(),
+            self.down_proj.quantized_weight(),
+        ) {
+            return unsafe {
+                mlxcel_core::compiled_gelu_mlp_forward(
+                    x,
+                    &gate_qw.weight,
+                    &gate_qw.scales,
+                    gate_qw.biases_ptr(),
+                    &up_qw.weight,
+                    &up_qw.scales,
+                    up_qw.biases_ptr(),
+                    &down_qw.weight,
+                    &down_qw.scales,
+                    down_qw.biases_ptr(),
+                    gate_qw.group_size,
+                    gate_qw.bits,
+                    &gate_qw.mode,
+                )
+            };
+        }
+
+        // Fallback: separate operations
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-
-        // GELU activation
-        let gate_gelu = mlxcel_core::gelu(&gate);
-
-        // Element-wise product
-        let activated = mlxcel_core::multiply(&gate_gelu, &up);
-
-        // Down projection
+        let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
         self.down_proj.forward(&activated)
     }
 
@@ -400,7 +410,7 @@ impl Gemma2Model {
         };
 
         // Apply final logit softcapping
-        logits = softcap(&logits, self.final_logit_softcapping);
+        logits = mlxcel_core::compiled_softcap(&logits, self.final_logit_softcapping);
 
         logits
     }
@@ -457,7 +467,7 @@ impl Gemma2Model {
             self.embed_tokens.as_linear(&h)
         };
 
-        logits = softcap(&logits, self.final_logit_softcapping);
+        logits = mlxcel_core::compiled_softcap(&logits, self.final_logit_softcapping);
 
         logits
     }

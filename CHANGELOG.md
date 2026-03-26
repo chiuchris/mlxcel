@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [Unreleased]
+
+### Added
+- Compiled C++ operations using `mlx::core::compile(shapeless=true)` for small model throughput:
+  - `compiled_gelu` / `compiled_gelu_approx`: fused GELU activation kernels
+  - `compiled_geglu_activation`: fused GELU-gated activation (`gelu(gate) * x`)
+  - `compiled_softcap`: fused softcap (`tanh(x/cap)*cap`) for Gemma2
+  - `compiled_softcap_sdpa`: entire attention path with softcap fused into single compiled graph
+  - `compiled_softcap_sdpa_gqa`: fused GQA + softcap SDPA variant
+  - `compiled_clip_residual`: fused float16-safe residual addition for Gemma3
+  - `compiled_gelu_mlp_forward`: full GELU MLP as single compiled graph
+- `UnifiedLinear::quantized_weight()` accessor for compiled MLP kernel dispatch
+
+### Changed
+- Gemma2: replaced manual attention ops with `compiled_softcap_sdpa` and uses `compiled_gelu_mlp_forward`
+- Gemma3: uses `compiled_gelu_mlp_forward` and `compiled_clip_residual`
+- StarCoder2: uses `compiled_gelu` activation
+
+### Fixed
+- Guard compiled MLP/MoE paths against non-standard quantization params (`group_size != 64` or `bits != 4`)
+
 ## [v0.0.11] - 2026-03-18
 
 ### Added

@@ -226,7 +226,8 @@ impl StarCoder2MLP {
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let x = self.c_fc.forward(x);
-        let x = mlxcel_core::gelu(&x);
+        // Use compiled GELU for kernel fusion (matches Python's gelu activation)
+        let x = mlxcel_core::compiled_gelu(&x);
         self.c_proj.forward(&x)
     }
 }

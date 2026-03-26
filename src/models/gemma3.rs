@@ -27,7 +27,7 @@
 use mlxcel_core::layers::{
     GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
-use mlxcel_core::utils::{clip_residual_f16, create_causal_mask, create_causal_mask_with_window};
+use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -159,9 +159,7 @@ impl Attention {
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
         // Use fused scaled dot-product attention (handles GQA internally)
-        let mask_ptr = mask
-            .map(|m| m as *const _)
-            .unwrap_or(std::ptr::null());
+        let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
         let attn_out = unsafe {
             mlxcel_core::fast_scaled_dot_product_attention(
                 &q, &cache_k, &cache_v, self.scale, mask_ptr,
@@ -240,17 +238,36 @@ pub struct MLP {
 
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // GELU(gate_proj(x)) * up_proj(x)
+        // GeGLU: gelu(gate_proj(x)) * up_proj(x), then down_proj
+        // Use compiled GELU MLP when possible for kernel fusion
+        if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
+            self.gate_proj.quantized_weight(),
+            self.up_proj.quantized_weight(),
+            self.down_proj.quantized_weight(),
+        ) {
+            return unsafe {
+                mlxcel_core::compiled_gelu_mlp_forward(
+                    x,
+                    &gate_qw.weight,
+                    &gate_qw.scales,
+                    gate_qw.biases_ptr(),
+                    &up_qw.weight,
+                    &up_qw.scales,
+                    up_qw.biases_ptr(),
+                    &down_qw.weight,
+                    &down_qw.scales,
+                    down_qw.biases_ptr(),
+                    gate_qw.group_size,
+                    gate_qw.bits,
+                    &gate_qw.mode,
+                )
+            };
+        }
+
+        // Fallback: separate operations with compiled activation
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-
-        // GELU activation (approx)
-        let gate_gelu = mlxcel_core::gelu(&gate);
-
-        // Element-wise product
-        let activated = mlxcel_core::multiply(&gate_gelu, &up);
-
-        // Down projection
+        let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
         self.down_proj.forward(&activated)
     }
 
@@ -306,13 +323,13 @@ impl TransformerBlock {
         let normed = self.input_layernorm.forward(x);
         let attn_out = self.self_attn.forward(&normed, cache, mask);
         let post_attn_normed = self.post_attention_layernorm.forward(&attn_out);
-        let h = clip_residual_f16(x, &post_attn_normed);
+        let h = mlxcel_core::compiled_clip_residual(x, &post_attn_normed);
 
         // Pre-norm FFN
         let normed = self.pre_feedforward_layernorm.forward(&h);
         let ff_out = self.mlp.forward(&normed);
         let post_ff_normed = self.post_feedforward_layernorm.forward(&ff_out);
-        clip_residual_f16(&h, &post_ff_normed)
+        mlxcel_core::compiled_clip_residual(&h, &post_ff_normed)
     }
 
     pub fn from_weights(
