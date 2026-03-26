@@ -143,7 +143,7 @@ pub struct Phi3Attention {
     /// SuScaledRoPE: input scaling factor applied to Q/K before rotation.
     /// = sqrt(1 + log(max_pos/orig_max_pos) / log(orig_max_pos))
     pub su_rope_scale: f32,
-    /// Pre-computed scale array to avoid per-token allocation in su_scale_rotary_dims
+    /// Pre-computed scale array to avoid per-token allocation in SuScaledRoPE forward
     su_rope_scale_arr: Option<UniquePtr<MlxArray>>,
 }
 
@@ -324,26 +324,6 @@ impl Phi3Attention {
     }
 }
 
-/// Pre-scale the rotary dimensions of Q/K for SuScaledRoPE.
-/// x shape: [batch, heads, seq, head_dim], scales x[..., :rope_dims] by `scale`.
-/// Used by: Phi4MM, Phi3V (longrope scaling)
-fn su_scale_rotary_dims(x: &MlxArray, scale: f32, rope_dims: i32) -> UniquePtr<MlxArray> {
-    let shape = mlxcel_core::array_shape(x);
-    let head_dim = shape[3];
-    if rope_dims >= head_dim {
-        // Full rotation: scale everything
-        let scale_arr = mlxcel_core::from_slice_f32(&[scale], &[1]);
-        mlxcel_core::multiply(x, &scale_arr)
-    } else {
-        // Partial rotation: scale only the first rope_dims
-        let rotary_part =
-            mlxcel_core::slice(x, &[0, 0, 0, 0], &[shape[0], shape[1], shape[2], rope_dims]);
-        let pass_part = mlxcel_core::slice(x, &[0, 0, 0, rope_dims], &shape);
-        let scale_arr = mlxcel_core::from_slice_f32(&[scale], &[1]);
-        let scaled = mlxcel_core::multiply(&rotary_part, &scale_arr);
-        mlxcel_core::concatenate(&scaled, &pass_part, 3)
-    }
-}
 
 // Phi3 MLP (with fused gate_up).
 pub struct Phi3MLP {
