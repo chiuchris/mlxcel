@@ -1,3 +1,17 @@
+mlxcel (0.0.12-1~jammy1) jammy; urgency=medium
+
+  * Perf: Compiled C++ ops (SDPA, MLP, clip_residual) via mlx::core::compile
+  * Perf: Gemma3 fused SDPA, pre-computed norms, skip decode masks (+35% for 1B)
+  * Perf: GQA-aware softcap SDPA for Gemma2
+  * Perf: Hoist env var checks and incremental token history in decode loop
+  * Perf: MLX native load_safetensors and batched sync for model loading
+  * Feat: Distributed inference framework (TP, PP, disaggregated serving)
+  * Feat: Comprehensive mkdocs documentation site (EN/KO) with PDF export
+  * Fix: OpenAI API streaming response format compatibility
+  * Fix: Guard compiled paths against non-standard quantization params
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 26 Mar 2026 12:00:00 +0900
+
 mlxcel (0.0.11-1~jammy1) jammy; urgency=medium
 
   * Feat: Add compiled kernel fusion for relu_squared, silu, MoE gate, and compute_dt

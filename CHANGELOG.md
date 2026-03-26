@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased]
+## [v0.0.12] - 2026-03-26
 
 ### Added
 - Compiled C++ operations using `mlx::core::compile(shapeless=true)` for small model throughput:
@@ -16,13 +16,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   - `compiled_clip_residual`: fused float16-safe residual addition for Gemma3
   - `compiled_gelu_mlp_forward`: full GELU MLP as single compiled graph
 - `UnifiedLinear::quantized_weight()` accessor for compiled MLP kernel dispatch
+- Distributed inference framework: node discovery, cluster configuration, tensor/pipeline parallelism, disaggregated serving
+- Comprehensive mkdocs documentation site (EN/KO) with PDF export
+- Project-specific Claude Code commands and skills
 
 ### Changed
-- Gemma2: replaced manual attention ops with `compiled_softcap_sdpa` and uses `compiled_gelu_mlp_forward`
-- Gemma3: uses `compiled_gelu_mlp_forward` and `compiled_clip_residual`
+- Gemma3: fused SDPA, pre-computed GemmaRMSNorm, skip decode masks — Gemma3 1B reaches 94% of Python mlx-lm
+- Gemma2: uses `compiled_softcap_sdpa_gqa` with internal GQA head expansion
 - StarCoder2: uses `compiled_gelu` activation
+- Phi3: pre-compute SuScaledRoPE scale array at load time
+- Hoist env var checks out of generation hot loop
+- Incremental token history and cached EOS in BatchScheduler
+- Use MLX native `load_safetensors()` for faster weight loading
+- Optimize model loading with batched synchronization
 
 ### Fixed
+- OpenAI API streaming response format compatibility
 - Guard compiled MLP/MoE paths against non-standard quantization params (`group_size != 64` or `bits != 4`)
 
 ## [v0.0.11] - 2026-03-18
@@ -230,6 +239,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.12]: https://github.com/lablup/mlxcel/compare/v0.0.11...v0.0.12
 [v0.0.11]: https://github.com/lablup/mlxcel/compare/v0.0.10...v0.0.11
 [v0.0.10]: https://github.com/lablup/mlxcel/compare/v0.0.9...v0.0.10
 [v0.0.9]: https://github.com/lablup/mlxcel/compare/v0.0.8...v0.0.9
