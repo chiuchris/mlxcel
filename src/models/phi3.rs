@@ -324,7 +324,6 @@ impl Phi3Attention {
     }
 }
 
-
 // Phi3 MLP (with fused gate_up).
 pub struct Phi3MLP {
     // Fused gate_up projection: outputs [gate, up] concatenated

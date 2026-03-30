@@ -36,7 +36,8 @@ use std::path::Path;
 // Custom deserializer for hybrid_override_pattern which can be either:
 // - A string like "MEMEM*EMEMEM*..." (each char is a block type)
 // - A Vec<String> like ["M", "E", "M", ...]
-fn deserialize_hybrid_pattern<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+// - null / absent (returns None)
+fn deserialize_hybrid_pattern<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
@@ -45,10 +46,24 @@ where
     struct PatternVisitor;
 
     impl<'de> Visitor<'de> for PatternVisitor {
-        type Value = Vec<String>;
+        type Value = Option<Vec<String>>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a string or array of strings for hybrid_override_pattern")
+            formatter.write_str("a string or array of strings for hybrid_override_pattern, or null")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(None)
         }
 
         fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
@@ -56,7 +71,7 @@ where
             E: de::Error,
         {
             // Convert string like "MEMEM*..." to Vec<String>
-            Ok(v.chars().map(|c| c.to_string()).collect())
+            Ok(Some(v.chars().map(|c| c.to_string()).collect()))
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -67,7 +82,7 @@ where
             while let Some(elem) = seq.next_element()? {
                 vec.push(elem);
             }
-            Ok(vec)
+            Ok(Some(vec))
         }
     }
 
@@ -158,8 +173,14 @@ pub struct NemotronHConfig {
     #[serde(default = "default_true")]
     pub use_conv_bias: bool,
 
-    #[serde(deserialize_with = "deserialize_hybrid_pattern")]
-    pub hybrid_override_pattern: Vec<String>,
+    #[serde(default, deserialize_with = "deserialize_hybrid_pattern")]
+    pub hybrid_override_pattern: Option<Vec<String>>,
+
+    /// Alternative to hybrid_override_pattern using word names
+    /// (e.g., ["mamba", "attention", "moe", "mlp"]).
+    /// Normalized to hybrid_override_pattern in post_init().
+    #[serde(default)]
+    pub layers_block_type: Option<Vec<String>>,
 
     #[serde(default)]
     pub head_dim: Option<usize>,
@@ -170,6 +191,11 @@ pub struct NemotronHConfig {
 
     #[serde(default)]
     pub moe_shared_expert_intermediate_size: Option<usize>,
+
+    /// Latent size for MoE dimensionality reduction (NemotronSuper).
+    /// When set, experts operate on the latent dim instead of hidden_size.
+    #[serde(default)]
+    pub moe_latent_size: Option<usize>,
 
     #[serde(default)]
     pub n_group: Option<usize>,
@@ -194,6 +220,15 @@ pub struct NemotronHConfig {
 
     #[serde(default)]
     pub quantization: Option<Quantization>,
+
+    /// Fallback fields for time_step_limit construction.
+    /// When time_step_limit is absent but time_step_min is present,
+    /// we construct (time_step_min, time_step_max or +inf).
+    #[serde(default)]
+    pub time_step_min: Option<f32>,
+
+    #[serde(default)]
+    pub time_step_max: Option<f32>,
 }
 
 impl NemotronHConfig {
@@ -206,6 +241,47 @@ impl NemotronHConfig {
 
     pub fn bits(&self) -> i32 {
         self.quantization.as_ref().map(|q| q.bits).unwrap_or(4)
+    }
+
+    /// Post-deserialization normalization (mirrors Python __post_init__).
+    /// - Builds time_step_limit from time_step_min/max when absent.
+    /// - Normalizes layers_block_type word names to single-char hybrid_override_pattern.
+    /// - Sets num_hidden_layers from pattern length.
+    pub fn post_init(&mut self) -> Result<(), String> {
+        // Build time_step_limit from min/max when the tuple field is at default
+        if self.time_step_limit == default_time_step_limit()
+            && let Some(ts_min) = self.time_step_min
+        {
+            let ts_max = self.time_step_max.unwrap_or(f32::INFINITY);
+            self.time_step_limit = (ts_min, ts_max);
+        }
+
+        // Normalize layers_block_type word names to single-char codes
+        if self.hybrid_override_pattern.is_none()
+            && let Some(ref block_types) = self.layers_block_type
+        {
+            let mut pattern = Vec::with_capacity(block_types.len());
+            for t in block_types {
+                let code = match t.as_str() {
+                    "mamba" => "M",
+                    "attention" => "*",
+                    "moe" => "E",
+                    "mlp" => "-",
+                    other => {
+                        return Err(format!("Unknown block type name: {other}"));
+                    }
+                };
+                pattern.push(code.to_string());
+            }
+            self.hybrid_override_pattern = Some(pattern);
+        }
+
+        // Set num_hidden_layers from pattern length
+        if let Some(ref pattern) = self.hybrid_override_pattern {
+            self.num_hidden_layers = pattern.len();
+        }
+
+        Ok(())
     }
 }
 
@@ -1120,9 +1196,18 @@ struct NemotronHMoE {
     gate: NemotronHMoEGate,
     switch_mlp: SwitchMLP,
     shared_experts: Option<NemotronHMLP>,
+    /// Latent projection: hidden_size -> moe_latent_size (NemotronSuper)
+    fc1_latent_proj: Option<UnifiedLinear>,
+    /// Latent projection: moe_latent_size -> hidden_size (NemotronSuper)
+    fc2_latent_proj: Option<UnifiedLinear>,
 }
 
 impl NemotronHMoE {
+    /// Returns true when latent projection is active (NemotronSuper MoE).
+    fn has_latent_proj(&self) -> bool {
+        self.fc1_latent_proj.is_some()
+    }
+
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let orig_shape = mlxcel_core::array_shape(x);
 
@@ -1134,83 +1219,82 @@ impl NemotronHMoE {
             mlxcel_core::copy(x)
         };
 
-        // Try fused MoE forward (quantized path only)
-        let result = if let (
-            QuantizedSwitchLinear::Quantized {
-                weight: fc1_w,
-                scales: fc1_s,
-                biases: fc1_b,
-                group_size,
-                bits,
-            },
-            QuantizedSwitchLinear::Quantized {
-                weight: fc2_w,
-                scales: fc2_s,
-                biases: fc2_b,
-                ..
-            },
-        ) = (&self.switch_mlp.fc1, &self.switch_mlp.fc2)
-        {
-            // Get shared expert weight pointers (nullable)
-            let (sup_w, sup_s, sup_b, sdn_w, sdn_s, sdn_b) =
-                if let Some(ref shared) = self.shared_experts {
-                    (
-                        shared.up_proj.weight_ptr(),
-                        shared.up_proj.scales_ptr(),
-                        shared.up_proj.biases_ptr(),
-                        shared.down_proj.weight_ptr(),
-                        shared.down_proj.scales_ptr(),
-                        shared.down_proj.biases_ptr(),
-                    )
-                } else {
-                    (
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                        std::ptr::null(),
-                    )
-                };
+        // When latent projection is active, use the non-fused path because the
+        // fused C++ MoE kernel does not support the latent dim reduction.
+        // Also, the shared expert must use the original residuals (not latent input).
+        let use_fused = !self.has_latent_proj();
 
-            unsafe {
-                mlxcel_core::fused_moe_forward(
-                    &x_flat,
-                    &self.gate.weight,
-                    &self.gate.e_score_correction_bias,
-                    fc1_w,
-                    fc1_s,
-                    fc1_b,
-                    fc2_w,
-                    fc2_s,
-                    fc2_b,
-                    sup_w,
-                    sup_s,
-                    sup_b,
-                    sdn_w,
-                    sdn_s,
-                    sdn_b,
-                    self.gate.top_k as i32,
-                    self.gate.routed_scaling_factor,
-                    self.gate.norm_topk_prob,
-                    *group_size,
-                    *bits,
-                )
+        // Try fused MoE forward (quantized path only, no latent projection)
+        let result = if use_fused {
+            if let (
+                QuantizedSwitchLinear::Quantized {
+                    weight: fc1_w,
+                    scales: fc1_s,
+                    biases: fc1_b,
+                    group_size,
+                    bits,
+                },
+                QuantizedSwitchLinear::Quantized {
+                    weight: fc2_w,
+                    scales: fc2_s,
+                    biases: fc2_b,
+                    ..
+                },
+            ) = (&self.switch_mlp.fc1, &self.switch_mlp.fc2)
+            {
+                // Get shared expert weight pointers (nullable)
+                let (sup_w, sup_s, sup_b, sdn_w, sdn_s, sdn_b) =
+                    if let Some(ref shared) = self.shared_experts {
+                        (
+                            shared.up_proj.weight_ptr(),
+                            shared.up_proj.scales_ptr(),
+                            shared.up_proj.biases_ptr(),
+                            shared.down_proj.weight_ptr(),
+                            shared.down_proj.scales_ptr(),
+                            shared.down_proj.biases_ptr(),
+                        )
+                    } else {
+                        (
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                            std::ptr::null(),
+                        )
+                    };
+
+                unsafe {
+                    mlxcel_core::fused_moe_forward(
+                        &x_flat,
+                        &self.gate.weight,
+                        &self.gate.e_score_correction_bias,
+                        fc1_w,
+                        fc1_s,
+                        fc1_b,
+                        fc2_w,
+                        fc2_s,
+                        fc2_b,
+                        sup_w,
+                        sup_s,
+                        sup_b,
+                        sdn_w,
+                        sdn_s,
+                        sdn_b,
+                        self.gate.top_k as i32,
+                        self.gate.routed_scaling_factor,
+                        self.gate.norm_topk_prob,
+                        *group_size,
+                        *bits,
+                    )
+                }
+            } else {
+                // Non-quantized without latent projection
+                self.forward_nonfused(&x_flat)
             }
         } else {
-            // Fallback: non-quantized path (individual calls)
-            let (indices, scores) = self.gate.forward(&x_flat);
-            let y = self.switch_mlp.forward(&x_flat, &indices);
-            let mut scores_shape = mlxcel_core::array_shape(&scores);
-            scores_shape.push(1);
-            let scores_exp = mlxcel_core::reshape(&scores, &scores_shape);
-            let weighted = mlxcel_core::multiply(&y, &scores_exp);
-            let mut result = mlxcel_core::sum_axis(&weighted, -2, false);
-            if let Some(ref shared) = self.shared_experts {
-                let shared_out = shared.forward(&x_flat);
-                result = mlxcel_core::add(&result, &shared_out);
-            }
-            result
+            // Latent projection path (always non-fused)
+            self.forward_nonfused(&x_flat)
         };
 
         // Reshape back
@@ -1219,6 +1303,46 @@ impl NemotronHMoE {
         } else {
             result
         }
+    }
+
+    /// Non-fused MoE forward with latent projection support.
+    /// CRITICAL: shared expert uses original residuals (not latent-projected input).
+    fn forward_nonfused(&self, x_flat: &MlxArray) -> UniquePtr<MlxArray> {
+        // Gate always operates on the original hidden dim
+        let (indices, scores) = self.gate.forward(x_flat);
+
+        // Apply latent projection before routing to experts (skip copy when
+        // no projection -- switch_mlp.forward takes &MlxArray)
+        let projected;
+        let expert_input: &MlxArray = if let Some(ref fc1) = self.fc1_latent_proj {
+            projected = fc1.forward(x_flat);
+            &projected
+        } else {
+            x_flat
+        };
+
+        let y = self.switch_mlp.forward(expert_input, &indices);
+        let mut scores_shape = mlxcel_core::array_shape(&scores);
+        scores_shape.push(1);
+        let scores_exp = mlxcel_core::reshape(&scores, &scores_shape);
+        let weighted = mlxcel_core::multiply(&y, &scores_exp);
+        let summed = mlxcel_core::sum_axis(&weighted, -2, false);
+
+        // Cast back to input dtype (matching Python: .astype(y.dtype))
+        let mut result = mlxcel_core::astype(&summed, mlxcel_core::array_dtype(x_flat));
+
+        // Project back from latent to hidden dim
+        if let Some(ref fc2) = self.fc2_latent_proj {
+            result = fc2.forward(&result);
+        }
+
+        // Shared expert uses original residuals (not latent-projected input)
+        if let Some(ref shared) = self.shared_experts {
+            let shared_out = shared.forward(x_flat);
+            result = mlxcel_core::add(&result, &shared_out);
+        }
+
+        result
     }
 }
 
@@ -1647,13 +1771,16 @@ impl NemotronHModel {
         let config_path = path.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)?;
         let config_str = super::sanitize_config_json(&config_str);
-        let config: NemotronHConfig = serde_json::from_str(&config_str)?;
+        let mut config: NemotronHConfig = serde_json::from_str(&config_str)?;
+        config
+            .post_init()
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-        let block_types: Vec<BlockType> = config
+        let pattern = config
             .hybrid_override_pattern
-            .iter()
-            .map(|s| BlockType::from_str(s))
-            .collect();
+            .as_ref()
+            .ok_or("hybrid_override_pattern must be set (directly or via layers_block_type)")?;
+        let block_types: Vec<BlockType> = pattern.iter().map(|s| BlockType::from_str(s)).collect();
 
         println!(
             "[NemotronH] Config loaded: {} layers ({} mamba, {} attention, {} mlp, {} moe)",
@@ -1682,6 +1809,9 @@ impl NemotronHModel {
     }
 
     pub fn sanitize_weights(mut weights: WeightMap, config: &NemotronHConfig) -> WeightMap {
+        // Filter out multi-token prediction (mtp.*) weights (NemotronSuper)
+        weights.retain(|k, _| !k.starts_with("mtp."));
+
         // Handle conv1d weight transpose
         let keys: Vec<String> = weights.keys().cloned().collect();
         for k in keys {
@@ -1933,6 +2063,27 @@ impl NemotronHModel {
                         None
                     };
 
+                    // Latent projection layers (NemotronSuper)
+                    let (fc1_latent_proj, fc2_latent_proj) = if config.moe_latent_size.is_some() {
+                        let fc1_lp = UnifiedLinear::from_weights(
+                            &weights,
+                            &format!("{}.fc1_latent_proj", mixer_prefix),
+                            group_size,
+                            bits,
+                        )
+                        .ok();
+                        let fc2_lp = UnifiedLinear::from_weights(
+                            &weights,
+                            &format!("{}.fc2_latent_proj", mixer_prefix),
+                            group_size,
+                            bits,
+                        )
+                        .ok();
+                        (fc1_lp, fc2_lp)
+                    } else {
+                        (None, None)
+                    };
+
                     NemotronHMixer::MoE(NemotronHMoE {
                         gate: NemotronHMoEGate {
                             weight: gate_weight,
@@ -1972,6 +2123,8 @@ impl NemotronHModel {
                             },
                         },
                         shared_experts,
+                        fc1_latent_proj,
+                        fc2_latent_proj,
                     })
                 }
             };

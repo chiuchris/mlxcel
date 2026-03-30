@@ -178,9 +178,17 @@ pub(crate) fn try_load_special_model_from_weights(
             ),
         },
         SpecialWeightLoaderKind::NemotronH => {
-            let args: models::nemotron_h::NemotronHConfig = super::parse_model_config(config_str)?;
-            let block_types: Vec<models::nemotron_h::BlockType> = args
-                .hybrid_override_pattern
+            let mut args: models::nemotron_h::NemotronHConfig =
+                super::parse_model_config(config_str)?;
+            args.post_init()
+                .map_err(|e| anyhow::anyhow!("NemotronH config post_init failed: {e}"))?;
+            let pattern = args.hybrid_override_pattern.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "NemotronH: hybrid_override_pattern must be set \
+                     (directly or via layers_block_type)"
+                )
+            })?;
+            let block_types: Vec<models::nemotron_h::BlockType> = pattern
                 .iter()
                 .map(|name| models::nemotron_h::BlockType::from_str(name))
                 .collect();
