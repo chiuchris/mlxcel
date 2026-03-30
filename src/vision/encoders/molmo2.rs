@@ -96,7 +96,8 @@ impl ViTAttention {
         let k = mlxcel_core::transpose_axes(&xk, &[0, 2, 1, 3]);
         let v = mlxcel_core::transpose_axes(&xv, &[0, 2, 1, 3]);
 
-        // Float32 attention for stability
+        // Float32 attention for stability (only convert when needed)
+        let dtype = mlxcel_core::array_dtype(inputs_q);
         let (q, k, v) = if self.float32_attention {
             (
                 mlxcel_core::astype(&q, mlxcel_core::dtype::FLOAT32),
@@ -104,31 +105,22 @@ impl ViTAttention {
                 mlxcel_core::astype(&v, mlxcel_core::dtype::FLOAT32),
             )
         } else {
-            (
-                mlxcel_core::copy(&q),
-                mlxcel_core::copy(&k),
-                mlxcel_core::copy(&v),
-            )
+            (q, k, v)
         };
 
-        // scores = Q @ K^T * scale
-        let k_t = mlxcel_core::transpose_axes(&k, &[0, 1, 3, 2]);
-        let mut scores = mlxcel_core::matmul(&q, &k_t);
-        scores = mlxcel_core::multiply_scalar(&scores, self.scale);
-
-        // Apply attention mask (if provided)
-        if let Some(mask) = attn_mask {
-            // Where mask is true, keep scores; where false, set to -1e9
-            let neg_inf = mlxcel_core::full_like(&scores, -1e9);
-            scores = mlxcel_core::where_cond(mask, &scores, &neg_inf);
-        }
-
-        let weights = mlxcel_core::softmax(&scores, -1);
-        let out = mlxcel_core::matmul(&weights, &v);
+        // Use fast SDPA kernel instead of manual matmul+softmax
+        let mask_ptr = attn_mask
+            .map(|m| m as *const MlxArray)
+            .unwrap_or(std::ptr::null());
+        let out =
+            unsafe { mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, self.scale, mask_ptr) };
 
         // Cast back to input dtype if needed
-        let dtype = mlxcel_core::array_dtype(inputs_q);
-        let out = mlxcel_core::astype(&out, dtype);
+        let out = if self.float32_attention {
+            mlxcel_core::astype(&out, dtype)
+        } else {
+            out
+        };
 
         // Transpose and reshape back
         let out = mlxcel_core::transpose_axes(&out, &[0, 2, 1, 3]);

@@ -114,14 +114,15 @@ impl Qwen3VLModel {
         input_ids: &MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> UniquePtr<MlxArray> {
-        mlxcel_core::eval(input_ids);
+        // Flatten to 1-D and eval once — avoids per-token eval() round-trips.
+        let flat = mlxcel_core::reshape(input_ids, &[-1]);
+        mlxcel_core::eval(&flat);
         let ids_shape = mlxcel_core::array_shape(input_ids);
         let seq_len = ids_shape[1] as usize;
 
         let mut tokens = Vec::with_capacity(seq_len);
         for i in 0..seq_len {
-            let tok = mlxcel_core::slice(input_ids, &[0, i as i32], &[1, i as i32 + 1]);
-            mlxcel_core::eval(&tok);
+            let tok = mlxcel_core::slice(&flat, &[i as i32], &[i as i32 + 1]);
             tokens.push(mlxcel_core::item_i32(&tok));
         }
 

@@ -2394,10 +2394,56 @@ bool is_gpu_available() {
     return mlx::core::default_device() == mlx::core::Device::gpu;
 }
 
+// Compiled top-p (nucleus) filtering fused into a single kernel.
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_top_p_filter() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            const auto& top_p_arr = inputs[1];
+            auto probs = mlx::core::softmax(x, -1);
+            auto sorted_indices = mlx::core::argsort(mlx::core::negative(probs), -1);
+            auto sorted_probs = mlx::core::take_along_axis(probs, sorted_indices, -1);
+            auto cum_probs = mlx::core::cumsum(sorted_probs, -1, false, true);
+            auto shifted_cum = cum_probs - sorted_probs;
+            auto mask = mlx::core::less_equal(shifted_cum, top_p_arr);
+            auto sorted_logits = mlx::core::take_along_axis(x, sorted_indices, -1);
+            auto filtered_sorted = mlx::core::where(
+                mask, sorted_logits, mlx::core::array(std::numeric_limits<float>::lowest()));
+            auto unsort_indices = mlx::core::argsort(sorted_indices, -1);
+            return {mlx::core::take_along_axis(filtered_sorted, unsort_indices, -1)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+// Compiled min-p filtering fused into a single kernel.
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_min_p_filter() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            const auto& min_p_arr = inputs[1];
+            auto probs = mlx::core::softmax(x, -1);
+            auto max_prob = mlx::core::max(probs, -1, true);
+            auto threshold = mlx::core::multiply(max_prob, min_p_arr);
+            auto mask = mlx::core::greater_equal(probs, threshold);
+            return {mlx::core::where(mask, x,
+                mlx::core::array(std::numeric_limits<float>::lowest()))};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
 // Fused sampling: temperature scaling + top-k + top-p + min-p + categorical
 // in a single function call to minimize FFI round-trips.
 // Input: 2D logits [batch, vocab] (already sliced, penalties already applied)
-// Returns (token, filtered_logits)
+// Returns sampled token
+//
+// Uses compiled (fused) kernels for the hot paths:
+// - Categorical sampling: temp scaling + random::categorical in one kernel
+// - Top-p filtering: softmax + argsort + cumsum + mask in one kernel
+// - Min-p filtering: softmax + max + mask in one kernel
 std::unique_ptr<MlxArray> fused_sample(
     const MlxArray& logits,
     float temperature,
@@ -2418,6 +2464,7 @@ std::unique_ptr<MlxArray> fused_sample(
     }
 
     // Top-k filtering: keep only the k highest-probability tokens
+    // (Not compiled: argpartition has dynamic shape that breaks compile)
     if (top_k > 0) {
         auto neg_x = mlx::core::negative(x);
         auto indices = mlx::core::argpartition(neg_x, top_k - 1, -1);
@@ -2435,37 +2482,21 @@ std::unique_ptr<MlxArray> fused_sample(
         x = mlx::core::where(mask, x, mlx::core::array(std::numeric_limits<float>::lowest()));
     }
 
-    // Top-p (nucleus) filtering: keep smallest set whose probability sums >= top_p
+    // Top-p (nucleus) filtering — compiled kernel
     if (top_p > 0.0f && top_p < 1.0f) {
-        auto probs = mlx::core::softmax(x, -1);
-        auto sorted_indices = mlx::core::argsort(mlx::core::negative(probs), -1);
-        auto sorted_probs = mlx::core::take_along_axis(probs, sorted_indices, -1);
-        auto cum_probs = mlx::core::cumsum(sorted_probs, -1, false, true);
-
-        // Keep tokens where cumsum(before this token) <= top_p
-        auto shifted_cum = cum_probs - sorted_probs;
-        auto mask = mlx::core::less_equal(shifted_cum, mlx::core::array(top_p));
-
-        // Apply mask in sorted space
-        auto sorted_logits = mlx::core::take_along_axis(x, sorted_indices, -1);
-        auto filtered_sorted = mlx::core::where(
-            mask, sorted_logits, mlx::core::array(std::numeric_limits<float>::lowest()));
-
-        // Unsort back to original order
-        auto unsort_indices = mlx::core::argsort(sorted_indices, -1);
-        x = mlx::core::take_along_axis(filtered_sorted, unsort_indices, -1);
+        static auto compiled_fn = get_compiled_top_p_filter();
+        auto result = compiled_fn({x, mlx::core::array(top_p)});
+        x = std::move(result[0]);
     }
 
-    // Min-p filtering: keep tokens with probability >= min_p * max_probability
+    // Min-p filtering — compiled kernel
     if (min_p > 0.0f && min_p < 1.0f) {
-        auto probs = mlx::core::softmax(x, -1);
-        auto max_prob = mlx::core::max(probs, -1, true);
-        auto threshold = max_prob * mlx::core::array(min_p);
-        auto mask = mlx::core::greater_equal(probs, threshold);
-        x = mlx::core::where(mask, x, mlx::core::array(std::numeric_limits<float>::lowest()));
+        static auto compiled_fn = get_compiled_min_p_filter();
+        auto result = compiled_fn({x, mlx::core::array(min_p)});
+        x = std::move(result[0]);
     }
 
-    // Categorical sampling
+    // Categorical sampling (not compiled — random ops need known shapes at trace time)
     return std::make_unique<MlxArray>(mlx::core::random::categorical(x, -1));
 }
 

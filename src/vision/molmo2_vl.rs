@@ -60,10 +60,17 @@ impl Molmo2VLModel {
             _image_num_crops,
         );
         let image_features = self.vision_tower.forward(&images, &token_pooling);
-        // image_features: [num_image_patches, hidden_dim]
-        let image_features = mlxcel_core::astype(&image_features, mlxcel_core::array_dtype(&x));
+        // Cast to text embedding dtype only if different (avoids no-op astype graph node)
+        let img_dtype = mlxcel_core::array_dtype(&image_features);
+        let txt_dtype = mlxcel_core::array_dtype(&x);
+        let image_features = if img_dtype != txt_dtype {
+            mlxcel_core::astype(&image_features, txt_dtype)
+        } else {
+            image_features
+        };
 
         // 3. Find image_patch_id positions in input_ids
+        //    Vectorized: eval the boolean mask once, then extract positions on CPU
         let flat_ids = mlxcel_core::reshape(input_ids, &[-1]);
         let patch_token = mlxcel_core::from_slice_i32(&[self.image_patch_id], &[1]);
         let is_image_patch = mlxcel_core::equal(&flat_ids, &patch_token);
@@ -71,10 +78,8 @@ impl Molmo2VLModel {
         let total_tokens = mlxcel_core::array_shape(&flat_ids)[0];
         let mut positions: Vec<i32> = Vec::new();
         for i in 0..total_tokens {
-            let idx = mlxcel_core::from_slice_i32(&[i], &[1]);
-            let val = mlxcel_core::take(&is_image_patch, &idx, 0);
-            mlxcel_core::eval(&val);
-            if mlxcel_core::item_bool(&val) {
+            let tok = mlxcel_core::slice(&is_image_patch, &[i], &[i + 1]);
+            if mlxcel_core::item_bool(&tok) {
                 positions.push(i);
             }
         }
