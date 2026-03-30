@@ -67,6 +67,12 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 total_tokens
             );
         }
+        VlmPreparationSummary::MolmoPoint { total_tokens } => {
+            println!(
+                "Molmo-Point: expanded prompt with image tokens ({} total tokens)",
+                total_tokens
+            );
+        }
         VlmPreparationSummary::Phi3V {
             image_slots,
             total_tokens,

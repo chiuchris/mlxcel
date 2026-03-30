@@ -12,24 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Image processors for vision models
+//! Molmo-Point Image Processor
 //!
-//! Provides the ImageProcessor trait and processor implementations.
+//! The image processing pipeline for Molmo-Point is identical to Molmo2:
+//! multi-scale overlapping crop preprocessing with the same parameters.
+//! This module re-exports the Molmo2 processor directly.
+//!
+//! Reference: references/mlx-vlm/mlx_vlm/models/molmo_point/image_processing.py
 
-pub mod minicpmo;
-pub mod molmo2;
-pub mod molmo_point;
-pub mod moondream3;
-pub mod phi3_v;
-pub mod phi4_siglip;
-pub mod phi4mm;
-pub mod qwen2_vl;
-pub mod siglip;
-
-use mlxcel_core::{MlxArray, UniquePtr};
-
-/// Trait for image preprocessors
-pub trait ImageProcessor {
-    /// Preprocess images to tensor format ready for vision encoder
-    fn preprocess(&self, images: &[image::DynamicImage]) -> UniquePtr<MlxArray>;
-}
+/// Molmo-Point uses the same image processor as Molmo2.
+/// Re-export for clarity in the loading code.
+pub type MolmoPointProcessor = super::molmo2::Molmo2Processor;
+pub type MolmoPointProcessorOutput = super::molmo2::Molmo2ProcessorOutput;

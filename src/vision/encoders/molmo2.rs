@@ -27,7 +27,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 // ViT MLP.
-struct ViTMLP {
+pub(crate) struct ViTMLP {
     w1: Linear,
     w2: Linear,
 }
@@ -47,7 +47,8 @@ impl ViTMLP {
 }
 
 // ViT Multi-Head Dot Product Attention (supports cross-attention).
-struct ViTAttention {
+// Used by: Molmo2, MolmoPoint
+pub(crate) struct ViTAttention {
     wq: Linear,
     wk: Linear,
     wv: Linear,
@@ -164,7 +165,8 @@ impl ViTAttention {
 }
 
 // ViT Block.
-struct Molmo2VisionBlock {
+// Used by: Molmo2, MolmoPoint
+pub(crate) struct Molmo2VisionBlock {
     attention: ViTAttention,
     feed_forward: ViTMLP,
     attention_norm: LayerNorm,
@@ -228,7 +230,8 @@ impl Molmo2VisionBlock {
 }
 
 // Vision Transformer (returns all hidden states).
-struct Molmo2VisionTransformer {
+// Used by: Molmo2, MolmoPoint
+pub(crate) struct Molmo2VisionTransformer {
     patch_embedding: Linear, // Linear, not Conv2d (patches already flattened)
     positional_embedding: UniquePtr<MlxArray>, // [image_num_pos, hidden_size]
     blocks: Vec<Molmo2VisionBlock>,
@@ -236,7 +239,7 @@ struct Molmo2VisionTransformer {
 }
 
 impl Molmo2VisionTransformer {
-    fn add_pos_emb(&self, x: &MlxArray, patch_h: i32, patch_w: i32) -> UniquePtr<MlxArray> {
+    pub(crate) fn add_pos_emb(&self, x: &MlxArray, patch_h: i32, patch_w: i32) -> UniquePtr<MlxArray> {
         let num_pos = self.image_num_pos as i32;
         let hidden_size = mlxcel_core::array_shape(&self.positional_embedding)[1];
 
@@ -262,7 +265,7 @@ impl Molmo2VisionTransformer {
         mlxcel_core::add(x, &pos_emb)
     }
 
-    fn forward(&self, x: &MlxArray, patch_num: Option<(i32, i32)>) -> Vec<UniquePtr<MlxArray>> {
+    pub(crate) fn forward(&self, x: &MlxArray, patch_num: Option<(i32, i32)>) -> Vec<UniquePtr<MlxArray>> {
         let default_patch_size = (self.image_num_pos as f64).sqrt() as i32;
         let (patch_h, patch_w) = patch_num.unwrap_or((default_patch_size, default_patch_size));
 
@@ -277,7 +280,7 @@ impl Molmo2VisionTransformer {
         hidden_states
     }
 
-    fn from_weights(
+    pub(crate) fn from_weights(
         weights: &WeightMap,
         prefix: &str,
         num_layers: usize,
@@ -321,14 +324,15 @@ impl Molmo2VisionTransformer {
 }
 
 // Image Projector MLP (SwiGLU).
-struct ImageProjectorMLP {
+// Used by: Molmo2, MolmoPoint
+pub(crate) struct ImageProjectorMLP {
     w1: Linear,
     w2: Linear,
     w3: Linear,
 }
 
 impl ImageProjectorMLP {
-    fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+    pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // silu(w1(x)) * w3(x) → w2(...)
         let gate = self.w1.forward(x);
         let gate = mlxcel_core::silu(&gate);
@@ -337,7 +341,7 @@ impl ImageProjectorMLP {
         self.w2.forward(&h)
     }
 
-    fn from_weights(weights: &WeightMap, prefix: &str) -> Result<Self, String> {
+    pub(crate) fn from_weights(weights: &WeightMap, prefix: &str) -> Result<Self, String> {
         let w1 = Linear::from_weights(weights, &format!("{}.w1", prefix))?;
         let w2 = Linear::from_weights(weights, &format!("{}.w2", prefix))?;
         let w3 = Linear::from_weights(weights, &format!("{}.w3", prefix))?;

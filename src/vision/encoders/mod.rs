@@ -20,6 +20,7 @@ pub mod gemma3n;
 pub mod llama4;
 pub mod minicpmo;
 pub mod molmo2;
+pub mod molmo_point;
 pub mod moondream3;
 pub mod phi4_siglip;
 pub mod pixtral;

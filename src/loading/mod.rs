@@ -136,6 +136,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::Phi4SigLipVLM => Some(load_phi4_siglip_vlm(model_path)?),
         ModelType::Phi3VLM => Some(load_phi3_vlm(model_path)?),
         ModelType::Molmo2VLM => Some(load_molmo2_vlm(model_path)?),
+        ModelType::MolmoPointVLM => Some(load_molmo_point_vlm(model_path)?),
         _ => None,
     })
 }

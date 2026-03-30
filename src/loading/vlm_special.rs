@@ -1269,6 +1269,306 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
     Ok(LoadedModel::Molmo2VLM(vlm))
 }
 
+pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
+    use vision::encoders::molmo2::Molmo2VisionTransformer;
+    use vision::encoders::molmo_point::{MolmoPointConnector, PointPredictor};
+    use vision::molmo_point_vl::{MolmoPointConfig, MolmoPointVLModel};
+    use vision::processors::molmo2::Molmo2Processor;
+
+    let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+
+    // Parse text config
+    let mut text_config_value = full_config
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| full_config.clone());
+    inherit_quantization_if_missing(&mut text_config_value, &full_config)?;
+    let text_config: models::molmo2::Molmo2TextConfig =
+        serde_json::from_value(text_config_value)
+            .map_err(|e| anyhow::anyhow!("Failed to parse text config: {e}"))?;
+
+    // Parse vision config (may be in vit_config or vision_config)
+    let vit_config = full_config
+        .get("vit_config")
+        .or_else(|| full_config.get("vision_config"))
+        .unwrap_or(&full_config);
+
+    // Parse adapter config
+    let adapter_config = full_config
+        .get("adapter_config")
+        .unwrap_or(&full_config);
+
+    // ViT parameters
+    let vit_num_layers = cap_molmo2_vit_num_layers(
+        vit_config
+            .get("num_hidden_layers")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(27) as usize,
+    );
+    let vit_hidden_size = vit_config
+        .get("hidden_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(1152) as i32;
+    let vit_intermediate_size = vit_config
+        .get("intermediate_size")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(4304) as i32;
+    let vit_num_heads = vit_config
+        .get("num_attention_heads")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(16) as i32;
+    let vit_num_kv_heads = vit_config
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(16) as i32;
+    let vit_head_dim = vit_config
+        .get("head_dim")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(72) as i32;
+    let vit_image_num_pos = vit_config
+        .get("image_num_pos")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(729) as usize;
+    let vit_layer_norm_eps = vit_config
+        .get("layer_norm_eps")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1e-6) as f32;
+
+    // Adapter parameters
+    let adapter_num_heads = adapter_config
+        .get("num_attention_heads")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(16) as i32;
+    let adapter_num_kv_heads = adapter_config
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(16) as i32;
+    let adapter_head_dim = adapter_config
+        .get("head_dim")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(72) as i32;
+    let pooling_attention_mask = adapter_config
+        .get("pooling_attention_mask")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let positional_embeddings_size = adapter_config
+        .get("positional_embeddings")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    // Resolve vit_layers (may be in adapter_config)
+    let vit_layers_raw = parse_molmo2_vit_layers(adapter_config);
+    let vit_layers_resolved: Vec<usize> = vit_layers_raw
+        .iter()
+        .map(|&layer| {
+            if layer < 0 {
+                (layer + vit_num_layers as i32) as usize
+            } else {
+                layer as usize
+            }
+        })
+        .collect();
+
+    // Truncate ViT to only the layers we need
+    let last_layer_needed = *vit_layers_resolved.iter().max().unwrap_or(&0) + 1;
+    let actual_vit_layers = last_layer_needed.min(vit_num_layers);
+
+    // Model-level config
+    let image_patch_id = full_config
+        .get("image_patch_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151938) as i32;
+    let image_end_token_id = full_config
+        .get("image_end_token_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151937) as i32;
+    let image_non_indexable_patch_id = full_config
+        .get("image_non_indexable_patch_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151942) as i32;
+    let patch_token_id = full_config
+        .get("patch_token_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151947) as i32;
+    let subpatch_token_id = full_config
+        .get("subpatch_token_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151948) as i32;
+    let location_token_id = full_config
+        .get("location_token_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(151949) as i32;
+    let no_more_points_class = full_config
+        .get("no_more_points_class")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let norm_logits = full_config
+        .get("norm_logits")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let patch_location = full_config
+        .get("patch_location")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let patch_embed_dim = full_config
+        .get("patch_embed_dim")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(512) as i32;
+    let layer_norm_x = full_config
+        .get("layer_norm_x")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let token_prediction_rotary = full_config
+        .get("token_prediction_rotary")
+        .and_then(|v| v.as_str())
+        .unwrap_or("one_d");
+    let token_prediction_rotary_theta = full_config
+        .get("token_prediction_rotary_theta")
+        .and_then(|v| v.as_f64())
+        .unwrap_or(50000.0) as f32;
+
+    // Load and remap weights
+    let weights = remap_molmo_point_weights(load_vlm_weights(model_path)?);
+
+    // Load language model (uses Molmo2 text config)
+    let language_model = models::molmo_point::MolmoPointLanguageModel::from_weights(
+        &weights,
+        &text_config,
+        "lm",
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load language model: {e}"))?;
+
+    // Load vision model (ViT, possibly truncated)
+    let vision_model = Molmo2VisionTransformer::from_weights(
+        &weights,
+        "vision_model",
+        actual_vit_layers,
+        vit_hidden_size,
+        vit_intermediate_size,
+        vit_num_heads,
+        vit_num_kv_heads,
+        vit_head_dim,
+        vit_image_num_pos,
+        vit_layer_norm_eps,
+        true, // float32_attention
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load vision model: {e}"))?;
+
+    // Load connector
+    let connector = MolmoPointConnector::from_weights(
+        &weights,
+        "connector",
+        adapter_num_heads,
+        adapter_num_kv_heads,
+        adapter_head_dim,
+        positional_embeddings_size,
+        pooling_attention_mask,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load connector: {e}"))?;
+
+    // Load point predictor
+    let point_predictor = PointPredictor::from_weights(
+        &weights,
+        "point_predictor",
+        text_config.layer_norm_eps,
+        layer_norm_x,
+        token_prediction_rotary,
+        token_prediction_rotary_theta,
+        patch_embed_dim,
+        patch_location.is_some(),
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load point predictor: {e}"))?;
+
+    // Load ViT feature embedding (vit_dim -> llm_dim)
+    let build_vit_embedding =
+        mlxcel_core::layers::Linear::from_weights(&weights, "build_vit_embedding")
+            .map_err(|e| anyhow::anyhow!("Failed to load build_vit_embedding: {e}"))?;
+
+    // Processor
+    let preprocessor_config = read_optional_model_json(model_path, "preprocessor_config.json");
+    let max_crops = preprocessor_config
+        .as_ref()
+        .and_then(|c| c.get("max_crops"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(24) as usize;
+    let processor = Molmo2Processor::new(max_crops, None, None, None, None);
+
+    let config = MolmoPointConfig {
+        image_patch_id,
+        image_end_token_id,
+        image_non_indexable_patch_id,
+        patch_token_id,
+        subpatch_token_id,
+        location_token_id,
+        no_more_points_class,
+        norm_logits,
+        patch_location,
+        vit_layers: vit_layers_raw,
+        hidden_size: text_config.hidden_size as i32,
+    };
+
+    let vlm = MolmoPointVLModel {
+        language_model,
+        vision_model,
+        connector,
+        point_predictor,
+        build_vit_embedding,
+        processor,
+        config,
+        vit_layers: vit_layers_resolved,
+    };
+
+    Ok(LoadedModel::MolmoPointVLM(vlm))
+}
+
+/// Remap Molmo-Point weight keys from HuggingFace format.
+///
+/// HF keys:
+///   model.transformer.* -> lm.model.*
+///   model.lm_head.* -> lm.lm_head.*
+///   model.vit.transformer.resblocks.* -> vision_model.resblocks.*
+///   model.vit.* -> vision_model.*
+fn remap_molmo_point_weights(raw_weights: WeightMap) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for (key, value) in raw_weights {
+        let mut new_key = key.clone();
+
+        // Strip "model." prefix
+        if new_key.starts_with("model.") {
+            new_key = new_key[6..].to_string();
+        }
+
+        // lm_head -> lm.lm_head
+        if new_key.starts_with("lm_head.") {
+            new_key = format!("lm.{new_key}");
+        }
+
+        // transformer.* -> lm.model.*
+        if new_key.starts_with("transformer.") {
+            new_key = format!("lm.model.{}", &new_key[12..]);
+        }
+
+        // vit.transformer.resblocks -> vision_model.transformer
+        new_key = new_key.replace("vit.transformer.resblocks", "vision_model.transformer");
+
+        // vit.* -> vision_model.* (remaining keys)
+        if new_key.starts_with("vit.") {
+            new_key = format!("vision_model.{}", &new_key[4..]);
+        }
+
+        // Cast float32 weights to float16
+        let dtype = mlxcel_core::array_dtype(&value);
+        let value = if dtype == mlxcel_core::dtype::FLOAT32 {
+            mlxcel_core::astype(&value, mlxcel_core::dtype::FLOAT16)
+        } else {
+            mlxcel_core::copy(&value)
+        };
+
+        weights.insert(new_key, value);
+    }
+    weights
+}
+
 pub(super) fn inherit_quantization_if_missing(
     text_config: &mut Value,
     full_config: &Value,

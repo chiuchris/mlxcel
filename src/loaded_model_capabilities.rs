@@ -36,6 +36,7 @@ pub enum VlmRuntimeRef<'a> {
     Phi4SigLip(&'a vision::Phi4SigLipVLModel),
     Phi3V(&'a vision::Phi3VLModel),
     Molmo2(&'a vision::Molmo2VLModel),
+    MolmoPoint(&'a vision::MolmoPointVLModel),
     Standard(&'a vision::VisionModule),
 }
 
@@ -124,6 +125,7 @@ impl LoadedModel {
             Self::Phi4SigLipVLM(model) => Some(VlmRuntimeRef::Phi4SigLip(model)),
             Self::Phi3VLM(model) => Some(VlmRuntimeRef::Phi3V(model)),
             Self::Molmo2VLM(model) => Some(VlmRuntimeRef::Molmo2(model)),
+            Self::MolmoPointVLM(model) => Some(VlmRuntimeRef::MolmoPoint(model)),
             Self::Gemma3VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
             Self::Llama4VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
             Self::LlavaVLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),

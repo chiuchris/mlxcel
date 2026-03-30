@@ -58,6 +58,9 @@ pub enum VlmPreparationSummary {
     Molmo2 {
         total_tokens: usize,
     },
+    MolmoPoint {
+        total_tokens: usize,
+    },
     Phi4SigLip {
         image_slots: usize,
         total_tokens: usize,
@@ -294,6 +297,40 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation: Some(VlmPreparationSummary::Molmo2 {
+                    total_tokens: prompt_tokens.len(),
+                }),
+            }))
+        }
+        VlmRuntimeRef::MolmoPoint(molmo_point) => {
+            let proc_out = molmo_point.processor.preprocess_image(&images[0]);
+            let image_token_str = molmo_point.processor.get_image_tokens(&proc_out.image_grid);
+            let text = if prompt.contains("<|image|>") {
+                prompt.replace("<|image|>", &image_token_str)
+            } else {
+                format!("{image_token_str}{prompt}")
+            };
+            *prompt_tokens = encode(&text, true);
+
+            let pixel_values =
+                mlxcel_core::from_slice_f32(&proc_out.pixel_values, &proc_out.pixel_values_shape);
+            let image_token_pooling = mlxcel_core::from_slice_i32(
+                &proc_out.image_token_pooling,
+                &proc_out.image_token_pooling_shape,
+            );
+            let image_grids = mlxcel_core::from_slice_i32(&proc_out.image_grid, &[4]);
+            let image_num_crops = mlxcel_core::from_slice_i32(&[proc_out.image_num_crops], &[1]);
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = molmo_point.get_input_embeddings(
+                &input_ids_arr,
+                &pixel_values,
+                &image_token_pooling,
+                &image_grids,
+                &image_num_crops,
+            );
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::MolmoPoint {
                     total_tokens: prompt_tokens.len(),
                 }),
             }))
