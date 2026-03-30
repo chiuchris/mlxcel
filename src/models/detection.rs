@@ -141,6 +141,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
             ModelType::Mistral3,
             ModelType::Mistral3VLM,
         )),
+        "mistral4" => Ok(ModelType::Mistral4),
         "nemotron" => Ok(ModelType::Nemotron),
         "mamba" | "falcon_mamba" => Ok(ModelType::Mamba),
         "mamba2" => Ok(ModelType::Mamba2),

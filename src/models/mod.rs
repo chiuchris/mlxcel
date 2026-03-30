@@ -63,6 +63,7 @@ pub mod minicpm;
 pub mod minicpm3;
 pub mod minimax;
 pub mod ministral3;
+pub mod mistral4;
 pub mod mixtral;
 pub mod molmo2;
 pub mod moondream3;
@@ -134,6 +135,7 @@ pub use minicpm::MiniCPMModel;
 pub use minicpm3::MiniCPM3Model;
 pub use minimax::MiniMaxModel;
 pub use ministral3::{Ministral3Model, Ministral3Wrapper};
+pub use mistral4::Mistral4Model;
 pub use mixtral::MixtralModel;
 pub use molmo2::Molmo2Model;
 pub use moondream3::Moondream3Model;
@@ -261,6 +263,7 @@ pub enum ModelType {
     SmolLM3,
     Ministral3,
     Mistral3,
+    Mistral4,
     Nemotron,
 
     // SSM/Mamba models

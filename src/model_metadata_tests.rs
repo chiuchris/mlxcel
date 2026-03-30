@@ -71,6 +71,28 @@ fn model_metadata_preserves_mistral3_nested_text_wrapper_rule() {
 }
 
 #[test]
+fn model_metadata_preserves_mistral3_mistral4_text_wrapper_rule() {
+    let config = json!({
+        "text_config": {
+            "model_type": "mistral4"
+        }
+    });
+
+    let policy = model_load_policy(ModelType::Mistral3, Some(&config)).unwrap();
+    assert_eq!(
+        policy.directory_route,
+        DirectoryLoadRoute::Mistral3Mistral4Wrapper
+    );
+    assert_eq!(policy.weight_route, Some(WeightLoadRoute::LlamaFamily));
+}
+
+#[test]
+fn model_metadata_mistral4_standalone_is_config_backed() {
+    assert!(is_config_backed_model_type(ModelType::Mistral4));
+    assert!(has_config_backed_registration(ModelType::Mistral4));
+}
+
+#[test]
 fn is_vlm_model_type_matches_control_plane_capabilities() {
     assert!(is_vlm_model_type(ModelType::Gemma3VLM));
     assert!(is_vlm_model_type(ModelType::Phi4MMVLM));

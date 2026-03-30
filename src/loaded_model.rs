@@ -113,6 +113,7 @@ pub enum LoadedModel {
     SmolLM3(models::SmolLM3Model),
     // Sliding window model uses wrapper
     Ministral3(models::Ministral3Wrapper),
+    Mistral4(models::Mistral4Model),
     Nemotron(models::NemotronModel),
     Mamba(models::MambaModel),
     Mamba2(models::Mamba2Model),
@@ -200,6 +201,7 @@ macro_rules! delegate_language_model {
             LoadedModel::StableLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::SmolLM3(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Ministral3(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Mistral4(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Nemotron(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Mamba(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Mamba2(inner) => LanguageModel::$method(inner, $($arg),*),

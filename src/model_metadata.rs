@@ -60,6 +60,8 @@ pub(crate) struct ModelCapabilities {
 pub(crate) enum DirectoryLoadRoute {
     /// `Mistral3` wrapper with `ministral3` text tower in `text_config`.
     Mistral3TextWrapper,
+    /// `Mistral3` wrapper with `mistral4` (MLA) text tower in `text_config`.
+    Mistral3Mistral4Wrapper,
     /// `Mistral3` wrapper whose inner text tower should fall back to `Llama`.
     Mistral3LlamaFallback,
     /// Vision-language model families routed through `src/loading/vlm*.rs`.
@@ -165,6 +167,7 @@ macro_rules! for_each_model_registration {
             SmolLM3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::SmolLM3Model::load, args: models::smollm3::ModelArgs, weight_builder: models::SmolLM3Model::from_weights, wrap: LoadedModel::SmolLM3 } };
             Ministral3 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Ministral3Model::load, args: models::ministral3::ModelArgs, weight_builder: models::Ministral3Model::from_weights, wrap: |m| LoadedModel::Ministral3(models::Ministral3Wrapper::new(m)) } };
             Mistral3 => { kind: Text, directory: Mistral3Dynamic, weight: Some(WeightLoadRoute::LlamaFamily), adapter: None };
+            Mistral4 => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::Mistral4Model::load, args: models::mistral4::Mistral4Config, weight_builder: models::Mistral4Model::from_weights, wrap: LoadedModel::Mistral4 } };
             Nemotron => { kind: Text, directory: ConfigBacked, weight: Some(WeightLoadRoute::ConfigBacked), adapter: None, config_backed: { dir_loader: models::NemotronModel::load, args: models::nemotron::ModelArgs, weight_builder: models::NemotronModel::from_weights, wrap: LoadedModel::Nemotron } };
             Mamba => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Mamba2 => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
@@ -216,6 +219,15 @@ pub(crate) fn is_ministral3_config(config: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn is_mistral4_config(config: &serde_json::Value) -> bool {
+    config
+        .get("text_config")
+        .and_then(|tc| tc.get("model_type"))
+        .and_then(|mt| mt.as_str())
+        .map(|mt| mt == "mistral4")
+        .unwrap_or(false)
+}
+
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn is_vlm_model_type(model_type: ModelType) -> bool {
     static_model_descriptor(model_type).kind == ModelKind::Vlm
@@ -258,6 +270,8 @@ pub(crate) fn directory_load_route(
         DirectoryRouteFamily::Mistral3Dynamic => {
             if config.is_some_and(is_ministral3_config) {
                 DirectoryLoadRoute::Mistral3TextWrapper
+            } else if config.is_some_and(is_mistral4_config) {
+                DirectoryLoadRoute::Mistral3Mistral4Wrapper
             } else {
                 DirectoryLoadRoute::Mistral3LlamaFallback
             }

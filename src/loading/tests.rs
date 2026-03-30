@@ -18,8 +18,8 @@ use super::{
 };
 use crate::model_metadata::{
     DirectoryLoadRoute, ModelCapabilities, ModelKind, ModelLoadPolicy, WeightLoadRoute,
-    directory_load_route, is_ministral3_config, is_vlm_model_type, model_capabilities,
-    model_load_policy, static_model_descriptor, weight_load_route,
+    directory_load_route, is_ministral3_config, is_mistral4_config, is_vlm_model_type,
+    model_capabilities, model_load_policy, static_model_descriptor, weight_load_route,
 };
 use crate::models::ModelType;
 use serde_json::json;
@@ -282,6 +282,59 @@ fn model_load_policy_handles_mistral3_text_wrapper_config() {
     assert_eq!(
         policy.directory_route,
         DirectoryLoadRoute::Mistral3TextWrapper
+    );
+    assert_eq!(policy.weight_route, Some(WeightLoadRoute::LlamaFamily));
+}
+
+#[test]
+fn is_mistral4_config_detects_nested_model_type() {
+    let config = json!({
+        "text_config": {
+            "model_type": "mistral4"
+        }
+    });
+
+    assert!(is_mistral4_config(&config));
+}
+
+#[test]
+fn is_mistral4_config_returns_false_without_matching_text_model() {
+    let config = json!({
+        "text_config": {
+            "model_type": "llama"
+        }
+    });
+
+    assert!(!is_mistral4_config(&config));
+}
+
+#[test]
+fn directory_load_route_handles_mistral3_mistral4_subtype() {
+    let config = json!({
+        "text_config": {
+            "model_type": "mistral4"
+        }
+    });
+
+    assert_eq!(
+        directory_load_route(ModelType::Mistral3, Some(&config)).unwrap(),
+        DirectoryLoadRoute::Mistral3Mistral4Wrapper
+    );
+}
+
+#[test]
+fn model_load_policy_handles_mistral3_mistral4_wrapper_config() {
+    let config = json!({
+        "text_config": {
+            "model_type": "mistral4"
+        }
+    });
+
+    let policy = model_load_policy(ModelType::Mistral3, Some(&config)).unwrap();
+    assert_eq!(policy.capabilities.kind, ModelKind::Text);
+    assert_eq!(
+        policy.directory_route,
+        DirectoryLoadRoute::Mistral3Mistral4Wrapper
     );
     assert_eq!(policy.weight_route, Some(WeightLoadRoute::LlamaFamily));
 }

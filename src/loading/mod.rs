@@ -31,7 +31,8 @@ use std::path::{Path, PathBuf};
 use crate::LoadedModel;
 use crate::lora;
 use crate::model_metadata::{
-    DirectoryLoadRoute, ModelLoadPolicy, WeightLoadRoute, is_ministral3_config, model_load_policy,
+    DirectoryLoadRoute, ModelLoadPolicy, WeightLoadRoute, is_ministral3_config, is_mistral4_config,
+    model_load_policy,
 };
 use crate::models::{self, ModelType, get_model_type, sanitize_config_json};
 use crate::tokenizer::{self, MlxcelTokenizer};
@@ -160,6 +161,13 @@ fn load_mistral3_text_directory_variant(path_str: &str) -> Result<LoadedModel> {
     )))
 }
 
+fn load_mistral3_mistral4_directory_variant(path_str: &str) -> Result<LoadedModel> {
+    Ok(LoadedModel::Mistral4(load_pair_from_dir(
+        path_str,
+        models::Mistral4Model::load_from_text_config,
+    )?))
+}
+
 fn load_mistral3_llama_directory_variant(path_str: &str) -> Result<LoadedModel> {
     Ok(LoadedModel::Llama(load_pair_from_dir(
         path_str,
@@ -184,6 +192,18 @@ fn load_llama_family_from_weights(
         return Ok(LoadedModel::Ministral3(models::Ministral3Wrapper::new(
             model,
         )));
+    }
+
+    if model_type == ModelType::Mistral3 && is_mistral4_config(config) {
+        let text_config = config
+            .get("text_config")
+            .ok_or_else(|| anyhow::anyhow!("Missing text_config for Mistral4"))?;
+        let args: models::mistral4::Mistral4Config = serde_json::from_value(text_config.clone())
+            .map_err(|err| anyhow::anyhow!("Failed to parse text_config: {}", err))?;
+        models::mistral4::sanitize_weights(weights, &args, "");
+        let model = models::Mistral4Model::from_weights(weights, &args)
+            .map_err(|err| anyhow::anyhow!("{}", err))?;
+        return Ok(LoadedModel::Mistral4(model));
     }
 
     let args: models::llama3::ModelArgs = parse_model_config(config_str)?;
@@ -233,6 +253,13 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
         ) => load_mistral3_text_directory_variant(path_str)?,
         (
             ModelLoadPolicy {
+                directory_route: DirectoryLoadRoute::Mistral3Mistral4Wrapper,
+                ..
+            },
+            Some(_),
+        ) => load_mistral3_mistral4_directory_variant(path_str)?,
+        (
+            ModelLoadPolicy {
                 directory_route: DirectoryLoadRoute::Mistral3LlamaFallback,
                 ..
             },
@@ -268,7 +295,9 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
         (
             ModelLoadPolicy {
                 directory_route:
-                    DirectoryLoadRoute::Mistral3TextWrapper | DirectoryLoadRoute::Mistral3LlamaFallback,
+                    DirectoryLoadRoute::Mistral3TextWrapper
+                    | DirectoryLoadRoute::Mistral3Mistral4Wrapper
+                    | DirectoryLoadRoute::Mistral3LlamaFallback,
                 ..
             },
             None,
