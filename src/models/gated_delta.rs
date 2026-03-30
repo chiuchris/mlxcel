@@ -28,7 +28,7 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 /// Cache for GatedDeltaNet (linear attention) layers.
 /// Stores conv1d state and recurrent SSM state.
 ///
-/// Used by: Qwen3Next, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub struct GatedDeltaCache {
     pub conv_state: Option<UniquePtr<MlxArray>>, // [batch, kernel-1, conv_dim]
     pub state_cache: Option<UniquePtr<MlxArray>>, // [batch, num_v_heads, head_v_dim, head_k_dim]
@@ -57,14 +57,21 @@ impl Default for GatedDeltaCache {
 
 // Core Functions.
 /// Compute gating values from A_log, a, and dt_bias.
-/// g = exp(-exp(A_log) * softplus(a + dt_bias))
+/// g = exp(-exp(A_log.astype(float32)) * softplus(a + dt_bias))
 ///
-/// Used by: Qwen3Next, KimiLinear
+/// Upstream Python casts the result back to a.dtype; here we keep float32
+/// so the ops-path state accumulation stays in higher precision (the Python
+/// Metal kernel path uses float32 state internally for the same reason).
+///
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePtr<MlxArray> {
     let a_plus_dt = mlxcel_core::add(a, dt_bias);
     let sp = softplus(&a_plus_dt);
-    let exp_a_log = mlxcel_core::exp(a_log);
+    // Cast a_log to float32 before exp() for numerical precision
+    let a_log_f32 = mlxcel_core::astype(a_log, dtype::FLOAT32);
+    let exp_a_log = mlxcel_core::exp(&a_log_f32);
     let neg_product = mlxcel_core::negative(&mlxcel_core::multiply(&exp_a_log, &sp));
+    // Keep result in float32 (no cast back to input dtype)
     mlxcel_core::exp(&neg_product)
 }
 
@@ -73,13 +80,13 @@ pub fn compute_g(a_log: &MlxArray, a: &MlxArray, dt_bias: &MlxArray) -> UniquePt
 /// Shapes:
 ///   - q, k: [B, H, Dk]
 ///   - v: [B, H, Dv]
-///   - g: [B, H] or [B, H, Dk]
+///   - g: [B, H] or [B, H, Dk] (float32 from compute_g)
 ///   - beta: [B, H]
-///   - state: [B, H, Dv, Dk]
+///   - state: [B, H, Dv, Dk] (float32)
 ///
-/// Returns: (y: [B, H, Dv], new_state: [B, H, Dv, Dk])
+/// Returns: (y: [B, H, Dv] in q dtype, new_state: [B, H, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn gated_delta_step(
     q: &MlxArray,
     k: &MlxArray,
@@ -133,21 +140,32 @@ pub fn gated_delta_step(
         new_state
     };
 
+    // Cast output to input query dtype (state stays float32, output matches input precision)
+    let q_dtype = mlxcel_core::array_dtype(q);
+    let y = if mlxcel_core::array_dtype(&y) != q_dtype {
+        mlxcel_core::astype(&y, q_dtype)
+    } else {
+        y
+    };
+
     (y, new_state)
 }
 
 /// Ops-based implementation for prompt prefill (sequential loop).
 ///
+/// State is initialized as float32 when not provided, and remains float32
+/// across timesteps to prevent underflow/overflow with bfloat16 inputs.
+///
 /// Shapes:
 ///   - q, k: [B, T, Hk, Dk]
 ///   - v: [B, T, Hv, Dv]
-///   - g: [B, T, Hv] (scalar) or [B, T, Hv, Dk] (vectorized)
+///   - g: [B, T, Hv] (scalar) or [B, T, Hv, Dk] (vectorized), float32
 ///   - beta: [B, T, Hv]
-///   - state: [B, Hv, Dv, Dk]
+///   - state: [B, Hv, Dv, Dk] (float32)
 ///
-/// Returns: (y: [B, T, Hv, Dv], state: [B, Hv, Dv, Dk])
+/// Returns: (y: [B, T, Hv, Dv] in q dtype, state: [B, Hv, Dv, Dk] in float32)
 ///
-/// Used by: Qwen3Next, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn gated_delta_ops(
     q: &MlxArray,
     k: &MlxArray,
@@ -166,11 +184,12 @@ pub fn gated_delta_ops(
     let hv = v_shape[2];
     let dv = v_shape[3];
 
-    // Initialize state if not provided
+    // Initialize state if not provided; use float32 for numerical precision
+    // (prevents underflow/overflow in long sequences when input is bfloat16)
     let mut current_state = if let Some(s) = state {
         mlxcel_core::copy(s)
     } else {
-        mlxcel_core::zeros(&[b, hv, dv, dk], mlxcel_core::array_dtype(v))
+        mlxcel_core::zeros(&[b, hv, dv, dk], dtype::FLOAT32)
     };
 
     // Compute repeat factor for GQA
@@ -268,10 +287,10 @@ pub fn gated_delta_ops(
 
 /// Main gated delta update function.
 ///
-/// Computes beta = sigmoid(b) and g = exp(-exp(A_log) * softplus(a + dt_bias)),
-/// then runs the ops-based implementation.
+/// Computes beta = sigmoid(b) and g = exp(-exp(A_log.float32) * softplus(a + dt_bias)),
+/// then runs the ops-based implementation with float32 state accumulation.
 ///
-/// Used by: Qwen3Next, KimiLinear
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
 pub fn gated_delta_update(
     q: &MlxArray,
     k: &MlxArray,
@@ -286,7 +305,7 @@ pub fn gated_delta_update(
     // Compute beta = sigmoid(b)
     let beta = mlxcel_core::sigmoid(b);
 
-    // Compute gating g = exp(-exp(A_log) * softplus(a + dt_bias))
+    // Compute gating g = exp(-exp(A_log.float32) * softplus(a + dt_bias)); stays float32
     let g = compute_g(a_log, a, dt_bias);
 
     // Run the ops-based implementation
