@@ -24,9 +24,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{
-    create_causal_mask, relu_squared, repeat_kv, silu, slice_axis, stack_arrays,
-};
+use mlxcel_core::utils::{create_causal_mask, relu_squared, silu, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -956,29 +954,15 @@ impl NemotronHAttention {
             (keys, values)
         };
 
-        // Repeat KV for GQA
-        let n_rep = self.n_heads / self.n_kv_heads;
-        let (keys, values) = if n_rep > 1 {
-            (
-                repeat_kv(&keys, n_rep as i32),
-                repeat_kv(&values, n_rep as i32),
+        // Scaled dot-product attention (MLX fast kernel, handles GQA internally)
+        let mask_ptr = mask
+            .map(|m| m as *const MlxArray)
+            .unwrap_or(std::ptr::null());
+        let output = unsafe {
+            mlxcel_core::fast_scaled_dot_product_attention(
+                &queries, &keys, &values, self.scale, mask_ptr,
             )
-        } else {
-            (keys, values)
         };
-
-        // Scaled dot-product attention
-        let keys_t = mlxcel_core::transpose_axes(&keys, &[0, 1, 3, 2]);
-        let mut scores = mlxcel_core::matmul(&queries, &keys_t);
-        let scale_arr = mlxcel_core::full_f32(&[1], self.scale, mlxcel_core::dtype::BFLOAT16);
-        scores = mlxcel_core::multiply(&scores, &scale_arr);
-
-        if let Some(m) = mask {
-            scores = mlxcel_core::add(&scores, m);
-        }
-
-        let weights = mlxcel_core::softmax(&scores, -1);
-        let output = mlxcel_core::matmul(&weights, &values);
 
         let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);
         let output = mlxcel_core::reshape(&output, &[batch, seq_len, -1]);
