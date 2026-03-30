@@ -435,9 +435,6 @@ impl Ministral3Model {
         input_ids: &MlxArray,
         caches: &mut [Cache],
     ) -> UniquePtr<MlxArray> {
-        let shape = mlxcel_core::array_shape(input_ids);
-        let seq_len = shape[1];
-
         // Find indices for mask creation
         let fa_idx = self.layers.iter().position(|l| !l.use_sliding).unwrap_or(0);
         let swa_idx = self.layers.iter().position(|l| l.use_sliding);
@@ -448,6 +445,14 @@ impl Ministral3Model {
             .map(|idx| caches[idx].as_interface().offset())
             .unwrap_or(0);
 
+        // Embed tokens first so seq_len is derived from h (matching upstream mlx-vlm fix:
+        // use h.shape[1] instead of inputs.shape[1] for attn_scale computation, since
+        // h may differ from inputs when inputs_embeds are provided in VLM contexts)
+        let mut h = self.embed_tokens.forward(input_ids);
+
+        let h_shape = mlxcel_core::array_shape(&h);
+        let seq_len = h_shape[1];
+
         // Create masks
         let fa_mask = Some(create_causal_mask(seq_len, fa_offset));
         let swa_mask = swa_idx.map(|_| {
@@ -457,7 +462,7 @@ impl Ministral3Model {
             create_causal_mask_with_window(seq_len, effective_offset, Some(max_cache))
         });
 
-        // Compute Llama 4 attention scale
+        // Compute Llama 4 attention scale using h.shape[1] (after embedding)
         let attn_scale = if let Some(ref params) = self.rope_params {
             get_llama4_attn_scale(
                 seq_len,
@@ -468,9 +473,6 @@ impl Ministral3Model {
         } else {
             vec![1.0; seq_len as usize]
         };
-
-        // Embed tokens
-        let mut h = self.embed_tokens.forward(input_ids);
 
         // Pass through transformer layers
         for (i, layer) in self.layers.iter().enumerate() {
