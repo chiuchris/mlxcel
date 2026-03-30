@@ -3037,7 +3037,7 @@ namespace {
             auto idx = d_idx * Ds + s_idx;
             auto dB_by_x = x_ * dt_ * static_cast<float>(B_[s_idx]);
             auto state = dA * i_state[idx] + dB_by_x;
-            o_state[idx] = static_cast<T>(state);
+            o_state[idx] = static_cast<U>(state);
             acc += state * C_[s_idx];
         }
         acc = simd_sum(acc);
@@ -3069,12 +3069,12 @@ namespace {
         return holder;
     }
 
-    // Compiled compute_dt: softplus + clip → single fused kernel
-    // Matches Python's @mx.compile compute_dt (CompiledBroadcastAddBroadcastLogAddExpMaximumBroadcastMinimum)
+    // Compiled compute_dt: float32 promotion + softplus + clip → single fused kernel
+    // Matches Python's @mx.compile compute_dt (casts dt to float32 before softplus for precision)
     static std::function<std::vector<array>(const std::vector<array>&)>
     get_compiled_compute_dt() {
         auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            const auto& dt = inputs[0];
+            auto dt = mlx::core::astype(inputs[0], mlx::core::float32);
             const auto& dt_bias = inputs[1];
             const auto& lo = inputs[2];
             const auto& hi = inputs[3];
@@ -3087,9 +3087,8 @@ namespace {
 
     static array compute_dt_compiled(const array& dt, const array& dt_bias, float min_val, float max_val) {
         static auto compiled_fn = get_compiled_compute_dt();
-        auto dt_dtype = dt.dtype();
-        auto lo = mlx::core::astype(mlx::core::array(min_val), dt_dtype);
-        auto hi = mlx::core::astype(mlx::core::array(max_val), dt_dtype);
+        auto lo = mlx::core::array(min_val);
+        auto hi = mlx::core::array(max_val);
         return compiled_fn({dt, dt_bias, lo, hi})[0];
     }
 }
@@ -3312,8 +3311,9 @@ void ssm_update_kernel(
     int g = h / hb;      // heads per group
 
     auto input_type = hidden_states.inner.dtype();
+    auto state_type = state_in.inner.dtype();
 
-    // Compute dt with softplus + clip
+    // Compute dt with softplus + clip (promoted to float32 internally)
     auto dt_result = compute_dt_compiled(dt.inner, dt_bias.inner, time_step_min, time_step_max);
 
     // Call the Metal kernel
@@ -3321,8 +3321,10 @@ void ssm_update_kernel(
 
     // CustomKernelFunction signature:
     // (inputs, output_shapes, output_dtypes, grid, threadgroup, template_args, init_value, verbose, stream)
+    // T = input type for x/out, U = state type for state_in/state_out (allows float32 state accumulation)
     std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
         {"T", input_type},
+        {"U", state_type},
         {"Dh", dh},
         {"Ds", ds},
         {"H", h},
@@ -3334,7 +3336,7 @@ void ssm_update_kernel(
         mlx::core::astype(D.inner, input_type), dt_result, state_in.inner
     };
     std::vector<Shape> output_shapes = {Shape{n, 1, h, dh}, state_in.inner.shape()};
-    std::vector<Dtype> output_dtypes = {input_type, input_type};
+    std::vector<Dtype> output_dtypes = {input_type, state_type};
 
     auto results = kernel(
         inputs,

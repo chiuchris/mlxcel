@@ -609,19 +609,22 @@ impl NemotronHMamba2Mixer {
         let head_dim = self.head_dim as i32;
         let repeats = num_heads / n_groups;
 
-        // Compute dt with bias and limits (same as Mamba2's compute_dt)
-        let dt_biased = mlxcel_core::add(dt, &self.dt_bias);
+        // Compute dt with bias and limits in float32 for numerical precision
+        // (same as Mamba2's compute_dt — upstream mlx-lm casts to float32 before softplus)
+        let dt_f32 = mlxcel_core::astype(dt, mlxcel_core::dtype::FLOAT32);
+        let dt_bias_f32 = mlxcel_core::astype(&self.dt_bias, mlxcel_core::dtype::FLOAT32);
+        let dt_biased = mlxcel_core::add(&dt_f32, &dt_bias_f32);
         let dt_soft = mlxcel_core::softplus(&dt_biased);
         let min_val =
-            mlxcel_core::full_f32(&[1], self.time_step_limit.0, mlxcel_core::dtype::BFLOAT16);
+            mlxcel_core::full_f32(&[1], self.time_step_limit.0, mlxcel_core::dtype::FLOAT32);
         let max_val =
-            mlxcel_core::full_f32(&[1], self.time_step_limit.1, mlxcel_core::dtype::BFLOAT16);
+            mlxcel_core::full_f32(&[1], self.time_step_limit.1, mlxcel_core::dtype::FLOAT32);
         let dt = mlxcel_core::clip(&dt_soft, &min_val, &max_val);
 
-        // A = -exp(A_log), cast to input dtype (A_log is float32 in safetensors,
-        // but Python does .astype(dt.dtype) to keep hidden states in bfloat16)
+        // A = -exp(A_log), cast to dt dtype (Python does .astype(dt.dtype);
+        // since dt is now float32, A stays in float32 for precision)
         let a = mlxcel_core::negative(&mlxcel_core::exp(&self.a_log));
-        let a = mlxcel_core::astype(&a, mlxcel_core::array_dtype(hidden_states));
+        let a = mlxcel_core::astype(&a, mlxcel_core::array_dtype(&dt));
         let a_reshaped = mlxcel_core::reshape(&a, &[1, 1, num_heads]);
 
         // dtA = dt * A
@@ -716,6 +719,9 @@ impl NemotronHMamba2Mixer {
         let d_reshaped = mlxcel_core::reshape(&self.d_param, &[1, 1, num_heads, 1]);
         let d_contrib = mlxcel_core::multiply(&x, &d_reshaped);
         let y = mlxcel_core::add(&y, &d_contrib);
+
+        // Cast y back to input dtype (dt computation was promoted to float32)
+        let y = mlxcel_core::astype(&y, mlxcel_core::array_dtype(hidden_states));
 
         (y, next_state)
     }

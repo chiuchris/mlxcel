@@ -190,19 +190,21 @@ impl Default for Mamba2Cache {
 }
 
 // Helper Functions.
-/// Compute dt with bias and time step limits
+/// Compute dt with bias and time step limits in float32 for numerical precision
+/// (upstream mlx-lm casts dt to float32 before softplus)
 fn compute_dt(
     dt: &MlxArray,
     dt_bias: &MlxArray,
     time_step_limit: (f32, f32),
 ) -> UniquePtr<MlxArray> {
-    let dt_biased = mlxcel_core::add(dt, dt_bias);
+    let dt_f32 = mlxcel_core::astype(dt, mlxcel_core::dtype::FLOAT32);
+    let dt_bias_f32 = mlxcel_core::astype(dt_bias, mlxcel_core::dtype::FLOAT32);
+    let dt_biased = mlxcel_core::add(&dt_f32, &dt_bias_f32);
     let dt_soft = mlxcel_core::softplus(&dt_biased);
 
-    // Clip to time step limits
-    let dt_dtype = mlxcel_core::array_dtype(&dt_soft);
-    let min_val = mlxcel_core::full_f32(&[1], time_step_limit.0, dt_dtype);
-    let max_val = mlxcel_core::full_f32(&[1], time_step_limit.1, dt_dtype);
+    // Clip to time step limits (float32)
+    let min_val = mlxcel_core::full_f32(&[1], time_step_limit.0, mlxcel_core::dtype::FLOAT32);
+    let max_val = mlxcel_core::full_f32(&[1], time_step_limit.1, mlxcel_core::dtype::FLOAT32);
     mlxcel_core::clip(&dt_soft, &min_val, &max_val)
 }
 
@@ -280,8 +282,10 @@ fn ssm_attn(
     let repeats = num_heads / n_groups;
 
     // Compute dt, A, dtA, dtx for full sequence
+    // dt is now float32 after compute_dt promotion; A matches dt dtype for precision
     let dt = compute_dt(dt, dt_bias, time_step_limit);
     let a = mlxcel_core::negative(&mlxcel_core::exp(a_log));
+    let a = mlxcel_core::astype(&a, mlxcel_core::array_dtype(&dt));
     let a_reshaped = mlxcel_core::reshape(&a, &[1, 1, num_heads]);
     let dt_a = mlxcel_core::multiply(&dt, &a_reshaped);
     let dt_exp = mlxcel_core::reshape(&dt, &[batch, seq_len as i32, num_heads, 1]);
@@ -384,6 +388,9 @@ fn ssm_attn(
     let d_reshaped = mlxcel_core::reshape(d, &[1, 1, num_heads, 1]);
     let d_contrib = mlxcel_core::multiply(x, &d_reshaped);
     y = mlxcel_core::add(&y, &d_contrib);
+
+    // Cast y back to input dtype (dt computation was promoted to float32)
+    y = mlxcel_core::astype(&y, mlxcel_core::array_dtype(x));
 
     (y, current_state.unwrap())
 }
