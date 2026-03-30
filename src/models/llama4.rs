@@ -38,7 +38,14 @@ pub enum Llama4Cache {
 }
 
 impl Llama4Cache {
-    /// Get the current offset (total tokens processed)
+    /// Get the current offset (total tokens processed).
+    ///
+    /// In Python mlx-vlm, `BatchKVCache` can return an `mx.array`-valued offset
+    /// when doing batch inference, requiring a `.max().item()` guard before using
+    /// it in `mx.arange`. In Rust, offset is always `i32` (scalar), so no such
+    /// guard is needed. Batch inference is also disabled for Llama4Wrapper
+    /// (`supports_batching()` returns false), making array-valued offsets
+    /// structurally impossible.
     pub fn offset(&self) -> i32 {
         match self {
             Llama4Cache::Chunked(c) => c.get_offset(),
@@ -46,7 +53,12 @@ impl Llama4Cache {
         }
     }
 
-    /// Get the start position (for chunked cache)
+    /// Get the start position (for chunked cache).
+    ///
+    /// Returns `0` for `Regular` variant. In Python, `getattr(cache[0],
+    /// "start_position", 0)` is used defensively for caches that may not have
+    /// this attribute (e.g. `BatchKVCache`). In Rust the enum always has a
+    /// well-defined answer, so no fallback is needed.
     pub fn start_position(&self) -> i32 {
         match self {
             Llama4Cache::Chunked(c) => c.get_start_position(),
@@ -54,7 +66,12 @@ impl Llama4Cache {
         }
     }
 
-    /// Maybe trim the front of chunked caches
+    /// Maybe trim the front of chunked caches.
+    ///
+    /// In Python, this is guarded with `hasattr(c, "maybe_trim_front")` because
+    /// `BatchKVCache` does not implement that method. In Rust the enum handles
+    /// both variants explicitly: `Chunked` delegates to the inner cache and
+    /// `Regular` is a no-op, so no runtime guard is required.
     pub fn maybe_trim_front(&mut self) {
         if let Llama4Cache::Chunked(c) = self {
             c.maybe_trim_front();
@@ -1489,7 +1506,15 @@ impl LanguageModel for Llama4Wrapper {
     }
 
     fn supports_batching(&self) -> bool {
-        false // Llama4 uses internal RefCell ChunkedKVCaches, not compatible with per-sequence KV isolation
+        // Llama4 uses internal RefCell<Vec<Llama4Cache>>, which combines
+        // ChunkedKVCache and KVCache in an interleaved pattern and is not
+        // compatible with the per-sequence KV isolation required for batching.
+        //
+        // As a consequence, the array-valued offset issue present in Python
+        // mlx-vlm's BatchKVCache (where `cache.offset` is an `mx.array`
+        // requiring `.max().item()` before use in `mx.arange`) cannot arise
+        // in this Rust implementation. All offset values are plain `i32`.
+        false
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
