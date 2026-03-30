@@ -65,6 +65,8 @@ pub struct Mamba2Config {
     pub ssm_state_size: Option<usize>,
     #[serde(default)]
     pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
 }
 
 impl Mamba2Config {
@@ -909,6 +911,6 @@ impl LanguageModel for Mamba2Model {
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
-        vec![0] // Mamba2 EOS token: <|endoftext|>
+        super::mamba::parse_eos_token_ids(&self.config.eos_token_id, 0)
     }
 }

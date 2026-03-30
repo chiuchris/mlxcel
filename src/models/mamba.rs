@@ -23,6 +23,19 @@ use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::path::Path;
 
+/// Parse eos_token_id from config.json. Can be a single int, an array of ints, or absent.
+/// Used by: Mamba, Mamba2
+pub fn parse_eos_token_ids(value: &Option<serde_json::Value>, default: i32) -> Vec<i32> {
+    match value {
+        Some(serde_json::Value::Number(n)) => vec![n.as_i64().unwrap_or(default as i64) as i32],
+        Some(serde_json::Value::Array(arr)) => arr
+            .iter()
+            .filter_map(|v| v.as_i64().map(|n| n as i32))
+            .collect(),
+        _ => vec![default],
+    }
+}
+
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Quantization {
@@ -60,6 +73,10 @@ pub struct MambaConfig {
     pub rms_norm_eps: f32,
     #[serde(default)]
     pub quantization: Option<Quantization>,
+    #[serde(default)]
+    pub eos_token_id: Option<serde_json::Value>,
+    #[serde(default)]
+    pub bos_token_id: Option<serde_json::Value>,
 }
 
 fn default_true() -> bool {
@@ -139,13 +156,14 @@ impl Default for MambaCache {
 
 // Helper Functions.
 /// RMS normalization without learnable scale (for mixer_norm in falcon_mamba)
+/// RMS norm without learned scale — matches Python's
+/// `mx.fast.rms_norm(x, mx.ones(x.shape[-1], x.dtype), eps)`.
+/// Uses MLX fast kernel for float32-precision internal computation.
 fn rms_norm_no_scale(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray> {
-    let x_sq = mlxcel_core::multiply(x, x);
-    let mean_sq = mlxcel_core::mean_axis(&x_sq, -1, true);
-    let eps_arr = mlxcel_core::full_f32(&[1], eps, mlxcel_core::array_dtype(&mean_sq));
-    let mean_plus_eps = mlxcel_core::add(&mean_sq, &eps_arr);
-    let rms = mlxcel_core::sqrt(&mean_plus_eps);
-    mlxcel_core::divide(x, &rms)
+    let shape = mlxcel_core::array_shape(x);
+    let last_dim = shape[shape.len() - 1];
+    let ones = mlxcel_core::ones(&[last_dim], mlxcel_core::array_dtype(x));
+    mlxcel_core::fast_rms_norm(x, &ones, eps)
 }
 
 // Model Components.
@@ -267,10 +285,13 @@ impl MambaBlock {
             -1,
         );
 
-        // Apply mixer_norm if needed
-        let delta_normed = self.mixer_norm(&delta_raw);
-        let b_normed = self.mixer_norm(&b_raw);
-        let c_normed = self.mixer_norm(&c_raw);
+        // Apply mixer_norm if needed.
+        // Python reference applies mixer_norm TWICE when use_bcdt_rms is true:
+        // 1. During the map() over split outputs
+        // 2. Again in the `if self.use_bcdt_rms:` block
+        let delta_normed = self.mixer_norm(&self.mixer_norm(&delta_raw));
+        let b_normed = self.mixer_norm(&self.mixer_norm(&b_raw));
+        let c_normed = self.mixer_norm(&self.mixer_norm(&c_raw));
 
         // delta = softplus(dt_proj(delta))
         let dt_out = self.dt_proj.forward(&delta_normed);
@@ -629,22 +650,10 @@ impl LanguageModel for MambaModel {
         _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        // Note: For Mamba, we process WITHOUT caching for the LanguageModel trait
-        // This is a simplified implementation - state accumulates within each call
-        // but is not preserved between calls
-        let mut h = self.embeddings.forward(input);
-
-        for layer in &self.layers {
-            h = layer.forward(&h, None);
-        }
-
-        let h = self.norm_f.forward(&h);
-
-        if let Some(ref head) = self.lm_head {
-            head.forward(&h)
-        } else {
-            self.embeddings.as_linear(&h)
-        }
+        // Mamba v1 uses internal caching (MambaCache) instead of KV cache.
+        // We use internal RefCell caches to maintain state through shared reference.
+        let mut internal = self.internal_caches.borrow_mut();
+        self.forward_with_caches(input, &mut internal)
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
@@ -665,7 +674,6 @@ impl LanguageModel for MambaModel {
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {
-        // Default EOS token ID - typically needs to be set from tokenizer
-        vec![2] // Common EOS token ID
+        parse_eos_token_ids(&self.config.eos_token_id, 2)
     }
 }

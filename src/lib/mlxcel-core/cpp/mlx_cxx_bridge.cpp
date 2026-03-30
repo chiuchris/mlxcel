@@ -2495,10 +2495,14 @@ std::unique_ptr<MlxArray> log1p(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::log1p(a.inner));
 }
 
-// Softplus activation: log(1 + exp(x))
-// Uses identity: softplus(x) = log1p(exp(x))
+// Numerically stable softplus activation: log(1 + exp(x))
+// Uses logaddexp(x, 0) = log(exp(x) + exp(0)) which matches Python's mx.logaddexp(x, 0).
+// This avoids float16 overflow that log1p(exp(x)) causes for x >= ~11.09
+// (where exp(x) overflows float16's max of 65504).
+// Used by: Mamba, Mamba2, SSM models for delta = softplus(dt_proj(delta))
 std::unique_ptr<MlxArray> softplus(const MlxArray& a) {
-    return std::make_unique<MlxArray>(mlx::core::log1p(mlx::core::exp(a.inner)));
+    auto zero = mlx::core::zeros_like(a.inner);
+    return std::make_unique<MlxArray>(mlx::core::logaddexp(a.inner, zero));
 }
 
 // 1D convolution with groups support (for depthwise conv when groups=channels)
@@ -3510,10 +3514,11 @@ void fused_mamba2_forward(
     MlxArray gate_w{gate};
     auto y_gated = multiply(y, compiled_silu(gate_w)->inner);
 
-    // 7b. Grouped RMS norm: reshape last dim into [batch, seq_len, num_heads, head_dim]
-    //     (norm group_size == head_dim, i.e. one RMS norm group per head)
-    auto y_grouped = reshape(y_gated, {batch, seq_len, num_heads, head_dim});
-    auto unit_weight = mlx::core::ones({head_dim}, hidden_states.inner.dtype());
+    // 7b. Grouped RMS norm: reshape last dim into [batch, seq_len, n_groups, group_size]
+    //     where group_size = intermediate_size / n_groups (NOT head_dim!)
+    int norm_group_size = intermediate_size / n_groups;
+    auto y_grouped = reshape(y_gated, {batch, seq_len, n_groups, norm_group_size});
+    auto unit_weight = mlx::core::ones({norm_group_size}, hidden_states.inner.dtype());
     auto y_normed_grouped = mlx::core::fast::rms_norm(y_grouped, unit_weight, norm_eps);
 
     // 7c. Flatten back and apply learned norm weight

@@ -201,7 +201,10 @@ pub fn relu_squared(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::compiled_relu_squared(x)
 }
 
-/// Softplus activation: log(1 + exp(x))
+///// Numerically stable softplus activation: log(1 + exp(x)).
+/// Uses logaddexp(x, 0) internally to match Python's mx.logaddexp(x, 0).
+/// This avoids float16 overflow for values >= ~11.09 (exp(x) > float16 max).
+/// Used by: Mamba, Mamba2, Jamba, GatedDelta, RecurrentGemma
 #[inline]
 pub fn softplus(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::softplus(x)
