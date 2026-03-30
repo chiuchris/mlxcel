@@ -257,7 +257,16 @@ impl Qwen35GatedDeltaNet {
         let conv_state = if let Some(ref c) = cache {
             c.conv_state
                 .as_ref()
-                .map(|s| mlxcel_core::copy(s.as_ref().unwrap()))
+                .and_then(|s| {
+                    let s = s.as_ref().unwrap();
+                    let state_shape = mlxcel_core::array_shape(s);
+                    // Guard: reinitialize if batch dimension doesn't match (continuous batching)
+                    if state_shape[0] != b {
+                        None
+                    } else {
+                        Some(mlxcel_core::copy(s))
+                    }
+                })
                 .unwrap_or_else(|| {
                     mlxcel_core::zeros(
                         &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
@@ -271,8 +280,15 @@ impl Qwen35GatedDeltaNet {
             )
         };
 
+        // Guard: discard mask if batch dimension doesn't match (continuous batching).
+        // Uses guarded_mask consistently for both the conv masking and gated_delta_update.
+        let guarded_mask = mask.filter(|m| {
+            let mask_shape = mlxcel_core::array_shape(m);
+            mask_shape[0] == b
+        });
+
         // Apply mask if present (mask qkv before conv)
-        let qkv = if let Some(m) = mask {
+        let qkv = if let Some(m) = guarded_mask {
             let m_exp = mlxcel_core::expand_dims(m, -1);
             let zero = mlxcel_core::full_f32(&[1], 0.0, input_dtype);
             mlxcel_core::where_cond(&m_exp, &qkv, &zero)
@@ -338,10 +354,17 @@ impl Qwen35GatedDeltaNet {
         );
 
         // Get recurrent state from cache
+        // Guard: discard cached state if batch dimension doesn't match (continuous batching)
         let state = cache.as_ref().and_then(|c| {
-            c.state_cache
-                .as_ref()
-                .map(|s| mlxcel_core::copy(s.as_ref().unwrap()))
+            c.state_cache.as_ref().and_then(|s| {
+                let s = s.as_ref().unwrap();
+                let state_shape = mlxcel_core::array_shape(s);
+                if state_shape[0] != b {
+                    None
+                } else {
+                    Some(mlxcel_core::copy(s))
+                }
+            })
         });
 
         // Apply RMS norm with scaling (same as Qwen3Next)
@@ -361,7 +384,7 @@ impl Qwen35GatedDeltaNet {
         let scale_k = mlxcel_core::full_f32(&[1], inv_scale, q_dtype);
         let k = mlxcel_core::multiply(&mlxcel_core::divide(&k, &k_rms), &scale_k);
 
-        // Run gated delta update
+        // Run gated delta update (use guarded_mask which is None if batch dims mismatch)
         let (out, new_state) = gated_delta_update(
             &q,
             &k,
@@ -371,7 +394,7 @@ impl Qwen35GatedDeltaNet {
             &self.a_log,
             &self.dt_bias,
             state.as_deref(),
-            mask,
+            guarded_mask,
         );
 
         // Update cache state
