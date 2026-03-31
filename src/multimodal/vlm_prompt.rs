@@ -58,17 +58,30 @@ pub fn apply_image_token_blocks(
         return None;
     }
 
+    // Count existing image tokens or BOI tokens (from chat template) that
+    // should be expanded into full image-token blocks.
+    // Gemma3 VLM chat templates emit <start_of_image> (= boi_token_id) which
+    // must be expanded the same way as a bare image_token_id placeholder.
     let existing_image_count = prompt_tokens
         .iter()
         .filter(|&&token| token == info.image_token_id)
         .count();
+    let existing_boi_count = if info.use_boi_eoi && info.boi_token_id != info.image_token_id {
+        prompt_tokens
+            .iter()
+            .filter(|&&token| token == info.boi_token_id)
+            .count()
+    } else {
+        0
+    };
+    let total_existing = existing_image_count + existing_boi_count;
 
-    if existing_image_count > 0 {
+    if total_existing > 0 {
         let mut expanded = Vec::with_capacity(
-            prompt_tokens.len() + (info.mm_tokens_per_image - 1) * existing_image_count,
+            prompt_tokens.len() + (info.mm_tokens_per_image - 1) * total_existing,
         );
         for &token in prompt_tokens.iter() {
-            if token == info.image_token_id {
+            if token == info.image_token_id || (info.use_boi_eoi && token == info.boi_token_id) {
                 if info.use_boi_eoi {
                     expanded.push(info.boi_token_id);
                 }
@@ -86,7 +99,7 @@ pub fn apply_image_token_blocks(
 
         return Some(ImageTokenBlockStats {
             action: ImageTokenBlockAction::Expanded {
-                existing_image_count,
+                existing_image_count: total_existing,
             },
             tokens_per_image: info.mm_tokens_per_image,
         });

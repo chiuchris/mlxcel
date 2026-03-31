@@ -102,6 +102,56 @@ impl ChatTemplateProcessor {
         self.add_generation_prompt = add;
     }
 
+    /// Apply the chat template with raw JSON messages (for multimodal content).
+    ///
+    /// This allows passing messages with list-type content entries (e.g.,
+    /// `[{"type": "image"}, {"type": "text", "text": "..."}]`) that Jinja2
+    /// templates like Gemma3 VLM can iterate over.
+    pub fn apply_raw(&self, messages: &serde_json::Value) -> Result<String> {
+        let mut env = Environment::new();
+        env.set_keep_trailing_newline(true);
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
+
+        env.add_template("chat", &self.template)
+            .with_context(|| "Failed to parse chat template")?;
+
+        env.add_function(
+            "raise_exception",
+            |msg: String| -> Result<Value, minijinja::Error> {
+                Err(minijinja::Error::new(
+                    minijinja::ErrorKind::InvalidOperation,
+                    msg,
+                ))
+            },
+        );
+
+        env.add_function("strftime_now", |_format: String| -> String {
+            chrono::Utc::now().format("%d %b %Y").to_string()
+        });
+
+        let tmpl = env.get_template("chat")?;
+
+        // Convert serde_json::Value to minijinja::Value
+        let messages_val = minijinja::Value::from_serialize(messages);
+
+        let tools: Option<Vec<String>> = None;
+        let context = minijinja::context! {
+            messages => messages_val,
+            bos_token => &self.bos_token,
+            eos_token => &self.eos_token,
+            add_generation_prompt => self.add_generation_prompt,
+            tools => tools,
+            enable_thinking => false,
+        };
+
+        let result = tmpl
+            .render(context)
+            .with_context(|| "Failed to render chat template")?;
+
+        Ok(result)
+    }
+
     /// Apply the chat template to messages
     pub fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
         let mut env = Environment::new();

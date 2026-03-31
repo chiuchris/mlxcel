@@ -107,10 +107,39 @@ fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str
         .unwrap_or_else(|_| user_prompt.to_string())
 }
 
+/// Apply chat template with image placeholders for VLM models.
+///
+/// Creates multimodal content entries that Gemma3-style templates can
+/// render into `<start_of_image>` tokens (which are later expanded into
+/// full image-token blocks by `apply_image_token_blocks`).
+fn apply_vlm_chat_template(
+    processor: &ChatTemplateProcessor,
+    user_prompt: &str,
+    num_images: usize,
+) -> String {
+    // Build a multimodal content list: [{type: image}, ..., {type: text, text: prompt}]
+    let mut content_parts: Vec<serde_json::Value> = Vec::new();
+    for _ in 0..num_images {
+        content_parts.push(serde_json::json!({"type": "image"}));
+    }
+    content_parts.push(serde_json::json!({"type": "text", "text": user_prompt}));
+
+    let messages = serde_json::json!([{
+        "role": "user",
+        "content": content_parts,
+    }]);
+
+    processor.apply_raw(&messages).unwrap_or_else(|_| {
+        // Fallback: text-only template
+        apply_user_chat_template(processor, user_prompt)
+    })
+}
+
 fn resolve_cli_prompt(
     user_prompt: &str,
     no_chat_template: bool,
     processor: Option<&ChatTemplateProcessor>,
+    num_images: usize,
 ) -> String {
     if no_chat_template {
         return user_prompt.to_string();
@@ -118,11 +147,22 @@ fn resolve_cli_prompt(
 
     processor.map_or_else(
         || user_prompt.to_string(),
-        |processor| apply_user_chat_template(processor, user_prompt),
+        |processor| {
+            if num_images > 0 {
+                apply_vlm_chat_template(processor, user_prompt, num_images)
+            } else {
+                apply_user_chat_template(processor, user_prompt)
+            }
+        },
     )
 }
 
-fn load_cli_prompt(model_path: &Path, user_prompt: &str, no_chat_template: bool) -> String {
+fn load_cli_prompt(
+    model_path: &Path,
+    user_prompt: &str,
+    no_chat_template: bool,
+    num_images: usize,
+) -> String {
     let processor = if no_chat_template {
         None
     } else {
@@ -131,7 +171,12 @@ fn load_cli_prompt(model_path: &Path, user_prompt: &str, no_chat_template: bool)
             .flatten()
     };
 
-    resolve_cli_prompt(user_prompt, no_chat_template, processor.as_ref())
+    resolve_cli_prompt(
+        user_prompt,
+        no_chat_template,
+        processor.as_ref(),
+        num_images,
+    )
 }
 
 fn tokenize_prompt(
@@ -368,6 +413,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         &args.model.model,
         &args.generation.prompt,
         args.generation.no_chat_template,
+        args.generation.image.len(),
     );
     let mut prompt_tokens = tokenize_prompt(&tokenizer, &prompt)?;
 
