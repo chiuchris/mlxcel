@@ -308,12 +308,20 @@ pub struct MLP {
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
+        // Non-quantized path: fused compiled FP MLP (single compiled graph)
+        if let Some(result) = mlxcel_core::layers::compiled_swiglu_mlp_fp16(
+            x,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ) {
+            return result;
+        }
+
+        // Quantized path: separate projections + compiled SwiGLU activation
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-
-        // Use compiled SwiGLU for kernel fusion
         let activated = mlxcel_core::compiled_swiglu_activation(&gate, &up);
-
         self.down_proj.forward(&activated)
     }
 

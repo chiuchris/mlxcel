@@ -237,7 +237,7 @@ pub struct MLP {
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // GeGLU: gelu(gate_proj(x)) * up_proj(x), then down_proj
-        // Use compiled GELU MLP when possible for kernel fusion
+        // Quantized path: fused compiled quantized MLP
         if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
             self.gate_proj.quantized_weight(),
             self.up_proj.quantized_weight(),
@@ -262,7 +262,17 @@ impl MLP {
             };
         }
 
-        // Fallback: separate operations
+        // Non-quantized path: fused compiled FP MLP
+        if let Some(result) = mlxcel_core::layers::compiled_gelu_mlp_fp16(
+            x,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ) {
+            return result;
+        }
+
+        // Fallback: separate operations with compiled activation
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
         let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);

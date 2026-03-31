@@ -561,6 +561,32 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) weights
+        /// Fuses gate_proj + silu + up_proj + multiply + down_proj into compiled graph
+        /// Used by: Llama, Qwen2, Qwen3, Mistral and other SwiGLU FP models
+        unsafe fn compiled_swiglu_mlp_forward_fp16(
+            x: &MlxArray,
+            gate_weight: &MlxArray,
+            up_weight: &MlxArray,
+            down_weight: &MlxArray,
+            gate_bias: *const MlxArray,
+            up_bias: *const MlxArray,
+            down_bias: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled GELU MLP forward for non-quantized (FP16/BF16) weights
+        /// Fuses gate_proj + gelu + up_proj + multiply + down_proj into compiled graph
+        /// Used by: Gemma2, Gemma3, StarCoder2 and other GELU-gated FP models
+        unsafe fn compiled_gelu_mlp_forward_fp16(
+            x: &MlxArray,
+            gate_weight: &MlxArray,
+            up_weight: &MlxArray,
+            down_weight: &MlxArray,
+            gate_bias: *const MlxArray,
+            up_bias: *const MlxArray,
+            down_bias: *const MlxArray,
+        ) -> UniquePtr<MlxArray>;
+
         /// Full transformer layer forward (maximum FFI reduction)
         unsafe fn transformer_layer_forward(
             x: &MlxArray,

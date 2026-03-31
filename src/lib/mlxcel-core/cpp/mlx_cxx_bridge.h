@@ -410,6 +410,34 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     rust::Str mode
 );
 
+// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
+//   down_proj(silu(gate_proj(x)) * up_proj(x))
+// Fuses gate_proj + silu + up_proj + multiply + down_proj into compiled graph.
+// Used by: Llama, Qwen2, Qwen3, Mistral and other SwiGLU FP models
+std::unique_ptr<MlxArray> compiled_swiglu_mlp_forward_fp16(
+    const MlxArray& x,
+    const MlxArray& gate_weight,
+    const MlxArray& up_weight,
+    const MlxArray& down_weight,
+    const MlxArray* gate_bias,
+    const MlxArray* up_bias,
+    const MlxArray* down_bias
+);
+
+// Compiled GELU MLP forward for non-quantized (FP16/BF16) weights:
+//   down_proj(gelu(gate_proj(x)) * up_proj(x))
+// Fuses gate_proj + gelu + up_proj + multiply + down_proj into compiled graph.
+// Used by: Gemma2, Gemma3, StarCoder2 and other GELU-gated FP models
+std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
+    const MlxArray& x,
+    const MlxArray& gate_weight,
+    const MlxArray& up_weight,
+    const MlxArray& down_weight,
+    const MlxArray* gate_bias,
+    const MlxArray* up_bias,
+    const MlxArray* down_bias
+);
+
 // Full transformer layer forward (maximum FFI reduction)
 // Combines: attention + MLP + residuals + norms
 std::unique_ptr<MlxArray> transformer_layer_forward(

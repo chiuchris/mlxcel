@@ -594,6 +594,15 @@ impl UnifiedLinear {
             Self::Regular(_) => None,
         }
     }
+
+    /// Get a reference to the inner Linear (if non-quantized)
+    /// Used by compiled FP MLP operations that need direct weight/bias access
+    pub fn regular_weight(&self) -> Option<&Linear> {
+        match self {
+            Self::Regular(linear) => Some(linear),
+            Self::Quantized { .. } => None,
+        }
+    }
 }
 
 /// Fused QKV linear layer for GQA models.
@@ -1344,4 +1353,100 @@ impl MultiLinear {
             MultiLinear::Regular(r) => ffi::matmul(x, &r.weight),
         }
     }
+}
+
+/// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+///
+/// When all three projections are non-quantized, calls the fused compiled C++ path
+/// (`compiled_swiglu_mlp_forward_fp16`) which fuses the entire MLP into a single
+/// compiled graph for kernel fusion.  Falls back to the unfused path for biased layers.
+///
+/// Returns `None` if any projection is quantized (caller should use the quantized path).
+///
+/// Used by: Llama, Qwen2, Qwen3, Mistral and other SwiGLU FP models
+pub fn compiled_swiglu_mlp_fp16(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    let gate_lin = gate_proj.regular_weight()?;
+    let up_lin = up_proj.regular_weight()?;
+    let down_lin = down_proj.regular_weight()?;
+
+    let gate_bias_ptr = gate_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let up_bias_ptr = up_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let down_bias_ptr = down_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+
+    Some(unsafe {
+        ffi::compiled_swiglu_mlp_forward_fp16(
+            x,
+            &gate_lin.weight,
+            &up_lin.weight,
+            &down_lin.weight,
+            gate_bias_ptr,
+            up_bias_ptr,
+            down_bias_ptr,
+        )
+    })
+}
+
+/// Compiled GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+///
+/// When all three projections are non-quantized, calls the fused compiled C++ path
+/// (`compiled_gelu_mlp_forward_fp16`) which fuses the entire MLP into a single
+/// compiled graph for kernel fusion.  Falls back to the unfused path for biased layers.
+///
+/// Returns `None` if any projection is quantized (caller should use the quantized path).
+///
+/// Used by: Gemma2, Gemma3, StarCoder2 and other GELU-gated FP models
+pub fn compiled_gelu_mlp_fp16(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    let gate_lin = gate_proj.regular_weight()?;
+    let up_lin = up_proj.regular_weight()?;
+    let down_lin = down_proj.regular_weight()?;
+
+    let gate_bias_ptr = gate_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let up_bias_ptr = up_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+    let down_bias_ptr = down_lin
+        .bias
+        .as_ref()
+        .map(|b| b.as_ref().unwrap() as *const MlxArray)
+        .unwrap_or(std::ptr::null());
+
+    Some(unsafe {
+        ffi::compiled_gelu_mlp_forward_fp16(
+            x,
+            &gate_lin.weight,
+            &up_lin.weight,
+            &down_lin.weight,
+            gate_bias_ptr,
+            up_bias_ptr,
+            down_bias_ptr,
+        )
+    })
 }
