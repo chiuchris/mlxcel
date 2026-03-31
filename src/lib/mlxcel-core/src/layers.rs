@@ -1370,6 +1370,13 @@ pub fn compiled_swiglu_mlp_fp16(
     up_proj: &UnifiedLinear,
     down_proj: &UnifiedLinear,
 ) -> Option<crate::UniquePtr<MlxArray>> {
+    // Skip compiled FP MLP for bfloat16 inputs: the compiled kernel JIT
+    // creates float32 constants (for SiLU) that cause type promotion overhead
+    // and incorrect results on some hardware configurations.
+    // Fall back to separate operations which handle bf16 natively.
+    if crate::ffi::array_dtype(x) == crate::dtype::BFLOAT16 {
+        return None;
+    }
     let gate_lin = gate_proj.regular_weight()?;
     let up_lin = up_proj.regular_weight()?;
     let down_lin = down_proj.regular_weight()?;
@@ -1473,6 +1480,10 @@ pub fn compiled_gelu_mlp_fp16(
     up_proj: &UnifiedLinear,
     down_proj: &UnifiedLinear,
 ) -> Option<crate::UniquePtr<MlxArray>> {
+    // Skip compiled FP MLP for bfloat16 inputs (same reason as SwiGLU variant)
+    if crate::ffi::array_dtype(x) == crate::dtype::BFLOAT16 {
+        return None;
+    }
     let gate_lin = gate_proj.regular_weight()?;
     let up_lin = up_proj.regular_weight()?;
     let down_lin = down_proj.regular_weight()?;

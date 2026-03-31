@@ -52,9 +52,7 @@ pub fn estimate_model_params_billions(model_path: &Path) -> Option<f64> {
 
 fn estimate_params_from_config(config: &serde_json::Value) -> Option<f64> {
     // Support models that wrap text config under a "text_config" key (VLMs).
-    let text_cfg = config
-        .get("text_config")
-        .unwrap_or(config);
+    let text_cfg = config.get("text_config").unwrap_or(config);
 
     let hidden_size = text_cfg
         .get("hidden_size")
@@ -115,11 +113,10 @@ fn estimate_params_from_config(config: &serde_json::Value) -> Option<f64> {
     //   norms: 2 × num_layers × hidden_size (small, included for accuracy)
     let embedding_params = vocab_size * hidden_size;
 
-    let attn_params_per_layer =
-        hidden_size * (num_heads * head_dim)          // Q proj
+    let attn_params_per_layer = hidden_size * (num_heads * head_dim)          // Q proj
         + hidden_size * (kv_heads * head_dim)         // K proj
         + hidden_size * (kv_heads * head_dim)         // V proj
-        + (num_heads * head_dim) * hidden_size;       // O proj
+        + (num_heads * head_dim) * hidden_size; // O proj
 
     let ffn_params_per_layer = 3.0 * hidden_size * ffn_size * num_experts;
     let norm_params_per_layer = 2.0 * hidden_size;
@@ -192,12 +189,9 @@ pub fn advise_quantization(
     model_params_override: Option<f64>,
 ) -> QuantAdvice {
     let estimated_params = estimate_model_params_billions(model_path);
-    let params = model_params_override
-        .or(estimated_params)
-        .unwrap_or(7.0); // safe fallback: assume 7B when unknown
+    let params = model_params_override.or(estimated_params).unwrap_or(7.0); // safe fallback: assume 7B when unknown
 
-    let recommendation =
-        recommend_quantization(params, hw.unified_memory_gb, hw);
+    let recommendation = recommend_quantization(params, hw.unified_memory_gb, hw);
 
     let uses_bf16 = model_uses_bfloat16(model_path);
 
@@ -230,7 +224,10 @@ pub fn print_quant_advice(advice: &QuantAdvice, hw: &HardwareCapabilities) {
     }
 
     println!();
-    println!("  Recommendation: {}", advice.recommendation.label().to_uppercase());
+    println!(
+        "  Recommendation: {}",
+        advice.recommendation.label().to_uppercase()
+    );
     println!("  Reason:         {}", advice.recommendation.reason());
 
     if advice.model_uses_bfloat16 && hw.has_neural_accelerator {
@@ -299,7 +296,11 @@ mod tests {
             }
         });
         let params = estimate_params_from_config(&config).unwrap();
-        assert!(params > 5.0, "Expected >5B for LLaVA-7B config, got {:.2}B", params);
+        assert!(
+            params > 5.0,
+            "Expected >5B for LLaVA-7B config, got {:.2}B",
+            params
+        );
     }
 
     #[test]

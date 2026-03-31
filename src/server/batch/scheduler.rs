@@ -212,7 +212,8 @@ impl BatchScheduler {
                     // least 2 requests are waiting, otherwise take the regular
                     // single-request path so there is zero overhead for the
                     // common case.
-                    if self.max_batch_prefill > 1 && self.prefill_queue.len() >= 2
+                    if self.max_batch_prefill > 1
+                        && self.prefill_queue.len() >= 2
                         && self.chunked_prefill_seq.is_none()
                     {
                         self.execute_batched_prefill();
@@ -533,9 +534,7 @@ impl BatchScheduler {
         // per-sequence and would need separate handling). Fall back for the
         // whole batch when any request carries VLM embeddings.
         if seqs.iter().any(|s| s.vlm_embeddings.is_some()) {
-            tracing::debug!(
-                "batched prefill: falling back to sequential (VLM request in batch)"
-            );
+            tracing::debug!("batched prefill: falling back to sequential (VLM request in batch)");
             for seq in seqs {
                 self.execute_full_prefill(seq);
             }
@@ -550,11 +549,7 @@ impl BatchScheduler {
             max_len
         };
 
-        tracing::debug!(
-            "batched prefill: {} requests, padded to {}",
-            b,
-            padded_len
-        );
+        tracing::debug!("batched prefill: {} requests, padded to {}", b, padded_len);
 
         // Transition all sequences to Prefilling.
         for seq in &mut seqs {
@@ -579,8 +574,7 @@ impl BatchScheduler {
         // Each mask has shape [padded_len, padded_len]; we add a batch dim
         // by expanding to [1, padded_len, padded_len] and stacking into
         // [B, padded_len, padded_len] so models can use it directly.
-        let mut batch_masks: Vec<UniquePtr<mlxcel_core::MlxArray>> =
-            Vec::with_capacity(b);
+        let mut batch_masks: Vec<UniquePtr<mlxcel_core::MlxArray>> = Vec::with_capacity(b);
         for seq in &seqs {
             let actual = seq.prompt_tokens.len() as i32;
             let padded = padded_len as i32;
@@ -594,8 +588,7 @@ impl BatchScheduler {
         let stacked_mask = mlxcel_core::stack_owned(&batch_masks, 0);
 
         // Collect cache pointers (one cache slice per sequence).
-        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> =
-            Vec::with_capacity(b);
+        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> = Vec::with_capacity(b);
         let mut valid = true;
         for seq in &seqs {
             match self.cache_pool.get_caches_mut(seq.seq_id) {
@@ -631,9 +624,9 @@ impl BatchScheduler {
             .collect();
 
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
-        let raw_logits =
-            self.model
-                .forward_batched(&input, &mut batch_caches, Some(&stacked_mask));
+        let raw_logits = self
+            .model
+            .forward_batched(&input, &mut batch_caches, Some(&stacked_mask));
 
         mlxcel_core::eval(&raw_logits);
         mlxcel_core::clear_memory_cache();
@@ -667,8 +660,7 @@ impl BatchScheduler {
             }
 
             seq.prefill_offset = actual_len;
-            self.batch_observability
-                .record_prefill_start(actual_len);
+            self.batch_observability.record_prefill_start(actual_len);
 
             let eos_tokens =
                 merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);

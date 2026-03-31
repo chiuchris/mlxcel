@@ -470,12 +470,17 @@ impl Gemma3Model {
         let shape = mlxcel_core::array_shape(input_ids);
         let seq_len = shape[1];
 
-        // Use pre-computed embeddings if provided, otherwise embed tokens
+        // Use pre-computed embeddings if provided, otherwise embed tokens.
+        // In both cases, apply Gemma's sqrt(hidden_size) normalizer.
+        // Python: h *= mx.array(self.args.hidden_size**0.5, mx.bfloat16)
         let mut h = if let Some(embeddings) = input_embeddings {
             mlxcel_core::copy(embeddings)
         } else {
-            self.get_embed_tokens(input_ids)
+            self.embed_tokens.forward(input_ids)
         };
+        // Gemma scaling: h *= sqrt(hidden_size)
+        let scale = (self.hidden_size as f32).sqrt();
+        h = mlxcel_core::multiply_scalar(&h, scale);
 
         let n = self.layers.len();
         // If external 4D mask is provided (from VLM), use it directly
@@ -675,7 +680,12 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
-        Some(self.model.get_embed_tokens(input_ids))
+        // Return RAW embeddings (without sqrt(hidden_size) scaling).
+        // Python mlx-vlm calls embed_tokens() to get unscaled embeddings for VLM merge,
+        // then the language model forward applies sqrt(hidden_size) to ALL embeddings
+        // (both text and merged image features). Returning scaled embeddings here would
+        // cause double-scaling for text tokens while leaving image features unscaled.
+        Some(self.model.embed_tokens.forward(input_ids))
     }
 
     fn make_caches(&self) -> Vec<mlxcel_core::layers::KVCache> {

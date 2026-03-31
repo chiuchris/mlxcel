@@ -201,7 +201,7 @@ pub(crate) fn spawn_legacy_model_worker(
             0,     // prefill_chunk_size = 0 → chunking disabled
             false, // enable_preemption = false
             crate::server::config::PreemptionPolicy::default(),
-            1,     // max_batch_prefill = 1 → sequential prefill
+            1, // max_batch_prefill = 1 → sequential prefill
         );
         scheduler.run();
     })

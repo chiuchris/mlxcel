@@ -138,11 +138,7 @@ pub(crate) struct GenerationOptions {
     ///
     /// INT8 mode is most beneficial for long context generation where KV cache
     /// becomes the memory bottleneck.
-    #[arg(
-        long = "kv-cache-mode",
-        default_value = "fp16",
-        value_name = "MODE"
-    )]
+    #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     pub(crate) kv_cache_mode: String,
 }
 
@@ -511,11 +507,7 @@ pub(crate) struct ServeArgs {
     ///   fp16  — Standard half-precision storage (default, no overhead).
     ///   int8  — Per-token INT8 absmax quantization; reduces KV cache memory
     ///           by ~50% at the cost of small quantization error per token.
-    #[arg(
-        long = "kv-cache-mode",
-        default_value = "fp16",
-        value_name = "MODE"
-    )]
+    #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     kv_cache_mode: String,
 }
 

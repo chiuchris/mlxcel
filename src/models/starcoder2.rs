@@ -102,13 +102,7 @@ impl StarCoder2Attention {
 
         // Fused QKV: concatenate q/k/v weights into one projection at load time
         let qkv_proj = FusedQKVLinear::from_weights_separate(
-            weights,
-            prefix,
-            group_size,
-            bits,
-            n_heads,
-            n_kv_heads,
-            head_dim,
+            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim,
         )?;
 
         Ok(Self {

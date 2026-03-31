@@ -216,18 +216,47 @@ pub struct GemmaMLP {
 
 impl GemmaMLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        // gate_proj(x) with GELU activation
+        // GeGLU: gelu(gate_proj(x)) * up_proj(x), then down_proj
+        // Quantized path: fused compiled quantized MLP
+        if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
+            self.gate_proj.quantized_weight(),
+            self.up_proj.quantized_weight(),
+            self.down_proj.quantized_weight(),
+        ) {
+            return unsafe {
+                mlxcel_core::compiled_gelu_mlp_forward(
+                    x,
+                    &gate_qw.weight,
+                    &gate_qw.scales,
+                    gate_qw.biases_ptr(),
+                    &up_qw.weight,
+                    &up_qw.scales,
+                    up_qw.biases_ptr(),
+                    &down_qw.weight,
+                    &down_qw.scales,
+                    down_qw.biases_ptr(),
+                    gate_qw.group_size,
+                    gate_qw.bits,
+                    &gate_qw.mode,
+                )
+            };
+        }
+
+        // Non-quantized path: fused compiled FP MLP
+        if let Some(result) = mlxcel_core::layers::compiled_gelu_mlp_fp16(
+            x,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ) {
+            return result;
+        }
+
+        // Fallback: separate operations with compiled activation
         let gate = self.gate_proj.forward(x);
-        let gate_gelu = mlxcel_core::gelu(&gate);
-
-        // up_proj(x)
         let up = self.up_proj.forward(x);
-
-        // Multiply: gelu(gate) * up
-        let prod = mlxcel_core::multiply(&gate_gelu, &up);
-
-        // down_proj
-        self.down_proj.forward(&prod)
+        let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+        self.down_proj.forward(&activated)
     }
 
     pub fn from_weights(
