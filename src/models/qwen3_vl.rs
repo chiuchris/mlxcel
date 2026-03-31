@@ -763,6 +763,12 @@ impl Qwen3VLModel {
         let delta = self.rope_deltas.borrow().unwrap_or(0);
         let offset = cache_offset + delta;
 
+        // Fast path for single-token decode (seq_len=1, batch=1):
+        // avoid arange+reshape+broadcast chain; directly construct [3, 1, 1].
+        if seq_len == 1 && batch == 1 {
+            return mlxcel_core::from_slice_i32(&[offset, offset, offset], &[3, 1, 1]);
+        }
+
         let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
         let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
         let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
