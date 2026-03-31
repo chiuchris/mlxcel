@@ -20,7 +20,7 @@
 //! - Attention/MLP bias enabled
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -78,9 +78,8 @@ impl StarCoder2Config {
 
 // Attention.
 pub struct StarCoder2Attention {
-    pub q_proj: UnifiedLinear,
-    pub k_proj: UnifiedLinear,
-    pub v_proj: UnifiedLinear,
+    /// Fused QKV projection: Q, K, V weights concatenated along output dim.
+    pub qkv_proj: FusedQKVLinear,
     pub o_proj: UnifiedLinear,
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -101,25 +100,19 @@ impl StarCoder2Attention {
         let group_size = cfg.group_size();
         let bits = cfg.bits();
 
+        // Fused QKV: concatenate q/k/v weights into one projection at load time
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            group_size,
+            bits,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        )?;
+
         Ok(Self {
-            q_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.q_proj", prefix),
-                group_size,
-                bits,
-            )?,
-            k_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.k_proj", prefix),
-                group_size,
-                bits,
-            )?,
-            v_proj: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.v_proj", prefix),
-                group_size,
-                bits,
-            )?,
+            qkv_proj,
             o_proj: UnifiedLinear::from_weights(
                 weights,
                 &format!("{}.o_proj", prefix),
@@ -144,10 +137,8 @@ impl StarCoder2Attention {
         let b = shape[0];
         let l = shape[1];
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x);
-        let k = self.k_proj.forward(x);
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split into Q, K, V
+        let (q, k, v) = self.qkv_proj.forward(x);
 
         // Reshape to [batch, seq_len, n_heads, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.n_heads, self.head_dim]);

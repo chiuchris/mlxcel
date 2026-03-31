@@ -25,7 +25,7 @@
 //! - Embedding scaling: h *= sqrt(hidden_size)
 
 use mlxcel_core::layers::{
-    GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
+    FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
@@ -106,9 +106,8 @@ impl ModelArgs {
 
 // Attention.
 pub struct Attention {
-    pub q_proj: UnifiedLinear,
-    pub k_proj: UnifiedLinear,
-    pub v_proj: UnifiedLinear,
+    /// Fused QKV projection: Q, K, V weights concatenated along output dim.
+    pub qkv_proj: FusedQKVLinear,
     pub o_proj: UnifiedLinear,
     pub num_heads: i32,
     pub num_kv_heads: i32,
@@ -131,10 +130,8 @@ impl Attention {
         let b = shape[0];
         let l = shape[1];
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x);
-        let k = self.k_proj.forward(x);
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split into Q, K, V
+        let (q, k, v) = self.qkv_proj.forward(x);
 
         // Reshape and transpose to [batch, n_heads, seq_len, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
@@ -183,16 +180,12 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
-        let k_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
-        let v_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
         let o_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim as i32;
+        let num_heads = args.num_attention_heads as i32;
+        let num_kv_heads = args.num_key_value_heads as i32;
         let scale = 1.0 / args.query_pre_attn_scalar.sqrt();
 
         // Determine if this is a sliding window layer
@@ -212,13 +205,22 @@ impl Attention {
         let q_norm = GemmaRMSNorm::new(q_norm_weight, args.rms_norm_eps);
         let k_norm = GemmaRMSNorm::new(k_norm_weight, args.rms_norm_eps);
 
+        // Fused QKV: concatenate q/k/v weights into one projection at load time
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            group_size,
+            bits,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
-            num_heads: args.num_attention_heads as i32,
-            num_kv_heads: args.num_key_value_heads as i32,
+            num_heads,
+            num_kv_heads,
             head_dim,
             scale,
             is_sliding,

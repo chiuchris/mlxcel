@@ -24,7 +24,7 @@
 //! - RMSNorm normalization
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -397,9 +397,8 @@ impl MLP {
 
 // Attention with Q/K Normalization.
 pub struct Attention {
-    pub q_proj: UnifiedLinear,
-    pub k_proj: UnifiedLinear,
-    pub v_proj: UnifiedLinear,
+    /// Fused QKV projection: Q, K, V weights concatenated along output dim.
+    pub qkv_proj: FusedQKVLinear,
     pub o_proj: UnifiedLinear,
     pub q_norm: RMSNorm, // Q normalization
     pub k_norm: RMSNorm, // K normalization
@@ -422,10 +421,8 @@ impl Attention {
         let b = shape[0];
         let l = shape[1];
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x);
-        let k = self.k_proj.forward(x);
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split into Q, K, V
+        let (q, k, v) = self.qkv_proj.forward(x);
 
         // Reshape to [batch, seq_len, n_heads, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
@@ -480,12 +477,6 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
-        let k_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
-        let v_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
         let o_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
@@ -494,16 +485,27 @@ impl Attention {
         let k_norm_weight = get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?;
 
         let head_dim = args.head_dim as i32;
+        let num_heads = args.num_attention_heads as i32;
+        let num_kv_heads = args.num_key_value_heads as i32;
+
+        // Fused QKV: concatenate q/k/v weights into one projection at load time
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            group_size,
+            bits,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
             q_norm: RMSNorm::new(q_norm_weight, args.rms_norm_eps),
             k_norm: RMSNorm::new(k_norm_weight, args.rms_norm_eps),
-            num_heads: args.num_attention_heads as i32,
-            num_kv_heads: args.num_key_value_heads as i32,
+            num_heads,
+            num_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             rope_dims: head_dim,

@@ -596,6 +596,220 @@ impl UnifiedLinear {
     }
 }
 
+/// Fused QKV linear layer for GQA models.
+///
+/// Stores Q, K, V weights concatenated along the output dimension into a single
+/// `UnifiedLinear`. A single matmul replaces 3 separate projections, improving
+/// Neural Engine tile utilisation (especially on M5).
+///
+/// Weight layout (output axis 0):
+///   `[q_dim | k_dim | v_dim, hidden_dim]`  →  `q_dim = n_heads * head_dim`
+///                                           →  `k_dim = v_dim = n_kv_heads * head_dim`
+///
+/// Used by: Llama3, Qwen2/3, Gemma2/3, Mistral, Cohere2, StarCoder2, InternLM3
+pub struct FusedQKVLinear {
+    /// Single concatenated QKV projection weight.
+    pub qkv_proj: UnifiedLinear,
+    pub n_heads: i32,
+    pub n_kv_heads: i32,
+    pub head_dim: i32,
+}
+
+impl FusedQKVLinear {
+    /// Load and concatenate separate q/k/v weights from the weight map.
+    ///
+    /// Concatenates `{prefix}.q_proj`, `{prefix}.k_proj`, `{prefix}.v_proj`
+    /// along axis 0 into a single `UnifiedLinear`.  Both quantized and
+    /// non-quantized weight layouts are supported.
+    pub fn from_weights_separate(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, String> {
+        Self::from_weights_separate_with_mode(
+            weights, prefix, group_size, bits, n_heads, n_kv_heads, head_dim, "affine",
+        )
+    }
+
+    /// Load and concatenate separate q/k/v weights with explicit quantization mode.
+    pub fn from_weights_separate_with_mode(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        mode: &str,
+    ) -> Result<Self, String> {
+        let q_prefix = format!("{}.q_proj", prefix);
+        let k_prefix = format!("{}.k_proj", prefix);
+        let v_prefix = format!("{}.v_proj", prefix);
+
+        let q_scales_key = format!("{}.scales", q_prefix);
+        let is_quantized = weights.contains_key(&q_scales_key);
+
+        let qkv_proj = if is_quantized {
+            // Quantized path: concatenate weight, scales, and biases tensors
+            // along axis 0 (output dimension).
+            let q_w = weights
+                .get(&format!("{}.weight", q_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", q_prefix))?;
+            let k_w = weights
+                .get(&format!("{}.weight", k_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", k_prefix))?;
+            let v_w = weights
+                .get(&format!("{}.weight", v_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", v_prefix))?;
+
+            let q_s = weights
+                .get(&format!("{}.scales", q_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", q_prefix))?;
+            let k_s = weights
+                .get(&format!("{}.scales", k_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", k_prefix))?;
+            let v_s = weights
+                .get(&format!("{}.scales", v_prefix))
+                .ok_or_else(|| format!("Scales not found: {}.scales", v_prefix))?;
+
+            // Concatenate along axis 0 (output dimension)
+            let qkv_weight = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_w.as_ref().unwrap() as *const MlxArray,
+                    k_w.as_ref().unwrap() as *const MlxArray,
+                    v_w.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+            let qkv_scales = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_s.as_ref().unwrap() as *const MlxArray,
+                    k_s.as_ref().unwrap() as *const MlxArray,
+                    v_s.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+
+            // Biases are optional (absent for mxfp4/nvfp4/mxfp8)
+            let qkv_biases = {
+                let q_b = weights.get(&format!("{}.biases", q_prefix));
+                let k_b = weights.get(&format!("{}.biases", k_prefix));
+                let v_b = weights.get(&format!("{}.biases", v_prefix));
+                match (q_b, k_b, v_b) {
+                    (Some(qb), Some(kb), Some(vb)) => {
+                        let ptrs: &[*const MlxArray] = &[
+                            qb.as_ref().unwrap() as *const MlxArray,
+                            kb.as_ref().unwrap() as *const MlxArray,
+                            vb.as_ref().unwrap() as *const MlxArray,
+                        ];
+                        Some(unsafe { ffi::concatenate(ptrs, 0) })
+                    }
+                    _ => None,
+                }
+            };
+
+            let qweight = QuantizedWeight {
+                weight: qkv_weight,
+                scales: qkv_scales,
+                biases: qkv_biases,
+                group_size,
+                bits,
+                mode: mode.to_string(),
+            };
+            UnifiedLinear::Quantized {
+                weight: qweight,
+                bias: None,
+            }
+        } else {
+            // Non-quantized path: concatenate weight tensors along axis 0.
+            let q_w = weights
+                .get(&format!("{}.weight", q_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", q_prefix))?;
+            let k_w = weights
+                .get(&format!("{}.weight", k_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", k_prefix))?;
+            let v_w = weights
+                .get(&format!("{}.weight", v_prefix))
+                .ok_or_else(|| format!("Weight not found: {}.weight", v_prefix))?;
+
+            let qkv_weight = {
+                let ptrs: &[*const MlxArray] = &[
+                    q_w.as_ref().unwrap() as *const MlxArray,
+                    k_w.as_ref().unwrap() as *const MlxArray,
+                    v_w.as_ref().unwrap() as *const MlxArray,
+                ];
+                unsafe { ffi::concatenate(ptrs, 0) }
+            };
+
+            // Optional bias per projection (rare, but handle it)
+            let q_bias = weights.get(&format!("{}.bias", q_prefix)).map(|b| ffi::copy(b));
+            let k_bias = weights.get(&format!("{}.bias", k_prefix)).map(|b| ffi::copy(b));
+            let v_bias = weights.get(&format!("{}.bias", v_prefix)).map(|b| ffi::copy(b));
+            let bias = match (q_bias, k_bias, v_bias) {
+                (Some(qb), Some(kb), Some(vb)) => {
+                    let ptrs: &[*const MlxArray] = &[
+                        qb.as_ref().unwrap() as *const MlxArray,
+                        kb.as_ref().unwrap() as *const MlxArray,
+                        vb.as_ref().unwrap() as *const MlxArray,
+                    ];
+                    Some(unsafe { ffi::concatenate(ptrs, 0) })
+                }
+                _ => None,
+            };
+
+            UnifiedLinear::Regular(Linear::new(qkv_weight, bias))
+        };
+
+        Ok(Self {
+            qkv_proj,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Load from a pre-concatenated `qkv_proj` weight (e.g., Phi3 layout).
+    pub fn from_weights_fused(
+        weights: &crate::weights::WeightMap,
+        prefix: &str,
+        group_size: i32,
+        bits: i32,
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+    ) -> Result<Self, String> {
+        let qkv_proj =
+            UnifiedLinear::from_weights(weights, &format!("{}.qkv_proj", prefix), group_size, bits)?;
+        Ok(Self {
+            qkv_proj,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+        })
+    }
+
+    /// Fused QKV projection + split.
+    ///
+    /// Returns `(q, k, v)` each shaped `[batch, seq_len, proj_dim]` (pre-reshape).
+    /// The caller is responsible for reshape/transpose/RoPE.
+    pub fn forward(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let qkv = self.qkv_proj.forward(x);
+
+        let q_size = self.n_heads * self.head_dim;
+        let kv_size = self.n_kv_heads * self.head_dim;
+
+        let q = ffi::slice_last_dim(&qkv, 0, q_size);
+        let k = ffi::slice_last_dim(&qkv, q_size, q_size + kv_size);
+        let v = ffi::slice_last_dim(&qkv, q_size + kv_size, q_size + 2 * kv_size);
+
+        (q, k, v)
+    }
+}
+
 /// Quantized per-head linear layer for MLA (Multi-head Latent Attention)
 /// Weight shape: [num_heads, output_dim, input_dim_packed]
 /// Used in GLM4 MoE Lite, DeepSeek-V2, etc.

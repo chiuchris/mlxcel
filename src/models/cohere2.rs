@@ -22,7 +22,7 @@
 //! - Logit scaling
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, LayerNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -122,9 +122,8 @@ impl Cohere2Config {
 
 // Cohere2 Attention (with conditional RoPE).
 pub struct Cohere2Attention {
-    pub q_proj: UnifiedLinear,
-    pub k_proj: UnifiedLinear,
-    pub v_proj: UnifiedLinear,
+    /// Fused QKV projection: Q, K, V weights concatenated along output dim.
+    pub qkv_proj: FusedQKVLinear,
     pub o_proj: UnifiedLinear,
     pub num_heads: i32,
     pub num_kv_heads: i32,
@@ -146,10 +145,8 @@ impl Cohere2Attention {
         let b = shape[0];
         let l = shape[1];
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x);
-        let k = self.k_proj.forward(x);
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split into Q, K, V
+        let (q, k, v) = self.qkv_proj.forward(x);
 
         // Reshape to [batch, seq_len, n_heads, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
@@ -212,25 +209,32 @@ impl Cohere2Attention {
         let bits = args.bits();
         let use_sliding_window = args.is_sliding_window_layer(layer_idx);
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
-        let k_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
-        let v_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
         let o_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
+        let num_heads = args.num_attention_heads as i32;
+        let num_kv_heads = args.num_key_value_heads as i32;
+        let head_dim = args.head_dim as i32;
+
+        // Fused QKV: concatenate q/k/v weights into one projection at load time
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            group_size,
+            bits,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
+
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
-            num_heads: args.num_attention_heads as i32,
-            num_kv_heads: args.num_key_value_heads as i32,
-            head_dim: args.head_dim as i32,
-            scale: (args.head_dim as f32).powf(-0.5),
-            rope_dims: args.head_dim as i32,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+            scale: (head_dim as f32).powf(-0.5),
+            rope_dims: head_dim,
             rope_base: args.rope_theta,
             use_sliding_window,
         })
