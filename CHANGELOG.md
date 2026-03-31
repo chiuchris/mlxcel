@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.13] - 2026-03-31
+
+### Added
+- Mistral4 MLA (Multi-head Latent Attention) language model support (#144)
+- Molmo-Point VLM model support (#148)
+- NemotronSuper model support (upstream mlx-lm sync) (#131)
+- `sync-upstream` Claude Code command for tracking mlx-lm/mlx-vlm changes
+
+### Changed
+- Fuse GatedDeltaNet decode step with `mlx::core::compile` for improved throughput
+- Apply MRoPE and position ID optimizations to Qwen3-VL-MoE
+- Fast-path single-token decode position IDs in Qwen3-VL
+- Vectorize Qwen3-VL interleaved MRoPE with `take_along_axis`
+- Optimize VLM vision encoding and sampling pipeline (#149)
+- Use SDPA for NemotronH attention, boosting decode throughput 59%
+
+### Fixed
+- Improve SSM/Mamba2 numerical precision with float32 dt computation (#133)
+- Improve GatedDelta numerical precision with float32 state (#132)
+- Resolve Mamba/NemotronNAS output corruption with softplus overflow and fused norm grouping
+- Guard Qwen3.5 GatedDeltaNet state batch dimension mismatches (#145)
+- Use `h.shape` instead of `inputs.shape` for Ministral3 attn_scale (#146)
+- Document scalar offset invariant for Llama4 BatchKVCache compatibility (#147)
+- Correct model_tests.md table placement and dedup nemotron entries
+
 ## [v0.0.12] - 2026-03-26
 
 ### Added
@@ -239,6 +264,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.13]: https://github.com/lablup/mlxcel/compare/v0.0.12...v0.0.13
 [v0.0.12]: https://github.com/lablup/mlxcel/compare/v0.0.11...v0.0.12
 [v0.0.11]: https://github.com/lablup/mlxcel/compare/v0.0.10...v0.0.11
 [v0.0.10]: https://github.com/lablup/mlxcel/compare/v0.0.9...v0.0.10

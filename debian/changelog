@@ -1,3 +1,22 @@
+mlxcel (0.0.13-1~jammy1) jammy; urgency=medium
+
+  * Feat: Add Mistral4 MLA language model support
+  * Feat: Add Molmo-Point VLM model support
+  * Feat: Add NemotronSuper model support (upstream mlx-lm sync)
+  * Perf: Fuse GatedDeltaNet decode step with mlx::core::compile
+  * Perf: Optimize Qwen3-VL MRoPE and position ID handling
+  * Perf: Vectorize Qwen3-VL interleaved MRoPE with take_along_axis
+  * Perf: Optimize VLM vision encoding and sampling pipeline
+  * Perf: Use SDPA for NemotronH attention (+59% decode throughput)
+  * Fix: SSM/Mamba2 numerical precision with float32 dt computation
+  * Fix: GatedDelta numerical precision with float32 state
+  * Fix: Mamba/NemotronNAS output corruption with softplus overflow
+  * Fix: Qwen3.5 GatedDeltaNet state batch dimension mismatches
+  * Fix: Ministral3 attn_scale shape reference
+  * Fix: Llama4 BatchKVCache scalar offset invariant
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 31 Mar 2026 12:00:00 +0900
+
 mlxcel (0.0.12-1~jammy1) jammy; urgency=medium
 
   * Perf: Compiled C++ ops (SDPA, MLP, clip_residual) via mlx::core::compile
