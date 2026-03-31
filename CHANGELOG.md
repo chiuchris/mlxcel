@@ -46,7 +46,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Project-specific Claude Code commands and skills
 
 ### Changed
-- Gemma3: fused SDPA, pre-computed GemmaRMSNorm, skip decode masks — Gemma3 1B reaches 94% of Python mlx-lm
+- Gemma3: fused SDPA, pre-computed GemmaRMSNorm, skip decode masks, Gemma3 1B reaches 94% of Python mlx-lm
 - Gemma2: uses `compiled_softcap_sdpa_gqa` with internal GQA head expansion
 - StarCoder2: uses `compiled_gelu` activation
 - Phi3: pre-compute SuScaledRoPE scale array at load time
@@ -109,7 +109,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ## [v0.0.8] - 2026-03-17
 
 ### Fixed
-- Support explicit `head_dim` config field in Qwen3-VL, Qwen2-VL, and Qwen2-MoE models — fixes Qwen3-VL-32B crash where `head_dim(128) != hidden_size/num_heads(80)`
+- Support explicit `head_dim` config field in Qwen3-VL, Qwen2-VL, and Qwen2-MoE models, fixes Qwen3-VL-32B crash where `head_dim(128) != hidden_size/num_heads(80)`
 - Switch macOS CI runner to macos-15 for Xcode 16+ C++20 ranges support
 
 ### Changed
