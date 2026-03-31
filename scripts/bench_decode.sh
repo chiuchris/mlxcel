@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+# Decode benchmark with warmup preheating for accurate measurements.
+#
+# Usage:
+#   ./scripts/bench_decode.sh models/llama3-1b-4bit
+#   ./scripts/bench_decode.sh all
+#   ./scripts/bench_decode.sh all --vlm --image tests/fixtures/test_image.png
+#   ./scripts/bench_decode.sh all --output benchmarks/custom_name.csv
+#
+# Default output: benchmarks/{backend}_{hardware}_{YYYY-MM-DD}.csv
+#   e.g. benchmarks/metal_m1ultra_2026-03-31.csv
+#   VLM: benchmarks/metal_m1ultra_vlm_2026-03-31.csv
+#
+# The script runs each model twice: a warmup pass (discarded) to preheat Metal
+# shader compilation and memory-mapping, followed by the measured pass.
+# Both passes use --profile for structured timing output.
+#
+# CSV columns (14):
+#   model, model_path, prompt_tokens, generated_tokens,
+#   prefill_ms, prefill_tok_s, decode_ms, decode_tok_s,
+#   date, hardware, mlx_version, build_type, max_tokens, prompt
+#
+# Filename convention:
+#   {backend}_{hardware}_{YYYY-MM-DD}.csv        (text)
+#   {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv    (VLM)
+#   Optional suffix: {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv
+
+set -euo pipefail
+
+MLXCEL="./target/release/mlxcel"
+MODELS_DIR="./models"
+BENCHMARKS_DIR="./benchmarks"
+TEXT_PROMPT="Hello, how are you today?"
+VLM_PROMPT="What is in this image?"
+MAX_TOKENS=100
+WARMUP_TOKENS=20
+TIMEOUT=300
+VLM_IMAGE="tests/fixtures/test_image.png"
+VLM_MODE=0
+OUTPUT=""
+SUFFIX=""
+DATE=$(date '+%Y-%m-%d')
+MLX_VERSION="0.31.1"
+BUILD_TYPE="release"
+
+# ---------------------------------------------------------------------------
+# Hardware detection
+# ---------------------------------------------------------------------------
+
+# Full hardware string for CSV content (e.g. Apple_M1_Ultra_128GB)
+detect_hardware_full() {
+  local chip mem
+  chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
+  mem=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fGB", $1/1073741824}')
+  echo "${chip}_${mem}" | tr ' ' '_'
+}
+
+# Short hardware name for filenames (e.g. m1ultra, m5max, gb10)
+detect_hardware_short() {
+  local model
+  model=$(sysctl -n hw.model 2>/dev/null || echo "unknown")
+  local full
+  full=$(detect_hardware_full)
+
+  # Map known hardware to short names
+  case "$full" in
+    *M1_Ultra*)  echo "m1ultra" ;;
+    *M1_Max*)    echo "m1max" ;;
+    *M1_Pro*)    echo "m1pro" ;;
+    *M2_Ultra*)  echo "m2ultra" ;;
+    *M2_Max*)    echo "m2max" ;;
+    *M3_Ultra*)  echo "m3ultra" ;;
+    *M3_Max*)    echo "m3max" ;;
+    *M4_Ultra*)  echo "m4ultra" ;;
+    *M4_Max*)    echo "m4max" ;;
+    *M5_Ultra*)  echo "m5ultra" ;;
+    *M5_Max*)    echo "m5max" ;;
+    *GB10*)      echo "gb10" ;;
+    *)           echo "$model" | tr '[:upper:]' '[:lower:]' | tr ',' '_' ;;
+  esac
+}
+
+# Detect backend from binary
+detect_backend() {
+  if "$MLXCEL" generate --help 2>&1 | grep -q "cuda"; then
+    echo "cuda"
+  else
+    echo "metal"
+  fi
+}
+
+HARDWARE_FULL=$(detect_hardware_full)
+HARDWARE_SHORT=$(detect_hardware_short)
+BACKEND=$(detect_backend)
+
+# ---------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+Usage: bench_decode.sh <model_path|all> [options]
+
+Options:
+  --vlm               VLM mode (use image prompt)
+  --image PATH        Image for VLM benchmark (default: tests/fixtures/test_image.png)
+  --prompt TEXT        Override text prompt
+  --max-tokens N      Max tokens to generate (default: 100)
+  --warmup-tokens N   Tokens for warmup pass (default: 20)
+  --timeout N         Timeout per run in seconds (default: 300)
+  --output PATH       Write CSV to specific file (overrides auto-naming)
+  --suffix TAG        Append suffix to auto-generated filename (e.g. --suffix baseline)
+  --help              Show this help
+
+Filename convention:
+  {backend}_{hardware}_{YYYY-MM-DD}.csv           text benchmarks
+  {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv       VLM benchmarks
+  {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv  with --suffix
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Generate default output filename
+# ---------------------------------------------------------------------------
+default_output_path() {
+  local name="${BACKEND}_${HARDWARE_SHORT}"
+  if [[ "$VLM_MODE" -eq 1 ]]; then
+    name="${name}_vlm"
+  fi
+  name="${name}_${DATE}"
+  if [[ -n "$SUFFIX" ]]; then
+    name="${name}_${SUFFIX}"
+  fi
+  echo "${BENCHMARKS_DIR}/${name}.csv"
+}
+
+# ---------------------------------------------------------------------------
+# Parse --profile output into CSV fields
+# ---------------------------------------------------------------------------
+parse_profile() {
+  local output="$1"
+  local prompt_tok gen_tok prefill_ms prefill_tps decode_ms decode_tps
+
+  prompt_tok=$(echo "$output" | sed -n 's/.*Prompt tokens:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+  gen_tok=$(echo "$output"    | sed -n 's/.*Generated tokens:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+  prefill_ms=$(echo "$output" | sed -n 's/.*Prefill:[[:space:]]*\([0-9.]*\) ms.*/\1/p' | head -1)
+  prefill_tps=$(echo "$output" | sed -n 's/.*Prefill:.*(\([0-9.]*\) tok\/s).*/\1/p' | head -1)
+  decode_ms=$(echo "$output"  | sed -n 's/.*Decode:[[:space:]]*\([0-9.]*\) ms.*/\1/p' | head -1)
+  decode_tps=$(echo "$output" | sed -n 's/.*Decode:.*(\([0-9.]*\) tok\/s).*/\1/p' | head -1)
+
+  echo "${prompt_tok:-},${gen_tok:-},${prefill_ms:-},${prefill_tps:-},${decode_ms:-},${decode_tps:-}"
+}
+
+# ---------------------------------------------------------------------------
+# Benchmark a single model
+# ---------------------------------------------------------------------------
+bench_one() {
+  local model_path="$1"
+  local model_name
+  model_name=$(basename "$model_path")
+
+  local prompt="$TEXT_PROMPT"
+  local extra_args=()
+  if [[ "$VLM_MODE" -eq 1 ]]; then
+    prompt="$VLM_PROMPT"
+    if [[ ! -f "$VLM_IMAGE" ]]; then
+      echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",SKIP:vlm_image_not_found"
+      return
+    fi
+    extra_args+=(--image "$VLM_IMAGE")
+  fi
+
+  # --- Warmup pass (preheat Metal shaders & memory maps) ---
+  >&2 printf '>>> [warmup] %s ...\n' "$model_name"
+  if ! timeout "$TIMEOUT" "$MLXCEL" generate \
+      -m "$model_path" -p "$prompt" -n "$WARMUP_TOKENS" \
+      "${extra_args[@]}" --profile >/dev/null 2>&1; then
+    >&2 echo "    warmup failed"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",FAIL:warmup"
+    return
+  fi
+
+  # --- Measured pass ---
+  >&2 printf '>>> [bench]  %s ...\n' "$model_name"
+  local raw
+  if ! raw=$(timeout "$TIMEOUT" "$MLXCEL" generate \
+      -m "$model_path" -p "$prompt" -n "$MAX_TOKENS" \
+      "${extra_args[@]}" --profile 2>&1); then
+    >&2 echo "    benchmark failed"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",FAIL:bench"
+    return
+  fi
+
+  local fields
+  fields=$(parse_profile "$raw")
+  local decode_tps
+  decode_tps=$(echo "$fields" | cut -d, -f6)
+
+  if [[ -z "$decode_tps" ]]; then
+    >&2 echo "    no decode output"
+    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",FAIL:no_output"
+  else
+    >&2 printf '    decode: %s tok/s\n' "$decode_tps"
+    echo "${model_name},${model_path},${fields},$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\""
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Argument parsing
+# ---------------------------------------------------------------------------
+MODEL_ARG=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --vlm)            VLM_MODE=1; shift ;;
+    --image)          VLM_IMAGE="$2"; VLM_MODE=1; shift 2 ;;
+    --prompt)         TEXT_PROMPT="$2"; shift 2 ;;
+    --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
+    --warmup-tokens)  WARMUP_TOKENS="$2"; shift 2 ;;
+    --timeout)        TIMEOUT="$2"; shift 2 ;;
+    --output)         OUTPUT="$2"; shift 2 ;;
+    --suffix)         SUFFIX="$2"; shift 2 ;;
+    --help)           usage; exit 0 ;;
+    -*)               echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
+    *)                MODEL_ARG="$1"; shift ;;
+  esac
+done
+
+if [[ -z "$MODEL_ARG" ]]; then
+  echo "Error: model path or 'all' required" >&2
+  usage >&2
+  exit 1
+fi
+
+if [[ ! -x "$MLXCEL" ]]; then
+  echo "Error: $MLXCEL not found. Run 'cargo build --release' first." >&2
+  exit 1
+fi
+
+# Auto-generate output path if not specified
+if [[ -z "$OUTPUT" ]]; then
+  OUTPUT=$(default_output_path)
+fi
+
+# ---------------------------------------------------------------------------
+# CSV header
+# ---------------------------------------------------------------------------
+CSV_HEADER="model,model_path,prompt_tokens,generated_tokens,prefill_ms,prefill_tok_s,decode_ms,decode_tok_s,date,hardware,mlx_version,build_type,max_tokens,prompt"
+
+mkdir -p "$(dirname "$OUTPUT")"
+echo "$CSV_HEADER" > "$OUTPUT"
+>&2 echo "Output: $OUTPUT"
+>&2 echo "Hardware: $HARDWARE_FULL ($HARDWARE_SHORT)"
+>&2 echo "Backend: $BACKEND"
+>&2 echo ""
+
+emit() {
+  echo "$1" | tee -a "$OUTPUT"
+}
+
+# ---------------------------------------------------------------------------
+# Run
+# ---------------------------------------------------------------------------
+if [[ "$MODEL_ARG" == "all" ]]; then
+  for dir in "$MODELS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    result=$(bench_one "$dir")
+    emit "$result"
+  done
+else
+  if [[ ! -d "$MODEL_ARG" ]]; then
+    echo "Error: model directory '$MODEL_ARG' not found" >&2
+    exit 1
+  fi
+  result=$(bench_one "$MODEL_ARG")
+  emit "$result"
+fi
+
+>&2 echo ""
+>&2 echo "Results saved to: $OUTPUT"
