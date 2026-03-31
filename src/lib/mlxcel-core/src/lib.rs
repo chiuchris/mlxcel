@@ -957,6 +957,25 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Metal 4 fused attention kernel dispatch (scaffolding).
+        ///
+        /// When `use_metal4` is true, this will eventually dispatch to a custom
+        /// MTL4MachineLearningCommandEncoder-based kernel on M5 hardware. Until
+        /// the Metal 4 SDK is available, both paths fall back to
+        /// `fast_scaled_dot_product_attention()`.
+        ///
+        /// Prefer calling `layers::metal4_attention()` from model code — it
+        /// queries `hardware::get_hardware()` and sets `use_metal4` automatically
+        /// based on the chip generation and macOS version at runtime.
+        unsafe fn fused_metal4_attention(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            scale: f32,
+            mask: *const MlxArray,
+            use_metal4: bool,
+        ) -> UniquePtr<MlxArray>;
+
         /// Fused QKV projection + reshape + transpose + RoPE
         /// Reduces ~5 FFI calls (projection, reshape, transpose, rope) to 1
         #[allow(clippy::too_many_arguments)]

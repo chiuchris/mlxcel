@@ -4517,6 +4517,112 @@ void nemotron_decode_step(
 
 // ── Native safetensors loading ────────────────────────────────────────
 
+// ── Metal 4 fused attention kernel scaffolding ────────────────────────────────
+//
+// BACKGROUND: Metal 4 (available on M5 and later) introduces TensorOps —
+// first-class tensor primitives built into the Metal Shading Language (MSL).
+// Key capabilities relevant to attention fusion:
+//
+//   - MTLTensor: Native GPU tensor resource type with explicit layout control.
+//     Allows keeping intermediate Q, K, V, scores, and context vectors
+//     on-chip in registers between shader stages.
+//
+//   - Tensor matmul / reduction: MSL built-in operators for fusing QKV
+//     projection, RoPE, score computation, softmax, and output projection
+//     into a SINGLE GPU dispatch, eliminating all intermediate memory writes.
+//
+//   - MTL4MachineLearningCommandEncoder: Encodes full ML subgraphs onto the
+//     GPU command timeline, enabling the Neural Accelerator to execute an
+//     entire attention layer without returning to the CPU scheduler.
+//
+// CURRENT STATUS: This function is SCAFFOLDING only.
+//   - Metal 4 SDK is not yet publicly available (requires macOS 26.2+ and M5).
+//   - The function signature and dispatch infrastructure are ready.
+//   - The actual MSL kernel body is a TODO guarded by `use_metal4`.
+//   - Until Metal 4 SDK ships, all paths fall back to
+//     `fast_scaled_dot_product_attention()`.
+//
+// WHEN TO IMPLEMENT THE FULL KERNEL:
+//   Requirements:
+//     - macOS 26.2 or later (first macOS release supporting Metal 4)
+//     - Xcode with Metal 4 SDK (WWDC25 release cycle)
+//     - M5 hardware for compilation and testing
+//   Reference material:
+//     - WWDC25 "Metal 4 TensorOps" session
+//     - WWDC25 "Accelerate ML inference with Metal 4" session
+//     - https://github.com/liuliu/example_matmul_metal4  (open-source matmul example)
+//     - mlx/backend/metal/steel_attention.metal  (MLX baseline for reference)
+//
+// PLANNED KERNEL STRUCTURE (pseudo-MSL):
+//
+//   [[kernel]] void fused_attention_metal4(
+//       tensor<half, 4> q         [[tensor(0)]],  // [B, H, S, D]
+//       tensor<half, 4> k         [[tensor(1)]],
+//       tensor<half, 4> v         [[tensor(2)]],
+//       constant float& scale     [[buffer(0)]],
+//       // --- All intermediate tensors stay on-chip in NA registers ---
+//   ) {
+//       // Step 1: scores = Q @ K^T * scale  (tensor matmul, on-chip)
+//       // Step 2: optional softcap           (tanh, on-chip)
+//       // Step 3: optional mask add          (on-chip)
+//       // Step 4: softmax                    (reduction, on-chip)
+//       // Step 5: context = scores @ V       (tensor matmul, on-chip)
+//       // Total memory traffic: read Q,K,V once + write context once
+//   }
+//
+// VARIANTS TO IMPLEMENT (in priority order):
+//   1. Standard MHA / GQA (Llama, Qwen, Mistral)          — highest impact
+//   2. Softcap + GQA      (Gemma2, Gemma3)                — medium
+//   3. Sliding window     (Gemma3, Ministral)             — medium
+//   4. MLA                (DeepSeek V3)                   — low (complex)
+//
+// ─────────────────────────────────────────────────────────────────────────────
+
+std::unique_ptr<MlxArray> fused_metal4_attention(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    const MlxArray* mask,
+    bool use_metal4
+) {
+    // TODO(metal4): When Metal 4 SDK is available, replace the body of this
+    // `if` branch with the MTL4MachineLearningCommandEncoder dispatch.
+    //
+    // Pseudo-code for the Metal 4 path:
+    //
+    //   if (use_metal4) {
+    //     auto* device = MTLCreateSystemDefaultDevice();
+    //     auto* cmd_queue = [device newCommandQueue];
+    //     auto* encoder = [cmd_queue ML4commandEncoder];
+    //
+    //     // Allocate MTLTensor descriptors for Q, K, V
+    //     // Set up fused attention kernel pipeline state
+    //     // Encode dispatch — all intermediate values remain on-chip
+    //     // [encoder endEncoding];
+    //     // Wrap result in MlxArray and return
+    //   }
+    //
+    // For now, both `use_metal4 = true` and `use_metal4 = false` fall through
+    // to the same MLX fast SDPA path.  This ensures correct numerical output
+    // on all hardware while the scaffolding is in place.
+    (void)use_metal4;  // suppress unused-variable warning until kernel is added
+
+    std::optional<mlx::core::array> mask_opt = std::nullopt;
+    std::string mask_mode = "";
+    if (mask) {
+        auto m = mask->inner;
+        if (m.dtype() != q.inner.dtype()) {
+            m = mlx::core::astype(m, q.inner.dtype());
+        }
+        mask_opt = m;
+        mask_mode = "array";
+    }
+    return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
+        q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
+    ));
+}
+
 std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
     std::string path_str(path.data(), path.size());
     auto [weights_map, metadata] = mlx::core::load_safetensors(path_str);

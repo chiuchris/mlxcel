@@ -1290,6 +1290,32 @@ void nemotron_full_forward(
 );
 #endif
 
+// Metal 4 fused attention kernel dispatch (scaffolding).
+//
+// When `use_metal4` is true AND Metal 4 SDK is available, this function will
+// dispatch to a custom MTL4MachineLearningCommandEncoder-based kernel that
+// keeps all intermediate Q/K/V/scores tensors on-chip in the M5 Neural
+// Accelerator's registers, eliminating intermediate memory round-trips.
+//
+// Current status: SCAFFOLDING — both paths fall back to
+// `fast_scaled_dot_product_attention()` until the Metal 4 kernel is written.
+//
+// Requirements for the full implementation:
+//   - macOS 26.2+ (first OS supporting Metal 4)
+//   - Metal 4 SDK (Xcode from WWDC25 release cycle)
+//   - M5 hardware (metal_version == 4 from HardwareCapabilities)
+//
+// Use `mlxcel_core::layers::metal4_attention()` from Rust, which queries
+// `hardware::get_hardware()` to set `use_metal4` automatically.
+std::unique_ptr<MlxArray> fused_metal4_attention(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    const MlxArray* mask,  // nullable
+    bool use_metal4
+);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {
