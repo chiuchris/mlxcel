@@ -96,16 +96,29 @@ pub fn gated_delta_step(
     state: &MlxArray,
     mask: Option<&MlxArray>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    // Fast path: no mask (common during decode) — use fused C++ kernel
+    // Replaces ~26 FFI round-trips with a single call.
+    if mask.is_none() {
+        let q_dtype = mlxcel_core::array_dtype(q);
+        let mut output = mlxcel_core::UniquePtr::null();
+        let mut new_state = mlxcel_core::UniquePtr::null();
+        unsafe {
+            mlxcel_core::fused_gated_delta_decode_step(
+                q, k, v, g, beta, state, q_dtype, &mut output, &mut new_state,
+            );
+        }
+        return (output, new_state);
+    }
+
+    // Slow path: mask present (rare — only during batch dim mismatch recovery)
     let old_state = mlxcel_core::copy(state);
 
     // Decay: state = state * g
     let g_ndim = mlxcel_core::array_ndim(g);
     let decay = if g_ndim == 2 {
-        // g: [B, H] -> [B, H, 1, 1]
         let g1 = mlxcel_core::expand_dims(g, -1);
         mlxcel_core::expand_dims(&g1, -1)
     } else if g_ndim == 3 {
-        // g: [B, H, Dk] -> [B, H, 1, Dk]
         mlxcel_core::expand_dims(g, -2)
     } else {
         panic!("Unsupported gating shape");
@@ -113,34 +126,25 @@ pub fn gated_delta_step(
 
     let mut new_state = mlxcel_core::multiply(state, &decay);
 
-    // kv_mem = (state * k[..., None, :]).sum(axis=-1) -> [B, H, Dv]
     let k_exp = mlxcel_core::expand_dims(k, -2);
     let kv_mem = mlxcel_core::sum_axis(&mlxcel_core::multiply(&new_state, &k_exp), -1, false);
 
-    // delta = (v - kv_mem) * beta[..., None]
     let beta_exp = mlxcel_core::expand_dims(beta, -1);
     let delta = mlxcel_core::multiply(&mlxcel_core::subtract(v, &kv_mem), &beta_exp);
 
-    // state = state + k[..., None, :] * delta[..., None]
     let delta_exp = mlxcel_core::expand_dims(&delta, -1);
     new_state = mlxcel_core::add(&new_state, &mlxcel_core::multiply(&k_exp, &delta_exp));
 
-    // Output projection: y = (state * q[..., None, :]).sum(axis=-1)
     let q_exp = mlxcel_core::expand_dims(q, -2);
     let y = mlxcel_core::sum_axis(&mlxcel_core::multiply(&new_state, &q_exp), -1, false);
 
-    // Apply mask if provided
-    let new_state = if let Some(m) = mask {
-        // m: [B] -> [B, 1, 1, 1]
-        let m1 = mlxcel_core::expand_dims(m, 1);
-        let m2 = mlxcel_core::expand_dims(&m1, 2);
-        let m3 = mlxcel_core::expand_dims(&m2, 3);
-        mlxcel_core::where_cond(&m3, &new_state, &old_state)
-    } else {
-        new_state
-    };
+    // Apply mask
+    let m = mask.unwrap();
+    let m1 = mlxcel_core::expand_dims(m, 1);
+    let m2 = mlxcel_core::expand_dims(&m1, 2);
+    let m3 = mlxcel_core::expand_dims(&m2, 3);
+    let new_state = mlxcel_core::where_cond(&m3, &new_state, &old_state);
 
-    // Cast output to input query dtype (state stays float32, output matches input precision)
     let q_dtype = mlxcel_core::array_dtype(q);
     let y = if mlxcel_core::array_dtype(&y) != q_dtype {
         mlxcel_core::astype(&y, q_dtype)
@@ -195,25 +199,61 @@ pub fn gated_delta_ops(
     // Compute repeat factor for GQA
     let repeat_factor = hv / hk;
 
-    // Repeat q and k if needed
-    let q = if repeat_factor > 1 {
-        mlxcel_core::repeat(q, repeat_factor as i32, -2)
+    // Repeat q and k if needed (skip copy for repeat_factor=1)
+    let q_rep;
+    let q_ref = if repeat_factor > 1 {
+        q_rep = mlxcel_core::repeat(q, repeat_factor as i32, -2);
+        q_rep.as_ref().unwrap()
     } else {
-        mlxcel_core::copy(q)
+        q
     };
-    let k = if repeat_factor > 1 {
-        mlxcel_core::repeat(k, repeat_factor as i32, -2)
+    let k_rep;
+    let k_ref = if repeat_factor > 1 {
+        k_rep = mlxcel_core::repeat(k, repeat_factor as i32, -2);
+        k_rep.as_ref().unwrap()
     } else {
-        mlxcel_core::copy(k)
+        k
     };
 
-    // Process each timestep
+    // Fast path: single-token decode (T=1) — skip slice+squeeze loop entirely.
+    // Directly squeeze the time dimension and call gated_delta_step once.
+    if t == 1 {
+        let q_t = mlxcel_core::squeeze_axis(q_ref, 1);
+        let k_t = mlxcel_core::squeeze_axis(k_ref, 1);
+        let v_t = mlxcel_core::squeeze_axis(v, 1);
+
+        let g_ndim = mlxcel_core::array_ndim(g);
+        let g_t = if g_ndim == 4 {
+            mlxcel_core::squeeze_axis(g, 1)
+        } else {
+            mlxcel_core::squeeze_axis(g, 1)
+        };
+
+        let beta_t = mlxcel_core::squeeze_axis(beta, 1);
+
+        let mask_t = mask.map(|m| mlxcel_core::squeeze_axis(m, 1));
+
+        let (y, new_state) = gated_delta_step(
+            &q_t,
+            &k_t,
+            &v_t,
+            &g_t,
+            &beta_t,
+            &current_state,
+            mask_t.as_deref(),
+        );
+
+        // Add back time dimension: [B, Hv, Dv] → [B, 1, Hv, Dv]
+        let y = mlxcel_core::expand_dims(&y, 1);
+        return (y, new_state);
+    }
+
+    // Multi-token path (prefill): process each timestep sequentially
     let mut ys = Vec::with_capacity(t);
     for t_idx in 0..t {
-        // Extract timestep t using slicing
         let q_t = mlxcel_core::squeeze_axis(
             &mlxcel_core::slice(
-                &q,
+                q_ref,
                 &[0, t_idx as i32, 0, 0],
                 &[b, (t_idx + 1) as i32, hv, dk],
             ),
@@ -221,7 +261,7 @@ pub fn gated_delta_ops(
         );
         let k_t = mlxcel_core::squeeze_axis(
             &mlxcel_core::slice(
-                &k,
+                k_ref,
                 &[0, t_idx as i32, 0, 0],
                 &[b, (t_idx + 1) as i32, hv, dk],
             ),

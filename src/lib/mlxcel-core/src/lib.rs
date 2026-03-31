@@ -1029,6 +1029,23 @@ mod ffi {
             next_state: &mut UniquePtr<MlxArray>,
         );
 
+        /// Fused gated-delta single-token decode step.
+        /// Combines: decay → kv_mem → delta → state_update → output into one C++ call.
+        /// Replaces ~26 FFI round-trips with 1.
+        /// Used by: Qwen3.5, Qwen3Next, KimiLinear (GatedDeltaNet T=1 decode)
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn fused_gated_delta_decode_step(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            g: &MlxArray,
+            beta: &MlxArray,
+            state: &MlxArray,
+            q_dtype: i32,
+            output: &mut UniquePtr<MlxArray>,
+            new_state_out: &mut UniquePtr<MlxArray>,
+        );
+
         // Fused Mamba2 mixer forward for single-token decode.
         /// Combines in_proj + conv1d + SSM kernel + MambaRMSNormGated + out_proj into one C++ call.
         /// Replaces ~23 FFI round-trips for the hot decode path.

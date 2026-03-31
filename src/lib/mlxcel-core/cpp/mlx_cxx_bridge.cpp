@@ -2536,6 +2536,112 @@ std::unique_ptr<MlxArray> softplus(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::logaddexp(a.inner, zero));
 }
 
+// Compiled gated-delta decode step kernel.
+// Uses mlx::core::compile to fuse all operations into a single Metal kernel dispatch.
+// This matches Python mlx-lm's gated_delta_kernel which uses a custom Metal kernel.
+namespace {
+    // Compiled version for scalar gate (g_ndim == 2): [B, H]
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_gated_delta_step_scalar_gate() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            using namespace mlx::core;
+            const auto& q = inputs[0];      // [B, H, Dk]
+            const auto& k = inputs[1];      // [B, H, Dk]
+            const auto& v = inputs[2];      // [B, H, Dv]
+            const auto& g = inputs[3];      // [B, H]
+            const auto& beta = inputs[4];   // [B, H]
+            const auto& state = inputs[5];  // [B, H, Dv, Dk]
+
+            auto decay = expand_dims(expand_dims(g, -1), -1);  // [B,H,1,1]
+            auto ns = multiply(state, decay);
+
+            auto k_exp = expand_dims(k, -2);
+            auto kv_mem = sum(multiply(ns, k_exp), -1, false);
+
+            auto beta_exp = expand_dims(beta, -1);
+            auto delta = multiply(subtract(v, kv_mem), beta_exp);
+            auto delta_exp = expand_dims(delta, -1);
+            ns = add(ns, multiply(k_exp, delta_exp));
+
+            auto q_exp = expand_dims(q, -2);
+            auto y = sum(multiply(ns, q_exp), -1, false);
+
+            return {y, ns};
+        };
+        return mlx::core::compile(fn, true);
+    }
+
+    // Compiled version for per-dim gate (g_ndim == 3): [B, H, Dk]
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_gated_delta_step_dim_gate() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            using namespace mlx::core;
+            const auto& q = inputs[0];
+            const auto& k = inputs[1];
+            const auto& v = inputs[2];
+            const auto& g = inputs[3];      // [B, H, Dk]
+            const auto& beta = inputs[4];
+            const auto& state = inputs[5];
+
+            auto decay = expand_dims(g, -2);  // [B,H,1,Dk]
+            auto ns = multiply(state, decay);
+
+            auto k_exp = expand_dims(k, -2);
+            auto kv_mem = sum(multiply(ns, k_exp), -1, false);
+
+            auto beta_exp = expand_dims(beta, -1);
+            auto delta = multiply(subtract(v, kv_mem), beta_exp);
+            auto delta_exp = expand_dims(delta, -1);
+            ns = add(ns, multiply(k_exp, delta_exp));
+
+            auto q_exp = expand_dims(q, -2);
+            auto y = sum(multiply(ns, q_exp), -1, false);
+
+            return {y, ns};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+// Fused gated-delta single-token decode step using compiled kernels.
+// Uses mlx::core::compile for kernel fusion matching Python's gated_delta_kernel.
+//
+// Used by: Qwen3.5, Qwen3Next, KimiLinear (GatedDeltaNet T=1 decode)
+void fused_gated_delta_decode_step(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    const MlxArray& g,
+    const MlxArray& beta,
+    const MlxArray& state,
+    int32_t q_dtype,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& new_state_out
+) {
+    using namespace mlx::core;
+
+    std::vector<array> result;
+    if (g.inner.ndim() == 2) {
+        static auto compiled_fn = get_compiled_gated_delta_step_scalar_gate();
+        result = compiled_fn({q.inner, k.inner, v.inner, g.inner, beta.inner, state.inner});
+    } else {
+        static auto compiled_fn = get_compiled_gated_delta_step_dim_gate();
+        result = compiled_fn({q.inner, k.inner, v.inner, g.inner, beta.inner, state.inner});
+    }
+
+    auto y = std::move(result[0]);
+    auto ns = std::move(result[1]);
+
+    // Cast output to query dtype if needed
+    auto target_dtype = static_cast<Dtype>(to_dtype(q_dtype));
+    if (y.dtype() != target_dtype) {
+        y = astype(y, target_dtype);
+    }
+
+    output = std::make_unique<MlxArray>(std::move(y));
+    new_state_out = std::make_unique<MlxArray>(std::move(ns));
+}
+
 // 1D convolution with groups support (for depthwise conv when groups=channels)
 std::unique_ptr<MlxArray> conv1d(
     const MlxArray& input,

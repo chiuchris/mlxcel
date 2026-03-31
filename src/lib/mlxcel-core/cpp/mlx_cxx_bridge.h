@@ -1048,6 +1048,21 @@ void compiled_moe_gate(
 // conv_state_out:  [batch, conv_kernel_size-1, conv_dim]
 // ssm_state_out:   same shape as ssm_state_in
 //
+// Fused gated-delta single-token decode step.
+// Combines: decay → kv_mem → delta → state_update → output into one call.
+// Used by: Qwen3.5, Qwen3Next, KimiLinear (GatedDeltaNet T=1 decode)
+void fused_gated_delta_decode_step(
+    const MlxArray& q,       // [B, H, D]
+    const MlxArray& k,       // [B, H, D]
+    const MlxArray& v,       // [B, H, Dv]
+    const MlxArray& g,       // [B, H] or [B, H, Dk]
+    const MlxArray& beta,    // [B, H]
+    const MlxArray& state,   // [B, H, Dv, Dk]
+    int32_t q_dtype,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& new_state_out
+);
+
 // Quantization mode is "affine" (standard mlx-community models).
 void fused_mamba2_forward(
     // Input
