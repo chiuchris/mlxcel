@@ -332,6 +332,82 @@ pub fn clip_residual_f16(x: &MlxArray, y: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::astype(&clipped, dtype::FLOAT16)
 }
 
+// Neural Accelerator Tile Alignment Utilities.
+
+/// Tile size for the M5 Neural Accelerator optimal matrix operation.
+pub const NA_TILE_SIZE: usize = 32;
+
+/// Align a sequence length up to the nearest multiple of `NA_TILE_SIZE`.
+///
+/// When the sequence is already aligned (i.e. `len % NA_TILE_SIZE == 0`),
+/// the value is returned unchanged. Otherwise it is rounded up so that
+/// the prefill input perfectly fills complete 32×32 tiles, enabling peak
+/// Neural Accelerator throughput on M5+ hardware.
+///
+/// # Examples
+/// ```ignore
+/// assert_eq!(align_to_na_tile(10), 32);
+/// assert_eq!(align_to_na_tile(32), 32);
+/// assert_eq!(align_to_na_tile(33), 64);
+/// assert_eq!(align_to_na_tile(0),   0);
+/// ```
+#[inline]
+pub fn align_to_na_tile(len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    ((len + NA_TILE_SIZE - 1) / NA_TILE_SIZE) * NA_TILE_SIZE
+}
+
+/// Create a causal attention mask for a tile-aligned padded prefill.
+///
+/// The input sequence has `actual_len` real tokens followed by `pad_len =
+/// padded_len - actual_len` padding tokens. The returned mask has shape
+/// `[padded_len, padded_len]` and encodes two constraints:
+///
+/// 1. **Causal**: query position `q` may only attend to key positions `k ≤ q`.
+/// 2. **No padding leakage**: key positions `k ≥ actual_len` are always masked
+///    with −∞, even for query positions that are themselves padding tokens.
+///
+/// This ensures that after the padded forward pass:
+/// - The logits at position `actual_len - 1` correctly predict the next token.
+/// - Padding tokens do not pollute the KV cache values that will be trimmed.
+///
+/// # Arguments
+/// * `actual_len` - Number of real (non-padding) tokens in the sequence.
+/// * `padded_len` - Total sequence length after alignment (≥ `actual_len`).
+/// * `offset`     - Number of tokens already in the KV cache (typically 0 for
+///   fresh prefill, non-zero for multi-turn continuation).
+pub fn create_padded_prefill_mask(
+    actual_len: i32,
+    padded_len: i32,
+    offset: i32,
+) -> UniquePtr<MlxArray> {
+    let total_kv = padded_len + offset;
+
+    // Step 1: causal lower-triangular mask over the full padded shape.
+    let ones = ffi::ones(&[padded_len, total_kv], dtype::FLOAT32);
+    let causal = ffi::tril(&ones, offset);
+
+    // Step 2: build a key-padding mask that zeros out positions ≥ actual_len.
+    // Shape: [1, total_kv]  (broadcast along the query axis).
+    // Value: 1 for valid key positions, 0 for padding key positions.
+    let mut valid_mask_data = vec![0f32; total_kv as usize];
+    for i in 0..(actual_len + offset) as usize {
+        valid_mask_data[i] = 1.0;
+    }
+    let valid_mask = ffi::from_slice_f32(&valid_mask_data, &[1, total_kv]);
+
+    // Combine: both constraints must hold (multiply, then convert to -inf mask).
+    let combined = ffi::multiply(&causal, &valid_mask);
+
+    // Convert to additive mask: 1 → 0.0,  0 → -inf
+    let zeros = ffi::zeros(&[padded_len, total_kv], dtype::FLOAT32);
+    let neg_inf = ffi::full_f32(&[padded_len, total_kv], f32::NEG_INFINITY, dtype::FLOAT32);
+    let bool_mask = ffi::greater(&combined, &zeros);
+    ffi::where_cond(&bool_mask, &zeros, &neg_inf)
+}
+
 // Shape Utilities.
 /// Concatenate two arrays along the specified axis.
 #[inline]
@@ -391,5 +467,52 @@ mod tests {
         let repeated = repeat_kv(&x, 1);
         let shape = ffi::array_shape(&repeated);
         assert_eq!(shape, vec![1, 8, 10, 64]);
+    }
+
+    #[test]
+    fn test_align_to_na_tile_zero() {
+        assert_eq!(align_to_na_tile(0), 0);
+    }
+
+    #[test]
+    fn test_align_to_na_tile_exact() {
+        // Already aligned
+        assert_eq!(align_to_na_tile(32), 32);
+        assert_eq!(align_to_na_tile(64), 64);
+        assert_eq!(align_to_na_tile(128), 128);
+    }
+
+    #[test]
+    fn test_align_to_na_tile_short() {
+        // Prompts shorter than one tile
+        assert_eq!(align_to_na_tile(1), 32);
+        assert_eq!(align_to_na_tile(10), 32);
+        assert_eq!(align_to_na_tile(31), 32);
+    }
+
+    #[test]
+    fn test_align_to_na_tile_cross_boundary() {
+        assert_eq!(align_to_na_tile(33), 64);
+        assert_eq!(align_to_na_tile(63), 64);
+        assert_eq!(align_to_na_tile(65), 96);
+    }
+
+    #[test]
+    fn test_create_padded_prefill_mask_shape() {
+        // actual_len=10, padded_len=32, offset=0
+        let mask = create_padded_prefill_mask(10, 32, 0);
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(shape, vec![32, 32]);
+    }
+
+    #[test]
+    fn test_create_padded_prefill_mask_no_padding() {
+        // When actual_len == padded_len, result equals a standard causal mask
+        let mask = create_padded_prefill_mask(8, 8, 0);
+        let ref_mask = create_causal_mask(8, 0);
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(shape, vec![8, 8]);
+        let ref_shape = ffi::array_shape(&ref_mask);
+        assert_eq!(ref_shape, vec![8, 8]);
     }
 }

@@ -35,8 +35,10 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
+use mlxcel_core::hardware;
 use mlxcel_core::sampling::sample_token_optimized;
 use mlxcel_core::streams::{install_default_stream, new_generation_stream};
+use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
 use mlxcel_core::{MlxStream, UniquePtr};
 
 use crate::LoadedModel;
@@ -57,6 +59,14 @@ use super::queue::PrefillQueue;
 use super::sequence::{
     BatchSchedulerAction, FinishReason, RequestPriority, SequenceInfo, SequenceState,
 };
+
+/// Returns true when the current hardware is M5+ with Neural Accelerator
+/// support and tile-aligned prefill should be applied.
+#[inline]
+fn should_align_prefill() -> bool {
+    let hw = hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
 
 /// Core batch scheduler that drives the model worker loop.
 ///
@@ -490,18 +500,39 @@ impl BatchScheduler {
             }
         };
 
-        let prompt_len = seq.prompt_tokens.len() as i32;
-        let input = mlxcel_core::from_slice_i32(&seq.prompt_tokens, &[1, prompt_len]);
+        // Run prefill (with or without VLM embeddings).
+        // On M5+ hardware pad the prompt to a 32-token tile boundary for
+        // optimal Neural Accelerator throughput.
+        let actual_len = seq.prompt_tokens.len();
+        let (effective_tokens, pad_mask_opt) = if should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_len);
+            if padded_len > actual_len {
+                let mut padded = seq.prompt_tokens.clone();
+                padded.resize(padded_len, 0);
+                let mask = create_padded_prefill_mask(actual_len as i32, padded_len as i32, 0);
+                (padded, Some(mask))
+            } else {
+                (seq.prompt_tokens.clone(), None)
+            }
+        } else {
+            (seq.prompt_tokens.clone(), None)
+        };
 
-        // Run prefill (with or without VLM embeddings)
-        let logits = if let Some(ref embeddings) = seq.vlm_embeddings {
+        let eff_len = effective_tokens.len() as i32;
+        let input = mlxcel_core::from_slice_i32(&effective_tokens, &[1, eff_len]);
+
+        let raw_logits = if let Some(ref embeddings) = seq.vlm_embeddings {
+            // VLM path: apply provided mask or the tile-alignment mask.
             match prepared_embedding_refs(embeddings) {
-                Ok((input_embeds, mask_ref)) => {
+                Ok((input_embeds, caller_mask)) => {
+                    // Caller-supplied mask takes precedence; tile-alignment mask
+                    // is used only when the caller does not provide one.
+                    let effective_mask = caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
                     let logits = self.model.forward_with_embeddings(
                         &input,
                         Some(input_embeds),
                         caches,
-                        mask_ref,
+                        effective_mask,
                     );
                     mlxcel_core::eval(&logits);
                     self.model.after_prefill();
@@ -513,11 +544,36 @@ impl BatchScheduler {
                 }
             }
         } else {
-            self.model.forward(&input, caches, None)
+            self.model.forward(
+                &input,
+                caches,
+                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            )
+        };
+
+        // Extract logits at the last real token position and trim padding from
+        // KV caches so the decode phase begins with the correct cache offset.
+        let logits = if pad_mask_opt.is_some() && effective_tokens.len() > actual_len {
+            let padded_len = effective_tokens.len();
+            let shape = mlxcel_core::array_shape(&raw_logits);
+            let vocab = shape[2];
+            let sliced = mlxcel_core::slice(
+                &raw_logits,
+                &[0, actual_len as i32 - 1, 0],
+                &[shape[0], actual_len as i32, vocab],
+            );
+            // Trim padding positions from all KV caches.
+            let excess = (padded_len - actual_len) as i32;
+            for c in caches.iter_mut() {
+                c.trim(excess);
+            }
+            sliced
+        } else {
+            raw_logits
         };
 
         mlxcel_core::clear_memory_cache();
-        seq.prefill_offset = seq.prompt_tokens.len();
+        seq.prefill_offset = actual_len;
 
         self.finish_prefill(seq, logits, eos_tokens, token_history, needs_history);
     }
@@ -547,18 +603,35 @@ impl BatchScheduler {
             }
         };
 
-        let chunk_len = chunk.len() as i32;
-        let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk_len]);
+        // Align the first chunk to a 32-token tile boundary on M5+ hardware.
+        let actual_chunk_len = chunk.len();
+        let (eff_chunk, pad_mask_opt) = if should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_chunk_len);
+            if padded_len > actual_chunk_len {
+                let mut padded = chunk.to_vec();
+                padded.resize(padded_len, 0);
+                let mask = create_padded_prefill_mask(actual_chunk_len as i32, padded_len as i32, 0);
+                (padded, Some(mask))
+            } else {
+                (chunk.to_vec(), None)
+            }
+        } else {
+            (chunk.to_vec(), None)
+        };
 
-        // VLM embeddings are applied only on the first chunk
+        let eff_len = eff_chunk.len() as i32;
+        let input = mlxcel_core::from_slice_i32(&eff_chunk, &[1, eff_len]);
+
+        // VLM embeddings are applied only on the first chunk.
         if let Some(ref embeddings) = seq.vlm_embeddings {
             match prepared_embedding_refs(embeddings) {
-                Ok((input_embeds, mask_ref)) => {
+                Ok((input_embeds, caller_mask)) => {
+                    let effective_mask = caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
                     let logits = self.model.forward_with_embeddings(
                         &input,
                         Some(input_embeds),
                         caches,
-                        mask_ref,
+                        effective_mask,
                     );
                     mlxcel_core::eval(&logits);
                     self.model.after_prefill();
@@ -569,8 +642,20 @@ impl BatchScheduler {
                 }
             }
         } else {
-            let logits = self.model.forward(&input, caches, None);
+            let logits = self.model.forward(
+                &input,
+                caches,
+                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
             mlxcel_core::eval(&logits);
+        }
+
+        // Trim padding positions from KV caches when the chunk was padded.
+        if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
+            let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+            for c in caches.iter_mut() {
+                c.trim(excess);
+            }
         }
 
         mlxcel_core::clear_memory_cache();
@@ -616,9 +701,42 @@ impl BatchScheduler {
             }
         };
 
-        let chunk_len = chunk.len() as i32;
-        let input = mlxcel_core::from_slice_i32(chunk, &[1, chunk_len]);
-        let logits = self.model.forward(&input, caches, None);
+        // Align each continuation chunk to a 32-token tile boundary on M5+.
+        let actual_chunk_len = chunk.len();
+        let kv_offset = caches.first().map_or(0, |c| c.offset);
+        let (eff_chunk, pad_mask_opt) = if should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_chunk_len);
+            if padded_len > actual_chunk_len {
+                let mut padded = chunk.to_vec();
+                padded.resize(padded_len, 0);
+                let mask = create_padded_prefill_mask(
+                    actual_chunk_len as i32,
+                    padded_len as i32,
+                    kv_offset,
+                );
+                (padded, Some(mask))
+            } else {
+                (chunk.to_vec(), None)
+            }
+        } else {
+            (chunk.to_vec(), None)
+        };
+
+        let eff_len = eff_chunk.len() as i32;
+        let input = mlxcel_core::from_slice_i32(&eff_chunk, &[1, eff_len]);
+        let logits = self.model.forward(
+            &input,
+            caches,
+            pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+        );
+
+        // Trim padding positions from KV caches when the chunk was padded.
+        if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
+            let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+            for c in caches.iter_mut() {
+                c.trim(excess);
+            }
+        }
 
         seq.prefill_offset = end;
 

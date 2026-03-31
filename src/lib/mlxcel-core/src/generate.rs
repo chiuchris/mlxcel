@@ -29,10 +29,110 @@ use crate::ffi::{MlxArray, MlxStream};
 use crate::generation_policy::{
     ensure_model_caches, initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
+use crate::hardware;
 use crate::layers::KVCache;
 use crate::sampling::sample_token_optimized;
 use crate::streams::{install_default_stream, new_generation_stream};
+use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
+
+/// Returns true when the current hardware is M5+ with a Neural Accelerator
+/// and tile-aligned prefill should be applied.
+#[inline]
+fn should_align_prefill() -> bool {
+    let hw = hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+/// Pad a prompt token slice to `padded_len` with the pad token (0) and return
+/// both the padded slice and an appropriate attention mask.
+///
+/// If `actual_len == padded_len` no padding is needed: returns the original
+/// tokens and `None` (the forward pass will use its built-in causal mask).
+///
+/// If `actual_len < padded_len` the sequence is extended with zeros and a
+/// padded causal mask is returned so that padding positions do not leak into
+/// the KV cache values.
+///
+/// # Arguments
+/// * `prompt_tokens` - Original token IDs.
+/// * `padded_len`    - Target aligned length (≥ `prompt_tokens.len()`).
+///
+/// # Returns
+/// `(padded_tokens_vec, mask_or_none)` where `mask_or_none` is `None` when no
+/// padding was added.
+fn pad_tokens_for_prefill(
+    prompt_tokens: &[i32],
+    padded_len: usize,
+) -> (Vec<i32>, Option<UniquePtr<MlxArray>>) {
+    let actual_len = prompt_tokens.len();
+    if padded_len == actual_len {
+        return (prompt_tokens.to_vec(), None);
+    }
+
+    let mut padded = Vec::with_capacity(padded_len);
+    padded.extend_from_slice(prompt_tokens);
+    padded.resize(padded_len, 0); // pad with token id 0
+
+    let mask = create_padded_prefill_mask(actual_len as i32, padded_len as i32, 0);
+    (padded, Some(mask))
+}
+
+/// After a padded prefill, trim all KV caches back to `actual_len` so that
+/// the decode phase starts with the correct sequence position.
+///
+/// The padded token positions `[actual_len, padded_len)` were written to the
+/// cache during the forward pass; trimming removes them so the KV cache offset
+/// reflects only the real prompt tokens.
+fn trim_caches_to_actual_len(caches: &mut [KVCache], actual_len: usize, padded_len: usize) {
+    let excess = (padded_len - actual_len) as i32;
+    if excess <= 0 {
+        return;
+    }
+    for cache in caches.iter_mut() {
+        cache.trim(excess);
+    }
+}
+
+/// Pad an embeddings tensor from `[batch, actual_len, hidden]` to
+/// `[batch, padded_len, hidden]` by appending zero rows.
+///
+/// Used by the VLM tile-alignment path to match the padded token sequence.
+fn pad_embeddings(embeds: &MlxArray, padded_len: usize) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(embeds);
+    let batch = shape[0];
+    let actual_seq = shape[1] as usize;
+    let hidden = shape[2];
+    if padded_len <= actual_seq {
+        return ffi::slice(embeds, &[0, 0, 0], &[batch, actual_seq as i32, hidden]);
+    }
+    let pad_rows = (padded_len - actual_seq) as i32;
+    let dtype = ffi::array_dtype(embeds);
+    let padding = ffi::zeros(&[batch, pad_rows, hidden], dtype);
+    crate::concatenate(embeds, &padding, 1)
+}
+
+/// Extract the logits at a specific sequence position, returning shape
+/// `[batch, 1, vocab]` to remain compatible with `slice_last_logits`.
+///
+/// `logits` has shape `[batch, seq_len, vocab]`. Slices out position `pos`
+/// along the sequence axis (keeping the dimension as size 1) so that the
+/// caller can still pass the result to `sample_token_optimized`, which
+/// internally calls `slice_last_logits` expecting `[batch, seq_len, vocab]`.
+///
+/// Used after a padded prefill to obtain the prediction for the last *real*
+/// token position rather than the last padding position.
+fn logits_at_position(logits: &MlxArray, pos: usize) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(logits);
+    let batch = shape[0];
+    let vocab = shape[2];
+    // Slice [batch, pos:pos+1, vocab]  →  shape [batch, 1, vocab].
+    ffi::slice(
+        logits,
+        &[0, pos as i32, 0],
+        &[batch, pos as i32 + 1, vocab],
+    )
+}
 
 /// Trait for language models that can be used for generation
 pub trait LanguageModel {
@@ -355,9 +455,30 @@ impl CxxGenerator {
         let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
         let profile_pipeline = std::env::var("MLXCEL_PROFILE_PIPELINE").is_ok();
 
-        // Prefill: process all prompt tokens at once
-        let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits = model.forward(&input, &mut self.caches, None);
+        // Prefill: process all prompt tokens at once.
+        // On M5+ hardware pad the sequence to a 32-token tile boundary for
+        // optimal Neural Accelerator throughput.
+        let actual_len = prompt_tokens.len();
+        let logits = if should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+            let raw_logits =
+                model.forward(&input, &mut self.caches, mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+            // Trim padding positions from all KV caches so decode uses the
+            // correct cache offset (actual_len, not padded_len).
+            if padded_len > actual_len {
+                trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                // Extract logits at the last real token position.
+                logits_at_position(&raw_logits, actual_len - 1)
+            } else {
+                // No padding was needed (already aligned).
+                raw_logits
+            }
+        } else {
+            let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+            model.forward(&input, &mut self.caches, None)
+        };
 
         if trace_dtype {
             ffi::eval(&logits);
@@ -371,7 +492,7 @@ impl CxxGenerator {
         let needs_history = sampling.needs_token_history();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
-        // Sample first token
+        // Sample first token (logits already sliced to last real position when padded)
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::async_eval(&y);
 
@@ -513,10 +634,39 @@ impl CxxGenerator {
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
-        // Prefill: use forward_with_embeddings for merged vision+text embeddings
-        let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits =
-            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
+        // Prefill: use forward_with_embeddings for merged vision+text embeddings.
+        // On M5+ hardware pad the sequence to a 32-token tile boundary when no
+        // explicit mask is provided by the caller (callers that supply a custom
+        // mask already control the shape and may not need tile alignment).
+        let actual_len = prompt_tokens.len();
+        let logits = if mask.is_none() && should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+            // Pad embeddings if provided.
+            let padded_embeds_storage;
+            let effective_embeds: Option<&MlxArray> = if let Some(emb) = input_embeddings {
+                padded_embeds_storage = pad_embeddings(emb, padded_len);
+                Some(padded_embeds_storage.as_ref().unwrap())
+            } else {
+                None
+            };
+            let raw_logits = model.forward_with_embeddings(
+                &input,
+                effective_embeds,
+                &mut self.caches,
+                mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
+            if padded_len > actual_len {
+                trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                logits_at_position(&raw_logits, actual_len - 1)
+            } else {
+                raw_logits
+            }
+        } else {
+            let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask)
+        };
 
         // Force evaluation of the prefill graph before any weight modifications
         // in after_prefill. MLX lazy evaluation means the graph references the
@@ -614,11 +764,38 @@ impl CxxGenerator {
         let needs_history = sampling.needs_token_history();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
-        // Prefill with embeddings
+        // Prefill with embeddings.
+        // On M5+ hardware pad to a 32-token tile boundary (same logic as
+        // generate_streaming_with_embeddings).
+        let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
-        let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits =
-            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask);
+        let logits = if mask.is_none() && should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+            let padded_embeds_storage;
+            let effective_embeds: Option<&MlxArray> = if let Some(emb) = input_embeddings {
+                padded_embeds_storage = pad_embeddings(emb, padded_len);
+                Some(padded_embeds_storage.as_ref().unwrap())
+            } else {
+                None
+            };
+            let raw_logits = model.forward_with_embeddings(
+                &input,
+                effective_embeds,
+                &mut self.caches,
+                mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
+            if padded_len > actual_len {
+                trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                logits_at_position(&raw_logits, actual_len - 1)
+            } else {
+                raw_logits
+            }
+        } else {
+            let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+            model.forward_with_embeddings(&input, input_embeddings, &mut self.caches, mask)
+        };
         model.after_prefill();
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::eval(&y);
@@ -729,9 +906,26 @@ impl CxxGenerator {
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // PREFILL PHASE.
+        // On M5+ hardware pad the sequence to a 32-token tile boundary for
+        // optimal Neural Accelerator throughput.
+        let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
-        let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-        let logits = model.forward(&input, &mut self.caches, None);
+        let logits = if should_align_prefill() {
+            let padded_len = align_to_na_tile(actual_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+            let raw_logits =
+                model.forward(&input, &mut self.caches, mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+            if padded_len > actual_len {
+                trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                logits_at_position(&raw_logits, actual_len - 1)
+            } else {
+                raw_logits
+            }
+        } else {
+            let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+            model.forward(&input, &mut self.caches, None)
+        };
 
         // Sample first token and force sync to measure prefill accurately
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
