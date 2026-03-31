@@ -1692,6 +1692,10 @@ pub mod streams;
 
 pub mod dtype;
 
+// Runtime Apple Silicon generation detection.
+// Public so that mlxcel (the main crate) can log hardware info at startup.
+pub mod hardware;
+
 #[cfg(test)]
 #[path = "ffi_tests.rs"]
 mod ffi_tests;

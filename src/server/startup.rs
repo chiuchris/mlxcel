@@ -453,6 +453,21 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         );
     }
 
+    // Log hardware capabilities (detection is cached; subsequent calls are free).
+    {
+        let hw = mlxcel_core::hardware::get_hardware();
+        tracing::debug!(
+            silicon_gen = %hw.silicon_gen,
+            gpu_cores = hw.gpu_core_count,
+            memory_gb = hw.unified_memory_gb,
+            bandwidth_gbps = hw.memory_bandwidth_gbps,
+            neural_accelerator = hw.has_neural_accelerator,
+            metal_version = hw.metal_version,
+            macos_supports_na = hw.macos_supports_na,
+            "Hardware capabilities detected"
+        );
+    }
+
     let runtime = crate::initialize_runtime();
     if let Some(invalid) = runtime.invalid_device_override.as_deref() {
         tracing::warn!(
