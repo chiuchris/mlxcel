@@ -113,11 +113,7 @@ impl MolmoPointTransformer {
         let ln_f_weight = get_weight_copy(weights, &format!("{prefix}.ln_f.weight"))?;
         let ln_f = mlxcel_core::layers::RMSNorm::new(ln_f_weight, config.layer_norm_eps);
 
-        Ok(Self {
-            wte,
-            blocks,
-            ln_f,
-        })
+        Ok(Self { wte, blocks, ln_f })
     }
 }
 
@@ -134,7 +130,9 @@ impl MolmoPointLanguageModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (h, _) = self.model.forward_with_pre_ln(Some(input_ids), None, caches, mask);
+        let (h, _) = self
+            .model
+            .forward_with_pre_ln(Some(input_ids), None, caches, mask);
         self.lm_head.forward(&h)
     }
 
@@ -145,12 +143,16 @@ impl MolmoPointLanguageModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let (h, _) = self.model.forward_with_pre_ln(None, input_embeddings, caches, mask);
+        let (h, _) = self
+            .model
+            .forward_with_pre_ln(None, input_embeddings, caches, mask);
         self.lm_head.forward(&h)
     }
 
     pub fn make_caches(&self) -> Vec<KVCache> {
-        (0..self.model.blocks.len()).map(|_| KVCache::new()).collect()
+        (0..self.model.blocks.len())
+            .map(|_| KVCache::new())
+            .collect()
     }
 
     pub fn from_weights(
@@ -158,7 +160,8 @@ impl MolmoPointLanguageModel {
         config: &Molmo2TextConfig,
         prefix: &str,
     ) -> Result<Self, String> {
-        let model = MolmoPointTransformer::from_weights(weights, config, &format!("{prefix}.model"))?;
+        let model =
+            MolmoPointTransformer::from_weights(weights, config, &format!("{prefix}.model"))?;
 
         let lm_head_prefix = if prefix.ends_with(".model") {
             let base = prefix.strip_suffix(".model").unwrap();

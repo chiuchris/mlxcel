@@ -3381,6 +3381,431 @@ namespace {
     }
 }
 
+// GatedDeltaNet custom Metal kernel for single/multi-token decode.
+// Port of Python mlx-lm gated_delta.py _make_gated_delta_kernel()
+// Four variants: scalar/vec gate x mask/no-mask
+namespace {
+    // Variant 1: scalar gate, no mask
+    static const char* GATED_DELTA_METAL_SOURCE = R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        // q, k: [B, T, Hk, Dk]
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        // v, y: [B, T, Hv, Dv]
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        // state_in, state_out: [B, Hv, Dv, Dk]
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+            if (true) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[hv_idx];
+                    kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + k_[s_idx] * delta;
+                    out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                    y[dv_idx] = static_cast<InT>(out);
+                }
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<InT>(state[i]);
+        }
+    )";
+
+    // Variant 2: scalar gate, with mask
+    static const char* GATED_DELTA_METAL_SOURCE_MASK = R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv]
+        auto g_ = g + b_idx * T * Hv;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+            if (mask[b_idx * T + t]) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[hv_idx];
+                    kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + k_[s_idx] * delta;
+                    out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                    y[dv_idx] = static_cast<InT>(out);
+                }
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<InT>(state[i]);
+        }
+    )";
+
+    // Variant 3: vectorized gate (per-dim), no mask
+    static const char* GATED_DELTA_METAL_SOURCE_VEC = R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv, Dk]
+        auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+            if (true) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[s_idx];
+                    kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + k_[s_idx] * delta;
+                    out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                    y[dv_idx] = static_cast<InT>(out);
+                }
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv * Dk;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<InT>(state[i]);
+        }
+    )";
+
+    // Variant 4: vectorized gate, with mask
+    static const char* GATED_DELTA_METAL_SOURCE_VEC_MASK = R"(
+        auto n = thread_position_in_grid.z;
+        auto b_idx = n / Hv;
+        auto hv_idx = n % Hv;
+        auto hk_idx = hv_idx / (Hv / Hk);
+        constexpr int n_per_t = Dk / 32;
+
+        auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+        auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+
+        auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+        y += b_idx * T * Hv * Dv + hv_idx * Dv;
+
+        auto dk_idx = thread_position_in_threadgroup.x;
+        auto dv_idx = thread_position_in_grid.y;
+
+        auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+        auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+
+        float state[n_per_t];
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            state[i] = static_cast<float>(i_state[s_idx]);
+        }
+
+        // g: [B, T, Hv, Dk]
+        auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;
+        auto beta_ = beta + b_idx * T * Hv;
+
+        for (int t = 0; t < T; ++t) {
+            if (mask[b_idx * T + t]) {
+                float kv_mem = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] * g_[s_idx];
+                    kv_mem += state[i] * k_[s_idx];
+                }
+                kv_mem = simd_sum(kv_mem);
+
+                auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+
+                float out = 0.0f;
+                for (int i = 0; i < n_per_t; ++i) {
+                    auto s_idx = n_per_t * dk_idx + i;
+                    state[i] = state[i] + k_[s_idx] * delta;
+                    out += state[i] * q_[s_idx];
+                }
+                out = simd_sum(out);
+                if (thread_index_in_simdgroup == 0) {
+                    y[dv_idx] = static_cast<InT>(out);
+                }
+            }
+            q_ += Hk * Dk;
+            k_ += Hk * Dk;
+            v_ += Hv * Dv;
+            y += Hv * Dv;
+            g_ += Hv * Dk;
+            beta_ += Hv;
+        }
+        for (int i = 0; i < n_per_t; ++i) {
+            auto s_idx = n_per_t * dk_idx + i;
+            o_state[s_idx] = static_cast<InT>(state[i]);
+        }
+    )";
+
+    // Kernel holder structs (lazy init, one per variant)
+    struct GatedDeltaKernelHolder {
+        std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+        bool initialized = false;
+
+        mlx::core::fast::CustomKernelFunction& get(const char* name,
+                                                    const std::vector<std::string>& inputs,
+                                                    const char* source) {
+            if (!initialized) {
+                kernel = mlx::core::fast::metal_kernel(
+                    name, inputs,
+                    {"y", "state_out"},
+                    source
+                );
+                initialized = true;
+            }
+            return *kernel;
+        }
+    };
+
+    static GatedDeltaKernelHolder& get_gd_kernel() {
+        static GatedDeltaKernelHolder holder;
+        return holder;
+    }
+    static GatedDeltaKernelHolder& get_gd_kernel_mask() {
+        static GatedDeltaKernelHolder holder;
+        return holder;
+    }
+    static GatedDeltaKernelHolder& get_gd_kernel_vec() {
+        static GatedDeltaKernelHolder holder;
+        return holder;
+    }
+    static GatedDeltaKernelHolder& get_gd_kernel_vec_mask() {
+        static GatedDeltaKernelHolder holder;
+        return holder;
+    }
+}
+
+bool gated_delta_kernel_available() {
+#ifdef __APPLE__
+    return mlx::core::metal::is_available();
+#else
+    return false;
+#endif
+}
+
+void metal_gated_delta_forward(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    const MlxArray& g,
+    const MlxArray& beta,
+    const MlxArray& state,
+    const MlxArray* mask,
+    std::unique_ptr<MlxArray>& output,
+    std::unique_ptr<MlxArray>& new_state
+) {
+    using namespace mlx::core;
+
+    // Extract dimensions from input shapes
+    auto q_shape = q.inner.shape();
+    int B = q_shape[0];
+    int T_val = q_shape[1];
+    int Hk = q_shape[2];
+    int Dk = q_shape[3];
+    auto v_shape = v.inner.shape();
+    int Hv = v_shape[2];
+    int Dv = v_shape[3];
+
+    auto input_type = q.inner.dtype();
+
+    // Cast inputs to input_type if needed (state may be float32 from Rust side)
+    auto state_cast = (state.inner.dtype() != input_type)
+        ? mlx::core::astype(state.inner, input_type) : state.inner;
+    auto g_cast = (g.inner.dtype() != input_type)
+        ? mlx::core::astype(g.inner, input_type) : g.inner;
+    auto beta_cast = (beta.inner.dtype() != input_type)
+        ? mlx::core::astype(beta.inner, input_type) : beta.inner;
+
+    // Detect vectorized gate: g has 4 dims [B, T, Hv, Dk]
+    bool vectorized = (g.inner.ndim() == 4);
+    bool has_mask = (mask != nullptr);
+
+    // Build T as a scalar array input
+    auto T_arr = mlx::core::array(T_val);
+
+    // Select kernel variant and build inputs
+    std::vector<array> inputs;
+    GatedDeltaKernelHolder* holder;
+    const char* kernel_name;
+    const char* kernel_source;
+    std::vector<std::string> input_names;
+
+    if (vectorized && has_mask) {
+        input_names = {"q", "k", "v", "g", "beta", "state_in", "T", "mask"};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr, mask->inner};
+        holder = &get_gd_kernel_vec_mask();
+        kernel_name = "gated_delta_step_vec_mask";
+        kernel_source = GATED_DELTA_METAL_SOURCE_VEC_MASK;
+    } else if (vectorized) {
+        input_names = {"q", "k", "v", "g", "beta", "state_in", "T"};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr};
+        holder = &get_gd_kernel_vec();
+        kernel_name = "gated_delta_step_vec";
+        kernel_source = GATED_DELTA_METAL_SOURCE_VEC;
+    } else if (has_mask) {
+        input_names = {"q", "k", "v", "g", "beta", "state_in", "T", "mask"};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr, mask->inner};
+        holder = &get_gd_kernel_mask();
+        kernel_name = "gated_delta_step_mask";
+        kernel_source = GATED_DELTA_METAL_SOURCE_MASK;
+    } else {
+        input_names = {"q", "k", "v", "g", "beta", "state_in", "T"};
+        inputs = {q.inner, k.inner, v.inner, g_cast, beta_cast, state_cast, T_arr};
+        holder = &get_gd_kernel();
+        kernel_name = "gated_delta_step";
+        kernel_source = GATED_DELTA_METAL_SOURCE;
+    }
+
+    auto& kernel = holder->get(kernel_name, input_names, kernel_source);
+
+    // Template parameters: InT (dtype), Dk, Dv, Hk, Hv
+    std::vector<std::pair<std::string, mlx::core::fast::TemplateArg>> template_args = {
+        {"InT", input_type},
+        {"Dk", Dk},
+        {"Dv", Dv},
+        {"Hk", Hk},
+        {"Hv", Hv},
+    };
+
+    // Output shapes and dtypes (matching Python: both in input_type)
+    std::vector<Shape> output_shapes = {
+        Shape{B, T_val, Hv, Dv},   // y
+        state.inner.shape(),        // state_out (same shape as state_in)
+    };
+    std::vector<Dtype> output_dtypes = {input_type, input_type};
+
+    // Grid: (32, Dv, B * Hv), Threadgroup: (32, 4, 1)
+    auto results = kernel(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(32, Dv, B * Hv),   // grid
+        std::make_tuple(32, 4, 1),          // threadgroup
+        template_args,
+        std::nullopt,  // init_value
+        false,         // verbose
+        {}             // stream (default)
+    );
+
+    output = std::make_unique<MlxArray>(std::move(results[0]));
+    new_state = std::make_unique<MlxArray>(std::move(results[1]));
+}
+
 // Compiled MoE gate function (matches Python @mx.compile group_expert_select)
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_moe_gate() {

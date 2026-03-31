@@ -1270,8 +1270,8 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
 }
 
 pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
-    use vision::encoders::molmo2::Molmo2VisionTransformer;
     use vision::encoders::molmo_point::{MolmoPointConnector, PointPredictor};
+    use vision::encoders::molmo2::Molmo2VisionTransformer;
     use vision::molmo_point_vl::{MolmoPointConfig, MolmoPointVLModel};
     use vision::processors::molmo2::Molmo2Processor;
 
@@ -1294,9 +1294,7 @@ pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
         .unwrap_or(&full_config);
 
     // Parse adapter config
-    let adapter_config = full_config
-        .get("adapter_config")
-        .unwrap_or(&full_config);
+    let adapter_config = full_config.get("adapter_config").unwrap_or(&full_config);
 
     // ViT parameters
     let vit_num_layers = cap_molmo2_vit_num_layers(
@@ -1431,12 +1429,9 @@ pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
     let weights = remap_molmo_point_weights(load_vlm_weights(model_path)?);
 
     // Load language model (uses Molmo2 text config)
-    let language_model = models::molmo_point::MolmoPointLanguageModel::from_weights(
-        &weights,
-        &text_config,
-        "lm",
-    )
-    .map_err(|e| anyhow::anyhow!("Failed to load language model: {e}"))?;
+    let language_model =
+        models::molmo_point::MolmoPointLanguageModel::from_weights(&weights, &text_config, "lm")
+            .map_err(|e| anyhow::anyhow!("Failed to load language model: {e}"))?;
 
     // Load vision model (ViT, possibly truncated)
     let vision_model = Molmo2VisionTransformer::from_weights(

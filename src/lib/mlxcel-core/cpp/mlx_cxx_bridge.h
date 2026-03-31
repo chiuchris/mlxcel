@@ -1091,6 +1091,25 @@ void fused_gated_delta_decode_step(
     std::unique_ptr<MlxArray>& new_state_out
 );
 
+// Check if GatedDeltaNet Metal kernel is available (Metal GPU only)
+bool gated_delta_kernel_available();
+
+// GatedDeltaNet custom Metal kernel forward.
+// Handles both T=1 (decode) and T>1 (prefill) in a single GPU dispatch.
+// Replaces ops-based gated_delta_step with a fused Metal shader using SIMD reductions.
+// Used by: Qwen3.5, Qwen3Next, KimiLinear
+void metal_gated_delta_forward(
+    const MlxArray& q,       // [B, T, Hk, Dk]
+    const MlxArray& k,       // [B, T, Hk, Dk]
+    const MlxArray& v,       // [B, T, Hv, Dv]
+    const MlxArray& g,       // [B, T, Hv] or [B, T, Hv, Dk]
+    const MlxArray& beta,    // [B, T, Hv]
+    const MlxArray& state,   // [B, Hv, Dv, Dk]
+    const MlxArray* mask,    // nullable: [B, T]
+    std::unique_ptr<MlxArray>& output,      // [B, T, Hv, Dv]
+    std::unique_ptr<MlxArray>& new_state    // [B, Hv, Dv, Dk]
+);
+
 // Quantization mode is "affine" (standard mlx-community models).
 void fused_mamba2_forward(
     // Input

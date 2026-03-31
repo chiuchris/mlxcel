@@ -208,9 +208,9 @@ pub enum ModelType {
     Phi4MMVLM,     // Phi-4 Multimodal (SigLIP2 NaFlex + Phi4 text, image path only)
     Phi4SigLipVLM, // Phi-4 reasoning vision (SigLIP2 NaFlex + Phi3-style text)
     Phi3VLM,       // Phi 3.5 Vision (CLIP + Phi3)
-    Molmo2VLM,      // Molmo2 (custom ViT + attention pooling + Molmo2 text)
-    MolmoPointVLM,  // Molmo-Point (custom ViT + point prediction + Molmo2 text)
-    Phi3Small,      // Phi 3 Small
+    Molmo2VLM,     // Molmo2 (custom ViT + attention pooling + Molmo2 text)
+    MolmoPointVLM, // Molmo-Point (custom ViT + point prediction + Molmo2 text)
+    Phi3Small,     // Phi 3 Small
     PhiMoe,        // Phi MoE
 
     // MoE models

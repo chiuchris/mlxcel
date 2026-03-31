@@ -28,8 +28,8 @@ use crate::LanguageModel;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-use encoders::molmo2::Molmo2VisionTransformer;
 use encoders::molmo_point::{MolmoPointConnector, PointPredictor};
+use encoders::molmo2::Molmo2VisionTransformer;
 
 /// Molmo-Point VLM configuration extracted from config.json
 pub struct MolmoPointConfig {
@@ -104,10 +104,7 @@ impl MolmoPointVLModel {
             &mlxcel_core::astype(&is_indexable, mlxcel_core::dtype::INT32),
             &mlxcel_core::astype(&is_non_indexable, mlxcel_core::dtype::INT32),
         );
-        let is_image = mlxcel_core::greater(
-            &is_image_i32,
-            &mlxcel_core::zeros_like(&is_image_i32),
-        );
+        let is_image = mlxcel_core::greater(&is_image_i32, &mlxcel_core::zeros_like(&is_image_i32));
 
         // 4. Encode images through ViT
         let img_shape = mlxcel_core::array_shape(&images);
@@ -161,12 +158,11 @@ impl MolmoPointVLModel {
         let vit_features_gathered =
             self.batched_gather(&vit_features, &clamped_pooling, batch_size);
         // Mask invalid positions (where token_pooling < 0)
-        let valid_mask = mlxcel_core::greater_equal(
-            &token_pooling,
-            &mlxcel_core::zeros_like(&token_pooling),
-        );
+        let valid_mask =
+            mlxcel_core::greater_equal(&token_pooling, &mlxcel_core::zeros_like(&token_pooling));
         let valid_4d = mlxcel_core::reshape(&valid_mask, &[tp_shape[0], n_pooled, pool_size, 1]);
-        let valid_f = mlxcel_core::astype(&valid_4d, mlxcel_core::array_dtype(&vit_features_gathered));
+        let valid_f =
+            mlxcel_core::astype(&valid_4d, mlxcel_core::array_dtype(&vit_features_gathered));
         let vit_features_gathered = mlxcel_core::multiply(&vit_features_gathered, &valid_f);
 
         // 7. Build sparse features for connector
@@ -186,10 +182,8 @@ impl MolmoPointVLModel {
             }
         }
 
-        let vit_features_flat = mlxcel_core::reshape(
-            &vit_features_gathered,
-            &[-1, pool_size, vit_feature_dim],
-        );
+        let vit_features_flat =
+            mlxcel_core::reshape(&vit_features_gathered, &[-1, pool_size, vit_feature_dim]);
         let vit_mask_flat = mlxcel_core::reshape(&valid_mask, &[-1, pool_size]);
 
         let (vit_features_sparse, vit_mask_sparse) = if valid_indices.is_empty() {
@@ -201,10 +195,8 @@ impl MolmoPointVLModel {
                 mlxcel_core::zeros(&[0, pool_size], mlxcel_core::dtype::BOOL),
             )
         } else {
-            let idx_arr = mlxcel_core::from_slice_i32(
-                &valid_indices,
-                &[valid_indices.len() as i32],
-            );
+            let idx_arr =
+                mlxcel_core::from_slice_i32(&valid_indices, &[valid_indices.len() as i32]);
             (
                 mlxcel_core::take(&vit_features_flat, &idx_arr, 0),
                 mlxcel_core::take(&vit_mask_flat, &idx_arr, 0),
@@ -212,7 +204,9 @@ impl MolmoPointVLModel {
         };
 
         // 8. Apply connector (attention pooling + projection)
-        let image_features = self.connector.forward(&vit_features_sparse, &vit_mask_sparse);
+        let image_features = self
+            .connector
+            .forward(&vit_features_sparse, &vit_mask_sparse);
 
         // 9. Find image token positions and add features
         let flat_is_image = mlxcel_core::reshape(&is_image, &[-1]);
@@ -238,10 +232,7 @@ impl MolmoPointVLModel {
             let row_arr = mlxcel_core::from_slice_i32(&row_indices, &[total_tokens, 1]);
             let pos_arr = mlxcel_core::from_slice_i32(&image_positions, &[1, num_pos]);
             let one_hot = mlxcel_core::equal(&row_arr, &pos_arr);
-            let one_hot_f = mlxcel_core::astype(
-                &one_hot,
-                mlxcel_core::dtype::FLOAT32,
-            );
+            let one_hot_f = mlxcel_core::astype(&one_hot, mlxcel_core::dtype::FLOAT32);
             let img_feat_flat = mlxcel_core::reshape(&image_features, &[-1, dim]);
             let img_feat_f32 = mlxcel_core::astype(&img_feat_flat, mlxcel_core::dtype::FLOAT32);
             let spread = mlxcel_core::matmul(&one_hot_f, &img_feat_f32);
@@ -296,8 +287,7 @@ impl MolmoPointVLModel {
 
         let flat_idx = mlxcel_core::reshape(indices, &[batch_size, num_pooled * pool_size]);
 
-        let mut batch_idx_data =
-            Vec::with_capacity((batch_size * num_pooled * pool_size) as usize);
+        let mut batch_idx_data = Vec::with_capacity((batch_size * num_pooled * pool_size) as usize);
         for b in 0..batch_size {
             for _ in 0..(num_pooled * pool_size) {
                 batch_idx_data.push(b);

@@ -1072,6 +1072,26 @@ mod ffi {
             new_state_out: &mut UniquePtr<MlxArray>,
         );
 
+        // GatedDeltaNet custom Metal kernel.
+        /// Check if GatedDeltaNet Metal kernel is available
+        fn gated_delta_kernel_available() -> bool;
+
+        /// GatedDeltaNet custom Metal kernel forward.
+        /// Handles both T=1 (decode) and T>1 (prefill) in a single GPU dispatch.
+        /// Used by: Qwen3.5, Qwen3Next, KimiLinear
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn metal_gated_delta_forward(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            g: &MlxArray,
+            beta: &MlxArray,
+            state: &MlxArray,
+            mask: *const MlxArray,      // nullable
+            output: &mut UniquePtr<MlxArray>,
+            new_state: &mut UniquePtr<MlxArray>,
+        );
+
         // Fused Mamba2 mixer forward for single-token decode.
         /// Combines in_proj + conv1d + SSM kernel + MambaRMSNormGated + out_proj into one C++ call.
         /// Replaces ~23 FFI round-trips for the hot decode path.

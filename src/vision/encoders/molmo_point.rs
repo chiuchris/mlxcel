@@ -143,11 +143,7 @@ pub struct MolmoPointConnector {
 }
 
 impl MolmoPointConnector {
-    pub fn forward(
-        &self,
-        to_pool: &MlxArray,
-        to_pool_mask: &MlxArray,
-    ) -> UniquePtr<MlxArray> {
+    pub fn forward(&self, to_pool: &MlxArray, to_pool_mask: &MlxArray) -> UniquePtr<MlxArray> {
         // Apply positional embeddings if configured
         let mut pool_input = if let Some(pos_emb) = &self.positional_embeddings {
             let x_shape = mlxcel_core::array_shape(to_pool);
@@ -193,11 +189,9 @@ impl MolmoPointConnector {
         let query = mlxcel_core::astype(&query, mlxcel_core::array_dtype(&pool_input));
 
         // Cross-attention pooling (no output projection)
-        let pooled = self.image_pooling_2d.forward(
-            &query,
-            Some(&pool_input),
-            attn_mask.as_deref(),
-        );
+        let pooled = self
+            .image_pooling_2d
+            .forward(&query, Some(&pool_input), attn_mask.as_deref());
 
         // Project through SwiGLU MLP
         self.image_projector.forward(&pooled)

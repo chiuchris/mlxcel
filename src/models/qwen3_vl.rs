@@ -211,8 +211,7 @@ impl InterleavedMRoPE {
         // Vectorized gather: for each column, take from the appropriate dimension.
         // freqs shape: [3, batch, seq_len, half_dim]
         // We gather along axis 0 using dim_indices broadcast to [1, 1, 1, half_dim].
-        let idx_arr =
-            mlxcel_core::from_slice_i32(&dim_indices, &[1, 1, 1, half_dim]);
+        let idx_arr = mlxcel_core::from_slice_i32(&dim_indices, &[1, 1, 1, half_dim]);
         let result = mlxcel_core::take_along_axis(freqs, &idx_arr, 0);
         // Squeeze the dimension axis: [1, batch, seq_len, half_dim] → [batch, seq_len, half_dim]
         mlxcel_core::squeeze_axis(&result, 0)

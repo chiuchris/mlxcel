@@ -51,8 +51,8 @@ pub mod qwen3_vl_moe;
 // Re-export VLM model types
 pub use gemma3n_vl::Gemma3nVLModel;
 pub use minicpmo_vl::MiniCPMOVLModel;
-pub use molmo2_vl::Molmo2VLModel;
 pub use molmo_point_vl::MolmoPointVLModel;
+pub use molmo2_vl::Molmo2VLModel;
 pub use moondream3_vl::Moondream3VLModel;
 pub use phi3_vl::Phi3VLModel;
 pub use phi4_siglip_vl::Phi4SigLipVLModel;

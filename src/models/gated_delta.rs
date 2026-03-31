@@ -104,7 +104,15 @@ pub fn gated_delta_step(
         let mut new_state = mlxcel_core::UniquePtr::null();
         unsafe {
             mlxcel_core::fused_gated_delta_decode_step(
-                q, k, v, g, beta, state, q_dtype, &mut output, &mut new_state,
+                q,
+                k,
+                v,
+                g,
+                beta,
+                state,
+                q_dtype,
+                &mut output,
+                &mut new_state,
             );
         }
         return (output, new_state);
@@ -190,11 +198,42 @@ pub fn gated_delta_ops(
 
     // Initialize state if not provided; use float32 for numerical precision
     // (prevents underflow/overflow in long sequences when input is bfloat16)
-    let mut current_state = if let Some(s) = state {
+    let current_state = if let Some(s) = state {
         mlxcel_core::copy(s)
     } else {
         mlxcel_core::zeros(&[b, hv, dv, dk], dtype::FLOAT32)
     };
+
+    // Metal kernel path: handles both T=1 and T>1 in a single GPU dispatch.
+    // The kernel handles GQA internally via hk_idx = hv_idx / (Hv / Hk),
+    // so q and k are passed with their original Hk heads (not repeated).
+    if mlxcel_core::gated_delta_kernel_available() {
+        let mut output = mlxcel_core::UniquePtr::null();
+        let mut new_state = mlxcel_core::UniquePtr::null();
+        let mask_ptr: *const mlxcel_core::MlxArray = match mask {
+            Some(m) => m as *const mlxcel_core::MlxArray,
+            None => std::ptr::null(),
+        };
+        // SAFETY: Metal kernel reads from valid input arrays, writes to output/new_state.
+        // mask_ptr is null when mask is None, which the C++ side handles correctly.
+        unsafe {
+            mlxcel_core::metal_gated_delta_forward(
+                q,
+                k,
+                v,
+                g,
+                beta,
+                &current_state,
+                mask_ptr,
+                &mut output,
+                &mut new_state,
+            );
+        }
+        return (output, new_state);
+    }
+
+    // Fallback: ops-based path for non-Metal devices
+    let mut current_state = current_state;
 
     // Compute repeat factor for GQA
     let repeat_factor = hv / hk;
@@ -215,19 +254,14 @@ pub fn gated_delta_ops(
         k
     };
 
-    // Fast path: single-token decode (T=1) — skip slice+squeeze loop entirely.
+    // Fast path: single-token decode (T=1) -- skip slice+squeeze loop entirely.
     // Directly squeeze the time dimension and call gated_delta_step once.
     if t == 1 {
         let q_t = mlxcel_core::squeeze_axis(q_ref, 1);
         let k_t = mlxcel_core::squeeze_axis(k_ref, 1);
         let v_t = mlxcel_core::squeeze_axis(v, 1);
 
-        let g_ndim = mlxcel_core::array_ndim(g);
-        let g_t = if g_ndim == 4 {
-            mlxcel_core::squeeze_axis(g, 1)
-        } else {
-            mlxcel_core::squeeze_axis(g, 1)
-        };
+        let g_t = mlxcel_core::squeeze_axis(g, 1);
 
         let beta_t = mlxcel_core::squeeze_axis(beta, 1);
 
@@ -243,7 +277,7 @@ pub fn gated_delta_ops(
             mask_t.as_deref(),
         );
 
-        // Add back time dimension: [B, Hv, Dv] → [B, 1, Hv, Dv]
+        // Add back time dimension: [B, Hv, Dv] -> [B, 1, Hv, Dv]
         let y = mlxcel_core::expand_dims(&y, 1);
         return (y, new_state);
     }

@@ -112,8 +112,9 @@ impl ViTAttention {
         let mask_ptr = attn_mask
             .map(|m| m as *const MlxArray)
             .unwrap_or(std::ptr::null());
-        let out =
-            unsafe { mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, self.scale, mask_ptr) };
+        let out = unsafe {
+            mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, self.scale, mask_ptr)
+        };
 
         // Cast back to input dtype if needed
         let out = if self.float32_attention {
@@ -231,7 +232,12 @@ pub(crate) struct Molmo2VisionTransformer {
 }
 
 impl Molmo2VisionTransformer {
-    pub(crate) fn add_pos_emb(&self, x: &MlxArray, patch_h: i32, patch_w: i32) -> UniquePtr<MlxArray> {
+    pub(crate) fn add_pos_emb(
+        &self,
+        x: &MlxArray,
+        patch_h: i32,
+        patch_w: i32,
+    ) -> UniquePtr<MlxArray> {
         let num_pos = self.image_num_pos as i32;
         let hidden_size = mlxcel_core::array_shape(&self.positional_embedding)[1];
 
@@ -257,7 +263,11 @@ impl Molmo2VisionTransformer {
         mlxcel_core::add(x, &pos_emb)
     }
 
-    pub(crate) fn forward(&self, x: &MlxArray, patch_num: Option<(i32, i32)>) -> Vec<UniquePtr<MlxArray>> {
+    pub(crate) fn forward(
+        &self,
+        x: &MlxArray,
+        patch_num: Option<(i32, i32)>,
+    ) -> Vec<UniquePtr<MlxArray>> {
         let default_patch_size = (self.image_num_pos as f64).sqrt() as i32;
         let (patch_h, patch_w) = patch_num.unwrap_or((default_patch_size, default_patch_size));
 

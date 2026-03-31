@@ -527,7 +527,8 @@ impl BatchScheduler {
                 Ok((input_embeds, caller_mask)) => {
                     // Caller-supplied mask takes precedence; tile-alignment mask
                     // is used only when the caller does not provide one.
-                    let effective_mask = caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+                    let effective_mask =
+                        caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
                     let logits = self.model.forward_with_embeddings(
                         &input,
                         Some(input_embeds),
@@ -610,7 +611,8 @@ impl BatchScheduler {
             if padded_len > actual_chunk_len {
                 let mut padded = chunk.to_vec();
                 padded.resize(padded_len, 0);
-                let mask = create_padded_prefill_mask(actual_chunk_len as i32, padded_len as i32, 0);
+                let mask =
+                    create_padded_prefill_mask(actual_chunk_len as i32, padded_len as i32, 0);
                 (padded, Some(mask))
             } else {
                 (chunk.to_vec(), None)
@@ -626,7 +628,8 @@ impl BatchScheduler {
         if let Some(ref embeddings) = seq.vlm_embeddings {
             match prepared_embedding_refs(embeddings) {
                 Ok((input_embeds, caller_mask)) => {
-                    let effective_mask = caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+                    let effective_mask =
+                        caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
                     let logits = self.model.forward_with_embeddings(
                         &input,
                         Some(input_embeds),
