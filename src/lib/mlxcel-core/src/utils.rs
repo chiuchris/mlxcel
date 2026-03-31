@@ -21,6 +21,7 @@ use crate::dtype;
 use crate::ffi;
 use crate::ffi::MlxArray;
 use cxx::UniquePtr;
+use std::sync::OnceLock;
 
 // Array Slicing Utilities.
 /// Slice an array along a specified axis.
@@ -422,6 +423,81 @@ pub fn stack_arrays(arrays: &[UniquePtr<MlxArray>], axis: i32) -> UniquePtr<MlxA
         .map(|a| a.as_ref().unwrap() as *const _)
         .collect();
     unsafe { ffi::stack(&ptrs, axis) }
+}
+
+// Pipeline Hint for Layer-Level async_eval
+
+/// Granularity setting for layer-boundary pipeline hints.
+///
+/// Controlled via the `MLXCEL_PIPELINE_GRANULARITY` environment variable:
+/// - `layer`   — call `async_eval` after every transformer layer
+/// - `block:N` — call `async_eval` every N layers (e.g. `block:4`)
+/// - `off`     — no intermediate eval (default; preserves MLX graph fusion)
+#[derive(Debug, Clone, Copy)]
+enum PipelineMode {
+    /// No intermediate eval — current MLX default behavior.
+    Off,
+    /// Evaluate after every transformer layer.
+    PerLayer,
+    /// Evaluate every N layers.
+    PerBlock(usize),
+}
+
+fn get_pipeline_mode() -> PipelineMode {
+    match std::env::var("MLXCEL_PIPELINE_GRANULARITY")
+        .as_deref()
+        .unwrap_or("off")
+    {
+        "layer" => PipelineMode::PerLayer,
+        s if s.starts_with("block:") => {
+            let n = s[6..].parse::<usize>().unwrap_or(4);
+            PipelineMode::PerBlock(n.max(1))
+        }
+        _ => PipelineMode::Off,
+    }
+}
+
+/// Insert an `async_eval` pipeline hint at a transformer layer boundary.
+///
+/// Calling this after each layer's `forward()` allows MLX's lazy evaluation
+/// engine to begin executing the current layer's compute graph while the next
+/// layer's weights are prefetched into L2 cache, hiding memory latency.
+///
+/// On M5 (Neural Accelerator + GPU shader cores), this can improve throughput
+/// by overlapping NA compute for layer N with weight loads for layer N+1.
+///
+/// Activation is controlled by `MLXCEL_PIPELINE_GRANULARITY`:
+/// - `layer`   — hint after every layer
+/// - `block:N` — hint every N layers
+/// - `off`     — no hints (default; preserves MLX graph fusion)
+///
+/// # Arguments
+/// * `hidden` - The hidden state tensor output from the current layer.
+/// * `layer_idx` - Zero-based index of the layer that was just executed.
+/// * `total_layers` - Total number of transformer layers in the model.
+///
+/// Used by: Llama3, Qwen3, Gemma2, Gemma3
+#[inline]
+pub fn pipeline_hint(hidden: &MlxArray, layer_idx: usize, total_layers: usize) {
+    static MODE: OnceLock<PipelineMode> = OnceLock::new();
+    let mode = MODE.get_or_init(get_pipeline_mode);
+
+    // Never emit a hint after the last layer — the caller will eval the output.
+    if layer_idx + 1 >= total_layers {
+        return;
+    }
+
+    match mode {
+        PipelineMode::Off => {}
+        PipelineMode::PerLayer => {
+            ffi::async_eval(hidden);
+        }
+        PipelineMode::PerBlock(n) => {
+            if (layer_idx + 1) % n == 0 {
+                ffi::async_eval(hidden);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

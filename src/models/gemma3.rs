@@ -27,7 +27,7 @@
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
-use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window};
+use mlxcel_core::utils::{create_causal_mask, create_causal_mask_with_window, pipeline_hint};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -477,11 +477,13 @@ impl Gemma3Model {
             self.get_embed_tokens(input_ids)
         };
 
+        let n = self.layers.len();
         // If external 4D mask is provided (from VLM), use it directly
         if let Some(ext_mask) = external_mask {
             // VLM provides a 4D attention mask — apply it to all layers
             for (i, layer) in self.layers.iter().enumerate() {
                 h = layer.forward(&h, caches[i].as_interface(), Some(ext_mask));
+                pipeline_hint(&h, i, n);
             }
         } else if seq_len == 1 {
             // Decode path (seq_len=1): no mask needed — matches Python mlx-lm
@@ -489,6 +491,7 @@ impl Gemma3Model {
             // The fused SDPA handles single-token attention without explicit masks.
             for (i, layer) in self.layers.iter().enumerate() {
                 h = layer.forward(&h, caches[i].as_interface(), None);
+                pipeline_hint(&h, i, n);
             }
         } else {
             // Prefill path (seq_len > 1): create causal masks
@@ -521,6 +524,7 @@ impl Gemma3Model {
                     sliding_mask.as_ref().map(|m| m.as_ref().unwrap())
                 };
                 h = layer.forward(&h, caches[i].as_interface(), mask);
+                pipeline_hint(&h, i, n);
             }
         }
 

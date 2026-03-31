@@ -25,6 +25,7 @@
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{FusedQKVLinear, GemmaRMSNorm, KVCache, UnifiedEmbedding, UnifiedLinear};
 // softcap is now handled by compiled_softcap for better kernel fusion
+use mlxcel_core::utils::pipeline_hint;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -405,8 +406,10 @@ impl Gemma2Model {
         h = mlxcel_core::multiply_scalar(&h, scale);
 
         // Pass through transformer layers
+        let n = self.layers.len();
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
+            pipeline_hint(&h, i, n);
         }
 
         // Final norm
@@ -465,8 +468,10 @@ impl Gemma2Model {
         let scale = (hidden_size as f32).sqrt();
         h = mlxcel_core::multiply_scalar(&h, scale);
 
+        let n = self.layers.len();
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], mask);
+            pipeline_hint(&h, i, n);
         }
 
         let h = self.norm.forward(&h);
