@@ -24,6 +24,7 @@
 //! - Shared sampling policy delegated to `crate::sampling`
 //! - Shared decode setup delegated to `crate::generation_policy`
 
+use crate::cache::KVCacheMode;
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxStream};
 use crate::generation_policy::{
@@ -371,15 +372,32 @@ pub struct CxxGenerator {
     generated_tokens: Vec<i32>,
     /// Dedicated generation stream for pipelining
     generation_stream: Option<UniquePtr<MlxStream>>,
+    /// KV cache quantization mode applied to all layer caches.
+    /// Default: `KVCacheMode::Fp16` (no quantization).
+    kv_cache_mode: KVCacheMode,
 }
 
 impl CxxGenerator {
-    /// Create a new generator
+    /// Create a new generator with FP16 KV cache (default).
     pub fn new(num_layers: usize) -> Self {
         Self {
             caches: (0..num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
+            kv_cache_mode: KVCacheMode::Fp16,
+        }
+    }
+
+    /// Create a new generator with the specified KV cache quantization mode.
+    ///
+    /// Use `KVCacheMode::Int8` to halve KV cache memory at the cost of
+    /// small per-token quantization error.
+    pub fn new_with_kv_mode(num_layers: usize, kv_cache_mode: KVCacheMode) -> Self {
+        Self {
+            caches: (0..num_layers).map(|_| KVCache::new_with_mode(kv_cache_mode)).collect(),
+            generated_tokens: Vec::new(),
+            generation_stream: new_generation_stream(),
+            kv_cache_mode,
         }
     }
 
@@ -388,8 +406,9 @@ impl CxxGenerator {
     /// Must call `reset_with_model` instead when the model uses internal caches
     /// (e.g. Gemma3, Jamba, Mamba, NemotronH, etc.) to ensure those are also reset.
     pub fn reset(&mut self) {
+        let mode = self.kv_cache_mode;
         for cache in &mut self.caches {
-            *cache = KVCache::new();
+            *cache = KVCache::new_with_mode(mode);
         }
         self.generated_tokens.clear();
     }
@@ -399,8 +418,16 @@ impl CxxGenerator {
     /// Models with internal RefCell caches (sliding window, SSM, hybrid) reset
     /// their own state inside `make_caches()`. This method ensures both the
     /// generator's cache vector and the model's internal caches are cleared.
+    /// The kv_cache_mode is applied to the freshly created caches.
     pub fn reset_with_model<M: LanguageModel + ?Sized>(&mut self, model: &M) {
         self.caches = model.make_caches();
+        // Apply the configured KV cache mode to all freshly created caches
+        let mode = self.kv_cache_mode;
+        if mode != KVCacheMode::Fp16 {
+            for cache in &mut self.caches {
+                cache.mode = mode;
+            }
+        }
         self.generated_tokens.clear();
     }
 
@@ -441,8 +468,17 @@ impl CxxGenerator {
         // Set random seed if specified (for reproducibility)
         seed_rng_if_needed(sampling);
 
-        // Ensure caches are initialized for this model
+        // Ensure caches are initialized for this model.
+        // `ensure_model_caches` may rebuild caches from `model.make_caches()`
+        // (which always uses the default Fp16 mode), so re-apply kv_cache_mode
+        // afterwards when a non-default mode is configured.
         ensure_model_caches(&mut self.caches, model);
+        let kv_mode = self.kv_cache_mode;
+        if kv_mode != KVCacheMode::Fp16 {
+            for cache in &mut self.caches {
+                cache.mode = kv_mode;
+            }
+        }
 
         // Set generation stream as default for better pipelining
         install_default_stream(self.generation_stream.as_ref());
@@ -629,6 +665,13 @@ impl CxxGenerator {
         seed_rng_if_needed(sampling);
 
         ensure_model_caches(&mut self.caches, model);
+        // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches
+        let kv_mode = self.kv_cache_mode;
+        if kv_mode != KVCacheMode::Fp16 {
+            for cache in &mut self.caches {
+                cache.mode = kv_mode;
+            }
+        }
 
         install_default_stream(self.generation_stream.as_ref());
 
@@ -758,6 +801,13 @@ impl CxxGenerator {
 
         seed_rng_if_needed(sampling);
         ensure_model_caches(&mut self.caches, model);
+        // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches
+        let kv_mode = self.kv_cache_mode;
+        if kv_mode != KVCacheMode::Fp16 {
+            for cache in &mut self.caches {
+                cache.mode = kv_mode;
+            }
+        }
         install_default_stream(self.generation_stream.as_ref());
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -892,8 +942,15 @@ impl CxxGenerator {
         // Set random seed if specified (for reproducibility)
         seed_rng_if_needed(sampling);
 
-        // Ensure caches are initialized for this model
+        // Ensure caches are initialized for this model.
+        // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches.
         ensure_model_caches(&mut self.caches, model);
+        let kv_mode = self.kv_cache_mode;
+        if kv_mode != KVCacheMode::Fp16 {
+            for cache in &mut self.caches {
+                cache.mode = kv_mode;
+            }
+        }
 
         // Set generation stream as default for better pipelining
         install_default_stream(self.generation_stream.as_ref());

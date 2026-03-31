@@ -17,11 +17,107 @@
 //! These types keep cache growth, rewinding, and sliding-window semantics in
 //! one place so `layers.rs` can focus on layer math while models continue to
 //! import the same cache types via `mlxcel_core::layers`.
+//!
+//! # KV Cache Quantization
+//!
+//! `KVCache` optionally stores keys/values in INT8 to reduce memory by ~50%.
+//! Enable via `KVCacheMode::Int8` at construction time. The `update_and_fetch`
+//! method always returns FP16 tensors (dequantized on read), so the attention
+//! computation is unaffected.
 
 use crate::concatenate;
+use crate::dtype;
 use crate::ffi;
 use crate::ffi::MlxArray;
+use crate::ops::divide_scalar;
 use cxx::UniquePtr;
+
+/// Storage mode for KV cache tensors.
+///
+/// Controls the on-device representation of accumulated key/value tensors.
+/// The public `update_and_fetch` interface always returns FP16 regardless of
+/// the chosen mode, so attention kernels are unaffected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum KVCacheMode {
+    /// Standard half-precision storage (default). No quantization overhead.
+    #[default]
+    Fp16,
+    /// Per-token INT8 absmax quantization. Reduces KV cache memory by ~50%
+    /// at the cost of small quantization error per token.
+    Int8,
+}
+
+impl std::str::FromStr for KVCacheMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "fp16" | "float16" => Ok(Self::Fp16),
+            "int8" | "i8" => Ok(Self::Int8),
+            other => Err(format!(
+                "unknown kv-cache-mode \"{other}\"; expected \"fp16\" or \"int8\""
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for KVCacheMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Fp16 => f.write_str("fp16"),
+            Self::Int8 => f.write_str("int8"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// INT8 quantization helpers
+// ---------------------------------------------------------------------------
+
+/// Quantize a tensor to INT8 using per-token absmax scaling.
+///
+/// `x` has shape `[B, H, T, D]` where T is typically 1 (one new token).
+/// Returns `(x_int8, scale)` where:
+/// - `x_int8`: `[B, H, T, D]` INT8
+/// - `scale`:  `[B, H, T, 1]` FP16 — the absmax / 127.0 for each token
+///
+/// Used by: QuantizedKVCache (INT8 mode of KVCache)
+fn quantize_per_token(
+    x: &MlxArray,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    // Compute per-token absmax: reduce over last dim (head_dim), keepdims
+    let abs_x = ffi::abs(x);
+    let absmax = ffi::max_axis(&abs_x, -1, true); // [B, H, T, 1]
+
+    // scale = absmax / 127.0  (FP16 to match cache dtype)
+    let scale = divide_scalar(&absmax, 127.0); // [B, H, T, 1]
+
+    // Avoid divide-by-zero: replace zero scales with 1.0
+    let one = ffi::full_f32(&[1], 1.0, dtype::FLOAT16);
+    let safe_scale = ffi::maximum(&scale, &one);
+
+    // x_int8 = round(x / safe_scale).clamp(-128, 127)
+    let x_div = ffi::divide(x, &safe_scale);
+    let x_rounded = ffi::round(&x_div);
+    let lo = ffi::full_f32(&[1], -128.0, ffi::array_dtype(x));
+    let hi = ffi::full_f32(&[1], 127.0, ffi::array_dtype(x));
+    let x_clipped = ffi::clip(&x_rounded, &lo, &hi);
+    let x_int8 = ffi::astype(&x_clipped, dtype::INT8);
+
+    (x_int8, safe_scale)
+}
+
+/// Dequantize INT8 tensor back to FP16 for attention computation.
+///
+/// `x_int8`: `[B, H, L, D]` INT8
+/// `scale`:  `[B, H, L, 1]` FP16
+/// Returns:  `[B, H, L, D]` FP16
+///
+/// Used by: QuantizedKVCache (INT8 mode of KVCache)
+fn dequantize(x_int8: &MlxArray, scale: &MlxArray) -> UniquePtr<MlxArray> {
+    let x_fp16 = ffi::astype(x_int8, dtype::FLOAT16);
+    ffi::multiply(&x_fp16, scale)
+}
 
 /// KV Cache for attention layers.
 ///
@@ -29,22 +125,51 @@ use cxx::UniquePtr;
 /// matching Python mlx-lm's KVCache implementation. Buffers grow by `step`
 /// slots at a time (default 256) to amortize allocation cost.
 ///
+/// When `mode` is `KVCacheMode::Int8`, keys and values are stored as INT8
+/// tensors with per-token scale factors. `update_and_fetch` always returns
+/// FP16 (dequantized) so attention kernels see standard tensors.
+///
 /// Used by: All transformer models (Llama, Qwen, Gemma, etc.)
 pub struct KVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
     pub values: Option<UniquePtr<MlxArray>>,
     pub offset: i32,
     step: i32,
+    /// Quantization mode for stored keys/values.
+    pub mode: KVCacheMode,
+    // INT8-mode scale factors: [B, H, L, 1] FP16, None when mode == Fp16
+    key_scales: Option<UniquePtr<MlxArray>>,
+    val_scales: Option<UniquePtr<MlxArray>>,
 }
 
 impl KVCache {
-    /// Create a new empty KV cache with default step size (256)
+    /// Create a new empty KV cache with default step size (256) and FP16 mode.
     pub fn new() -> Self {
         Self {
             keys: None,
             values: None,
             offset: 0,
             step: 256,
+            mode: KVCacheMode::Fp16,
+            key_scales: None,
+            val_scales: None,
+        }
+    }
+
+    /// Create a new empty KV cache with the specified quantization mode.
+    ///
+    /// Use `KVCacheMode::Int8` to store accumulated keys/values in INT8 format.
+    /// The `update_and_fetch` method will transparently quantize incoming
+    /// tensors and dequantize them on read, so callers receive standard FP16.
+    pub fn new_with_mode(mode: KVCacheMode) -> Self {
+        Self {
+            keys: None,
+            values: None,
+            offset: 0,
+            step: 256,
+            mode,
+            key_scales: None,
+            val_scales: None,
         }
     }
 
@@ -73,8 +198,22 @@ impl KVCache {
         }
     }
 
-    /// Update cache with new key/value using pre-allocated buffer + slice_update
+    /// Update cache with new key/value using pre-allocated buffer + slice_update.
+    ///
+    /// In `KVCacheMode::Int8` the incoming tensors are quantized to INT8 before
+    /// storage; scale factors are accumulated in a parallel `[B, H, L, 1]`
+    /// buffer. In `KVCacheMode::Fp16` this behaves identically to the original
+    /// implementation.
     pub fn update(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        if self.mode == KVCacheMode::Int8 {
+            self.update_int8(new_keys, new_values);
+        } else {
+            self.update_fp16(new_keys, new_values);
+        }
+    }
+
+    /// FP16 (standard) update path — original pre-allocated buffer logic.
+    fn update_fp16(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
         let key_shape = ffi::array_shape(&new_keys);
         let new_seq_len = key_shape[2];
         let prev = self.offset;
@@ -133,9 +272,114 @@ impl KVCache {
         ));
     }
 
+    /// INT8 update path — quantizes incoming K/V tokens and accumulates into
+    /// INT8 key/value buffers alongside FP16 per-token scale buffers.
+    ///
+    /// Layout of stored buffers (step-aligned, grown lazily):
+    /// - `keys`/`values`: `[B, H, capacity, D]` INT8
+    /// - `key_scales`/`val_scales`: `[B, H, capacity, 1]` FP16
+    fn update_int8(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
+        // Cast incoming tensors to FP16 before quantization so scale
+        // computation operates in a consistent dtype.
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        let (k_int8, k_scale) = quantize_per_token(&new_keys_f16);
+        let (v_int8, v_scale) = quantize_per_token(&new_values_f16);
+
+        let key_shape = ffi::array_shape(&k_int8);
+        let new_seq_len = key_shape[2];
+        let prev = self.offset;
+
+        if self.keys.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
+            let b = key_shape[0];
+            let n_kv_heads = key_shape[1];
+            let k_head_dim = key_shape[3];
+            let val_shape = ffi::array_shape(&v_int8);
+            let v_head_dim = val_shape[3];
+
+            let n_steps = (self.step + new_seq_len - 1) / self.step;
+            let buf_size = n_steps * self.step;
+
+            let new_k_buf = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::INT8);
+            let new_v_buf = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], dtype::INT8);
+            let new_ks_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            let new_vs_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+
+            if self.keys.is_some() {
+                if prev % self.step != 0 {
+                    self.keys = Some(ffi::slice(
+                        self.keys.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, k_head_dim],
+                    ));
+                    self.values = Some(ffi::slice(
+                        self.values.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, v_head_dim],
+                    ));
+                    self.key_scales = Some(ffi::slice(
+                        self.key_scales.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, 1],
+                    ));
+                    self.val_scales = Some(ffi::slice(
+                        self.val_scales.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, 1],
+                    ));
+                }
+                self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k_buf, 2));
+                self.values = Some(concatenate(self.values.as_ref().unwrap(), &new_v_buf, 2));
+                self.key_scales =
+                    Some(concatenate(self.key_scales.as_ref().unwrap(), &new_ks_buf, 2));
+                self.val_scales =
+                    Some(concatenate(self.val_scales.as_ref().unwrap(), &new_vs_buf, 2));
+            } else {
+                self.keys = Some(new_k_buf);
+                self.values = Some(new_v_buf);
+                self.key_scales = Some(new_ks_buf);
+                self.val_scales = Some(new_vs_buf);
+            }
+        }
+
+        self.offset += new_seq_len;
+
+        let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
+        let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
+        let ks_shape = ffi::array_shape(self.key_scales.as_ref().unwrap());
+        let vs_shape = ffi::array_shape(self.val_scales.as_ref().unwrap());
+
+        self.keys = Some(ffi::slice_update(
+            self.keys.as_ref().unwrap(),
+            &k_int8,
+            &[0, 0, prev, 0],
+            &[k_shape[0], k_shape[1], self.offset, k_shape[3]],
+        ));
+        self.values = Some(ffi::slice_update(
+            self.values.as_ref().unwrap(),
+            &v_int8,
+            &[0, 0, prev, 0],
+            &[v_shape[0], v_shape[1], self.offset, v_shape[3]],
+        ));
+        self.key_scales = Some(ffi::slice_update(
+            self.key_scales.as_ref().unwrap(),
+            &k_scale,
+            &[0, 0, prev, 0],
+            &[ks_shape[0], ks_shape[1], self.offset, 1],
+        ));
+        self.val_scales = Some(ffi::slice_update(
+            self.val_scales.as_ref().unwrap(),
+            &v_scale,
+            &[0, 0, prev, 0],
+            &[vs_shape[0], vs_shape[1], self.offset, 1],
+        ));
+    }
+
     /// Trim the last `n` entries from the cache.
     ///
     /// Returns the number of entries actually trimmed.
+    /// In INT8 mode the corresponding scale buffers are also trimmed.
     /// Used by: speculative decoding cache rewinds
     pub fn trim(&mut self, n: i32) -> i32 {
         let n = n.min(self.offset);
@@ -146,6 +390,8 @@ impl KVCache {
         if self.offset == 0 {
             self.keys = None;
             self.values = None;
+            self.key_scales = None;
+            self.val_scales = None;
         } else {
             let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
             let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
@@ -159,11 +405,34 @@ impl KVCache {
                 &[0, 0, 0, 0],
                 &[v_shape[0], v_shape[1], self.offset, v_shape[3]],
             ));
+            // Also trim scale buffers in INT8 mode
+            if self.mode == KVCacheMode::Int8 {
+                if let Some(ref ks) = self.key_scales {
+                    let ks_shape = ffi::array_shape(ks);
+                    self.key_scales = Some(ffi::slice(
+                        ks,
+                        &[0, 0, 0, 0],
+                        &[ks_shape[0], ks_shape[1], self.offset, 1],
+                    ));
+                }
+                if let Some(ref vs) = self.val_scales {
+                    let vs_shape = ffi::array_shape(vs);
+                    self.val_scales = Some(ffi::slice(
+                        vs,
+                        &[0, 0, 0, 0],
+                        &[vs_shape[0], vs_shape[1], self.offset, 1],
+                    ));
+                }
+            }
         }
         n
     }
 
     /// Update cache and return view of filled portion.
+    ///
+    /// In `KVCacheMode::Fp16` returns sliced FP16 keys/values directly.
+    /// In `KVCacheMode::Int8` dequantizes the accumulated INT8 buffers back to
+    /// FP16 before returning, so attention kernels always receive FP16 tensors.
     pub fn update_and_fetch(
         &mut self,
         new_keys: UniquePtr<MlxArray>,
@@ -171,21 +440,50 @@ impl KVCache {
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         self.update(new_keys, new_values);
 
-        let k = self.keys.as_ref().unwrap();
-        let v = self.values.as_ref().unwrap();
-        let ks = ffi::array_shape(k);
-        let vs = ffi::array_shape(v);
-        (
-            ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]),
-            ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]),
-        )
+        if self.mode == KVCacheMode::Int8 {
+            // Dequantize the filled portion of the INT8 buffers
+            let k_int8 = self.keys.as_ref().unwrap();
+            let v_int8 = self.values.as_ref().unwrap();
+            let k_scales = self.key_scales.as_ref().unwrap();
+            let v_scales = self.val_scales.as_ref().unwrap();
+
+            let ks = ffi::array_shape(k_int8);
+            let vs = ffi::array_shape(v_int8);
+            let kss = ffi::array_shape(k_scales);
+            let vss = ffi::array_shape(v_scales);
+
+            let k_slice = ffi::slice(k_int8, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+            let v_slice = ffi::slice(v_int8, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]);
+            let ks_slice =
+                ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], self.offset, 1]);
+            let vs_slice =
+                ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], self.offset, 1]);
+
+            (
+                dequantize(&k_slice, &ks_slice),
+                dequantize(&v_slice, &vs_slice),
+            )
+        } else {
+            let k = self.keys.as_ref().unwrap();
+            let v = self.values.as_ref().unwrap();
+            let ks = ffi::array_shape(k);
+            let vs = ffi::array_shape(v);
+            (
+                ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]),
+                ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]),
+            )
+        }
     }
 
-    /// Get the total memory size of the cached keys and values in bytes
+    /// Get the total memory size of the cached keys and values in bytes.
+    ///
+    /// In INT8 mode this includes both the INT8 buffers and the scale tensors.
     pub fn nbytes(&self) -> usize {
         let k_bytes = self.keys.as_ref().map_or(0, |k| ffi::array_nbytes(k));
         let v_bytes = self.values.as_ref().map_or(0, |v| ffi::array_nbytes(v));
-        k_bytes + v_bytes
+        let ks_bytes = self.key_scales.as_ref().map_or(0, |k| ffi::array_nbytes(k));
+        let vs_bytes = self.val_scales.as_ref().map_or(0, |v| ffi::array_nbytes(v));
+        k_bytes + v_bytes + ks_bytes + vs_bytes
     }
 }
 

@@ -31,6 +31,7 @@ use mlxcel::{
     vision::merge::InputEmbeddings,
     vlm_runtime::prepared_embedding_refs,
 };
+use mlxcel_core::cache::KVCacheMode;
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -225,8 +226,9 @@ fn generate_standard<M: LanguageModel>(
     max_tokens: usize,
     sampling_config: &SamplingConfig,
     profile: bool,
+    kv_cache_mode: KVCacheMode,
 ) -> (Vec<i32>, GenerationStats) {
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
 
     if profile {
         return generator.generate_with_stats(model, prompt_tokens, max_tokens, sampling_config);
@@ -253,8 +255,9 @@ fn generate_with_embeddings<M: LanguageModel>(
     max_tokens: usize,
     sampling_config: &SamplingConfig,
     profile: bool,
+    kv_cache_mode: KVCacheMode,
 ) -> Result<(Vec<i32>, GenerationStats)> {
-    let mut generator = CxxGenerator::new(model.num_layers());
+    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
     let (input_embeds, mask_ref) = prepared_embedding_refs(embeddings)?;
 
     if profile {
@@ -293,6 +296,7 @@ fn run_generation_mode<M: LanguageModel>(
     prompt_tokens: &[i32],
     sampling_config: &SamplingConfig,
     vlm_embeddings: Option<&InputEmbeddings>,
+    kv_cache_mode: KVCacheMode,
 ) -> Result<(Vec<i32>, GenerationStats)> {
     let output = if let Some(ref draft_model_path) = args.model.draft_model {
         println!("Loading draft model from {:?}...", draft_model_path);
@@ -319,6 +323,7 @@ fn run_generation_mode<M: LanguageModel>(
             args.generation.max_tokens,
             sampling_config,
             args.generation.profile,
+            kv_cache_mode,
         )?
     } else {
         generate_standard(
@@ -327,6 +332,7 @@ fn run_generation_mode<M: LanguageModel>(
             args.generation.max_tokens,
             sampling_config,
             args.generation.profile,
+            kv_cache_mode,
         )
     };
 
@@ -379,12 +385,23 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         &tokenizer,
     )?;
 
+    // Parse KV cache mode (validated early so errors surface before generation)
+    let kv_cache_mode = args
+        .generation
+        .kv_cache_mode
+        .parse::<KVCacheMode>()
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
+    if kv_cache_mode == KVCacheMode::Int8 {
+        println!("KV cache mode: int8 (per-token absmax quantization)");
+    }
+
     let (generated_tokens, stats) = run_generation_mode(
         &model,
         &args,
         &prompt_tokens,
         &sampling_config,
         vlm_embeddings.as_ref(),
+        kv_cache_mode,
     )?;
     let generated_text = decode_generated_text(&tokenizer, &prompt_tokens, &generated_tokens);
     print_generation_result(&generated_text, &stats, args.generation.profile)?;

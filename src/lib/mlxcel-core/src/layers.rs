@@ -25,7 +25,7 @@ use crate::ffi;
 use crate::ffi::MlxArray;
 use cxx::UniquePtr;
 
-pub use crate::cache::{ChunkedKVCache, KVCache, RotatingKVCache};
+pub use crate::cache::{ChunkedKVCache, KVCache, KVCacheMode, RotatingKVCache};
 
 /// Quantized weight structure for 4-bit/8-bit quantized layers
 /// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.

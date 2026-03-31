@@ -128,6 +128,22 @@ pub(crate) struct GenerationOptions {
     /// the Neural Accelerator does not support BFloat16 computation.
     #[arg(long, default_value_t = false)]
     pub(crate) recommend_quant: bool,
+
+    /// KV cache quantization mode.
+    ///
+    /// Controls how accumulated key/value tensors are stored:
+    ///   fp16  — Standard half-precision storage (default, no overhead).
+    ///   int8  — Per-token INT8 absmax quantization; reduces KV cache memory
+    ///           by ~50% at the cost of small quantization error per token.
+    ///
+    /// INT8 mode is most beneficial for long context generation where KV cache
+    /// becomes the memory bottleneck.
+    #[arg(
+        long = "kv-cache-mode",
+        default_value = "fp16",
+        value_name = "MODE"
+    )]
+    pub(crate) kv_cache_mode: String,
 }
 
 /// Sampling strategy options
@@ -488,6 +504,19 @@ pub(crate) struct ServeArgs {
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel handles batching internally)
     #[arg(long, hide = true)]
     _cont_batching: bool,
+
+    /// KV cache quantization mode.
+    ///
+    /// Controls how accumulated key/value tensors are stored:
+    ///   fp16  — Standard half-precision storage (default, no overhead).
+    ///   int8  — Per-token INT8 absmax quantization; reduces KV cache memory
+    ///           by ~50% at the cost of small quantization error per token.
+    #[arg(
+        long = "kv-cache-mode",
+        default_value = "fp16",
+        value_name = "MODE"
+    )]
+    kv_cache_mode: String,
 }
 
 fn main() -> anyhow::Result<()> {
