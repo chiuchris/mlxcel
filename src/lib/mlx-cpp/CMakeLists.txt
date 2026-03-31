@@ -26,8 +26,8 @@ FetchContent_GetProperties(mlx)
 if(NOT mlx_POPULATED)
   FetchContent_Populate(mlx)
 
-  # Apply CUDA backend patches (overlay modified/new files onto fetched source)
-  if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
+  # Apply patches (overlay modified/new files onto fetched source)
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
     file(GLOB_RECURSE _patch_files
          RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
          "${CMAKE_CURRENT_SOURCE_DIR}/patches/*")
