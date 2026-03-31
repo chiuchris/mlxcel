@@ -18,5 +18,6 @@
 //! entry points easier to add without re-implementing environment parsing or
 //! generation defaults in multiple places.
 
+pub mod quant_advisor;
 pub mod runtime;
 pub mod sampling;

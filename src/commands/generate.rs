@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use mlxcel::{
     CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
     SpeculativeGenerator, initialize_runtime, load_model, load_model_with_adapter,
+    quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
     vision::merge::InputEmbeddings,
@@ -335,6 +336,26 @@ fn run_generation_mode<M: LanguageModel>(
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
     print_runtime_setup(&runtime);
+
+    // Quantization recommendation and BF16 warning (before loading the model).
+    let hw = mlxcel_core::hardware::get_hardware();
+    if args.generation.recommend_quant {
+        let advice = advise_quantization(&args.model.model, hw, None);
+        print_quant_advice(&advice, hw);
+        return Ok(());
+    }
+
+    // BF16 warning on M5 hardware (even without --recommend-quant).
+    if hw.has_neural_accelerator {
+        let advice = advise_quantization(&args.model.model, hw, None);
+        if advice.model_uses_bfloat16 {
+            eprintln!(
+                "WARNING: This model uses BFloat16 weights, which are not supported by \
+                 the M5 Neural Accelerator. For best performance, use an INT8 or FP16 \
+                 quantized variant of this model (--recommend-quant for guidance)."
+            );
+        }
+    }
 
     let (model, tokenizer) = load_generation_model(&args)?;
     let prompt = load_cli_prompt(

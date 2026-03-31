@@ -115,6 +115,19 @@ pub(crate) struct GenerationOptions {
     /// Disable automatic chat template application
     #[arg(long, default_value_t = false)]
     pub(crate) no_chat_template: bool,
+
+    /// Print the recommended quantization mode for this model on the current hardware.
+    ///
+    /// Detects Apple Silicon generation and available memory, estimates model
+    /// parameter count from config.json, then suggests the optimal quantization
+    /// (int8, int4, or fp16). On M5 hardware with sufficient memory, INT8 is
+    /// recommended because the Neural Accelerator delivers ~2x throughput over
+    /// FP16 for 8-bit integer matmuls.
+    ///
+    /// Also warns when the model uses BFloat16 weights on M5 hardware, since
+    /// the Neural Accelerator does not support BFloat16 computation.
+    #[arg(long, default_value_t = false)]
+    pub(crate) recommend_quant: bool,
 }
 
 /// Sampling strategy options

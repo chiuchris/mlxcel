@@ -369,6 +369,107 @@ fn estimate_bandwidth(gen: AppleSiliconGen, memory_gb: u32) -> f64 {
     }
 }
 
+// ── Quantization recommendation ───────────────────────────────────────────────
+
+/// Recommended quantization mode for a given hardware + model combination.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub enum QuantRecommendation {
+    /// 8-bit integer quantization — best throughput on M5 Neural Accelerator.
+    Int8 { reason: &'static str },
+    /// 4-bit affine quantization — best balance of speed and memory footprint.
+    Int4Affine { reason: &'static str },
+    /// FP16 (no quantization) — for small models that fit comfortably in memory.
+    Fp16 { reason: &'static str },
+}
+
+impl QuantRecommendation {
+    /// Short label used in CLI output (e.g. `"int8"`, `"int4"`, `"fp16"`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            QuantRecommendation::Int8 { .. } => "int8",
+            QuantRecommendation::Int4Affine { .. } => "int4",
+            QuantRecommendation::Fp16 { .. } => "fp16",
+        }
+    }
+
+    /// Human-readable rationale returned by the recommendation engine.
+    pub fn reason(&self) -> &'static str {
+        match self {
+            QuantRecommendation::Int8 { reason }
+            | QuantRecommendation::Int4Affine { reason }
+            | QuantRecommendation::Fp16 { reason } => reason,
+        }
+    }
+}
+
+/// Recommend the optimal quantization mode for a given model and hardware.
+///
+/// The decision tree is:
+/// 1. **M5 with Neural Accelerator + enough memory for 8-bit**: prefer INT8.
+///    The M5 NA delivers ~2x compute throughput for INT8 vs FP16, making 8-bit
+///    quantized models strictly faster when they fit in unified memory.
+/// 2. **4-bit headroom**: prefer INT4 affine — best latency-per-memory trade-off
+///    on all other Apple Silicon generations.
+/// 3. **Fallback**: INT4 is also recommended when memory is tight (8-bit would
+///    not fit), so we never recommend FP16 unless the model is tiny enough that
+///    no quantization is needed.
+///
+/// # Arguments
+/// * `model_params_billions` — approximate model parameter count in billions.
+/// * `available_memory_gb` — total unified memory in GB (`unified_memory_gb`
+///   from [`HardwareCapabilities`]).
+/// * `hw` — hardware capabilities from [`get_hardware`].
+pub fn recommend_quantization(
+    model_params_billions: f64,
+    available_memory_gb: u32,
+    hw: &HardwareCapabilities,
+) -> QuantRecommendation {
+    // Rough memory footprints (parameters only — add 2 GB headroom for KV cache
+    // and activations):
+    //   FP16: ~2 bytes/param  →  model_params_billions * 2 GB
+    //   INT8: ~1 byte/param   →  model_params_billions * 1 GB
+    //   INT4: ~0.5 bytes/param →  model_params_billions * 0.5 GB
+    const KV_CACHE_HEADROOM_GB: u32 = 2;
+
+    let mem_fp16_gb = (model_params_billions * 2.0).ceil() as u32 + KV_CACHE_HEADROOM_GB;
+    let mem_8bit_gb = (model_params_billions * 1.0).ceil() as u32 + KV_CACHE_HEADROOM_GB;
+    let mem_4bit_gb = (model_params_billions * 0.5).ceil() as u32 + KV_CACHE_HEADROOM_GB;
+
+    // M5 Neural Accelerator path: 2x INT8 throughput over FP16.
+    if hw.has_neural_accelerator && hw.macos_supports_na {
+        if mem_8bit_gb <= available_memory_gb {
+            return QuantRecommendation::Int8 {
+                reason: "M5 NA delivers 2x throughput for INT8 vs FP16",
+            };
+        }
+        // NA still helps with INT4 on M5 for models too large for 8-bit.
+        if mem_4bit_gb <= available_memory_gb {
+            return QuantRecommendation::Int4Affine {
+                reason: "M5 NA available but 8-bit exceeds memory; 4-bit recommended",
+            };
+        }
+    }
+
+    // Non-M5 or macOS < 26.2: FP16 if small enough, else INT4.
+    if mem_fp16_gb <= available_memory_gb {
+        return QuantRecommendation::Fp16 {
+            reason: "Model fits in memory as FP16; no quantization needed",
+        };
+    }
+
+    if mem_4bit_gb <= available_memory_gb {
+        return QuantRecommendation::Int4Affine {
+            reason: "Best balance of speed and memory on this hardware",
+        };
+    }
+
+    // Even 4-bit is tight — still recommend it as the only viable option.
+    QuantRecommendation::Int4Affine {
+        reason: "Memory constrained; 4-bit required to fit model",
+    }
+}
+
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -435,5 +536,96 @@ mod tests {
         let b = get_hardware();
         // Pointer equality — same cached allocation.
         assert!(std::ptr::eq(a, b));
+    }
+
+    // ── recommend_quantization tests ──────────────────────────────────────────
+
+    fn make_hw(has_na: bool, macos_supports_na: bool, memory_gb: u32) -> HardwareCapabilities {
+        HardwareCapabilities {
+            silicon_gen: if has_na {
+                AppleSiliconGen::M5
+            } else {
+                AppleSiliconGen::M4
+            },
+            gpu_core_count: 10,
+            has_neural_accelerator: has_na,
+            metal_version: if has_na { 4 } else { 3 },
+            macos_supports_na,
+            memory_bandwidth_gbps: 150.0,
+            unified_memory_gb: memory_gb,
+        }
+    }
+
+    #[test]
+    fn recommends_int8_on_m5_with_sufficient_memory() {
+        // 7B model needs ~7 GB for INT8 + 2 GB headroom = 9 GB.
+        // 32 GB memory gives ample headroom → INT8.
+        let hw = make_hw(true, true, 32);
+        let rec = recommend_quantization(7.0, 32, &hw);
+        assert_eq!(rec, QuantRecommendation::Int8 {
+            reason: "M5 NA delivers 2x throughput for INT8 vs FP16",
+        });
+        assert_eq!(rec.label(), "int8");
+    }
+
+    #[test]
+    fn recommends_int4_on_m5_when_8bit_too_large() {
+        // 70B model: INT8 needs 70 + 2 = 72 GB, exceeds 64 GB.
+        // INT4 needs 35 + 2 = 37 GB — fits in 64 GB → INT4.
+        let hw = make_hw(true, true, 64);
+        let rec = recommend_quantization(70.0, 64, &hw);
+        assert_eq!(rec, QuantRecommendation::Int4Affine {
+            reason: "M5 NA available but 8-bit exceeds memory; 4-bit recommended",
+        });
+    }
+
+    #[test]
+    fn recommends_fp16_on_m4_with_small_model() {
+        // 1B model: FP16 needs 2 + 2 = 4 GB, fits in 24 GB → FP16.
+        let hw = make_hw(false, false, 24);
+        let rec = recommend_quantization(1.0, 24, &hw);
+        assert_eq!(rec, QuantRecommendation::Fp16 {
+            reason: "Model fits in memory as FP16; no quantization needed",
+        });
+        assert_eq!(rec.label(), "fp16");
+    }
+
+    #[test]
+    fn recommends_int4_on_m4_with_large_model() {
+        // 8B model: FP16 needs 16 + 2 = 18 GB, exceeds 16 GB.
+        // INT4 needs 4 + 2 = 6 GB, fits → INT4.
+        let hw = make_hw(false, false, 16);
+        let rec = recommend_quantization(8.0, 16, &hw);
+        assert_eq!(rec, QuantRecommendation::Int4Affine {
+            reason: "Best balance of speed and memory on this hardware",
+        });
+    }
+
+    #[test]
+    fn recommends_int4_on_m5_without_na_os_support() {
+        // M5 hardware but macOS < 26.2: NA path skipped, falls through to FP16/INT4.
+        let hw = make_hw(true, false, 32);
+        let rec = recommend_quantization(7.0, 32, &hw);
+        // 7B FP16 = 14 + 2 = 16 GB, fits in 32 GB → FP16 (no NA).
+        assert_eq!(rec, QuantRecommendation::Fp16 {
+            reason: "Model fits in memory as FP16; no quantization needed",
+        });
+    }
+
+    #[test]
+    fn recommends_int4_on_memory_constrained_m5() {
+        // 30B model on 16 GB M5: INT8 = 30 + 2 = 32 GB (too big), INT4 = 15 + 2 = 17 GB (too big).
+        let hw = make_hw(true, true, 16);
+        let rec = recommend_quantization(30.0, 16, &hw);
+        assert_eq!(rec, QuantRecommendation::Int4Affine {
+            reason: "Memory constrained; 4-bit required to fit model",
+        });
+        assert_eq!(rec.label(), "int4");
+    }
+
+    #[test]
+    fn reason_accessor_works() {
+        let rec = QuantRecommendation::Int8 { reason: "test reason" };
+        assert_eq!(rec.reason(), "test reason");
     }
 }
