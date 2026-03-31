@@ -209,41 +209,29 @@ impl InterleavedMRoPE {
     /// Returns: [batch, seq_len, half_dim]
     fn apply_interleaved_mrope(&self, freqs: &MlxArray) -> UniquePtr<MlxArray> {
         let freqs_shape = mlxcel_core::array_shape(freqs);
-        let batch = freqs_shape[1];
-        let seq_len = freqs_shape[2];
+        let _batch = freqs_shape[1];
+        let _seq_len = freqs_shape[2];
         let half_dim = freqs_shape[3];
 
-        // Start with T (temporal) as base
-        let mut result = mlxcel_core::slice(freqs, &[0, 0, 0, 0], &[1, batch, seq_len, half_dim]);
-        result = mlxcel_core::squeeze_axis(&result, 0);
-
-        // For H and W dimensions, interleave at step-3 indices
+        // Vectorized gather: build per-column source-dimension index and use
+        // take_along_axis instead of per-column slice loops.
+        let mut dim_indices: Vec<i32> = vec![0; half_dim as usize]; // default: T
         for (dim_idx, &section_len) in self.mrope_section[1..].iter().enumerate() {
             let src_dim = dim_idx as i32 + 1;
             let offset = dim_idx as i32 + 1;
             let length = section_len * 3;
-
-            let src = mlxcel_core::slice(
-                freqs,
-                &[src_dim, 0, 0, 0],
-                &[src_dim + 1, batch, seq_len, half_dim],
-            );
-            let src = mlxcel_core::squeeze_axis(&src, 0);
-
             let mut idx = offset;
             while idx < length {
-                let src_col = mlxcel_core::slice(&src, &[0, 0, idx], &[batch, seq_len, idx + 1]);
-                mlxcel_core::slice_update(
-                    &result,
-                    &src_col,
-                    &[0, 0, idx],
-                    &[batch, seq_len, idx + 1],
-                );
+                if (idx as usize) < dim_indices.len() {
+                    dim_indices[idx as usize] = src_dim;
+                }
                 idx += 3;
             }
         }
 
-        result
+        let idx_arr = mlxcel_core::from_slice_i32(&dim_indices, &[1, 1, 1, half_dim]);
+        let result = mlxcel_core::take_along_axis(freqs, &idx_arr, 0);
+        mlxcel_core::squeeze_axis(&result, 0)
     }
 }
 
@@ -952,6 +940,11 @@ impl Qwen3VLMoeModel {
     ) -> UniquePtr<MlxArray> {
         let delta = self.rope_deltas.borrow().unwrap_or(0);
         let offset = cache_offset + delta;
+
+        // Fast path for single-token decode
+        if seq_len == 1 && batch == 1 {
+            return mlxcel_core::from_slice_i32(&[offset, offset, offset], &[3, 1, 1]);
+        }
 
         let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
         let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
