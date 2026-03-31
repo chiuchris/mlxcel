@@ -83,6 +83,8 @@ pub struct ServerStartupConfig {
     pub preemption_policy: String,
     /// Force the legacy sequential worker, bypassing the batch scheduler.
     pub no_batch: bool,
+    /// Maximum number of pending requests to batch together for prefill (default: 1).
+    pub max_batch_prefill: usize,
 
     // Warmup
     pub warmup: bool,
@@ -156,6 +158,7 @@ impl Default for ServerStartupConfig {
             enable_preemption: false,
             preemption_policy: "longest-first".to_string(),
             no_batch: false,
+            max_batch_prefill: 1,
             chat_template: None,
             chat_template_file: None,
             enable_slots: true,
@@ -286,6 +289,7 @@ pub(super) fn build_server_config(
         enable_preemption: startup.enable_preemption,
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
         no_batch: startup.no_batch,
+        max_batch_prefill: startup.max_batch_prefill.max(1),
     }
 }
 

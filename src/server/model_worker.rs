@@ -44,6 +44,8 @@ pub(crate) struct WorkerSchedulerConfig {
     pub prefill_chunk_size: usize,
     pub enable_preemption: bool,
     pub preemption_policy: crate::server::config::PreemptionPolicy,
+    /// Maximum number of requests to batch together for prefill (default: 1).
+    pub max_batch_prefill: usize,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -93,9 +95,14 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         } else {
             String::new()
         };
+        let batch_prefill_info = if sched_config.max_batch_prefill > 1 {
+            format!(", max_batch_prefill={}", sched_config.max_batch_prefill)
+        } else {
+            String::new()
+        };
         tracing::info!(
             "Starting BatchScheduler (max_batch_size={}, \
-             max_queue_depth={}{chunk_info})",
+             max_queue_depth={}{chunk_info}{batch_prefill_info})",
             sched_config.max_batch_size,
             sched_config.max_queue_depth,
         );
@@ -112,6 +119,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.prefill_chunk_size,
             sched_config.enable_preemption,
             sched_config.preemption_policy,
+            sched_config.max_batch_prefill,
         );
         scheduler.run();
     })
@@ -193,6 +201,7 @@ pub(crate) fn spawn_legacy_model_worker(
             0,     // prefill_chunk_size = 0 → chunking disabled
             false, // enable_preemption = false
             crate::server::config::PreemptionPolicy::default(),
+            1,     // max_batch_prefill = 1 → sequential prefill
         );
         scheduler.run();
     })

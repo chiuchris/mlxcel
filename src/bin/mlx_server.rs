@@ -152,6 +152,14 @@ struct Args {
     #[arg(long = "preemption-policy", default_value = "longest-first")]
     preemption_policy: String,
 
+    /// Maximum number of requests to batch together for prefill (default: 1)
+    ///
+    /// When > 1, the scheduler collects up to this many pending requests and
+    /// runs a single batched forward pass [batch_size, max_seq_len] for better
+    /// Neural Accelerator utilization. Recommended: 4-8 on M5 Pro/Max hardware.
+    #[arg(long = "max-batch-prefill", default_value_t = 1)]
+    max_batch_prefill: usize,
+
     /// Override chat template (Jinja2 template string)
     #[arg(long = "chat-template", value_name = "TEMPLATE")]
     chat_template: Option<String>,
@@ -371,6 +379,7 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         ubatch_size: args.ubatch_size,
         enable_preemption: args.enable_preemption,
         preemption_policy: args.preemption_policy,
+        max_batch_prefill: args.max_batch_prefill,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
         slots: args.slots,

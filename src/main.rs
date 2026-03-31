@@ -276,6 +276,15 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value = "longest-first")]
     preemption_policy: String,
 
+    /// Maximum number of requests to batch together for prefill (default: 1)
+    ///
+    /// When > 1, the scheduler collects up to this many pending requests and
+    /// runs a single batched forward pass [batch_size, max_seq_len] for better
+    /// Neural Accelerator utilization. Falls back to sequential prefill when
+    /// only one request is pending. Recommended: 4-8 on M5 Pro/Max hardware.
+    #[arg(long, default_value_t = 1)]
+    max_batch_prefill: usize,
+
     /// Request timeout in seconds
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,

@@ -92,6 +92,17 @@ pub struct ServerConfig {
     /// worker. Equivalent to `max_batch_size <= 1` for scheduling purposes
     /// but makes the intent explicit and guarantees zero scheduler overhead.
     pub no_batch: bool,
+    /// Maximum number of requests to batch together for prefill.
+    ///
+    /// When `> 1`, the scheduler collects up to this many pending requests and
+    /// runs a single batched forward pass `[batch_size, max_seq_len]` so that
+    /// larger matmul operations better saturate Neural Accelerator cores.
+    /// Falls back to sequential (per-request) prefill when only one request
+    /// is pending or on any error.
+    ///
+    /// Default: 1 (no batching, backward compatible).
+    /// Recommended: 4–8 on M5 Pro/Max hardware.
+    pub max_batch_prefill: usize,
 }
 
 impl Default for ServerConfig {
@@ -127,6 +138,7 @@ impl Default for ServerConfig {
             enable_preemption: false,
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,
+            max_batch_prefill: 1,
         }
     }
 }

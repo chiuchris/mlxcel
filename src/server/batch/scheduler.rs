@@ -114,6 +114,13 @@ pub struct BatchScheduler {
 
     // -- Shutdown flag --
     shutdown_requested: bool,
+
+    // -- Batched prefill config --
+    /// Maximum number of pending requests to batch together for prefill.
+    /// When `> 1`, the scheduler may collect multiple queued requests and
+    /// run a single batched forward pass. Falls back to sequential prefill
+    /// when only one request is pending or on any error.
+    max_batch_prefill: usize,
 }
 
 impl BatchScheduler {
@@ -139,6 +146,7 @@ impl BatchScheduler {
             0,
             false,
             PreemptionPolicy::default(),
+            1,
         )
     }
 
@@ -156,6 +164,7 @@ impl BatchScheduler {
         prefill_chunk_size: usize,
         enable_preemption: bool,
         preemption_policy: PreemptionPolicy,
+        max_batch_prefill: usize,
     ) -> Self {
         let generation_stream = new_generation_stream();
         let max_batch_size = max_batch_size.max(1);
@@ -175,6 +184,7 @@ impl BatchScheduler {
             preemption_policy,
             chunked_prefill_seq: None,
             shutdown_requested: false,
+            max_batch_prefill: max_batch_prefill.max(1),
         }
     }
 
@@ -198,7 +208,17 @@ impl BatchScheduler {
             // 3. Execute
             match action {
                 BatchSchedulerAction::Prefill(seq_id) => {
-                    self.execute_prefill(seq_id);
+                    // Use batched prefill when max_batch_prefill > 1 and at
+                    // least 2 requests are waiting, otherwise take the regular
+                    // single-request path so there is zero overhead for the
+                    // common case.
+                    if self.max_batch_prefill > 1 && self.prefill_queue.len() >= 2
+                        && self.chunked_prefill_seq.is_none()
+                    {
+                        self.execute_batched_prefill();
+                    } else {
+                        self.execute_prefill(seq_id);
+                    }
                     self.publish_metrics();
                 }
                 BatchSchedulerAction::Decode(ids) => {
@@ -473,6 +493,189 @@ impl BatchScheduler {
         } else {
             // Full-prompt prefill (original path)
             self.execute_full_prefill(seq);
+        }
+    }
+
+    /// Batched prefill: drain up to `max_batch_prefill` requests from the
+    /// prefill queue and process them in a single forward pass.
+    ///
+    /// Sequences are padded to the longest prompt in the batch (aligned to a
+    /// 32-token tile on M5+). Each sequence gets a per-sequence causal +
+    /// padding attention mask so padding tokens are excluded from attention.
+    ///
+    /// On any error the method falls back to sequential single-request prefill
+    /// for the remaining requests so no requests are lost.
+    fn execute_batched_prefill(&mut self) {
+        let batch_size = self.max_batch_prefill.min(self.prefill_queue.len());
+
+        // Collect up to `batch_size` requests from the queue.
+        let mut seqs: Vec<SequenceInfo> = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match self.prefill_queue.dequeue() {
+                Some(s) => seqs.push(s),
+                None => break,
+            }
+        }
+
+        if seqs.is_empty() {
+            return;
+        }
+
+        // Single-request fast path: fall through to the regular prefill so
+        // there is no overhead for constructing a padded batch.
+        if seqs.len() == 1 {
+            let seq = seqs.remove(0);
+            self.execute_full_prefill(seq);
+            return;
+        }
+
+        // Any VLM request cannot currently be batched (embeddings are
+        // per-sequence and would need separate handling). Fall back for the
+        // whole batch when any request carries VLM embeddings.
+        if seqs.iter().any(|s| s.vlm_embeddings.is_some()) {
+            tracing::debug!(
+                "batched prefill: falling back to sequential (VLM request in batch)"
+            );
+            for seq in seqs {
+                self.execute_full_prefill(seq);
+            }
+            return;
+        }
+
+        let b = seqs.len();
+        let max_len = seqs.iter().map(|s| s.prompt_tokens.len()).max().unwrap();
+        let padded_len = if should_align_prefill() {
+            align_to_na_tile(max_len)
+        } else {
+            max_len
+        };
+
+        tracing::debug!(
+            "batched prefill: {} requests, padded to {}",
+            b,
+            padded_len
+        );
+
+        // Transition all sequences to Prefilling.
+        for seq in &mut seqs {
+            if let Err(err) = seq.state.transition_to(SequenceState::Prefilling) {
+                tracing::error!("Batched prefill state transition error: {err}");
+            }
+            seq.prefill_start = Some(Instant::now());
+            seed_rng_if_needed(&seq.sampling);
+        }
+
+        // Build padded input: [B, padded_len]
+        let mut flat_tokens: Vec<i32> = Vec::with_capacity(b * padded_len);
+        for seq in &seqs {
+            let tokens = &seq.prompt_tokens;
+            flat_tokens.extend_from_slice(tokens);
+            // Pad with 0 to padded_len
+            flat_tokens.extend(std::iter::repeat_n(0, padded_len - tokens.len()));
+        }
+        let input = mlxcel_core::from_slice_i32(&flat_tokens, &[b as i32, padded_len as i32]);
+
+        // Build per-sequence attention masks and collect cache pointers.
+        // Each mask has shape [padded_len, padded_len]; we add a batch dim
+        // by expanding to [1, padded_len, padded_len] and stacking into
+        // [B, padded_len, padded_len] so models can use it directly.
+        let mut batch_masks: Vec<UniquePtr<mlxcel_core::MlxArray>> =
+            Vec::with_capacity(b);
+        for seq in &seqs {
+            let actual = seq.prompt_tokens.len() as i32;
+            let padded = padded_len as i32;
+            let mask = create_padded_prefill_mask(actual, padded, 0);
+            // Expand to [1, padded_len, padded_len] for stacking.
+            let expanded = mlxcel_core::expand_dims(&mask, 0);
+            batch_masks.push(expanded);
+        }
+
+        // Stack masks into [B, padded_len, padded_len].
+        let stacked_mask = mlxcel_core::stack_owned(&batch_masks, 0);
+
+        // Collect cache pointers (one cache slice per sequence).
+        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> =
+            Vec::with_capacity(b);
+        let mut valid = true;
+        for seq in &seqs {
+            match self.cache_pool.get_caches_mut(seq.seq_id) {
+                Some(caches) => {
+                    cache_ptrs.push((caches.as_mut_ptr(), caches.len()));
+                }
+                None => {
+                    tracing::warn!(
+                        "batched prefill: cache not found for seq {}, falling back",
+                        seq.seq_id
+                    );
+                    valid = false;
+                    break;
+                }
+            }
+        }
+
+        if !valid {
+            // Re-queue all sequences for sequential processing.
+            for seq in seqs {
+                self.execute_full_prefill(seq);
+            }
+            return;
+        }
+
+        // SAFETY: Each seq_id maps to a distinct SequenceCacheSet entry in the
+        // CachePool HashMap (allocation guarantees uniqueness). No two slices
+        // alias the same memory. Pointers remain valid because cache_pool is not
+        // mutated between extraction and the forward_batched call.
+        let mut batch_caches: Vec<&mut [mlxcel_core::layers::KVCache]> = cache_ptrs
+            .iter()
+            .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+            .collect();
+
+        // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
+        let raw_logits =
+            self.model
+                .forward_batched(&input, &mut batch_caches, Some(&stacked_mask));
+
+        mlxcel_core::eval(&raw_logits);
+        mlxcel_core::clear_memory_cache();
+
+        // Process per-sequence results.
+        for (i, mut seq) in seqs.into_iter().enumerate() {
+            let actual_len = seq.prompt_tokens.len();
+            let padded = padded_len;
+
+            // Extract logits at the last real token position: index [i, actual_len-1, :]
+            let last_pos = actual_len as i32 - 1;
+            let vocab = {
+                let shape = mlxcel_core::array_shape(&raw_logits);
+                shape[2]
+            };
+            let seq_logits = mlxcel_core::slice(
+                &raw_logits,
+                &[i as i32, last_pos, 0],
+                &[i as i32 + 1, last_pos + 1, vocab],
+            );
+
+            // Trim padding positions from this sequence's KV cache so that the
+            // decode phase starts with the correct cache offset.
+            let excess = (padded - actual_len) as i32;
+            if excess > 0
+                && let Some(caches) = self.cache_pool.get_caches_mut(seq.seq_id)
+            {
+                for c in caches.iter_mut() {
+                    c.trim(excess);
+                }
+            }
+
+            seq.prefill_offset = actual_len;
+            self.batch_observability
+                .record_prefill_start(actual_len);
+
+            let eos_tokens =
+                merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
+            let needs_history = seq.sampling.needs_token_history();
+            let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
+
+            self.finish_prefill(seq, seq_logits, eos_tokens, token_history, needs_history);
         }
     }
 

@@ -122,7 +122,7 @@ impl ModelProvider {
                 batch_observability,
             )
         } else {
-            Self::new_with_full_config(
+            Self::new_with_full_config_and_batch_prefill(
                 model_path,
                 adapter_path,
                 config.max_batch_size,
@@ -130,6 +130,7 @@ impl ModelProvider {
                 config.prefill_chunk_size,
                 config.enable_preemption,
                 config.preemption_policy,
+                config.max_batch_prefill,
                 batch_metrics,
                 batch_observability,
             )
@@ -195,6 +196,35 @@ impl ModelProvider {
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
+        Self::new_with_full_config_and_batch_prefill(
+            model_path,
+            adapter_path,
+            max_batch_size,
+            max_queue_depth,
+            prefill_chunk_size,
+            enable_preemption,
+            preemption_policy,
+            1,
+            batch_metrics,
+            batch_observability,
+        )
+    }
+
+    /// Create and start a new model provider with full scheduler config,
+    /// shared batch metrics, and batched prefill support.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_full_config_and_batch_prefill(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        prefill_chunk_size: usize,
+        enable_preemption: bool,
+        preemption_policy: crate::server::config::PreemptionPolicy,
+        max_batch_prefill: usize,
+        batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
+    ) -> Result<Self> {
         let model_id = model_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -214,6 +244,7 @@ impl ModelProvider {
             prefill_chunk_size,
             enable_preemption,
             preemption_policy,
+            max_batch_prefill: max_batch_prefill.max(1),
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -272,6 +303,7 @@ impl ModelProvider {
             prefill_chunk_size: 0,
             enable_preemption: false,
             preemption_policy: crate::server::config::PreemptionPolicy::default(),
+            max_batch_prefill: 1,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

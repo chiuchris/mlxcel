@@ -39,6 +39,7 @@ fn sample_input() -> ServerStartupInput {
         enable_preemption: false,
         preemption_policy: "longest-first".to_string(),
         no_batch: false,
+        max_batch_prefill: 1,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),
         slots: true,
