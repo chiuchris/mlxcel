@@ -32,11 +32,21 @@ use crate::ffi;
 use crate::ffi::MlxStream;
 use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
 use crate::generation_policy::{initial_token_history, merged_eos_token_ids};
+use crate::hardware;
 use crate::layers::KVCache;
 use crate::sampling::sample_token_optimized;
 use crate::streams::{install_default_stream, new_generation_stream};
+use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::time::Instant;
+
+/// Returns true when the current hardware is M5+ with a Neural Accelerator
+/// and tile-aligned verification batching should be applied.
+#[inline]
+fn should_align_verification() -> bool {
+    let hw = hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
 
 /// Speculative decoding generator
 ///
@@ -161,13 +171,72 @@ impl SpeculativeGenerator {
                 break;
             }
 
-            // Step 2: Verify draft tokens with main model
-            // Forward [current_token, draft_token_0, ..., draft_token_n-1] through main model
+            // Step 2: Verify draft tokens with main model in a single batched forward pass.
+            // Input: [current_token, draft_token_0, ..., draft_token_n-1] shape [1, N+1]
+            // Output: logits shape [1, N+1, vocab_size]
+            //
+            // This is structurally identical to a prefill pass, converting N memory-bound
+            // GEMV decode operations into one compute-bound GEMM. On M5+ Neural Accelerator
+            // hardware, this yields 3-4x speedup via tile-aligned GEMM dispatch.
             let mut verify_tokens = vec![current_token];
             verify_tokens.extend_from_slice(&draft_tokens);
-            let verify_input =
-                ffi::from_slice_i32(&verify_tokens, &[1, verify_tokens.len() as i32]);
-            let main_logits = main_model.forward(&verify_input, &mut self.main_caches, None);
+            let actual_verify_len = verify_tokens.len();
+
+            // On M5+ hardware with Neural Accelerator, pad the verification sequence
+            // to a 32-token tile boundary for optimal GEMM throughput. On other
+            // hardware, no padding is needed (batching is still beneficial but
+            // tile alignment does not apply).
+            let main_logits = if should_align_verification() {
+                let padded_len = align_to_na_tile(actual_verify_len);
+                // Capture the current KV cache offset before the verification pass
+                // so the attention mask correctly spans [offset, offset + padded_len).
+                let kv_offset = self.main_caches.first().map(|c| c.offset).unwrap_or(0);
+
+                if padded_len > actual_verify_len {
+                    // Pad with zeros up to the tile boundary
+                    let mut padded_tokens = verify_tokens.clone();
+                    padded_tokens.resize(padded_len, 0);
+                    let verify_input =
+                        ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
+                    // Create attention mask so padding positions cannot attend to
+                    // anything and real tokens cannot attend to padding keys.
+                    let mask = create_padded_prefill_mask(
+                        actual_verify_len as i32,
+                        padded_len as i32,
+                        kv_offset,
+                    );
+                    let raw_logits = main_model.forward(
+                        &verify_input,
+                        &mut self.main_caches,
+                        Some(mask.as_ref().unwrap()),
+                    );
+                    // Trim padding positions from KV caches so subsequent decode
+                    // steps see the correct cache offset (actual_verify_len tokens,
+                    // not padded_len tokens).
+                    let excess = (padded_len - actual_verify_len) as i32;
+                    for cache in self.main_caches.iter_mut() {
+                        cache.trim(excess);
+                    }
+                    // Return only the logits for the actual (non-padded) positions,
+                    // sliced to shape [1, actual_verify_len, vocab].
+                    let vocab = ffi::array_shape(&raw_logits)[2];
+                    ffi::slice(
+                        &raw_logits,
+                        &[0, 0, 0],
+                        &[1, actual_verify_len as i32, vocab],
+                    )
+                } else {
+                    // Sequence already aligns to a tile boundary; no padding needed.
+                    let verify_input =
+                        ffi::from_slice_i32(&verify_tokens, &[1, actual_verify_len as i32]);
+                    main_model.forward(&verify_input, &mut self.main_caches, None)
+                }
+            } else {
+                // Non-NA hardware: plain batched forward pass, no tile alignment.
+                let verify_input =
+                    ffi::from_slice_i32(&verify_tokens, &[1, actual_verify_len as i32]);
+                main_model.forward(&verify_input, &mut self.main_caches, None)
+            };
 
             // The main model returns logits for each position:
             // - Position 0 (current_token): logits that would produce draft_tokens[0]
@@ -176,7 +245,7 @@ impl SpeculativeGenerator {
 
             // Step 3: Compare draft tokens with main model's choices
             let main_shape = ffi::array_shape(&main_logits);
-            let seq_len = main_shape[1]; // Number of logit positions
+            let seq_len = main_shape[1]; // Number of logit positions (actual, not padded)
             let mut accepted = 0;
 
             for (i, draft_token) in draft_tokens.iter().copied().enumerate() {
