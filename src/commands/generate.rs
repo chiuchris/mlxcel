@@ -112,11 +112,21 @@ fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str
 /// Creates multimodal content entries that Gemma3-style templates can
 /// render into `<start_of_image>` tokens (which are later expanded into
 /// full image-token blocks by `apply_image_token_blocks`).
+///
+/// Only used when the template explicitly handles `type == 'image'`
+/// content items. Templates without image support fall back to text-only.
 fn apply_vlm_chat_template(
     processor: &ChatTemplateProcessor,
     user_prompt: &str,
     num_images: usize,
 ) -> String {
+    // Only attempt multimodal rendering when the template handles image
+    // content items.  Templates that don't (e.g. Vicuna, ChatML) would
+    // render the raw JSON list as text, producing garbled output.
+    if !processor.supports_image_content() {
+        return apply_user_chat_template(processor, user_prompt);
+    }
+
     // Build a multimodal content list: [{type: image}, ..., {type: text, text: prompt}]
     let mut content_parts: Vec<serde_json::Value> = Vec::new();
     for _ in 0..num_images {

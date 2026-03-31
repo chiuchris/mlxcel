@@ -102,6 +102,15 @@ impl ChatTemplateProcessor {
         self.add_generation_prompt = add;
     }
 
+    /// Check if the template handles multimodal content with image items.
+    ///
+    /// Returns true when the Jinja2 template iterates over content items and
+    /// checks for `type == 'image'`, as Gemma3 VLM templates do.  Templates
+    /// without this pattern expect `content` to be a plain string.
+    pub fn supports_image_content(&self) -> bool {
+        self.template.contains("'image'") || self.template.contains("\"image\"")
+    }
+
     /// Apply the chat template with raw JSON messages (for multimodal content).
     ///
     /// This allows passing messages with list-type content entries (e.g.,
