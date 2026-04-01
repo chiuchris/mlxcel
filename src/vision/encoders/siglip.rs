@@ -41,7 +41,7 @@ struct VisionMLP {
 impl VisionMLP {
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let x = self.fc1.forward(x);
-        let x = mlxcel_core::gelu_approx(&x); // GELU(approx="fast") matching Python
+        let x = mlxcel_core::gelu_approx(&x); // GELU(approx="precise") matching Python
         self.fc2.forward(&x)
     }
 
@@ -153,10 +153,12 @@ struct EncoderLayer {
 impl EncoderLayer {
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         // LayerNorm -> Attention -> residual
-        let r = self.self_attn.forward(&self.layer_norm1.forward(x));
+        let ln1 = self.layer_norm1.forward(x);
+        let r = self.self_attn.forward(&ln1);
         let h = mlxcel_core::add(x, &r);
         // LayerNorm -> MLP -> residual
-        let r = self.mlp.forward(&self.layer_norm2.forward(&h));
+        let ln2 = self.layer_norm2.forward(&h);
+        let r = self.mlp.forward(&ln2);
         mlxcel_core::add(&h, &r)
     }
 

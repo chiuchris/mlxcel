@@ -63,6 +63,8 @@ fn test_vision_module() -> VisionModule {
         has_bos: true,
         separator_token_id: Some(12),
         suffix_tokens: vec![13, 14],
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     }
 }
 

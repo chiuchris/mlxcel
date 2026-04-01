@@ -347,6 +347,8 @@ pub(crate) fn load_llava_vlm(model_path: &Path) -> Result<LoadedModel> {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {
@@ -471,6 +473,8 @@ pub(crate) fn load_llava_bunny_vlm(model_path: &Path) -> Result<LoadedModel> {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {

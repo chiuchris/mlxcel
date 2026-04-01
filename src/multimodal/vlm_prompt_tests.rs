@@ -27,6 +27,8 @@ fn apply_image_token_blocks_expands_existing_tokens_with_boi_eoi() {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
     let mut prompt_tokens = vec![1, 99, 2];
 
@@ -55,6 +57,8 @@ fn apply_image_token_blocks_inserts_blocks_after_bos() {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
     let mut prompt_tokens = vec![1, 2, 3];
 
@@ -82,6 +86,8 @@ fn apply_image_token_blocks_paligemma_format() {
         has_bos: false,
         separator_token_id: Some(2), // BOS between images and text
         suffix_tokens: vec![108],    // newline after text
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
     let mut prompt_tokens = vec![100, 200, 300]; // text tokens only, no BOS
 
@@ -112,6 +118,8 @@ fn apply_image_token_blocks_is_noop_without_prompt_or_images() {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
 
     let mut empty_prompt = Vec::new();
@@ -123,4 +131,39 @@ fn apply_image_token_blocks_is_noop_without_prompt_or_images() {
     let mut prompt_tokens = vec![1, 2, 3];
     assert_eq!(apply_image_token_blocks(&mut prompt_tokens, info, 0), None);
     assert_eq!(prompt_tokens, vec![1, 2, 3]);
+}
+
+#[test]
+fn apply_image_token_blocks_expands_with_block_prefix_and_suffix() {
+    // Gemma3 VLM: each image block is wrapped with \n\n (token 108) prefix and suffix.
+    // Input:  [BOS(1), <start_of_image>(10), text(2)]
+    // Expect: [BOS(1), \n(108), BOI(10), img*3, EOI(11), \n(108), text(2)]
+    let info = ImageTokenBlockInfo {
+        use_boi_eoi: true,
+        image_token_id: 99,
+        mm_tokens_per_image: 3,
+        boi_token_id: 10,
+        eoi_token_id: 11,
+        has_bos: true,
+        separator_token_id: None,
+        suffix_tokens: Vec::new(),
+        block_prefix_tokens: vec![108],
+        block_suffix_tokens: vec![108],
+    };
+    // Prompt has a BOI token (10) that should be expanded
+    let mut prompt_tokens = vec![1, 10, 2];
+
+    let stats = apply_image_token_blocks(&mut prompt_tokens, info, 1);
+
+    assert_eq!(
+        stats,
+        Some(ImageTokenBlockStats {
+            action: ImageTokenBlockAction::Expanded {
+                existing_image_count: 1,
+            },
+            tokens_per_image: 3,
+        })
+    );
+    // prefix(108) + BOI(10) + img*3(99,99,99) + EOI(11) + suffix(108)
+    assert_eq!(prompt_tokens, vec![1, 108, 10, 99, 99, 99, 11, 108, 2]);
 }

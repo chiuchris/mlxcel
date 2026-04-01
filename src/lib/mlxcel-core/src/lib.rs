@@ -500,8 +500,8 @@ mod ffi {
         /// Used by: Gemma2, Gemma3, StarCoder2, and other GELU-based models
         fn compiled_gelu(x: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Compiled gelu_approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-        /// Matches Python nn.gelu_approx — single fused kernel
+        /// Compiled gelu_approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2))))
+        /// Uses erf instead of tanh for numerical stability with bf16 inputs.
         /// Used by: Gemma2, Gemma3 (Python uses gelu_approx)
         fn compiled_gelu_approx(x: &MlxArray) -> UniquePtr<MlxArray>;
 
@@ -682,7 +682,7 @@ mod ffi {
         /// GELU activation
         fn gelu(a: &MlxArray) -> UniquePtr<MlxArray>;
 
-        /// Approximate GELU (using tanh)
+        /// Approximate GELU (erf-based for numerical stability)
         fn gelu_approx(a: &MlxArray) -> UniquePtr<MlxArray>;
 
         /// ReLU activation

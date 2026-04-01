@@ -211,8 +211,8 @@ pub fn softplus(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::softplus(x)
 }
 
-/// GELU approximate activation (tanh-based approximation)
-/// This is the faster approximation used by many models like Phi
+/// GELU approximate activation (erf-based for numerical stability with bf16)
+/// Used by many models like Phi
 #[inline]
 pub fn gelu_approx(x: &MlxArray) -> UniquePtr<MlxArray> {
     ffi::gelu_approx(x)

@@ -441,6 +441,28 @@ fn test_compiled_gelu_approx() {
 }
 
 #[test]
+fn test_gelu_approx_bf16_negative_values() {
+    // Verify gelu_approx does not produce NaN for negative bf16 inputs.
+    // This was the root cause of issue #174: Gemma3 VLM 0-token generation.
+    let x_f32 = from_slice_f32(&[-10.0, -5.0, -1.0, 0.0, 1.0, 5.0, 10.0], &[1, 7]);
+    let x_bf16 = astype(&x_f32, crate::dtype::BFLOAT16);
+
+    let out = gelu_approx(&x_bf16);
+    eval(&out);
+
+    // Check no NaN values
+    let out_f32 = astype(&out, crate::dtype::FLOAT32);
+    let nan_mask = isnan(&out_f32);
+    let nan_count = sum_all(&astype(&nan_mask, crate::dtype::INT32));
+    eval(&nan_count);
+    assert_eq!(
+        item_i32(&nan_count),
+        0,
+        "gelu_approx produced NaN for negative bf16 inputs"
+    );
+}
+
+#[test]
 fn test_compiled_gelu_matches_gelu() {
     // Verify compiled_gelu gives same result as non-compiled gelu
     let x = from_slice_f32(&[0.5, -0.5, 1.5, -1.5], &[1, 4]);

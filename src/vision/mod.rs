@@ -125,6 +125,12 @@ pub struct VisionModule {
     /// Tokens to append after text.
     /// PaliGemma: newline(108) appended after text prompt.
     pub suffix_tokens: Vec<i32>,
+    /// Tokens to insert before each image block during expansion.
+    /// Gemma3 VLM: `[108]` (\n\n token) to match Python processor behavior.
+    pub block_prefix_tokens: Vec<i32>,
+    /// Tokens to insert after each image block during expansion.
+    /// Gemma3 VLM: `[108]` (\n\n token) to match Python processor behavior.
+    pub block_suffix_tokens: Vec<i32>,
 }
 
 impl VisionModule {

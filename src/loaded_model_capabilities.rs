@@ -52,6 +52,8 @@ pub(crate) fn standard_image_token_block_info(
         has_bos: vm.has_bos,
         separator_token_id: vm.separator_token_id,
         suffix_tokens: vm.suffix_tokens.clone(),
+        block_prefix_tokens: vm.block_prefix_tokens.clone(),
+        block_suffix_tokens: vm.block_suffix_tokens.clone(),
     }
 }
 
@@ -67,6 +69,8 @@ fn gemma3n_image_token_block_info(
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     }
 }
 

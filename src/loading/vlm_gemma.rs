@@ -180,6 +180,13 @@ pub(crate) fn load_gemma3_vlm(model_path: &Path) -> Result<LoadedModel> {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        // Gemma3 VLM: Python Gemma3Processor wraps image tokens as:
+        //   \n\n<start_of_image><image>x256<end_of_image>\n\n
+        // Token 108 = "\n\n" in the Gemma3 vocabulary. However, the chat
+        // template may already include surrounding \n tokens, so we only add
+        // the extra \n\n wrapping when expanding BOI tokens from the template.
+        block_prefix_tokens: vec![108],
+        block_suffix_tokens: vec![108],
     };
 
     let vlm = vision::VisionLanguageModel {

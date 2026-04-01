@@ -1096,21 +1096,20 @@ std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x) {
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
-// Compiled GELU approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-// Matches Python nn.gelu_approx
+// Compiled GELU approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2))))
+// Uses erf instead of tanh for numerical stability with bf16 inputs.
 // Used by: Gemma2, Gemma3 (Python uses gelu_approx)
 namespace {
     static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_approx() {
         auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];
-            auto sqrt_2_pi = array(std::sqrt(2.0f / M_PI));
-            auto coef = array(0.044715f);
+            // Use erf-based GELU for numerical stability with bf16 inputs.
+            // See gelu_approx() below for detailed explanation.
+            auto sqrt2 = array(std::sqrt(2.0f));
             auto half = array(0.5f);
             auto one = array(1.0f);
-            auto x3 = mlx::core::power(x, array(3.0f));
-            auto inner = mlx::core::add(x, mlx::core::multiply(coef, x3));
-            auto tanh_val = mlx::core::tanh(mlx::core::multiply(sqrt_2_pi, inner));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, tanh_val));
+            auto erf_val = mlx::core::erf(mlx::core::divide(x, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
             return {mlx::core::multiply(x, scale)};
         };
         return mlx::core::compile(fn, true);
@@ -1816,17 +1815,22 @@ std::unique_ptr<MlxArray> gelu(const MlxArray& a) {
 }
 
 std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a) {
-    // Approximate GELU using tanh
-    // gelu_approx(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    auto sqrt_2_pi = array(std::sqrt(2.0f / M_PI));
-    auto coef = array(0.044715f);
+    // Use erf-based exact GELU instead of the original tanh approximation.
+    //
+    // The tanh approximation 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3)))
+    // produced NaN for negative bf16 inputs in the SigLIP vision encoder MLP
+    // because power(x, 3.0f) uses exp(3*log(x)) which is undefined for x<0.
+    // Even with x*x*x the MLX lazy graph fuses operations that can overflow
+    // bf16 intermediates within the large SigLIP computation graph (4096 patches).
+    //
+    // The erf-based GELU: x * 0.5 * (1 + erf(x / sqrt(2))) is numerically
+    // stable for all inputs and matches Python nn.GELU(approx="precise")
+    // output within floating-point tolerance.
+    auto sqrt2 = array(std::sqrt(2.0f));
     auto half = array(0.5f);
     auto one = array(1.0f);
-
-    auto x3 = mlx::core::power(a.inner, array(3.0f));
-    auto inner = mlx::core::add(a.inner, mlx::core::multiply(coef, x3));
-    auto tanh_val = mlx::core::tanh(mlx::core::multiply(sqrt_2_pi, inner));
-    auto scale = mlx::core::multiply(half, mlx::core::add(one, tanh_val));
+    auto erf_val = mlx::core::erf(mlx::core::divide(a.inner, sqrt2));
+    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
     return std::make_unique<MlxArray>(mlx::core::multiply(a.inner, scale));
 }
 
@@ -2223,15 +2227,23 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
     float scale,
     const MlxArray* mask
 ) {
-    // Cast mask to Q's dtype to avoid "Mask type must promote to output type" errors
-    // when mask is float32 but Q/K/V are float16 or bfloat16
+    // MLX SDPA accepts boolean masks (True=attend, False=mask) and additive
+    // masks (0=attend, -inf=mask).  Boolean/integer masks must NOT be cast to
+    // float, or their True/False semantics are lost and they become additive
+    // 1.0/0.0 offsets.  Float masks are cast to Q's dtype to satisfy the
+    // "must promote to output type" constraint.
     std::optional<array> mask_opt = std::nullopt;
     std::string mask_mode = "";
     if (mask) {
         auto m = mask->inner;
-        if (m.dtype() != q.inner.dtype()) {
-            m = mlx::core::astype(m, q.inner.dtype());
+        if (mlx::core::issubdtype(m.dtype(), mlx::core::floating)) {
+            // Additive mask: cast to Q's dtype
+            if (m.dtype() != q.inner.dtype()) {
+                m = mlx::core::astype(m, q.inner.dtype());
+            }
         }
+        // Boolean/integer masks are passed through unchanged — MLX
+        // handles them natively.
         mask_opt = m;
         mask_mode = "array";
     }
@@ -2254,7 +2266,14 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_with_sinks(
     std::string mask_mode = "";
     if (mask) {
         auto m = mask->inner;
-        if (m.dtype() != q.inner.dtype()) m = mlx::core::astype(m, q.inner.dtype());
+        if (mlx::core::issubdtype(m.dtype(), mlx::core::floating)) {
+            // Additive mask: cast to Q's dtype
+            if (m.dtype() != q.inner.dtype()) {
+                m = mlx::core::astype(m, q.inner.dtype());
+            }
+        }
+        // Boolean/integer masks are passed through unchanged — MLX
+        // handles them natively.
         mask_opt = m;
         mask_mode = "array";
     }

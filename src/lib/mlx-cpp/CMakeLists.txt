@@ -26,7 +26,7 @@ FetchContent_GetProperties(mlx)
 if(NOT mlx_POPULATED)
   FetchContent_Populate(mlx)
 
-  # Apply patches (overlay modified/new files onto fetched source)
+  # Apply shared patches (Metal JIT fixes, kernel utils) to all builds
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
     file(GLOB_RECURSE _patch_files
          RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
@@ -37,7 +37,24 @@ if(NOT mlx_POPULATED)
         "${mlx_SOURCE_DIR}/${_patch_file}"
         COPYONLY)
     endforeach()
-    message(STATUS "Applied ${CMAKE_CURRENT_SOURCE_DIR}/patches to MLX source")
+    message(STATUS "Applied shared patches to MLX source")
+  endif()
+
+  # Apply CUDA-only patches (bf16 type promotion, normalization precision)
+  # These change dtype promotion rules (bf16+fp32→bf16) and norm computation
+  # to avoid copy_v kernel overhead on CUDA, but break Metal precision for
+  # bf16 vision weights (e.g., SigLIP position embeddings read as zeros).
+  if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda")
+    file(GLOB _cuda_patch_files
+         "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda/*.cpp")
+    foreach(_patch_file ${_cuda_patch_files})
+      get_filename_component(_fname "${_patch_file}" NAME)
+      configure_file(
+        "${_patch_file}"
+        "${mlx_SOURCE_DIR}/mlx/${_fname}"
+        COPYONLY)
+    endforeach()
+    message(STATUS "Applied CUDA-only patches to MLX source")
   endif()
 
   add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})

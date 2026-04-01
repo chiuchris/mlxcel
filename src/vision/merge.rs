@@ -26,7 +26,7 @@
 //!
 //! Contract:
 //! - merge helpers keep output embeddings in the text-model dtype
-//! - Gemma-style merge returns an additive 4D mask (`0` or `f32::MIN`)
+//! - Gemma-style merge returns an integer 4D mask (`0` or `1`)
 //! - LLaVA-style merge keeps standard causal masking and returns `None`
 //!
 //! Reference: references/mlx-vlm/mlx_vlm/models/gemma3/gemma3.py:121-168
@@ -119,23 +119,18 @@ pub fn prepare_inputs_for_multimodal(
         &scaled_image_features,
     );
 
-    // Build 4D attention mask in additive format (0=attend, -inf=masked)
-    // Python mlx-vlm creates a 0/1 mask and converts it in the attention layer:
-    //   mask = (1.0 - mask) * finfo.min
-    // We do the conversion here so the attention code can simply add the mask to scores.
+    // Build 4D attention mask as INT32 0/1, matching Python mlx-vlm exactly.
+    // Python's prepare_inputs_for_multimodal returns the mask directly as:
+    //   final_attention_mask_4d = (attention_mask[:, None] * attention_mask[:, :, None])[:, None]
+    // which is INT32 (1=attend, 0=mask). mx.fast.scaled_dot_product_attention
+    // treats non-bool masks as additive, so 0/1 adds 0 or 1 to scores.
+    // With all-ones attention_mask, this creates a uniform +1 offset that
+    // doesn't affect softmax (shift-invariant).
     // Used by: PaliGemma (Gemma2 backbone), Gemma3 VLM
     let attn_mask_1 = mlxcel_core::expand_dims(attention_mask, 1); // [B, 1, S]
     let attn_mask_2 = mlxcel_core::expand_dims(attention_mask, 2); // [B, S, 1]
     let attn_mask_4d = mlxcel_core::multiply(&attn_mask_1, &attn_mask_2); // [B, S, S]
     let attn_mask_4d = mlxcel_core::expand_dims(&attn_mask_4d, 1); // [B, 1, S, S]
-    // Convert from boolean-style (1=attend, 0=mask) to additive (0=attend, -inf=mask)
-    let attn_mask_float = mlxcel_core::astype(&attn_mask_4d, mlxcel_core::dtype::FLOAT32);
-    let ones = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
-    let inverted = mlxcel_core::subtract(&ones, &attn_mask_float); // 1→0, 0→1
-    // Use f32::MIN (not NEG_INFINITY) to avoid NaN from 0.0 * -inf in IEEE 754.
-    // Matches Python's mx.finfo(dtype).min = -3.4028235e+38.
-    let mask_fill = mlxcel_core::full_f32(&[1], f32::MIN, mlxcel_core::dtype::FLOAT32);
-    let attn_mask_4d = mlxcel_core::multiply(&inverted, &mask_fill); // 0→0, 1→-3.4e38
 
     // Cast final embedding to same dtype as inputs_embeds
     let dtype = mlxcel_core::array_dtype(inputs_embeds);

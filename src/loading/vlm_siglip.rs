@@ -257,6 +257,8 @@ pub(crate) fn load_aya_vision_vlm(model_path: &Path) -> Result<LoadedModel> {
         has_bos: true,
         separator_token_id: None,
         suffix_tokens: Vec::new(),
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {
@@ -337,6 +339,8 @@ pub(crate) fn load_paligemma_vlm(model_path: &Path) -> Result<LoadedModel> {
         has_bos: false,              // PaliGemma: tokenizer has add_bos_token=false
         separator_token_id: Some(2), // BOS(2) between image and text tokens
         suffix_tokens: vec![108],    // newline after text prompt
+        block_prefix_tokens: Vec::new(),
+        block_suffix_tokens: Vec::new(),
     };
 
     let vlm = vision::VisionLanguageModel {

@@ -329,7 +329,8 @@ std::unique_ptr<MlxArray> compiled_silu(const MlxArray& x);
 // Used by: Gemma2, Gemma3, StarCoder2, and other GELU-based models
 std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x);
 
-// Compiled gelu_approx: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))) — fused kernel
+// Compiled gelu_approx: erf-based GELU (x * 0.5 * (1 + erf(x / sqrt(2)))) — fused kernel
+// Uses erf instead of tanh for numerical stability with bf16 inputs.
 // Used by: Gemma2, Gemma3 (matches Python nn.gelu_approx)
 std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x);
 

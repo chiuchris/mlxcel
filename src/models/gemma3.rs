@@ -483,9 +483,13 @@ impl Gemma3Model {
         h = mlxcel_core::multiply_scalar(&h, scale);
 
         let n = self.layers.len();
-        // If external 4D mask is provided (from VLM), use it directly
+        // If external 4D mask is provided (from VLM), use it for all layers.
+        // Python mlx-vlm passes a 0/1 INT32 mask from prepare_inputs_for_multimodal
+        // directly to all layers, bypassing the causal mask creation.
+        // When attention_mask is all-ones (no padding), this creates a bidirectional
+        // mask that lets all tokens attend to all others during prefill.
         if let Some(ext_mask) = external_mask {
-            // VLM provides a 4D attention mask — apply it to all layers
+            // VLM provides a 4D attention mask -- apply it to all layers
             for (i, layer) in self.layers.iter().enumerate() {
                 h = layer.forward(&h, caches[i].as_interface(), Some(ext_mask));
                 pipeline_hint(&h, i, n);

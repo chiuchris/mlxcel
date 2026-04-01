@@ -35,6 +35,14 @@ pub struct ImageTokenBlockInfo {
     /// Tokens to append after text.
     /// PaliGemma: newline(108) appended after text prompt.
     pub suffix_tokens: Vec<i32>,
+    /// Tokens to insert before each image block during expansion.
+    /// Gemma3 VLM: `[108, 108]` (\n\n) to match Python processor behavior.
+    /// Used by: Gemma3 VLM
+    pub block_prefix_tokens: Vec<i32>,
+    /// Tokens to insert after each image block during expansion.
+    /// Gemma3 VLM: `[108, 108]` (\n\n) to match Python processor behavior.
+    /// Used by: Gemma3 VLM
+    pub block_suffix_tokens: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,11 +85,14 @@ pub fn apply_image_token_blocks(
     let total_existing = existing_image_count + existing_boi_count;
 
     if total_existing > 0 {
+        let extra_per_block = info.block_prefix_tokens.len() + info.block_suffix_tokens.len();
         let mut expanded = Vec::with_capacity(
-            prompt_tokens.len() + (info.mm_tokens_per_image - 1) * total_existing,
+            prompt_tokens.len() + (info.mm_tokens_per_image - 1 + extra_per_block) * total_existing,
         );
         for &token in prompt_tokens.iter() {
             if token == info.image_token_id || (info.use_boi_eoi && token == info.boi_token_id) {
+                // Insert block prefix tokens (e.g., \n\n for Gemma3 VLM)
+                expanded.extend_from_slice(&info.block_prefix_tokens);
                 if info.use_boi_eoi {
                     expanded.push(info.boi_token_id);
                 }
@@ -91,6 +102,8 @@ pub fn apply_image_token_blocks(
                 if info.use_boi_eoi {
                     expanded.push(info.eoi_token_id);
                 }
+                // Insert block suffix tokens (e.g., \n\n for Gemma3 VLM)
+                expanded.extend_from_slice(&info.block_suffix_tokens);
             } else {
                 expanded.push(token);
             }
