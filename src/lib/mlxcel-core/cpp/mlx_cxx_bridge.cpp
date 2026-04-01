@@ -1444,38 +1444,16 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     return std::make_unique<MlxArray>(std::move(down));
 }
 
-// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
+// SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
 //   down_proj(silu(gate_proj(x)) * up_proj(x))
-// Fuses the entire MLP into a single compiled graph.
+//
+// Matmul operations run outside the compile boundary because
+// mlx::core::compile with matmul+transpose can produce incorrect results
+// when the compiled graph is reused across layers with different weights.
+// The SwiGLU activation (silu(gate) * up) uses the compiled swiglu kernel
+// which correctly fuses element-wise ops only.
+//
 // Used by: Llama, Qwen2, Qwen3, and all other SwiGLU FP models
-namespace {
-    static std::function<std::vector<array>(const std::vector<array>&)>
-    get_compiled_fp_swiglu_mlp() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            // inputs: x, gate_weight, up_weight, down_weight
-            const auto& x       = inputs[0];
-            const auto& gate_w  = inputs[1];
-            const auto& up_w    = inputs[2];
-            const auto& down_w  = inputs[3];
-
-            // gate_proj(x) = x @ gate_w.T
-            auto gate = mlx::core::matmul(x, mlx::core::transpose(gate_w));
-            // up_proj(x) = x @ up_w.T
-            auto up = mlx::core::matmul(x, mlx::core::transpose(up_w));
-
-            // SwiGLU: silu(gate) * up, where silu(x) = x * sigmoid(x)
-            auto silu_gate = mlx::core::multiply(gate, mlx::core::sigmoid(gate));
-            auto activated = mlx::core::multiply(silu_gate, up);
-
-            // down_proj(activated) = activated @ down_w.T
-            auto down = mlx::core::matmul(activated, mlx::core::transpose(down_w));
-
-            return {down};
-        };
-        return mlx::core::compile(fn, true);  // shapeless=true
-    }
-}
-
 std::unique_ptr<MlxArray> compiled_swiglu_mlp_forward_fp16(
     const MlxArray& x,
     const MlxArray& gate_weight,
@@ -1485,71 +1463,38 @@ std::unique_ptr<MlxArray> compiled_swiglu_mlp_forward_fp16(
     const MlxArray* up_bias,
     const MlxArray* down_bias
 ) {
-    // If no biases, use the fully compiled path (common case for Llama/Qwen)
-    if (!gate_bias && !up_bias && !down_bias) {
-        static auto compiled_fn = get_compiled_fp_swiglu_mlp();
-        auto result = compiled_fn({x.inner, gate_weight.inner, up_weight.inner, down_weight.inner});
-        return std::make_unique<MlxArray>(std::move(result[0]));
-    }
-
-    // Fallback with biases: run unfused but still correct
+    // gate_proj(x) = x @ gate_w.T [+ bias]
     auto gate_t = mlx::core::transpose(gate_weight.inner);
     auto gate = mlx::core::matmul(x.inner, gate_t);
     if (gate_bias) gate = mlx::core::add(gate, gate_bias->inner);
 
+    // up_proj(x) = x @ up_w.T [+ bias]
     auto up_t = mlx::core::transpose(up_weight.inner);
     auto up = mlx::core::matmul(x.inner, up_t);
     if (up_bias) up = mlx::core::add(up, up_bias->inner);
 
-    auto silu_gate = mlx::core::multiply(gate, mlx::core::sigmoid(gate));
-    auto activated = mlx::core::multiply(silu_gate, up);
+    // SwiGLU activation: silu(gate) * up — compiled element-wise fusion
+    static auto compiled_act = get_compiled_swiglu();
+    auto activated = compiled_act({gate, up});
 
+    // down_proj(activated) = activated @ down_w.T [+ bias]
     auto down_t = mlx::core::transpose(down_weight.inner);
-    auto down = mlx::core::matmul(activated, down_t);
+    auto down = mlx::core::matmul(activated[0], down_t);
     if (down_bias) down = mlx::core::add(down, down_bias->inner);
 
     return std::make_unique<MlxArray>(std::move(down));
 }
 
-// Compiled GELU MLP forward for non-quantized (FP16/BF16) weights:
+// GELU MLP forward for non-quantized (FP16/BF16) weights:
 //   down_proj(gelu(gate_proj(x)) * up_proj(x))
-// Fuses the entire MLP into a single compiled graph.
+//
+// Matmul operations run outside the compile boundary because
+// mlx::core::compile with matmul+transpose can produce incorrect results
+// when the compiled graph is reused across layers with different weights.
+// The GeGLU activation (gelu(gate) * up) uses the compiled geglu kernel
+// which correctly fuses element-wise ops only.
+//
 // Used by: Gemma2, Gemma3, StarCoder2 and other GELU-gated FP models
-namespace {
-    static std::function<std::vector<array>(const std::vector<array>&)>
-    get_compiled_fp_gelu_mlp() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            // inputs: x, gate_weight, up_weight, down_weight
-            const auto& x      = inputs[0];
-            const auto& gate_w = inputs[1];
-            const auto& up_w   = inputs[2];
-            const auto& down_w = inputs[3];
-
-            // gate_proj(x) = x @ gate_w.T
-            auto gate = mlx::core::matmul(x, mlx::core::transpose(gate_w));
-            // up_proj(x) = x @ up_w.T
-            auto up = mlx::core::matmul(x, mlx::core::transpose(up_w));
-
-            // GELU(gate): gate * 0.5 * (1 + erf(gate / sqrt(2)))
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto gelu_gate = mlx::core::multiply(gate, scale);
-
-            // activated = gelu(gate) * up
-            auto activated = mlx::core::multiply(gelu_gate, up);
-
-            // down_proj(activated) = activated @ down_w.T
-            auto down = mlx::core::matmul(activated, mlx::core::transpose(down_w));
-
-            return {down};
-        };
-        return mlx::core::compile(fn, true);  // shapeless=true
-    }
-}
-
 std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
     const MlxArray& x,
     const MlxArray& gate_weight,
@@ -1559,33 +1504,23 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward_fp16(
     const MlxArray* up_bias,
     const MlxArray* down_bias
 ) {
-    // If no biases, use the fully compiled path (common case)
-    if (!gate_bias && !up_bias && !down_bias) {
-        static auto compiled_fn = get_compiled_fp_gelu_mlp();
-        auto result = compiled_fn({x.inner, gate_weight.inner, up_weight.inner, down_weight.inner});
-        return std::make_unique<MlxArray>(std::move(result[0]));
-    }
-
-    // Fallback with biases: run unfused but still correct
+    // gate_proj(x) = x @ gate_w.T [+ bias]
     auto gate_t = mlx::core::transpose(gate_weight.inner);
     auto gate = mlx::core::matmul(x.inner, gate_t);
     if (gate_bias) gate = mlx::core::add(gate, gate_bias->inner);
 
+    // up_proj(x) = x @ up_w.T [+ bias]
     auto up_t = mlx::core::transpose(up_weight.inner);
     auto up = mlx::core::matmul(x.inner, up_t);
     if (up_bias) up = mlx::core::add(up, up_bias->inner);
 
-    // GELU(gate): gate * 0.5 * (1 + erf(gate / sqrt(2)))
-    auto sqrt2 = array(std::sqrt(2.0f));
-    auto half = array(0.5f);
-    auto one = array(1.0f);
-    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-    auto scale_val = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-    auto gelu_gate = mlx::core::multiply(gate, scale_val);
-    auto activated = mlx::core::multiply(gelu_gate, up);
+    // GeGLU activation: gelu(gate) * up — compiled element-wise fusion
+    static auto compiled_act = get_compiled_geglu();
+    auto activated = compiled_act({gate, up});
 
+    // down_proj(activated) = activated @ down_w.T [+ bias]
     auto down_t = mlx::core::transpose(down_weight.inner);
-    auto down = mlx::core::matmul(activated, down_t);
+    auto down = mlx::core::matmul(activated[0], down_t);
     if (down_bias) down = mlx::core::add(down, down_bias->inner);
 
     return std::make_unique<MlxArray>(std::move(down));

@@ -1355,11 +1355,11 @@ impl MultiLinear {
     }
 }
 
-/// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+/// SwiGLU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
 ///
-/// When all three projections are non-quantized, calls the fused compiled C++ path
-/// (`compiled_swiglu_mlp_forward_fp16`) which fuses the entire MLP into a single
-/// compiled graph for kernel fusion.  Falls back to the unfused path for biased layers.
+/// When all three projections are non-quantized, calls the C++ path which
+/// runs matmul operations directly and fuses only the SwiGLU activation via
+/// compiled element-wise kernels.
 ///
 /// Returns `None` if any projection is quantized (caller should use the quantized path).
 ///
@@ -1370,13 +1370,6 @@ pub fn compiled_swiglu_mlp_fp16(
     up_proj: &UnifiedLinear,
     down_proj: &UnifiedLinear,
 ) -> Option<crate::UniquePtr<MlxArray>> {
-    // Skip compiled FP MLP for bfloat16 inputs: the compiled kernel JIT
-    // creates float32 constants (for SiLU) that cause type promotion overhead
-    // and incorrect results on some hardware configurations.
-    // Fall back to separate operations which handle bf16 natively.
-    if crate::ffi::array_dtype(x) == crate::dtype::BFLOAT16 {
-        return None;
-    }
     let gate_lin = gate_proj.regular_weight()?;
     let up_lin = up_proj.regular_weight()?;
     let down_lin = down_proj.regular_weight()?;
@@ -1465,11 +1458,11 @@ pub fn metal4_attention(
     unsafe { ffi::fused_metal4_attention(q, k, v, scale, mask_ptr, use_metal4) }
 }
 
-/// Compiled GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
+/// GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
 ///
-/// When all three projections are non-quantized, calls the fused compiled C++ path
-/// (`compiled_gelu_mlp_forward_fp16`) which fuses the entire MLP into a single
-/// compiled graph for kernel fusion.  Falls back to the unfused path for biased layers.
+/// When all three projections are non-quantized, calls the C++ path which
+/// runs matmul operations directly and fuses only the GELU activation via
+/// compiled element-wise kernels.
 ///
 /// Returns `None` if any projection is quantized (caller should use the quantized path).
 ///
@@ -1480,10 +1473,6 @@ pub fn compiled_gelu_mlp_fp16(
     up_proj: &UnifiedLinear,
     down_proj: &UnifiedLinear,
 ) -> Option<crate::UniquePtr<MlxArray>> {
-    // Skip compiled FP MLP for bfloat16 inputs (same reason as SwiGLU variant)
-    if crate::ffi::array_dtype(x) == crate::dtype::BFLOAT16 {
-        return None;
-    }
     let gate_lin = gate_proj.regular_weight()?;
     let up_lin = up_proj.regular_weight()?;
     let down_lin = down_proj.regular_weight()?;
