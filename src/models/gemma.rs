@@ -21,7 +21,7 @@
 //! - Always uses tied word embeddings
 
 use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{KVCache, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::layers::{FusedQKVLinear, KVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -98,10 +98,13 @@ impl GemmaRMSNorm {
 }
 
 // Attention (standard, same as Llama).
+// Uses FusedQKVLinear: Q, K, V weights are concatenated at load time
+// into a single [q_dim+k_dim+v_dim, hidden_dim] weight matrix,
+// enabling a single matmul instead of 3 separate ones per forward pass.
+// For Gemma v1 2B: q_dim=k_dim=v_dim=2048, fused weight = [6144, 2048].
 pub struct Attention {
-    pub q_proj: UnifiedLinear,
-    pub k_proj: UnifiedLinear,
-    pub v_proj: UnifiedLinear,
+    /// Fused QKV projection: Q, K, V weights concatenated along output dim.
+    pub qkv_proj: FusedQKVLinear,
     pub o_proj: UnifiedLinear,
     pub num_heads: i32,
     pub num_kv_heads: i32,
@@ -121,10 +124,8 @@ impl Attention {
         let b = shape[0];
         let l = shape[1];
 
-        // Project Q, K, V
-        let q = self.q_proj.forward(x);
-        let k = self.k_proj.forward(x);
-        let v = self.v_proj.forward(x);
+        // Fused QKV projection: single matmul → split into Q, K, V
+        let (q, k, v) = self.qkv_proj.forward(x);
 
         // Reshape to [batch, seq_len, n_heads, head_dim]
         let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
@@ -182,24 +183,31 @@ impl Attention {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let q_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.q_proj", prefix), group_size, bits)?;
-        let k_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.k_proj", prefix), group_size, bits)?;
-        let v_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.v_proj", prefix), group_size, bits)?;
         let o_proj =
             UnifiedLinear::from_weights(weights, &format!("{}.o_proj", prefix), group_size, bits)?;
 
         let head_dim = args.head_dim as i32;
+        let num_heads = args.num_attention_heads as i32;
+        let num_kv_heads = args.num_key_value_heads as i32;
+
+        // Fuse Q/K/V into a single projection: concatenate along output dim at load time.
+        // For Gemma v1 2B (MHA): num_heads == num_kv_heads == 8, head_dim == 256,
+        // so q_dim == k_dim == v_dim == 2048, fused weight shape = [6144, 2048].
+        let qkv_proj = FusedQKVLinear::from_weights_separate(
+            weights,
+            prefix,
+            group_size,
+            bits,
+            num_heads,
+            num_kv_heads,
+            head_dim,
+        )?;
 
         Ok(Self {
-            q_proj,
-            k_proj,
-            v_proj,
+            qkv_proj,
             o_proj,
-            num_heads: args.num_attention_heads as i32,
-            num_kv_heads: args.num_key_value_heads as i32,
+            num_heads,
+            num_kv_heads,
             head_dim,
             scale: 1.0 / (head_dim as f32).sqrt(),
             rope_base: args.rope_theta,
