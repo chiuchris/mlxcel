@@ -675,8 +675,8 @@ impl NemotronHMamba2Mixer {
         // Handle previous state if present (using Mamba2's approach)
         let y = if let Some(prev_state) = state {
             // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2))
-            // Python uses inclusive cumsum (exclusive=false)
-            let dta_cumsum = mlxcel_core::cumsum(&dt_a, -2, false, false);
+            // Python reference uses exclusive cumsum for carry-forward computation
+            let dta_cumsum = mlxcel_core::cumsum(&dt_a, -2, false, true);
             let exp_dta_cumsum = mlxcel_core::exp(&dta_cumsum);
 
             // Update next_state with previous state
@@ -900,8 +900,8 @@ fn segsum_nemotron(x: &MlxArray) -> UniquePtr<MlxArray> {
     let x_rep = mlxcel_core::broadcast_to(&x_exp, &new_shape);
 
     let x_tril = mlxcel_core::tril(&x_rep, -1);
-    // Python uses inclusive cumsum (exclusive=false)
-    mlxcel_core::cumsum(&x_tril, -2, false, false)
+    // Exclusive cumsum matching mamba2.rs segsum and Python reference
+    mlxcel_core::cumsum(&x_tril, -2, false, true)
 }
 
 // Attention.
@@ -2479,7 +2479,32 @@ impl LanguageModel for NemotronHModel {
         false // NemotronH is a hybrid Mamba+Transformer, internal caches not compatible with per-sequence KV isolation
     }
 
+    fn trim_internal_caches(&self, excess: i32) {
+        if excess <= 0 {
+            return;
+        }
+        let mut internal = self.internal_caches.borrow_mut();
+        for cache in internal.iter_mut() {
+            match cache {
+                NemotronLayerCache::Attention(kv) => {
+                    kv.trim(excess);
+                }
+                NemotronLayerCache::Mamba(mc) => {
+                    // Mamba caches are recurrent state, not positional.
+                    // Reset them since the SSM/conv state was computed using
+                    // padding tokens and would corrupt subsequent decode steps.
+                    mc.conv_state = None;
+                    mc.ssm_state = None;
+                }
+            }
+        }
+    }
+
     fn eos_token_ids(&self) -> Vec<i32> {
         vec![11] // <|im_end|>
     }
 }
+
+#[cfg(test)]
+#[path = "nemotron_h_tests.rs"]
+mod tests;

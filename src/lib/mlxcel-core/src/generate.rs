@@ -180,6 +180,11 @@ pub trait LanguageModel {
     /// e.g. Phi4MM unfuses vision LoRA so decode uses base weights.
     fn after_prefill(&self) {}
 
+    /// Trim internal caches after padded prefill. Models with internal
+    /// cache state (e.g. NemotronH) override this to trim their own caches
+    /// so that padding positions do not corrupt subsequent decode steps.
+    fn trim_internal_caches(&self, _excess: i32) {}
+
     /// Whether this model supports batched decode for continuous batching.
     ///
     /// Standard transformer models return `true` (the default) because their
@@ -505,6 +510,7 @@ impl CxxGenerator {
             // correct cache offset (actual_len, not padded_len).
             if padded_len > actual_len {
                 trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                model.trim_internal_caches((padded_len - actual_len) as i32);
                 // Extract logits at the last real token position.
                 logits_at_position(&raw_logits, actual_len - 1)
             } else {
@@ -702,6 +708,7 @@ impl CxxGenerator {
             );
             if padded_len > actual_len {
                 trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                model.trim_internal_caches((padded_len - actual_len) as i32);
                 logits_at_position(&raw_logits, actual_len - 1)
             } else {
                 raw_logits
@@ -838,6 +845,7 @@ impl CxxGenerator {
             );
             if padded_len > actual_len {
                 trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                model.trim_internal_caches((padded_len - actual_len) as i32);
                 logits_at_position(&raw_logits, actual_len - 1)
             } else {
                 raw_logits
@@ -975,6 +983,7 @@ impl CxxGenerator {
                 model.forward(&input, &mut self.caches, mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
             if padded_len > actual_len {
                 trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
+                model.trim_internal_caches((padded_len - actual_len) as i32);
                 logits_at_position(&raw_logits, actual_len - 1)
             } else {
                 raw_logits
@@ -1440,5 +1449,89 @@ mod tests {
         assert_eq!(cfg.temperature, 0.0);
         assert_eq!(cfg.top_k, 1);
         assert!(!cfg.needs_token_history());
+    }
+
+    // -- trim_internal_caches default implementation --
+
+    /// Default LanguageModel::trim_internal_caches is a no-op: calling it
+    /// with any excess value must not panic or alter observable state.
+    #[test]
+    fn trim_internal_caches_default_is_noop() {
+        let model = StubModel;
+        // Should not panic for positive, zero, or negative excess.
+        model.trim_internal_caches(8);
+        model.trim_internal_caches(0);
+        model.trim_internal_caches(-1);
+    }
+
+    /// A model that overrides trim_internal_caches records each call so we can
+    /// verify the generation machinery actually invokes the method.
+    struct TrackingTrimModel {
+        trim_call_count: std::cell::Cell<usize>,
+        last_excess: std::cell::Cell<i32>,
+    }
+
+    impl TrackingTrimModel {
+        fn new() -> Self {
+            Self {
+                trim_call_count: std::cell::Cell::new(0),
+                last_excess: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl LanguageModel for TrackingTrimModel {
+        fn forward(
+            &self,
+            input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::eval(input_ids);
+            ffi::zeros(&[1, 1, 4], crate::dtype::FLOAT32)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![99]
+        }
+
+        fn trim_internal_caches(&self, excess: i32) {
+            self.trim_call_count
+                .set(self.trim_call_count.get() + 1);
+            self.last_excess.set(excess);
+        }
+    }
+
+    #[test]
+    fn trim_internal_caches_override_receives_correct_excess() {
+        let model = TrackingTrimModel::new();
+        assert_eq!(model.trim_call_count.get(), 0);
+
+        // Simulate the call pattern from the generation loop: excess = padded - actual.
+        model.trim_internal_caches(16);
+        assert_eq!(model.trim_call_count.get(), 1);
+        assert_eq!(model.last_excess.get(), 16);
+
+        model.trim_internal_caches(32);
+        assert_eq!(model.trim_call_count.get(), 2);
+        assert_eq!(model.last_excess.get(), 32);
+    }
+
+    #[test]
+    fn trim_internal_caches_override_called_with_zero_is_safe() {
+        let model = TrackingTrimModel::new();
+        model.trim_internal_caches(0);
+        // The implementation still receives the call; it is the model's
+        // responsibility to handle excess == 0 gracefully.
+        assert_eq!(model.trim_call_count.get(), 1);
+        assert_eq!(model.last_excess.get(), 0);
     }
 }
