@@ -17,7 +17,7 @@
 //! Key features:
 //! - Mixture of Experts (MoE) architecture
 //! - LayerNorm (not RMSNorm) with bias
-//! - GELU approximate activation (not SiLU)
+//! - SiLU activation (SwiGLU) — hidden_act=silu per model config
 //! - Softmax scoring for experts
 //! - Standard RoPE (simplified from SuScaledRoPE)
 //! - bias=True for attention projections
@@ -197,8 +197,8 @@ impl SwitchLinear {
     }
 }
 
-// SwitchGLU: GLU with GELU activation and stacked expert weights.
-/// SwitchGLU: GLU with GELU activation (not SiLU) for PhiMoE
+// SwitchGLU: GLU with SiLU activation and stacked expert weights.
+/// SwitchGLU: GLU with SiLU activation (SwiGLU) for PhiMoE — hidden_act=silu per model config
 pub struct SwitchGLU {
     pub gate_proj: SwitchLinear,
     pub up_proj: SwitchLinear,
@@ -206,7 +206,7 @@ pub struct SwitchGLU {
 }
 
 impl SwitchGLU {
-    /// Forward pass with GELU activation (not SwiGLU)
+    /// Forward pass with SiLU activation (SwiGLU — hidden_act=silu per model config)
     /// x: [n_tokens, hidden]
     /// indices: [n_tokens, top_k]
     /// Returns: [n_tokens, top_k, hidden]
@@ -231,9 +231,9 @@ impl SwitchGLU {
             let x_gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
             let x_up = self.up_proj.forward(&sorted_x, &sorted_idx, true);
 
-            // GELU activation: gelu_approx(gate) * up
-            let activated_gate = mlxcel_core::utils::gelu_approx(&x_gate);
-            let activated = mlxcel_core::multiply(&activated_gate, &x_up);
+            // Fused SwiGLU activation: compiled_swiglu_activation(gate, up) == silu(gate) * up
+            // Used by: PhiMoE (sorted expert dispatch path) — hidden_act=silu per config
+            let activated = mlxcel_core::compiled_swiglu_activation(&x_gate, &x_up);
 
             // Down projection
             let output = self.down_proj.forward(&activated, &sorted_idx, true);
@@ -245,9 +245,9 @@ impl SwitchGLU {
             let x_gate = self.gate_proj.forward(&x_expanded, indices, false);
             let x_up = self.up_proj.forward(&x_expanded, indices, false);
 
-            // GELU activation: gelu_approx(gate) * up
-            let activated_gate = mlxcel_core::utils::gelu_approx(&x_gate);
-            let activated = mlxcel_core::multiply(&activated_gate, &x_up);
+            // Fused SwiGLU activation: compiled_swiglu_activation(gate, up) == silu(gate) * up
+            // Used by: PhiMoE (unsorted expert dispatch path) — hidden_act=silu per config
+            let activated = mlxcel_core::compiled_swiglu_activation(&x_gate, &x_up);
 
             // Down projection
             let output = self.down_proj.forward(&activated, indices, false);
