@@ -193,8 +193,12 @@ fn tokenize_prompt(
     tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
     prompt: &str,
 ) -> Result<Vec<i32>> {
+    // If the prompt already starts with a BOS token string (e.g. from a chat
+    // template that embeds <bos>), skip add_special_tokens to avoid double-BOS.
+    // Matches mlx-lm generate.py behaviour.
+    let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
     let prompt_token_ids = tokenizer
-        .encode(prompt, true)
+        .encode(prompt, add_special)
         .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
     Ok(prompt_token_ids.iter().map(|&x| x as i32).collect())
 }

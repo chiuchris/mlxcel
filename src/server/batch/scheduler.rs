@@ -304,7 +304,8 @@ impl BatchScheduler {
         images: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
     ) {
-        let token_ids = match self.tokenizer.encode(&prompt, true) {
+        let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
+        let token_ids = match self.tokenizer.encode(&prompt, add_special) {
             Ok(ids) => ids,
             Err(err) => {
                 let _ =
