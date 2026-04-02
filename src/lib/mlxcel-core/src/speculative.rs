@@ -186,7 +186,7 @@ impl SpeculativeGenerator {
             // to a 32-token tile boundary for optimal GEMM throughput. On other
             // hardware, no padding is needed (batching is still beneficial but
             // tile alignment does not apply).
-            let main_logits = if should_align_verification() {
+            let main_logits = if should_align_verification() && main_model.supports_padded_prefill() {
                 let padded_len = align_to_na_tile(actual_verify_len);
                 // Capture the current KV cache offset before the verification pass
                 // so the attention mask correctly spans [offset, offset + padded_len).

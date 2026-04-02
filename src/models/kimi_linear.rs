@@ -1371,6 +1371,10 @@ impl LanguageModel for KimiLinearModel {
         self.layers.len()
     }
 
+    fn supports_padded_prefill(&self) -> bool {
+        false // Padding tokens corrupt DeltaCache recurrent state
+    }
+
     fn supports_batching(&self) -> bool {
         false // KimiLinear uses internal mixed caches (MLA + DeltaCache), not compatible with per-sequence KV isolation
     }

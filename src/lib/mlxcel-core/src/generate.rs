@@ -185,6 +185,18 @@ pub trait LanguageModel {
     /// so that padding positions do not corrupt subsequent decode steps.
     fn trim_internal_caches(&self, _excess: i32) {}
 
+    /// Whether this model supports tile-aligned padded prefill on M5+ hardware.
+    ///
+    /// Pure transformer models return `true` (the default) because padding
+    /// tokens only affect the external KV cache which is trimmed afterwards.
+    /// Hybrid SSM models (NemotronH, Jamba, Mamba, etc.) return `false`
+    /// because padding tokens corrupt the internal recurrent state (conv /
+    /// SSM state) in a way that cannot be safely trimmed, and the resulting
+    /// NaN/inf values can corrupt the Metal GPU state.
+    fn supports_padded_prefill(&self) -> bool {
+        true
+    }
+
     /// Whether this model supports batched decode for continuous batching.
     ///
     /// Standard transformer models return `true` (the default) because their
@@ -500,7 +512,7 @@ impl CxxGenerator {
         // On M5+ hardware pad the sequence to a 32-token tile boundary for
         // optimal Neural Accelerator throughput.
         let actual_len = prompt_tokens.len();
-        let logits = if should_align_prefill() {
+        let logits = if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
@@ -688,7 +700,7 @@ impl CxxGenerator {
         // explicit mask is provided by the caller (callers that supply a custom
         // mask already control the shape and may not need tile alignment).
         let actual_len = prompt_tokens.len();
-        let logits = if mask.is_none() && should_align_prefill() {
+        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
@@ -826,7 +838,7 @@ impl CxxGenerator {
         // generate_streaming_with_embeddings).
         let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
-        let logits = if mask.is_none() && should_align_prefill() {
+        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
@@ -975,7 +987,7 @@ impl CxxGenerator {
         // optimal Neural Accelerator throughput.
         let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
-        let logits = if should_align_prefill() {
+        let logits = if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);

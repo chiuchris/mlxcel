@@ -693,6 +693,10 @@ impl LanguageModel for NemotronNASModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_padded_prefill(&self) -> bool {
+        false // Padding tokens corrupt Mamba recurrent state in hybrid architecture
+    }
+
     fn supports_batching(&self) -> bool {
         false // NemotronNAS is a hybrid architecture, not compatible with per-sequence KV isolation
     }

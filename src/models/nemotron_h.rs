@@ -398,9 +398,9 @@ impl MambaRMSNormGated {
         new_shape.push(self.group_size as i32);
         let x_grouped = mlxcel_core::reshape(&x, &new_shape);
 
-        // Apply RMS norm per group
-        let group_weight =
-            mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::BFLOAT16);
+        // Apply RMS norm per group (use input dtype to avoid float16/bfloat16 mismatch)
+        let input_dtype = mlxcel_core::array_dtype(&x_grouped);
+        let group_weight = mlxcel_core::ones(&[self.group_size as i32], input_dtype);
         let x_normed = mlxcel_core::fast_rms_norm(&x_grouped, &group_weight, self.eps);
 
         // Flatten back and apply weight
@@ -481,9 +481,10 @@ impl NemotronHMamba2Mixer {
         let padded_input = if let Some(conv_st) = conv_state_ref {
             concatenate(conv_st, &conv_input, 1)
         } else {
+            let conv_dtype = mlxcel_core::array_dtype(&conv_input);
             let pad_arr = mlxcel_core::zeros(
                 &[batch, (k - 1) as i32, self.conv_dim as i32],
-                mlxcel_core::dtype::BFLOAT16,
+                conv_dtype,
             );
             concatenate(&pad_arr, &conv_input, 1)
         };
@@ -675,7 +676,7 @@ impl NemotronHMamba2Mixer {
         // Handle previous state if present (using Mamba2's approach)
         let y = if let Some(prev_state) = state {
             // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2))
-            // Python reference uses exclusive cumsum for carry-forward computation
+            // Python mx.cumsum defaults to inclusive; match mamba2.rs ssm_step
             let dta_cumsum = mlxcel_core::cumsum(&dt_a, -2, false, true);
             let exp_dta_cumsum = mlxcel_core::exp(&dta_cumsum);
 
@@ -900,7 +901,7 @@ fn segsum_nemotron(x: &MlxArray) -> UniquePtr<MlxArray> {
     let x_rep = mlxcel_core::broadcast_to(&x_exp, &new_shape);
 
     let x_tril = mlxcel_core::tril(&x_rep, -1);
-    // Exclusive cumsum matching mamba2.rs segsum and Python reference
+    // Inclusive cumsum matching mamba2.rs segsum and Python mx.cumsum default
     mlxcel_core::cumsum(&x_tril, -2, false, true)
 }
 
@@ -1699,8 +1700,18 @@ impl NemotronHModel {
             None
         };
 
+        // On M5 Max (Metal GPU Family 4), the lazy evaluation graph for 52
+        // hybrid SSM+MoE layers can exceed the Metal command buffer capacity,
+        // causing a GPU hang.  Periodically evaluating the hidden state during
+        // prefill (seq_len > 1) keeps the graph small.  During single-token
+        // decode the graph is already tiny, so no intermediate eval is needed.
+        let needs_chunked_eval = seq_len > 1 && !profile_blocks;
+        let eval_interval = 8; // evaluate every 8 layers
+
         let mut cache_idx = 0;
-        for (layer, &block_type) in self.layers.iter().zip(self.block_types.iter()) {
+        for (layer_num, (layer, &block_type)) in
+            self.layers.iter().zip(self.block_types.iter()).enumerate()
+        {
             let t0 = if profile_blocks {
                 mlxcel_core::eval(&h);
                 Some(std::time::Instant::now())
@@ -1725,14 +1736,25 @@ impl NemotronHModel {
             }
 
             if let Some(t0) = t0 {
+                let layer_idx = if block_type.needs_cache() { cache_idx - 1 } else { cache_idx };
+                let bt = match block_type {
+                    BlockType::Mamba => "M",
+                    BlockType::Attention => "*",
+                    BlockType::MoE => "E",
+                    _ => "-",
+                };
+                eprint!("[{}{}]", bt, layer_idx);
                 mlxcel_core::eval(&h);
                 let e = t0.elapsed().as_nanos();
+                eprintln!(" {:.1}ms", e as f64 / 1e6);
                 match block_type {
                     BlockType::Mamba => mamba_ns += e,
                     BlockType::Attention => attn_ns += e,
                     BlockType::MoE => moe_ns += e,
                     _ => {}
                 }
+            } else if needs_chunked_eval && (layer_num + 1) % eval_interval == 0 {
+                mlxcel_core::eval(&h);
             }
         }
 
@@ -2005,7 +2027,7 @@ impl NemotronHModel {
                     let e_score_bias = weights
                         .remove(&format!("{}.gate.e_score_correction_bias", mixer_prefix))
                         .unwrap_or_else(|| {
-                            mlxcel_core::zeros(&[n_routed as i32], mlxcel_core::dtype::BFLOAT16)
+                            mlxcel_core::zeros(&[n_routed as i32], mlxcel_core::dtype::FLOAT32)
                         });
 
                     // Switch MLP (quantized or regular)
@@ -2498,6 +2520,10 @@ impl LanguageModel for NemotronHModel {
                 }
             }
         }
+    }
+
+    fn supports_padded_prefill(&self) -> bool {
+        false // Hybrid SSM model: padding tokens corrupt Mamba recurrent state
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

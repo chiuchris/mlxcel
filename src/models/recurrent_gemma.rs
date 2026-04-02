@@ -1006,6 +1006,10 @@ impl LanguageModel for GriffinModel {
         self.config.num_hidden_layers
     }
 
+    fn supports_padded_prefill(&self) -> bool {
+        false // Padding tokens corrupt RGLRU recurrent state
+    }
+
     fn supports_batching(&self) -> bool {
         false // RecurrentGemma uses internal RGLRUCache state, not compatible with per-sequence KV isolation
     }

@@ -906,6 +906,10 @@ impl LanguageModel for Mamba2Model {
         self.config.num_hidden_layers
     }
 
+    fn supports_padded_prefill(&self) -> bool {
+        false // Padding tokens corrupt Mamba2 recurrent state
+    }
+
     fn supports_batching(&self) -> bool {
         false // Mamba2 uses internal recurrent state, not compatible with per-sequence KV isolation
     }
