@@ -171,7 +171,7 @@ bench_one() {
   >&2 printf '>>> [warmup] %s ...\n' "$model_name"
   if ! timeout "$TIMEOUT" "$MLXCEL" generate \
       -m "$model_path" -p "$prompt" -n "$WARMUP_TOKENS" \
-      "${extra_args[@]}" --profile >/dev/null 2>&1; then
+      ${extra_args[@]+"${extra_args[@]}"} --profile >/dev/null 2>&1; then
     >&2 echo "    warmup failed"
     echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",FAIL:warmup"
     return
@@ -182,7 +182,7 @@ bench_one() {
   local raw
   if ! raw=$(timeout "$TIMEOUT" "$MLXCEL" generate \
       -m "$model_path" -p "$prompt" -n "$MAX_TOKENS" \
-      "${extra_args[@]}" --profile 2>&1); then
+      ${extra_args[@]+"${extra_args[@]}"} --profile 2>&1); then
     >&2 echo "    benchmark failed"
     echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$prompt\",FAIL:bench"
     return
