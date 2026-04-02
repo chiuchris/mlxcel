@@ -23,6 +23,7 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 
 use anyhow::Result;
+use mlxcel_core::sampling::TokenLogprobData;
 
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::BatchObservability;
@@ -43,6 +44,8 @@ pub enum ModelRequest {
 /// Events from generation
 pub enum GenerateEvent {
     Token(String),
+    /// Token with associated log probability data (emitted when logprobs are enabled)
+    TokenWithLogprobs(String, TokenLogprobData),
     Done(GenerationResult),
     Error(String),
 }
@@ -57,6 +60,8 @@ pub struct GenerationResult {
     pub prompt_eval_ms: u64,
     pub generation_only_ms: u64,
     pub finish_reason: String,
+    /// Per-token log probability data; `None` when logprobs were not requested
+    pub logprobs: Option<Vec<TokenLogprobData>>,
 }
 
 #[path = "model_worker.rs"]
@@ -401,6 +406,25 @@ impl ModelProvider {
         drain_generation_events(response_rx, callback)
     }
 
+    /// Generate text with optional images and a logprobs-aware streaming callback.
+    ///
+    /// The callback receives the decoded token text plus optional `TokenLogprobData`.
+    /// When `options.logprobs.enabled` is false the logprob argument will always
+    /// be `None`, so this method is a strict superset of `generate_streaming_with_images`.
+    pub fn generate_streaming_with_logprobs<F>(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        callback: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(String, Option<TokenLogprobData>),
+    {
+        let response_rx = self.send_generate_request(prompt, options, images)?;
+        drain_generation_events_with_logprobs(response_rx, callback)
+    }
+
     fn send_generate_request(
         &self,
         prompt: String,
@@ -433,9 +457,42 @@ fn drain_generation_events<F>(
 where
     F: FnMut(String),
 {
-    loop {
+    // Accumulate logprobs from TokenWithLogprobs events so the final
+    // GenerationResult can carry them even in non-streaming mode.
+    let mut accumulated_logprobs: Vec<TokenLogprobData> = Vec::new();
+
+    let mut result = loop {
         match response_rx.recv() {
             Ok(GenerateEvent::Token(token)) => on_token(token),
+            // Collect logprobs even when the streaming callback ignores them.
+            Ok(GenerateEvent::TokenWithLogprobs(token, lp)) => {
+                accumulated_logprobs.push(lp);
+                on_token(token);
+            }
+            Ok(GenerateEvent::Done(result)) => break result,
+            Ok(GenerateEvent::Error(err)) => return Err(anyhow::anyhow!(err)),
+            Err(_) => return Err(anyhow::anyhow!("Response channel closed")),
+        }
+    };
+
+    if !accumulated_logprobs.is_empty() {
+        result.logprobs = Some(accumulated_logprobs);
+    }
+
+    Ok(result)
+}
+
+fn drain_generation_events_with_logprobs<F>(
+    response_rx: mpsc::Receiver<GenerateEvent>,
+    mut on_token: F,
+) -> Result<GenerationResult>
+where
+    F: FnMut(String, Option<TokenLogprobData>),
+{
+    loop {
+        match response_rx.recv() {
+            Ok(GenerateEvent::Token(token)) => on_token(token, None),
+            Ok(GenerateEvent::TokenWithLogprobs(token, lp)) => on_token(token, Some(lp)),
             Ok(GenerateEvent::Done(result)) => return Ok(result),
             Ok(GenerateEvent::Error(err)) => return Err(anyhow::anyhow!(err)),
             Err(_) => return Err(anyhow::anyhow!("Response channel closed")),

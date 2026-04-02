@@ -14,6 +14,8 @@
 
 use std::sync::mpsc;
 
+use mlxcel_core::sampling::TokenLogprobData;
+
 use super::{
     GenerateEvent, GenerationResult, ModelProvider, ModelRequest, drain_generation_events,
     send_shutdown_signal,
@@ -28,6 +30,7 @@ fn sample_result() -> GenerationResult {
         prompt_eval_ms: 4,
         generation_only_ms: 6,
         finish_reason: "stop".to_string(),
+        logprobs: None,
     }
 }
 
@@ -61,6 +64,28 @@ fn drain_generation_events_reports_closed_channel() {
     drop(tx);
     let err = drain_generation_events(rx, |_| {}).unwrap_err();
     assert!(err.to_string().contains("Response channel closed"));
+}
+
+#[test]
+fn drain_generation_events_accumulates_logprobs_from_token_with_logprobs() {
+    let (tx, rx) = mpsc::channel();
+    let lp = TokenLogprobData {
+        token_id: 42,
+        logprob: -0.5,
+        top_alternatives: vec![(7, -1.2)],
+    };
+    tx.send(GenerateEvent::TokenWithLogprobs("Hi".to_string(), lp))
+        .unwrap();
+    tx.send(GenerateEvent::Done(sample_result())).unwrap();
+
+    let mut streamed = Vec::new();
+    let result = drain_generation_events(rx, |token| streamed.push(token)).unwrap();
+
+    assert_eq!(streamed, vec!["Hi".to_string()]);
+    let lp_data = result.logprobs.expect("logprobs should be Some");
+    assert_eq!(lp_data.len(), 1);
+    assert_eq!(lp_data[0].token_id, 42);
+    assert!((lp_data[0].logprob - (-0.5)).abs() < 1e-6);
 }
 
 #[test]

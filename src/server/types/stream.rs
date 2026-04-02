@@ -15,7 +15,8 @@
 //! SSE streaming response types
 
 use serde::Serialize;
-use serde_json::Value;
+
+use super::response::{ChatLogprobs, CompletionLogprobs};
 
 /// Delta content for streaming
 #[derive(Debug, Clone, Serialize)]
@@ -37,8 +38,8 @@ pub struct StreamChoice {
     pub delta: Delta,
     /// Always serialized: `null` in content chunks, "stop"/"length" in final
     pub finish_reason: Option<String>,
-    /// Always null for now; present to satisfy strict client parsers
-    pub logprobs: Option<Value>,
+    /// Log probabilities for this chunk's token; `null` when not requested
+    pub logprobs: Option<ChatLogprobs>,
 }
 
 /// Chat completion chunk for streaming
@@ -81,6 +82,16 @@ impl ChatCompletionChunk {
 
     /// Create content chunk
     pub fn content(id: String, model: String, content: String) -> Self {
+        Self::content_with_logprobs(id, model, content, None)
+    }
+
+    /// Create content chunk with optional log probabilities
+    pub fn content_with_logprobs(
+        id: String,
+        model: String,
+        content: String,
+        logprobs: Option<ChatLogprobs>,
+    ) -> Self {
         Self {
             id,
             object: "chat.completion.chunk".to_string(),
@@ -94,7 +105,7 @@ impl ChatCompletionChunk {
                     content: Some(content),
                 },
                 finish_reason: None,
-                logprobs: None,
+                logprobs,
             }],
             usage: None,
         }
@@ -173,13 +184,23 @@ pub struct CompletionStreamChoice {
     pub text: String,
     /// Always serialized: `null` in content chunks, "stop"/"length" in final
     pub finish_reason: Option<String>,
-    /// Always null for now; present to satisfy strict client parsers
-    pub logprobs: Option<Value>,
+    /// Log probabilities for this chunk's token; `null` when not requested
+    pub logprobs: Option<CompletionLogprobs>,
 }
 
 impl CompletionChunk {
     /// Create content chunk
     pub fn content(id: String, model: String, text: String) -> Self {
+        Self::content_with_logprobs(id, model, text, None)
+    }
+
+    /// Create content chunk with optional log probabilities
+    pub fn content_with_logprobs(
+        id: String,
+        model: String,
+        text: String,
+        logprobs: Option<CompletionLogprobs>,
+    ) -> Self {
         Self {
             id,
             object: "text_completion".to_string(),
@@ -190,7 +211,7 @@ impl CompletionChunk {
                 index: 0,
                 text,
                 finish_reason: None,
-                logprobs: None,
+                logprobs,
             }],
             usage: None,
         }

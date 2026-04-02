@@ -36,7 +36,7 @@ use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
 use mlxcel_core::hardware;
-use mlxcel_core::sampling::sample_token_optimized;
+use mlxcel_core::sampling::{compute_logprobs, sample_token_optimized};
 use mlxcel_core::streams::{install_default_stream, new_generation_stream};
 use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
 use mlxcel_core::{MlxStream, UniquePtr};
@@ -349,6 +349,7 @@ impl BatchScheduler {
             max_tokens: options.max_tokens,
             eos_token_ids: self.config_eos.clone(),
             priority: options.priority,
+            logprobs_config: options.logprobs,
             vlm_embeddings,
             images,
             generated_tokens: Vec::new(),
@@ -973,7 +974,7 @@ impl BatchScheduler {
         mut token_history: Vec<i32>,
         needs_history: bool,
     ) {
-        let (first_token_arr, _logprobs) =
+        let (first_token_arr, adjusted_logits) =
             sample_token_optimized(&logits, &seq.sampling, &token_history);
         mlxcel_core::eval(&first_token_arr);
         let first_token = mlxcel_core::item_i32(&first_token_arr);
@@ -1003,6 +1004,9 @@ impl BatchScheduler {
             return;
         }
 
+        // Optionally compute logprobs for the first token.
+        let token_lp = compute_logprobs(&adjusted_logits, first_token, &seq.logprobs_config);
+
         seq.generated_tokens.push(first_token);
         if needs_history {
             token_history.push(first_token);
@@ -1014,7 +1018,11 @@ impl BatchScheduler {
         seq.token_history = token_history;
 
         if let Some(new_text) = seq.decode_state.on_token(first_token, &self.tokenizer) {
-            let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
+            let event = match token_lp {
+                Some(lp) => GenerateEvent::TokenWithLogprobs(new_text, lp),
+                None => GenerateEvent::Token(new_text),
+            };
+            let _ = seq.response_tx.send(event);
         }
 
         if seq.generated_tokens.len() >= seq.max_tokens {
@@ -1229,15 +1237,17 @@ impl BatchScheduler {
 
             // Use cached token_history (incrementally maintained) instead of
             // rebuilding per step. Use cached merged_eos computed once at prefill.
-            let token_val = {
+            let (token_val, token_lp) = {
                 let seq = match self.active_batch.get_mut(seq_id) {
                     Some(s) => s,
                     None => continue,
                 };
-                let (token_arr, _logprobs) =
+                let (token_arr, adjusted_logits) =
                     sample_token_optimized(&seq_logits, &seq.sampling, &seq.token_history);
                 mlxcel_core::eval(&token_arr);
-                mlxcel_core::item_i32(&token_arr)
+                let tok = mlxcel_core::item_i32(&token_arr);
+                let lp = compute_logprobs(&adjusted_logits, tok, &seq.logprobs_config);
+                (tok, lp)
             };
 
             let seq = match self.active_batch.get_mut(seq_id) {
@@ -1263,7 +1273,11 @@ impl BatchScheduler {
             }
 
             if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
-                let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
+                let event = match token_lp {
+                    Some(lp) => GenerateEvent::TokenWithLogprobs(new_text, lp),
+                    None => GenerateEvent::Token(new_text),
+                };
+                let _ = seq.response_tx.send(event);
             }
 
             if seq.generated_tokens.len() >= seq.max_tokens
@@ -1318,12 +1332,14 @@ impl BatchScheduler {
         // Use cached token_history from SequenceInfo (incrementally maintained)
         // and cached merged_eos (computed once during prefill) to avoid
         // per-step allocation and reconstruction overhead.
-        let token_val = {
+        let (token_val, token_lp) = {
             let seq = self.active_batch.get_mut(seq_id).unwrap();
-            let (token_arr, _logprobs) =
+            let (token_arr, adjusted_logits) =
                 sample_token_optimized(&logits, &seq.sampling, &seq.token_history);
             mlxcel_core::eval(&token_arr);
-            mlxcel_core::item_i32(&token_arr)
+            let tok = mlxcel_core::item_i32(&token_arr);
+            let lp = compute_logprobs(&adjusted_logits, tok, &seq.logprobs_config);
+            (tok, lp)
         };
 
         let seq = match self.active_batch.get_mut(seq_id) {
@@ -1349,7 +1365,11 @@ impl BatchScheduler {
         }
 
         if let Some(new_text) = seq.decode_state.on_token(token_val, &self.tokenizer) {
-            let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
+            let event = match token_lp {
+                Some(lp) => GenerateEvent::TokenWithLogprobs(new_text, lp),
+                None => GenerateEvent::Token(new_text),
+            };
+            let _ = seq.response_tx.send(event);
         }
 
         if seq.generated_tokens.len() >= seq.max_tokens

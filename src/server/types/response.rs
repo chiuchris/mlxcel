@@ -15,7 +15,55 @@
 //! OpenAI and llama-server compatible response types
 
 use serde::Serialize;
-use serde_json::Value;
+
+// ---------------------------------------------------------------------------
+// Logprobs structures
+// ---------------------------------------------------------------------------
+
+/// Top-logprob alternative for a single token position (chat completions)
+#[derive(Debug, Clone, Serialize)]
+pub struct TopLogprob {
+    /// Text representation of the token
+    pub token: String,
+    /// Log probability of this token
+    pub logprob: f32,
+    /// UTF-8 byte encoding of the token text (`null` for non-UTF-8 tokens)
+    pub bytes: Option<Vec<u8>>,
+}
+
+/// Log probability data for a single generated token (chat completions)
+#[derive(Debug, Clone, Serialize)]
+pub struct TokenLogprob {
+    /// Text representation of the token
+    pub token: String,
+    /// Log probability of this token
+    pub logprob: f32,
+    /// UTF-8 byte encoding of the token text (`null` for non-UTF-8 tokens)
+    pub bytes: Option<Vec<u8>>,
+    /// Top-k alternative tokens at this position (empty when `top_logprobs` is 0)
+    pub top_logprobs: Vec<TopLogprob>,
+}
+
+/// Logprobs container for chat completion choices
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatLogprobs {
+    /// Per-token log probability data for the generated content
+    pub content: Option<Vec<TokenLogprob>>,
+}
+
+/// Logprobs container for legacy text completion choices
+#[derive(Debug, Clone, Serialize)]
+pub struct CompletionLogprobs {
+    /// Decoded token strings
+    pub tokens: Vec<String>,
+    /// Log probability of each token
+    pub token_logprobs: Vec<f32>,
+    /// Character offset of each token within the completion text
+    pub text_offset: Vec<usize>,
+    /// Top-k alternatives at each position (each entry is `null` or a map of
+    /// token→logprob)
+    pub top_logprobs: Vec<Option<std::collections::HashMap<String, f32>>>,
+}
 
 /// Token usage statistics
 #[derive(Debug, Clone, Serialize)]
@@ -31,8 +79,8 @@ pub struct ChatChoice {
     pub index: usize,
     pub message: ChatMessage,
     pub finish_reason: Option<String>,
-    /// Always null for now; present to satisfy strict client parsers
-    pub logprobs: Option<Value>,
+    /// Log probabilities for output tokens; `null` when not requested
+    pub logprobs: Option<ChatLogprobs>,
 }
 
 /// Chat message in response
@@ -63,6 +111,26 @@ impl ChatCompletionResponse {
         completion_tokens: usize,
         finish_reason: Option<String>,
     ) -> Self {
+        Self::new_with_logprobs(
+            id,
+            model,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason,
+            None,
+        )
+    }
+
+    pub fn new_with_logprobs(
+        id: String,
+        model: String,
+        content: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        finish_reason: Option<String>,
+        logprobs: Option<ChatLogprobs>,
+    ) -> Self {
         Self {
             id,
             object: "chat.completion".to_string(),
@@ -76,7 +144,7 @@ impl ChatCompletionResponse {
                     content,
                 },
                 finish_reason,
-                logprobs: None,
+                logprobs,
             }],
             usage: Usage {
                 prompt_tokens,
@@ -93,8 +161,8 @@ pub struct CompletionChoice {
     pub index: usize,
     pub text: String,
     pub finish_reason: Option<String>,
-    /// Always null for now; present to satisfy strict client parsers
-    pub logprobs: Option<Value>,
+    /// Log probabilities for output tokens; `null` when not requested
+    pub logprobs: Option<CompletionLogprobs>,
 }
 
 /// Text completion response
@@ -118,6 +186,26 @@ impl CompletionResponse {
         completion_tokens: usize,
         finish_reason: Option<String>,
     ) -> Self {
+        Self::new_with_logprobs(
+            id,
+            model,
+            text,
+            prompt_tokens,
+            completion_tokens,
+            finish_reason,
+            None,
+        )
+    }
+
+    pub fn new_with_logprobs(
+        id: String,
+        model: String,
+        text: String,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        finish_reason: Option<String>,
+        logprobs: Option<CompletionLogprobs>,
+    ) -> Self {
         Self {
             id,
             object: "text_completion".to_string(),
@@ -128,7 +216,7 @@ impl CompletionResponse {
                 index: 0,
                 text,
                 finish_reason,
-                logprobs: None,
+                logprobs,
             }],
             usage: Usage {
                 prompt_tokens,

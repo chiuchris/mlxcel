@@ -185,6 +185,12 @@ pub struct ChatCompletionRequest {
     /// Options controlling streaming behavior (only used when stream=true)
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Whether to return log probabilities of output tokens
+    #[serde(default)]
+    pub logprobs: Option<bool>,
+    /// Number of top log-probability alternatives to return per token (0–20)
+    #[serde(default)]
+    pub top_logprobs: Option<u8>,
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
@@ -203,6 +209,9 @@ pub struct CompletionRequest {
     /// Options controlling streaming behavior (only used when stream=true)
     #[serde(default)]
     pub stream_options: Option<StreamOptions>,
+    /// Number of top log-probability alternatives to return (legacy format: 0–5)
+    #[serde(default)]
+    pub logprobs: Option<u8>,
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,

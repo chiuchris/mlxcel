@@ -405,7 +405,8 @@ impl MambaRMSNormGated {
         let x_grouped = mlxcel_core::reshape(&x, &new_shape);
 
         // Apply RMS norm per group in float32
-        let group_weight = mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::FLOAT32);
+        let group_weight =
+            mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::FLOAT32);
         let x_normed = mlxcel_core::fast_rms_norm(&x_grouped, &group_weight, self.eps);
 
         // Flatten back, apply weight, and cast back to original dtype
@@ -1830,9 +1831,7 @@ impl NemotronHModel {
         }
 
         let h = self.norm_f.forward(&h);
-        let logits = self.lm_head.forward(&h);
-
-        logits
+        self.lm_head.forward(&h)
     }
 
     pub fn load(model_path: &str) -> Result<(Self, NemotronHConfig), Box<dyn std::error::Error>> {

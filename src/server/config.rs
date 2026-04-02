@@ -22,6 +22,7 @@ use std::path::PathBuf;
 
 use crate::SamplingConfig;
 use crate::server::batch::RequestPriority;
+use mlxcel_core::sampling::LogprobsConfig;
 
 /// Bridge between server request params and `mlxcel-core` `SamplingConfig`.
 #[derive(Debug, Clone)]
@@ -31,6 +32,8 @@ pub struct ServerGenerateOptions {
     pub stop_sequences: Option<Vec<String>>,
     /// Request priority for prefill queue ordering.
     pub priority: RequestPriority,
+    /// Log probability configuration; disabled by default (zero overhead).
+    pub logprobs: LogprobsConfig,
 }
 
 /// Policy for selecting which sequence to evict when preemption is enabled

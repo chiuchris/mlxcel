@@ -308,6 +308,7 @@ pub(crate) fn build_generation_result(
         prompt_eval_ms,
         generation_only_ms: elapsed_ms.saturating_sub(prompt_eval_ms),
         finish_reason: finish_reason.to_string(),
+        logprobs: None,
     }
 }
 

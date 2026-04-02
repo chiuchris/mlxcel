@@ -25,15 +25,87 @@ use axum::{
     response::{IntoResponse, Response, sse::Sse},
 };
 
+use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
+
 use crate::server::batch::RequestPriority;
 use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
+use crate::server::types::response::{ChatLogprobs, TokenLogprob, TopLogprob};
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
     SamplingParams,
 };
 use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
+use crate::tokenizer::MlxcelTokenizer;
+
+/// Decode a single token ID to its text representation using the tokenizer.
+pub(crate) fn decode_token(tokenizer: &MlxcelTokenizer, token_id: i32) -> String {
+    tokenizer
+        .decode(&[token_id as u32], false)
+        .unwrap_or_default()
+}
+
+/// Convert a `TokenLogprobData` to a `TokenLogprob` response struct.
+///
+/// `top_k` controls how many top alternatives to include. Pass 0 to include
+/// none (only the selected token's logprob will be in the response).
+pub(crate) fn token_lp_to_response(
+    tokenizer: &MlxcelTokenizer,
+    lp: &TokenLogprobData,
+    top_k: usize,
+) -> TokenLogprob {
+    let token_text = decode_token(tokenizer, lp.token_id);
+    let bytes = token_text.as_bytes().to_vec();
+
+    let top_logprobs: Vec<TopLogprob> = lp
+        .top_alternatives
+        .iter()
+        .take(top_k)
+        .map(|&(alt_id, alt_lp)| {
+            let alt_text = decode_token(tokenizer, alt_id);
+            let alt_bytes = alt_text.as_bytes().to_vec();
+            TopLogprob {
+                token: alt_text,
+                logprob: alt_lp,
+                bytes: Some(alt_bytes),
+            }
+        })
+        .collect();
+
+    TokenLogprob {
+        token: token_text,
+        logprob: lp.logprob,
+        bytes: Some(bytes),
+        top_logprobs,
+    }
+}
+
+/// Build a `ChatLogprobs` from a list of `TokenLogprobData`.
+pub(crate) fn build_chat_logprobs(
+    tokenizer: &MlxcelTokenizer,
+    lp_data: &[TokenLogprobData],
+    top_k: usize,
+) -> ChatLogprobs {
+    let content = lp_data
+        .iter()
+        .map(|lp| token_lp_to_response(tokenizer, lp, top_k))
+        .collect();
+    ChatLogprobs {
+        content: Some(content),
+    }
+}
+
+/// Build a single-token `ChatLogprobs` for streaming chunks.
+pub(crate) fn build_single_token_chat_logprobs(
+    tokenizer: &MlxcelTokenizer,
+    lp: &TokenLogprobData,
+    top_k: usize,
+) -> ChatLogprobs {
+    ChatLogprobs {
+        content: Some(vec![token_lp_to_response(tokenizer, lp, top_k)]),
+    }
+}
 
 /// POST /v1/chat/completions
 pub async fn chat_completions(
@@ -41,6 +113,25 @@ pub async fn chat_completions(
     headers: HeaderMap,
     Json(request): Json<ChatCompletionRequest>,
 ) -> Response {
+    // Validate top_logprobs range per OpenAI spec (0-20)
+    if let Some(top) = request.top_logprobs
+        && top > 20
+    {
+        return ErrorResponse::new(
+            "top_logprobs must be between 0 and 20",
+            "invalid_request_error",
+        )
+        .into_response();
+    }
+    // top_logprobs requires logprobs: true
+    if request.top_logprobs.is_some() && request.logprobs != Some(true) {
+        return ErrorResponse::new(
+            "top_logprobs requires logprobs to be set to true",
+            "invalid_request_error",
+        )
+        .into_response();
+    }
+
     let priority = parse_priority_header(&headers);
     if request.stream {
         stream_chat_completion(state, request, priority).await
@@ -79,6 +170,15 @@ async fn non_stream_chat_completion(
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
 
+    // Set logprobs configuration when requested
+    let top_k = request.top_logprobs.unwrap_or(0) as usize;
+    if request.logprobs == Some(true) {
+        options.logprobs = LogprobsConfig {
+            enabled: true,
+            top_k,
+        };
+    }
+
     // Generate (blocking call handled by model provider's worker thread)
     let result = state
         .model_provider
@@ -91,13 +191,23 @@ async fn non_stream_chat_completion(
         result.generation_time_ms,
     );
 
-    Ok(Json(ChatCompletionResponse::new(
+    // Build logprobs for the response if requested
+    let logprobs = result.logprobs.as_deref().and_then(|lp_data| {
+        if lp_data.is_empty() {
+            None
+        } else {
+            Some(build_chat_logprobs(&state.tokenizer, lp_data, top_k))
+        }
+    });
+
+    Ok(Json(ChatCompletionResponse::new_with_logprobs(
         request_id,
         model_id,
         result.text,
         result.prompt_tokens,
         result.completion_tokens,
         Some(result.finish_reason),
+        logprobs,
     )))
 }
 
@@ -125,12 +235,23 @@ async fn stream_chat_completion(
         .map(|o| o.include_usage)
         .unwrap_or(false);
 
+    // Set logprobs configuration when requested
+    let top_k = request.top_logprobs.unwrap_or(0) as usize;
+    let logprobs_enabled = request.logprobs == Some(true);
+    if logprobs_enabled {
+        options.logprobs = LogprobsConfig {
+            enabled: true,
+            top_k,
+        };
+    }
+
     let (events, stream) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
     let model_id_clone = model_id.clone();
     let finish_events = events.clone();
+    let tokenizer = state.tokenizer.clone();
 
     // Spawn a blocking task to handle generation
     tokio::task::spawn_blocking(move || {
@@ -139,20 +260,28 @@ async fn stream_chat_completion(
             ChatCompletionChunk::initial(request_id_clone.clone(), model_id_clone.clone());
         let _ = finish_events.json(&initial);
 
-        // Use model provider's streaming API
+        // Use logprobs-aware streaming when requested, otherwise use the plain API.
         let token_events = finish_events.clone();
         let request_id_inner = request_id_clone.clone();
         let model_id_inner = model_id_clone.clone();
 
-        let result = state.model_provider.generate_streaming_with_images(
+        let result = state.model_provider.generate_streaming_with_logprobs(
             prepared.prompt,
             options,
             prepared.image_data,
-            |token| {
-                let chunk = ChatCompletionChunk::content(
+            |token, lp_data| {
+                let logprobs = if logprobs_enabled {
+                    lp_data
+                        .as_ref()
+                        .map(|lp| build_single_token_chat_logprobs(&tokenizer, lp, top_k))
+                } else {
+                    None
+                };
+                let chunk = ChatCompletionChunk::content_with_logprobs(
                     request_id_inner.clone(),
                     model_id_inner.clone(),
                     token,
+                    logprobs,
                 );
                 let _ = token_events.json(&chunk);
             },

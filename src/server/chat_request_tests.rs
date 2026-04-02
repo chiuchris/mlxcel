@@ -24,6 +24,8 @@ fn request_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
         messages,
         stream: false,
         stream_options: None,
+        logprobs: None,
+        top_logprobs: None,
         params: SamplingParams::default(),
     }
 }

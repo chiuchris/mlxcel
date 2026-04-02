@@ -181,6 +181,7 @@ mod tests {
             max_tokens: 100,
             eos_token_ids: vec![2],
             priority,
+            logprobs_config: Default::default(),
             vlm_embeddings: None,
             images: Vec::new(),
             generated_tokens: Vec::new(),

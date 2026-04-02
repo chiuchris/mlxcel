@@ -280,6 +280,109 @@ pub(crate) fn apply_dry_penalty(
     ffi::add(logits, &penalty_arr)
 }
 
+/// Configuration for log probability computation during generation.
+///
+/// When `enabled` is false, no logprobs are computed and zero overhead is incurred.
+#[derive(Debug, Clone, Default)]
+pub struct LogprobsConfig {
+    /// Whether to compute log probabilities at all
+    pub enabled: bool,
+    /// Number of top alternative tokens to return (0 = only the selected token)
+    pub top_k: usize,
+}
+
+/// Log probability data for a single generated token.
+#[derive(Debug, Clone)]
+pub struct TokenLogprobData {
+    /// Token ID of the selected token
+    pub token_id: i32,
+    /// Log probability of the selected token
+    pub logprob: f32,
+    /// Top-k alternative (token_id, logprob) pairs, sorted descending by logprob
+    pub top_alternatives: Vec<(i32, f32)>,
+}
+
+/// Compute log probabilities for the selected token from penalty-adjusted logits.
+///
+/// `adjusted_logits` should have shape `[1, vocab]` (output of `sample_token_optimized`).
+/// Returns `TokenLogprobData` containing the selected token's log-probability and
+/// optionally the top-k alternatives.
+///
+/// Zero-overhead when `config.enabled` is false.
+pub fn compute_logprobs(
+    adjusted_logits: &MlxArray,
+    selected_token: i32,
+    config: &LogprobsConfig,
+) -> Option<TokenLogprobData> {
+    if !config.enabled {
+        return None;
+    }
+
+    // Apply log-softmax to get per-token log probabilities.
+    let log_probs = ffi::log_softmax(adjusted_logits, -1);
+    ffi::eval(&log_probs);
+
+    // Extract the log probability of the selected token.
+    let idx = ffi::from_slice_i32(&[selected_token], &[1, 1]);
+    let selected_lp_arr = ffi::take_along_axis(&log_probs, &idx, -1);
+    ffi::eval(&selected_lp_arr);
+    let selected_logprob = ffi::item_f32(&selected_lp_arr);
+
+    // Compute top-k alternatives if requested.
+    let top_alternatives = if config.top_k > 0 {
+        let vocab_size = ffi::array_shape(&log_probs).last().copied().unwrap_or(0);
+        // Clamp k to vocab_size to satisfy argpartition's requirement that kth < array_size.
+        let k = (config.top_k as i32).min(vocab_size);
+        // negate log_probs so argpartition gives us the top-k (smallest negated = largest)
+        let neg_log_probs = ffi::negative(&log_probs);
+        let partition_idx = ffi::argpartition(&neg_log_probs, k - 1, -1);
+        ffi::eval(&partition_idx);
+
+        // Slice only the first k elements from the partitioned result.
+        // argpartition guarantees that indices 0..k contain the k smallest
+        // values of the negated log_probs (= the k largest log_probs),
+        // so we avoid materializing the full vocabulary into host memory.
+        let shape = ffi::array_shape(&partition_idx);
+        let ndim = shape.len();
+        let starts = vec![0i32; ndim];
+        let mut stops = shape.clone();
+        stops[ndim - 1] = k.min(stops[ndim - 1]);
+        let top_idx = ffi::slice(&partition_idx, &starts, &stops);
+
+        // Gather the log_probs for the top-k partitioned indices.
+        let top_lp = ffi::take_along_axis(&log_probs, &top_idx, -1);
+        ffi::eval(&top_idx);
+        ffi::eval(&top_lp);
+
+        let k_usize = k as usize;
+
+        // Use raw bytes to extract i32 token IDs from top_idx.
+        let idx_bytes = ffi::array_to_raw_bytes(&top_idx);
+        let lp_bytes = ffi::array_to_raw_bytes(&top_lp);
+
+        // Build (token_id, logprob) pairs for only the top-k partition.
+        let mut pairs: Vec<(i32, f32)> = (0..k_usize.min(idx_bytes.len() / 4))
+            .filter_map(|i| {
+                let tok_bytes: [u8; 4] = idx_bytes[i * 4..(i + 1) * 4].try_into().ok()?;
+                let lp_bytes4: [u8; 4] = lp_bytes[i * 4..(i + 1) * 4].try_into().ok()?;
+                Some((i32::from_ne_bytes(tok_bytes), f32::from_ne_bytes(lp_bytes4)))
+            })
+            .collect();
+
+        // Sort the k elements descending by logprob.
+        pairs.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        pairs
+    } else {
+        Vec::new()
+    };
+
+    Some(TokenLogprobData {
+        token_id: selected_token,
+        logprob: selected_logprob,
+        top_alternatives,
+    })
+}
+
 /// Apply min-p filtering to logits.
 #[allow(dead_code)]
 pub(crate) fn min_p_filter(logits: &MlxArray, min_p: f32) -> UniquePtr<MlxArray> {
@@ -410,5 +513,60 @@ mod tests {
         let tokens = batched_sample(&logits, &configs, &histories);
         assert_eq!(tokens.len(), 1);
         assert_eq!(tokens[0], 1); // argmax of [0.5, 1.5, 0.3] is index 1
+    }
+
+    #[test]
+    fn compute_logprobs_returns_none_when_disabled() {
+        let logits = ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 3]);
+        let config = LogprobsConfig {
+            enabled: false,
+            top_k: 0,
+        };
+        let result = compute_logprobs(&logits, 2, &config);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn compute_logprobs_returns_selected_token_logprob() {
+        // Uniform logits -> log-softmax produces equal log-probs for all tokens
+        let logits = ffi::from_slice_f32(&[1.0, 1.0, 1.0, 1.0], &[1, 4]);
+        let config = LogprobsConfig {
+            enabled: true,
+            top_k: 0,
+        };
+        let result = compute_logprobs(&logits, 2, &config).expect("should return Some");
+        assert_eq!(result.token_id, 2);
+        // log(1/4) ≈ -1.386
+        assert!((result.logprob - (-1.386_f32)).abs() < 0.01);
+        assert!(result.top_alternatives.is_empty());
+    }
+
+    #[test]
+    fn compute_logprobs_returns_top_k_alternatives_sorted_descending() {
+        // logits: token 0 has highest, token 2 next, token 1 lowest
+        let logits = ffi::from_slice_f32(&[3.0, 0.0, 2.0], &[1, 3]);
+        let config = LogprobsConfig {
+            enabled: true,
+            top_k: 2,
+        };
+        // Select token 1 (low logprob) so top-k will include better alternatives
+        let result = compute_logprobs(&logits, 1, &config).expect("should return Some");
+        assert_eq!(result.token_id, 1);
+        assert_eq!(result.top_alternatives.len(), 2);
+        // Alternatives must be sorted descending by logprob
+        assert!(result.top_alternatives[0].1 >= result.top_alternatives[1].1);
+    }
+
+    #[test]
+    fn compute_logprobs_top_k_capped_at_vocab_size() {
+        // Vocab of 3 tokens, top_k larger than vocab; k is clamped to 3
+        let logits = ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 3]);
+        let config = LogprobsConfig {
+            enabled: true,
+            top_k: 10,
+        };
+        let result = compute_logprobs(&logits, 2, &config).expect("should return Some");
+        // top_k is clamped to vocab size (3), so at most 3 alternatives
+        assert_eq!(result.top_alternatives.len(), 3);
     }
 }

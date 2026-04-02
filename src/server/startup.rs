@@ -327,6 +327,7 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
             sampling: SamplingConfig::greedy(),
             stop_sequences: None,
             priority: crate::server::batch::RequestPriority::Normal,
+            logprobs: Default::default(),
         },
     )?;
     Ok(())

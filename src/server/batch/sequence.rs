@@ -41,6 +41,7 @@ use std::time::Instant;
 
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::SamplingConfig;
+use mlxcel_core::sampling::LogprobsConfig;
 
 use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
@@ -201,6 +202,8 @@ pub struct SequenceInfo {
     pub eos_token_ids: Vec<i32>,
     /// Request priority for prefill ordering and eviction decisions.
     pub priority: RequestPriority,
+    /// Log probability configuration for this request.
+    pub logprobs_config: LogprobsConfig,
 
     // -- VLM context (optional) --
     /// Pre-computed vision-language embeddings for VLM requests.
