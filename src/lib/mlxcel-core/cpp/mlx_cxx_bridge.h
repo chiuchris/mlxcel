@@ -213,6 +213,9 @@ std::unique_ptr<MlxArray> copy(const MlxArray& a);
 // Softmax along axis
 std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis);
 
+// Softmax along axis with precise=true (f32 accumulation for f16 inputs)
+std::unique_ptr<MlxArray> softmax_precise(const MlxArray& a, int32_t axis);
+
 // Log-softmax along axis (numerically stable)
 std::unique_ptr<MlxArray> log_softmax(const MlxArray& a, int32_t axis);
 

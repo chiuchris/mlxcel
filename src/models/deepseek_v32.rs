@@ -31,7 +31,7 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, silu, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
-use mlxcel_core::{MlxArray, UniquePtr, dtype};
+use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -398,9 +398,9 @@ impl MoEGate {
         let weight_t = mlxcel_core::transpose(&self.weight);
         let gates = mlxcel_core::matmul(x, &weight_t);
 
-        // Sigmoid scoring (NOT softmax!)
-        let gates_f32 = mlxcel_core::astype(&gates, dtype::FLOAT32);
-        let scores = mlxcel_core::sigmoid(&gates_f32);
+        // Sigmoid scoring in native dtype (f16 sigmoid saturation at |x|>5.5
+        // preserves relative ordering for top-k selection, safe for MoE gating)
+        let scores = mlxcel_core::sigmoid(&gates);
         let orig_scores = mlxcel_core::copy(&scores);
 
         // Add correction bias

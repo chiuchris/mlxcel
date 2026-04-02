@@ -389,6 +389,9 @@ mod ffi {
         /// Softmax along axis
         fn softmax(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
+        /// Softmax along axis with precise=true (f32 accumulation for f16 inputs)
+        fn softmax_precise(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
+
         /// Log-softmax along axis (numerically stable)
         fn log_softmax(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 

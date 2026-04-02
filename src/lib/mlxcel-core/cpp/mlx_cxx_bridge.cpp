@@ -721,6 +721,10 @@ std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::softmax(a.inner, axis));
 }
 
+std::unique_ptr<MlxArray> softmax_precise(const MlxArray& a, int32_t axis) {
+    return std::make_unique<MlxArray>(mlx::core::softmax(a.inner, axis, true));
+}
+
 std::unique_ptr<MlxArray> log_softmax(const MlxArray& a, int32_t axis) {
     // log_softmax(x) = x - logsumexp(x)
     auto lse = mlx::core::logsumexp(a.inner, axis, true);
