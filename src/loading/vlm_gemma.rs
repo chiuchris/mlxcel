@@ -96,7 +96,12 @@ fn gemma3n_language_model_prefix(weights: &WeightMap) -> &'static str {
 
 fn sanitize_gemma3n_weights(raw_weights: WeightMap) -> WeightMap {
     let needs_transpose = gemma3n_needs_conv_transpose(&raw_weights);
+    // On M5+ Apple Silicon, cast bf16 tensors to f16 to avoid GPU Address
+    // Faults in compiled JIT kernels. M1–M4 and CUDA keep bf16 as-is.
+    let hw = mlxcel_core::hardware::get_hardware();
+    let cast_bf16 = hw.has_neural_accelerator && hw.macos_supports_na;
     let mut weights = WeightMap::new();
+    let mut bf16_count = 0u32;
 
     for (key, value) in raw_weights {
         let new_key = if let Some(stripped) = key.strip_prefix("model.") {
@@ -105,7 +110,7 @@ fn sanitize_gemma3n_weights(raw_weights: WeightMap) -> WeightMap {
             key
         };
 
-        let value = if needs_transpose {
+        let mut value = if needs_transpose {
             let shape = mlxcel_core::array_shape(&value);
             if shape.len() == 4 {
                 mlxcel_core::transpose_axes(&value, &[0, 2, 3, 1])
@@ -115,7 +120,21 @@ fn sanitize_gemma3n_weights(raw_weights: WeightMap) -> WeightMap {
         } else {
             mlxcel_core::copy(&value)
         };
+
+        // Cast bf16 → f16 for Metal 4 compatibility
+        if cast_bf16 && mlxcel_core::array_dtype(&value) == mlxcel_core::dtype::BFLOAT16 {
+            value = mlxcel_core::astype(&value, mlxcel_core::dtype::FLOAT16);
+            bf16_count += 1;
+        }
+
         weights.insert(new_key, value);
+    }
+
+    if bf16_count > 0 {
+        eprintln!(
+            "Converted {} bf16 tensors to f16 for Metal 4 compatibility.",
+            bf16_count
+        );
     }
 
     weights

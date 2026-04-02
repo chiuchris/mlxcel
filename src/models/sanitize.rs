@@ -72,6 +72,11 @@ pub fn sanitize_tied_embeddings(
 /// This is the common weight loading entry point for text model `load()`
 /// functions. It reads safetensors, parses config.json, and ensures lm_head
 /// weights exist.
+///
+/// On Apple Silicon M5+ (Metal 4), bf16 tensors are automatically converted
+/// to f16 to avoid GPU Address Fault / Timeout errors in compiled Metal
+/// kernels that cannot handle mixed bf16×float operands.  CUDA backends
+/// keep bf16 as-is since NVIDIA hardware supports it natively.
 pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
     model_dir: P,
 ) -> Result<mlxcel_core::weights::WeightMap, String> {
@@ -86,7 +91,47 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
         }
     }
 
+    // Convert bf16 → f16 on Metal backends where bf16 compiled kernels crash.
+    if should_convert_bf16_to_f16() {
+        convert_bf16_weights(&mut weights);
+    }
+
     Ok(weights)
+}
+
+/// Returns true when bf16 tensors should be cast to f16 at load time.
+///
+/// M5+ Apple Silicon compiled JIT kernels produce GPU Address Faults when
+/// mixing bf16 tensors with float32 constants.  M1–M4 and CUDA backends
+/// handle bf16 natively, so no conversion is needed there.
+///
+/// Uses the same M5 detection as padded prefill and Metal 4 attention:
+/// `has_neural_accelerator && macos_supports_na`.
+fn should_convert_bf16_to_f16() -> bool {
+    let hw = mlxcel_core::hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+/// Cast every bf16 tensor in the weight map to f16.
+fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+    let bf16_keys: Vec<String> = weights
+        .iter()
+        .filter(|(_, v)| mlxcel_core::array_dtype(v) == mlxcel_core::dtype::BFLOAT16)
+        .map(|(k, _)| k.clone())
+        .collect();
+
+    if !bf16_keys.is_empty() {
+        eprintln!(
+            "Converting {} bf16 weight tensors to f16 for Metal 4 compatibility.",
+            bf16_keys.len()
+        );
+        for key in bf16_keys {
+            if let Some(tensor) = weights.get(&key) {
+                let converted = mlxcel_core::astype(tensor, mlxcel_core::dtype::FLOAT16);
+                weights.insert(key, converted);
+            }
+        }
+    }
 }
 
 /// Sanitize config JSON string by replacing non-standard JSON values.
