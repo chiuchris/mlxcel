@@ -1305,26 +1305,37 @@ void nemotron_full_forward(
 // Metal 4 fused attention kernel dispatch (scaffolding).
 //
 // When `use_metal4` is true AND Metal 4 SDK is available, this function will
-// dispatch to a custom MTL4MachineLearningCommandEncoder-based kernel that
-// keeps all intermediate Q/K/V/scores tensors on-chip in the M5 Neural
-// Accelerator's registers, eliminating intermediate memory round-trips.
+// dispatch to a Metal 4 TensorOps kernel that keeps all intermediate
+// Q/K/V/scores tensors on-chip in the M5 Neural Accelerator's registers,
+// eliminating intermediate memory round-trips.
 //
 // Current status: SCAFFOLDING — both paths fall back to
 // `fast_scaled_dot_product_attention()` until the Metal 4 kernel is written.
 //
-// Requirements for the full implementation:
+// Supported attention patterns (via MLX SDPA fallback, and future kernel):
+//   - Standard MHA: n_heads == n_kv_heads
+//   - GQA: n_heads > n_kv_heads (e.g., Llama 3.1: 32 Q / 8 KV)
+//   - MQA: n_kv_heads == 1
+//
+// Mask handling: boolean/integer masks are passed through unchanged. Float
+// masks are cast to Q's dtype. See fast_scaled_dot_product_attention() for
+// the reference implementation.
+//
+// Requirements for the full Metal 4 implementation:
 //   - macOS 26.2+ (first OS supporting Metal 4)
 //   - Metal 4 SDK (Xcode from WWDC25 release cycle)
-//   - M5 hardware (metal_version == 4 from HardwareCapabilities)
+//   - M5 hardware (has_neural_accelerator && macos_supports_na)
 //
 // Use `mlxcel_core::layers::metal4_attention()` from Rust, which queries
 // `hardware::get_hardware()` to set `use_metal4` automatically.
+//
+// See docs/metal4-fused-attention-research.md for design notes.
 std::unique_ptr<MlxArray> fused_metal4_attention(
     const MlxArray& q,
     const MlxArray& k,
     const MlxArray& v,
     float scale,
-    const MlxArray* mask,  // nullable
+    const MlxArray* mask,  // nullable; supports boolean, integer, and float masks
     bool use_metal4
 );
 
