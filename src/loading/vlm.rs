@@ -99,7 +99,40 @@ pub(super) fn require_object_mut<'a>(
 }
 
 fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
-    mlxcel_core::weights::load_weights_from_dir(model_path).map_err(|e| anyhow::anyhow!("{}", e))
+    let mut weights =
+        mlxcel_core::weights::load_weights_from_dir(model_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // On M5+, convert bf16 → f16 for non-quantized models to avoid Metal JIT
+    // crashes.  Quantized models keep bf16 scales/biases as-is.
+    let hw = mlxcel_core::hardware::get_hardware();
+    if hw.has_neural_accelerator && hw.macos_supports_na {
+        let is_quantized = is_model_quantized(model_path);
+        if !is_quantized {
+            crate::models::convert_bf16_weights(&mut weights);
+        }
+    }
+
+    Ok(weights)
+}
+
+/// Check if a model is quantized by looking for `.scales` keys in weights
+/// or a `quantization` field in config.json.
+fn is_model_quantized(model_path: &Path) -> bool {
+    let config_path = model_path.join("config.json");
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
+            if config.get("quantization").is_some() {
+                return true;
+            }
+            if let Some(tc) = config.get("text_config") {
+                if tc.get("quantization").is_some() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 fn read_optional_model_json(model_path: &Path, file_name: &str) -> Option<Value> {

@@ -121,7 +121,7 @@ fn should_convert_bf16_to_f16() -> bool {
 }
 
 /// Cast every bf16 tensor in the weight map to f16.
-fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
     let bf16_keys: Vec<String> = weights
         .iter()
         .filter(|(_, v)| mlxcel_core::array_dtype(v) == mlxcel_core::dtype::BFLOAT16)

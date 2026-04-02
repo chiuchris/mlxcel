@@ -163,7 +163,10 @@ pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
-pub use sanitize::{load_and_sanitize_weights, sanitize_config_json, sanitize_tied_embeddings};
+pub use sanitize::{
+    convert_bf16_weights, load_and_sanitize_weights, sanitize_config_json,
+    sanitize_tied_embeddings,
+};
 pub use smollm3::SmolLM3Model;
 pub use solar_open::SolarOpenModel;
 pub use stablelm::StableLMModel;

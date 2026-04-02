@@ -96,7 +96,7 @@ fn sanitize_gemma3n_weights_strips_model_prefix_and_transposes_conv_weights() {
         mlxcel_core::ones(&[4, 4], dtype::FLOAT32),
     );
 
-    let sanitized = sanitize_gemma3n_weights(raw_weights, false);
+    let sanitized = sanitize_gemma3n_weights(raw_weights);
 
     assert!(sanitized.contains_key("vision_tower.timm_model.blocks.0.0.conv_exp.weight"));
     assert!(sanitized.contains_key("language_model.embed_tokens.weight"));
