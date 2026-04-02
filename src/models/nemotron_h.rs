@@ -380,11 +380,17 @@ struct MambaRMSNormGated {
 
 impl MambaRMSNormGated {
     fn forward(&self, x: &MlxArray, gate: Option<&MlxArray>) -> UniquePtr<MlxArray> {
-        // Apply gating first if provided
+        let orig_dtype = mlxcel_core::array_dtype(x);
+
+        // Promote to float32 for the entire gated norm computation to prevent
+        // NaN from float16 overflow in RMS norm (x^2 sum) and mixed-dtype
+        // multiply on M5 Max (Metal GPU Family 4) NAx kernels.
+        let x = mlxcel_core::astype(x, mlxcel_core::dtype::FLOAT32);
         let x = if let Some(g) = gate {
-            mlxcel_core::multiply(x, &silu(g))
+            let g_f32 = mlxcel_core::astype(g, mlxcel_core::dtype::FLOAT32);
+            mlxcel_core::multiply(&x, &silu(&g_f32))
         } else {
-            mlxcel_core::copy(x)
+            x
         };
 
         // Unflatten last dim into groups
@@ -398,14 +404,15 @@ impl MambaRMSNormGated {
         new_shape.push(self.group_size as i32);
         let x_grouped = mlxcel_core::reshape(&x, &new_shape);
 
-        // Apply RMS norm per group (use input dtype to avoid float16/bfloat16 mismatch)
-        let input_dtype = mlxcel_core::array_dtype(&x_grouped);
-        let group_weight = mlxcel_core::ones(&[self.group_size as i32], input_dtype);
+        // Apply RMS norm per group in float32
+        let group_weight = mlxcel_core::ones(&[self.group_size as i32], mlxcel_core::dtype::FLOAT32);
         let x_normed = mlxcel_core::fast_rms_norm(&x_grouped, &group_weight, self.eps);
 
-        // Flatten back and apply weight
+        // Flatten back, apply weight, and cast back to original dtype
         let x_flat = mlxcel_core::reshape(&x_normed, &shape);
-        mlxcel_core::multiply(&self.weight, &x_flat)
+        let w_f32 = mlxcel_core::astype(&self.weight, mlxcel_core::dtype::FLOAT32);
+        let result = mlxcel_core::multiply(&w_f32, &x_flat);
+        mlxcel_core::astype(&result, orig_dtype)
     }
 }
 
@@ -482,10 +489,8 @@ impl NemotronHMamba2Mixer {
             concatenate(conv_st, &conv_input, 1)
         } else {
             let conv_dtype = mlxcel_core::array_dtype(&conv_input);
-            let pad_arr = mlxcel_core::zeros(
-                &[batch, (k - 1) as i32, self.conv_dim as i32],
-                conv_dtype,
-            );
+            let pad_arr =
+                mlxcel_core::zeros(&[batch, (k - 1) as i32, self.conv_dim as i32], conv_dtype);
             concatenate(&pad_arr, &conv_input, 1)
         };
 
@@ -562,7 +567,17 @@ impl NemotronHMamba2Mixer {
 
         // Apply gated norm and output projection
         let y_normed = self.norm.forward(&y, Some(&gate));
-        self.out_proj.forward(&y_normed)
+        let result = self.out_proj.forward(&y_normed);
+
+        // Force evaluation of the Mamba layer output.
+        // On M5 Max (Metal GPU Family 4), the lazy computation graph from
+        // the SSM step contains mixed float32×float16 intermediate nodes
+        // that produce NaN when fused with downstream layers in a single
+        // Metal command buffer.  Materializing here splits the graph at a
+        // clean dtype boundary.
+        mlxcel_core::eval(&result);
+
+        result
     }
 
     /// SSM computation using the same approach as Mamba2's ssm_attn
@@ -630,14 +645,26 @@ impl NemotronHMamba2Mixer {
         let dt_a = mlxcel_core::multiply(&dt, &a_reshaped);
 
         // dtx = dt * x (expand dt for broadcasting)
+        // Promote x to float32 before multiplication with dt (float32).
+        // On M5 Max (Metal GPU Family 4), mixed float32×float16 multiply
+        // in a lazy computation graph produces NaN via the NAx broadcast kernel.
         let dt_exp = mlxcel_core::reshape(&dt, &[batch, seq_len, num_heads, 1]);
-        let dtx = mlxcel_core::multiply(&dt_exp, &x);
+        let x_f32 = mlxcel_core::astype(&x, mlxcel_core::dtype::FLOAT32);
+        let dtx = mlxcel_core::multiply(&dt_exp, &x_f32);
+
+        // Promote B, C to float32 before CB matmul to prevent float16 overflow
+        // on M5 Max (Metal GPU Family 4) NAx GEMM kernel.  The dot products
+        // over ssm_state_size elements can exceed float16 max (65504) for
+        // certain weight distributions, producing NaN that propagates through
+        // the entire model and causes all-<unk> output.
+        let b_f32 = mlxcel_core::astype(&b, mlxcel_core::dtype::FLOAT32);
+        let c_f32 = mlxcel_core::astype(&c, mlxcel_core::dtype::FLOAT32);
 
         // B: [batch, seq, groups, state_dim] -> [batch, groups, state_dim, seq]
-        let b_t = mlxcel_core::transpose_axes(&b, &[0, 2, 3, 1]);
+        let b_t = mlxcel_core::transpose_axes(&b_f32, &[0, 2, 3, 1]);
 
-        // CB = C.swapaxes(1, 2) @ B
-        let c_t = mlxcel_core::swap_axes(&c, 1, 2);
+        // CB = C.swapaxes(1, 2) @ B (in float32 to avoid overflow)
+        let c_t = mlxcel_core::swap_axes(&c_f32, 1, 2);
         let cb = mlxcel_core::matmul(&c_t, &b_t);
 
         // Repeat CB for each head in group
@@ -663,7 +690,7 @@ impl NemotronHMamba2Mixer {
         let decay_last = slice_axis(&decay, 2, decay_shape[2] - 1, decay_shape[2]);
         let decay_t = mlxcel_core::transpose_axes(&decay_last, &[0, 3, 1, 2]);
 
-        // B for state update
+        // B for state update (already float32 from promotion above)
         let b_rep = repeat_axis_nemotron(&b_t, repeats, 1);
         let b_sw = mlxcel_core::swap_axes(&b_rep, 2, 3);
 
@@ -681,20 +708,18 @@ impl NemotronHMamba2Mixer {
             let exp_dta_cumsum = mlxcel_core::exp(&dta_cumsum);
 
             // Update next_state with previous state
+            // Python: exp_dtA_cumsum[:, -1, :, None, None] → [batch, heads, 1, 1]
             let exp_shape = mlxcel_core::array_shape(&exp_dta_cumsum);
             let last_exp = slice_axis(&exp_dta_cumsum, 1, exp_shape[1] - 1, exp_shape[1]);
-
-            // Expand for broadcasting with state (Mamba2's approach)
-            let mut exp_shape_new = mlxcel_core::array_shape(&last_exp);
-            exp_shape_new.push(1);
-            exp_shape_new.push(1);
-            let last_exp = mlxcel_core::reshape(&last_exp, &exp_shape_new);
+            // last_exp is [batch, 1, num_heads] — squeeze seq dim, add two trailing dims
+            let last_exp = mlxcel_core::reshape(&last_exp, &[batch, num_heads, 1, 1]);
 
             let state_contrib = mlxcel_core::multiply(&last_exp, prev_state);
             next_state = mlxcel_core::add(&next_state, &state_contrib);
 
-            // y_prev contribution
-            let c_reshaped = mlxcel_core::reshape(&c, &[batch, seq_len, n_groups, 1, state_dim, 1]);
+            // y_prev contribution (use float32 C for precision with float32 state)
+            let c_reshaped =
+                mlxcel_core::reshape(&c_f32, &[batch, seq_len, n_groups, 1, state_dim, 1]);
             let state_reshaped = mlxcel_core::reshape(
                 prev_state,
                 &[batch, 1, n_groups, repeats, head_dim, state_dim],
@@ -714,13 +739,25 @@ impl NemotronHMamba2Mixer {
             y
         };
 
-        // Add D term: y = y + x * D
-        let d_reshaped = mlxcel_core::reshape(&self.d_param, &[1, 1, num_heads, 1]);
-        let d_contrib = mlxcel_core::multiply(&x, &d_reshaped);
+        // Add D term: y = y + x * D (all in float32 to prevent mixed-dtype NaN
+        // on M5 Max NAx kernel — keep D and x in float32 matching y's dtype)
+        let d_f32 = mlxcel_core::astype(&self.d_param, mlxcel_core::dtype::FLOAT32);
+        let d_reshaped = mlxcel_core::reshape(&d_f32, &[1, 1, num_heads, 1]);
+        let d_contrib = mlxcel_core::multiply(&x_f32, &d_reshaped);
         let y = mlxcel_core::add(&y, &d_contrib);
 
         // Cast y back to input dtype (dt computation was promoted to float32)
         let y = mlxcel_core::astype(&y, mlxcel_core::array_dtype(hidden_states));
+
+        // Force evaluation of y and next_state before returning.
+        // On M5 Max (Metal GPU Family 4), the lazy computation graph from the
+        // SSM step contains mixed float32×float16 intermediate nodes.  When
+        // this graph is fused with downstream operations (gated norm, residual
+        // add, MoE, attention) in a single Metal command buffer, the NAx
+        // kernel produces NaN.  Materializing the SSM outputs here splits
+        // the graph at a clean float16 boundary.
+        mlxcel_core::eval(&y);
+        mlxcel_core::eval(&next_state);
 
         (y, next_state)
     }
@@ -1210,9 +1247,6 @@ impl NemotronHMoE {
             mlxcel_core::copy(x)
         };
 
-        // When latent projection is active, use the non-fused path because the
-        // fused C++ MoE kernel does not support the latent dim reduction.
-        // Also, the shared expert must use the original residuals (not latent input).
         let use_fused = !self.has_latent_proj();
 
         // Try fused MoE forward (quantized path only, no latent projection)
@@ -1316,7 +1350,10 @@ impl NemotronHMoE {
         let mut scores_shape = mlxcel_core::array_shape(&scores);
         scores_shape.push(1);
         let scores_exp = mlxcel_core::reshape(&scores, &scores_shape);
-        let weighted = mlxcel_core::multiply(&y, &scores_exp);
+        // Cast scores to y's dtype to avoid mixed float32×float16 multiply
+        // which produces NaN on M5 Max (Metal GPU Family 4) NAx kernel.
+        let scores_cast = mlxcel_core::astype(&scores_exp, mlxcel_core::array_dtype(&y));
+        let weighted = mlxcel_core::multiply(&y, &scores_cast);
         let summed = mlxcel_core::sum_axis(&weighted, -2, false);
 
         // Cast back to input dtype (matching Python: .astype(y.dtype))
@@ -1736,7 +1773,11 @@ impl NemotronHModel {
             }
 
             if let Some(t0) = t0 {
-                let layer_idx = if block_type.needs_cache() { cache_idx - 1 } else { cache_idx };
+                let layer_idx = if block_type.needs_cache() {
+                    cache_idx - 1
+                } else {
+                    cache_idx
+                };
                 let bt = match block_type {
                     BlockType::Mamba => "M",
                     BlockType::Attention => "*",
@@ -1755,6 +1796,22 @@ impl NemotronHModel {
                 }
             } else if needs_chunked_eval && (layer_num + 1) % eval_interval == 0 {
                 mlxcel_core::eval(&h);
+                // Also evaluate Mamba cache states to prevent lazy graph issues
+                // on M5 Max (Metal GPU Family 4).  The conv/ssm states are
+                // separate outputs from the SSM computation that don't feed into
+                // h, so eval(&h) alone doesn't materialize them.  Leaving them
+                // as lazy arrays across Metal command buffer boundaries can cause
+                // stale GPU buffer references on NAx architecture.
+                for c in caches.iter() {
+                    if let NemotronLayerCache::Mamba(mc) = c {
+                        if let Some(ref cs) = mc.conv_state {
+                            mlxcel_core::eval(cs);
+                        }
+                        if let Some(ref ss) = mc.ssm_state {
+                            mlxcel_core::eval(ss);
+                        }
+                    }
+                }
             }
         }
 
@@ -1773,7 +1830,9 @@ impl NemotronHModel {
         }
 
         let h = self.norm_f.forward(&h);
-        self.lm_head.forward(&h)
+        let logits = self.lm_head.forward(&h);
+
+        logits
     }
 
     pub fn load(model_path: &str) -> Result<(Self, NemotronHConfig), Box<dyn std::error::Error>> {

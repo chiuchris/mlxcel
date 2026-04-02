@@ -3923,9 +3923,11 @@ std::unique_ptr<MlxArray> fused_moe_forward(
     h = squeeze(h, -2);  // [tokens, top_k, hidden]
 
     // 3. Score weighting: weighted sum over experts, cast back to input dtype
-    // (scores are float32 from sigmoid, must cast result back like Python does)
+    // Cast scores to h's dtype to avoid mixed float32×float16 multiply
+    // which produces NaN on M5 Max (Metal GPU Family 4) NAx broadcast kernel.
     auto scores_exp = reshape(topk_scores, {topk_scores.shape()[0], top_k, 1});
-    auto result = astype(sum(multiply(h, scores_exp), -2, false), x.inner.dtype());
+    auto scores_cast = astype(scores_exp, h.dtype());
+    auto result = astype(sum(multiply(h, scores_cast), -2, false), x.inner.dtype());
 
     // 4. Optional shared expert
     if (shared_up_weight && shared_down_weight) {

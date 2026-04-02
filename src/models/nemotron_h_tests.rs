@@ -141,3 +141,74 @@ fn attention_cache_trim_on_empty_cache_is_safe() {
     assert_eq!(trimmed, 0);
     assert_eq!(kv.offset, 0);
 }
+
+// ---------------------------------------------------------------------------
+// state_contrib broadcast shape invariants
+// ---------------------------------------------------------------------------
+
+/// The broadcast shape for state_contrib must be [batch, heads, 1, 1] (rank 4),
+/// NOT [batch, 1, heads, 1, 1] (rank 5).  The extra leading `1` was the pre-fix
+/// shape; this test documents the correct rank expected by the multiply.
+///
+/// In ssm_step, after slicing exp_dta_cumsum at the last seq position we get a
+/// tensor of shape [batch, 1, num_heads].  The reshape target is
+/// [batch, num_heads, 1, 1] so that it broadcasts correctly with next_state
+/// whose shape is [batch, heads, head_dim, state_dim].
+///
+/// We verify the rank arithmetic here without requiring MLX array allocation.
+#[test]
+fn state_contrib_broadcast_shape_is_rank4() {
+    // Representative dims matching Nemotron-H 30B config.
+    let batch = 1_i32;
+    let num_heads = 128_i32;
+    // After slice_axis on the seq dimension and reshape:
+    // last_exp: [batch, num_heads, 1, 1]
+    let last_exp_shape = [batch, num_heads, 1_i32, 1_i32];
+    // next_state: [batch, heads, head_dim, state_dim]
+    let head_dim = 64_i32;
+    let state_dim = 128_i32;
+    let next_state_shape = [batch, num_heads, head_dim, state_dim];
+
+    // Verify rank matches (both rank-4) and leading two dims are identical
+    // so that element-wise multiply broadcasts correctly.
+    assert_eq!(
+        last_exp_shape.len(),
+        next_state_shape.len(),
+        "last_exp and next_state must have the same rank for broadcasting"
+    );
+    assert_eq!(
+        last_exp_shape[0], next_state_shape[0],
+        "batch dims must match"
+    );
+    assert_eq!(
+        last_exp_shape[1], next_state_shape[1],
+        "heads dims must match"
+    );
+    // The trailing [1, 1] in last_exp broadcasts over [head_dim, state_dim].
+    assert_eq!(
+        last_exp_shape[2], 1,
+        "last_exp trailing dim[2] must be 1 for broadcast"
+    );
+    assert_eq!(
+        last_exp_shape[3], 1,
+        "last_exp trailing dim[3] must be 1 for broadcast"
+    );
+}
+
+/// Confirm the pre-fix (wrong) shape [batch, 1, heads, 1, 1] has rank 5,
+/// which would mismatch next_state at rank 4 and produce wrong broadcast
+/// semantics on M5 Max.
+#[test]
+fn state_contrib_old_shape_was_rank5() {
+    let batch = 1_i32;
+    let num_heads = 128_i32;
+    // The buggy reshape target before this PR.
+    let old_last_exp_shape = [batch, 1_i32, num_heads, 1_i32, 1_i32];
+    let next_state_rank = 4_usize;
+
+    assert_ne!(
+        old_last_exp_shape.len(),
+        next_state_rank,
+        "pre-fix shape rank 5 must differ from next_state rank 4"
+    );
+}

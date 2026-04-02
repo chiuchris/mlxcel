@@ -536,7 +536,8 @@ impl CxxGenerator {
 
         if trace_dtype {
             ffi::eval(&logits);
-            eprintln!("[LOGITS] prefill dtype={}", ffi::array_dtype(&logits));
+            let shape = ffi::array_shape(&logits);
+            eprintln!("[LOGITS] prefill dtype={} shape={:?}", ffi::array_dtype(&logits), shape);
         }
 
         // Clear intermediate tensors from prefill to free memory
