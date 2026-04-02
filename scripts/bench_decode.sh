@@ -256,11 +256,35 @@ emit() {
 }
 
 # ---------------------------------------------------------------------------
+# Models known to crash the GPU (Metal timeout / address fault).
+# Run these LAST to prevent GPU state corruption from affecting other models.
+# ---------------------------------------------------------------------------
+GPU_CRASH_MODELS="gemma3n-e4b-bf16"
+
+is_gpu_crash_model() {
+  local name
+  name=$(basename "$1")
+  for m in $GPU_CRASH_MODELS; do
+    [[ "$name" == "$m" ]] && return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
 if [[ "$MODEL_ARG" == "all" ]]; then
+  # First pass: run all models except known GPU-crash models
   for dir in "$MODELS_DIR"/*/; do
     [[ -d "$dir" ]] || continue
+    is_gpu_crash_model "$dir" && continue
+    result=$(bench_one "$dir")
+    emit "$result"
+  done
+  # Second pass: run known GPU-crash models last
+  for dir in "$MODELS_DIR"/*/; do
+    [[ -d "$dir" ]] || continue
+    is_gpu_crash_model "$dir" || continue
     result=$(bench_one "$dir")
     emit "$result"
   done

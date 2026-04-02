@@ -39,8 +39,13 @@ use cxx::UniquePtr;
 
 /// Returns true when the current hardware is M5+ with a Neural Accelerator
 /// and tile-aligned prefill should be applied.
+///
+/// Set `MLXCEL_NO_PADDED_PREFILL=1` to disable tile alignment (debugging).
 #[inline]
 fn should_align_prefill() -> bool {
+    if std::env::var("MLXCEL_NO_PADDED_PREFILL").is_ok() {
+        return false;
+    }
     let hw = hardware::get_hardware();
     hw.has_neural_accelerator && hw.macos_supports_na
 }
