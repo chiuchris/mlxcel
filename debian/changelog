@@ -1,3 +1,28 @@
+mlxcel (0.0.14-1~jammy1) jammy; urgency=medium
+
+  * Feat: Add logprobs support for chat completions and completions endpoints
+  * Feat: Add runtime Apple Silicon generation detection
+  * Feat: Add prefill tile alignment for M5 Neural Accelerator
+  * Feat: Add batched speculative decode verification for NA utilization
+  * Feat: Add batched prefill in server mode
+  * Feat: Add layer pipelining with strategic async_eval
+  * Feat: Add Metal 4 fused attention kernel scaffolding
+  * Feat: Add KV cache INT8 quantization for memory savings
+  * Feat: Add multimodal chat template support for VLM image token placement
+  * Perf: Centralize bf16-to-f16 weight conversion in VLM common path
+  * Perf: Skip bf16-to-f16 conversion for quantized models (+20% throughput)
+  * Perf: Add compiled gelu_topk kernel
+  * Perf: Expand QKV projection fusion to GQA models
+  * Perf: Fuse Q/K/V projections in Gemma v1 attention
+  * Fix: Auto-convert bf16 weights to f16 on M5 for Metal JIT compatibility
+  * Fix: Skip add_special_tokens when prompt already contains BOS token
+  * Fix: Prevent NemotronH GPU hang and state corruption on M5 Max
+  * Fix: PhiMoE expert activation from GeGLU to SwiGLU
+  * Fix: Replace gelu_approx power(x,3) with erf-based GELU in vision encoder
+  * Fix: Patch MLX Metal kernels for macOS 26.4 compatibility
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 03 Apr 2026 12:00:00 +0900
+
 mlxcel (0.0.13-1~jammy1) jammy; urgency=medium
 
   * Feat: Add Mistral4 MLA language model support

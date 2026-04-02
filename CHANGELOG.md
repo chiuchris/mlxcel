@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.14] - 2026-04-03
+
+### Added
+- Logprobs support for chat completions and completions endpoints (#188)
+- Runtime Apple Silicon generation detection for hardware-specific optimizations (#161)
+- Prefill tile alignment for M5 Neural Accelerator (#162)
+- Batched speculative decode verification for NA utilization (#167)
+- Batched prefill in server mode (#169)
+- Layer pipelining with strategic async_eval (#170)
+- Metal 4 fused attention kernel scaffolding (#171)
+- KV cache INT8 quantization for memory savings (#172)
+- INT8 quantization optimization for M5 Neural Accelerator (#168)
+- Multimodal chat template support for VLM image token placement
+- Apple Silicon precision hardware guide documentation
+
+### Changed
+- Centralize bf16→f16 weight conversion in shared VLM loading path
+- Skip bf16→f16 conversion for quantized models (restores +20% throughput)
+- Add compiled gelu_topk kernel matching Python mlx-lm `@mx.compile` pattern
+- Expand QKV projection fusion to GQA models (#164)
+- Expand compiled MLP fusion to non-quantized models (#166)
+- Fuse Q/K/V projections in Gemma v1 attention for faster decode (#183)
+- Refactor AGENTS.md into focused reference docs (313→75 lines)
+
+### Fixed
+- Auto-convert bf16 weights to f16 on M5 for Metal JIT compatibility
+- Skip add_special_tokens when prompt already contains BOS token (double-BOS fix)
+- Prevent NemotronH all-`<unk>` output on M5 Max by avoiding mixed float32/float16 ops (#187)
+- Prevent Nemotron-H/NAS GPU hang and state corruption on M5 Max (#186)
+- Trim NemotronH internal caches after padded prefill to prevent GPU hang (#184)
+- Fix PhiMoE expert activation from GeGLU to SwiGLU (#182)
+- Fix matmul outside compile boundary in FP MLP to fix output corruption (#181)
+- Replace gelu_approx power(x,3) with erf-based GELU to fix NaN in vision encoder (#179)
+- Guard multimodal chat template to avoid garbled output on text-only VLMs
+- Skip compiled FP MLP for bfloat16 models
+- Patch MLX compiled kernel JIT to cast mixed bfloat16/float operands
+- Patch MLX Metal kernels for macOS 26.4 compatibility
+- Correct M5 Max benchmark results affected by GPU cascade corruption
+
 ## [v0.0.13] - 2026-03-31
 
 ### Added
@@ -264,6 +303,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.14]: https://github.com/lablup/mlxcel/compare/v0.0.13...v0.0.14
 [v0.0.13]: https://github.com/lablup/mlxcel/compare/v0.0.12...v0.0.13
 [v0.0.12]: https://github.com/lablup/mlxcel/compare/v0.0.11...v0.0.12
 [v0.0.11]: https://github.com/lablup/mlxcel/compare/v0.0.10...v0.0.11
