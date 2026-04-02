@@ -104,7 +104,10 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
     // models — quantized models use bf16 scales/biases in quantized_matmul
     // which handles bf16 natively.
     if !is_quantized && should_convert_bf16_to_f16() {
-        convert_bf16_weights(&mut weights);
+        let had_bf16 = convert_bf16_weights(&mut weights);
+        if had_bf16 {
+            warn_bf16_precision();
+        }
     }
 
     Ok(weights)
@@ -125,8 +128,25 @@ fn should_convert_bf16_to_f16() -> bool {
     hw.silicon_gen != mlxcel_core::hardware::AppleSiliconGen::Unknown
 }
 
+/// Emit a one-line stderr note when a full-precision bf16 model is loaded,
+/// unless suppressed by `MLXCEL_NO_PRECISION_WARNING` env var.
+///
+/// Used by: load_and_sanitize_weights, load_vlm_weights
+pub fn warn_bf16_precision() {
+    if std::env::var("MLXCEL_NO_PRECISION_WARNING").is_err() {
+        eprintln!(
+            "Note: This model uses bf16 weights. On Apple Silicon, quantized models (4bit/8bit) are significantly faster. Consider using a quantized variant from mlx-community."
+        );
+    }
+}
+
 /// Cast every bf16 tensor in the weight map to f16.
-pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+///
+/// Returns `true` if any bf16 tensors were found and converted, `false` otherwise.
+///
+/// Used by: load_and_sanitize_weights, load_vlm_weights
+#[must_use]
+pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) -> bool {
     let bf16_keys: Vec<String> = weights
         .iter()
         .filter(|(_, v)| mlxcel_core::array_dtype(v) == mlxcel_core::dtype::BFLOAT16)
@@ -144,6 +164,9 @@ pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
                 weights.insert(key, converted);
             }
         }
+        true
+    } else {
+        false
     }
 }
 

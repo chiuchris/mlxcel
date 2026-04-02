@@ -108,7 +108,10 @@ fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
     if hw.silicon_gen != mlxcel_core::hardware::AppleSiliconGen::Unknown {
         let is_quantized = is_model_quantized(model_path);
         if !is_quantized {
-            crate::models::convert_bf16_weights(&mut weights);
+            let had_bf16 = crate::models::convert_bf16_weights(&mut weights);
+            if had_bf16 {
+                crate::models::warn_bf16_precision();
+            }
         }
     }
 
