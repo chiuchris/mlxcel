@@ -94,12 +94,14 @@ fn gemma3n_language_model_prefix(weights: &WeightMap) -> &'static str {
     }
 }
 
-fn sanitize_gemma3n_weights(raw_weights: WeightMap) -> WeightMap {
+fn sanitize_gemma3n_weights(raw_weights: WeightMap, is_quantized: bool) -> WeightMap {
     let needs_transpose = gemma3n_needs_conv_transpose(&raw_weights);
     // On M5+ Apple Silicon, cast bf16 tensors to f16 to avoid GPU Address
-    // Faults in compiled JIT kernels. M1–M4 and CUDA keep bf16 as-is.
+    // Faults in compiled JIT kernels. Only needed for non-quantized (full
+    // bf16) models — quantized models use bf16 scales/biases in the
+    // quantized_matmul kernel which handles bf16 natively.
     let hw = mlxcel_core::hardware::get_hardware();
-    let cast_bf16 = hw.has_neural_accelerator && hw.macos_supports_na;
+    let cast_bf16 = !is_quantized && hw.has_neural_accelerator && hw.macos_supports_na;
     let mut weights = WeightMap::new();
     let mut bf16_count = 0u32;
 
@@ -226,7 +228,8 @@ pub(crate) fn load_gemma3n_vlm(model_path: &Path) -> Result<LoadedModel> {
     let text_config = top_args.text_args();
     let metadata = gemma3n_metadata(&full_config);
 
-    let mut weights = sanitize_gemma3n_weights(load_vlm_weights(model_path)?);
+    let is_quantized = text_config.quantization.is_some();
+    let mut weights = sanitize_gemma3n_weights(load_vlm_weights(model_path)?, is_quantized);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let language_model = models::gemma3n::Gemma3nLanguageModel::from_weights(

@@ -334,6 +334,14 @@ std::unique_ptr<MlxArray> compiled_gelu(const MlxArray& x);
 // Used by: Gemma2, Gemma3 (matches Python nn.gelu_approx)
 std::unique_ptr<MlxArray> compiled_gelu_approx(const MlxArray& x);
 
+// Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
+// gelu_approx(max(0, x - (mean + std * multiplier)))
+// Used by: Gemma3n MLP layers with activation_sparsity > 0
+std::unique_ptr<MlxArray> compiled_gelu_topk(
+    const MlxArray& x,
+    float std_multiplier
+);
+
 // SwiGLU activation only - compiled with kernel fusion (shapeless=true)
 // output = silu(gate) * x
 // Uses mlx::core::compile for kernel fusion (like Python's @mx.compile)

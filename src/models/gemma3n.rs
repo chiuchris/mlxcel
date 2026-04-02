@@ -602,36 +602,16 @@ pub struct MLP {
 }
 
 impl MLP {
-    /// Apply gelu_topk activation with sparsity
+    /// Apply gelu_topk activation with sparsity.
+    /// Uses a compiled fused kernel matching Python's @mx.compile gelu_topk.
     fn gelu_topk(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         if self.activation_sparsity <= 0.0 {
             return mlxcel_core::gelu_approx(x);
         }
 
-        // Compute mean and std along last axis
-        let mean = mlxcel_core::mean_axis(x, -1, true);
-
-        // Manual std calculation: sqrt(mean((x - mean)^2))
-        let diff = mlxcel_core::subtract(x, &mean);
-        let diff_sq = mlxcel_core::square(&diff);
-        let var = mlxcel_core::mean_axis(&diff_sq, -1, true);
-        let std = mlxcel_core::sqrt(&var);
-
-        // cutoff = mean + std * std_multiplier
-        let x_dtype = mlxcel_core::array_dtype(x);
-        let std_mult = mlxcel_core::full_f32(&[1], self.std_multiplier, x_dtype);
-        let std_scaled = mlxcel_core::multiply(&std, &std_mult);
-        let cutoff = mlxcel_core::add(&mean, &std_scaled);
-
-        // shifted = x - cutoff
-        let shifted = mlxcel_core::subtract(x, &cutoff);
-
-        // zeroed = max(shifted, 0)
-        let zero = mlxcel_core::zeros(&[1], x_dtype);
-        let zeroed = mlxcel_core::maximum(&shifted, &zero);
-
-        // Apply gelu
-        mlxcel_core::gelu_approx(&zeroed)
+        // Single compiled kernel: mean/std/cutoff/max/gelu fused together.
+        // Matches Python mlx-lm's @partial(mx.compile, shapeless=True) gelu_topk.
+        mlxcel_core::compiled_gelu_topk(x, self.std_multiplier)
     }
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {

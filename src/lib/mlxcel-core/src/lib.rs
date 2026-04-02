@@ -509,6 +509,11 @@ mod ffi {
         /// Used by: Gemma2, Gemma3 MLP layers
         fn compiled_geglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
+        /// gelu_approx(max(0, x - (mean + std * multiplier)))
+        /// Used by: Gemma3n MLP layers with activation_sparsity > 0
+        fn compiled_gelu_topk(x: &MlxArray, std_multiplier: f32) -> UniquePtr<MlxArray>;
+
         /// Compiled softcap: tanh(scores / cap) * cap — single fused kernel
         /// Used by: Gemma2 attention with logit softcapping
         fn compiled_softcap(scores: &MlxArray, cap: f32) -> UniquePtr<MlxArray>;

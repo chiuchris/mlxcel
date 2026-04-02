@@ -1151,6 +1151,50 @@ std::unique_ptr<MlxArray> compiled_geglu_activation(
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
+// Compiled gelu_topk: sparse GELU with dynamic threshold.
+// Matches Python: gelu_approx(max(0, x - (mean + std * multiplier)))
+// Used by: Gemma3n MLP layers with activation_sparsity > 0
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_gelu_topk() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];
+            const auto& std_multiplier = inputs[1];
+
+            // mean and std along last axis
+            auto mean = mlx::core::mean(x, /* axis */ -1, /* keepdims */ true);
+            auto diff = mlx::core::subtract(x, mean);
+            auto var = mlx::core::mean(mlx::core::square(diff), -1, true);
+            auto stddev = mlx::core::sqrt(var);
+
+            // cutoff = mean + std * multiplier
+            auto cutoff = mlx::core::add(mean, mlx::core::multiply(stddev, std_multiplier));
+
+            // zeroed = max(x - cutoff, 0)
+            auto shifted = mlx::core::subtract(x, cutoff);
+            auto zeroed = mlx::core::maximum(shifted, array(0.0f));
+
+            // gelu_approx via erf
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(zeroed, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            return {mlx::core::multiply(zeroed, scale)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_topk(
+    const MlxArray& x,
+    float std_multiplier
+) {
+    static auto compiled_fn = get_compiled_gelu_topk();
+    auto mult = array(std_multiplier);
+    auto result = compiled_fn({x.inner, mult});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
 // Compiled softcap: tanh(scores / cap) * cap
 // Used by: Gemma2 attention with logit softcapping
 namespace {

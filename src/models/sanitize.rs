@@ -84,15 +84,23 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
     let mut weights = mlxcel_core::weights::load_weights_from_dir(model_dir)?;
 
     let config_path = model_dir.join("config.json");
+    let mut is_quantized = false;
     if let Ok(config_str) = std::fs::read_to_string(&config_path) {
         let config_str = sanitize_config_json(&config_str);
         if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
             sanitize_tied_embeddings(&mut weights, &config);
+            is_quantized = config.get("quantization").is_some()
+                || config
+                    .get("text_config")
+                    .and_then(|tc| tc.get("quantization"))
+                    .is_some();
         }
     }
 
-    // Convert bf16 → f16 on Metal backends where bf16 compiled kernels crash.
-    if should_convert_bf16_to_f16() {
+    // Convert bf16 → f16 on M5+ Metal where bf16 compiled JIT kernels crash.
+    // Only for non-quantized models — quantized models use bf16 scales/biases
+    // in the quantized_matmul kernel which handles bf16 natively.
+    if !is_quantized && should_convert_bf16_to_f16() {
         convert_bf16_weights(&mut weights);
     }
 
