@@ -73,10 +73,12 @@ pub fn sanitize_tied_embeddings(
 /// functions. It reads safetensors, parses config.json, and ensures lm_head
 /// weights exist.
 ///
-/// On Apple Silicon M5+ (Metal 4), bf16 tensors are automatically converted
-/// to f16 to avoid GPU Address Fault / Timeout errors in compiled Metal
-/// kernels that cannot handle mixed bf16×float operands.  CUDA backends
-/// keep bf16 as-is since NVIDIA hardware supports it natively.
+/// On Apple Silicon, bf16 tensors are automatically converted to f16 for
+/// performance.  No Apple GPU (M1–M5) has native bf16 ALU hardware — bf16
+/// arithmetic is emulated via f32 upcast/truncate, yielding f32 throughput.
+/// f16 is strictly better: on M3/M4 it unlocks ~2x compute throughput via
+/// fp16 co-issue, and on M1/M2 there is no penalty.  Non-Apple backends
+/// keep bf16 as-is since they may support it natively.
 pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
     model_dir: P,
 ) -> Result<mlxcel_core::weights::WeightMap, String> {
@@ -97,9 +99,10 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
         }
     }
 
-    // Convert bf16 → f16 on M5+ Metal where bf16 compiled JIT kernels crash.
-    // Only for non-quantized models — quantized models use bf16 scales/biases
-    // in the quantized_matmul kernel which handles bf16 natively.
+    // Convert bf16 → f16 on all Apple Silicon for performance.  No Apple GPU
+    // has native bf16 ALU, so f16 is strictly better.  Only for non-quantized
+    // models — quantized models use bf16 scales/biases in quantized_matmul
+    // which handles bf16 natively.
     if !is_quantized && should_convert_bf16_to_f16() {
         convert_bf16_weights(&mut weights);
     }
@@ -109,15 +112,17 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
 
 /// Returns true when bf16 tensors should be cast to f16 at load time.
 ///
-/// M5+ Apple Silicon compiled JIT kernels produce GPU Address Faults when
-/// mixing bf16 tensors with float32 constants.  M1–M4 and CUDA backends
-/// handle bf16 natively, so no conversion is needed there.
+/// All Apple Silicon GPUs (M1–M5) lack native bf16 ALU hardware.  Metal's
+/// `bfloat` type is storage-only — arithmetic is emulated via f32
+/// upcast/truncate, yielding f32 throughput.  f16 is strictly better:
+/// - M3/M4: fp16 co-issue provides ~2x compute throughput over bf16/f32.
+/// - M1/M2: fp16 and fp32 have identical throughput, no penalty from converting.
+/// - M5: already benefits from conversion (crash avoidance + performance).
 ///
-/// Uses the same M5 detection as padded prefill and Metal 4 attention:
-/// `has_neural_accelerator && macos_supports_na`.
+/// Non-Apple backends (Unknown silicon_gen) keep bf16 as-is.
 fn should_convert_bf16_to_f16() -> bool {
     let hw = mlxcel_core::hardware::get_hardware();
-    hw.has_neural_accelerator && hw.macos_supports_na
+    hw.silicon_gen != mlxcel_core::hardware::AppleSiliconGen::Unknown
 }
 
 /// Cast every bf16 tensor in the weight map to f16.
@@ -130,7 +135,7 @@ pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) {
 
     if !bf16_keys.is_empty() {
         eprintln!(
-            "Converting {} bf16 weight tensors to f16 for Metal 4 compatibility.",
+            "Converting {} bf16 weight tensors to f16 for Apple Silicon fp16 optimization.",
             bf16_keys.len()
         );
         for key in bf16_keys {

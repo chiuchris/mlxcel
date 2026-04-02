@@ -102,10 +102,10 @@ fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
     let mut weights = mlxcel_core::weights::load_weights_from_dir(model_path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    // On M5+, convert bf16 → f16 for non-quantized models to avoid Metal JIT
-    // crashes.  Quantized models keep bf16 scales/biases as-is.
+    // On Apple Silicon, convert bf16 → f16 for performance (no Apple GPU has
+    // native bf16 ALU).  Quantized models keep bf16 scales/biases as-is.
     let hw = mlxcel_core::hardware::get_hardware();
-    if hw.has_neural_accelerator && hw.macos_supports_na {
+    if hw.silicon_gen != mlxcel_core::hardware::AppleSiliconGen::Unknown {
         let is_quantized = is_model_quantized(model_path);
         if !is_quantized {
             crate::models::convert_bf16_weights(&mut weights);
@@ -126,9 +126,10 @@ fn is_model_quantized(model_path: &Path) -> bool {
                 return true;
             }
             if let Some(tc) = config.get("text_config")
-                && tc.get("quantization").is_some() {
-                    return true;
-                }
+                && tc.get("quantization").is_some()
+            {
+                return true;
+            }
         }
     }
     false
