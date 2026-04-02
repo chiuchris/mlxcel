@@ -99,8 +99,8 @@ pub(super) fn require_object_mut<'a>(
 }
 
 fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
-    let mut weights =
-        mlxcel_core::weights::load_weights_from_dir(model_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    let mut weights = mlxcel_core::weights::load_weights_from_dir(model_path)
+        .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // On M5+, convert bf16 → f16 for non-quantized models to avoid Metal JIT
     // crashes.  Quantized models keep bf16 scales/biases as-is.
@@ -125,11 +125,10 @@ fn is_model_quantized(model_path: &Path) -> bool {
             if config.get("quantization").is_some() {
                 return true;
             }
-            if let Some(tc) = config.get("text_config") {
-                if tc.get("quantization").is_some() {
+            if let Some(tc) = config.get("text_config")
+                && tc.get("quantization").is_some() {
                     return true;
                 }
-            }
         }
     }
     false
