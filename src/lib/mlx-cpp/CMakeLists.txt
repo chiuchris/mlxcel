@@ -15,17 +15,7 @@ set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
-FetchContent_Declare(
-  mlx
-  GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-  GIT_TAG v0.31.1)
-
-# Use FetchContent_Populate + add_subdirectory so we can apply source overlays
-# before the MLX build system processes the files.
-FetchContent_GetProperties(mlx)
-if(NOT mlx_POPULATED)
-  FetchContent_Populate(mlx)
-
+function(mlx_apply_source_overlays mlx_source_dir)
   # Apply shared patches (Metal JIT fixes, kernel utils) to all builds
   if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
     file(GLOB_RECURSE _patch_files
@@ -34,7 +24,7 @@ if(NOT mlx_POPULATED)
     foreach(_patch_file ${_patch_files})
       configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
-        "${mlx_SOURCE_DIR}/${_patch_file}"
+        "${mlx_source_dir}/${_patch_file}"
         COPYONLY)
     endforeach()
     message(STATUS "Applied shared patches to MLX source")
@@ -51,14 +41,39 @@ if(NOT mlx_POPULATED)
       get_filename_component(_fname "${_patch_file}" NAME)
       configure_file(
         "${_patch_file}"
-        "${mlx_SOURCE_DIR}/mlx/${_fname}"
+        "${mlx_source_dir}/mlx/${_fname}"
         COPYONLY)
     endforeach()
     message(STATUS "Applied CUDA-only patches to MLX source")
   endif()
+endfunction()
 
-  add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
+set(_mlx_cached_source_dir "${CMAKE_BINARY_DIR}/_deps/mlx-src")
+set(_mlx_cached_binary_dir "${CMAKE_BINARY_DIR}/_deps/mlx-build")
+
+# Reuse an already-populated source tree when present so offline rebuilds can
+# proceed without re-running FetchContent. This is especially useful when Cargo
+# changes the build hash but the developer already has a cached MLX checkout.
+if(EXISTS "${_mlx_cached_source_dir}/CMakeLists.txt")
+  set(mlx_SOURCE_DIR "${_mlx_cached_source_dir}")
+  set(mlx_BINARY_DIR "${_mlx_cached_binary_dir}")
+  message(STATUS "Using cached MLX source from ${mlx_SOURCE_DIR}")
+else()
+  FetchContent_Declare(
+    mlx
+    GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
+    GIT_TAG v0.31.1)
+
+  # Use FetchContent_Populate + add_subdirectory so we can apply source
+  # overlays before the MLX build system processes the files.
+  FetchContent_GetProperties(mlx)
+  if(NOT mlx_POPULATED)
+    FetchContent_Populate(mlx)
+  endif()
 endif()
+
+mlx_apply_source_overlays("${mlx_SOURCE_DIR}")
+add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
 
 # ----------------------------- CUDA CCCL ---------------------------------
 # Ensure MLX_CCCL_DIR is defined for CUDA JIT kernel compilation at runtime.

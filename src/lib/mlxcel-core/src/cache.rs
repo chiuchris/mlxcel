@@ -82,9 +82,7 @@ impl std::fmt::Display for KVCacheMode {
 /// - `scale`:  `[B, H, T, 1]` FP16 — the absmax / 127.0 for each token
 ///
 /// Used by: QuantizedKVCache (INT8 mode of KVCache)
-fn quantize_per_token(
-    x: &MlxArray,
-) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+fn quantize_per_token(x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     // Compute per-token absmax: reduce over last dim (head_dim), keepdims
     let abs_x = ffi::abs(x);
     let absmax = ffi::max_axis(&abs_x, -1, true); // [B, H, T, 1]
@@ -331,10 +329,16 @@ impl KVCache {
                 }
                 self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k_buf, 2));
                 self.values = Some(concatenate(self.values.as_ref().unwrap(), &new_v_buf, 2));
-                self.key_scales =
-                    Some(concatenate(self.key_scales.as_ref().unwrap(), &new_ks_buf, 2));
-                self.val_scales =
-                    Some(concatenate(self.val_scales.as_ref().unwrap(), &new_vs_buf, 2));
+                self.key_scales = Some(concatenate(
+                    self.key_scales.as_ref().unwrap(),
+                    &new_ks_buf,
+                    2,
+                ));
+                self.val_scales = Some(concatenate(
+                    self.val_scales.as_ref().unwrap(),
+                    &new_vs_buf,
+                    2,
+                ));
             } else {
                 self.keys = Some(new_k_buf);
                 self.values = Some(new_v_buf);
@@ -454,10 +458,8 @@ impl KVCache {
 
             let k_slice = ffi::slice(k_int8, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
             let v_slice = ffi::slice(v_int8, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]);
-            let ks_slice =
-                ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], self.offset, 1]);
-            let vs_slice =
-                ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], self.offset, 1]);
+            let ks_slice = ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], self.offset, 1]);
+            let vs_slice = ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], self.offset, 1]);
 
             (
                 dequantize(&k_slice, &ks_slice),
