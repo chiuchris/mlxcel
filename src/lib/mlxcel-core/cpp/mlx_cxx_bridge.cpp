@@ -2563,26 +2563,23 @@ bool is_gpu_available() {
     return mlx::core::default_device() == mlx::core::Device::gpu;
 }
 
-// Compiled top-p (nucleus) filtering fused into a single kernel.
+// Top-p (nucleus) filtering.
+// Not compiled: MLX v0.31.x Scan primitive (cumsum) lacks output_shapes,
+// which causes "CumSum cannot infer output shapes" when used inside
+// mlx::core::compile with shapeless=true.
 namespace {
-    static std::function<std::vector<array>(const std::vector<array>&)>
-    get_compiled_top_p_filter() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            const auto& x = inputs[0];
-            const auto& top_p_arr = inputs[1];
-            auto probs = mlx::core::softmax(x, -1);
-            auto sorted_indices = mlx::core::argsort(mlx::core::negative(probs), -1);
-            auto sorted_probs = mlx::core::take_along_axis(probs, sorted_indices, -1);
-            auto cum_probs = mlx::core::cumsum(sorted_probs, -1, false, true);
-            auto shifted_cum = cum_probs - sorted_probs;
-            auto mask = mlx::core::less_equal(shifted_cum, top_p_arr);
-            auto sorted_logits = mlx::core::take_along_axis(x, sorted_indices, -1);
-            auto filtered_sorted = mlx::core::where(
-                mask, sorted_logits, mlx::core::array(std::numeric_limits<float>::lowest()));
-            auto unsort_indices = mlx::core::argsort(sorted_indices, -1);
-            return {mlx::core::take_along_axis(filtered_sorted, unsort_indices, -1)};
-        };
-        return mlx::core::compile(fn, true);
+    array top_p_filter(const array& x, float top_p) {
+        auto probs = mlx::core::softmax(x, -1);
+        auto sorted_indices = mlx::core::argsort(mlx::core::negative(probs), -1);
+        auto sorted_probs = mlx::core::take_along_axis(probs, sorted_indices, -1);
+        auto cum_probs = mlx::core::cumsum(sorted_probs, -1, false, true);
+        auto shifted_cum = cum_probs - sorted_probs;
+        auto mask = mlx::core::less_equal(shifted_cum, mlx::core::array(top_p));
+        auto sorted_logits = mlx::core::take_along_axis(x, sorted_indices, -1);
+        auto filtered_sorted = mlx::core::where(
+            mask, sorted_logits, mlx::core::array(std::numeric_limits<float>::lowest()));
+        auto unsort_indices = mlx::core::argsort(sorted_indices, -1);
+        return mlx::core::take_along_axis(filtered_sorted, unsort_indices, -1);
     }
 }
 
@@ -2609,10 +2606,10 @@ namespace {
 // Input: 2D logits [batch, vocab] (already sliced, penalties already applied)
 // Returns sampled token
 //
-// Uses compiled (fused) kernels for the hot paths:
+// Uses compiled (fused) kernels where supported:
 // - Categorical sampling: temp scaling + random::categorical in one kernel
-// - Top-p filtering: softmax + argsort + cumsum + mask in one kernel
 // - Min-p filtering: softmax + max + mask in one kernel
+// - Top-p filtering: uncompiled (cumsum lacks output_shapes in MLX v0.31.x)
 std::unique_ptr<MlxArray> fused_sample(
     const MlxArray& logits,
     float temperature,
@@ -2651,11 +2648,9 @@ std::unique_ptr<MlxArray> fused_sample(
         x = mlx::core::where(mask, x, mlx::core::array(std::numeric_limits<float>::lowest()));
     }
 
-    // Top-p (nucleus) filtering — compiled kernel
+    // Top-p (nucleus) filtering
     if (top_p > 0.0f && top_p < 1.0f) {
-        static auto compiled_fn = get_compiled_top_p_filter();
-        auto result = compiled_fn({x, mlx::core::array(top_p)});
-        x = std::move(result[0]);
+        x = top_p_filter(x, top_p);
     }
 
     // Min-p filtering — compiled kernel
