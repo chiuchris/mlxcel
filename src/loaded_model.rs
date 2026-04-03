@@ -56,8 +56,10 @@ pub enum LoadedModel {
     Gemma2(models::Gemma2Model),
     // Sliding window models use wrappers that implement LanguageModel
     Gemma3(models::Gemma3Wrapper),
+    Gemma4(models::Gemma4Wrapper),
     // Vision-language models
     Gemma3VLM(vision::VisionLanguageModel),
+    Gemma4VLM(vision::Gemma4VLModel),
     Llama4VLM(vision::VisionLanguageModel),
     LlavaVLM(vision::VisionLanguageModel),
     Qwen2VL(vision::Qwen2VLModel),
@@ -148,7 +150,9 @@ macro_rules! delegate_language_model {
             LoadedModel::Gemma(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma3(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma4(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Gemma3VLM(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::Gemma4VLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Llama4VLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::LlavaVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen2VL(inner) => LanguageModel::$method(inner, $($arg),*),

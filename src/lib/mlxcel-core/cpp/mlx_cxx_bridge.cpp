@@ -172,6 +172,17 @@ std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slic
     }
 }
 
+std::unique_ptr<MlxArray> from_bytes_nocopy(
+    rust::Slice<const uint8_t> data,
+    rust::Slice<const int32_t> shape,
+    int32_t dtype) {
+    auto mlx_dtype = to_dtype(dtype);
+    auto mlx_shape = to_shape(shape);
+    void* ptr = const_cast<uint8_t*>(data.data());
+    auto noop_deleter = [](void*) {};
+    return std::make_unique<MlxArray>(array(ptr, mlx_shape, mlx_dtype, noop_deleter));
+}
+
 // Helper function to convert float16 bits to float32
 inline float f16_to_f32_bits(uint16_t h) {
     uint32_t sign = (h >> 15) & 0x1;
@@ -2187,6 +2198,15 @@ std::unique_ptr<MlxArray> fast_rms_norm(
 ) {
     return std::make_unique<MlxArray>(mlx::core::fast::rms_norm(
         x.inner, weight.inner, eps
+    ));
+}
+
+std::unique_ptr<MlxArray> fast_rms_norm_no_weight(
+    const MlxArray& x,
+    float eps
+) {
+    return std::make_unique<MlxArray>(mlx::core::fast::rms_norm(
+        x.inner, std::nullopt, eps
     ));
 }
 

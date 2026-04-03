@@ -168,6 +168,7 @@ fn require_qwen35_vlm_kind_rejects_non_vlm_variants() {
 fn is_vlm_model_type_distinguishes_multimodal_variants() {
     assert!(is_vlm_model_type(ModelType::Qwen3VL));
     assert!(is_vlm_model_type(ModelType::LlavaVLM));
+    assert!(is_vlm_model_type(ModelType::Gemma4VLM));
     assert!(!is_vlm_model_type(ModelType::Qwen35));
     assert!(!is_vlm_model_type(ModelType::Llama));
 }
@@ -185,6 +186,14 @@ fn model_capabilities_distinguish_kind_and_adapter_support() {
     let qwen_vl = model_capabilities(ModelType::Qwen3VL);
     assert_eq!(qwen_vl.kind, ModelKind::Vlm);
     assert!(qwen_vl.adapter_unsupported_message.is_some());
+
+    let gemma4 = model_capabilities(ModelType::Gemma4);
+    assert_eq!(gemma4.kind, ModelKind::Text);
+    assert_eq!(gemma4.adapter_unsupported_message, None);
+
+    let gemma4_vlm = model_capabilities(ModelType::Gemma4VLM);
+    assert_eq!(gemma4_vlm.kind, ModelKind::Vlm);
+    assert!(gemma4_vlm.adapter_unsupported_message.is_some());
 }
 
 #[test]

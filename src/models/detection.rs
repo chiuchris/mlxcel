@@ -19,6 +19,7 @@
 //! model implementations and exported types.
 
 use anyhow::Result;
+use serde_json::Value;
 use std::path::Path;
 
 use super::ModelType;
@@ -26,6 +27,20 @@ use super::sanitize::sanitize_config_json;
 
 pub(crate) fn has_vision_config(config: &serde_json::Value) -> bool {
     config.get("vision_config").is_some()
+}
+
+fn gemma4_has_vision_weights(model_path: &Path) -> bool {
+    let index_path = model_path.join("model.safetensors.index.json");
+    if let Ok(index_str) = std::fs::read_to_string(&index_path)
+        && let Ok(index) = serde_json::from_str::<Value>(&index_str)
+        && let Some(weight_map) = index.get("weight_map").and_then(Value::as_object)
+    {
+        return weight_map
+            .keys()
+            .any(|key| key.starts_with("vision_tower.") || key.starts_with("embed_vision."));
+    }
+
+    model_path.join("processor_config.json").exists()
 }
 
 pub(crate) fn detect_text_or_vlm(
@@ -89,6 +104,11 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
             ModelType::Gemma3,
             ModelType::Gemma3VLM,
         )),
+        "gemma4" | "gemma4_text" => Ok(if gemma4_has_vision_weights(model_path) {
+            ModelType::Gemma4VLM
+        } else {
+            ModelType::Gemma4
+        }),
         "gemma3n" | "gemma3n_text" => Ok(detect_text_or_vlm(
             &v,
             ModelType::Gemma3n,

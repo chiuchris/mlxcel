@@ -479,7 +479,10 @@ fn test_compiled_gelu_matches_gelu() {
     eval(&regular_sum);
 
     let diff = (item_f32(&compiled_sum) - item_f32(&regular_sum)).abs();
-    assert!(diff < 1e-4, "compiled_gelu and gelu should give same result, diff={diff}");
+    assert!(
+        diff < 1e-4,
+        "compiled_gelu and gelu should give same result, diff={diff}"
+    );
 }
 
 #[test]
@@ -516,7 +519,10 @@ fn test_compiled_geglu_matches_manual() {
     eval(&manual_sum);
 
     let diff = (item_f32(&compiled_sum) - item_f32(&manual_sum)).abs();
-    assert!(diff < 1e-4, "compiled_geglu and manual gelu*x should match, diff={diff}");
+    assert!(
+        diff < 1e-4,
+        "compiled_geglu and manual gelu*x should match, diff={diff}"
+    );
 }
 
 #[test]
@@ -540,8 +546,14 @@ fn test_compiled_softcap() {
         eval(&max_arr);
         item_f32(&max_arr)
     };
-    assert!(min_val >= -cap - 1e-5, "softcap output must be >= -cap, got {min_val}");
-    assert!(max_val <= cap + 1e-5, "softcap output must be <= cap, got {max_val}");
+    assert!(
+        min_val >= -cap - 1e-5,
+        "softcap output must be >= -cap, got {min_val}"
+    );
+    assert!(
+        max_val <= cap + 1e-5,
+        "softcap output must be <= cap, got {max_val}"
+    );
 }
 
 #[test]
@@ -597,9 +609,7 @@ fn test_compiled_softcap_sdpa_gqa_shape() {
     let k = ones(&[1, 2, 2, 8], dtype::FLOAT32);
     let v = ones(&[1, 2, 2, 8], dtype::FLOAT32);
 
-    let out = unsafe {
-        compiled_softcap_sdpa_gqa(&q, &k, &v, 0.125, 30.0, 2, std::ptr::null())
-    };
+    let out = unsafe { compiled_softcap_sdpa_gqa(&q, &k, &v, 0.125, 30.0, 2, std::ptr::null()) };
     eval(&out);
 
     // Output shape should match q shape [1, 4, 2, 8]

@@ -51,6 +51,10 @@ pub enum VlmPreparationSummary {
         total_tokens: usize,
         prefix_tokens: usize,
     },
+    Gemma4 {
+        image_slots: usize,
+        total_tokens: usize,
+    },
     Phi4MM {
         image_slots: usize,
         total_tokens: usize,
@@ -208,6 +212,29 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation,
+            }))
+        }
+        VlmRuntimeRef::Gemma4(gemma4_vl) => {
+            let processed_images = gemma4_vl.processor.preprocess(images);
+            let num_soft_tokens: Vec<usize> =
+                processed_images.iter().map(|image| image.num_soft_tokens).collect();
+            expand_gemma4_image_tokens(
+                prompt_tokens,
+                gemma4_vl.image_token_id,
+                gemma4_vl.boi_token_id,
+                gemma4_vl.eoi_token_id,
+                &num_soft_tokens,
+            )?;
+
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = gemma4_vl.get_input_embeddings(&input_ids_arr, &processed_images);
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::Gemma4 {
+                    image_slots: processed_images.len(),
+                    total_tokens: prompt_tokens.len(),
+                }),
             }))
         }
         VlmRuntimeRef::Phi4MM(phi4mm) => {
@@ -385,6 +412,64 @@ where
             }))
         }
     }
+}
+
+fn expand_gemma4_image_tokens(
+    prompt_tokens: &mut Vec<i32>,
+    image_token_id: i32,
+    boi_token_id: i32,
+    eoi_token_id: i32,
+    num_soft_tokens: &[usize],
+) -> Result<()> {
+    if prompt_tokens.is_empty() || num_soft_tokens.is_empty() {
+        return Ok(());
+    }
+
+    let placeholder_count = prompt_tokens
+        .iter()
+        .filter(|&&token| token == image_token_id || token == boi_token_id)
+        .count();
+
+    if placeholder_count > 0 {
+        if placeholder_count != num_soft_tokens.len() {
+            return Err(anyhow::anyhow!(
+                "Gemma4 prompt has {} image placeholder(s) but {} image(s) were provided",
+                placeholder_count,
+                num_soft_tokens.len()
+            ));
+        }
+
+        let mut expanded = Vec::new();
+        let mut soft_tokens = num_soft_tokens.iter();
+        for &token in prompt_tokens.iter() {
+            if token == image_token_id || token == boi_token_id {
+                let count = *soft_tokens
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("Gemma4 soft-token expansion ran out of images"))?;
+                expanded.push(boi_token_id);
+                expanded.extend(std::iter::repeat_n(image_token_id, count));
+                expanded.push(eoi_token_id);
+            } else {
+                expanded.push(token);
+            }
+        }
+        *prompt_tokens = expanded;
+        return Ok(());
+    }
+
+    let mut image_tokens = Vec::new();
+    for &count in num_soft_tokens {
+        image_tokens.push(boi_token_id);
+        image_tokens.extend(std::iter::repeat_n(image_token_id, count));
+        image_tokens.push(eoi_token_id);
+    }
+
+    let bos = prompt_tokens[0];
+    let rest = prompt_tokens[1..].to_vec();
+    *prompt_tokens = vec![bos];
+    prompt_tokens.extend(image_tokens);
+    prompt_tokens.extend(rest);
+    Ok(())
 }
 
 #[cfg(test)]

@@ -34,6 +34,7 @@ pub mod merge;
 pub mod processors;
 
 // VLM model implementations
+pub mod gemma4_vl;
 pub mod gemma3n_vl;
 pub mod minicpmo_vl;
 pub mod molmo2_vl;
@@ -49,6 +50,7 @@ pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
 
 // Re-export VLM model types
+pub use gemma4_vl::Gemma4VLModel;
 pub use gemma3n_vl::Gemma3nVLModel;
 pub use minicpmo_vl::MiniCPMOVLModel;
 pub use molmo_point_vl::MolmoPointVLModel;

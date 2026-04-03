@@ -16,6 +16,7 @@
 //!
 //! Provides the ImageProcessor trait and processor implementations.
 
+pub mod gemma4;
 pub mod minicpmo;
 pub mod molmo2;
 pub mod molmo_point;

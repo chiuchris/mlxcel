@@ -42,6 +42,7 @@ pub mod gemma;
 pub mod gemma2;
 pub mod gemma3;
 pub mod gemma3n;
+pub mod gemma4;
 pub mod glm4;
 pub mod glm4_moe;
 pub mod glm4_moe_lite;
@@ -115,6 +116,7 @@ pub use gemma::GemmaModel;
 pub use gemma2::Gemma2Model;
 pub use gemma3::{Gemma3Model, Gemma3Wrapper};
 pub use gemma3n::Gemma3nModel;
+pub use gemma4::{Gemma4Model, Gemma4Wrapper};
 pub use glm_moe_dsa::GlmMoeDsaModel;
 pub use glm4::Glm4Model;
 pub use glm4_moe::Glm4MoeModel;
@@ -163,6 +165,7 @@ pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
+pub(crate) use sanitize::load_gemma4_vlm_weights;
 pub use sanitize::{
     convert_bf16_weights, load_and_sanitize_weights, sanitize_config_json,
     sanitize_tied_embeddings, warn_bf16_precision,
@@ -191,7 +194,9 @@ pub enum ModelType {
     Gemma,         // Gemma 1
     Gemma2,        // Gemma 2
     Gemma3,        // Gemma 3 (text-only)
+    Gemma4,        // Gemma 4 text-only route
     Gemma3VLM,     // Gemma 3 VLM (vision-language)
+    Gemma4VLM,     // Gemma 4 VLM (vision-language)
     LlavaVLM,      // LLaVA (CLIP/SigLIP + Llama/Qwen2)
     LlavaBunnyVLM, // LLaVA-Bunny (SigLIP + Qwen2)
     AyaVisionVLM,  // Aya Vision (SigLIP + Cohere2)

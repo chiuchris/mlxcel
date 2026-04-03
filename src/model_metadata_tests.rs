@@ -95,12 +95,14 @@ fn model_metadata_mistral4_standalone_is_config_backed() {
 #[test]
 fn is_vlm_model_type_matches_control_plane_capabilities() {
     assert!(is_vlm_model_type(ModelType::Gemma3VLM));
+    assert!(is_vlm_model_type(ModelType::Gemma4VLM));
     assert!(is_vlm_model_type(ModelType::Phi4MMVLM));
     assert!(is_vlm_model_type(ModelType::Phi4SigLipVLM));
     assert!(is_vlm_model_type(ModelType::MiniCPMOVLM));
     assert!(is_vlm_model_type(ModelType::Moondream3VLM));
     assert!(is_vlm_model_type(ModelType::Phi3VLM));
     assert!(!is_vlm_model_type(ModelType::Gemma3));
+    assert!(!is_vlm_model_type(ModelType::Gemma4));
     assert!(!is_vlm_model_type(ModelType::Mamba2));
 }
 
@@ -133,12 +135,18 @@ fn static_model_descriptor_centralizes_directory_and_weight_families() {
 #[test]
 fn descriptor_backed_support_helpers_stay_in_sync() {
     assert!(is_config_backed_model_type(ModelType::Gemma3));
+    assert!(is_config_backed_model_type(ModelType::Gemma4));
     assert!(has_config_backed_registration(ModelType::Gemma3));
+    assert!(has_config_backed_registration(ModelType::Gemma4));
     assert!(is_nonstandard_model_type(ModelType::Gemma3n));
     assert!(is_special_weight_model_type(ModelType::Qwen35));
     assert!(!has_config_backed_registration(ModelType::Gemma3n));
     assert!(!has_config_backed_registration(ModelType::Qwen3VL));
 
+    assert_eq!(
+        adapter_loading_unsupported_message(ModelType::Gemma4VLM),
+        Some("Gemma4 VLM cannot be loaded with LoRA adapters yet")
+    );
     assert_eq!(
         adapter_loading_unsupported_message(ModelType::Phi3VLM),
         Some("Phi3V VLM does not support adapter loading; use load_model() instead")
