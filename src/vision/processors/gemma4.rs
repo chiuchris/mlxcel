@@ -99,23 +99,24 @@ impl Gemma4Processor {
         let factor = (target_px / ((image_height * image_width).max(1) as f64)).sqrt();
         let side_mult = self.pooling_kernel_size * self.patch_size;
 
-        let mut target_h = ((factor * image_height as f64 / side_mult as f64).floor() as usize)
-            * side_mult;
-        let mut target_w = ((factor * image_width as f64 / side_mult as f64).floor() as usize)
-            * side_mult;
+        let mut target_h =
+            ((factor * image_height as f64 / side_mult as f64).floor() as usize) * side_mult;
+        let mut target_w =
+            ((factor * image_width as f64 / side_mult as f64).floor() as usize) * side_mult;
 
-        let max_side_length =
-            (max_patches / self.pooling_kernel_size.pow(2)).max(1) * side_mult;
+        let max_side_length = (max_patches / self.pooling_kernel_size.pow(2)).max(1) * side_mult;
 
         if target_h == 0 && target_w == 0 {
             target_h = side_mult;
             target_w = side_mult;
         } else if target_h == 0 {
             target_h = side_mult;
-            target_w = ((image_width / image_height.max(1)).max(1) * side_mult).min(max_side_length);
+            target_w =
+                ((image_width / image_height.max(1)).max(1) * side_mult).min(max_side_length);
         } else if target_w == 0 {
             target_w = side_mult;
-            target_h = ((image_height / image_width.max(1)).max(1) * side_mult).min(max_side_length);
+            target_h =
+                ((image_height / image_width.max(1)).max(1) * side_mult).min(max_side_length);
         }
 
         (target_h, target_w)

@@ -246,9 +246,7 @@ pub struct RMSNormNoScale {
 impl RMSNormNoScale {
     pub fn new(dim: i32, eps: f32) -> Self {
         let _ = dim;
-        Self {
-            eps,
-        }
+        Self { eps }
     }
 
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
@@ -1421,9 +1419,9 @@ impl Gemma4Model {
         mask: Option<&MlxArray>,
         per_layer_inputs: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let hidden = self
-            .text_model
-            .forward(input_ids, input_embeddings, caches, mask, per_layer_inputs);
+        let hidden =
+            self.text_model
+                .forward(input_ids, input_embeddings, caches, mask, per_layer_inputs);
         let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);

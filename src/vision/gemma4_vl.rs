@@ -118,14 +118,22 @@ impl Gemma4VLModel {
         }
 
         let image_features = if image_features.len() == 1 {
-            mlxcel_core::astype(image_features[0].as_ref().unwrap(), mlxcel_core::array_dtype(&inputs_embeds))
+            mlxcel_core::astype(
+                image_features[0].as_ref().unwrap(),
+                mlxcel_core::array_dtype(&inputs_embeds),
+            )
         } else {
             let merged = crate::vision::encoders::qwen2_vl::concat_many(&image_features, 1);
             mlxcel_core::astype(&merged, mlxcel_core::array_dtype(&inputs_embeds))
         };
 
         *self.cached_per_layer_inputs.borrow_mut() = per_layer_inputs;
-        merge::merge_llava(self.image_token_id, &image_features, &inputs_embeds, input_ids)
+        merge::merge_llava(
+            self.image_token_id,
+            &image_features,
+            &inputs_embeds,
+            input_ids,
+        )
     }
 }
 

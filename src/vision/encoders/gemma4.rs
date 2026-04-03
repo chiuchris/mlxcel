@@ -118,7 +118,10 @@ fn take_2d_embedding(
     mlxcel_core::reshape(&gathered, &[batch, seq_len, hidden_size])
 }
 
-fn build_patch_position_ids(patch_h: usize, patch_w: usize) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+fn build_patch_position_ids(
+    patch_h: usize,
+    patch_w: usize,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     let num_patches = patch_h * patch_w;
     let mut x_ids = Vec::with_capacity(num_patches);
     let mut y_ids = Vec::with_capacity(num_patches);
@@ -253,7 +256,12 @@ impl ClippableLinear {
         bits: i32,
     ) -> Result<Self, String> {
         Ok(Self {
-            linear: UnifiedLinear::from_weights(weights, &format!("{}.linear", prefix), group_size, bits)?,
+            linear: UnifiedLinear::from_weights(
+                weights,
+                &format!("{}.linear", prefix),
+                group_size,
+                bits,
+            )?,
             input_min: if use_clipping {
                 copy_weight_opt(weights, &format!("{}.input_min", prefix))
             } else {
@@ -279,10 +287,16 @@ impl ClippableLinear {
 
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let clipped_input = match (&self.input_min, &self.input_max) {
-            (Some(min), Some(max)) => Some(mlxcel_core::clip(x, min.as_ref().unwrap(), max.as_ref().unwrap())),
+            (Some(min), Some(max)) => Some(mlxcel_core::clip(
+                x,
+                min.as_ref().unwrap(),
+                max.as_ref().unwrap(),
+            )),
             _ => None,
         };
-        let linear_input = clipped_input.as_ref().map_or(x, |arr| arr.as_ref().unwrap());
+        let linear_input = clipped_input
+            .as_ref()
+            .map_or(x, |arr| arr.as_ref().unwrap());
         let output = self.linear.forward(linear_input);
         match (&self.output_min, &self.output_max) {
             (Some(min), Some(max)) => {
@@ -336,7 +350,8 @@ impl VisionMLP {
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
         let activated = mlxcel_core::gelu_approx(&gate);
-        self.down_proj.forward(&mlxcel_core::multiply(&activated, &up))
+        self.down_proj
+            .forward(&mlxcel_core::multiply(&activated, &up))
     }
 }
 
@@ -390,8 +405,14 @@ impl VisionAttention {
                 group_size,
                 bits,
             )?,
-            q_norm: RMSNorm::new(copy_weight(weights, &format!("{}.q_norm.weight", prefix))?, config.rms_norm_eps()),
-            k_norm: RMSNorm::new(copy_weight(weights, &format!("{}.k_norm.weight", prefix))?, config.rms_norm_eps()),
+            q_norm: RMSNorm::new(
+                copy_weight(weights, &format!("{}.q_norm.weight", prefix))?,
+                config.rms_norm_eps(),
+            ),
+            k_norm: RMSNorm::new(
+                copy_weight(weights, &format!("{}.k_norm.weight", prefix))?,
+                config.rms_norm_eps(),
+            ),
             v_norm: crate::models::gemma4::RMSNormNoScale::new(
                 config.head_dim as i32,
                 config.rms_norm_eps(),
@@ -472,15 +493,24 @@ impl VisionTransformerBlock {
                 config.rms_norm_eps(),
             ),
             post_attention_layernorm: RMSNorm::new(
-                copy_weight(weights, &format!("{}.post_attention_layernorm.weight", prefix))?,
+                copy_weight(
+                    weights,
+                    &format!("{}.post_attention_layernorm.weight", prefix),
+                )?,
                 config.rms_norm_eps(),
             ),
             pre_feedforward_layernorm: RMSNorm::new(
-                copy_weight(weights, &format!("{}.pre_feedforward_layernorm.weight", prefix))?,
+                copy_weight(
+                    weights,
+                    &format!("{}.pre_feedforward_layernorm.weight", prefix),
+                )?,
                 config.rms_norm_eps(),
             ),
             post_feedforward_layernorm: RMSNorm::new(
-                copy_weight(weights, &format!("{}.post_feedforward_layernorm.weight", prefix))?,
+                copy_weight(
+                    weights,
+                    &format!("{}.post_feedforward_layernorm.weight", prefix),
+                )?,
                 config.rms_norm_eps(),
             ),
         })
@@ -594,7 +624,12 @@ impl VisionPatchEmbedder {
         mlxcel_core::multiply_scalar(&mlxcel_core::subtract(&patches, &half), 2.0)
     }
 
-    fn forward(&self, pixel_values: &MlxArray, patch_x: &MlxArray, patch_y: &MlxArray) -> UniquePtr<MlxArray> {
+    fn forward(
+        &self,
+        pixel_values: &MlxArray,
+        patch_x: &MlxArray,
+        patch_y: &MlxArray,
+    ) -> UniquePtr<MlxArray> {
         let hidden_states = self.patchify(pixel_values);
         let shape = mlxcel_core::array_shape(&hidden_states);
         let batch = shape[0];
@@ -654,7 +689,11 @@ impl Gemma4VisionModel {
         })
     }
 
-    pub fn forward(&self, pixel_values: &MlxArray, patch_grid: (usize, usize)) -> UniquePtr<MlxArray> {
+    pub fn forward(
+        &self,
+        pixel_values: &MlxArray,
+        patch_grid: (usize, usize),
+    ) -> UniquePtr<MlxArray> {
         let (patch_h, patch_w) = patch_grid;
         let (patch_x, patch_y) = build_patch_position_ids(patch_h, patch_w);
         let rope = Gemma4VisionRope::new(

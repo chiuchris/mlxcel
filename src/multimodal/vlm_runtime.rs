@@ -216,8 +216,10 @@ where
         }
         VlmRuntimeRef::Gemma4(gemma4_vl) => {
             let processed_images = gemma4_vl.processor.preprocess(images);
-            let num_soft_tokens: Vec<usize> =
-                processed_images.iter().map(|image| image.num_soft_tokens).collect();
+            let num_soft_tokens: Vec<usize> = processed_images
+                .iter()
+                .map(|image| image.num_soft_tokens)
+                .collect();
             expand_gemma4_image_tokens(
                 prompt_tokens,
                 gemma4_vl.image_token_id,
@@ -443,9 +445,9 @@ fn expand_gemma4_image_tokens(
         let mut soft_tokens = num_soft_tokens.iter();
         for &token in prompt_tokens.iter() {
             if token == image_token_id || token == boi_token_id {
-                let count = *soft_tokens
-                    .next()
-                    .ok_or_else(|| anyhow::anyhow!("Gemma4 soft-token expansion ran out of images"))?;
+                let count = *soft_tokens.next().ok_or_else(|| {
+                    anyhow::anyhow!("Gemma4 soft-token expansion ran out of images")
+                })?;
                 expanded.push(boi_token_id);
                 expanded.extend(std::iter::repeat_n(image_token_id, count));
                 expanded.push(eoi_token_id);

@@ -1056,16 +1056,17 @@ impl CachePool {
     /// Calls `model.make_caches()` to build per-layer caches, assigns a
     /// unique `SequenceId`, and stores the set in the pool.
     ///
-    /// Returns `Err` if the model does not support batching (i.e.
-    /// `supports_batching()` returns `false`) or the pool already has
-    /// `max_sequences` active entries.
+    /// Non-batching models (internal RefCell/SSM caches) are allowed when the
+    /// pool has no other active entries, since sequential single-sequence
+    /// operation is safe.  Multiple concurrent sequences are rejected because
+    /// they would silently corrupt shared internal state.
     pub fn allocate(
         &mut self,
         model: &dyn crate::generate::LanguageModel,
     ) -> Result<SequenceId, String> {
-        if !model.supports_batching() {
+        if !model.supports_batching() && !self.active.is_empty() {
             return Err(
-                "CachePool: model does not support batching (internal recurrent/SSM state)".into(),
+                "CachePool: model does not support batching and another sequence is active".into(),
             );
         }
         if self.active.len() >= self.max_sequences {
@@ -1390,9 +1391,22 @@ mod tests {
         let model = NonBatchModel;
         let mut pool = CachePool::new(8);
 
-        let result = pool.allocate(&model);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("does not support batching"));
+        // First allocation succeeds (pool is empty, single-sequence is safe)
+        let first = pool.allocate(&model);
+        assert!(first.is_ok());
+        assert_eq!(pool.active_count(), 1);
+
+        // Second allocation fails (another sequence is already active)
+        let second = pool.allocate(&model);
+        assert!(second.is_err());
+        assert!(second.unwrap_err().contains("does not support batching"));
+        assert_eq!(pool.active_count(), 1);
+
+        // After releasing the first, allocation succeeds again
+        pool.release(first.unwrap());
         assert_eq!(pool.active_count(), 0);
+        let third = pool.allocate(&model);
+        assert!(third.is_ok());
+        assert_eq!(pool.active_count(), 1);
     }
 }

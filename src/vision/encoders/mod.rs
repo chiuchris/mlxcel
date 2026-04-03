@@ -16,8 +16,8 @@
 //!
 //! Provides the VisionEncoder trait and encoder implementations.
 
-pub mod gemma4;
 pub mod gemma3n;
+pub mod gemma4;
 pub mod llama4;
 pub mod minicpmo;
 pub mod molmo2;

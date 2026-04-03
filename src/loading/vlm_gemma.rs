@@ -280,7 +280,10 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
         parse_required_vlm_subconfig(&full_config, "vision_config", "Gemma4 vision config")?;
 
     let text_quant = args.text_args().quantization;
-    let group_size = text_quant.as_ref().map(|q| q.group_size as i32).unwrap_or(64);
+    let group_size = text_quant
+        .as_ref()
+        .map(|q| q.group_size as i32)
+        .unwrap_or(64);
     let bits = text_quant.as_ref().map(|q| q.bits as i32).unwrap_or(4);
 
     let vision_tower = vision::encoders::gemma4::Gemma4VisionModel::from_weights(
@@ -320,8 +323,11 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
         .and_then(|value| value.as_u64())
         .unwrap_or(vision_config.pooling_kernel_size as u64) as usize;
 
-    let processor =
-        vision::processors::gemma4::Gemma4Processor::new(patch_size, max_soft_tokens, pooling_kernel_size);
+    let processor = vision::processors::gemma4::Gemma4Processor::new(
+        patch_size,
+        max_soft_tokens,
+        pooling_kernel_size,
+    );
 
     let vlm = vision::Gemma4VLModel::new(
         models::Gemma4Wrapper::new(text_model),
