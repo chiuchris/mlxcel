@@ -63,6 +63,7 @@ std::unique_ptr<MlxArray> from_slice_i64(rust::Slice<const int64_t> data, rust::
 
 // Create array from raw bytes with specified dtype
 std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, int32_t dtype);
+std::unique_ptr<MlxArray> from_bytes_nocopy(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, int32_t dtype);
 
 // Create half-precision array from raw bytes
 std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool bfloat16);
@@ -674,6 +675,12 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
 std::unique_ptr<MlxArray> fast_rms_norm(
     const MlxArray& x,
     const MlxArray& weight,
+    float eps
+);
+
+// Fast RMS norm without a learnable scale
+std::unique_ptr<MlxArray> fast_rms_norm_no_weight(
+    const MlxArray& x,
     float eps
 );
 

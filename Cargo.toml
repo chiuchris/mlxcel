@@ -39,6 +39,7 @@ hf-hub = "0.5.0"
 
 # Zero-copy buffers
 bytes = "1.9"
+memmap2 = "0.9"
 
 # LZ4 compression (pure Rust, used for tensor transfer)
 lz4_flex = "0.11"

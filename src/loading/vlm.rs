@@ -50,7 +50,7 @@ mod siglip;
 #[path = "vlm_special.rs"]
 mod special;
 
-pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm};
+pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm, load_gemma4_vlm};
 pub(crate) use llava::{load_llava_bunny_vlm, load_llava_vlm};
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};
 pub(crate) use qwen::{

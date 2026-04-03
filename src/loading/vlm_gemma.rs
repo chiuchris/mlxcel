@@ -31,7 +31,8 @@ use crate::models;
 use crate::vision;
 
 use super::{
-    load_vlm_weights, parse_vlm_config, read_sanitized_vlm_config, strip_language_model_prefix,
+    load_vlm_weights, parse_required_vlm_subconfig, parse_vlm_config, read_optional_model_json,
+    read_sanitized_vlm_config, strip_language_model_prefix,
 };
 
 struct Gemma3nMetadata {
@@ -263,6 +264,85 @@ pub(crate) fn load_gemma3n_vlm(model_path: &Path) -> Result<LoadedModel> {
     );
 
     Ok(LoadedModel::Gemma3nVLM(vlm))
+}
+
+/// Load a Gemma4 VLM model.
+pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
+    let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
+    let args: models::gemma4::ModelArgs = parse_vlm_config(&config_str, "Gemma4 config")?;
+    let mut weights = models::load_gemma4_vlm_weights(model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 VLM weights: {}", e))?;
+    models::sanitize_tied_embeddings(&mut weights, &full_config);
+    let text_model = models::Gemma4Model::from_weights(&weights, &args)
+        .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 text model: {}", e))?;
+
+    let vision_config: vision::encoders::gemma4::Gemma4VisionConfig =
+        parse_required_vlm_subconfig(&full_config, "vision_config", "Gemma4 vision config")?;
+
+    let text_quant = args.text_args().quantization;
+    let group_size = text_quant.as_ref().map(|q| q.group_size as i32).unwrap_or(64);
+    let bits = text_quant.as_ref().map(|q| q.bits as i32).unwrap_or(4);
+
+    let vision_tower = vision::encoders::gemma4::Gemma4VisionModel::from_weights(
+        &weights,
+        "vision_tower",
+        &vision_config,
+        group_size,
+        bits,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 vision tower: {}", e))?;
+
+    let embed_vision = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
+        &weights,
+        "embed_vision",
+        args.text_args().hidden_size,
+        vision_config.rms_norm_eps(),
+        group_size,
+        bits,
+    )
+    .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 multimodal embedder: {}", e))?;
+
+    let image_processor_config = read_optional_model_json(model_path, "processor_config.json")
+        .and_then(|config| config.get("image_processor").cloned());
+    let max_soft_tokens = image_processor_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("max_soft_tokens"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(vision_config.default_output_length as u64) as usize;
+    let patch_size = image_processor_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("patch_size"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(vision_config.patch_size as u64) as usize;
+    let pooling_kernel_size = image_processor_config
+        .as_ref()
+        .and_then(|cfg| cfg.get("pooling_kernel_size"))
+        .and_then(|value| value.as_u64())
+        .unwrap_or(vision_config.pooling_kernel_size as u64) as usize;
+
+    let processor =
+        vision::processors::gemma4::Gemma4Processor::new(patch_size, max_soft_tokens, pooling_kernel_size);
+
+    let vlm = vision::Gemma4VLModel::new(
+        models::Gemma4Wrapper::new(text_model),
+        vision_tower,
+        embed_vision,
+        processor,
+        full_config
+            .get("image_token_id")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(258_880) as i32,
+        full_config
+            .get("boi_token_id")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(255_999) as i32,
+        full_config
+            .get("eoi_token_id")
+            .and_then(|value| value.as_i64())
+            .unwrap_or(258_882) as i32,
+    );
+
+    Ok(LoadedModel::Gemma4VLM(vlm))
 }
 
 #[cfg(test)]

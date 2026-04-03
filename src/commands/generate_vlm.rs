@@ -52,6 +52,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 mode, total_tokens, prefix_tokens
             );
         }
+        VlmPreparationSummary::Gemma4 {
+            image_slots,
+            total_tokens,
+        } => {
+            println!(
+                "Gemma4: expanded {} image slot(s) into dynamic soft tokens ({} total tokens)",
+                image_slots, total_tokens
+            );
+        }
         VlmPreparationSummary::Phi4MM {
             image_slots,
             total_tokens,

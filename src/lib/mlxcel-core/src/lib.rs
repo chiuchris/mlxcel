@@ -86,6 +86,12 @@ mod ffi {
         /// Create array from raw bytes with specified dtype
         fn from_bytes(data: &[u8], shape: &[i32], dtype: i32) -> UniquePtr<MlxArray>;
 
+        /// Create array from raw bytes without copying.
+        ///
+        /// The caller must keep the backing buffer alive for the full lifetime
+        /// of the returned array.
+        fn from_bytes_nocopy(data: &[u8], shape: &[i32], dtype: i32) -> UniquePtr<MlxArray>;
+
         /// Create half-precision array from raw bytes
         fn from_bytes_f16(data: &[u8], shape: &[i32], bfloat16: bool) -> UniquePtr<MlxArray>;
 
@@ -928,6 +934,9 @@ mod ffi {
         /// Fast RMS norm using MLX fast kernel
         fn fast_rms_norm(x: &MlxArray, weight: &MlxArray, eps: f32) -> UniquePtr<MlxArray>;
 
+        /// Fast RMS norm without a learnable scale
+        fn fast_rms_norm_no_weight(x: &MlxArray, eps: f32) -> UniquePtr<MlxArray>;
+
         /// Fast layer norm using MLX fast kernel
         unsafe fn fast_layer_norm(
             x: &MlxArray,
@@ -1114,7 +1123,7 @@ mod ffi {
             g: &MlxArray,
             beta: &MlxArray,
             state: &MlxArray,
-            mask: *const MlxArray,      // nullable
+            mask: *const MlxArray, // nullable
             output: &mut UniquePtr<MlxArray>,
             new_state: &mut UniquePtr<MlxArray>,
         );
@@ -1129,10 +1138,10 @@ mod ffi {
             // in_proj (quantized)
             in_proj_weight: &MlxArray,
             in_proj_scales: &MlxArray,
-            in_proj_biases: *const MlxArray,     // nullable
+            in_proj_biases: *const MlxArray, // nullable
             // conv1d
             conv_weight: &MlxArray,
-            conv_bias: *const MlxArray,           // nullable
+            conv_bias: *const MlxArray, // nullable
             // SSM parameters
             a_log: &MlxArray,
             d: &MlxArray,
@@ -1142,7 +1151,7 @@ mod ffi {
             // out_proj (quantized)
             out_proj_weight: &MlxArray,
             out_proj_scales: &MlxArray,
-            out_proj_biases: *const MlxArray,    // nullable
+            out_proj_biases: *const MlxArray, // nullable
             // cache state inputs
             conv_state_in: &MlxArray,
             ssm_state_in: &MlxArray,
@@ -1169,21 +1178,39 @@ mod ffi {
         // NemotronH full-forward decode (opaque handle pattern).
         #[allow(clippy::too_many_arguments)]
         unsafe fn nemotron_register_model(
-            embed_w: &MlxArray, embed_s: &MlxArray, embed_b: &MlxArray,
+            embed_w: &MlxArray,
+            embed_s: &MlxArray,
+            embed_b: &MlxArray,
             final_norm_w: &MlxArray,
-            lm_head_w: &MlxArray, lm_head_s: &MlxArray, lm_head_b: *const MlxArray,
+            lm_head_w: &MlxArray,
+            lm_head_s: &MlxArray,
+            lm_head_b: *const MlxArray,
             norm_weights: &[*const MlxArray],
             block_types: &[i32],
             mamba_weights: &[*const MlxArray],
             moe_weights: &[*const MlxArray],
             attn_weights: &[*const MlxArray],
-            norm_eps: f32, group_size: i32, bits: i32,
-            m_inter: i32, m_cdim: i32, m_ck: i32,
-            m_heads: i32, m_hdim: i32, m_groups: i32, m_state: i32,
-            m_ts_min: f32, m_ts_max: f32, m_neps: f32,
-            moe_tk: i32, moe_sc: f32, moe_norm: bool,
-            a_heads: i32, a_kvh: i32, a_hdim: i32,
-            a_rope: f32, a_scale: f32,
+            norm_eps: f32,
+            group_size: i32,
+            bits: i32,
+            m_inter: i32,
+            m_cdim: i32,
+            m_ck: i32,
+            m_heads: i32,
+            m_hdim: i32,
+            m_groups: i32,
+            m_state: i32,
+            m_ts_min: f32,
+            m_ts_max: f32,
+            m_neps: f32,
+            moe_tk: i32,
+            moe_sc: f32,
+            moe_norm: bool,
+            a_heads: i32,
+            a_kvh: i32,
+            a_hdim: i32,
+            a_rope: f32,
+            a_scale: f32,
         ) -> u64;
 
         fn nemotron_free_model(handle: u64);
@@ -1715,10 +1742,7 @@ mod ffi {
         fn loaded_weights_name(w: &MlxLoadedWeights, index: usize) -> String;
 
         /// Take (move out) the i-th weight array, leaving the slot empty
-        fn loaded_weights_take(
-            w: Pin<&mut MlxLoadedWeights>,
-            index: usize,
-        ) -> UniquePtr<MlxArray>;
+        fn loaded_weights_take(w: Pin<&mut MlxLoadedWeights>, index: usize) -> UniquePtr<MlxArray>;
     }
 }
 

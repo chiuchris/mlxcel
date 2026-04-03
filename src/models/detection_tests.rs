@@ -15,6 +15,9 @@
 use super::ModelType;
 use super::detection::{detect_hunyuan_model_type, detect_text_or_vlm, has_vision_config};
 use serde_json::json;
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[test]
 fn has_vision_config_detects_vlm_configs() {
@@ -49,4 +52,61 @@ fn detect_hunyuan_model_type_uses_num_experts() {
         detect_hunyuan_model_type(&json!({})),
         ModelType::HunyuanV1Dense
     );
+}
+
+fn temp_path(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    std::env::temp_dir().join(format!("mlxcel_detection_test_{name}_{nanos}"))
+}
+
+#[test]
+fn gemma4_detection_stays_on_text_route_without_vision_weights() {
+    let model_dir = temp_path("gemma4_text_route");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "vision_config": {},
+            "text_config": { "model_type": "gemma4_text" }
+        }"#,
+    )
+    .unwrap();
+
+    let detected = super::detection::get_model_type(&model_dir).unwrap();
+    assert_eq!(detected, ModelType::Gemma4);
+
+    fs::remove_dir_all(model_dir).unwrap();
+}
+
+#[test]
+fn gemma4_detection_uses_vlm_route_when_vision_weights_exist() {
+    let model_dir = temp_path("gemma4_vlm_route");
+    fs::create_dir_all(&model_dir).unwrap();
+    fs::write(
+        model_dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "vision_config": {},
+            "text_config": { "model_type": "gemma4_text" }
+        }"#,
+    )
+    .unwrap();
+    fs::write(
+        model_dir.join("model.safetensors.index.json"),
+        r#"{
+            "weight_map": {
+                "vision_tower.encoder.layers.0.input_layernorm.weight": "model-00001-of-00001.safetensors"
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let detected = super::detection::get_model_type(&model_dir).unwrap();
+    assert_eq!(detected, ModelType::Gemma4VLM);
+
+    fs::remove_dir_all(model_dir).unwrap();
 }
