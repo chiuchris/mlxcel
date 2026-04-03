@@ -168,8 +168,13 @@ impl BatchScheduler {
     ) -> Self {
         let generation_stream = new_generation_stream();
         let max_batch_size = max_batch_size.max(1);
+        // Non-batching models use lightweight placeholder entries in the pool
+        // (no real KV caches), so we size the pool to cover both the active
+        // batch and the prefill queue so requests can be queued while another
+        // sequence is generating.
+        let pool_capacity = max_batch_size + max_queue_depth;
         Self {
-            cache_pool: CachePool::new(max_batch_size),
+            cache_pool: CachePool::new(pool_capacity),
             prefill_queue: PrefillQueue::with_capacity(max_queue_depth),
             active_batch: ActiveBatch::new(max_batch_size),
             model,
@@ -684,6 +689,14 @@ impl BatchScheduler {
         self.batch_observability
             .record_prefill_start(seq.prompt_tokens.len());
 
+        // Non-batching models use internal RefCell caches that are shared
+        // across all sequences.  Reset them now (at prefill time) rather
+        // than at enqueue time so that queued requests don't corrupt an
+        // in-flight generation.
+        if !self.model.supports_batching() {
+            let _ = self.model.make_caches();
+        }
+
         let eos_tokens =
             merged_eos_token_ids(self.model.eos_token_ids(), &seq.sampling.stop_token_ids);
         let needs_history = seq.sampling.needs_token_history();
@@ -788,6 +801,11 @@ impl BatchScheduler {
         .entered();
         self.batch_observability
             .record_prefill_start(seq.prompt_tokens.len());
+
+        // Reset internal caches for non-batching models (same as execute_full_prefill).
+        if !self.model.supports_batching() {
+            let _ = self.model.make_caches();
+        }
 
         let chunk_size = self.prefill_chunk_size;
         let end = chunk_size.min(seq.prompt_tokens.len());

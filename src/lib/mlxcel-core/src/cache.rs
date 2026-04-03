@@ -1053,40 +1053,53 @@ impl CachePool {
 
     /// Allocate a fresh cache set for a new sequence.
     ///
-    /// Calls `model.make_caches()` to build per-layer caches, assigns a
-    /// unique `SequenceId`, and stores the set in the pool.
+    /// For batching models, calls `model.make_caches()` to build per-layer
+    /// caches and enforces the `max_sequences` capacity limit.
     ///
-    /// Non-batching models (internal RefCell/SSM caches) are allowed when the
-    /// pool has no other active entries, since sequential single-sequence
-    /// operation is safe.  Multiple concurrent sequences are rejected because
-    /// they would silently corrupt shared internal state.
+    /// For non-batching models (internal RefCell/SSM caches), allocates a
+    /// lightweight placeholder entry with dummy caches — without calling
+    /// `make_caches()` — so that requests can be queued while another
+    /// sequence is still generating.  The scheduler resets the model's
+    /// internal caches at prefill time, not at enqueue time.
     pub fn allocate(
         &mut self,
         model: &dyn crate::generate::LanguageModel,
     ) -> Result<SequenceId, String> {
-        if !model.supports_batching() && !self.active.is_empty() {
-            return Err(
-                "CachePool: model does not support batching and another sequence is active".into(),
-            );
+        if model.supports_batching() {
+            if self.active.len() >= self.max_sequences {
+                return Err(format!(
+                    "CachePool: max capacity ({}) reached, cannot allocate new sequence",
+                    self.max_sequences
+                ));
+            }
+            let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let caches = model.make_caches();
+            let entry = SequenceCacheSet {
+                caches,
+                seq_id: id,
+                prompt_len: 0,
+                current_offset: 0,
+                created_at: Instant::now(),
+            };
+            self.active.insert(id, entry);
+            Ok(id)
+        } else {
+            // Non-batching models: allocate a placeholder with dummy caches.
+            // Do NOT call make_caches() here — that would reset the model's
+            // internal caches and corrupt any in-flight generation.
+            let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+            let num_layers = model.num_layers();
+            let caches = (0..num_layers).map(|_| KVCache::new()).collect();
+            let entry = SequenceCacheSet {
+                caches,
+                seq_id: id,
+                prompt_len: 0,
+                current_offset: 0,
+                created_at: Instant::now(),
+            };
+            self.active.insert(id, entry);
+            Ok(id)
         }
-        if self.active.len() >= self.max_sequences {
-            return Err(format!(
-                "CachePool: max capacity ({}) reached, cannot allocate new sequence",
-                self.max_sequences
-            ));
-        }
-
-        let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let caches = model.make_caches();
-        let entry = SequenceCacheSet {
-            caches,
-            seq_id: id,
-            prompt_len: 0,
-            current_offset: 0,
-            created_at: Instant::now(),
-        };
-        self.active.insert(id, entry);
-        Ok(id)
     }
 
     /// Return a mutable reference to the full `SequenceCacheSet` for the
@@ -1391,22 +1404,20 @@ mod tests {
         let model = NonBatchModel;
         let mut pool = CachePool::new(8);
 
-        // First allocation succeeds (pool is empty, single-sequence is safe)
+        // Non-batching models use lightweight placeholders — multiple
+        // allocations are allowed so requests can be queued while another
+        // sequence is generating.
         let first = pool.allocate(&model);
         assert!(first.is_ok());
         assert_eq!(pool.active_count(), 1);
 
-        // Second allocation fails (another sequence is already active)
         let second = pool.allocate(&model);
-        assert!(second.is_err());
-        assert!(second.unwrap_err().contains("does not support batching"));
-        assert_eq!(pool.active_count(), 1);
+        assert!(second.is_ok());
+        assert_eq!(pool.active_count(), 2);
 
-        // After releasing the first, allocation succeeds again
+        // Release both
         pool.release(first.unwrap());
+        pool.release(second.unwrap());
         assert_eq!(pool.active_count(), 0);
-        let third = pool.allocate(&model);
-        assert!(third.is_ok());
-        assert_eq!(pool.active_count(), 1);
     }
 }
