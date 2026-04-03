@@ -57,6 +57,9 @@ help: ## Show this help message
 	@echo "$(BOLD)Benchmark Targets:$(RESET)"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(bench)' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
+	@echo "$(BOLD)Webpage Targets:$(RESET)"
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(webpage)' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
+	@echo ""
 	@echo "$(BOLD)Utility Targets:$(RESET)"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E '(clean|fmt|install)' | grep -v '^bench' | awk 'BEGIN {FS = ":.*?## "}; {printf "  $(CYAN)%-20s$(RESET) %s\n", $$1, $$2}'
 	@echo ""
@@ -265,6 +268,7 @@ models: run-list ## Alias for run-list (show supported models)
 clean: ## Clean build artifacts
 	@echo "$(CYAN)Cleaning build artifacts...$(RESET)"
 	$(CARGO) clean
+	rm -rf webpage/site/.next webpage/site/out
 	@echo "$(GREEN)Clean complete!$(RESET)"
 
 .PHONY: clean-release
@@ -515,6 +519,30 @@ bench-report: ## Show last benchmark results summary
 bench-clean: ## Remove benchmark log
 	@rm -f $(BENCH_LOG)
 	@echo "Benchmark log removed."
+
+# ============================================================================
+# Webpage (Next.js static site)
+# ============================================================================
+
+.PHONY: webpage-dev
+webpage-dev: ## Run download webpage dev server
+	@echo "$(CYAN)Starting webpage development server...$(RESET)"
+	cd webpage/site && pnpm install && pnpm dev
+
+.PHONY: webpage-build
+webpage-build: ## Build download webpage (static export)
+	@echo "$(CYAN)Building documentation for webpage...$(RESET)"
+	rm -rf webpage/site/public/en/manual webpage/site/public/ko/manual
+	uv run zensical build -f mkdocs.yml -d webpage/site/public/en/manual
+	uv run zensical build -f mkdocs.ko.yml -d webpage/site/public/ko/manual
+	@echo "$(CYAN)Building webpage...$(RESET)"
+	cd webpage/site && pnpm install && pnpm build
+	@echo "$(GREEN)Build complete. Output in webpage/site/out/$(RESET)"
+
+.PHONY: webpage-deploy
+webpage-deploy: ## Deploy download webpage to GitHub Pages
+	@echo "$(CYAN)Deploying webpage...$(RESET)"
+	./scripts/deploy_webpage.sh
 
 # ============================================================================
 # Documentation (Zensical / MkDocs-compatible)

@@ -26,8 +26,13 @@ CLAUDE.md
 /docs/analysis/
 
 # MkDocs build output
-site/
+/site/
 
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Webpage build artifacts
+webpage/site/.next/
+webpage/site/out/
+webpage/site/node_modules/

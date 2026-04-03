@@ -1,3 +1,15 @@
+mlxcel (0.0.15-1~jammy1) jammy; urgency=medium
+
+  * Feat: Add Gemma 4 text and VLM model support
+  * Feat: Add user-facing warning when loading full-precision bf16 models
+  * Fix: Extend bf16-to-f16 weight conversion to all Apple Silicon generations
+  * Perf: Audit f32 upcasts and optimize MoE gate sigmoid for fp16 co-issue
+  * Update: Improve Metal 4 fused attention scaffolding with research docs
+  * Chore: Reuse cached MLX source for faster rebuilds
+  * Feat: Add download webpage with Next.js static site (EN/KO)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 03 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.14-1~jammy1) jammy; urgency=medium
 
   * Feat: Add logprobs support for chat completions and completions endpoints

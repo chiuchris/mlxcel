@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.15] - 2026-04-03
+
+### Added
+- Gemma 4 text and VLM model support (#199)
+- User-facing warning when loading full-precision bf16 models (#195)
+- Download webpage with Next.js static site (EN/KO i18n)
+
+### Changed
+- Extend bf16→f16 weight conversion to all Apple Silicon generations (#193)
+- Audit f32 upcasts and optimize MoE gate sigmoid for fp16 co-issue (#194)
+- Improve Metal 4 fused attention scaffolding with research documentation (#196)
+- Reuse cached MLX source for faster rebuilds (#200)
+
 ## [v0.0.14] - 2026-04-03
 
 ### Added
@@ -303,6 +316,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.15]: https://github.com/lablup/mlxcel/compare/v0.0.14...v0.0.15
 [v0.0.14]: https://github.com/lablup/mlxcel/compare/v0.0.13...v0.0.14
 [v0.0.13]: https://github.com/lablup/mlxcel/compare/v0.0.12...v0.0.13
 [v0.0.12]: https://github.com/lablup/mlxcel/compare/v0.0.11...v0.0.12
