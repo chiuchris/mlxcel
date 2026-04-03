@@ -394,22 +394,26 @@ impl Attention {
         // Attention
         let output = if let Some(m) = mask {
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q,
                     &k,
                     &v,
                     self.scale,
                     m as *const MlxArray,
+                    0.0,
+                    0,
                 )
             }
         } else {
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q,
                     &k,
                     &v,
                     self.scale,
                     std::ptr::null(),
+                    0.0,
+                    0,
                 )
             }
         };

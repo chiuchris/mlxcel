@@ -158,8 +158,8 @@ impl Attention {
         // Use fused scaled dot-product attention (handles GQA internally)
         let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
         let attn_out = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
-                &q, &cache_k, &cache_v, self.scale, mask_ptr,
+            mlxcel_core::layers::attention_from_ptr(
+                &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
             )
         };
 

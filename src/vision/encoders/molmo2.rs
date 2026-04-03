@@ -113,7 +113,7 @@ impl ViTAttention {
             .map(|m| m as *const MlxArray)
             .unwrap_or(std::ptr::null());
         let out = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, self.scale, mask_ptr)
+            mlxcel_core::layers::attention_from_ptr(&q, &k, &v, self.scale, mask_ptr, 0.0, 0)
         };
 
         // Cast back to input dtype if needed

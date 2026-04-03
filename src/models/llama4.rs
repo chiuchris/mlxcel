@@ -555,23 +555,27 @@ impl CxxAttention {
         } else if let Some(m) = mask {
             // Explicit mask provided
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q,
                     &cache_k,
                     &cache_v,
                     self.scale,
                     m as *const _,
+                    0.0,
+                    0,
                 )
             }
         } else {
             // Single token, no mask needed
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q,
                     &cache_k,
                     &cache_v,
                     self.scale,
                     std::ptr::null(),
+                    0.0,
+                    0,
                 )
             }
         };
@@ -670,8 +674,8 @@ impl CxxAttention {
         } else {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
-                    &q, cache_k, cache_v, self.scale, mask_ptr,
+                mlxcel_core::layers::attention_from_ptr(
+                    &q, cache_k, cache_v, self.scale, mask_ptr, 0.0, 0,
                 )
             }
         };
@@ -795,12 +799,14 @@ impl CxxAttention {
             mlxcel_core::fast_scaled_dot_product_attention_causal(&q, cache_k, cache_v, self.scale)
         } else {
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q,
                     cache_k,
                     cache_v,
                     self.scale,
                     std::ptr::null(),
+                    0.0,
+                    0,
                 )
             }
         };

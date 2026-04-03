@@ -91,12 +91,14 @@ impl VisionAttention {
 
         // Scaled dot product attention (no mask for vision encoder)
         let output = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
+            mlxcel_core::layers::attention_from_ptr(
                 &queries,
                 &keys,
                 &values,
                 self.scale,
                 std::ptr::null(),
+                0.0,
+                0,
             )
         };
 

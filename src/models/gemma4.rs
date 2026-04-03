@@ -680,8 +680,8 @@ impl Attention {
             .unwrap_or(std::ptr::null());
 
         unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
-                queries, keys, values, self.scale, mask_ptr,
+            mlxcel_core::layers::attention_from_ptr(
+                queries, keys, values, self.scale, mask_ptr, 0.0, 0,
             )
         }
     }

@@ -139,7 +139,15 @@ impl Moondream3VisionAttention {
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
         let attn = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, self.scale, std::ptr::null())
+            mlxcel_core::layers::attention_from_ptr(
+                &q,
+                &k,
+                &v,
+                self.scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
         };
         let attn = mlxcel_core::transpose_axes(&attn, &[0, 2, 1, 3]);
         let attn = mlxcel_core::reshape(&attn, &[batch, seq_len, self.num_heads * head_dim]);

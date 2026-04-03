@@ -974,12 +974,12 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
-        /// Metal 4 fused attention kernel dispatch (scaffolding).
+        /// Metal 4 attention dispatch via upstream MLX main SDPA.
         ///
-        /// When `use_metal4` is true, this will eventually dispatch to a custom
-        /// MTL4MachineLearningCommandEncoder-based kernel on M5 hardware. Until
-        /// the Metal 4 SDK is available, both paths fall back to
-        /// `fast_scaled_dot_product_attention()`.
+        /// When `use_metal4` is true on supported M5 hardware, upstream MLX
+        /// main may route `fast::scaled_dot_product_attention()` to its NAX
+        /// kernel internally. This bridge preserves Rust-side softcap/window
+        /// plumbing while delegating the kernel body to MLX.
         ///
         /// Prefer calling `layers::metal4_attention()` from model code — it
         /// queries `hardware::get_hardware()` and sets `use_metal4` automatically
@@ -990,6 +990,8 @@ mod ffi {
             v: &MlxArray,
             scale: f32,
             mask: *const MlxArray,
+            softcap: f32,
+            window_size: i32,
             use_metal4: bool,
         ) -> UniquePtr<MlxArray>;
 

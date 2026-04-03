@@ -380,7 +380,7 @@ impl MultiQueryAttention2d {
         let scale = 1.0 / (self.key_dim as f32).sqrt();
         // Use the unsafe SDPA with no mask (vision attention is non-causal)
         let o = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null())
+            mlxcel_core::layers::attention_from_ptr(&q, &k, &v, scale, std::ptr::null(), 0.0, 0)
         };
 
         // Reshape output: [B, num_heads, H*W, value_dim] → [B, H, W, num_heads*value_dim]

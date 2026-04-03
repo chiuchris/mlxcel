@@ -1419,6 +1419,67 @@ pub fn compiled_swiglu_mlp_fp16(
 
 // ── Metal 4 fused attention dispatch ─────────────────────────────────────────
 
+fn should_use_metal4_attention() -> bool {
+    let hw = crate::hardware::get_hardware();
+    hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+/// Unified attention dispatch with transparent Metal 4 and softcap fallback.
+///
+/// Used by: Llama3, Qwen3, Gemma2, Gemma3 and other standard SDPA call sites
+pub fn attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    if should_use_metal4_attention() {
+        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
+    }
+
+    let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+    if softcap > 0.0 {
+        let q_heads = ffi::array_shape(q)[1];
+        let kv_heads = ffi::array_shape(k)[1];
+        if q_heads > kv_heads && q_heads % kv_heads == 0 {
+            let n_rep = q_heads / kv_heads;
+            // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+            return unsafe {
+                ffi::compiled_softcap_sdpa_gqa(q, k, v, scale, softcap, n_rep, mask_ptr)
+            };
+        }
+        // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+        return unsafe { ffi::compiled_softcap_sdpa(q, k, v, scale, softcap, mask_ptr) };
+    }
+
+    // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
+    unsafe { ffi::fast_scaled_dot_product_attention(q, k, v, scale, mask_ptr) }
+}
+
+/// Pointer-friendly attention wrapper for existing model call sites.
+///
+/// Used by: Model attention call sites that still store masks as raw pointers
+pub unsafe fn attention_from_ptr(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    mask: *const MlxArray,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    let mask = if mask.is_null() {
+        None
+    } else {
+        // SAFETY: callers must pass either null or a valid `MlxArray` pointer.
+        Some(unsafe { &*mask })
+    };
+    attention(q, k, v, scale, mask, softcap, window_size)
+}
+
 /// Metal 4 fused attention dispatch with automatic hardware detection.
 ///
 /// Dispatches SDPA to the Metal 4 fused kernel when the hardware supports it,
@@ -1432,59 +1493,44 @@ pub fn compiled_swiglu_mlp_fp16(
 ///
 /// When `hw.has_neural_accelerator && hw.macos_supports_na` is true, this
 /// function sets `use_metal4 = true`.  The C++ side will eventually dispatch
-/// to a Metal 4 TensorOps kernel that keeps all intermediate Q/K/V/scores
-/// tensors on-chip in the Neural Accelerator's registers, eliminating
-/// intermediate memory round-trips.
+/// to upstream MLX main's Metal NAX SDPA kernel when the hardware and shape
+/// constraints match.
 ///
-/// The fused kernel is designed to handle:
-///   - Standard MHA and GQA (n_heads != n_kv_heads): MLX SDPA broadcasts
-///     KV heads automatically, so no caller-side repeat_kv is needed.
-///   - Softcap (Gemma 2/3): Apply `tanh(scores/cap)*cap` on-chip. Until
-///     the Metal 4 kernel is available, use `compiled_softcap_sdpa` instead.
-///   - Sliding window (Gemma 3, Ministral): Generate band mask on-chip.
-///     Until available, pass a pre-built mask via the `mask` parameter.
+/// The Metal 4 path is designed to handle:
+///   - Standard MHA and GQA (n_heads != n_kv_heads): upstream MLX broadcasts
+///     KV heads internally, so no caller-side repeat_kv is needed.
+///   - Softcap (Gemma 2/3): still handled by `compiled_softcap_sdpa*` until
+///     upstream MLX grows a fused softcap variant.
+///   - Sliding window (Gemma 3, Ministral): still handled by passing an
+///     explicit pre-built mask from Rust model code.
 ///
 /// # Current behaviour
 ///
-/// Both `use_metal4 = true` and `use_metal4 = false` fall through to
-/// `mlx::core::fast::scaled_dot_product_attention()`.  No behaviour change
-/// on any hardware.  Boolean/integer masks are passed through unchanged;
-/// float masks are cast to Q's dtype.
+/// This helper now routes M5-capable requests through upstream MLX main's
+/// NAX-backed SDPA implementation via the C++ bridge. Boolean/integer masks
+/// are passed through unchanged; float masks are cast to Q's dtype.
 ///
-/// # When to complete the implementation
-///
-/// Prerequisites:
-///   - macOS 26.2 SDK (released alongside WWDC25)
-///   - Xcode with Metal 4 support
-///   - M5 hardware for development and testing
-///
-/// Reference:
-///   - WWDC25 "Metal 4 TensorOps" session
-///   - WWDC25 "Accelerate ML inference with Metal 4" session
-///   - <https://github.com/liuliu/example_matmul_metal4>
-///   - `mlx/backend/metal/steel_attention.metal` (MLX baseline)
-///   - `docs/metal4-fused-attention-research.md` (research notes)
-///
-/// Used by: (future — not yet called from model code; models currently use
-/// `fast_scaled_dot_product_attention` or `compiled_softcap_sdpa` directly)
+/// Used by: Llama, Qwen, Gemma2, Gemma3, Mistral, Ministral, DeepSeek, Phi,
+/// Exaone, Cohere, InternLM, OLMo, StableLM, StarCoder2, GLM4, Ernie4.5,
+/// Hunyuan, Gemma VLMs, Qwen VLMs, SigLIP/CLIP-style vision encoders
 pub fn metal4_attention(
     q: &MlxArray,
     k: &MlxArray,
     v: &MlxArray,
     scale: f32,
     mask: Option<&MlxArray>,
+    softcap: f32,
+    window_size: i32,
 ) -> UniquePtr<MlxArray> {
-    let hw = crate::hardware::get_hardware();
-    // Enable Metal 4 dispatch only on M5+ hardware running macOS 26.2+.
+    // Enable Metal 4 dispatch only on M5+ hardware running macOS 26+.
     // Uses the canonical NA detection condition from apple-silicon-precision.md.
-    // The flag is passed to the C++ layer so the kernel can be conditionally
-    // compiled in when the Metal 4 SDK becomes available without changing the
-    // Rust call sites.
-    let use_metal4 = hw.has_neural_accelerator && hw.macos_supports_na;
+    let use_metal4 = should_use_metal4_attention();
     let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
     // SAFETY: mask_ptr is either null or a valid reference with lifetime tied
     // to the `mask` argument, which outlives this function call.
-    unsafe { ffi::fused_metal4_attention(q, k, v, scale, mask_ptr, use_metal4) }
+    unsafe {
+        ffi::fused_metal4_attention(q, k, v, scale, mask_ptr, softcap, window_size, use_metal4)
+    }
 }
 
 /// GELU MLP forward for non-quantized (FP16/BF16) UnifiedLinear layers.
@@ -1557,7 +1603,7 @@ mod tests {
         let v = ffi::zeros(&[1, 2, 4, 8], dtype::FLOAT16);
         let scale = 1.0 / 8.0_f32.sqrt();
 
-        let out = metal4_attention(&q, &k, &v, scale, None);
+        let out = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
 
         let shape = ffi::array_shape(&out);
         assert_eq!(shape.as_slice(), &[1, 2, 4, 8]);
@@ -1574,7 +1620,7 @@ mod tests {
 
         // Both calls should produce the same result because the Metal 4 kernel
         // body is not yet implemented — both paths fall back to fast SDPA.
-        let out_m4 = metal4_attention(&q, &k, &v, scale, None);
+        let out_m4 = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
         let out_fast =
             unsafe { ffi::fast_scaled_dot_product_attention(&q, &k, &v, scale, std::ptr::null()) };
 
@@ -1594,10 +1640,22 @@ mod tests {
         let v = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
         let scale = 1.0 / 8.0_f32.sqrt();
 
-        let out = metal4_attention(&q, &k, &v, scale, None);
+        let out = metal4_attention(&q, &k, &v, scale, None, 0.0, 0);
         let shape = ffi::array_shape(&out);
         // Output should have Q's head count, not KV's
         assert_eq!(shape.as_slice(), &[1, 4, 3, 8]);
+    }
+
+    /// Verify the unified attention helper preserves Gemma-style softcap GQA shapes.
+    #[test]
+    fn attention_softcap_gqa_shape() {
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 4, 3, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+
+        let out = attention(&q, &k, &v, 0.5, None, 30.0, 0);
+        assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 4, 3, 8]);
     }
 
     /// Verify that the detection condition uses the canonical NA check
@@ -1616,7 +1674,7 @@ mod tests {
         let q = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
         let k = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
         let v = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
-        let out = metal4_attention(&q, &k, &v, 0.5, None);
+        let out = metal4_attention(&q, &k, &v, 0.5, None, 0.0, 0);
         assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 1, 1, 4]);
     }
 }

@@ -16,35 +16,51 @@ set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
 function(mlx_apply_source_overlays mlx_source_dir)
-  # Apply shared patches (Metal JIT fixes, kernel utils) to all builds
-  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches")
-    file(GLOB_RECURSE _patch_files
+  # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix)
+  set(_metal_patch_files
+      "mlx/backend/metal/compiled.cpp"
+      "mlx/backend/metal/kernels/utils.h")
+  foreach(_patch_file ${_metal_patch_files})
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}")
+      configure_file(
+        "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
+        "${mlx_source_dir}/${_patch_file}"
+        COPYONLY)
+    endif()
+  endforeach()
+  message(STATUS "Applied Metal kernel patches")
+
+  # CUDA patches: custom grouped GEMM, quantized kernels, reduce ops, binary ops.
+  # These are in patches/mlx/backend/cuda/ and only compiled for CUDA targets,
+  # so they are safe to apply unconditionally (harmless on Metal-only builds).
+  if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda")
+    file(GLOB_RECURSE _cuda_patch_files
          RELATIVE "${CMAKE_CURRENT_SOURCE_DIR}/patches"
-         "${CMAKE_CURRENT_SOURCE_DIR}/patches/*")
-    foreach(_patch_file ${_patch_files})
+         "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/cuda/*")
+    foreach(_patch_file ${_cuda_patch_files})
       configure_file(
         "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}"
         "${mlx_source_dir}/${_patch_file}"
         COPYONLY)
     endforeach()
-    message(STATUS "Applied shared patches to MLX source")
+    message(STATUS "Applied CUDA backend patches (${_cuda_patch_files})")
   endif()
 
-  # Apply CUDA-only patches (bf16 type promotion, normalization precision)
-  # These change dtype promotion rules (bf16+fp32→bf16) and norm computation
-  # to avoid copy_v kernel overhead on CUDA, but break Metal precision for
-  # bf16 vision weights (e.g., SigLIP position embeddings read as zeros).
+  # CUDA-only patches: bf16 type promotion and norm computation changes.
+  # These change dtype promotion rules (bf16+fp32→bf16) to avoid copy_v kernel
+  # overhead on CUDA, but break Metal precision for bf16 vision weights
+  # (e.g., SigLIP position embeddings). Apply ONLY for CUDA builds.
   if(MLX_BUILD_CUDA AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda")
-    file(GLOB _cuda_patch_files
+    file(GLOB _cuda_only_patches
          "${CMAKE_CURRENT_SOURCE_DIR}/patches-cuda/*.cpp")
-    foreach(_patch_file ${_cuda_patch_files})
+    foreach(_patch_file ${_cuda_only_patches})
       get_filename_component(_fname "${_patch_file}" NAME)
       configure_file(
         "${_patch_file}"
         "${mlx_source_dir}/mlx/${_fname}"
         COPYONLY)
     endforeach()
-    message(STATUS "Applied CUDA-only patches to MLX source")
+    message(STATUS "Applied CUDA-only dtype/precision patches")
   endif()
 endfunction()
 
@@ -62,7 +78,7 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG v0.31.1)
+    GIT_TAG 6a9a121d09546fec051038535b444bc797fac045)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.

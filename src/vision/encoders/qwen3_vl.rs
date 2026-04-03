@@ -387,10 +387,10 @@ fn ensure_fused_sdpa(
         let k = mlxcel_core::pad(k, &pad_width, 0.0);
         let v = mlxcel_core::pad(v, &pad_width, 0.0);
         let attn =
-            unsafe { mlxcel_core::fast_scaled_dot_product_attention(&q, &k, &v, scale, mask_ptr) };
+            unsafe { mlxcel_core::layers::attention_from_ptr(&q, &k, &v, scale, mask_ptr, 0.0, 0) };
         mlxcel_core::slice_last_dim(&attn, 0, head_dim)
     } else {
-        unsafe { mlxcel_core::fast_scaled_dot_product_attention(q, k, v, scale, mask_ptr) }
+        unsafe { mlxcel_core::layers::attention_from_ptr(q, k, v, scale, mask_ptr, 0.0, 0) }
     }
 }
 

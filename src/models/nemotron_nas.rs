@@ -29,8 +29,8 @@ use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, repeat_kv};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{
-    MlxArray, UniquePtr, add, array_shape, copy, fast_rope, fast_scaled_dot_product_attention,
-    gelu, multiply, relu, reshape, silu, transpose_axes,
+    MlxArray, UniquePtr, add, array_shape, copy, fast_rope, gelu, multiply, relu, reshape, silu,
+    transpose_axes,
 };
 use serde::Deserialize;
 use std::path::Path;
@@ -274,7 +274,9 @@ impl NASAttention {
 
         // Scaled dot-product attention
         let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
-        let output = unsafe { fast_scaled_dot_product_attention(&q, &k, &v, self.scale, mask_ptr) };
+        let output = unsafe {
+            mlxcel_core::layers::attention_from_ptr(&q, &k, &v, self.scale, mask_ptr, 0.0, 0)
+        };
 
         // Transpose back and reshape
         let output = transpose_axes(&output, &[0, 2, 1, 3]);

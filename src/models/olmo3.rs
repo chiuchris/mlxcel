@@ -205,8 +205,8 @@ impl OLMo3Attention {
             // Prefill with mask
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr,
+                mlxcel_core::layers::attention_from_ptr(
+                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
                 )
             }
         } else if l > 1 {

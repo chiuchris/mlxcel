@@ -4572,79 +4572,22 @@ void nemotron_decode_step(
 //     - https://github.com/liuliu/example_matmul_metal4  (open-source matmul example)
 //     - mlx/backend/metal/steel_attention.metal  (MLX baseline for reference)
 //
-// PLANNED KERNEL STRUCTURE (pseudo-MSL):
-//
-//   [[kernel]] void fused_attention_metal4(
-//       tensor<half, 4> q         [[tensor(0)]],  // [B, H, S, D]
-//       tensor<half, 4> k         [[tensor(1)]],
-//       tensor<half, 4> v         [[tensor(2)]],
-//       constant float& scale     [[buffer(0)]],
-//       // --- All intermediate tensors stay on-chip in NA registers ---
-//   ) {
-//       // Step 1: scores = Q @ K^T * scale  (tensor matmul, on-chip)
-//       // Step 2: optional softcap           (tanh, on-chip)
-//       // Step 3: optional mask add          (on-chip)
-//       // Step 4: softmax                    (reduction, on-chip)
-//       // Step 5: context = scores @ V       (tensor matmul, on-chip)
-//       // Total memory traffic: read Q,K,V once + write context once
-//   }
-//
-// VARIANTS TO IMPLEMENT (in priority order):
-//   1. Standard MHA / GQA (Llama, Qwen, Mistral)          — highest impact
-//   2. Softcap + GQA      (Gemma2, Gemma3)                — medium
-//   3. Sliding window     (Gemma3, Ministral)             — medium
-//   4. MLA                (DeepSeek V3)                   — low (complex)
-//
-// ─────────────────────────────────────────────────────────────────────────────
-
 std::unique_ptr<MlxArray> fused_metal4_attention(
     const MlxArray& q,
     const MlxArray& k,
     const MlxArray& v,
     float scale,
     const MlxArray* mask,
+    float softcap,
+    int32_t window_size,
     bool use_metal4
 ) {
-    // ── Metal 4 TensorOps path (M5+ with macOS 26.2+) ──────────────────
-    //
-    // TODO(metal4): When the Metal 4 SDK is available, implement the fused
-    // attention kernel here.  The kernel should:
-    //
-    //   1. Convert Q/K/V MLX arrays to MTLTensor descriptors
-    //   2. Create a fused compute pipeline that chains:
-    //        scores = Q @ K^T * scale   (tensor matmul, on-chip)
-    //        scores += mask             (element-wise, on-chip, if present)
-    //        P = softmax(scores)        (reduction, on-chip)
-    //        output = P @ V             (tensor matmul, on-chip)
-    //   3. Encode via MTL4MachineLearningCommandEncoder
-    //   4. Wrap the output MTLTensor back into an MlxArray
-    //
-    // GQA: the kernel must handle n_heads != n_kv_heads by broadcasting KV
-    // heads within each group (groups = n_heads / n_kv_heads).  MLX's SDPA
-    // already handles this in the fallback path.
-    //
-    // Sliding window: accept an optional window_size parameter and generate
-    // the band mask on-chip instead of reading it from device memory.
-    //
-    // Softcap: accept an optional softcap parameter and apply
-    // tanh(scores / cap) * cap on-chip between score computation and softmax.
-    //
-    // Prerequisites:
-    //   - macOS 26.2+ SDK with Metal 4 headers
-    //   - Xcode from WWDC25 release cycle
-    //   - M5 hardware for testing
-    //
-    // Reference: docs/metal4-fused-attention-research.md
-    //
-    // ────────────────────────────────────────────────────────────────────────
-
-    (void)use_metal4;  // suppress unused-variable warning until kernel is added
-
-    // ── Fallback: MLX fast SDPA (all hardware) ──────────────────────────
-    //
-    // Both use_metal4=true and use_metal4=false currently reach this path.
-    // Once the Metal 4 kernel is implemented, the use_metal4=true branch
-    // will return early above, and this fallback serves M1-M4 hardware.
+    // Upstream MLX main already provides the Metal NAX SDPA kernel body.
+    // We keep this bridge so Rust can centralize dispatch and continue
+    // threading future softcap/sliding-window metadata.
+    (void)use_metal4;
+    (void)softcap;
+    (void)window_size;
 
     std::optional<mlx::core::array> mask_opt = std::nullopt;
     std::string mask_mode = "";

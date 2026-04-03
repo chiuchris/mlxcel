@@ -188,12 +188,14 @@ impl MiniCPMOAttention {
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
         let output = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
+            mlxcel_core::layers::attention_from_ptr(
                 &queries,
                 &keys,
                 &values,
                 self.scale,
                 std::ptr::null(),
+                0.0,
+                0,
             )
         };
         let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);
@@ -511,12 +513,14 @@ impl MiniCPMOCrossAttention {
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
         let output = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
+            mlxcel_core::layers::attention_from_ptr(
                 &queries,
                 &keys,
                 &values,
                 self.scale,
                 std::ptr::null(),
+                0.0,
+                0,
             )
         };
         let output = mlxcel_core::transpose_axes(&output, &[0, 2, 1, 3]);

@@ -237,12 +237,14 @@ impl MlaAttention {
             let q_projected = self.embed_q.forward(&q_nope);
             let pe_mask_ptr = &*pe_scores as *const MlxArray;
             let output = unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q_projected,
                     &kv_latent,
                     &kv_latent,
                     self.scale,
                     pe_mask_ptr,
+                    0.0,
+                    0,
                 )
             };
             // Project output from latent space to v_head_dim
@@ -253,12 +255,14 @@ impl MlaAttention {
             let v = self.unembed_out.forward(&kv_latent);
             let pe_mask_ptr = &*pe_scores as *const MlxArray;
             unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q_nope,
                     &k,
                     &v,
                     self.scale,
                     pe_mask_ptr,
+                    0.0,
+                    0,
                 )
             }
         };

@@ -321,12 +321,14 @@ impl VisionAttention {
             );
 
             let attn = unsafe {
-                mlxcel_core::fast_scaled_dot_product_attention(
+                mlxcel_core::layers::attention_from_ptr(
                     &q_seg,
                     &k_seg,
                     &v_seg,
                     self.scale,
                     std::ptr::null(),
+                    0.0,
+                    0,
                 )
             };
             attn_outputs.push(attn);

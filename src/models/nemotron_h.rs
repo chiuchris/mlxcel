@@ -998,8 +998,8 @@ impl NemotronHAttention {
             .map(|m| m as *const MlxArray)
             .unwrap_or(std::ptr::null());
         let output = unsafe {
-            mlxcel_core::fast_scaled_dot_product_attention(
-                &queries, &keys, &values, self.scale, mask_ptr,
+            mlxcel_core::layers::attention_from_ptr(
+                &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
             )
         };
 
