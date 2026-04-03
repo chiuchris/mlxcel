@@ -316,10 +316,7 @@ impl GemmaRMSNorm {
     /// Create a new Gemma RMS norm layer.
     /// Pre-computes (1 + weight) once at construction time.
     pub fn new(weight: UniquePtr<MlxArray>, eps: f32) -> Self {
-        let ones = ffi::ones(
-            &[ffi::array_shape(&weight)[0]],
-            ffi::array_dtype(&weight),
-        );
+        let ones = ffi::ones(&[ffi::array_shape(&weight)[0]], ffi::array_dtype(&weight));
         let adjusted_weight = ffi::add(&ones, &weight);
         Self {
             weight,
@@ -755,9 +752,15 @@ impl FusedQKVLinear {
             };
 
             // Optional bias per projection (rare, but handle it)
-            let q_bias = weights.get(&format!("{}.bias", q_prefix)).map(|b| ffi::copy(b));
-            let k_bias = weights.get(&format!("{}.bias", k_prefix)).map(|b| ffi::copy(b));
-            let v_bias = weights.get(&format!("{}.bias", v_prefix)).map(|b| ffi::copy(b));
+            let q_bias = weights
+                .get(&format!("{}.bias", q_prefix))
+                .map(|b| ffi::copy(b));
+            let k_bias = weights
+                .get(&format!("{}.bias", k_prefix))
+                .map(|b| ffi::copy(b));
+            let v_bias = weights
+                .get(&format!("{}.bias", v_prefix))
+                .map(|b| ffi::copy(b));
             let bias = match (q_bias, k_bias, v_bias) {
                 (Some(qb), Some(kb), Some(vb)) => {
                     let ptrs: &[*const MlxArray] = &[
@@ -791,8 +794,12 @@ impl FusedQKVLinear {
         n_kv_heads: i32,
         head_dim: i32,
     ) -> Result<Self, String> {
-        let qkv_proj =
-            UnifiedLinear::from_weights(weights, &format!("{}.qkv_proj", prefix), group_size, bits)?;
+        let qkv_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.qkv_proj", prefix),
+            group_size,
+            bits,
+        )?;
         Ok(Self {
             qkv_proj,
             n_heads,
@@ -805,7 +812,14 @@ impl FusedQKVLinear {
     ///
     /// Returns `(q, k, v)` each shaped `[batch, seq_len, proj_dim]` (pre-reshape).
     /// The caller is responsible for reshape/transpose/RoPE.
-    pub fn forward(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    pub fn forward(
+        &self,
+        x: &MlxArray,
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    ) {
         let qkv = self.qkv_proj.forward(x);
 
         let q_size = self.n_heads * self.head_dim;

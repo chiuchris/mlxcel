@@ -133,11 +133,7 @@ fn logits_at_position(logits: &MlxArray, pos: usize) -> UniquePtr<MlxArray> {
     let batch = shape[0];
     let vocab = shape[2];
     // Slice [batch, pos:pos+1, vocab]  →  shape [batch, 1, vocab].
-    ffi::slice(
-        logits,
-        &[0, pos as i32, 0],
-        &[batch, pos as i32 + 1, vocab],
-    )
+    ffi::slice(logits, &[0, pos as i32, 0], &[batch, pos as i32 + 1, vocab])
 }
 
 /// Trait for language models that can be used for generation
@@ -416,7 +412,9 @@ impl CxxGenerator {
     /// small per-token quantization error.
     pub fn new_with_kv_mode(num_layers: usize, kv_cache_mode: KVCacheMode) -> Self {
         Self {
-            caches: (0..num_layers).map(|_| KVCache::new_with_mode(kv_cache_mode)).collect(),
+            caches: (0..num_layers)
+                .map(|_| KVCache::new_with_mode(kv_cache_mode))
+                .collect(),
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
             kv_cache_mode,
@@ -521,8 +519,11 @@ impl CxxGenerator {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
-            let raw_logits =
-                model.forward(&input, &mut self.caches, mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+            let raw_logits = model.forward(
+                &input,
+                &mut self.caches,
+                mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
             // Trim padding positions from all KV caches so decode uses the
             // correct cache offset (actual_len, not padded_len).
             if padded_len > actual_len {
@@ -542,7 +543,11 @@ impl CxxGenerator {
         if trace_dtype {
             ffi::eval(&logits);
             let shape = ffi::array_shape(&logits);
-            eprintln!("[LOGITS] prefill dtype={} shape={:?}", ffi::array_dtype(&logits), shape);
+            eprintln!(
+                "[LOGITS] prefill dtype={} shape={:?}",
+                ffi::array_dtype(&logits),
+                shape
+            );
         }
 
         // Clear intermediate tensors from prefill to free memory
@@ -706,7 +711,8 @@ impl CxxGenerator {
         // explicit mask is provided by the caller (callers that supply a custom
         // mask already control the shape and may not need tile alignment).
         let actual_len = prompt_tokens.len();
-        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill() {
+        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill()
+        {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
@@ -844,7 +850,8 @@ impl CxxGenerator {
         // generate_streaming_with_embeddings).
         let actual_len = prompt_tokens.len();
         let prefill_start = Instant::now();
-        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill() {
+        let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill()
+        {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
@@ -997,8 +1004,11 @@ impl CxxGenerator {
             let padded_len = align_to_na_tile(actual_len);
             let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
-            let raw_logits =
-                model.forward(&input, &mut self.caches, mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+            let raw_logits = model.forward(
+                &input,
+                &mut self.caches,
+                mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
             if padded_len > actual_len {
                 trim_caches_to_actual_len(&mut self.caches, actual_len, padded_len);
                 model.trim_internal_caches((padded_len - actual_len) as i32);
@@ -1522,8 +1532,7 @@ mod tests {
         }
 
         fn trim_internal_caches(&self, excess: i32) {
-            self.trim_call_count
-                .set(self.trim_call_count.get() + 1);
+            self.trim_call_count.set(self.trim_call_count.get() + 1);
             self.last_excess.set(excess);
         }
     }

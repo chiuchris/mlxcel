@@ -515,9 +515,18 @@ mod tests {
     #[test]
     fn macos_na_threshold() {
         // Boundary conditions for "macOS 26.2+" check.
-        assert!(!{ let (maj, min) = parse_macos_version("26.1"); (maj > 26) || (maj == 26 && min >= 2) });
-        assert!({ let (maj, min) = parse_macos_version("26.2"); (maj > 26) || (maj == 26 && min >= 2) });
-        assert!({ let (maj, min) = parse_macos_version("27.0"); (maj > 26) || (maj == 26 && min >= 2) });
+        assert!(!{
+            let (maj, min) = parse_macos_version("26.1");
+            (maj > 26) || (maj == 26 && min >= 2)
+        });
+        assert!({
+            let (maj, min) = parse_macos_version("26.2");
+            (maj > 26) || (maj == 26 && min >= 2)
+        });
+        assert!({
+            let (maj, min) = parse_macos_version("27.0");
+            (maj > 26) || (maj == 26 && min >= 2)
+        });
     }
 
     #[test]
@@ -562,9 +571,12 @@ mod tests {
         // 32 GB memory gives ample headroom → INT8.
         let hw = make_hw(true, true, 32);
         let rec = recommend_quantization(7.0, 32, &hw);
-        assert_eq!(rec, QuantRecommendation::Int8 {
-            reason: "M5 NA delivers 2x throughput for INT8 vs FP16",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Int8 {
+                reason: "M5 NA delivers 2x throughput for INT8 vs FP16",
+            }
+        );
         assert_eq!(rec.label(), "int8");
     }
 
@@ -574,9 +586,12 @@ mod tests {
         // INT4 needs 35 + 2 = 37 GB — fits in 64 GB → INT4.
         let hw = make_hw(true, true, 64);
         let rec = recommend_quantization(70.0, 64, &hw);
-        assert_eq!(rec, QuantRecommendation::Int4Affine {
-            reason: "M5 NA available but 8-bit exceeds memory; 4-bit recommended",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Int4Affine {
+                reason: "M5 NA available but 8-bit exceeds memory; 4-bit recommended",
+            }
+        );
     }
 
     #[test]
@@ -584,9 +599,12 @@ mod tests {
         // 1B model: FP16 needs 2 + 2 = 4 GB, fits in 24 GB → FP16.
         let hw = make_hw(false, false, 24);
         let rec = recommend_quantization(1.0, 24, &hw);
-        assert_eq!(rec, QuantRecommendation::Fp16 {
-            reason: "Model fits in memory as FP16; no quantization needed",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Fp16 {
+                reason: "Model fits in memory as FP16; no quantization needed",
+            }
+        );
         assert_eq!(rec.label(), "fp16");
     }
 
@@ -596,9 +614,12 @@ mod tests {
         // INT4 needs 4 + 2 = 6 GB, fits → INT4.
         let hw = make_hw(false, false, 16);
         let rec = recommend_quantization(8.0, 16, &hw);
-        assert_eq!(rec, QuantRecommendation::Int4Affine {
-            reason: "Best balance of speed and memory on this hardware",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Int4Affine {
+                reason: "Best balance of speed and memory on this hardware",
+            }
+        );
     }
 
     #[test]
@@ -607,9 +628,12 @@ mod tests {
         let hw = make_hw(true, false, 32);
         let rec = recommend_quantization(7.0, 32, &hw);
         // 7B FP16 = 14 + 2 = 16 GB, fits in 32 GB → FP16 (no NA).
-        assert_eq!(rec, QuantRecommendation::Fp16 {
-            reason: "Model fits in memory as FP16; no quantization needed",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Fp16 {
+                reason: "Model fits in memory as FP16; no quantization needed",
+            }
+        );
     }
 
     #[test]
@@ -617,15 +641,20 @@ mod tests {
         // 30B model on 16 GB M5: INT8 = 30 + 2 = 32 GB (too big), INT4 = 15 + 2 = 17 GB (too big).
         let hw = make_hw(true, true, 16);
         let rec = recommend_quantization(30.0, 16, &hw);
-        assert_eq!(rec, QuantRecommendation::Int4Affine {
-            reason: "Memory constrained; 4-bit required to fit model",
-        });
+        assert_eq!(
+            rec,
+            QuantRecommendation::Int4Affine {
+                reason: "Memory constrained; 4-bit required to fit model",
+            }
+        );
         assert_eq!(rec.label(), "int4");
     }
 
     #[test]
     fn reason_accessor_works() {
-        let rec = QuantRecommendation::Int8 { reason: "test reason" };
+        let rec = QuantRecommendation::Int8 {
+            reason: "test reason",
+        };
         assert_eq!(rec.reason(), "test reason");
     }
 }
