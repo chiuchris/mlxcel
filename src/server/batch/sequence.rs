@@ -210,11 +210,13 @@ pub struct SequenceInfo {
     /// Log probability configuration for this request.
     pub logprobs_config: LogprobsConfig,
 
-    // -- VLM context (optional) --
+    // -- VLM / multimodal context (optional) --
     /// Pre-computed vision-language embeddings for VLM requests.
     pub vlm_embeddings: Option<InputEmbeddings>,
     /// Raw image bytes for VLM requests (empty for text-only).
     pub images: Vec<Vec<u8>>,
+    /// Raw audio bytes for audio-language models (empty for non-audio).
+    pub audio: Vec<Vec<u8>>,
 
     // -- Generation state --
     /// Tokens produced so far during decode.

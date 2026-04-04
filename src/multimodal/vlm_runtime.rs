@@ -496,6 +496,42 @@ pub fn expand_gemma4_image_tokens_pub(
     )
 }
 
+/// Expand audio token placeholder in prompt tokens for server requests.
+///
+/// Replaces the first `audio_token_id` with `boa + audio_token*N + eoa`.
+/// If no audio placeholder is found, inserts before the last token.
+pub fn expand_gemma4_audio_tokens_for_server(
+    prompt_tokens: &mut Vec<i32>,
+    audio_token_id: i32,
+    boa_token_id: i32,
+    eoa_token_id: i32,
+    num_audio_tokens: usize,
+) {
+    let mut expanded = Vec::with_capacity(prompt_tokens.len() + num_audio_tokens + 2);
+    let mut found = false;
+    for &token in prompt_tokens.iter() {
+        if token == audio_token_id && !found {
+            found = true;
+            expanded.push(boa_token_id);
+            expanded.extend(std::iter::repeat_n(audio_token_id, num_audio_tokens));
+            expanded.push(eoa_token_id);
+        } else {
+            expanded.push(token);
+        }
+    }
+    // If no placeholder found, insert before last token
+    if !found {
+        let last = expanded.pop();
+        expanded.push(boa_token_id);
+        expanded.extend(std::iter::repeat_n(audio_token_id, num_audio_tokens));
+        expanded.push(eoa_token_id);
+        if let Some(tok) = last {
+            expanded.push(tok);
+        }
+    }
+    *prompt_tokens = expanded;
+}
+
 #[cfg(test)]
 #[path = "vlm_runtime_tests.rs"]
 mod tests;

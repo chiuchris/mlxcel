@@ -36,6 +36,8 @@ pub enum ModelRequest {
         options: ServerGenerateOptions,
         /// Raw image bytes for VLM (empty for text-only)
         images: Vec<Vec<u8>>,
+        /// Raw audio bytes for audio-language models (empty for text/vision-only)
+        audio: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
         /// Cancellation flag set by the SSE sender when the client disconnects.
         /// The `BatchScheduler` polls this to abort orphaned sequences.
@@ -367,7 +369,7 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
     ) -> Result<GenerationResult> {
-        self.generate_with_images(prompt, options, Vec::new())
+        self.generate_with_media(prompt, options, Vec::new(), Vec::new())
     }
 
     /// Generate text with optional images and return the full result
@@ -377,7 +379,18 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
     ) -> Result<GenerationResult> {
-        let response_rx = self.send_generate_request(prompt, options, images)?;
+        self.generate_with_media(prompt, options, images, Vec::new())
+    }
+
+    /// Generate text with optional images and audio, and return the full result
+    pub fn generate_with_media(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+    ) -> Result<GenerationResult> {
+        let response_rx = self.send_generate_request(prompt, options, images, audio)?;
         drain_generation_events(response_rx, |_| {})
     }
 
@@ -405,11 +418,11 @@ impl ModelProvider {
     where
         F: FnMut(String),
     {
-        let response_rx = self.send_generate_request(prompt, options, images)?;
+        let response_rx = self.send_generate_request(prompt, options, images, Vec::new())?;
         drain_generation_events(response_rx, callback)
     }
 
-    /// Generate text with optional images and a logprobs-aware streaming callback.
+    /// Generate text with optional images/audio and a logprobs-aware streaming callback.
     ///
     /// The callback receives the decoded token text plus optional `TokenLogprobData`.
     /// When `options.logprobs.enabled` is false the logprob argument will always
@@ -419,12 +432,13 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
         callback: F,
     ) -> Result<GenerationResult>
     where
         F: FnMut(String, Option<TokenLogprobData>),
     {
-        let response_rx = self.send_generate_request(prompt, options, images)?;
+        let response_rx = self.send_generate_request(prompt, options, images, audio)?;
         drain_generation_events_with_logprobs(response_rx, callback)
     }
 
@@ -444,8 +458,13 @@ impl ModelProvider {
     where
         F: FnMut(String),
     {
-        let response_rx =
-            self.send_generate_request_with_cancellation(prompt, options, Vec::new(), cancelled)?;
+        let response_rx = self.send_generate_request_with_cancellation(
+            prompt,
+            options,
+            Vec::new(),
+            Vec::new(),
+            cancelled,
+        )?;
         drain_generation_events(response_rx, callback)
     }
 
@@ -461,14 +480,15 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
         cancelled: Arc<AtomicBool>,
         callback: F,
     ) -> Result<GenerationResult>
     where
         F: FnMut(String, Option<TokenLogprobData>),
     {
-        let response_rx =
-            self.send_generate_request_with_cancellation(prompt, options, images, cancelled)?;
+        let response_rx = self
+            .send_generate_request_with_cancellation(prompt, options, images, audio, cancelled)?;
         drain_generation_events_with_logprobs(response_rx, callback)
     }
 
@@ -477,11 +497,13 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         self.send_generate_request_with_cancellation(
             prompt,
             options,
             images,
+            audio,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -496,6 +518,7 @@ impl ModelProvider {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -505,6 +528,7 @@ impl ModelProvider {
                 prompt,
                 options,
                 images,
+                audio,
                 response_tx,
                 cancelled,
             })

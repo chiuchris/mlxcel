@@ -22,9 +22,89 @@ use base64::Engine;
 use std::{path::Path, sync::OnceLock, time::Duration};
 
 use super::types::ChatCompletionRequest;
+use super::types::request::InputAudio;
 
 pub(crate) async fn extract_chat_image_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
     collect_image_data(request.image_urls()).await
+}
+
+/// Extract raw audio bytes from chat request audio inputs.
+///
+/// Supports base64-encoded inline data, `data:audio/...;base64,...` URIs,
+/// `file://` paths, bare local paths, and `http(s)` URLs.
+///
+/// Only WAV format is currently supported; other formats are rejected early.
+pub(crate) async fn extract_chat_audio_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
+    let audio_inputs = request.audio_inputs();
+    let mut audio_data = Vec::new();
+    for input in &audio_inputs {
+        if let Some(bytes) = read_audio_input(input).await {
+            audio_data.push(bytes);
+        }
+    }
+    audio_data
+}
+
+/// Maximum raw audio payload size after decoding: 500 MB.
+/// This prevents OOM from extremely large base64 payloads before WAV
+/// parsing can apply its own data-chunk limit.
+const MAX_AUDIO_PAYLOAD_SIZE: usize = 500 * 1024 * 1024;
+
+async fn read_audio_input(input: &InputAudio) -> Option<Vec<u8>> {
+    // Validate format early -- only WAV is supported for now.
+    if input.format != "wav" {
+        tracing::warn!(
+            "Unsupported audio format \'{}\'; only \'wav\' is currently supported",
+            input.format
+        );
+        return None;
+    }
+
+    let data = &input.data;
+
+    // data:audio/...;base64,... URI
+    if data.starts_with("data:audio/") {
+        return validate_audio_size(decode_data_uri(data));
+    }
+
+    // file:// prefix
+    if let Some(path) = data.strip_prefix("file://") {
+        return validate_audio_size(read_local_image(Path::new(path)).await);
+    }
+
+    // HTTP(S) URL
+    if is_http_url(data) {
+        return validate_audio_size(fetch_remote_image(data).await);
+    }
+
+    // Bare local path
+    if Path::new(data).is_file() {
+        return validate_audio_size(read_local_image(Path::new(data)).await);
+    }
+
+    // Try as raw base64 data
+    match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(bytes) if !bytes.is_empty() => validate_audio_size(Some(bytes)),
+        _ => {
+            tracing::warn!("Could not decode audio input data");
+            None
+        }
+    }
+}
+
+/// Reject audio payloads that exceed `MAX_AUDIO_PAYLOAD_SIZE`.
+fn validate_audio_size(data: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match data {
+        Some(bytes) if bytes.len() > MAX_AUDIO_PAYLOAD_SIZE => {
+            tracing::warn!(
+                "Audio payload too large ({} bytes, max {}); rejecting",
+                bytes.len(),
+                MAX_AUDIO_PAYLOAD_SIZE
+            );
+            None
+        }
+        other => other,
+    }
 }
 
 pub(crate) async fn collect_image_data<I, S>(urls: I) -> Vec<Vec<u8>>

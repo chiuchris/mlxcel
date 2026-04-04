@@ -150,6 +150,9 @@ pub enum ContentPart {
     /// and `http(s)` URLs)
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    /// Audio input content (base64-encoded audio data)
+    #[serde(rename = "input_audio")]
+    InputAudio { input_audio: InputAudio },
 }
 
 /// Image URL reference
@@ -158,6 +161,20 @@ pub struct ImageUrl {
     /// URL: `data:image/...;base64,...`, `file://...`, bare local path, or
     /// `http(s)://...`
     pub url: String,
+}
+
+/// Audio input reference (OpenAI-compatible)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAudio {
+    /// Base64-encoded audio data, or a URL/file path
+    pub data: String,
+    /// Audio format: "wav", "mp3", etc.
+    #[serde(default = "default_audio_format")]
+    pub format: String,
+}
+
+fn default_audio_format() -> String {
+    "wav".to_string()
 }
 
 /// Message content: either a plain string or multimodal array
@@ -194,6 +211,20 @@ impl MessageContent {
                 .iter()
                 .filter_map(|p| match p {
                     ContentPart::ImageUrl { image_url } => Some(image_url.url.clone()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Extract audio input data from multimodal content
+    pub fn audio_inputs(&self) -> Vec<InputAudio> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::InputAudio { input_audio } => Some(input_audio.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -366,6 +397,14 @@ impl ChatCompletionRequest {
         self.messages
             .iter()
             .flat_map(|m| m.content.image_urls())
+            .collect()
+    }
+
+    /// Extract all audio inputs from messages
+    pub fn audio_inputs(&self) -> Vec<InputAudio> {
+        self.messages
+            .iter()
+            .flat_map(|m| m.content.audio_inputs())
             .collect()
     }
 }

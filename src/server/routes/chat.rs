@@ -213,7 +213,12 @@ async fn non_stream_chat_completion(
     // Generate (blocking call handled by model provider's worker thread)
     let result = state
         .model_provider
-        .generate_with_images(prepared.prompt, options, prepared.image_data)
+        .generate_with_media(
+            prepared.prompt,
+            options,
+            prepared.image_data,
+            prepared.audio_data,
+        )
         .map_err(|e| ErrorResponse::new(format!("Generation error: {e}"), "server_error"))?;
 
     state.metrics.record_request(
@@ -334,6 +339,7 @@ async fn stream_chat_completion(
                 prepared.prompt,
                 options,
                 prepared.image_data,
+                prepared.audio_data,
                 cancelled,
                 |token, lp_data| {
                     // Accumulate for later tool call parsing

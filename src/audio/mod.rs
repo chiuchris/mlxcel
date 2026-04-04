@@ -29,4 +29,5 @@ pub use config::AudioConfig;
 pub use encoder::AudioEncoder;
 pub use feature_extractor::{
     AudioFeatureExtractor, AudioFeatureExtractorConfig, compute_audio_num_tokens, load_wav_file,
+    load_wav_from_bytes,
 };

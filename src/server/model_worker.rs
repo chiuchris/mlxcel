@@ -245,8 +245,11 @@ pub(crate) fn prepare_request_vlm_embeddings(
     prompt: &str,
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
+    audio: &[Vec<u8>],
 ) -> Result<Option<InputEmbeddings>> {
-    if images.is_empty() || !model.is_vlm() {
+    let has_media = !images.is_empty() || !audio.is_empty();
+
+    if !has_media || !model.is_vlm() {
         // Moondream3 needs special prompt formatting even for text-only
         if images.is_empty() && matches!(model, LoadedModel::Moondream3VLM(_)) {
             let prepared = crate::moondream3_prompt::prepare_moondream3_prompt_tokens(
@@ -267,23 +270,152 @@ pub(crate) fn prepare_request_vlm_embeddings(
         return Ok(None);
     }
 
-    let decoded_images = decode_request_images(images)?;
-    let prepared = prepare_and_compute_vlm_embeddings(
-        model,
-        prompt_tokens,
-        prompt,
-        &decoded_images,
-        |text, add_special| {
-            tokenizer
-                .encode(text, add_special)
-                .unwrap_or_default()
-                .iter()
-                .map(|&t| t as i32)
-                .collect()
-        },
-    )?;
+    // Audio-only or audio+images for Gemma4
+    if !audio.is_empty() {
+        match prepare_gemma4_audio_embeddings(model, prompt_tokens, images, audio)? {
+            Some(embeddings) => return Ok(Some(embeddings)),
+            None => {
+                // Model does not support audio (not Gemma4 or no audio tower).
+                // Log a warning and fall through to image-only or text-only paths.
+                tracing::warn!("Audio input provided but model does not support audio; ignoring");
+            }
+        }
+    }
 
-    Ok(prepared.map(|prepared| prepared.embeddings))
+    // Standard image-only path
+    if !images.is_empty() {
+        let decoded_images = decode_request_images(images)?;
+        let prepared = prepare_and_compute_vlm_embeddings(
+            model,
+            prompt_tokens,
+            prompt,
+            &decoded_images,
+            |text, add_special| {
+                tokenizer
+                    .encode(text, add_special)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&t| t as i32)
+                    .collect()
+            },
+        )?;
+        return Ok(prepared.map(|prepared| prepared.embeddings));
+    }
+
+    // If we reach here with no images (audio was present but unsupported),
+    // apply model-specific text-only formatting if needed.
+    if images.is_empty() && matches!(model, LoadedModel::Moondream3VLM(_)) {
+        let prepared = crate::moondream3_prompt::prepare_moondream3_prompt_tokens(
+            prompt,
+            0,
+            |text, add_special| {
+                tokenizer
+                    .encode(text, add_special)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|&t| t as i32)
+                    .collect()
+            },
+        )
+        .map_err(|e| anyhow!("{}", e))?;
+        *prompt_tokens = prepared.tokens;
+    }
+
+    Ok(None)
+}
+
+/// Process audio (and optionally images) for Gemma4 VLM models.
+///
+/// Returns `Ok(None)` if the model is not a Gemma4 VLM with audio support.
+fn prepare_gemma4_audio_embeddings(
+    model: &LoadedModel,
+    prompt_tokens: &mut Vec<i32>,
+    images: &[Vec<u8>],
+    audio_data: &[Vec<u8>],
+) -> Result<Option<InputEmbeddings>> {
+    use crate::audio;
+
+    let gemma4_vl = match model {
+        LoadedModel::Gemma4VLM(vl) => vl,
+        _ => return Ok(None),
+    };
+
+    if gemma4_vl.audio_tower.is_none() {
+        tracing::warn!("Gemma4 model has no audio encoder; ignoring audio input");
+        return Ok(None);
+    }
+
+    if audio_data.len() > 1 {
+        tracing::warn!(
+            "Multiple audio inputs provided ({}); only the first will be processed",
+            audio_data.len()
+        );
+    }
+
+    // Process the first audio input
+    let audio_bytes = &audio_data[0];
+    let (samples, sample_rate) = audio::load_wav_from_bytes(audio_bytes)
+        .map_err(|e| anyhow!("Failed to decode audio: {}", e))?;
+
+    tracing::info!(
+        "Audio input: {} samples at {} Hz ({:.1}s)",
+        samples.len(),
+        sample_rate,
+        samples.len() as f64 / sample_rate as f64
+    );
+
+    let num_audio_tokens = audio::compute_audio_num_tokens(samples.len(), sample_rate, 40, 750);
+
+    // Expand audio tokens: BOA + AUDIO*N + EOA
+    crate::vlm_runtime::expand_gemma4_audio_tokens_for_server(
+        prompt_tokens,
+        gemma4_vl.audio_token_id,
+        gemma4_vl.boa_token_id,
+        gemma4_vl.eoa_token_id,
+        num_audio_tokens,
+    );
+
+    // Extract mel spectrogram features
+    let extractor =
+        audio::AudioFeatureExtractor::new(audio::AudioFeatureExtractorConfig::default());
+    let (features, mask) = extractor.extract(&samples, None);
+    let num_frames = mask.len();
+
+    let audio_features = mlxcel_core::from_slice_f32(
+        &features,
+        &[1, num_frames as i32, extractor.feature_size() as i32],
+    );
+    let mask_i32: Vec<i32> = mask.iter().map(|&b| if b { 1 } else { 0 }).collect();
+    let audio_mask = mlxcel_core::from_slice_i32(&mask_i32, &[1, num_frames as i32]);
+    let audio_mask = mlxcel_core::astype(&audio_mask, mlxcel_core::dtype::BOOL);
+
+    // Process images if present alongside audio
+    let processed_images = if !images.is_empty() {
+        let decoded_images = decode_request_images(images)?;
+        let processed = gemma4_vl.processor.preprocess(&decoded_images);
+        let num_soft_tokens: Vec<usize> = processed.iter().map(|img| img.num_soft_tokens).collect();
+        crate::vlm_runtime::expand_gemma4_image_tokens_pub(
+            prompt_tokens,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &num_soft_tokens,
+        )?;
+        processed
+    } else {
+        Vec::new()
+    };
+
+    let input_ids_arr =
+        mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings = gemma4_vl.get_input_embeddings_with_audio(
+        &input_ids_arr,
+        &processed_images,
+        Some(&audio_features),
+        Some(&audio_mask),
+    );
+
+    Ok(Some(embeddings))
 }
 
 pub(crate) fn build_generation_result(

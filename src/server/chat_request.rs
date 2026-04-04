@@ -20,13 +20,14 @@
 //! Used by: routes/chat
 
 use super::chat_template::{ChatMessage, ChatTemplateProcessor};
-use super::media::extract_chat_image_data;
+use super::media::{extract_chat_audio_data, extract_chat_image_data};
 use super::types::ChatCompletionRequest;
 use super::types::request::Tool;
 
 pub(crate) struct PreparedChatRequest {
     pub(crate) prompt: String,
     pub(crate) image_data: Vec<Vec<u8>>,
+    pub(crate) audio_data: Vec<Vec<u8>>,
 }
 
 pub(crate) async fn prepare_chat_request(
@@ -59,9 +60,15 @@ pub(crate) async fn prepare_chat_request(
             })
     };
 
+    let (image_data, audio_data) = tokio::join!(
+        extract_chat_image_data(request),
+        extract_chat_audio_data(request),
+    );
+
     PreparedChatRequest {
         prompt,
-        image_data: extract_chat_image_data(request).await,
+        image_data,
+        audio_data,
     }
 }
 

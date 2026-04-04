@@ -327,6 +327,14 @@ pub fn load_wav_file(path: &std::path::Path) -> Result<(Vec<f32>, u32), String> 
     parse_wav(reader)
 }
 
+/// Load raw audio samples from in-memory WAV bytes.
+///
+/// Returns mono f32 samples at the file's native sample rate.
+pub fn load_wav_from_bytes(data: &[u8]) -> Result<(Vec<f32>, u32), String> {
+    let reader = std::io::Cursor::new(data);
+    parse_wav(reader)
+}
+
 fn parse_wav<R: std::io::Read>(mut reader: R) -> Result<(Vec<f32>, u32), String> {
     // Maximum audio data size: 500 MB (16-bit mono at 16kHz ~ 4.3 hours).
     // This prevents OOM from malformed WAV headers declaring absurd sizes.

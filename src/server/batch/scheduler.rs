@@ -305,10 +305,11 @@ impl BatchScheduler {
                 prompt,
                 options,
                 images,
+                audio,
                 response_tx,
                 cancelled,
             } => {
-                self.enqueue_request(prompt, options, images, response_tx, cancelled);
+                self.enqueue_request(prompt, options, images, audio, response_tx, cancelled);
                 false
             }
             ModelRequest::Shutdown => {
@@ -323,6 +324,7 @@ impl BatchScheduler {
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
         cancelled: Arc<AtomicBool>,
     ) {
@@ -353,6 +355,7 @@ impl BatchScheduler {
             &prompt,
             &mut prompt_tokens,
             &images,
+            &audio,
         ) {
             Ok(emb) => emb,
             Err(err) => {
@@ -375,6 +378,7 @@ impl BatchScheduler {
             logprobs_config: options.logprobs,
             vlm_embeddings,
             images,
+            audio,
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             decode_state,

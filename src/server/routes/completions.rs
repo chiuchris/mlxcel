@@ -247,6 +247,7 @@ async fn stream_completion(
                 prompt,
                 options,
                 Vec::new(),
+                Vec::new(),
                 cancelled,
                 |token, lp_data| {
                     let logprobs = if logprobs_enabled {
@@ -261,7 +262,6 @@ async fn stream_completion(
                             chunk_lp
                         })
                     } else {
-                        char_offset += token.len();
                         None
                     };
                     let chunk = CompletionChunk::content_with_logprobs(
