@@ -256,9 +256,7 @@ impl MLAAttention {
             }
         } else {
             // Single token: use causal SDPA (no mask needed)
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &queries, &keys, &values, self.scale,
-            )
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
         };
 
         // Reshape output: [B, H, L, D] -> [B, L, H*D]

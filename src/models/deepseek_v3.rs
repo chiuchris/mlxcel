@@ -22,7 +22,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{create_causal_mask, slice_axis, stack_arrays};
+use mlxcel_core::utils::{slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -828,23 +828,16 @@ impl DeepSeekV3Model {
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(input_ids);
 
-        let shape = mlxcel_core::array_shape(&h);
-        let l = shape[1] as usize;
-
-        // Create mask for prefill
-        let mask = if l > 1 {
-            let offset = caches[0].offset;
-            Some(create_causal_mask(l as i32, offset))
-        } else {
-            None
-        };
+        // Preserve any caller-provided mask (for padded prefill) but let the
+        // attention stack use its implicit causal path for standard prefill.
+        let mask = _mask.map(mlxcel_core::copy);
 
         // Pass through layers
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(
                 &h,
                 &mut caches[i],
-                mask.as_ref().map(|m| m.as_ref().unwrap() as &MlxArray),
+                mask.as_deref(),
             );
         }
 

@@ -136,6 +136,7 @@ pub struct Attention {
     pub head_dim: i32,
     pub scale: f32,
     pub rope_base: f32,
+    pub window_size: i32,
 }
 
 impl Attention {
@@ -186,12 +187,23 @@ impl Attention {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
+            mlxcel_core::causal_attention(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         };
 
@@ -239,6 +251,7 @@ impl Attention {
             head_dim,
             scale,
             rope_base,
+            window_size: args.sliding_window.map(|w| w as i32).unwrap_or(0),
         })
     }
 }

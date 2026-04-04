@@ -605,6 +605,7 @@ pub struct Attention {
     kv_shared_layer_index: Option<usize>,
     store_full_length_kv: bool,
     use_k_eq_v: bool,
+    window_size: i32,
 }
 
 impl Attention {
@@ -668,8 +669,13 @@ impl Attention {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         if mask.is_none() && self.n_kv_heads > 1 {
-            return mlxcel_core::fast_scaled_dot_product_attention_causal(
-                queries, keys, values, self.scale,
+            return mlxcel_core::causal_attention(
+                queries,
+                keys,
+                values,
+                self.scale,
+                0.0,
+                self.window_size,
             );
         }
 
@@ -681,7 +687,7 @@ impl Attention {
 
         unsafe {
             mlxcel_core::layers::attention_from_ptr(
-                queries, keys, values, self.scale, mask_ptr, 0.0, 0,
+                queries, keys, values, self.scale, mask_ptr, 0.0, self.window_size,
             )
         }
     }
@@ -831,6 +837,11 @@ impl Attention {
             kv_shared_layer_index,
             store_full_length_kv,
             use_k_eq_v,
+            window_size: if config.is_sliding_layer(layer_idx) {
+                config.sliding_window as i32
+            } else {
+                0
+            },
         })
     }
 }

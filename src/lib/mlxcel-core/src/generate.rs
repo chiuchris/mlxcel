@@ -186,6 +186,12 @@ pub trait LanguageModel {
     /// so that padding positions do not corrupt subsequent decode steps.
     fn trim_internal_caches(&self, _excess: i32) {}
 
+    /// Release any model-owned sequence state associated with the provided
+    /// external cache slice before the scheduler drops that cache set.
+    ///
+    /// Used by: Qwen3.5 mixed-cache map cleanup, server batch scheduler
+    fn release_sequence_state(&self, _caches: &mut [KVCache]) {}
+
     /// Whether this model supports tile-aligned padded prefill on M5+ hardware.
     ///
     /// Pure transformer models return `true` (the default) because padding
@@ -209,6 +215,21 @@ pub trait LanguageModel {
     /// Used by: CachePool (to reject unsupported models), server scheduler
     fn supports_batching(&self) -> bool {
         true
+    }
+
+    /// Whether this model supports full-sequence batched prefill.
+    ///
+    /// This is stricter than decode batching. A model may support
+    /// `forward_batched()` for `[B, 1]` decode while not supporting
+    /// `[B, T]` prompt prefill with shared graph execution.
+    ///
+    /// The default is `false` so server prefill keeps using the standard
+    /// single-sequence path unless a model explicitly opts in with a
+    /// true full-prompt batched implementation.
+    ///
+    /// Used by: BatchScheduler batched prefill gate
+    fn supports_batched_prefill(&self) -> bool {
+        false
     }
 
     /// Batched decode: process B sequences in one forward pass.
@@ -1325,6 +1346,35 @@ mod tests {
         }
     }
 
+    struct FullBatchPrefillModel;
+
+    impl LanguageModel for FullBatchPrefillModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::zeros(&[1, 1, 4], crate::dtype::FLOAT32)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+
+        fn supports_batched_prefill(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn non_batching_model_uses_default_loop_fallback() {
         let model = NonBatchModel;
@@ -1339,6 +1389,18 @@ mod tests {
         ffi::eval(&logits);
 
         assert_eq!(ffi::array_shape(&logits), vec![1, 1, 4]);
+    }
+
+    #[test]
+    fn supports_batched_prefill_defaults_false() {
+        let model = StubModel;
+        assert!(!model.supports_batched_prefill());
+    }
+
+    #[test]
+    fn supports_batched_prefill_can_opt_in() {
+        let model = FullBatchPrefillModel;
+        assert!(model.supports_batched_prefill());
     }
 
     // -- SamplingConfig::needs_token_history (incremental history optimization) --

@@ -967,12 +967,31 @@ mod ffi {
         ) -> UniquePtr<MlxArray>;
 
         /// SDPA with explicit causal masking for prefill
+        #[rust_name = "ffi_fast_scaled_dot_product_attention_causal"]
         fn fast_scaled_dot_product_attention_causal(
             q: &MlxArray,
             k: &MlxArray,
             v: &MlxArray,
             scale: f32,
         ) -> UniquePtr<MlxArray>;
+
+        fn sdpa_supports_fast_path(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            has_mask: bool,
+            has_arr_mask: bool,
+            do_causal: bool,
+        ) -> bool;
+
+        fn sdpa_supports_nax(
+            q: &MlxArray,
+            k: &MlxArray,
+            v: &MlxArray,
+            has_mask: bool,
+            has_arr_mask: bool,
+            do_causal: bool,
+        ) -> bool;
 
         /// Metal 4 attention dispatch via upstream MLX main SDPA.
         ///
@@ -1754,6 +1773,57 @@ pub use ffi::*;
 // Re-export cxx::UniquePtr for consumers of this crate
 pub use cxx::UniquePtr;
 pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
+
+/// Causal SDPA wrapper with transparent M5 Neural Accelerator routing.
+///
+/// On M5-class hardware (`has_neural_accelerator && macos_supports_na`), the
+/// plain causal case preserves MLX's native `"causal"` mask mode so upstream
+/// Metal/NAX SDPA can select the dedicated causal kernel. Sliding-window and
+/// softcap variants still route through the shared attention dispatcher with an
+/// explicit mask array. Other hardware keeps using MLX's native causal SDPA
+/// entry point.
+///
+/// Used by: Llama, Qwen, Mixtral, Gemma, Cohere, Phi, OLMo, Exaone, GLM4,
+/// MiniCPM, DeepSeek, Hunyuan, StarCoder2 and other causal prefill call sites
+pub fn causal_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    softcap: f32,
+    window_size: i32,
+) -> UniquePtr<MlxArray> {
+    if softcap > 0.0 || window_size > 0 {
+        let q_len = ffi::array_shape(q)[2];
+        let k_len = ffi::array_shape(k)[2];
+        let offset = (k_len - q_len).max(0);
+        let mask = if window_size > 0 {
+            utils::create_causal_mask_with_window(q_len, offset, Some(window_size))
+        } else {
+            utils::create_causal_mask(q_len, offset)
+        };
+        return layers::attention(q, k, v, scale, Some(mask.as_ref().unwrap()), softcap, window_size);
+    }
+
+    let hw = hardware::get_hardware();
+    if hw.has_neural_accelerator && hw.macos_supports_na {
+        return layers::metal4_causal_attention(q, k, v, scale);
+    }
+
+    ffi::ffi_fast_scaled_dot_product_attention_causal(q, k, v, scale)
+}
+
+/// Causal SDPA wrapper with transparent M5 Neural Accelerator routing.
+///
+/// This is the zero-softcap, full-window shorthand used by existing model code.
+pub fn fast_scaled_dot_product_attention_causal(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    causal_attention(q, k, v, scale, 0.0, 0)
+}
 
 // High-level layer abstractions
 pub mod layers;

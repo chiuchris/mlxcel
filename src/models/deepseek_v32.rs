@@ -29,7 +29,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{create_causal_mask, silu, slice_axis, stack_arrays};
+use mlxcel_core::utils::{silu, slice_axis, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
@@ -604,15 +604,7 @@ impl DeepSeekV32Model {
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(input_ids);
 
-        let shape = mlxcel_core::array_shape(&h);
-        let seq_len = shape[1];
-
-        let mask = if seq_len > 1 {
-            let offset = caches.first().map(|c| c.seq_len()).unwrap_or(0);
-            Some(create_causal_mask(seq_len, offset))
-        } else {
-            mask.map(mlxcel_core::copy)
-        };
+        let mask = mask.map(mlxcel_core::copy);
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             h = layer.forward(&h, mask.as_deref(), cache);

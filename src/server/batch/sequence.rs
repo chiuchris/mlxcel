@@ -138,6 +138,7 @@ impl SequenceState {
     /// Valid transitions:
     /// - `Queued -> Prefilling` (scheduler begins prefill)
     /// - `Prefilling -> Decoding` (prefill complete, enter decode loop)
+    /// - `Prefilling -> Finished(Stop | Length)` (completed on first token)
     /// - `Decoding -> Finished(*)` (normal completion)
     /// - `Decoding -> Queued` (preemptive eviction for re-prefill)
     /// - Any non-terminal state -> `Finished(Cancelled | Error)` (early abort)
@@ -146,6 +147,8 @@ impl SequenceState {
             // Normal forward progression
             (SequenceState::Queued, SequenceState::Prefilling) => true,
             (SequenceState::Prefilling, SequenceState::Decoding) => true,
+            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::Stop)) => true,
+            (SequenceState::Prefilling, SequenceState::Finished(FinishReason::Length)) => true,
             (SequenceState::Decoding, SequenceState::Finished(_)) => true,
             // Preemptive eviction: a decoding sequence can be evicted and
             // re-queued for re-prefill.
@@ -489,12 +492,28 @@ mod tests {
     }
 
     #[test]
-    fn invalid_transition_prefilling_to_finished_stop() {
-        // Prefilling can only go to Finished via Cancelled or Error, not Stop/Length
+    fn valid_transition_prefilling_to_finished_stop() {
         let mut state = SequenceState::Prefilling;
-        let result = state.transition_to(SequenceState::Finished(FinishReason::Stop));
-        assert!(result.is_err());
-        assert!(matches!(state, SequenceState::Prefilling));
+        assert!(
+            state
+                .transition_to(SequenceState::Finished(FinishReason::Stop))
+                .is_ok()
+        );
+        assert!(matches!(state, SequenceState::Finished(FinishReason::Stop)));
+    }
+
+    #[test]
+    fn valid_transition_prefilling_to_finished_length() {
+        let mut state = SequenceState::Prefilling;
+        assert!(
+            state
+                .transition_to(SequenceState::Finished(FinishReason::Length))
+                .is_ok()
+        );
+        assert!(matches!(
+            state,
+            SequenceState::Finished(FinishReason::Length)
+        ));
     }
 
     #[test]

@@ -720,6 +720,25 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     float scale
 );
 
+// Upstream MLX SDPA capability helpers for Metal/NAX instrumentation.
+bool sdpa_supports_fast_path(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+);
+
+bool sdpa_supports_nax(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+);
+
 // Fused QKV projection + reshape + transpose + RoPE
 // Reduces FFI overhead for the projection chain
 std::unique_ptr<MlxArray> fused_qkv_project_and_rope(

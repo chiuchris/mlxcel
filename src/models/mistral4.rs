@@ -315,9 +315,7 @@ impl Mistral4Attention {
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &queries, &keys, &values, self.scale,
-            )
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
         };
 
         // Transpose back and reshape

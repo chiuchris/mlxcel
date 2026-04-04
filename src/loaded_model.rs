@@ -271,6 +271,10 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, after_prefill())
     }
 
+    fn release_sequence_state(&self, caches: &mut [mlxcel_core::layers::KVCache]) {
+        delegate_language_model!(self, release_sequence_state(caches))
+    }
+
     fn supports_batching(&self) -> bool {
         delegate_language_model!(self, supports_batching())
     }
@@ -282,5 +286,9 @@ impl LanguageModel for LoadedModel {
         mask: Option<&mlxcel_core::MlxArray>,
     ) -> UniquePtr<mlxcel_core::MlxArray> {
         delegate_language_model!(self, forward_batched(input_ids, batch_caches, mask))
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        delegate_language_model!(self, supports_batched_prefill())
     }
 }

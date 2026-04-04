@@ -472,6 +472,7 @@ pub struct ExaoneMoeAttention {
     pub rope_base: f32,
     pub rope_traditional: bool,
     pub is_sliding_window: bool,
+    pub window_size: i32,
 }
 
 impl ExaoneMoeAttention {
@@ -530,15 +531,26 @@ impl ExaoneMoeAttention {
         // Scaled dot-product attention
         let attn_out = if l > 1 && mask.is_none() {
             // Prefill: use causal masking
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
+            mlxcel_core::causal_attention(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         } else {
             // Single token or explicit mask
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         };
@@ -842,6 +854,11 @@ fn load_decoder_layer(
         rope_base: args.get_rope_theta(),
         rope_traditional: args.rope_traditional,
         is_sliding_window,
+        window_size: if is_sliding_window {
+            args.sliding_window as i32
+        } else {
+            0
+        },
     };
 
     // Load MLP (either Dense or MoE)

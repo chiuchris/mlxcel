@@ -183,9 +183,7 @@ impl Attention {
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         };
 
         // Transpose back and reshape
@@ -376,24 +374,12 @@ impl HunyuanV1DenseModel {
         &self,
         input_ids: &MlxArray,
         caches: &mut [KVCache],
-        _mask: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         // Embed tokens
         let mut h = self.embed_tokens.forward(input_ids);
 
-        // Create causal mask from hidden state and cache offset
-        // (matches Python: mask = create_attention_mask(h, cache[0]))
-        let h_shape = mlxcel_core::array_shape(&h);
-        let seq_len = h_shape[1];
-        let cache_offset = caches[0].offset;
-        let mask = if seq_len > 1 {
-            Some(mlxcel_core::utils::create_causal_mask(
-                seq_len,
-                cache_offset,
-            ))
-        } else {
-            None
-        };
+        let mask = mask.map(mlxcel_core::copy);
 
         // Pass through transformer layers
         for (i, layer) in self.layers.iter().enumerate() {

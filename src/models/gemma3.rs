@@ -114,6 +114,7 @@ pub struct Attention {
     pub head_dim: i32,
     pub scale: f32,
     pub is_sliding: bool,
+    pub window_size: i32,
     pub rope_base: f32,
     pub q_norm: GemmaRMSNorm,
     pub k_norm: GemmaRMSNorm,
@@ -159,7 +160,13 @@ impl Attention {
         let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
         let attn_out = unsafe {
             mlxcel_core::layers::attention_from_ptr(
-                &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                mask_ptr,
+                0.0,
+                self.window_size,
             )
         };
 
@@ -224,6 +231,11 @@ impl Attention {
             head_dim,
             scale,
             is_sliding,
+            window_size: if is_sliding {
+                args.sliding_window as i32
+            } else {
+                0
+            },
             rope_base,
             q_norm,
             k_norm,

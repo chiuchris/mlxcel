@@ -124,6 +124,20 @@ pub struct BatchScheduler {
 }
 
 impl BatchScheduler {
+    fn release_sequence_caches(&mut self, seq_id: SequenceId) {
+        if let Some(caches) = self.cache_pool.get_caches_mut(seq_id) {
+            self.model.release_sequence_state(caches);
+        }
+        self.cache_pool.release(seq_id);
+    }
+
+    fn begin_prefill(seq: &mut SequenceInfo) -> Result<(), String> {
+        seq.state.transition_to(SequenceState::Prefilling)?;
+        seq.prefill_start = Some(Instant::now());
+        seed_rng_if_needed(&seq.sampling);
+        Ok(())
+    }
+
     /// Create a new batch scheduler, taking ownership of the model and channel.
     pub fn new(
         model: LoadedModel,
@@ -339,7 +353,7 @@ impl BatchScheduler {
         ) {
             Ok(emb) => emb,
             Err(err) => {
-                self.cache_pool.release(seq_id);
+                self.release_sequence_caches(seq_id);
                 let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
                 return;
             }
@@ -371,7 +385,7 @@ impl BatchScheduler {
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
-            self.cache_pool.release(rejected.seq_id);
+            self.release_sequence_caches(rejected.seq_id);
             let _ = rejected.response_tx.send(GenerateEvent::Error(
                 "Server busy: prefill queue full".to_string(),
             ));
@@ -484,13 +498,11 @@ impl BatchScheduler {
             None => return,
         };
 
-        if let Err(err) = seq.state.transition_to(SequenceState::Prefilling) {
+        if let Err(err) = Self::begin_prefill(&mut seq) {
             tracing::error!("State transition error: {err}");
             self.abort_sequence(seq, &err);
             return;
         }
-        seq.prefill_start = Some(Instant::now());
-        seed_rng_if_needed(&seq.sampling);
 
         let prompt_len = seq.prompt_tokens.len();
 
@@ -537,12 +549,36 @@ impl BatchScheduler {
             return;
         }
 
+        // Most models only implement batched decode (`[B, 1]`) and do not
+        // support full-sequence prompt prefill via `forward_batched()`.
+        // Keep those on the single-sequence prefill path so correctness and
+        // the standard NAX-friendly prefill route are preserved.
+        if !self.model.supports_batched_prefill() {
+            tracing::debug!(
+                "batched prefill: falling back to sequential (model lacks full batched prefill)"
+            );
+            for mut seq in seqs {
+                if let Err(err) = Self::begin_prefill(&mut seq) {
+                    tracing::error!("Batched prefill state transition error: {err}");
+                    self.abort_sequence(seq, &err);
+                    continue;
+                }
+                self.execute_full_prefill(seq);
+            }
+            return;
+        }
+
         // Any VLM request cannot currently be batched (embeddings are
         // per-sequence and would need separate handling). Fall back for the
         // whole batch when any request carries VLM embeddings.
         if seqs.iter().any(|s| s.vlm_embeddings.is_some()) {
             tracing::debug!("batched prefill: falling back to sequential (VLM request in batch)");
-            for seq in seqs {
+            for mut seq in seqs {
+                if let Err(err) = Self::begin_prefill(&mut seq) {
+                    tracing::error!("Batched prefill state transition error: {err}");
+                    self.abort_sequence(seq, &err);
+                    continue;
+                }
                 self.execute_full_prefill(seq);
             }
             return;
@@ -550,7 +586,18 @@ impl BatchScheduler {
 
         let b = seqs.len();
         let max_len = seqs.iter().map(|s| s.prompt_tokens.len()).max().unwrap();
-        let padded_len = if should_align_prefill() {
+        let can_pad_prefill = self.model.supports_padded_prefill();
+        if !can_pad_prefill && seqs.iter().any(|s| s.prompt_tokens.len() != max_len) {
+            tracing::debug!(
+                "batched prefill: falling back to sequential (model requires equal prompt lengths)"
+            );
+            for seq in seqs {
+                self.execute_full_prefill(seq);
+            }
+            return;
+        }
+
+        let padded_len = if can_pad_prefill && should_align_prefill() {
             align_to_na_tile(max_len)
         } else {
             max_len
@@ -560,11 +607,9 @@ impl BatchScheduler {
 
         // Transition all sequences to Prefilling.
         for seq in &mut seqs {
-            if let Err(err) = seq.state.transition_to(SequenceState::Prefilling) {
+            if let Err(err) = Self::begin_prefill(seq) {
                 tracing::error!("Batched prefill state transition error: {err}");
             }
-            seq.prefill_start = Some(Instant::now());
-            seed_rng_if_needed(&seq.sampling);
         }
 
         // Build padded input: [B, padded_len]
@@ -578,21 +623,21 @@ impl BatchScheduler {
         let input = mlxcel_core::from_slice_i32(&flat_tokens, &[b as i32, padded_len as i32]);
 
         // Build per-sequence attention masks and collect cache pointers.
-        // Each mask has shape [padded_len, padded_len]; we add a batch dim
-        // by expanding to [1, padded_len, padded_len] and stacking into
-        // [B, padded_len, padded_len] so models can use it directly.
-        let mut batch_masks: Vec<UniquePtr<mlxcel_core::MlxArray>> = Vec::with_capacity(b);
-        for seq in &seqs {
-            let actual = seq.prompt_tokens.len() as i32;
-            let padded = padded_len as i32;
-            let mask = create_padded_prefill_mask(actual, padded, 0);
-            // Expand to [1, padded_len, padded_len] for stacking.
-            let expanded = mlxcel_core::expand_dims(&mask, 0);
-            batch_masks.push(expanded);
-        }
-
-        // Stack masks into [B, padded_len, padded_len].
-        let stacked_mask = mlxcel_core::stack_owned(&batch_masks, 0);
+        // Each mask has shape [padded_len, padded_len]. Stacking on axis 0
+        // produces [B, padded_len, padded_len], which model batched-prefill
+        // paths slice per sequence into [padded_len, padded_len].
+        let stacked_mask = if seqs.iter().any(|s| s.prompt_tokens.len() != padded_len) {
+            let mut batch_masks: Vec<UniquePtr<mlxcel_core::MlxArray>> = Vec::with_capacity(b);
+            for seq in &seqs {
+                let actual = seq.prompt_tokens.len() as i32;
+                let padded = padded_len as i32;
+                let mask = create_padded_prefill_mask(actual, padded, 0);
+                batch_masks.push(mask);
+            }
+            Some(mlxcel_core::stack_owned(&batch_masks, 0))
+        } else {
+            None
+        };
 
         // Collect cache pointers (one cache slice per sequence).
         let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> = Vec::with_capacity(b);
@@ -633,7 +678,7 @@ impl BatchScheduler {
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
         let raw_logits = self
             .model
-            .forward_batched(&input, &mut batch_caches, Some(&stacked_mask));
+            .forward_batched(&input, &mut batch_caches, stacked_mask.as_deref());
 
         mlxcel_core::eval(&raw_logits);
         mlxcel_core::clear_memory_cache();
@@ -1019,7 +1064,7 @@ impl BatchScheduler {
                 seq.max_tokens,
             );
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
-            self.cache_pool.release(seq.seq_id);
+            self.release_sequence_caches(seq.seq_id);
             return;
         }
 
@@ -1056,7 +1101,7 @@ impl BatchScheduler {
                 seq.decode_state
                     .finish(seq.created_at, seq.prompt_tokens.len(), seq.max_tokens);
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
-            self.cache_pool.release(seq.seq_id);
+            self.release_sequence_caches(seq.seq_id);
             return;
         }
 
@@ -1106,7 +1151,7 @@ impl BatchScheduler {
             );
 
             // Release its KV cache
-            self.cache_pool.release(victim.seq_id);
+            self.release_sequence_caches(victim.seq_id);
 
             // Reset the sequence for re-prefill: clear generated tokens,
             // reset decode state, and re-allocate a cache slot.
@@ -1123,7 +1168,7 @@ impl BatchScheduler {
                     victim.seq_id = new_id;
                     if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
                         tracing::error!("Eviction state transition error: {err}");
-                        self.cache_pool.release(new_id);
+                        self.release_sequence_caches(new_id);
                         let _ = victim
                             .response_tx
                             .send(GenerateEvent::Error(format!("Eviction state error: {err}")));
@@ -1141,7 +1186,7 @@ impl BatchScheduler {
 
             // Re-queue the evicted sequence (it will re-prefill when admitted)
             if let Err(rejected) = self.prefill_queue.enqueue(victim) {
-                self.cache_pool.release(rejected.seq_id);
+                self.release_sequence_caches(rejected.seq_id);
                 let _ = rejected.response_tx.send(GenerateEvent::Error(
                     "Preemption re-queue failed: prefill queue full".to_string(),
                 ));
@@ -1436,7 +1481,7 @@ impl BatchScheduler {
                 );
                 let _ = seq.response_tx.send(GenerateEvent::Done(result));
 
-                self.cache_pool.release(id);
+                self.release_sequence_caches(id);
                 self.batch_metrics
                     .record_sequence_completed(tokens_generated);
                 self.batch_observability.record_sequence_completed();
@@ -1454,7 +1499,7 @@ impl BatchScheduler {
         let _ = seq
             .response_tx
             .send(GenerateEvent::Error(error.to_string()));
-        self.cache_pool.release(seq.seq_id);
+        self.release_sequence_caches(seq.seq_id);
     }
 }
 

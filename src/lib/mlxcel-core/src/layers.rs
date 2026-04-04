@@ -24,6 +24,8 @@
 use crate::ffi;
 use crate::ffi::MlxArray;
 use cxx::UniquePtr;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 pub use crate::cache::{ChunkedKVCache, KVCache, KVCacheMode, RotatingKVCache};
 
@@ -1424,6 +1426,197 @@ fn should_use_metal4_attention() -> bool {
     hw.has_neural_accelerator && hw.macos_supports_na
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NaAttentionLogMode {
+    Off,
+    Sampled,
+    All,
+}
+
+fn na_attention_log_mode() -> NaAttentionLogMode {
+    static MODE: OnceLock<NaAttentionLogMode> = OnceLock::new();
+    *MODE.get_or_init(|| {
+        match std::env::var("MLXCEL_LOG_NA_ATTENTION")
+            .map(|v| v.trim().to_ascii_lowercase())
+            .ok()
+            .as_deref()
+        {
+            Some("1" | "true" | "yes" | "on" | "sample" | "sampled") => NaAttentionLogMode::Sampled,
+            Some("all" | "full") => NaAttentionLogMode::All,
+            _ => NaAttentionLogMode::Off,
+        }
+    })
+}
+
+fn classify_na_attention_dispatch(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    softcap: f32,
+    window_size: i32,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+) -> (&'static str, bool, bool) {
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(k);
+    let query_sequence_length = q_shape[2];
+    let key_sequence_length = k_shape[2];
+
+    let route = if softcap > 0.0 {
+        "softcap"
+    } else if has_array_mask && window_size == 0 && query_sequence_length > 1
+        && query_sequence_length == key_sequence_length
+    {
+        "padded_prefill"
+    } else if do_causal && !has_mask {
+        "native_causal"
+    } else if has_array_mask {
+        "array_mask"
+    } else if has_mask {
+        "mask"
+    } else {
+        "unmasked"
+    };
+
+    let fast_path_eligible =
+        ffi::sdpa_supports_fast_path(q, k, v, has_mask, has_array_mask, do_causal);
+    let nax_eligible = ffi::sdpa_supports_nax(q, k, v, has_mask, has_array_mask, do_causal);
+
+    (route, fast_path_eligible, nax_eligible)
+}
+
+fn na_attention_eligibility_reasons(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+    fast_path_eligible: bool,
+    nax_eligible: bool,
+) -> (&'static str, &'static str) {
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(k);
+    let v_shape = ffi::array_shape(v);
+
+    let q_len = q_shape[2];
+    let k_len = k_shape[2];
+    let q_heads = q_shape[1];
+    let kv_heads = k_shape[1].max(1);
+    let head_dim = q_shape[3];
+    let value_head_dim = v_shape[3];
+    let gqa_factor = q_heads / kv_heads;
+    let tf32_enabled = std::env::var("MLX_ENABLE_TF32")
+        .map(|v| v.trim() != "0")
+        .unwrap_or(true);
+
+    let fast_reason = if fast_path_eligible {
+        "eligible"
+    } else if q_len <= 8 {
+        if q_len > k_len {
+            "vector_q_len_gt_k_len"
+        } else if head_dim != value_head_dim {
+            "vector_head_dim_mismatch"
+        } else if !matches!(head_dim, 64 | 96 | 128 | 256) {
+            "vector_head_dim_unsupported"
+        } else if q_len * gqa_factor > 32 {
+            "vector_gqa_over_limit"
+        } else {
+            "vector_other"
+        }
+    } else if head_dim != value_head_dim {
+        "full_head_dim_mismatch"
+    } else if !matches!(head_dim, 64 | 80 | 128 | 256) {
+        "full_head_dim_unsupported"
+    } else if has_mask && !has_array_mask && !(q_len <= k_len && do_causal) {
+        "full_mask_mode_unsupported"
+    } else {
+        "full_other"
+    };
+
+    let nax_reason = if nax_eligible {
+        "eligible"
+    } else if !fast_path_eligible {
+        "fast_path_blocked"
+    } else if q_len <= 8 {
+        "vector_path_only"
+    } else if head_dim == 80 {
+        "head_dim_80_excluded"
+    } else if ffi::array_dtype(q) == crate::dtype::FLOAT32 && !tf32_enabled {
+        "float32_tf32_disabled"
+    } else {
+        "other"
+    };
+
+    (fast_reason, nax_reason)
+}
+
+fn record_na_attention_dispatch(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+    softcap: f32,
+    window_size: i32,
+    has_mask: bool,
+    has_array_mask: bool,
+    do_causal: bool,
+) {
+    static DISPATCH_COUNT: AtomicUsize = AtomicUsize::new(0);
+    let count = DISPATCH_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    let should_log = match na_attention_log_mode() {
+        NaAttentionLogMode::Off => false,
+        NaAttentionLogMode::Sampled => count <= 8 || count % 100 == 0,
+        NaAttentionLogMode::All => true,
+    };
+    if should_log {
+        let q_shape = ffi::array_shape(q);
+        let k_shape = ffi::array_shape(k);
+        let phase = if q_shape[2] > 1 { "prefill" } else { "decode" };
+        let (route, fast_path_eligible, nax_eligible) = classify_na_attention_dispatch(
+            q,
+            k,
+            v,
+            softcap,
+            window_size,
+            has_mask,
+            has_array_mask,
+            do_causal,
+        );
+        let (fast_reason, nax_reason) = na_attention_eligibility_reasons(
+            q,
+            k,
+            v,
+            has_mask,
+            has_array_mask,
+            do_causal,
+            fast_path_eligible,
+            nax_eligible,
+        );
+        eprintln!(
+            "[mlxcel][na-attention] dispatch={} phase={} route={} fast_path_eligible={} fast_path_reason={} nax_eligible={} nax_reason={} q={:?} k={:?} scale={:.6} softcap={:.3} window_size={}",
+            count, phase, route, fast_path_eligible, fast_reason, nax_eligible, nax_reason, q_shape, k_shape, scale, softcap, window_size
+        );
+    }
+}
+
+/// Causal SDPA dispatch that preserves MLX's native `"causal"` mask mode.
+///
+/// Used by: `crate::causal_attention()` on M5-class hardware for full-window
+/// causal prefill, so upstream MLX can select the NAX causal kernel directly.
+pub fn metal4_causal_attention(
+    q: &MlxArray,
+    k: &MlxArray,
+    v: &MlxArray,
+    scale: f32,
+) -> UniquePtr<MlxArray> {
+    if should_use_metal4_attention() {
+        record_na_attention_dispatch(q, k, v, scale, 0.0, 0, false, false, true);
+    }
+    ffi::ffi_fast_scaled_dot_product_attention_causal(q, k, v, scale)
+}
+
 /// Unified attention dispatch with transparent Metal 4 and softcap fallback.
 ///
 /// Used by: Llama3, Qwen3, Gemma2, Gemma3 and other standard SDPA call sites
@@ -1436,10 +1629,6 @@ pub fn attention(
     softcap: f32,
     window_size: i32,
 ) -> UniquePtr<MlxArray> {
-    if should_use_metal4_attention() {
-        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
-    }
-
     let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
     if softcap > 0.0 {
         let q_heads = ffi::array_shape(q)[1];
@@ -1453,6 +1642,10 @@ pub fn attention(
         }
         // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
         return unsafe { ffi::compiled_softcap_sdpa(q, k, v, scale, softcap, mask_ptr) };
+    }
+
+    if should_use_metal4_attention() {
+        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
     }
 
     // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
@@ -1525,6 +1718,19 @@ pub fn metal4_attention(
     // Enable Metal 4 dispatch only on M5+ hardware running macOS 26+.
     // Uses the canonical NA detection condition from apple-silicon-precision.md.
     let use_metal4 = should_use_metal4_attention();
+    if use_metal4 {
+        record_na_attention_dispatch(
+            q,
+            k,
+            v,
+            scale,
+            softcap,
+            window_size,
+            mask.is_some(),
+            mask.is_some(),
+            false,
+        );
+    }
     let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
     // SAFETY: mask_ptr is either null or a valid reference with lifetime tied
     // to the `mask` argument, which outlives this function call.
@@ -1656,6 +1862,22 @@ mod tests {
 
         let out = attention(&q, &k, &v, 0.5, None, 30.0, 0);
         assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 4, 3, 8]);
+    }
+
+    /// Verify the public causal SDPA wrapper preserves the original shape
+    /// contract while routing through the centralized attention dispatcher.
+    #[test]
+    fn causal_attention_wrapper_matches_fast_causal_shape() {
+        use crate::dtype;
+        let q = ffi::zeros(&[1, 2, 3, 8], dtype::FLOAT16);
+        let k = ffi::zeros(&[1, 2, 5, 8], dtype::FLOAT16);
+        let v = ffi::zeros(&[1, 2, 5, 8], dtype::FLOAT16);
+        let scale = 1.0 / 8.0_f32.sqrt();
+
+        let out = crate::fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+        let out_fast = ffi::ffi_fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
+
+        assert_eq!(ffi::array_shape(&out), ffi::array_shape(&out_fast));
     }
 
     /// Verify that the detection condition uses the canonical NA check

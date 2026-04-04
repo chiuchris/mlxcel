@@ -235,9 +235,7 @@ impl Attention {
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         };
 
         // Transpose back and reshape

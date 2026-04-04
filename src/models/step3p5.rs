@@ -298,6 +298,7 @@ pub struct Step3p5Attention {
     rope_dims: i32,
     rope_base: f32,
     scale: f32,
+    window_size: i32,
 }
 
 impl Step3p5Attention {
@@ -340,12 +341,23 @@ impl Step3p5Attention {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
+            mlxcel_core::causal_attention(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         };
 
@@ -419,6 +431,11 @@ impl Step3p5Attention {
             rope_dims,
             rope_base,
             scale,
+            window_size: if args.is_sliding(layer_idx) {
+                args.sliding_window
+            } else {
+                0
+            },
         })
     }
 }

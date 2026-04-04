@@ -37,6 +37,7 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::Path;
 
 // Configuration.
@@ -631,6 +632,8 @@ pub struct Qwen35Model {
     /// Internal caches for LanguageModel trait compatibility
     /// Using RefCell to allow mutation through shared reference (required by trait)
     internal_caches: RefCell<Vec<Qwen3NextCache>>,
+    /// Sequence-local mixed caches keyed by the dummy external KV cache slice.
+    sequence_caches: RefCell<HashMap<usize, Vec<Qwen3NextCache>>>,
     /// MRoPE position_ids for VLM [3, batch, seq_len]
     position_ids: RefCell<Option<UniquePtr<MlxArray>>>,
     /// Rope deltas for token generation after VLM prefill
@@ -703,6 +706,130 @@ impl Qwen35Model {
                 }
             })
             .collect()
+    }
+
+    fn cache_key(caches: &[KVCache]) -> usize {
+        caches.as_ptr() as usize
+    }
+
+    fn split_batched_cache(cache: &Qwen3NextCache, batch_idx: usize) -> Qwen3NextCache {
+        match cache {
+            Qwen3NextCache::Attention(kv) => {
+                let mut split = KVCache::new();
+                split.offset = kv.offset;
+                split.keys = kv.keys.as_ref().map(|keys| {
+                    mlxcel_core::slice(
+                        keys,
+                        &[batch_idx as i32, 0, 0, 0],
+                        &[batch_idx as i32 + 1, mlxcel_core::array_shape(keys)[1], kv.offset, mlxcel_core::array_shape(keys)[3]],
+                    )
+                });
+                split.values = kv.values.as_ref().map(|values| {
+                    mlxcel_core::slice(
+                        values,
+                        &[batch_idx as i32, 0, 0, 0],
+                        &[batch_idx as i32 + 1, mlxcel_core::array_shape(values)[1], kv.offset, mlxcel_core::array_shape(values)[3]],
+                    )
+                });
+                Qwen3NextCache::Attention(split)
+            }
+            Qwen3NextCache::Linear(gd) => {
+                let mut split = GatedDeltaCache::new();
+                split.offset = gd.offset;
+                split.conv_state = gd.conv_state.as_ref().map(|state| {
+                    let shape = mlxcel_core::array_shape(state);
+                    mlxcel_core::slice(
+                        state,
+                        &[batch_idx as i32, 0, 0],
+                        &[batch_idx as i32 + 1, shape[1], shape[2]],
+                    )
+                });
+                split.state_cache = gd.state_cache.as_ref().map(|state| {
+                    let shape = mlxcel_core::array_shape(state);
+                    mlxcel_core::slice(
+                        state,
+                        &[batch_idx as i32, 0, 0, 0],
+                        &[batch_idx as i32 + 1, shape[1], shape[2], shape[3]],
+                    )
+                });
+                Qwen3NextCache::Linear(split)
+            }
+        }
+    }
+
+    fn forward_batched_prefill(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+    ) -> UniquePtr<MlxArray> {
+        let mut batched_caches = self.make_internal_caches();
+        let logits = self.forward_internal(input_ids, None, &mut batched_caches, None);
+        let keys: Vec<usize> = batch_caches.iter().map(|c| Self::cache_key(c)).collect();
+        let mut sequence_caches = self.sequence_caches.borrow_mut();
+        for (batch_idx, key) in keys.into_iter().enumerate() {
+            let split_caches = batched_caches
+                .iter()
+                .map(|cache| Self::split_batched_cache(cache, batch_idx))
+                .collect();
+            sequence_caches.insert(key, split_caches);
+        }
+        logits
+    }
+
+    fn forward_with_sequence_caches(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+    ) -> UniquePtr<MlxArray> {
+        let key = Self::cache_key(caches);
+        let seq_caches_opt = self.sequence_caches.borrow_mut().remove(&key);
+        if let Some(mut seq_caches) = seq_caches_opt {
+            let logits = self.forward_with_mrope_state(input_ids, input_embeddings, &mut seq_caches);
+            self.sequence_caches.borrow_mut().insert(key, seq_caches);
+            return logits;
+        }
+
+        let mut internal = self.internal_caches.borrow_mut();
+        self.forward_with_mrope_state(input_ids, input_embeddings, &mut internal)
+    }
+
+    fn forward_with_mrope_state(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Qwen3NextCache],
+    ) -> UniquePtr<MlxArray> {
+        let cache_offset = caches
+            .iter()
+            .find_map(|c| match c {
+                super::qwen3_next::Qwen3NextCache::Attention(kv) => Some(kv.offset),
+                _ => None,
+            })
+            .unwrap_or(0);
+
+        let ids_shape = mlxcel_core::array_shape(input_ids);
+        let batch = ids_shape[0];
+        let seq_len = ids_shape[1];
+
+        let has_stored = { self.position_ids.borrow().is_some() };
+        let has_deltas = { self.rope_deltas.borrow().is_some() };
+
+        let position_ids = if has_stored && cache_offset == 0 {
+            self.position_ids.borrow_mut().take()
+        } else if has_deltas {
+            let delta = { self.rope_deltas.borrow().unwrap_or(0) };
+            let offset = cache_offset + delta;
+            let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
+            let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
+            let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
+            let pos = mlxcel_core::expand_dims(&pos, 0);
+            Some(mlxcel_core::broadcast_to(&pos, &[3, batch, seq_len]))
+        } else {
+            None
+        };
+
+        self.forward_internal(input_ids, input_embeddings, caches, position_ids.as_deref())
     }
 
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, Qwen35Config), String> {
@@ -802,6 +929,7 @@ impl Qwen35Model {
             lm_head,
             config: config_clone,
             internal_caches: RefCell::new(internal_caches),
+            sequence_caches: RefCell::new(HashMap::new()),
             position_ids: RefCell::new(None),
             rope_deltas: RefCell::new(None),
         })
@@ -828,51 +956,10 @@ impl Qwen35Model {
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut internal = self.internal_caches.borrow_mut();
-
-        // Get cache offset from first full attention layer's cache
-        let cache_offset = internal
-            .iter()
-            .find_map(|c| match c {
-                super::qwen3_next::Qwen3NextCache::Attention(kv) => Some(kv.offset),
-                _ => None,
-            })
-            .unwrap_or(0);
-
-        let ids_shape = mlxcel_core::array_shape(input_ids);
-        let batch = ids_shape[0];
-        let seq_len = ids_shape[1];
-
-        // Compute position_ids for MRoPE
-        let has_stored = self.position_ids.borrow().is_some();
-        let has_deltas = self.rope_deltas.borrow().is_some();
-
-        let position_ids = if has_stored && cache_offset == 0 {
-            // Prefill: consume stored position_ids from VLM preprocessing
-            self.position_ids.borrow_mut().take()
-        } else if has_deltas {
-            // Decode: compute sequential position_ids with rope_deltas offset
-            let delta = self.rope_deltas.borrow().unwrap_or(0);
-            let offset = cache_offset + delta;
-            let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
-            let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
-            let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
-            let pos = mlxcel_core::expand_dims(&pos, 0);
-            Some(mlxcel_core::broadcast_to(&pos, &[3, batch, seq_len]))
-        } else {
-            // Text-only: no MRoPE, position_ids = None
-            None
-        };
-
-        self.forward_internal(
-            input_ids,
-            input_embeddings,
-            &mut internal,
-            position_ids.as_deref(),
-        )
+        self.forward_with_sequence_caches(input_ids, input_embeddings, caches)
     }
 
     /// Number of layers
@@ -1130,29 +1217,20 @@ impl LanguageModel for Qwen35Model {
     fn forward(
         &self,
         input: &MlxArray,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        // Qwen3.5 uses mixed cache types (KVCache + GatedDeltaCache)
-        // We use internal RefCell caches to maintain state through shared reference
-        let mut internal = self.internal_caches.borrow_mut();
-        // Use stored position_ids if available (set by VLM during prefill)
-        let pos_ids = self.position_ids.borrow();
-        let pos_ref = pos_ids.as_deref();
-        self.forward_internal(input, None, &mut internal, pos_ref)
+        self.forward_with_sequence_caches(input, None, caches)
     }
 
     fn forward_with_embeddings(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut internal = self.internal_caches.borrow_mut();
-        let pos_ids = self.position_ids.borrow();
-        let pos_ref = pos_ids.as_deref();
-        self.forward_internal(input_ids, input_embeddings, &mut internal, pos_ref)
+        self.forward_with_sequence_caches(input_ids, input_embeddings, caches)
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
@@ -1160,10 +1238,12 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
-        // Reset internal caches
+        let dummy_caches: Vec<KVCache> = (0..self.layers.len()).map(|_| KVCache::new()).collect();
+        self.sequence_caches
+            .borrow_mut()
+            .insert(Self::cache_key(&dummy_caches), self.make_internal_caches());
         *self.internal_caches.borrow_mut() = self.make_internal_caches();
-        // Return dummy KV caches for trait compatibility
-        (0..self.layers.len()).map(|_| KVCache::new()).collect()
+        dummy_caches
     }
 
     fn num_layers(&self) -> usize {
@@ -1171,7 +1251,58 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn supports_batching(&self) -> bool {
-        false // Qwen3.5 uses internal RefCell mixed caches, not compatible with per-sequence KV isolation
+        true
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        true
+    }
+
+    fn supports_padded_prefill(&self) -> bool {
+        false
+    }
+
+    fn release_sequence_state(&self, caches: &mut [KVCache]) {
+        self.sequence_caches
+            .borrow_mut()
+            .remove(&Self::cache_key(caches));
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        if batch_caches.len() <= 1 || shape[1] <= 1 {
+            let token_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
+            if batch_caches.len() == 1 {
+                return self.forward(&token_0, batch_caches[0], None);
+            }
+            let mut result = self.forward(&token_0, batch_caches[0], None);
+            for (i, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+                let input_i =
+                    mlxcel_core::slice(input_ids, &[i as i32, 0], &[i as i32 + 1, shape[1]]);
+                let logits_i = self.forward(&input_i, caches, None);
+                result = mlxcel_core::concatenate(&result, &logits_i, 0);
+            }
+            return result;
+        }
+
+        if mask.is_some() {
+            let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
+            let mut result = self.forward(&input_0, batch_caches[0], None);
+            for (i, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+                let input_i =
+                    mlxcel_core::slice(input_ids, &[i as i32, 0], &[i as i32 + 1, shape[1]]);
+                let logits_i = self.forward(&input_i, caches, None);
+                result = mlxcel_core::concatenate(&result, &logits_i, 0);
+            }
+            return result;
+        }
+
+        self.forward_batched_prefill(input_ids, batch_caches)
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

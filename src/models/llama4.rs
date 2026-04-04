@@ -549,9 +549,7 @@ impl CxxAttention {
         // Scaled dot-product attention using cached K,V
         let attn_out = if l > 1 && mask.is_none() {
             // Prefill with no mask: use causal masking
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         } else if let Some(m) = mask {
             // Explicit mask provided
             unsafe {
@@ -670,7 +668,7 @@ impl CxxAttention {
             .expect("Cache values should exist after update");
 
         let attn_out = if l > 1 && mask.is_none() {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(&q, cache_k, cache_v, self.scale)
+            mlxcel_core::causal_attention(&q, cache_k, cache_v, self.scale, 0.0, 0)
         } else {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
@@ -796,7 +794,7 @@ impl CxxAttention {
 
         // SDPA with causal masking for prefill
         let attn_out = if l > 1 {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(&q, cache_k, cache_v, self.scale)
+            mlxcel_core::causal_attention(&q, cache_k, cache_v, self.scale, 0.0, 0)
         } else {
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(

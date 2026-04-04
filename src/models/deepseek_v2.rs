@@ -24,7 +24,7 @@
 
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
-use mlxcel_core::utils::{create_causal_mask, repeat_kv, silu, slice_axis};
+use mlxcel_core::utils::{repeat_kv, silu, slice_axis};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
@@ -436,9 +436,7 @@ impl MLAAttention {
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &queries, &keys, &values, self.scale,
-            )
+            mlxcel_core::causal_attention(&queries, &keys, &values, self.scale, 0.0, 0)
         };
 
         // Reshape output
@@ -648,15 +646,7 @@ impl DeepSeekV2Model {
     ) -> UniquePtr<MlxArray> {
         let mut h = self.embed_tokens.forward(input_ids);
 
-        let shape = mlxcel_core::array_shape(&h);
-        let seq_len = shape[1];
-
-        let mask = if seq_len > 1 {
-            let offset = caches.first().map(|c| c.seq_len()).unwrap_or(0);
-            Some(create_causal_mask(seq_len, offset))
-        } else {
-            mask.map(mlxcel_core::copy)
-        };
+        let mask = mask.map(mlxcel_core::copy);
 
         for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
             h = layer.forward(&h, mask.as_deref(), cache);

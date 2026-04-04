@@ -10,6 +10,7 @@
 #include "mlx/fft.h"
 #include "mlx/random.h"
 #include "mlx/einsum.h"
+#include "mlx/utils.h"
 #ifdef __APPLE__
 #include "mlx/backend/metal/metal.h"
 #endif
@@ -2296,6 +2297,98 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, "causal", std::nullopt
     ));
+}
+
+namespace {
+bool sdpa_supports_fast_path_impl(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+) {
+    const int value_head_dim = v.shape(-1);
+    const int query_head_dim = q.shape(-1);
+    const int query_sequence_length = q.shape(2);
+    const int key_sequence_length = k.shape(2);
+    const int num_query_heads = q.shape(1);
+    const int num_kv_heads = k.shape(1);
+    const int gqa_factor = num_query_heads / std::max(num_kv_heads, 1);
+
+    const bool sdpa_vector_supported_head_dim =
+        query_head_dim == value_head_dim &&
+        (query_head_dim == 64 || query_head_dim == 96 || query_head_dim == 128 ||
+         query_head_dim == 256);
+    const bool sdpa_full_supported_head_dim =
+        query_head_dim == value_head_dim &&
+        (query_head_dim == 64 || query_head_dim == 80 || query_head_dim == 128 ||
+         query_head_dim == 256);
+    const bool sdpa_full_supported_mask =
+        !has_mask || has_arr_mask ||
+        (query_sequence_length <= key_sequence_length && do_causal);
+
+    const bool supports_sdpa_full =
+        query_sequence_length > 8 && sdpa_full_supported_mask && sdpa_full_supported_head_dim;
+    const bool supports_sdpa_vector =
+        query_sequence_length <= 8 && query_sequence_length <= key_sequence_length &&
+        sdpa_vector_supported_head_dim && (query_sequence_length * gqa_factor) <= 32;
+
+    return supports_sdpa_full || supports_sdpa_vector;
+}
+
+bool sdpa_supports_nax_impl(
+    const array& q,
+    const array& k,
+    const array& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+) {
+#ifdef __APPLE__
+    const bool supports_fast_path =
+        sdpa_supports_fast_path_impl(q, k, v, has_mask, has_arr_mask, do_causal);
+    const bool supports_full_path =
+        q.shape(2) > 8 && q.shape(-1) == v.shape(-1) &&
+        (q.shape(-1) == 64 || q.shape(-1) == 80 || q.shape(-1) == 128 ||
+         q.shape(-1) == 256);
+    return supports_fast_path && supports_full_path &&
+        q.shape(3) != 80 &&
+        (mlx::core::env::enable_tf32() || q.dtype() != mlx::core::float32);
+#else
+    (void)q;
+    (void)k;
+    (void)v;
+    (void)has_mask;
+    (void)has_arr_mask;
+    (void)do_causal;
+    return false;
+#endif
+}
+} // namespace
+
+bool sdpa_supports_fast_path(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+) {
+    return sdpa_supports_fast_path_impl(
+        q.inner, k.inner, v.inner, has_mask, has_arr_mask, do_causal);
+}
+
+bool sdpa_supports_nax(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    bool has_mask,
+    bool has_arr_mask,
+    bool do_causal
+) {
+    return sdpa_supports_nax_impl(
+        q.inner, k.inner, v.inner, has_mask, has_arr_mask, do_causal);
 }
 
 // Fused QKV projection + reshape + transpose + RoPE (no cache, no SDPA)

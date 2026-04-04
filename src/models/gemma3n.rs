@@ -427,6 +427,7 @@ pub struct Gemma3nAttention {
     pub num_kv_heads: i32,
     pub head_dim: i32,
     pub is_sliding: bool,
+    pub window_size: i32,
     pub is_kv_shared_layer: bool,
     pub rope_theta: f32,
     pub scale: f32,
@@ -483,15 +484,26 @@ impl Gemma3nAttention {
         // Scaled dot-product attention
         let attn_out = if l > 1 && mask.is_none() {
             // Prefill: use causal masking
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &queries, &keys, &values, self.scale,
+            mlxcel_core::causal_attention(
+                &queries,
+                &keys,
+                &values,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         } else {
             // Single token or explicit mask
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &queries, &keys, &values, self.scale, mask_ptr, 0.0, 0,
+                    &queries,
+                    &keys,
+                    &values,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         };
@@ -585,6 +597,11 @@ impl Gemma3nAttention {
             num_kv_heads: config.num_key_value_heads as i32,
             head_dim,
             is_sliding,
+            window_size: if is_sliding {
+                config.sliding_window as i32
+            } else {
+                0
+            },
             is_kv_shared_layer,
             rope_theta,
             scale,

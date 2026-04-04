@@ -19,6 +19,10 @@ function(mlx_apply_source_overlays mlx_source_dir)
   # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix)
   set(_metal_patch_files
       "mlx/backend/metal/compiled.cpp"
+      "mlx/backend/metal/scaled_dot_product_attention.cpp"
+      "mlx/backend/metal/kernels/scaled_dot_product_attention.metal"
+      "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal"
+      "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal"
       "mlx/backend/metal/kernels/utils.h")
   foreach(_patch_file ${_metal_patch_files})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}")

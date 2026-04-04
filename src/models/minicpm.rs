@@ -162,9 +162,7 @@ impl Attention {
         // Scaled dot-product attention
         let attn_out = if l > 1 && mask.is_none() {
             // Prefill: use causal masking
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         } else {
             // Single token or explicit mask
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());

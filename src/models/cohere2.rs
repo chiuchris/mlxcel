@@ -132,6 +132,7 @@ pub struct Cohere2Attention {
     pub rope_dims: i32,
     pub rope_base: f32,
     pub use_sliding_window: bool,
+    pub window_size: i32,
 }
 
 impl Cohere2Attention {
@@ -181,13 +182,24 @@ impl Cohere2Attention {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         } else {
             // Single token: use causal SDPA
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
+            mlxcel_core::causal_attention(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         };
 
@@ -237,6 +249,11 @@ impl Cohere2Attention {
             rope_dims: head_dim,
             rope_base: args.rope_theta,
             use_sliding_window,
+            window_size: if use_sliding_window {
+                args.sliding_window as i32
+            } else {
+                0
+            },
         })
     }
 }

@@ -85,6 +85,7 @@ pub struct Attention {
     pub head_dim: i32,
     pub scale: f32,
     pub is_local: bool,
+    pub window_size: i32,
     pub use_rope: bool,
     pub rope_base: f32,
     /// Pre-computed frequencies for llama3/yarn RoPE scaling (None = use base theta)
@@ -153,12 +154,23 @@ impl Attention {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    mask_ptr,
+                    0.0,
+                    self.window_size,
                 )
             }
         } else {
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
+            mlxcel_core::causal_attention(
+                &q,
+                &cache_k,
+                &cache_v,
+                self.scale,
+                0.0,
+                self.window_size,
             )
         };
 
@@ -215,6 +227,11 @@ impl Attention {
             head_dim,
             scale,
             is_local: is_local.unwrap_or(false),
+            window_size: if is_local.unwrap_or(false) {
+                args.sliding_window.unwrap_or(512) as i32
+            } else {
+                0
+            },
             use_rope,
             rope_base: args.rope_theta,
             rope_freqs,

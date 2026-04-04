@@ -171,9 +171,7 @@ impl Attention {
         // Scaled dot-product attention
         let attn_out = if l > 1 && mask.is_none() {
             // Prefill: use causal masking
-            mlxcel_core::fast_scaled_dot_product_attention_causal(
-                &q, &cache_k, &cache_v, self.scale,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         } else {
             // Single token or explicit mask
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
@@ -194,34 +192,46 @@ impl Attention {
 
     /// Split-attention forward for batched decode.
     ///
-    /// Receives pre-projected Q/K/V tensors of shape [B, 1, proj_dim],
+    /// Receives pre-projected Q/K/V tensors of shape `[B, T, proj_dim]`,
     /// splits them per-sequence for attention with individual KV caches,
-    /// then concatenates the results back into [B, 1, hidden_dim].
+    /// then concatenates the results back into `[B, T, hidden_dim]`.
     ///
-    /// Used by: Llama3 batched decode (TransformerBlock::forward_batched)
+    /// Used by: Llama3 batched decode and full-sequence batched prefill
     pub fn forward_split_attention(
         &self,
         q_batched: &MlxArray,
         k_batched: &MlxArray,
         v_batched: &MlxArray,
         caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let b = caches.len();
+        let seq_len = mlxcel_core::array_shape(q_batched)[1];
         let mut attn_outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(b);
 
         for (i, cache) in caches.iter_mut().enumerate() {
-            // Slice [B, 1, proj_dim] -> [1, 1, proj_dim] for sequence i
-            let q_i =
-                mlxcel_core::slice(q_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
-            let k_i =
-                mlxcel_core::slice(k_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
-            let v_i =
-                mlxcel_core::slice(v_batched, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
+            // Slice [B, T, proj_dim] -> [1, T, proj_dim] for sequence i.
+            let q_i = mlxcel_core::slice(
+                q_batched,
+                &[i as i32, 0, 0],
+                &[i as i32 + 1, seq_len, i32::MAX],
+            );
+            let k_i = mlxcel_core::slice(
+                k_batched,
+                &[i as i32, 0, 0],
+                &[i as i32 + 1, seq_len, i32::MAX],
+            );
+            let v_i = mlxcel_core::slice(
+                v_batched,
+                &[i as i32, 0, 0],
+                &[i as i32 + 1, seq_len, i32::MAX],
+            );
 
-            // Reshape to [1, 1, n_heads, head_dim] then transpose to [1, n_heads, 1, head_dim]
-            let q_i = mlxcel_core::reshape(&q_i, &[1, 1, self.num_heads, self.head_dim]);
-            let k_i = mlxcel_core::reshape(&k_i, &[1, 1, self.num_kv_heads, self.head_dim]);
-            let v_i = mlxcel_core::reshape(&v_i, &[1, 1, self.num_kv_heads, self.head_dim]);
+            // Reshape to [1, T, n_heads, head_dim] then transpose to
+            // [1, n_heads, T, head_dim].
+            let q_i = mlxcel_core::reshape(&q_i, &[1, seq_len, self.num_heads, self.head_dim]);
+            let k_i = mlxcel_core::reshape(&k_i, &[1, seq_len, self.num_kv_heads, self.head_dim]);
+            let v_i = mlxcel_core::reshape(&v_i, &[1, seq_len, self.num_kv_heads, self.head_dim]);
 
             let q_i = mlxcel_core::transpose_axes(&q_i, &[0, 2, 1, 3]);
             let k_i = mlxcel_core::transpose_axes(&k_i, &[0, 2, 1, 3]);
@@ -238,22 +248,38 @@ impl Attention {
             // Update KV cache
             let (cache_k, cache_v) = cache.update_and_fetch(k_i, v_i);
 
-            // Scaled dot-product attention (single token decode, no mask needed)
-            let mask_ptr = std::ptr::null();
-            let attn_out = unsafe {
-                mlxcel_core::layers::attention_from_ptr(
-                    &q_i, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
-                )
+            let mask_i = mask.map(|m| {
+                let sliced =
+                    mlxcel_core::slice(m, &[i as i32, 0, 0], &[i as i32 + 1, seq_len, i32::MAX]);
+                mlxcel_core::squeeze_axis(&sliced, 0)
+            });
+
+            // Causal prefill without explicit masks can use the shared causal
+            // helper; masked/padded prefill and decode keep using the unified
+            // attention dispatcher.
+            let attn_out = if seq_len > 1 && mask_i.is_none() {
+                mlxcel_core::causal_attention(&q_i, &cache_k, &cache_v, self.scale, 0.0, 0)
+            } else {
+                let mask_ptr = mask_i
+                    .as_ref()
+                    .map(|m| m.as_ref().unwrap() as *const _)
+                    .unwrap_or(std::ptr::null());
+                unsafe {
+                    mlxcel_core::layers::attention_from_ptr(
+                        &q_i, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    )
+                }
             };
 
-            // Transpose back: [1, n_heads, 1, head_dim] -> [1, 1, n_heads * head_dim]
+            // Transpose back: [1, n_heads, T, head_dim] -> [1, T, n_heads * head_dim]
             let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
-            let attn_out = mlxcel_core::reshape(&attn_out, &[1, 1, self.num_heads * self.head_dim]);
+            let attn_out =
+                mlxcel_core::reshape(&attn_out, &[1, seq_len, self.num_heads * self.head_dim]);
 
             attn_outputs.push(attn_out);
         }
 
-        // Concatenate along batch dim: B * [1, 1, hidden] -> [B, 1, hidden]
+        // Concatenate along batch dim: B * [1, T, hidden] -> [B, T, hidden]
         let mut result = attn_outputs.remove(0);
         for attn_out in attn_outputs {
             result = mlxcel_core::concatenate(&result, &attn_out, 0);
@@ -385,14 +411,15 @@ impl TransformerBlock {
 
     /// Batched decode forward: batch norms + projections + FFN, per-sequence attention.
     ///
-    /// `x` has shape `[B, 1, hidden_dim]`, `caches[i]` is the KVCache for
-    /// the i-th sequence. Returns `[B, 1, hidden_dim]`.
+    /// `x` has shape `[B, T, hidden_dim]`, `caches[i]` is the KVCache for
+    /// the i-th sequence. Returns `[B, T, hidden_dim]`.
     ///
     /// Used by: Llama3Model::forward_batched
     pub fn forward_batched(
         &self,
         x: &MlxArray,
         caches: &mut [&mut KVCache],
+        mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         // Batched pre-attention norm
         let normed = self.input_layernorm.forward(x);
@@ -401,7 +428,9 @@ impl TransformerBlock {
         let (q, k, v) = self.self_attn.qkv_proj.forward(&normed);
 
         // Per-sequence attention with individual KV caches
-        let attn_concat = self.self_attn.forward_split_attention(&q, &k, &v, caches);
+        let attn_concat = self
+            .self_attn
+            .forward_split_attention(&q, &k, &v, caches, mask);
 
         // Batched output projection
         let attn_out = self.self_attn.o_proj.forward(&attn_concat);
@@ -506,10 +535,10 @@ impl Llama3Model {
         self.lm_head.forward(&h)
     }
 
-    /// Batched decode forward pass: batch compute-bound layers, per-sequence attention.
+    /// Batched forward pass: batch compute-bound layers, per-sequence attention.
     ///
-    /// `input_ids` has shape `[B, 1]`. `batch_caches[i]` is the per-layer
-    /// KV cache slice for the i-th sequence. Returns `[B, 1, vocab_size]`.
+    /// `input_ids` has shape `[B, T]`. `batch_caches[i]` is the per-layer
+    /// KV cache slice for the i-th sequence. Returns `[B, T, vocab_size]`.
     ///
     /// This is the explicit batched implementation that amortizes weight-loading
     /// bandwidth for embedding, normalization, linear projections, and FFN/MLP
@@ -521,6 +550,7 @@ impl Llama3Model {
         &self,
         input_ids: &MlxArray,
         batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let b = batch_caches.len();
 
@@ -535,7 +565,7 @@ impl Llama3Model {
                 .map(|caches| &mut caches[layer_idx])
                 .collect();
 
-            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches);
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, mask);
         }
 
         // Batched final norm: [B, 1, hidden_dim]
@@ -667,8 +697,12 @@ impl LanguageModel for Llama3Model {
         &self,
         input_ids: &MlxArray,
         batch_caches: &mut [&mut [KVCache]],
-        _mask: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_batched_impl(input_ids, batch_caches)
+        self.forward_batched_impl(input_ids, batch_caches, mask)
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        true
     }
 }
