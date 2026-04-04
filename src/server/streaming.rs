@@ -18,6 +18,8 @@
 //! same blocking channel pattern even though their payload shapes differ.
 
 use std::convert::Infallible;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use axum::response::sse::Event;
 use futures::{Stream, StreamExt};
@@ -29,20 +31,41 @@ pub(crate) const DONE_MARKER: &str = "[DONE]";
 
 type SsePayload = Result<String, Infallible>;
 
+/// A cancellation token shared between the SSE sender and the scheduler.
+///
+/// Set to `true` when the SSE channel detects that the client has disconnected
+/// (i.e. `blocking_send` returns `Err`). The `BatchScheduler` polls this flag
+/// to abort orphaned sequences promptly.
+pub(crate) type CancellationToken = Arc<AtomicBool>;
+
 #[derive(Clone)]
 pub(crate) struct BlockingSseSender {
     tx: mpsc::Sender<SsePayload>,
+    /// Shared flag set to `true` when the client disconnects (SSE receiver is
+    /// dropped). Checked by the `BatchScheduler` to cancel orphaned sequences.
+    cancelled: Option<CancellationToken>,
 }
 
+/// Create an SSE channel with a cancellation token.
+///
+/// Returns `(sender, stream, cancellation_token)`. The cancellation token is
+/// an `Arc<AtomicBool>` that is set to `true` when `BlockingSseSender::text()`
+/// detects the client has disconnected (SSE receiver dropped). Pass the token
+/// to `ModelRequest::Generate` so the `BatchScheduler` can abort orphaned
+/// sequences.
+///
+/// Used by: chat.rs, completions.rs, native_completion.rs
 pub(crate) fn sse_channel(
     buffer: usize,
 ) -> (
     BlockingSseSender,
     impl Stream<Item = Result<Event, Infallible>>,
+    CancellationToken,
 ) {
-    let (sender, rx) = payload_channel(buffer);
+    let cancelled: CancellationToken = Arc::new(AtomicBool::new(false));
+    let (sender, rx) = payload_channel(buffer, Some(cancelled.clone()));
     let stream = ReceiverStream::new(rx).map(|payload| payload.map(sse_event));
-    (sender, stream)
+    (sender, stream, cancelled)
 }
 
 impl BlockingSseSender {
@@ -52,7 +75,14 @@ impl BlockingSseSender {
     }
 
     pub(crate) fn text(&self, data: impl Into<String>) {
-        let _ = self.tx.blocking_send(Ok(data.into()));
+        if self.tx.blocking_send(Ok(data.into())).is_err() {
+            // The SSE receiver has been dropped, meaning the client
+            // disconnected. Signal cancellation so the BatchScheduler can
+            // abort the orphaned sequence.
+            if let Some(ref flag) = self.cancelled {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
     }
 
     pub(crate) fn done(&self) {
@@ -60,9 +90,12 @@ impl BlockingSseSender {
     }
 }
 
-fn payload_channel(buffer: usize) -> (BlockingSseSender, mpsc::Receiver<SsePayload>) {
+fn payload_channel(
+    buffer: usize,
+    cancelled: Option<CancellationToken>,
+) -> (BlockingSseSender, mpsc::Receiver<SsePayload>) {
     let (tx, rx) = mpsc::channel(buffer);
-    (BlockingSseSender { tx }, rx)
+    (BlockingSseSender { tx, cancelled }, rx)
 }
 
 fn serialize_json_data<T: Serialize>(value: &T) -> Result<String, serde_json::Error> {

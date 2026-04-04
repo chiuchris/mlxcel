@@ -17,6 +17,8 @@
 //! These tests verify the `decide_action` policy given various combinations
 //! of empty/non-empty queue and batch states, without requiring a real model.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -54,6 +56,7 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         decode_state,
         prefill_offset: 0,
         response_tx: tx,
+        cancelled: Arc::new(AtomicBool::new(false)),
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,
@@ -237,6 +240,7 @@ fn make_test_sequence_with_priority(
         decode_state,
         prefill_offset: 0,
         response_tx: tx,
+        cancelled: Arc::new(AtomicBool::new(false)),
         created_at: Instant::now(),
         prefill_start: None,
         first_token_time: None,

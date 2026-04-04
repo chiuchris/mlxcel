@@ -36,6 +36,8 @@
 //! scheduler and generation loop: prompt tokens, sampling config, VLM
 //! embeddings, generated output, response channel, and timing data.
 
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -242,6 +244,12 @@ pub struct SequenceInfo {
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.
     pub response_tx: mpsc::Sender<GenerateEvent>,
+
+    // -- Cancellation --
+    /// Shared flag set to `true` by the SSE sender when the client disconnects.
+    /// The `BatchScheduler` checks this flag in `finalize_completed()` and
+    /// transitions the sequence to `Finished(Cancelled)`.
+    pub cancelled: Arc<AtomicBool>,
 
     // -- Timing --
     /// Wall-clock time when the request was received.

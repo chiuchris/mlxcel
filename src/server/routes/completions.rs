@@ -225,7 +225,7 @@ async fn stream_completion(
         };
     }
 
-    let (events, stream) = sse_channel(100);
+    let (events, stream, cancelled) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
@@ -241,35 +241,38 @@ async fn stream_completion(
         let model_id_inner = model_id_clone.clone();
         let mut char_offset: usize = 0;
 
-        let result = state.model_provider.generate_streaming_with_logprobs(
-            prompt,
-            options,
-            Vec::new(),
-            |token, lp_data| {
-                let logprobs = if logprobs_enabled {
-                    lp_data.as_ref().map(|lp| {
-                        let chunk_lp = build_single_token_completion_logprobs(
-                            &tokenizer,
-                            lp,
-                            top_k,
-                            char_offset,
-                        );
+        let result = state
+            .model_provider
+            .generate_streaming_with_logprobs_cancellable(
+                prompt,
+                options,
+                Vec::new(),
+                cancelled,
+                |token, lp_data| {
+                    let logprobs = if logprobs_enabled {
+                        lp_data.as_ref().map(|lp| {
+                            let chunk_lp = build_single_token_completion_logprobs(
+                                &tokenizer,
+                                lp,
+                                top_k,
+                                char_offset,
+                            );
+                            char_offset += token.len();
+                            chunk_lp
+                        })
+                    } else {
                         char_offset += token.len();
-                        chunk_lp
-                    })
-                } else {
-                    char_offset += token.len();
-                    None
-                };
-                let chunk = CompletionChunk::content_with_logprobs(
-                    request_id_inner.clone(),
-                    model_id_inner.clone(),
-                    token,
-                    logprobs,
-                );
-                let _ = token_events.json(&chunk);
-            },
-        );
+                        None
+                    };
+                    let chunk = CompletionChunk::content_with_logprobs(
+                        request_id_inner.clone(),
+                        model_id_inner.clone(),
+                        token,
+                        logprobs,
+                    );
+                    let _ = token_events.json(&chunk);
+                },
+            );
 
         // Send finish chunk
         let finish_reason = match &result {

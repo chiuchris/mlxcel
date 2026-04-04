@@ -15,7 +15,7 @@
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{DONE_MARKER, payload_channel, serialize_json_data};
+use super::{CancellationToken, DONE_MARKER, payload_channel, serialize_json_data};
 use crate::server::types::{ChatCompletionChunk, CompletionChunk};
 
 #[derive(Serialize)]
@@ -36,7 +36,7 @@ impl Serialize for FailingPayload {
 
 #[test]
 fn blocking_sse_sender_sends_json_text_and_done_in_order() {
-    let (sender, mut rx) = payload_channel(4);
+    let (sender, mut rx) = payload_channel(4, None);
 
     sender.json(&TestPayload { token: "hello" }).unwrap();
     sender.text("plain-text");
@@ -189,4 +189,48 @@ fn completion_usage_chunk_has_empty_choices_and_populated_usage() {
     assert_eq!(json["usage"]["prompt_tokens"], 5);
     assert_eq!(json["usage"]["completion_tokens"], 15);
     assert_eq!(json["usage"]["total_tokens"], 20);
+}
+
+// ── Cancellation token tests ────────────────────────────────────────────────
+
+#[test]
+fn cancellation_token_set_when_receiver_dropped() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let token: CancellationToken = Arc::new(AtomicBool::new(false));
+    let (sender, rx) = payload_channel(4, Some(token.clone()));
+
+    // Drop the receiver to simulate client disconnect
+    drop(rx);
+
+    // Sending after receiver drop should set the cancellation flag
+    sender.text("hello");
+    assert!(
+        token.load(Ordering::Relaxed),
+        "cancellation token must be set when receiver is dropped"
+    );
+}
+
+#[test]
+fn cancellation_token_not_set_when_send_succeeds() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let token: CancellationToken = Arc::new(AtomicBool::new(false));
+    let (sender, _rx) = payload_channel(4, Some(token.clone()));
+
+    sender.text("hello");
+    assert!(
+        !token.load(Ordering::Relaxed),
+        "cancellation token must not be set when send succeeds"
+    );
+}
+
+#[test]
+fn sender_without_cancellation_token_does_not_panic_on_dropped_receiver() {
+    let (sender, rx) = payload_channel(4, None);
+    drop(rx);
+    // Should not panic even without a cancellation token
+    sender.text("hello");
 }

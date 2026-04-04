@@ -305,7 +305,7 @@ async fn stream_chat_completion(
     };
     let tool_choice = request.tool_choice.clone();
 
-    let (events, stream) = sse_channel(100);
+    let (events, stream, cancelled) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
@@ -328,32 +328,35 @@ async fn stream_chat_completion(
         let accumulated = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let acc_clone = accumulated.clone();
 
-        let result = state.model_provider.generate_streaming_with_logprobs(
-            prepared.prompt,
-            options,
-            prepared.image_data,
-            |token, lp_data| {
-                // Accumulate for later tool call parsing
-                if parse_tools && let Ok(mut acc) = acc_clone.lock() {
-                    acc.push_str(&token);
-                }
+        let result = state
+            .model_provider
+            .generate_streaming_with_logprobs_cancellable(
+                prepared.prompt,
+                options,
+                prepared.image_data,
+                cancelled,
+                |token, lp_data| {
+                    // Accumulate for later tool call parsing
+                    if parse_tools && let Ok(mut acc) = acc_clone.lock() {
+                        acc.push_str(&token);
+                    }
 
-                let logprobs = if logprobs_enabled {
-                    lp_data
-                        .as_ref()
-                        .map(|lp| build_single_token_chat_logprobs(&tokenizer, lp, top_k))
-                } else {
-                    None
-                };
-                let chunk = ChatCompletionChunk::content_with_logprobs(
-                    request_id_inner.clone(),
-                    model_id_inner.clone(),
-                    token,
-                    logprobs,
-                );
-                let _ = token_events.json(&chunk);
-            },
-        );
+                    let logprobs = if logprobs_enabled {
+                        lp_data
+                            .as_ref()
+                            .map(|lp| build_single_token_chat_logprobs(&tokenizer, lp, top_k))
+                    } else {
+                        None
+                    };
+                    let chunk = ChatCompletionChunk::content_with_logprobs(
+                        request_id_inner.clone(),
+                        model_id_inner.clone(),
+                        token,
+                        logprobs,
+                    );
+                    let _ = token_events.json(&chunk);
+                },
+            );
 
         // Check for tool calls in accumulated output
         let mut finish_reason = match &result {

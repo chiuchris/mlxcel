@@ -138,21 +138,24 @@ async fn stream_native_completion(
     options.priority = priority;
     let prompt = request.prompt.clone();
 
-    let (events, stream) = sse_channel(100);
+    let (events, stream, cancelled) = sse_channel(100);
     let finish_events = events.clone();
 
     tokio::task::spawn_blocking(move || {
         let token_events = finish_events.clone();
 
-        let result = state
-            .model_provider
-            .generate_streaming(prompt, options, |token| {
+        let result = state.model_provider.generate_streaming_cancellable(
+            prompt,
+            options,
+            cancelled,
+            |token| {
                 let chunk = serde_json::json!({
                     "content": token,
                     "stop": false,
                 });
                 let _ = token_events.json(&chunk);
-            });
+            },
+        );
 
         // Send final chunk
         let stop = match &result {

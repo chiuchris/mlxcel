@@ -37,6 +37,9 @@ pub enum ModelRequest {
         /// Raw image bytes for VLM (empty for text-only)
         images: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
+        /// Cancellation flag set by the SSE sender when the client disconnects.
+        /// The `BatchScheduler` polls this to abort orphaned sequences.
+        cancelled: Arc<AtomicBool>,
     },
     Shutdown,
 }
@@ -425,11 +428,75 @@ impl ModelProvider {
         drain_generation_events_with_logprobs(response_rx, callback)
     }
 
+    /// Generate text with streaming callback and cancellation support.
+    ///
+    /// Like `generate_streaming` but accepts a `cancelled` token that the SSE
+    /// sender sets when the client disconnects.
+    ///
+    /// Used by: chat.rs, completions.rs, native_completion.rs (streaming routes)
+    pub fn generate_streaming_cancellable<F>(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        cancelled: Arc<AtomicBool>,
+        callback: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(String),
+    {
+        let response_rx =
+            self.send_generate_request_with_cancellation(prompt, options, Vec::new(), cancelled)?;
+        drain_generation_events(response_rx, callback)
+    }
+
+    /// Generate text with logprobs-aware streaming callback and cancellation
+    /// support.
+    ///
+    /// Like `generate_streaming_with_logprobs` but accepts a `cancelled` token
+    /// that the SSE sender sets when the client disconnects.
+    ///
+    /// Used by: chat.rs, completions.rs (streaming routes)
+    pub fn generate_streaming_with_logprobs_cancellable<F>(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
+        callback: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(String, Option<TokenLogprobData>),
+    {
+        let response_rx =
+            self.send_generate_request_with_cancellation(prompt, options, images, cancelled)?;
+        drain_generation_events_with_logprobs(response_rx, callback)
+    }
+
     fn send_generate_request(
         &self,
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
+    ) -> Result<mpsc::Receiver<GenerateEvent>> {
+        self.send_generate_request_with_cancellation(
+            prompt,
+            options,
+            images,
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
+    /// Send a generation request with an explicit cancellation token.
+    ///
+    /// The cancellation token is an `Arc<AtomicBool>` shared with the SSE
+    /// sender. When the client disconnects the token is set to `true`, and the
+    /// `BatchScheduler` will abort the corresponding sequence.
+    fn send_generate_request_with_cancellation(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        cancelled: Arc<AtomicBool>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();
 
@@ -439,8 +506,9 @@ impl ModelProvider {
                 options,
                 images,
                 response_tx,
+                cancelled,
             })
-            .map_err(|e| anyhow::anyhow!("Failed to send request: {}", e))?;
+            .map_err(|e| anyhow::anyhow!("Failed to send request: {e}"))?;
 
         Ok(response_rx)
     }

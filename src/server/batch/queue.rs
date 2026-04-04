@@ -21,6 +21,7 @@
 //! memory growth under sustained load.
 
 use std::collections::VecDeque;
+use std::sync::atomic::Ordering;
 
 use super::sequence::{RequestPriority, SequenceInfo};
 
@@ -132,6 +133,35 @@ impl PrefillQueue {
     pub fn max_size(&self) -> usize {
         self.max_size
     }
+
+    /// Remove and return all queued sequences whose cancellation flag is set.
+    ///
+    /// Scans all priority lanes and removes sequences where
+    /// `cancelled.load(Relaxed)` is `true`. The caller is responsible for
+    /// cleaning up cache pool entries and notifying the response channel.
+    pub fn drain_cancelled(&mut self) -> Vec<SequenceInfo> {
+        let mut cancelled = Vec::new();
+        Self::drain_cancelled_from_lane(&mut self.high, &mut cancelled);
+        Self::drain_cancelled_from_lane(&mut self.normal, &mut cancelled);
+        Self::drain_cancelled_from_lane(&mut self.low, &mut cancelled);
+        cancelled
+    }
+
+    /// Helper: remove cancelled entries from a single lane, preserving order.
+    fn drain_cancelled_from_lane(lane: &mut VecDeque<SequenceInfo>, out: &mut Vec<SequenceInfo>) {
+        let mut i = 0;
+        while i < lane.len() {
+            if lane[i].cancelled.load(Ordering::Relaxed) {
+                // remove() returns Option but index is valid since i < len.
+                if let Some(seq) = lane.remove(i) {
+                    out.push(seq);
+                }
+                // Do not increment i because remove shifts elements left.
+            } else {
+                i += 1;
+            }
+        }
+    }
 }
 
 impl Default for PrefillQueue {
@@ -160,6 +190,8 @@ mod tests {
     use crate::server::model_provider::model_worker::StreamingDecodeState;
     use mlxcel_core::cache::SequenceId;
     use mlxcel_core::generate::SamplingConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -189,6 +221,7 @@ mod tests {
             decode_state,
             prefill_offset: 0,
             response_tx: tx,
+            cancelled: Arc::new(AtomicBool::new(false)),
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
@@ -364,5 +397,73 @@ mod tests {
 
         let (s2, _r2) = make_test_sequence(2);
         assert!(queue.enqueue(s2).is_ok());
+    }
+
+    #[test]
+    fn drain_cancelled_removes_only_cancelled_sequences() {
+        use std::sync::atomic::Ordering;
+
+        let mut queue = PrefillQueue::new();
+
+        let (s1, _r1) = make_test_sequence(1);
+        let (s2, _r2) = make_test_sequence(2);
+        let (s3, _r3) = make_test_sequence(3);
+
+        // Mark s2 as cancelled before enqueueing
+        s2.cancelled.store(true, Ordering::Relaxed);
+
+        queue.enqueue(s1).unwrap();
+        queue.enqueue(s2).unwrap();
+        queue.enqueue(s3).unwrap();
+        assert_eq!(queue.len(), 3);
+
+        let drained = queue.drain_cancelled();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].seq_id.as_u64(), 2);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn drain_cancelled_returns_empty_when_none_cancelled() {
+        let mut queue = PrefillQueue::new();
+
+        let (s1, _r1) = make_test_sequence(10);
+        let (s2, _r2) = make_test_sequence(20);
+        queue.enqueue(s1).unwrap();
+        queue.enqueue(s2).unwrap();
+
+        let drained = queue.drain_cancelled();
+        assert!(drained.is_empty());
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn drain_cancelled_removes_across_all_priority_lanes() {
+        use std::sync::atomic::Ordering;
+
+        let mut queue = PrefillQueue::new();
+
+        let (s_high, _r1) = make_test_sequence_with_priority(1, RequestPriority::High);
+        let (s_norm, _r2) = make_test_sequence_with_priority(2, RequestPriority::Normal);
+        let (s_low, _r3) = make_test_sequence_with_priority(3, RequestPriority::Low);
+
+        // Cancel the high and low priority sequences
+        s_high.cancelled.store(true, Ordering::Relaxed);
+        s_low.cancelled.store(true, Ordering::Relaxed);
+
+        queue.enqueue(s_high).unwrap();
+        queue.enqueue(s_norm).unwrap();
+        queue.enqueue(s_low).unwrap();
+
+        let drained = queue.drain_cancelled();
+        assert_eq!(drained.len(), 2);
+        let drained_ids: Vec<u64> = drained.iter().map(|s| s.seq_id.as_u64()).collect();
+        assert!(drained_ids.contains(&1));
+        assert!(drained_ids.contains(&3));
+
+        // Only the normal priority sequence should remain
+        assert_eq!(queue.len(), 1);
+        let remaining = queue.dequeue().unwrap();
+        assert_eq!(remaining.seq_id.as_u64(), 2);
     }
 }

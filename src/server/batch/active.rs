@@ -125,6 +125,8 @@ mod tests {
     use crate::server::model_provider::GenerateEvent;
     use crate::server::model_provider::model_worker::StreamingDecodeState;
     use mlxcel_core::generate::SamplingConfig;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
     use std::sync::mpsc;
     use std::time::Instant;
 
@@ -150,6 +152,7 @@ mod tests {
             decode_state,
             prefill_offset: 0,
             response_tx: tx,
+            cancelled: Arc::new(AtomicBool::new(false)),
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,

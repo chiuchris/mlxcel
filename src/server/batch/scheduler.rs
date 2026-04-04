@@ -27,6 +27,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
@@ -305,8 +306,9 @@ impl BatchScheduler {
                 options,
                 images,
                 response_tx,
+                cancelled,
             } => {
-                self.enqueue_request(prompt, options, images, response_tx);
+                self.enqueue_request(prompt, options, images, response_tx, cancelled);
                 false
             }
             ModelRequest::Shutdown => {
@@ -322,6 +324,7 @@ impl BatchScheduler {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         response_tx: mpsc::Sender<GenerateEvent>,
+        cancelled: Arc<AtomicBool>,
     ) {
         let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
         let token_ids = match self.tokenizer.encode(&prompt, add_special) {
@@ -377,6 +380,7 @@ impl BatchScheduler {
             decode_state,
             prefill_offset: 0,
             response_tx,
+            cancelled,
             created_at: Instant::now(),
             prefill_start: None,
             first_token_time: None,
@@ -1459,6 +1463,49 @@ impl BatchScheduler {
     // ------------------------------------------------------------------
 
     fn finalize_completed(&mut self) {
+        // First, transition any cancelled sequences to Finished(Cancelled).
+        // This must happen before the finished-ID scan so that newly cancelled
+        // sequences are collected in the same pass.
+        let cancelled_ids: Vec<SequenceId> = self
+            .active_batch
+            .iter_sequences()
+            .filter(|s| !s.state.is_finished() && s.cancelled.load(Ordering::Relaxed))
+            .map(|s| s.seq_id)
+            .collect();
+
+        for id in &cancelled_ids {
+            if let Some(seq) = self.active_batch.get_mut(*id) {
+                if let Err(err) = seq
+                    .state
+                    .transition_to(SequenceState::Finished(FinishReason::Cancelled))
+                {
+                    tracing::warn!("Failed to cancel sequence {id}: {err}");
+                } else {
+                    tracing::info!("Sequence {id} cancelled (client disconnected)");
+                }
+            }
+        }
+
+        // Cancel a chunked-prefill-in-progress sequence if client disconnected.
+        if let Some(ref seq) = self.chunked_prefill_seq
+            && seq.cancelled.load(Ordering::Relaxed)
+        {
+            let seq = self.chunked_prefill_seq.take().unwrap();
+            tracing::info!(
+                "Chunked-prefill sequence {} cancelled (client disconnected)",
+                seq.seq_id
+            );
+            let _ = seq.response_tx.send(GenerateEvent::Error(
+                "Request cancelled: client disconnected".to_string(),
+            ));
+            self.release_sequence_caches(seq.seq_id);
+            self.batch_observability.record_sequence_completed();
+        }
+
+        // Also cancel queued sequences whose client has already disconnected,
+        // so they never enter the active batch.
+        self.cancel_queued_disconnected();
+
         // Collect finished IDs by scanning active sequences. Uses iter_sequences()
         // to avoid allocating a full key snapshot when no sequences are finished.
         let finished_ids: Vec<SequenceId> = self
@@ -1492,6 +1539,25 @@ impl BatchScheduler {
 
         if has_completed {
             self.publish_metrics();
+        }
+    }
+
+    /// Remove queued sequences whose client has already disconnected.
+    ///
+    /// This prevents cancelled requests from ever entering the active batch,
+    /// freeing the prefill queue slot immediately.
+    fn cancel_queued_disconnected(&mut self) {
+        let drained: Vec<SequenceInfo> = self.prefill_queue.drain_cancelled();
+        for seq in drained {
+            tracing::info!(
+                "Queued sequence {} cancelled before prefill (client disconnected)",
+                seq.seq_id
+            );
+            let _ = seq.response_tx.send(GenerateEvent::Error(
+                "Request cancelled: client disconnected".to_string(),
+            ));
+            self.release_sequence_caches(seq.seq_id);
+            self.batch_observability.record_sequence_completed();
         }
     }
 
