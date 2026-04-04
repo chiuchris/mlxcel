@@ -259,6 +259,12 @@ struct JambaMLP {
 
 impl JambaMLP {
     fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Some(result) =
+            mlxcel_core::layers::compiled_swiglu_mlp(x, &self.gate_proj, &self.up_proj, &self.down_proj)
+        {
+            return result;
+        }
+
         let gate = silu(&self.gate_proj.forward(x));
         let up = self.up_proj.forward(x);
         let gated = mlxcel_core::multiply(&gate, &up);

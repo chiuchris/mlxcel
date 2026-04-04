@@ -32,6 +32,10 @@ use crate::ffi::MlxArray;
 use crate::ops::divide_scalar;
 use cxx::UniquePtr;
 
+fn direct_prefill_cache_store_enabled() -> bool {
+    std::env::var("MLXCEL_ENABLE_DIRECT_PREFILL_CACHE_STORE").is_ok()
+}
+
 /// Storage mode for KV cache tensors.
 ///
 /// Controls the on-device representation of accumulated key/value tensors.
@@ -216,6 +220,13 @@ impl KVCache {
         let new_seq_len = key_shape[2];
         let prev = self.offset;
 
+        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+            self.keys = Some(ffi::contiguous(&new_keys, false));
+            self.values = Some(ffi::contiguous(&new_values, false));
+            self.offset = new_seq_len;
+            return;
+        }
+
         if self.keys.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
             let b = key_shape[0];
             let n_kv_heads = key_shape[1];
@@ -288,6 +299,15 @@ impl KVCache {
         let key_shape = ffi::array_shape(&k_int8);
         let new_seq_len = key_shape[2];
         let prev = self.offset;
+
+        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+            self.keys = Some(ffi::contiguous(&k_int8, false));
+            self.values = Some(ffi::contiguous(&v_int8, false));
+            self.key_scales = Some(ffi::contiguous(&k_scale, false));
+            self.val_scales = Some(ffi::contiguous(&v_scale, false));
+            self.offset = new_seq_len;
+            return;
+        }
 
         if self.keys.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
             let b = key_shape[0];

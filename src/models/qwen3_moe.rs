@@ -290,6 +290,15 @@ pub struct SparseMoeBlock {
 
 impl SparseMoeBlock {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        if std::env::var("MLXCEL_PROFILE_QWEN3_MOE_DETAIL").is_ok() {
+            let (out, _, _, _) = self.forward_profiled(x);
+            out
+        } else {
+            self.forward_impl(x).0
+        }
+    }
+
+    fn forward_impl(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, f64, f64, f64) {
         let orig_shape = mlxcel_core::array_shape(x);
         let hidden_dim = orig_shape[orig_shape.len() - 1];
 
@@ -301,6 +310,7 @@ impl SparseMoeBlock {
             mlxcel_core::copy(x)
         };
 
+        let gate_start = std::time::Instant::now();
         // Get router logits
         let logits = self.router.forward(&x_flat);
 
@@ -327,10 +337,16 @@ impl SparseMoeBlock {
             let sum = mlxcel_core::sum_axis(&scores, -1, true);
             scores = mlxcel_core::divide(&scores, &sum);
         }
+        mlxcel_core::eval(&scores);
+        let gate_ms = gate_start.elapsed().as_secs_f64() * 1000.0;
 
+        let expert_start = std::time::Instant::now();
         // Apply experts - returns [n_tokens, k, hidden]
         let expert_out = self.experts.forward(&x_flat, &topk_indices);
+        mlxcel_core::eval(&expert_out);
+        let expert_ms = expert_start.elapsed().as_secs_f64() * 1000.0;
 
+        let combine_start = std::time::Instant::now();
         // Weighted sum over experts: [n_tokens, k, hidden] * [n_tokens, k] -> [n_tokens, hidden]
         // einsum fuses expand_dims + multiply + sum_axis into single kernel
         let operands: [*const mlxcel_core::MlxArray; 2] = [
@@ -340,11 +356,19 @@ impl SparseMoeBlock {
         let result = unsafe { mlxcel_core::einsum("nkh,nk->nh", &operands) };
 
         // Reshape back to original shape
-        if orig_shape.len() > 2 {
+        let result = if orig_shape.len() > 2 {
             mlxcel_core::reshape(&result, &orig_shape)
         } else {
             result
-        }
+        };
+        mlxcel_core::eval(&result);
+        let combine_ms = combine_start.elapsed().as_secs_f64() * 1000.0;
+
+        (result, gate_ms, expert_ms, combine_ms)
+    }
+
+    pub fn forward_profiled(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, f64, f64, f64) {
+        self.forward_impl(x)
     }
 }
 
@@ -554,6 +578,50 @@ impl DecoderLayer {
         mlxcel_core::add(&h, &mlp_out)
     }
 
+    pub fn forward_profiled(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> (UniquePtr<MlxArray>, f64, f64) {
+        mlxcel_core::eval(x);
+
+        let t0 = std::time::Instant::now();
+        let normed = self.input_layernorm.forward(x);
+        let attn_out = self.self_attn.forward(&normed, cache, mask);
+        let h = mlxcel_core::add(x, &attn_out);
+        mlxcel_core::eval(&h);
+        let attn_ms = t0.elapsed().as_secs_f64() * 1000.0;
+
+        let t1 = std::time::Instant::now();
+        let normed = self.post_attention_layernorm.forward(&h);
+        let mut moe_detail = None;
+        let mlp_out = match &self.mlp {
+            MLPType::Dense(mlp) => mlp.forward(&normed),
+            MLPType::MoE(moe) => {
+                if std::env::var("MLXCEL_PROFILE_QWEN3_MOE_DETAIL").is_ok() {
+                    let (out, gate_ms, expert_ms, combine_ms) = moe.forward_profiled(&normed);
+                    moe_detail = Some((gate_ms, expert_ms, combine_ms));
+                    out
+                } else {
+                    moe.forward(&normed)
+                }
+            }
+        };
+        let out = mlxcel_core::add(&h, &mlp_out);
+        mlxcel_core::eval(&out);
+        let mlp_ms = t1.elapsed().as_secs_f64() * 1000.0;
+
+        if let Some((gate_ms, expert_ms, combine_ms)) = moe_detail {
+            eprintln!(
+                "[QWEN3_MOE_SPARSE] gate={:.2}ms expert={:.2}ms combine={:.2}ms",
+                gate_ms, expert_ms, combine_ms
+            );
+        }
+
+        (out, attn_ms, mlp_ms)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -617,12 +685,42 @@ impl Qwen3MoeModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let profile_blocks =
+            std::env::var("MLXCEL_PROFILE_BLOCKS").is_ok() && mlxcel_core::array_shape(input_ids)[1] == 1;
+
         // Embed tokens
         let mut h = self.embed_tokens.forward(input_ids);
 
         // Pass through transformer layers
+        let mut attn_ms_total = 0.0f64;
+        let mut moe_ms_total = 0.0f64;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches[i], mask);
+            if profile_blocks {
+                let is_moe = matches!(layer.mlp, MLPType::MoE(_));
+                let (next_h, attn_ms, mlp_ms) = layer.forward_profiled(&h, &mut caches[i], mask);
+                h = next_h;
+                attn_ms_total += attn_ms;
+                moe_ms_total += mlp_ms;
+                let mlp_tag = if is_moe { "E" } else { "M" };
+                eprintln!(
+                    "[QWEN3_MOE_BLOCK {}] attn={:.2}ms mlp{}={:.2}ms",
+                    i, attn_ms, mlp_tag, mlp_ms
+                );
+            } else {
+                h = layer.forward(&h, &mut caches[i], mask);
+            }
+        }
+
+        if profile_blocks {
+            let total = (attn_ms_total + moe_ms_total).max(1e-9);
+            eprintln!(
+                "[QWEN3_MOE_BLOCKS] A:{:.1}ms({:.0}%) M:{:.1}ms({:.0}%) T:{:.1}ms",
+                attn_ms_total,
+                attn_ms_total * 100.0 / total,
+                moe_ms_total,
+                moe_ms_total * 100.0 / total,
+                total
+            );
         }
 
         // Final norm
@@ -793,5 +891,9 @@ impl LanguageModel for Qwen3MoeModel {
     fn eos_token_ids(&self) -> Vec<i32> {
         // Qwen3 MoE EOS token (same as Qwen3)
         vec![151645]
+    }
+
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        true
     }
 }

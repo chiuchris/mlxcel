@@ -540,6 +540,13 @@ impl UnifiedLinear {
         }
     }
 
+    pub fn as_quantized_weight(&self) -> Option<&QuantizedWeight> {
+        match self {
+            UnifiedLinear::Quantized { weight, .. } => Some(weight),
+            UnifiedLinear::Regular(_) => None,
+        }
+    }
+
     /// Forward pass
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         match self {
@@ -832,6 +839,57 @@ impl FusedQKVLinear {
         let v = ffi::slice_last_dim(&qkv, q_size + kv_size, q_size + 2 * kv_size);
 
         (q, k, v)
+    }
+
+    /// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
+    ///
+    /// Returns Q/K/V already shaped `[B, H, T, D]`. Q/K have RoPE applied.
+    /// Only available for quantized fused-QKV weights.
+    ///
+    /// Used by: Llama3-family fused attention path.
+    pub fn forward_split_rope(
+        &self,
+        x: &MlxArray,
+        rope_dims: i32,
+        rope_base: f32,
+        cache_offset: i32,
+    ) -> Option<(
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+    )> {
+        if std::env::var("MLXCEL_ENABLE_FUSED_QKV_SPLIT_ROPE").is_err() {
+            return None;
+        }
+        match &self.qkv_proj {
+            UnifiedLinear::Quantized { weight, .. } => {
+                let mut q = cxx::UniquePtr::null();
+                let mut k = cxx::UniquePtr::null();
+                let mut v = cxx::UniquePtr::null();
+                unsafe {
+                    ffi::fused_qkv_project_split_rope(
+                        x,
+                        &weight.weight,
+                        &weight.scales,
+                        weight.biases_ptr(),
+                        self.n_heads,
+                        self.n_kv_heads,
+                        self.head_dim,
+                        rope_dims,
+                        rope_base,
+                        cache_offset,
+                        weight.group_size,
+                        weight.bits,
+                        &weight.mode,
+                        &mut q,
+                        &mut k,
+                        &mut v,
+                    );
+                }
+                Some((q, k, v))
+            }
+            UnifiedLinear::Regular(_) => None,
+        }
     }
 }
 
@@ -1417,6 +1475,49 @@ pub fn compiled_swiglu_mlp_fp16(
             down_bias_ptr,
         )
     })
+}
+
+/// SwiGLU MLP forward for either quantized or non-quantized UnifiedLinear layers.
+///
+/// Returns a fused compiled path when all three projections are either:
+/// - non-quantized regular weights, via `compiled_swiglu_mlp_fp16()`
+/// - quantized weights, via `compiled_moe_expert_forward()`
+///
+/// Returns `None` for mixed projection kinds so callers can preserve their
+/// existing fallback path.
+///
+/// Used by: Llama3, Qwen3, SmolLM3, StableLM, Exaone4 and other SwiGLU models
+pub fn compiled_swiglu_mlp(
+    x: &MlxArray,
+    gate_proj: &UnifiedLinear,
+    up_proj: &UnifiedLinear,
+    down_proj: &UnifiedLinear,
+) -> Option<crate::UniquePtr<MlxArray>> {
+    if let (Some(gate_qw), Some(up_qw), Some(down_qw)) = (
+        gate_proj.quantized_weight(),
+        up_proj.quantized_weight(),
+        down_proj.quantized_weight(),
+    ) {
+        return Some(unsafe {
+            ffi::compiled_moe_expert_forward(
+                x,
+                &gate_qw.weight,
+                &gate_qw.scales,
+                gate_qw.biases_ptr(),
+                &up_qw.weight,
+                &up_qw.scales,
+                up_qw.biases_ptr(),
+                &down_qw.weight,
+                &down_qw.scales,
+                down_qw.biases_ptr(),
+                gate_qw.group_size,
+                gate_qw.bits,
+                &gate_qw.mode,
+            )
+        });
+    }
+
+    compiled_swiglu_mlp_fp16(x, gate_proj, up_proj, down_proj)
 }
 
 // ── Metal 4 fused attention dispatch ─────────────────────────────────────────

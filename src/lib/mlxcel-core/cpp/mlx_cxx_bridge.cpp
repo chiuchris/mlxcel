@@ -2433,6 +2433,132 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     return std::make_unique<MlxArray>(std::move(proj));
 }
 
+void fused_qkv_project_split_rope(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray* biases,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    int32_t cache_offset,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode,
+    std::unique_ptr<MlxArray>& q_out,
+    std::unique_ptr<MlxArray>& k_out,
+    std::unique_ptr<MlxArray>& v_out
+) {
+    using namespace mlx::core;
+
+    auto batch_size = x.inner.shape()[0];
+    auto seq_len = x.inner.shape()[1];
+
+    std::optional<array> biases_opt = biases ? std::optional(biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
+    auto proj = quantized_matmul(
+        x.inner, weight.inner, scales.inner, biases_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    int q_cols = num_heads * head_dim;
+    int kv_cols = num_kv_heads * head_dim;
+    int qkv_cols = q_cols + (2 * kv_cols);
+
+    auto proj_shape = proj.shape();
+    if (proj_shape.size() != 3 || proj_shape[2] != qkv_cols) {
+        throw std::runtime_error("fused_qkv_project_split_rope: unexpected projection shape");
+    }
+
+    auto q = slice(proj, {0, 0, 0}, {batch_size, seq_len, q_cols});
+    auto k = slice(proj, {0, 0, q_cols}, {batch_size, seq_len, q_cols + kv_cols});
+    auto v = slice(proj, {0, 0, q_cols + kv_cols}, {batch_size, seq_len, qkv_cols});
+
+    q = reshape(q, {batch_size, seq_len, num_heads, head_dim});
+    k = reshape(k, {batch_size, seq_len, num_kv_heads, head_dim});
+    v = reshape(v, {batch_size, seq_len, num_kv_heads, head_dim});
+
+    q = transpose(q, {0, 2, 1, 3});
+    k = transpose(k, {0, 2, 1, 3});
+    v = transpose(v, {0, 2, 1, 3});
+
+    q = mlx::core::fast::rope(q, rope_dims, false, rope_base, 1.0f, cache_offset);
+    k = mlx::core::fast::rope(k, rope_dims, false, rope_base, 1.0f, cache_offset);
+
+    q_out = std::make_unique<MlxArray>(std::move(q));
+    k_out = std::make_unique<MlxArray>(std::move(k));
+    v_out = std::make_unique<MlxArray>(std::move(v));
+}
+
+void fused_causal_prefill_attention(
+    const MlxArray& x,
+    const MlxArray& qkv_weight,
+    const MlxArray& qkv_scales,
+    const MlxArray* qkv_biases,
+    const MlxArray& o_weight,
+    const MlxArray& o_scales,
+    const MlxArray* o_biases,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    float scale,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode,
+    std::unique_ptr<MlxArray>& output_out,
+    std::unique_ptr<MlxArray>& k_out,
+    std::unique_ptr<MlxArray>& v_out
+) {
+    using namespace mlx::core;
+
+    auto batch_size = x.inner.shape()[0];
+    auto seq_len = x.inner.shape()[1];
+
+    std::optional<array> qkv_biases_opt = qkv_biases ? std::optional(qkv_biases->inner) : std::nullopt;
+    std::optional<array> o_biases_opt = o_biases ? std::optional(o_biases->inner) : std::nullopt;
+    std::string mode_str(mode.data(), mode.size());
+
+    auto proj = quantized_matmul(
+        x.inner, qkv_weight.inner, qkv_scales.inner, qkv_biases_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    int q_cols = num_heads * head_dim;
+    int kv_cols = num_kv_heads * head_dim;
+    int qkv_cols = q_cols + (2 * kv_cols);
+
+    auto q = slice(proj, {0, 0, 0}, {batch_size, seq_len, q_cols});
+    auto k = slice(proj, {0, 0, q_cols}, {batch_size, seq_len, q_cols + kv_cols});
+    auto v = slice(proj, {0, 0, q_cols + kv_cols}, {batch_size, seq_len, qkv_cols});
+
+    q = reshape(q, {batch_size, seq_len, num_heads, head_dim});
+    k = reshape(k, {batch_size, seq_len, num_kv_heads, head_dim});
+    v = reshape(v, {batch_size, seq_len, num_kv_heads, head_dim});
+
+    q = transpose(q, {0, 2, 1, 3});
+    k = transpose(k, {0, 2, 1, 3});
+    v = transpose(v, {0, 2, 1, 3});
+
+    q = mlx::core::fast::rope(q, rope_dims, false, rope_base, 1.0f, 0);
+    k = mlx::core::fast::rope(k, rope_dims, false, rope_base, 1.0f, 0);
+
+    auto attn = mlx::core::fast::scaled_dot_product_attention(
+        q, k, v, scale, "causal", std::nullopt);
+
+    attn = transpose(attn, {0, 2, 1, 3});
+    attn = reshape(attn, {batch_size, seq_len, q_cols});
+
+    auto output = quantized_matmul(
+        attn, o_weight.inner, o_scales.inner, o_biases_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    output_out = std::make_unique<MlxArray>(std::move(output));
+    k_out = std::make_unique<MlxArray>(std::move(k));
+    v_out = std::make_unique<MlxArray>(std::move(v));
+}
+
 // Compiled operations (with kernel fusion).
 // Compiled MoE expert forward with quantized weights
 namespace {
@@ -3914,39 +4040,6 @@ void metal_gated_delta_forward(
 
     output = std::make_unique<MlxArray>(std::move(results[0]));
     new_state = std::make_unique<MlxArray>(std::move(results[1]));
-}
-
-// Compiled MoE gate function (matches Python @mx.compile group_expert_select)
-namespace {
-    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_moe_gate() {
-        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
-            // inputs: [gates, correction_bias, params]
-            // params: [top_k, scaling_factor, norm_topk_prob]
-            const auto& gates = inputs[0];
-            const auto& correction_bias = inputs[1];
-            const auto& params = inputs[2];
-
-            // Sigmoid scoring
-            auto orig_scores = mlx::core::sigmoid(mlx::core::astype(gates, mlx::core::float32));
-            auto scores = mlx::core::add(orig_scores, correction_bias);
-
-            // Top-k selection via argpartition on negated scores
-            int k = 6; // Will be overridden by params but compile needs shapeless=true
-            auto neg_scores = mlx::core::negative(scores);
-            auto indices = mlx::core::argpartition(neg_scores, k - 1, -1);
-            auto topk_indices = mlx::core::slice(indices, {0, 0}, {(int)indices.shape()[0], k});
-
-            // Get scores from original (not biased)
-            auto topk_scores = mlx::core::take_along_axis(orig_scores, topk_indices, -1);
-
-            // Normalize
-            auto denom = mlx::core::sum(topk_scores, -1, true);
-            topk_scores = mlx::core::divide(topk_scores, mlx::core::add(denom, mlx::core::array(1e-20f)));
-
-            return {topk_indices, topk_scores};
-        };
-        return mlx::core::compile(fn, true);  // shapeless=true
-    }
 }
 
 // Compiled MoE gate: sigmoid + bias + topk + normalize + scale

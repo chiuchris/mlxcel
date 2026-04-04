@@ -675,4 +675,8 @@ impl LanguageModel for Qwen3Model {
     fn supports_batched_prefill(&self) -> bool {
         true
     }
+
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        true
+    }
 }

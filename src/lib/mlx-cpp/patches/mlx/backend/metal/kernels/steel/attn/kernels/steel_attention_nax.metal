@@ -16,7 +16,12 @@
     instantiate_attn(iname, itype, 64, 32, 128, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 64, 32,  64, 4, 1, mname, mtype) \
     instantiate_attn(iname, itype, 64, 64, 128, 4, 1, mname, mtype) \
-    instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype)
+    instantiate_attn(iname, itype, 64, 64,  64, 4, 1, mname, mtype) \
+    instantiate_attn(iname, itype, 64, 32, 256, 2, 2, mname, mtype) \
+    instantiate_attn(iname, itype, 64, 32, 128, 2, 2, mname, mtype) \
+    instantiate_attn(iname, itype, 64, 32,  64, 2, 2, mname, mtype) \
+    instantiate_attn(iname, itype, 64, 64, 128, 2, 2, mname, mtype) \
+    instantiate_attn(iname, itype, 64, 64,  64, 2, 2, mname, mtype)
 
 #define instantiate_attn_mask_helper(iname, itype) \
     instantiate_attn_shapes_helper(iname, itype, iname, itype) \

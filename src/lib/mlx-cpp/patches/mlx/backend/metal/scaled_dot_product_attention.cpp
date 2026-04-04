@@ -15,6 +15,56 @@ namespace mlx::core::fast {
 
 namespace {
 
+bool use_experimental_nax_bk64() {
+  static const bool enabled = []() {
+    if (const char* v = std::getenv("MLXCEL_EXPERIMENTAL_NAX_BK64")) {
+      return std::string_view(v) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+bool use_experimental_nax_wm2_wn2() {
+  static const bool enabled = []() {
+    if (const char* v = std::getenv("MLXCEL_EXPERIMENTAL_NAX_WM2_WN2")) {
+      return std::string_view(v) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+bool use_experimental_disable_nax_full_sdpa() {
+  static const bool enabled = []() {
+    if (const char* v = std::getenv("MLXCEL_EXPERIMENTAL_DISABLE_NAX_FULL_SDPA")) {
+      return std::string_view(v) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+bool use_experimental_nax_shape_bucket_tuning() {
+  static const bool enabled = []() {
+    if (const char* v = std::getenv("MLXCEL_EXPERIMENTAL_NAX_SHAPE_BUCKET_TUNING")) {
+      return std::string_view(v) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
+bool use_experimental_nax_gqa2_shape_bucket() {
+  static const bool enabled = []() {
+    if (const char* v = std::getenv("MLXCEL_EXPERIMENTAL_NAX_GQA2_SHAPE_BUCKET")) {
+      return std::string_view(v) != "0";
+    }
+    return false;
+  }();
+  return enabled;
+}
+
 void sdpa_full_self_attention_nax(
     const Stream& s,
     metal::Device& d,
@@ -42,6 +92,30 @@ void sdpa_full_self_attention_nax(
 
   int qL = q.shape(2);
   int kL = k.shape(2);
+
+  if (use_experimental_nax_gqa2_shape_bucket() && bd == 128 && gqa_factor == 2 &&
+      qL >= 1024 && kL >= 1024 && !mask.has_value() && !sinks.has_value() &&
+      do_causal_) {
+    wm = 2;
+    wn = 2;
+  }
+
+  if (use_experimental_nax_shape_bucket_tuning() && bd == 128 && qL >= 1024 &&
+      kL >= 1024 && !mask.has_value() && !sinks.has_value() && do_causal_) {
+    wm = 2;
+    wn = 2;
+  }
+
+  if (use_experimental_nax_wm2_wn2() && bd <= 256 && kL >= 512 &&
+      !mask.has_value() && !sinks.has_value() && do_causal_) {
+    wm = 2;
+    wn = 2;
+  }
+
+  if (use_experimental_nax_bk64() && bd <= 128 && kL >= 512 && !mask.has_value() &&
+      !sinks.has_value() && do_causal_) {
+    bk = 64;
+  }
 
   const bool align_Q = (qL % bq) == 0;
   const bool align_K = (kL % bk) == 0;
@@ -175,7 +249,8 @@ void sdpa_full_self_attention_metal(
     const std::optional<array>& mask,
     const std::optional<array>& sinks) {
   if (metal::is_nax_available() && q.shape(3) != 80 &&
-      (env::enable_tf32() || q.dtype() != float32)) {
+      (env::enable_tf32() || q.dtype() != float32) &&
+      !use_experimental_disable_nax_full_sdpa()) {
     return sdpa_full_self_attention_nax(
         /* const Stream& s = */ s,
         /* metal::Device& d = */ d,

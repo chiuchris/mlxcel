@@ -757,6 +757,52 @@ std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
     rust::Str mode
 );
 
+// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
+// Used by: Llama3-family fused attention preparation path.
+void fused_qkv_project_split_rope(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray* biases,     // nullable for mxfp4/nvfp4/mxfp8
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    int32_t cache_offset,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode,
+    std::unique_ptr<MlxArray>& q_out,
+    std::unique_ptr<MlxArray>& k_out,
+    std::unique_ptr<MlxArray>& v_out
+);
+
+// Experimental dense causal prefill attention path:
+// qkv projection + split + rope + native causal SDPA + output projection.
+// Returns output plus K/V tensors so Rust can populate the KV cache.
+void fused_causal_prefill_attention(
+    const MlxArray& x,
+    const MlxArray& qkv_weight,
+    const MlxArray& qkv_scales,
+    const MlxArray* qkv_biases,
+    const MlxArray& o_weight,
+    const MlxArray& o_scales,
+    const MlxArray* o_biases,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    float scale,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode,
+    std::unique_ptr<MlxArray>& output_out,
+    std::unique_ptr<MlxArray>& k_out,
+    std::unique_ptr<MlxArray>& v_out
+);
+
 // Compiled operations (with kernel fusion).
 // Compiled full MoE expert forward
 // Compiles: silu(gate_proj(x)) * up_proj(x), then down_proj

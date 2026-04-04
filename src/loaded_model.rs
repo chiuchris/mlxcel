@@ -275,6 +275,14 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, release_sequence_state(caches))
     }
 
+    fn supports_padded_prefill(&self) -> bool {
+        delegate_language_model!(self, supports_padded_prefill())
+    }
+
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        delegate_language_model!(self, supports_maskless_padded_prefill())
+    }
+
     fn supports_batching(&self) -> bool {
         delegate_language_model!(self, supports_batching())
     }

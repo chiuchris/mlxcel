@@ -50,6 +50,11 @@ fn should_align_prefill() -> bool {
     hw.has_neural_accelerator && hw.macos_supports_na
 }
 
+#[inline]
+fn force_padded_prefill_array_mask() -> bool {
+    std::env::var("MLXCEL_FORCE_PADDED_PREFILL_MASK").is_ok()
+}
+
 /// Pad a prompt token slice to `padded_len` with the pad token (0) and return
 /// both the padded slice and an appropriate attention mask.
 ///
@@ -70,6 +75,7 @@ fn should_align_prefill() -> bool {
 fn pad_tokens_for_prefill(
     prompt_tokens: &[i32],
     padded_len: usize,
+    use_maskless_causal: bool,
 ) -> (Vec<i32>, Option<UniquePtr<MlxArray>>) {
     let actual_len = prompt_tokens.len();
     if padded_len == actual_len {
@@ -79,6 +85,10 @@ fn pad_tokens_for_prefill(
     let mut padded = Vec::with_capacity(padded_len);
     padded.extend_from_slice(prompt_tokens);
     padded.resize(padded_len, 0); // pad with token id 0
+
+    if use_maskless_causal && !force_padded_prefill_array_mask() {
+        return (padded, None);
+    }
 
     let mask = create_padded_prefill_mask(actual_len as i32, padded_len as i32, 0);
     (padded, Some(mask))
@@ -202,6 +212,20 @@ pub trait LanguageModel {
     /// NaN/inf values can corrupt the Metal GPU state.
     fn supports_padded_prefill(&self) -> bool {
         true
+    }
+
+    /// Whether tile-aligned padded prefill can safely use the model's implicit
+    /// causal attention path without building an explicit array mask.
+    ///
+    /// This is only valid for standard causal transformer prefill where:
+    /// - padding tokens are appended after the real prompt
+    /// - outputs from padded positions are discarded
+    /// - external/internal caches are trimmed back to the real prompt length
+    ///
+    /// Hybrid/recurrent models and models with custom prefill mask semantics
+    /// should keep returning `false`.
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        false
     }
 
     /// Whether this model supports batched decode for continuous batching.
@@ -538,7 +562,11 @@ impl CxxGenerator {
         let actual_len = prompt_tokens.len();
         let logits = if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
-            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
+                prompt_tokens,
+                padded_len,
+                model.supports_maskless_padded_prefill(),
+            );
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             let raw_logits = model.forward(
                 &input,
@@ -735,7 +763,11 @@ impl CxxGenerator {
         let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill()
         {
             let padded_len = align_to_na_tile(actual_len);
-            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
+                prompt_tokens,
+                padded_len,
+                model.supports_maskless_padded_prefill(),
+            );
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             // Pad embeddings if provided.
             let padded_embeds_storage;
@@ -874,7 +906,11 @@ impl CxxGenerator {
         let logits = if mask.is_none() && should_align_prefill() && model.supports_padded_prefill()
         {
             let padded_len = align_to_na_tile(actual_len);
-            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
+                prompt_tokens,
+                padded_len,
+                model.supports_maskless_padded_prefill(),
+            );
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             let padded_embeds_storage;
             let effective_embeds: Option<&MlxArray> = if let Some(emb) = input_embeddings {
@@ -1023,7 +1059,11 @@ impl CxxGenerator {
         let prefill_start = Instant::now();
         let logits = if should_align_prefill() && model.supports_padded_prefill() {
             let padded_len = align_to_na_tile(actual_len);
-            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(prompt_tokens, padded_len);
+            let (padded_tokens, mask_opt) = pad_tokens_for_prefill(
+                prompt_tokens,
+                padded_len,
+                model.supports_maskless_padded_prefill(),
+            );
             let input = ffi::from_slice_i32(&padded_tokens, &[1, padded_len as i32]);
             let raw_logits = model.forward(
                 &input,
@@ -1375,6 +1415,35 @@ mod tests {
         }
     }
 
+    struct MasklessPaddedPrefillModel;
+
+    impl LanguageModel for MasklessPaddedPrefillModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::zeros(&[1, 1, 4], crate::dtype::FLOAT32)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+
+        fn supports_maskless_padded_prefill(&self) -> bool {
+            true
+        }
+    }
+
     #[test]
     fn non_batching_model_uses_default_loop_fallback() {
         let model = NonBatchModel;
@@ -1401,6 +1470,32 @@ mod tests {
     fn supports_batched_prefill_can_opt_in() {
         let model = FullBatchPrefillModel;
         assert!(model.supports_batched_prefill());
+    }
+
+    #[test]
+    fn supports_maskless_padded_prefill_defaults_false() {
+        let model = StubModel;
+        assert!(!model.supports_maskless_padded_prefill());
+    }
+
+    #[test]
+    fn supports_maskless_padded_prefill_can_opt_in() {
+        let model = MasklessPaddedPrefillModel;
+        assert!(model.supports_maskless_padded_prefill());
+    }
+
+    #[test]
+    fn padded_prefill_can_skip_array_mask_for_opted_in_models() {
+        let tokens = [1, 2, 3];
+        let (_padded, mask_opt) = pad_tokens_for_prefill(&tokens, 32, true);
+        assert!(mask_opt.is_none());
+    }
+
+    #[test]
+    fn padded_prefill_keeps_array_mask_by_default() {
+        let tokens = [1, 2, 3];
+        let (_padded, mask_opt) = pad_tokens_for_prefill(&tokens, 32, false);
+        assert!(mask_opt.is_some());
     }
 
     // -- SamplingConfig::needs_token_history (incremental history optimization) --

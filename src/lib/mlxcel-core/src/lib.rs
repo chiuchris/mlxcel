@@ -1033,6 +1033,51 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        /// Fused concatenated QKV projection + split + reshape + transpose + RoPE.
+        /// Used by: Llama3-family fused attention preparation path.
+        unsafe fn fused_qkv_project_split_rope(
+            x: &MlxArray,
+            weight: &MlxArray,
+            scales: &MlxArray,
+            biases: *const MlxArray,
+            num_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            rope_dims: i32,
+            rope_base: f32,
+            cache_offset: i32,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+            q_out: &mut UniquePtr<MlxArray>,
+            k_out: &mut UniquePtr<MlxArray>,
+            v_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Experimental dense causal prefill attention path:
+        /// qkv projection + split + rope + native causal SDPA + output projection.
+        unsafe fn fused_causal_prefill_attention(
+            x: &MlxArray,
+            qkv_weight: &MlxArray,
+            qkv_scales: &MlxArray,
+            qkv_biases: *const MlxArray,
+            o_weight: &MlxArray,
+            o_scales: &MlxArray,
+            o_biases: *const MlxArray,
+            num_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            rope_dims: i32,
+            rope_base: f32,
+            scale: f32,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+            output_out: &mut UniquePtr<MlxArray>,
+            k_out: &mut UniquePtr<MlxArray>,
+            v_out: &mut UniquePtr<MlxArray>,
+        );
+
         // Compiled operations (with kernel fusion).
         /// Compiled MoE expert forward with quantized weights
         /// Falls back to non-compiled for non-affine modes (mxfp4/nvfp4/mxfp8)

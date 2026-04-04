@@ -131,39 +131,72 @@ impl Attention {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
-
-        // Fused QKV projection: single matmul → split into Q, K, V
-        let (q, k, v) = self.qkv_proj.forward(x);
-
-        // Reshape to [batch, seq_len, n_heads, head_dim]
-        let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
-        let k = mlxcel_core::reshape(&k, &[b, l, self.num_kv_heads, self.head_dim]);
-        let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
-
-        // Transpose to [batch, n_heads, seq_len, head_dim]
-        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
-        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
-        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
-
         let offset = cache.offset;
 
-        // Apply RoPE
-        let q = mlxcel_core::fast_rope(
-            &q,
-            self.rope_dims,
-            false,
-            self.rope_base,
-            1.0, // scale
-            offset,
-        );
-        let k = mlxcel_core::fast_rope(
-            &k,
-            self.rope_dims,
-            false,
-            self.rope_base,
-            1.0, // scale
-            offset,
-        );
+        if l > 1
+            && mask.is_none()
+            && cache.is_empty()
+            && std::env::var("MLXCEL_ENABLE_FUSED_CAUSAL_PREFILL_ATTENTION").is_ok()
+            && let (Some(qkv_weight), Some(o_weight)) = (
+                self.qkv_proj.qkv_proj.as_quantized_weight(),
+                self.o_proj.as_quantized_weight(),
+            )
+        {
+            let mut output = UniquePtr::null();
+            let mut k = UniquePtr::null();
+            let mut v = UniquePtr::null();
+            unsafe {
+                mlxcel_core::fused_causal_prefill_attention(
+                    x,
+                    &qkv_weight.weight,
+                    &qkv_weight.scales,
+                    qkv_weight.biases_ptr(),
+                    &o_weight.weight,
+                    &o_weight.scales,
+                    o_weight.biases_ptr(),
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.rope_dims,
+                    self.rope_base,
+                    self.scale,
+                    qkv_weight.group_size,
+                    qkv_weight.bits,
+                    &qkv_weight.mode,
+                    &mut output,
+                    &mut k,
+                    &mut v,
+                );
+            }
+            cache.update(k, v);
+            return output;
+        }
+
+        let (q, k, v) = if let Some((q, k, v)) =
+            self.qkv_proj
+                .forward_split_rope(x, self.rope_dims, self.rope_base, offset)
+        {
+            (q, k, v)
+        } else {
+            // Fallback for non-quantized weights: preserve the existing Rust path.
+            let (q, k, v) = self.qkv_proj.forward(x);
+
+            // Reshape to [batch, seq_len, n_heads, head_dim]
+            let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
+            let k = mlxcel_core::reshape(&k, &[b, l, self.num_kv_heads, self.head_dim]);
+            let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
+
+            // Transpose to [batch, n_heads, seq_len, head_dim]
+            let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+            let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+            let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+            let q =
+                mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
+            let k =
+                mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
+            (q, k, v)
+        };
 
         // Update KV cache and get sliced views
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
@@ -703,6 +736,10 @@ impl LanguageModel for Llama3Model {
     }
 
     fn supports_batched_prefill(&self) -> bool {
+        true
+    }
+
+    fn supports_maskless_padded_prefill(&self) -> bool {
         true
     }
 }
