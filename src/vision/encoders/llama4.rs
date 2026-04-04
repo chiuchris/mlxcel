@@ -397,15 +397,7 @@ impl VisionAttention {
         let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
         // Scaled dot-product attention (no mask - full attention)
-        let attn_output = unsafe {
-            mlxcel_core::scaled_dot_product_attention(
-                &q,
-                &k,
-                &v,
-                self.scale,
-                std::ptr::null(), // no mask
-            )
-        };
+        let attn_output = mlxcel_core::layers::attention(&q, &k, &v, self.scale, None, 0.0, 0);
 
         // Transpose back and reshape: [B, num_heads, L, head_dim] -> [B, L, hidden]
         let attn_output = mlxcel_core::transpose_axes(&attn_output, &[0, 2, 1, 3]);

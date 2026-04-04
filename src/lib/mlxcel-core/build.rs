@@ -106,6 +106,7 @@ fn main() {
     println!("cargo:rerun-if-changed=src/lib.rs");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.h");
     println!("cargo:rerun-if-changed=cpp/mlx_cxx_bridge.cpp");
+    println!("cargo:rerun-if-changed=metal/fused_attention_metal4.metal");
     println!("cargo:rerun-if-changed=../mlx-cpp/CMakeLists.txt");
     println!("cargo:rerun-if-changed=../mlx-cpp/patches");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");

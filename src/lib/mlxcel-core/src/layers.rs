@@ -1566,7 +1566,9 @@ fn classify_na_attention_dispatch(
 
     let route = if softcap > 0.0 {
         "softcap"
-    } else if has_array_mask && window_size == 0 && query_sequence_length > 1
+    } else if has_array_mask
+        && window_size == 0
+        && query_sequence_length > 1
         && query_sequence_length == key_sequence_length
     {
         "padded_prefill"
@@ -1697,7 +1699,18 @@ fn record_na_attention_dispatch(
         );
         eprintln!(
             "[mlxcel][na-attention] dispatch={} phase={} route={} fast_path_eligible={} fast_path_reason={} nax_eligible={} nax_reason={} q={:?} k={:?} scale={:.6} softcap={:.3} window_size={}",
-            count, phase, route, fast_path_eligible, fast_reason, nax_eligible, nax_reason, q_shape, k_shape, scale, softcap, window_size
+            count,
+            phase,
+            route,
+            fast_path_eligible,
+            fast_reason,
+            nax_eligible,
+            nax_reason,
+            q_shape,
+            k_shape,
+            scale,
+            softcap,
+            window_size
         );
     }
 }
@@ -1731,6 +1744,10 @@ pub fn attention(
     window_size: i32,
 ) -> UniquePtr<MlxArray> {
     let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+    if should_use_metal4_attention() {
+        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
+    }
+
     if softcap > 0.0 {
         let q_heads = ffi::array_shape(q)[1];
         let kv_heads = ffi::array_shape(k)[1];
@@ -1743,10 +1760,6 @@ pub fn attention(
         }
         // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
         return unsafe { ffi::compiled_softcap_sdpa(q, k, v, scale, softcap, mask_ptr) };
-    }
-
-    if should_use_metal4_attention() {
-        return metal4_attention(q, k, v, scale, mask, softcap, window_size);
     }
 
     // SAFETY: q/k/v/mask_ptr are valid for the duration of this call.
@@ -1783,12 +1796,12 @@ pub unsafe fn attention_from_ptr(
 /// hardware supports Metal 4 TensorOps (M5+ with macOS 26.2+) and passes
 /// the `use_metal4` flag to the C++ bridge.
 ///
-/// # Metal 4 path (future — scaffolding only)
+/// # Metal 4 path
 ///
 /// When `hw.has_neural_accelerator && hw.macos_supports_na` is true, this
-/// function sets `use_metal4 = true`.  The C++ side will eventually dispatch
-/// to upstream MLX main's Metal NAX SDPA kernel when the hardware and shape
-/// constraints match.
+/// function sets `use_metal4 = true`. The C++ bridge delegates standard SDPA
+/// to upstream MLX `fast::scaled_dot_product_attention()`, allowing backend
+/// Metal/NAX kernel selection on M5-class hardware.
 ///
 /// The Metal 4 path is designed to handle:
 ///   - Standard MHA and GQA (n_heads != n_kv_heads): upstream MLX broadcasts
@@ -1979,6 +1992,218 @@ mod tests {
         let out_fast = ffi::ffi_fast_scaled_dot_product_attention_causal(&q, &k, &v, scale);
 
         assert_eq!(ffi::array_shape(&out), ffi::array_shape(&out_fast));
+    }
+
+    #[test]
+    fn causal_attention_single_query_softcap_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.1, -0.2, 0.3, -0.1], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.1, 0.3, 0.1, -0.2, 0.2, 0.0, -0.3, 0.2, 0.1, -0.2, 0.4, -0.1, 0.0, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, 0.1, -0.3, 0.2, -0.2, 0.4, 0.3, -0.1, 0.1, -0.5, 0.2, 0.6, -0.4, 0.2, 0.1,
+                -0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let softcap = 30.0_f32;
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, softcap, 0);
+        let mask = crate::utils::create_causal_mask(1, 3);
+        let out_masked = attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), softcap, 0);
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query softcap fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
+    fn causal_attention_single_query_window_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.2, 0.1, -0.4, 0.3], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.0, -0.1, 0.2, -0.2, 0.3, 0.0, 0.1, 0.3, -0.1, 0.2, 0.0, -0.1, 0.4, -0.2, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.3, -0.1, 0.2, 0.4, -0.1, 0.2, -0.3, 0.1, 0.5, 0.0, -0.2, 0.2, -0.4, 0.3, 0.1,
+                -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let window_size = 8_i32; // k_len <= window, so fast path should skip mask creation.
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        let mask = crate::utils::create_causal_mask_with_window(1, 3, Some(window_size));
+        let out_masked = attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query window fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
+    fn causal_attention_single_query_window_respects_mask_when_needed() {
+        let q = crate::from_slice_f32(&[0.2, -0.1, 0.4, 0.0], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.1, 0.0, -0.1, -0.2, 0.3, 0.1, 0.0, 0.4, -0.2, 0.2, 0.1, -0.3, 0.2, 0.3, -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.2, 0.4, 0.1, -0.1, 0.3, -0.2, 0.5, 0.2, -0.1, 0.1, -0.3, 0.4, 0.0,
+                -0.1,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+        let window_size = 2_i32; // k_len > window, mask is required.
+
+        let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        let mask = crate::utils::create_causal_mask_with_window(1, 3, Some(window_size));
+        let out_masked = attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query window path should keep explicit mask semantics when k_len > window"
+        );
+    }
+
+    #[test]
+    fn causal_attention_window_bool_mask_matches_float_reference() {
+        let q = crate::from_slice_f32(
+            &[0.1, -0.2, 0.3, 0.4, 0.2, 0.0, -0.1, 0.5, -0.3, 0.1, 0.2, -0.4],
+            &[1, 1, 3, 4],
+        );
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.1, -0.1, 0.0, -0.2, 0.3, 0.1, -0.1, 0.0, -0.3, 0.2, 0.4, 0.1, 0.2,
+                -0.2, 0.3, -0.1, 0.0, 0.4, -0.2,
+            ],
+            &[1, 1, 5, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, -0.2, 0.1, 0.0, -0.1, 0.3, 0.2, -0.3, 0.2, 0.1, -0.4, 0.5, 0.3, -0.1,
+                0.0, 0.2, -0.2, 0.4, 0.1, -0.1,
+            ],
+            &[1, 1, 5, 4],
+        );
+        let scale = 0.5_f32;
+        let window_size = 2_i32;
+
+        let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        let mask_f = crate::utils::create_causal_mask_with_window(3, 2, Some(window_size));
+        let out_ref = attention(
+            &q,
+            &k,
+            &v,
+            scale,
+            Some(mask_f.as_ref().unwrap()),
+            0.0,
+            window_size,
+        );
+
+        let diff = crate::subtract(out.as_ref().unwrap(), out_ref.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "bool-mask causal window path should match float-mask reference"
+        );
+    }
+
+    #[test]
+    fn softcap_gqa_decode_matches_explicit_repeat_kv_reference() {
+        let q = crate::from_slice_f32(
+            &[
+                0.2, -0.1, 0.3, 0.0, 0.1, 0.4, -0.2, 0.2, -0.3, 0.2, 0.1, -0.1, 0.0, -0.2, 0.5,
+                0.3,
+            ],
+            &[1, 4, 1, 4],
+        );
+        let k = crate::from_slice_f32(
+            &[
+                0.1, 0.0, -0.2, 0.3, -0.1, 0.2, 0.1, 0.0, 0.2, -0.3, 0.0, 0.4, 0.3, 0.1, -0.1,
+                -0.2,
+            ],
+            &[1, 2, 2, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, -0.1, 0.2, 0.0, -0.2, 0.4, 0.1, -0.3, 0.1, 0.3, -0.4, 0.2, 0.2, -0.2, 0.0,
+                0.5,
+            ],
+            &[1, 2, 2, 4],
+        );
+
+        let scale = 0.5_f32;
+        let softcap = 30.0_f32;
+
+        let out_new = attention(&q, &k, &v, scale, None, softcap, 0);
+        let rk = crate::utils::repeat_kv(&k, 2);
+        let rv = crate::utils::repeat_kv(&v, 2);
+        let out_ref = unsafe {
+            ffi::compiled_softcap_sdpa(
+                &q,
+                rk.as_ref().unwrap(),
+                rv.as_ref().unwrap(),
+                scale,
+                softcap,
+                std::ptr::null(),
+            )
+        };
+
+        let diff = crate::subtract(out_new.as_ref().unwrap(), out_ref.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        let diff_val = crate::item_f32(&diff_sum);
+        assert!(
+            diff_val < 1e-5,
+            "decode GQA softcap path should match explicit repeat_kv reference (diff_sum={diff_val})"
+        );
     }
 
     /// Verify that the detection condition uses the canonical NA check

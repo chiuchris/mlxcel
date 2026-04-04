@@ -78,6 +78,8 @@ pub fn slice_axis(x: &MlxArray, axis: i32, start: i32, end: i32) -> UniquePtr<Ml
 
 // Attention Mask Utilities.
 /// Create a causal attention mask.
+/// Used by: Llama, Qwen, Mixtral, Gemma, Cohere, Phi, OLMo, Exaone, GLM4,
+/// MiniCPM, DeepSeek, Hunyuan, StarCoder2 and other causal attention callers
 ///
 /// Creates a lower triangular mask of shape [size, size + offset] where:
 /// - 1.0 indicates positions that can be attended to
@@ -105,7 +107,20 @@ pub fn create_causal_mask(size: i32, offset: i32) -> UniquePtr<MlxArray> {
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
 }
 
+/// Create a boolean causal attention mask.
+/// Used by: same as `create_causal_mask` (experimental path)
+///
+/// Returns a bool mask where `true` means "allowed attention".
+pub fn create_causal_bool_mask(size: i32, offset: i32) -> UniquePtr<MlxArray> {
+    let total_len = size + offset;
+    let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
+    let mask = ffi::tril(&ones, offset);
+    let zeros = ffi::zeros(&[size, total_len], dtype::FLOAT32);
+    ffi::greater(&mask, &zeros)
+}
+
 /// Create a causal attention mask with sliding window.
+/// Used by: Gemma2, Gemma3, Gemma4, Qwen3, Ministral and other windowed-attention callers
 ///
 /// # Arguments
 /// * `size` - Size of the query sequence
@@ -139,6 +154,28 @@ pub fn create_causal_mask_with_window(
     let bool_mask = ffi::greater(&mask, &zeros); // mask > 0 gives bool mask
 
     ffi::where_cond(&bool_mask, &zeros, &neg_inf)
+}
+
+/// Create a boolean causal attention mask with optional sliding window.
+/// Used by: same as `create_causal_mask_with_window` (experimental path)
+///
+/// Returns a bool mask where `true` means "allowed attention".
+pub fn create_causal_bool_mask_with_window(
+    size: i32,
+    offset: i32,
+    window: Option<i32>,
+) -> UniquePtr<MlxArray> {
+    let total_len = size + offset;
+    let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
+    let mut mask = ffi::tril(&ones, offset);
+
+    if let Some(w) = window {
+        let upper_mask = ffi::triu(&ones, offset - w + 1);
+        mask = ffi::multiply(&mask, &upper_mask);
+    }
+
+    let zeros = ffi::zeros(&[size, total_len], dtype::FLOAT32);
+    ffi::greater(&mask, &zeros)
 }
 
 // KV Cache Utilities.

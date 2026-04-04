@@ -1325,6 +1325,22 @@ namespace {
         };
         return mlx::core::compile(fn, true);
     }
+
+    bool enable_softcap_gqa_decode_grouped_opt() {
+        static const bool enabled = []() {
+            // Backward compatibility for old rollback knob:
+            // - MLXCEL_DISABLE_SOFTCAP_GQA_DECODE_GROUPED=1 -> force OFF
+            // - MLXCEL_DISABLE_SOFTCAP_GQA_DECODE_GROUPED=0 -> force ON
+            if (const char* v = std::getenv("MLXCEL_DISABLE_SOFTCAP_GQA_DECODE_GROUPED")) {
+                return std::string_view(v) == "0";
+            }
+            if (const char* v = std::getenv("MLXCEL_ENABLE_SOFTCAP_GQA_DECODE_GROUPED")) {
+                return std::string_view(v) != "0";
+            }
+            return false;
+        }();
+        return enabled;
+    }
 }
 
 std::unique_ptr<MlxArray> compiled_softcap_sdpa(
@@ -1366,6 +1382,40 @@ std::unique_ptr<MlxArray> compiled_softcap_sdpa_gqa(
     int32_t n_rep,
     const MlxArray* mask
 ) {
+    // Decode-specialized GQA softcap path:
+    // Avoid materializing repeated K/V tensors when q_len == 1 and no mask.
+    // This keeps K/V in [B, H_kv, S, D] and broadcasts over n_rep in matmul.
+    if (!mask && n_rep > 1 && q.inner.shape(2) == 1 &&
+        enable_softcap_gqa_decode_grouped_opt()) {
+        auto q_shape = q.inner.shape();
+        auto k_shape = k.inner.shape();
+        int B = q_shape[0];
+        int Hq = q_shape[1];
+        int QL = q_shape[2];
+        int D = q_shape[3];
+        int Hk = k_shape[1];
+        int S = k_shape[2];
+
+        auto q_grouped = mlx::core::reshape(q.inner, {B, Hk, n_rep, QL, D});
+        auto k_t = mlx::core::transpose(k.inner, {0, 1, 3, 2});
+        k_t = mlx::core::reshape(k_t, {B, Hk, 1, D, S});
+        auto scores = mlx::core::matmul(q_grouped, k_t);
+
+        auto scale_arr = array(scale);
+        auto cap_arr = array(softcap);
+        scores = mlx::core::multiply(scores, scale_arr);
+        scores = mlx::core::multiply(
+            mlx::core::tanh(mlx::core::divide(scores, cap_arr)),
+            cap_arr
+        );
+
+        auto probs = mlx::core::softmax(scores, -1);
+        auto v_grouped = mlx::core::reshape(v.inner, {B, Hk, 1, S, D});
+        auto ctx = mlx::core::matmul(probs, v_grouped);
+        auto out = mlx::core::reshape(ctx, {B, Hq, QL, D});
+        return std::make_unique<MlxArray>(std::move(out));
+    }
+
     // repeat_kv outside compiled graph (uses shape-dependent operations)
     auto do_repeat_kv = [n_rep](const array& x) -> array {
         if (n_rep == 1) return x;
@@ -4740,12 +4790,14 @@ void nemotron_decode_step(
 //     GPU command timeline, enabling the Neural Accelerator to execute an
 //     entire attention layer without returning to the CPU scheduler.
 //
-// CURRENT STATUS: This function is SCAFFOLDING only.
-//   - Metal 4 SDK is not yet publicly available (requires macOS 26.2+ and M5).
-//   - The function signature and dispatch infrastructure are ready.
-//   - The actual MSL kernel body is a TODO guarded by `use_metal4`.
-//   - Until Metal 4 SDK ships, all paths fall back to
-//     `fast_scaled_dot_product_attention()`.
+// CURRENT STATUS:
+//   - For standard SDPA, this bridge delegates to upstream MLX
+//     `fast::scaled_dot_product_attention()`, which can dispatch to the
+//     backend Metal/NAX fused kernels when eligible.
+//   - For softcap attention (Gemma family), this bridge currently keeps the
+//     existing compiled softcap fallback.
+//   - window_size metadata is currently represented by explicit masks from
+//     Rust model code (no dedicated on-chip band-mask kernel here yet).
 //
 // WHEN TO IMPLEMENT THE FULL KERNEL:
 //   Requirements:
@@ -4768,29 +4820,44 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     int32_t window_size,
     bool use_metal4
 ) {
-    // Upstream MLX main already provides the Metal NAX SDPA kernel body.
-    // We keep this bridge so Rust can centralize dispatch and continue
-    // threading future softcap/sliding-window metadata.
-    (void)use_metal4;
-    (void)softcap;
+    // window_size is currently represented by an explicit mask from Rust.
     (void)window_size;
 
     std::optional<mlx::core::array> mask_opt = std::nullopt;
     std::string mask_mode = "";
     if (mask) {
         auto m = mask->inner;
-        // Float masks: cast to Q's dtype to satisfy the "must promote to
-        // output type" constraint.  Boolean/integer masks must NOT be cast
-        // to float or their True/False semantics are lost and they become
-        // additive 1.0/0.0 offsets.
-        if (mlx::core::issubdtype(m.dtype(), mlx::core::floating)) {
-            if (m.dtype() != q.inner.dtype()) {
-                m = mlx::core::astype(m, q.inner.dtype());
-            }
+        // Float masks are additive masks and should match q dtype.
+        // Bool/int masks must preserve original semantics.
+        if (mlx::core::issubdtype(m.dtype(), mlx::core::floating) &&
+            m.dtype() != q.inner.dtype()) {
+            m = mlx::core::astype(m, q.inner.dtype());
         }
         mask_opt = m;
         mask_mode = "array";
     }
+
+    // Keep existing softcap semantics (including GQA) on the Metal4 bridge path
+    // until upstream MLX provides a native fused softcap SDPA variant.
+    if (softcap > 0.0f) {
+        auto q_heads = q.inner.shape(1);
+        auto kv_heads = k.inner.shape(1);
+        std::unique_ptr<MlxArray> mask_holder = nullptr;
+        if (mask_opt.has_value()) {
+            mask_holder = std::make_unique<MlxArray>(mask_opt.value());
+        }
+        const MlxArray* mask_ptr = mask_holder ? mask_holder.get() : nullptr;
+
+        if (q_heads > kv_heads && q_heads % kv_heads == 0) {
+            int32_t n_rep = static_cast<int32_t>(q_heads / kv_heads);
+            return compiled_softcap_sdpa_gqa(q, k, v, scale, softcap, n_rep, mask_ptr);
+        }
+        return compiled_softcap_sdpa(q, k, v, scale, softcap, mask_ptr);
+    }
+
+    // Standard path: delegate to upstream MLX fast SDPA so backend kernel
+    // selection (including M5 NAX full/vector kernels) remains active.
+    (void)use_metal4;
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
     ));

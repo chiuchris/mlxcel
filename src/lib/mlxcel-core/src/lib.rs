@@ -1819,6 +1819,29 @@ pub use ffi::*;
 pub use cxx::UniquePtr;
 pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
 
+fn use_single_query_maskless_path() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MLXCEL_DISABLE_SINGLE_QUERY_MASKLESS").ok().as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
+fn use_bool_causal_mask_path() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        // Explicit opt-in only: kept experimental until repeated A/B shows stable wins.
+        matches!(
+            std::env::var("MLXCEL_EXPERIMENTAL_BOOL_CAUSAL_MASK")
+                .ok()
+                .as_deref(),
+            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
+        )
+    })
+}
+
 /// Causal SDPA wrapper with transparent M5 Neural Accelerator routing.
 ///
 /// On M5-class hardware (`has_neural_accelerator && macos_supports_na`), the
@@ -1838,16 +1861,40 @@ pub fn causal_attention(
     softcap: f32,
     window_size: i32,
 ) -> UniquePtr<MlxArray> {
+    let q_len = ffi::array_shape(q)[2];
+    let k_len = ffi::array_shape(k)[2];
+
     if softcap > 0.0 || window_size > 0 {
-        let q_len = ffi::array_shape(q)[2];
-        let k_len = ffi::array_shape(k)[2];
+        // Decode single-query fast path:
+        // - Causal masking is unnecessary when q_len == 1 (no future positions).
+        // - Sliding-window masking is only needed if cached KV exceeds window.
+        // This avoids per-token mask materialization for common decode cases.
+        let needs_window_mask = window_size > 0 && k_len > window_size;
+        if q_len == 1 && !needs_window_mask && use_single_query_maskless_path() {
+            return layers::attention(q, k, v, scale, None, softcap, window_size);
+        }
+
         let offset = (k_len - q_len).max(0);
-        let mask = if window_size > 0 {
+        let mask = if softcap == 0.0 && use_bool_causal_mask_path() {
+            if window_size > 0 {
+                utils::create_causal_bool_mask_with_window(q_len, offset, Some(window_size))
+            } else {
+                utils::create_causal_bool_mask(q_len, offset)
+            }
+        } else if window_size > 0 {
             utils::create_causal_mask_with_window(q_len, offset, Some(window_size))
         } else {
             utils::create_causal_mask(q_len, offset)
         };
-        return layers::attention(q, k, v, scale, Some(mask.as_ref().unwrap()), softcap, window_size);
+        return layers::attention(
+            q,
+            k,
+            v,
+            scale,
+            Some(mask.as_ref().unwrap()),
+            softcap,
+            window_size,
+        );
     }
 
     let hw = hardware::get_hardware();
