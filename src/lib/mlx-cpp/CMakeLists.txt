@@ -93,6 +93,28 @@ else()
 endif()
 
 mlx_apply_source_overlays("${mlx_SOURCE_DIR}")
+
+# Sanity-check: detect deprecated MLX Device API usage in patch files that
+# would cause build failures after an upstream MLX version bump.
+set(_deprecated_patterns
+    "d\\.get_command_encoder("
+    "d\\.new_command_buffer(")
+foreach(_patch_file ${_metal_patch_files_global})
+  # _metal_patch_files is function-local; re-glob here
+endforeach()
+file(GLOB_RECURSE _all_patches
+     "${CMAKE_CURRENT_SOURCE_DIR}/patches/mlx/backend/metal/*.cpp")
+foreach(_pf ${_all_patches})
+  file(READ "${_pf}" _pf_content)
+  foreach(_pat ${_deprecated_patterns})
+    string(FIND "${_pf_content}" "${_pat}" _found)
+    if(NOT _found EQUAL -1)
+      message(WARNING "Patch file ${_pf} uses deprecated API '${_pat}' — "
+                      "update to match upstream MLX at GIT_TAG commit.")
+    endif()
+  endforeach()
+endforeach()
+
 add_subdirectory(${mlx_SOURCE_DIR} ${mlx_BINARY_DIR})
 
 # ----------------------------- CUDA CCCL ---------------------------------

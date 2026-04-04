@@ -1,4 +1,6 @@
 // Copyright © 2023-2024 Apple Inc.
+// mlxcel patch: adds static_cast for mixed-dtype compiled ops.
+// upstream API drift fixed for 6a9a121 (metal::get_command_encoder).
 #include <fmt/format.h>
 #include <sstream>
 
@@ -407,7 +409,7 @@ void Compiled::eval_gpu(
     kernel_name += "_large";
   }
   auto kernel = d.get_kernel(kernel_name, lib);
-  auto& compute_encoder = d.get_command_encoder(s.index);
+  auto& compute_encoder = metal::get_command_encoder(s);
   compute_encoder.set_compute_pipeline_state(kernel);
 
   // Put the inputs in
