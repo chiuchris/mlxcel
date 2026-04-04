@@ -721,14 +721,24 @@ impl Qwen35Model {
                     mlxcel_core::slice(
                         keys,
                         &[batch_idx as i32, 0, 0, 0],
-                        &[batch_idx as i32 + 1, mlxcel_core::array_shape(keys)[1], kv.offset, mlxcel_core::array_shape(keys)[3]],
+                        &[
+                            batch_idx as i32 + 1,
+                            mlxcel_core::array_shape(keys)[1],
+                            kv.offset,
+                            mlxcel_core::array_shape(keys)[3],
+                        ],
                     )
                 });
                 split.values = kv.values.as_ref().map(|values| {
                     mlxcel_core::slice(
                         values,
                         &[batch_idx as i32, 0, 0, 0],
-                        &[batch_idx as i32 + 1, mlxcel_core::array_shape(values)[1], kv.offset, mlxcel_core::array_shape(values)[3]],
+                        &[
+                            batch_idx as i32 + 1,
+                            mlxcel_core::array_shape(values)[1],
+                            kv.offset,
+                            mlxcel_core::array_shape(values)[3],
+                        ],
                     )
                 });
                 Qwen3NextCache::Attention(split)
@@ -785,7 +795,8 @@ impl Qwen35Model {
         let key = Self::cache_key(caches);
         let seq_caches_opt = self.sequence_caches.borrow_mut().remove(&key);
         if let Some(mut seq_caches) = seq_caches_opt {
-            let logits = self.forward_with_mrope_state(input_ids, input_embeddings, &mut seq_caches);
+            let logits =
+                self.forward_with_mrope_state(input_ids, input_embeddings, &mut seq_caches);
             self.sequence_caches.borrow_mut().insert(key, seq_caches);
             return logits;
         }

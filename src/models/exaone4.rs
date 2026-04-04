@@ -164,14 +164,7 @@ impl Attention {
                 )
             }
         } else {
-            mlxcel_core::causal_attention(
-                &q,
-                &cache_k,
-                &cache_v,
-                self.scale,
-                0.0,
-                self.window_size,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
         };
 
         // Transpose back and reshape

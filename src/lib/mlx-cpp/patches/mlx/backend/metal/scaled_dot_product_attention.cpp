@@ -191,12 +191,27 @@ void sdpa_full_self_attention_metal(
 
   using namespace mlx::steel;
 
-  int wm = 4;
   int wn = 1;
 
   int bd = q.shape(-1);
-  int bq = 32;
-  int bk = bd < 128 ? 32 : 16;
+  int bq, bk, wm;
+  if (bd >= 256) {
+    // head_dim=256 (Gemma family): use smaller blocks to stay within the 32 KB
+    // threadgroup memory limit on all Apple GPUs.
+    //   (wm=2, bq=16, bk=8, bd=256) → 28,928 bytes for float32.
+    // TQ = BQ/(kNWarps*8) = 16/(2*8) = 1 satisfies static_assert(TQ==1).
+    wm = 2;
+    bq = 16;
+    bk = 8;
+  } else if (bd < 128) {
+    wm = 4;
+    bq = 32;
+    bk = 32;
+  } else {
+    wm = 4;
+    bq = 32;
+    bk = 16;
+  }
 
   int B = q.shape(0);
   int H = q.shape(1);

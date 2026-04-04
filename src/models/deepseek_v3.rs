@@ -834,11 +834,7 @@ impl DeepSeekV3Model {
 
         // Pass through layers
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(
-                &h,
-                &mut caches[i],
-                mask.as_deref(),
-            );
+            h = layer.forward(&h, &mut caches[i], mask.as_deref());
         }
 
         // Final norm and lm_head

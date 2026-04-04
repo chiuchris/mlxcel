@@ -676,9 +676,9 @@ impl BatchScheduler {
             .collect();
 
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
-        let raw_logits = self
-            .model
-            .forward_batched(&input, &mut batch_caches, stacked_mask.as_deref());
+        let raw_logits =
+            self.model
+                .forward_batched(&input, &mut batch_caches, stacked_mask.as_deref());
 
         mlxcel_core::eval(&raw_logits);
         mlxcel_core::clear_memory_cache();

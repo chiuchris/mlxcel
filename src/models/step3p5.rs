@@ -351,14 +351,7 @@ impl Step3p5Attention {
                 )
             }
         } else {
-            mlxcel_core::causal_attention(
-                &q,
-                &cache_k,
-                &cache_v,
-                self.scale,
-                0.0,
-                self.window_size,
-            )
+            mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
         };
 
         // Transpose back: [B, H, L, D] -> [B, L, H, D]

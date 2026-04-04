@@ -687,7 +687,13 @@ impl Attention {
 
         unsafe {
             mlxcel_core::layers::attention_from_ptr(
-                queries, keys, values, self.scale, mask_ptr, 0.0, self.window_size,
+                queries,
+                keys,
+                values,
+                self.scale,
+                mask_ptr,
+                0.0,
+                self.window_size,
             )
         }
     }

@@ -262,7 +262,7 @@ where
             &name,
             &tensor,
             mode,
-            owned_buffers.as_mut().map(|buffers| &mut **buffers),
+            owned_buffers.as_deref_mut(),
         )?;
         if debug_gemma4 {
             eprintln!("  loaded {name}");
