@@ -266,6 +266,38 @@ pub(crate) fn load_gemma3n_vlm(model_path: &Path) -> Result<LoadedModel> {
     Ok(LoadedModel::Gemma3nVLM(vlm))
 }
 
+/// Sanitize Gemma4 audio weights: transpose conv weights from PyTorch to MLX format.
+fn sanitize_gemma4_audio_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+    let audio_keys: Vec<String> = weights
+        .keys()
+        .filter(|k| k.starts_with("audio_tower."))
+        .cloned()
+        .collect();
+
+    for key in audio_keys {
+        let shape = {
+            let w = weights.get(&key).unwrap();
+            mlxcel_core::array_shape(w)
+        };
+
+        // Conv2d: PyTorch [out, in, kH, kW] -> MLX [out, kH, kW, in]
+        if key.contains("subsample_conv_projection")
+            && key.contains("conv.weight")
+            && shape.len() == 4
+        {
+            let w = weights.remove(&key).unwrap();
+            let transposed = mlxcel_core::transpose_axes(&w, &[0, 2, 3, 1]);
+            weights.insert(key, transposed);
+        }
+        // Conv1d depthwise: PyTorch [out, in, kW] -> MLX [out, kW, in]
+        else if key.contains("depthwise_conv1d.weight") && shape.len() == 3 {
+            let w = weights.remove(&key).unwrap();
+            let transposed = mlxcel_core::transpose_axes(&w, &[0, 2, 1]);
+            weights.insert(key, transposed);
+        }
+    }
+}
+
 /// Load a Gemma4 VLM model.
 pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
@@ -273,6 +305,10 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     let mut weights = models::load_gemma4_vlm_weights(model_path)
         .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 VLM weights: {}", e))?;
     models::sanitize_tied_embeddings(&mut weights, &full_config);
+
+    // Sanitize audio conv weights (PyTorch -> MLX format)
+    sanitize_gemma4_audio_weights(&mut weights);
+
     let text_model = models::Gemma4Model::from_weights(&weights, &args)
         .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 text model: {}", e))?;
 
@@ -329,7 +365,7 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
         pooling_kernel_size,
     );
 
-    let vlm = vision::Gemma4VLModel::new(
+    let mut vlm = vision::Gemma4VLModel::new(
         models::Gemma4Wrapper::new(text_model),
         vision_tower,
         embed_vision,
@@ -347,6 +383,63 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
             .and_then(|value| value.as_i64())
             .unwrap_or(258_882) as i32,
     );
+
+    // Load audio tower if audio_config is present
+    if let Some(audio_config_val) = full_config.get("audio_config")
+        && !audio_config_val.is_null()
+    {
+        let audio_config: crate::audio::AudioConfig =
+            serde_json::from_value(audio_config_val.clone())
+                .map_err(|e| anyhow::anyhow!("Failed to parse audio_config: {}", e))?;
+
+        // Only load if audio weights actually exist
+        if weights.contains_key("audio_tower.output_proj.weight") {
+            let audio_tower = crate::audio::AudioEncoder::from_weights(
+                &weights,
+                "audio_tower",
+                &audio_config,
+                group_size,
+                bits,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load audio tower: {}", e))?;
+
+            let embed_audio = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
+                &weights,
+                "embed_audio",
+                args.text_args().hidden_size,
+                audio_config.rms_norm_eps,
+                group_size,
+                bits,
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to load audio embedder: {}", e))?;
+
+            let audio_token_id = full_config
+                .get("audio_token_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(258_881) as i32;
+            let boa_token_id = full_config
+                .get("boa_token_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(256_000) as i32;
+            let eoa_token_id = full_config
+                .get("eoa_token_id")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(258_883) as i32;
+
+            vlm.set_audio(
+                audio_tower,
+                embed_audio,
+                audio_token_id,
+                boa_token_id,
+                eoa_token_id,
+            );
+
+            eprintln!(
+                "Loaded Gemma4 audio encoder ({} Conformer layers)",
+                audio_config.num_hidden_layers
+            );
+        }
+    }
 
     Ok(LoadedModel::Gemma4VLM(vlm))
 }

@@ -104,6 +104,10 @@ pub(crate) struct GenerationOptions {
     #[arg(long, value_name = "PATH", num_args = 1..)]
     pub(crate) image: Vec<PathBuf>,
 
+    /// Audio file path for audio-language models (e.g. Gemma4 with audio)
+    #[arg(long, value_name = "PATH")]
+    pub(crate) audio: Option<PathBuf>,
+
     /// Maximum number of tokens to generate
     #[arg(short = 'n', long, default_value_t = 100, value_name = "N")]
     pub(crate) max_tokens: usize,

@@ -55,6 +55,8 @@ fn is_gemma4_vlm_weight(name: &str) -> bool {
     is_gemma4_text_weight(name)
         || name.starts_with("vision_tower.")
         || name.starts_with("embed_vision.")
+        || name.starts_with("audio_tower.")
+        || name.starts_with("embed_audio.")
 }
 
 fn tensor_view_to_array(

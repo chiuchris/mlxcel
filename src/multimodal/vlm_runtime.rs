@@ -55,6 +55,10 @@ pub enum VlmPreparationSummary {
         image_slots: usize,
         total_tokens: usize,
     },
+    Gemma4Audio {
+        audio_tokens: usize,
+        total_tokens: usize,
+    },
     Phi4MM {
         image_slots: usize,
         total_tokens: usize,
@@ -472,6 +476,24 @@ fn expand_gemma4_image_tokens(
     prompt_tokens.extend(image_tokens);
     prompt_tokens.extend(rest);
     Ok(())
+}
+
+/// Public wrapper for Gemma4 image token expansion.
+/// Used by generate_vlm when combining image + audio inputs.
+pub fn expand_gemma4_image_tokens_pub(
+    prompt_tokens: &mut Vec<i32>,
+    image_token_id: i32,
+    boi_token_id: i32,
+    eoi_token_id: i32,
+    num_soft_tokens: &[usize],
+) -> Result<()> {
+    expand_gemma4_image_tokens(
+        prompt_tokens,
+        image_token_id,
+        boi_token_id,
+        eoi_token_id,
+        num_soft_tokens,
+    )
 }
 
 #[cfg(test)]

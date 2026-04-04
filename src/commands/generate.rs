@@ -436,12 +436,13 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let sampling_config =
         build_cli_sampling_config(&args, mlxcel::read_eos_token_ids(&args.model.model));
 
-    // Check for VLM image mode
+    // Check for VLM image/audio mode
     let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
         &model,
         &mut prompt_tokens,
         &prompt,
         &args.generation.image,
+        args.generation.audio.as_deref(),
         &tokenizer,
     )?;
 
