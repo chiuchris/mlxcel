@@ -292,13 +292,9 @@ impl SparseMoeBlock {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         if std::env::var("MLXCEL_PROFILE_QWEN3_MOE_DETAIL").is_ok() {
             let (out, _, _, _) = self.forward_profiled(x);
-            out
-        } else {
-            self.forward_impl(x).0
+            return out;
         }
-    }
 
-    fn forward_impl(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, f64, f64, f64) {
         let orig_shape = mlxcel_core::array_shape(x);
         let hidden_dim = orig_shape[orig_shape.len() - 1];
 
@@ -310,7 +306,6 @@ impl SparseMoeBlock {
             mlxcel_core::copy(x)
         };
 
-        let gate_start = std::time::Instant::now();
         // Get router logits
         let logits = self.router.forward(&x_flat);
 
@@ -337,16 +332,10 @@ impl SparseMoeBlock {
             let sum = mlxcel_core::sum_axis(&scores, -1, true);
             scores = mlxcel_core::divide(&scores, &sum);
         }
-        mlxcel_core::eval(&scores);
-        let gate_ms = gate_start.elapsed().as_secs_f64() * 1000.0;
 
-        let expert_start = std::time::Instant::now();
         // Apply experts - returns [n_tokens, k, hidden]
         let expert_out = self.experts.forward(&x_flat, &topk_indices);
-        mlxcel_core::eval(&expert_out);
-        let expert_ms = expert_start.elapsed().as_secs_f64() * 1000.0;
 
-        let combine_start = std::time::Instant::now();
         // Weighted sum over experts: [n_tokens, k, hidden] * [n_tokens, k] -> [n_tokens, hidden]
         // einsum fuses expand_dims + multiply + sum_axis into single kernel
         let operands: [*const mlxcel_core::MlxArray; 2] = [
@@ -356,6 +345,53 @@ impl SparseMoeBlock {
         let result = unsafe { mlxcel_core::einsum("nkh,nk->nh", &operands) };
 
         // Reshape back to original shape
+        if orig_shape.len() > 2 {
+            mlxcel_core::reshape(&result, &orig_shape)
+        } else {
+            result
+        }
+    }
+
+    pub fn forward_profiled(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, f64, f64, f64) {
+        let orig_shape = mlxcel_core::array_shape(x);
+        let hidden_dim = orig_shape[orig_shape.len() - 1];
+
+        let x_flat = if orig_shape.len() > 2 {
+            let n: i32 = orig_shape[..orig_shape.len() - 1].iter().product();
+            mlxcel_core::reshape(x, &[n, hidden_dim])
+        } else {
+            mlxcel_core::copy(x)
+        };
+
+        let gate_start = std::time::Instant::now();
+        let logits = self.router.forward(&x_flat);
+        let gates = mlxcel_core::softmax(&logits, -1);
+        let k = self.num_experts_per_tok as i32;
+        let n_experts = mlxcel_core::array_shape(&logits)[1];
+        let kth = n_experts - k;
+        let indices = mlxcel_core::argpartition(&logits, kth, -1);
+        let indices_shape = mlxcel_core::array_shape(&indices);
+        let topk_indices =
+            mlxcel_core::slice(&indices, &[0, kth], &[indices_shape[0], indices_shape[1]]);
+        let mut scores = mlxcel_core::take_along_axis(&gates, &topk_indices, -1);
+        if self.norm_topk_prob {
+            let sum = mlxcel_core::sum_axis(&scores, -1, true);
+            scores = mlxcel_core::divide(&scores, &sum);
+        }
+        mlxcel_core::eval(&scores);
+        let gate_ms = gate_start.elapsed().as_secs_f64() * 1000.0;
+
+        let expert_start = std::time::Instant::now();
+        let expert_out = self.experts.forward(&x_flat, &topk_indices);
+        mlxcel_core::eval(&expert_out);
+        let expert_ms = expert_start.elapsed().as_secs_f64() * 1000.0;
+
+        let combine_start = std::time::Instant::now();
+        let operands: [*const mlxcel_core::MlxArray; 2] = [
+            expert_out.as_ref().unwrap() as *const _,
+            scores.as_ref().unwrap() as *const _,
+        ];
+        let result = unsafe { mlxcel_core::einsum("nkh,nk->nh", &operands) };
         let result = if orig_shape.len() > 2 {
             mlxcel_core::reshape(&result, &orig_shape)
         } else {
@@ -365,10 +401,6 @@ impl SparseMoeBlock {
         let combine_ms = combine_start.elapsed().as_secs_f64() * 1000.0;
 
         (result, gate_ms, expert_ms, combine_ms)
-    }
-
-    pub fn forward_profiled(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, f64, f64, f64) {
-        self.forward_impl(x)
     }
 }
 
@@ -685,8 +717,8 @@ impl Qwen3MoeModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let profile_blocks =
-            std::env::var("MLXCEL_PROFILE_BLOCKS").is_ok() && mlxcel_core::array_shape(input_ids)[1] == 1;
+        let profile_blocks = std::env::var("MLXCEL_PROFILE_BLOCKS").is_ok()
+            && mlxcel_core::array_shape(input_ids)[1] == 1;
 
         // Embed tokens
         let mut h = self.embed_tokens.forward(input_ids);
