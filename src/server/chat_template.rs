@@ -20,7 +20,7 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use minijinja::{Environment, Value};
+use minijinja::{Environment, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
 
 /// A message in the conversation
@@ -118,26 +118,10 @@ impl ChatTemplateProcessor {
     /// templates like Gemma3 VLM can iterate over.
     pub fn apply_raw(&self, messages: &serde_json::Value) -> Result<String> {
         let mut env = Environment::new();
-        env.set_keep_trailing_newline(true);
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        configure_environment(&mut env);
 
         env.add_template("chat", &self.template)
             .with_context(|| "Failed to parse chat template")?;
-
-        env.add_function(
-            "raise_exception",
-            |msg: String| -> Result<Value, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    msg,
-                ))
-            },
-        );
-
-        env.add_function("strftime_now", |_format: String| -> String {
-            chrono::Utc::now().format("%d %b %Y").to_string()
-        });
 
         let tmpl = env.get_template("chat")?;
 
@@ -164,33 +148,13 @@ impl ChatTemplateProcessor {
     /// Apply the chat template to messages
     pub fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
         let mut env = Environment::new();
-        env.set_keep_trailing_newline(true);
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        configure_environment(&mut env);
 
-        // Add the template
         env.add_template("chat", &self.template)
             .with_context(|| "Failed to parse chat template")?;
 
-        // Add raise_exception function (used by some templates)
-        env.add_function(
-            "raise_exception",
-            |msg: String| -> Result<Value, minijinja::Error> {
-                Err(minijinja::Error::new(
-                    minijinja::ErrorKind::InvalidOperation,
-                    msg,
-                ))
-            },
-        );
-
-        // Add strftime_now function if needed
-        env.add_function("strftime_now", |_format: String| -> String {
-            chrono::Utc::now().format("%d %b %Y").to_string()
-        });
-
         let tmpl = env.get_template("chat")?;
 
-        // Build context
         // Many templates conditionally check variables like `tools`, `enable_thinking`, etc.
         // We must provide them as None/false to avoid undefined variable errors.
         let tools: Option<Vec<String>> = None;
@@ -209,6 +173,40 @@ impl ChatTemplateProcessor {
 
         Ok(result)
     }
+}
+
+/// Configure a minijinja environment with common settings and Python-compat methods.
+fn configure_environment(env: &mut Environment<'_>) {
+    env.set_keep_trailing_newline(true);
+    env.set_trim_blocks(true);
+    env.set_lstrip_blocks(true);
+
+    env.add_function(
+        "raise_exception",
+        |msg: String| -> std::result::Result<Value, minijinja::Error> {
+            Err(minijinja::Error::new(
+                minijinja::ErrorKind::InvalidOperation,
+                msg,
+            ))
+        },
+    );
+
+    env.add_function("strftime_now", |_format: String| -> String {
+        chrono::Utc::now().format("%d %b %Y").to_string()
+    });
+
+    // Handle Python string methods not natively supported by minijinja.
+    // Many HuggingFace chat templates (e.g. Gemma 4) use `.split()` which
+    // is standard Python/Jinja2 but not a built-in minijinja string method.
+    env.set_unknown_method_callback(|_state, value, method, args| match (value.kind(), method) {
+        (minijinja::value::ValueKind::String, "split") => {
+            let s = value.as_str().unwrap_or_default();
+            let sep = args.first().and_then(|a| a.as_str()).unwrap_or_default();
+            let parts: Vec<Value> = s.split(sep).map(|p| Value::from(p.to_string())).collect();
+            Ok(Value::from(parts))
+        }
+        _ => Err(minijinja::Error::from(ErrorKind::UnknownMethod)),
+    });
 }
 
 /// Extract a token from config, handling both string and object formats
