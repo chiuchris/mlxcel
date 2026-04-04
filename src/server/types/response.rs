@@ -88,6 +88,30 @@ pub struct ChatChoice {
 pub struct ChatMessage {
     pub role: String,
     pub content: String,
+    /// Tool calls made by the assistant (present when finish_reason is "tool_calls")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallResponse>>,
+}
+
+/// A single tool call in the response (OpenAI format)
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallResponse {
+    /// Unique tool call ID (format: "call_" + random string)
+    pub id: String,
+    /// Always "function"
+    #[serde(rename = "type")]
+    pub call_type: String,
+    /// Function call details
+    pub function: ToolCallFunctionResponse,
+}
+
+/// Function name + arguments in a tool call response
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallFunctionResponse {
+    /// Function name
+    pub name: String,
+    /// Stringified JSON arguments
+    pub arguments: String,
 }
 
 /// Chat completion response
@@ -142,8 +166,46 @@ impl ChatCompletionResponse {
                 message: ChatMessage {
                     role: "assistant".to_string(),
                     content,
+                    tool_calls: None,
                 },
                 finish_reason,
+                logprobs,
+            }],
+            usage: Usage {
+                prompt_tokens,
+                completion_tokens,
+                total_tokens: prompt_tokens + completion_tokens,
+            },
+        }
+    }
+
+    /// Create a response with tool calls.
+    ///
+    /// `content` is set to empty when tool calls are present (per OpenAI spec).
+    /// `finish_reason` is automatically set to "tool_calls".
+    pub fn new_with_tool_calls(
+        id: String,
+        model: String,
+        content: String,
+        tool_calls: Vec<ToolCallResponse>,
+        prompt_tokens: usize,
+        completion_tokens: usize,
+        logprobs: Option<ChatLogprobs>,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage {
+                    role: "assistant".to_string(),
+                    content,
+                    tool_calls: Some(tool_calls),
+                },
+                finish_reason: Some("tool_calls".to_string()),
                 logprobs,
             }],
             usage: Usage {

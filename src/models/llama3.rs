@@ -191,10 +191,8 @@ impl Attention {
             let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
             let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
 
-            let q =
-                mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
-            let k =
-                mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
+            let q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
+            let k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
             (q, k, v)
         };
 

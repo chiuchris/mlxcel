@@ -74,13 +74,13 @@ fn resolve_chat_template_respects_override_then_file_then_model_metadata() {
 
     let processor =
         resolve_chat_template(Some("inline={{ messages[0].content }}"), None, &dir).unwrap();
-    assert_eq!(processor.apply(&messages).unwrap(), "inline=hello");
+    assert_eq!(processor.apply(&messages, None).unwrap(), "inline=hello");
 
     let processor = resolve_chat_template(None, Some(&file_template), &dir).unwrap();
-    assert_eq!(processor.apply(&messages).unwrap(), "file=hello");
+    assert_eq!(processor.apply(&messages, None).unwrap(), "file=hello");
 
     let processor = resolve_chat_template(None, None, &dir).unwrap();
-    assert_eq!(processor.apply(&messages).unwrap(), "model=hello");
+    assert_eq!(processor.apply(&messages, None).unwrap(), "model=hello");
 
     std::fs::remove_dir_all(dir).unwrap();
 }

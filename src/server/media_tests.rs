@@ -28,11 +28,16 @@ fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
             role: Role::User,
             content: MessageContent::Parts(parts),
             name: None,
+            tool_call_id: None,
+            tool_calls: None,
         }],
         stream: false,
         stream_options: None,
         logprobs: None,
         top_logprobs: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
         params: SamplingParams::default(),
     }
 }
@@ -137,6 +142,8 @@ async fn extract_chat_image_data_collects_images_across_messages() {
                 role: Role::System,
                 content: MessageContent::Text("ignore".to_string()),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             },
             Message {
                 role: Role::User,
@@ -156,12 +163,17 @@ async fn extract_chat_image_data_collects_images_across_messages() {
                     },
                 ]),
                 name: None,
+                tool_call_id: None,
+                tool_calls: None,
             },
         ],
         stream: false,
         stream_options: None,
         logprobs: None,
         top_logprobs: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
         params: SamplingParams::default(),
     };
 

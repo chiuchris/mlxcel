@@ -31,6 +31,7 @@ use crate::server::batch::RequestPriority;
 use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
+use crate::server::tool_calls;
 use crate::server::types::response::{ChatLogprobs, TokenLogprob, TopLogprob};
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
@@ -132,6 +133,22 @@ pub async fn chat_completions(
         .into_response();
     }
 
+    // Validate tool_choice values
+    if let Some(ref tc) = request.tool_choice {
+        match tc {
+            crate::server::types::request::ToolChoice::Mode(mode) => {
+                if !["auto", "none", "required"].contains(&mode.as_str()) {
+                    return ErrorResponse::new(
+                        format!("Invalid tool_choice value: '{mode}'. Must be 'auto', 'none', 'required', or a function object."),
+                        "invalid_request_error",
+                    )
+                    .into_response();
+                }
+            }
+            crate::server::types::request::ToolChoice::Specific(_) => {}
+        }
+    }
+
     let priority = parse_priority_header(&headers);
     if request.stream {
         stream_chat_completion(state, request, priority).await
@@ -183,7 +200,7 @@ async fn non_stream_chat_completion(
     let result = state
         .model_provider
         .generate_with_images(prepared.prompt, options, prepared.image_data)
-        .map_err(|e| ErrorResponse::new(format!("Generation error: {}", e), "server_error"))?;
+        .map_err(|e| ErrorResponse::new(format!("Generation error: {e}"), "server_error"))?;
 
     state.metrics.record_request(
         result.prompt_tokens,
@@ -199,6 +216,27 @@ async fn non_stream_chat_completion(
             Some(build_chat_logprobs(&state.tokenizer, lp_data, top_k))
         }
     });
+
+    // Try to parse tool calls from the output
+    if tool_calls::should_parse_tool_calls(&request) {
+        let tools = request.tools.as_deref();
+        let parsed = tool_calls::parse_tool_calls(&result.text, tools);
+
+        if parsed.has_tool_calls() {
+            let tool_call_responses = tool_calls::build_tool_call_responses(&parsed, &request);
+            if !tool_call_responses.is_empty() {
+                return Ok(Json(ChatCompletionResponse::new_with_tool_calls(
+                    request_id,
+                    model_id,
+                    parsed.content.clone(),
+                    tool_call_responses,
+                    result.prompt_tokens,
+                    result.completion_tokens,
+                    logprobs,
+                )));
+            }
+        }
+    }
 
     Ok(Json(ChatCompletionResponse::new_with_logprobs(
         request_id,
@@ -245,6 +283,14 @@ async fn stream_chat_completion(
         };
     }
 
+    let parse_tools = tool_calls::should_parse_tool_calls(&request);
+    let tools_for_parser = if parse_tools {
+        request.tools.clone()
+    } else {
+        None
+    };
+    let tool_choice = request.tool_choice.clone();
+
     let (events, stream) = sse_channel(100);
 
     // Clone for the spawned task
@@ -260,16 +306,24 @@ async fn stream_chat_completion(
             ChatCompletionChunk::initial(request_id_clone.clone(), model_id_clone.clone());
         let _ = finish_events.json(&initial);
 
-        // Use logprobs-aware streaming when requested, otherwise use the plain API.
+        // Accumulate full output for tool call parsing at the end
         let token_events = finish_events.clone();
         let request_id_inner = request_id_clone.clone();
         let model_id_inner = model_id_clone.clone();
+
+        let accumulated = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let acc_clone = accumulated.clone();
 
         let result = state.model_provider.generate_streaming_with_logprobs(
             prepared.prompt,
             options,
             prepared.image_data,
             |token, lp_data| {
+                // Accumulate for later tool call parsing
+                if parse_tools && let Ok(mut acc) = acc_clone.lock() {
+                    acc.push_str(&token);
+                }
+
                 let logprobs = if logprobs_enabled {
                     lp_data
                         .as_ref()
@@ -287,11 +341,58 @@ async fn stream_chat_completion(
             },
         );
 
-        // Send finish chunk
-        let finish_reason = match &result {
+        // Check for tool calls in accumulated output
+        let mut finish_reason = match &result {
             Ok(r) => r.finish_reason.clone(),
             Err(_) => "error".to_string(),
         };
+
+        if parse_tools && let Ok(full_output) = accumulated.lock() {
+            let tools_ref = tools_for_parser.as_deref();
+            let parsed = tool_calls::parse_tool_calls(&full_output, tools_ref);
+
+            if parsed.has_tool_calls() {
+                // Emit tool call deltas
+                let specific_fn = tool_choice
+                    .as_ref()
+                    .and_then(|tc| tc.specific_function())
+                    .map(|s| s.to_string());
+
+                for (idx, call) in parsed.tool_calls.iter().enumerate() {
+                    // Filter by specific function if applicable
+                    if let Some(ref fn_name) = specific_fn
+                        && call.name != *fn_name
+                    {
+                        continue;
+                    }
+
+                    let call_id = tool_calls::generate_tool_call_id();
+
+                    // Send tool call start delta
+                    let start_chunk = ChatCompletionChunk::tool_call_start(
+                        request_id_clone.clone(),
+                        model_id_clone.clone(),
+                        idx,
+                        call_id,
+                        call.name.clone(),
+                    );
+                    let _ = finish_events.json(&start_chunk);
+
+                    // Send arguments as a single chunk
+                    let args_chunk = ChatCompletionChunk::tool_call_arguments(
+                        request_id_clone.clone(),
+                        model_id_clone.clone(),
+                        idx,
+                        call.arguments.clone(),
+                    );
+                    let _ = finish_events.json(&args_chunk);
+                }
+
+                finish_reason = "tool_calls".to_string();
+            }
+        }
+
+        // Send finish chunk
         let finish = ChatCompletionChunk::finish(
             request_id_clone.clone(),
             model_id_clone.clone(),

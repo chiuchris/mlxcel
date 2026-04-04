@@ -27,6 +27,106 @@ pub enum Role {
     Tool,
 }
 
+// ---------------------------------------------------------------------------
+// Tool calling types (OpenAI-compatible)
+// Used by: ChatCompletionRequest, chat_template, routes/chat
+// ---------------------------------------------------------------------------
+
+/// A tool definition (OpenAI format)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tool {
+    /// Tool type (always "function" for now)
+    #[serde(rename = "type")]
+    pub tool_type: String,
+    /// Function definition
+    pub function: FunctionDefinition,
+}
+
+/// Function definition within a tool
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDefinition {
+    /// Function name
+    pub name: String,
+    /// Human-readable description
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for parameters
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+}
+
+/// Tool choice specification
+///
+/// Can be a string ("auto", "none", "required") or an object specifying a
+/// particular function.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum ToolChoice {
+    /// String mode: "auto", "none", or "required"
+    Mode(String),
+    /// Specific function: {"type": "function", "function": {"name": "X"}}
+    Specific(ToolChoiceFunction),
+}
+
+impl ToolChoice {
+    /// Returns the mode string for simple string choices, or "specific" for
+    /// named function selections.
+    pub fn mode(&self) -> &str {
+        match self {
+            ToolChoice::Mode(s) => s.as_str(),
+            ToolChoice::Specific(_) => "specific",
+        }
+    }
+
+    /// Returns true if tool calling is effectively disabled.
+    pub fn is_none(&self) -> bool {
+        matches!(self, ToolChoice::Mode(s) if s == "none")
+    }
+
+    /// Returns the specific function name if this is a named choice.
+    pub fn specific_function(&self) -> Option<&str> {
+        match self {
+            ToolChoice::Specific(f) => Some(&f.function.name),
+            _ => None,
+        }
+    }
+}
+
+/// Named function tool choice
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunction {
+    #[serde(rename = "type")]
+    pub choice_type: String,
+    pub function: ToolChoiceFunctionName,
+}
+
+/// Function name within a tool choice
+#[derive(Debug, Clone, Deserialize)]
+pub struct ToolChoiceFunctionName {
+    pub name: String,
+}
+
+/// A tool call within an assistant message (multi-turn history)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallInMessage {
+    /// Unique tool call ID
+    pub id: String,
+    /// Tool type (always "function")
+    #[serde(rename = "type")]
+    pub call_type: String,
+    /// Function call details
+    pub function: ToolCallFunction,
+}
+
+/// Function name + arguments within a tool call
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallFunction {
+    /// Function name
+    pub name: String,
+    /// Stringified JSON arguments
+    pub arguments: String,
+}
+
 impl Role {
     /// Convert role to lowercase string for chat templates
     pub fn as_str(&self) -> &'static str {
@@ -108,6 +208,12 @@ pub struct Message {
     pub content: MessageContent,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Tool call ID for `role: "tool"` messages (references a previous tool call)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Tool calls made by the assistant (multi-turn history)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallInMessage>>,
 }
 
 /// Sampling parameters shared across endpoints
@@ -191,6 +297,19 @@ pub struct ChatCompletionRequest {
     /// Number of top log-probability alternatives to return per token (0–20)
     #[serde(default)]
     pub top_logprobs: Option<u8>,
+
+    // Tool calling fields (OpenAI-compatible)
+    /// Tool definitions available for the model to call
+    #[serde(default)]
+    pub tools: Option<Vec<Tool>>,
+    /// Controls how the model selects tools: "auto", "none", "required", or a
+    /// specific function object
+    #[serde(default)]
+    pub tool_choice: Option<ToolChoice>,
+    /// Whether the model may issue multiple tool calls in parallel
+    #[serde(default)]
+    pub parallel_tool_calls: Option<bool>,
+
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,

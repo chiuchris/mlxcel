@@ -23,6 +23,8 @@ use anyhow::{Context, Result};
 use minijinja::{Environment, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
 
+use super::types::request::Tool;
+
 /// A message in the conversation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChatMessage {
@@ -102,6 +104,21 @@ impl ChatTemplateProcessor {
         self.add_generation_prompt = add;
     }
 
+    /// Check if the template uses the `tools` variable.
+    ///
+    /// Returns true when the Jinja2 template references `tools` in a
+    /// meaningful way (iteration, conditional, etc.), indicating the model's
+    /// template supports tool definitions in the prompt.
+    pub fn supports_tools(&self) -> bool {
+        // Simple heuristic: the template references `tools` as a variable
+        // (beyond just `tools is none` or `tools is defined` guard checks).
+        // We check for iteration or indexing patterns.
+        self.template.contains("for tool in tools")
+            || self.template.contains("tools | tojson")
+            || self.template.contains("tools|tojson")
+            || (self.template.contains("tools") && self.template.contains("function"))
+    }
+
     /// Check if the template handles multimodal content with image items.
     ///
     /// Returns true when the Jinja2 template iterates over content items and
@@ -116,7 +133,15 @@ impl ChatTemplateProcessor {
     /// This allows passing messages with list-type content entries (e.g.,
     /// `[{"type": "image"}, {"type": "text", "text": "..."}]`) that Jinja2
     /// templates like Gemma3 VLM can iterate over.
-    pub fn apply_raw(&self, messages: &serde_json::Value) -> Result<String> {
+    ///
+    /// When `tools` is `Some`, the tool definitions are passed to the Jinja2
+    /// template context, enabling tool-calling prompt formatting.
+    // Used by: chat_request, routes/chat
+    pub fn apply_raw(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&[Tool]>,
+    ) -> Result<String> {
         let mut env = Environment::new();
         configure_environment(&mut env);
 
@@ -128,13 +153,13 @@ impl ChatTemplateProcessor {
         // Convert serde_json::Value to minijinja::Value
         let messages_val = minijinja::Value::from_serialize(messages);
 
-        let tools: Option<Vec<String>> = None;
+        let tools_val = tools.map(minijinja::Value::from_serialize);
         let context = minijinja::context! {
             messages => messages_val,
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             add_generation_prompt => self.add_generation_prompt,
-            tools => tools,
+            tools => tools_val,
             enable_thinking => false,
         };
 
@@ -145,8 +170,12 @@ impl ChatTemplateProcessor {
         Ok(result)
     }
 
-    /// Apply the chat template to messages
-    pub fn apply(&self, messages: &[ChatMessage]) -> Result<String> {
+    /// Apply the chat template to messages.
+    ///
+    /// When `tools` is `Some`, the tool definitions are passed to the Jinja2
+    /// template context, enabling tool-calling prompt formatting.
+    // Used by: chat_request, routes/chat
+    pub fn apply(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> Result<String> {
         let mut env = Environment::new();
         configure_environment(&mut env);
 
@@ -157,13 +186,13 @@ impl ChatTemplateProcessor {
 
         // Many templates conditionally check variables like `tools`, `enable_thinking`, etc.
         // We must provide them as None/false to avoid undefined variable errors.
-        let tools: Option<Vec<String>> = None;
+        let tools_val = tools.map(minijinja::Value::from_serialize);
         let context = minijinja::context! {
             messages => messages,
             bos_token => &self.bos_token,
             eos_token => &self.eos_token,
             add_generation_prompt => self.add_generation_prompt,
-            tools => tools,
+            tools => tools_val,
             enable_thinking => false,
         };
 
@@ -251,7 +280,7 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
-        let result = processor.apply(&messages).unwrap();
+        let result = processor.apply(&messages, None).unwrap();
         assert!(result.contains("User: Hello"));
         assert!(result.ends_with("Assistant: "));
     }
@@ -268,9 +297,87 @@ mod tests {
             role: "user".to_string(),
             content: "Hello".to_string(),
         }];
-        let result = processor.apply(&messages).unwrap();
+        let result = processor.apply(&messages, None).unwrap();
         assert!(result.contains("<|im_start|>user"));
         assert!(result.contains("Hello<|im_end|>"));
         assert!(result.contains("<|im_start|>assistant"));
+    }
+
+    #[test]
+    fn test_apply_with_tools_none_still_works() {
+        let processor = ChatTemplateProcessor::default();
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Hi".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert!(result.contains("User: Hi"));
+    }
+
+    #[test]
+    fn test_apply_with_tools_passes_to_template() {
+        // Template that explicitly uses tools
+        let template = r#"{% if tools %}Tools: {{ tools | length }}{% endif %}
+{% for message in messages %}{{ message.role }}: {{ message.content }}
+{% endfor %}{% if add_generation_prompt %}Assistant: {% endif %}"#;
+
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "Call a tool".to_string(),
+        }];
+
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: crate::server::types::request::FunctionDefinition {
+                name: "get_weather".to_string(),
+                description: Some("Get weather".to_string()),
+                parameters: None,
+            },
+        }];
+
+        let result = processor.apply(&messages, Some(&tools)).unwrap();
+        assert!(result.contains("Tools: 1"));
+    }
+
+    #[test]
+    fn test_supports_tools_detection() {
+        // Template that uses tools
+        let with_tools =
+            r#"{% if tools %}{% for tool in tools %}{{ tool }}{% endfor %}{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(with_tools.to_string());
+        assert!(processor.supports_tools());
+
+        // Template without tools
+        let without = r#"{% for m in messages %}{{ m.content }}{% endfor %}"#;
+        let processor = ChatTemplateProcessor::with_template(without.to_string());
+        assert!(!processor.supports_tools());
+    }
+
+    #[test]
+    fn test_apply_raw_with_tools() {
+        let template = r#"{% if tools %}[TOOLS]{% endif %}{% for message in messages %}{{ message.role }}: {{ message.content }}
+{% endfor %}"#;
+
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = serde_json::json!([
+            {"role": "user", "content": "hi"}
+        ]);
+
+        let tools = vec![Tool {
+            tool_type: "function".to_string(),
+            function: crate::server::types::request::FunctionDefinition {
+                name: "test_fn".to_string(),
+                description: None,
+                parameters: None,
+            },
+        }];
+
+        let result = processor.apply_raw(&messages, Some(&tools)).unwrap();
+        assert!(result.contains("[TOOLS]"));
+
+        // Without tools
+        let result_no_tools = processor.apply_raw(&messages, None).unwrap();
+        assert!(!result_no_tools.contains("[TOOLS]"));
     }
 }

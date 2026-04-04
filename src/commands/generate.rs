@@ -103,7 +103,7 @@ fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str
     }];
 
     processor
-        .apply(&messages)
+        .apply(&messages, None)
         .unwrap_or_else(|_| user_prompt.to_string())
 }
 
@@ -139,7 +139,7 @@ fn apply_vlm_chat_template(
         "content": content_parts,
     }]);
 
-    processor.apply_raw(&messages).unwrap_or_else(|_| {
+    processor.apply_raw(&messages, None).unwrap_or_else(|_| {
         // Fallback: text-only template
         apply_user_chat_template(processor, user_prompt)
     })

@@ -269,9 +269,12 @@ pub struct MLP {
 
 impl MLP {
     pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        if let Some(result) =
-            mlxcel_core::layers::compiled_swiglu_mlp(x, &self.gate_proj, &self.up_proj, &self.down_proj)
-        {
+        if let Some(result) = mlxcel_core::layers::compiled_swiglu_mlp(
+            x,
+            &self.gate_proj,
+            &self.up_proj,
+            &self.down_proj,
+        ) {
             return result;
         }
 

@@ -258,12 +258,7 @@ where
         if debug_gemma4 {
             eprintln!("  loading {name} {:?} {:?}", tensor.dtype(), tensor.shape());
         }
-        let array = tensor_view_to_array(
-            &name,
-            &tensor,
-            mode,
-            owned_buffers.as_deref_mut(),
-        )?;
+        let array = tensor_view_to_array(&name, &tensor, mode, owned_buffers.as_deref_mut())?;
         if debug_gemma4 {
             eprintln!("  loaded {name}");
         }

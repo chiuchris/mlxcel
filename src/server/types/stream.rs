@@ -25,6 +25,36 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Tool call deltas for streaming tool call output
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+/// Incremental tool call data for streaming
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallDelta {
+    /// Index of this tool call in the parallel array
+    pub index: usize,
+    /// Tool call ID (only in the first delta for this index)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Tool type (only in the first delta for this index)
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub call_type: Option<String>,
+    /// Incremental function data
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<ToolCallFunctionDelta>,
+}
+
+/// Incremental function data for streaming
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallFunctionDelta {
+    /// Function name (only in the first delta)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Incremental arguments string
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
 }
 
 /// Streaming choice
@@ -72,6 +102,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
                 logprobs: None,
@@ -103,6 +134,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: Some(content),
+                    tool_calls: None,
                 },
                 finish_reason: None,
                 logprobs,
@@ -124,8 +156,80 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some(finish_reason),
+                logprobs: None,
+            }],
+            usage: None,
+        }
+    }
+
+    /// Create a tool call delta chunk (first delta with id/type/name).
+    pub fn tool_call_start(
+        id: String,
+        model: String,
+        index: usize,
+        call_id: String,
+        function_name: String,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index,
+                        id: Some(call_id),
+                        call_type: Some("function".to_string()),
+                        function: Some(ToolCallFunctionDelta {
+                            name: Some(function_name),
+                            arguments: None,
+                        }),
+                    }]),
+                },
+                finish_reason: None,
+                logprobs: None,
+            }],
+            usage: None,
+        }
+    }
+
+    /// Create a tool call arguments delta chunk (incremental arguments).
+    pub fn tool_call_arguments(
+        id: String,
+        model: String,
+        index: usize,
+        arguments_chunk: String,
+    ) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    tool_calls: Some(vec![ToolCallDelta {
+                        index,
+                        id: None,
+                        call_type: None,
+                        function: Some(ToolCallFunctionDelta {
+                            name: None,
+                            arguments: Some(arguments_chunk),
+                        }),
+                    }]),
+                },
+                finish_reason: None,
                 logprobs: None,
             }],
             usage: None,

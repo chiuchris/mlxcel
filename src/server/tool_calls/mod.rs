@@ -1,0 +1,83 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Tool call output parsing and formatting.
+//!
+//! This module detects and parses tool call patterns from model output,
+//! supporting multiple formats used by popular model families (Hermes/Qwen,
+//! Llama 3.x, Mistral Nemo, Functionary, etc.).
+//!
+//! Used by: routes/chat, chat_request
+
+mod formats;
+pub mod parser;
+pub mod types;
+
+pub use parser::{generate_tool_call_id, parse_tool_calls};
+pub use types::{ParsedToolCall, ToolCallFormat, ToolCallParseResult};
+
+use super::types::request::ChatCompletionRequest;
+use super::types::response::{ToolCallFunctionResponse, ToolCallResponse};
+
+/// Check if tool call parsing should be attempted for this request.
+///
+/// Returns false when no tools are provided or tool_choice is "none".
+// Used by: routes/chat
+pub fn should_parse_tool_calls(request: &ChatCompletionRequest) -> bool {
+    let Some(ref tools) = request.tools else {
+        return false;
+    };
+    if tools.is_empty() {
+        return false;
+    }
+    if let Some(ref tc) = request.tool_choice
+        && tc.is_none()
+    {
+        return false;
+    }
+    true
+}
+
+/// Convert parsed tool calls to response format, filtering by specific
+/// function name when tool_choice selects one.
+// Used by: routes/chat
+pub fn build_tool_call_responses(
+    parsed: &ToolCallParseResult,
+    request: &ChatCompletionRequest,
+) -> Vec<ToolCallResponse> {
+    let specific_fn = request
+        .tool_choice
+        .as_ref()
+        .and_then(|tc| tc.specific_function());
+
+    parsed
+        .tool_calls
+        .iter()
+        .filter(|c| {
+            if let Some(fn_name) = specific_fn {
+                c.name == fn_name
+            } else {
+                true
+            }
+        })
+        .map(|c| ToolCallResponse {
+            id: generate_tool_call_id(),
+            call_type: "function".to_string(),
+            function: ToolCallFunctionResponse {
+                name: c.name.clone(),
+                arguments: c.arguments.clone(),
+            },
+        })
+        .collect()
+}
