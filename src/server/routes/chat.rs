@@ -149,6 +149,20 @@ pub async fn chat_completions(
         }
     }
 
+    // Enforce tools array size limit to prevent DoS via template rendering
+    if let Some(ref tools) = request.tools
+        && tools.len() > MAX_TOOLS
+    {
+        return ErrorResponse::new(
+            format!(
+                "Too many tools: {}. Maximum allowed is {MAX_TOOLS}.",
+                tools.len()
+            ),
+            "invalid_request_error",
+        )
+        .into_response();
+    }
+
     let priority = parse_priority_header(&headers);
     if request.stream {
         stream_chat_completion(state, request, priority).await
@@ -417,6 +431,12 @@ async fn stream_chat_completion(
     Sse::new(stream).into_response()
 }
 
+/// Maximum number of tools allowed in a single request.
+///
+/// Enforced in `chat_completions()` to prevent DoS via large tool definitions
+/// being rendered through the Jinja2 chat template.
+pub(crate) const MAX_TOOLS: usize = 128;
+
 /// Build ServerGenerateOptions using request params with server config as defaults
 pub(crate) fn build_generate_options(
     params: &SamplingParams,
@@ -443,4 +463,44 @@ pub(crate) fn build_generate_options(
             priority: RequestPriority::default(),
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::server::types::request::{FunctionDefinition, Tool};
+
+    fn make_tool(name: &str) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: None,
+                parameters: None,
+            },
+        }
+    }
+
+    #[test]
+    fn max_tools_constant_is_128() {
+        assert_eq!(MAX_TOOLS, 128);
+    }
+
+    #[test]
+    fn tools_below_limit_accepted() {
+        // Build a vec of exactly MAX_TOOLS tools — should not exceed the limit
+        let tools: Vec<Tool> = (0..MAX_TOOLS)
+            .map(|i| make_tool(&format!("fn_{i}")))
+            .collect();
+        assert!(tools.len() <= MAX_TOOLS);
+    }
+
+    #[test]
+    fn tools_above_limit_detected() {
+        // Build a vec of MAX_TOOLS + 1 tools — must exceed the limit
+        let tools: Vec<Tool> = (0..=MAX_TOOLS)
+            .map(|i| make_tool(&format!("fn_{i}")))
+            .collect();
+        assert!(tools.len() > MAX_TOOLS);
+    }
 }

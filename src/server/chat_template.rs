@@ -39,6 +39,9 @@ pub struct ChatTemplateProcessor {
     bos_token: String,
     eos_token: String,
     add_generation_prompt: bool,
+    /// Cached result of `supports_tools()` introspection.
+    /// `None` means not yet computed.
+    supports_tools_cached: Option<bool>,
 }
 
 impl ChatTemplateProcessor {
@@ -86,6 +89,7 @@ impl ChatTemplateProcessor {
             bos_token,
             eos_token,
             add_generation_prompt: true,
+            supports_tools_cached: None,
         }))
     }
 
@@ -96,6 +100,7 @@ impl ChatTemplateProcessor {
             bos_token: String::new(),
             eos_token: String::new(),
             add_generation_prompt: true,
+            supports_tools_cached: None,
         }
     }
 
@@ -106,17 +111,51 @@ impl ChatTemplateProcessor {
 
     /// Check if the template uses the `tools` variable.
     ///
-    /// Returns true when the Jinja2 template references `tools` in a
-    /// meaningful way (iteration, conditional, etc.), indicating the model's
-    /// template supports tool definitions in the prompt.
-    pub fn supports_tools(&self) -> bool {
-        // Simple heuristic: the template references `tools` as a variable
-        // (beyond just `tools is none` or `tools is defined` guard checks).
-        // We check for iteration or indexing patterns.
-        self.template.contains("for tool in tools")
-            || self.template.contains("tools | tojson")
-            || self.template.contains("tools|tojson")
-            || (self.template.contains("tools") && self.template.contains("function"))
+    /// Returns true when the template produces different output when `tools`
+    /// is set vs. `None`.  The result is computed once by rendering the
+    /// template with a sentinel tool and comparing output, then cached.
+    ///
+    /// Falls back to the string-heuristic if template rendering fails.
+    pub fn supports_tools(&mut self) -> bool {
+        if let Some(cached) = self.supports_tools_cached {
+            return cached;
+        }
+        let result = self.compute_supports_tools();
+        self.supports_tools_cached = Some(result);
+        result
+    }
+
+    /// Inner computation for `supports_tools` — tries template rendering
+    /// introspection and falls back to string heuristics on failure.
+    fn compute_supports_tools(&self) -> bool {
+        // Sentinel tool used for the probe render
+        let sentinel_tool = Tool {
+            tool_type: "function".to_string(),
+            function: super::types::request::FunctionDefinition {
+                name: "__test__".to_string(),
+                description: Some("test".to_string()),
+                parameters: None,
+            },
+        };
+
+        let probe_messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+
+        let with_tools = self.apply(&probe_messages, Some(&[sentinel_tool]));
+        let without_tools = self.apply(&probe_messages, None);
+
+        match (with_tools, without_tools) {
+            (Ok(with), Ok(without)) => with != without,
+            _ => {
+                // Rendering failed — fall back to string heuristic
+                self.template.contains("for tool in tools")
+                    || self.template.contains("tools | tojson")
+                    || self.template.contains("tools|tojson")
+                    || (self.template.contains("tools") && self.template.contains("function"))
+            }
+        }
     }
 
     /// Check if the template handles multimodal content with image items.
@@ -269,6 +308,17 @@ impl Default for ChatTemplateProcessor {
     }
 }
 
+impl std::fmt::Debug for ChatTemplateProcessor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatTemplateProcessor")
+            .field("bos_token", &self.bos_token)
+            .field("eos_token", &self.eos_token)
+            .field("add_generation_prompt", &self.add_generation_prompt)
+            .field("supports_tools_cached", &self.supports_tools_cached)
+            .finish_non_exhaustive()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -342,16 +392,31 @@ mod tests {
 
     #[test]
     fn test_supports_tools_detection() {
-        // Template that uses tools
+        // Template that uses tools — rendering differs with/without tools
         let with_tools =
-            r#"{% if tools %}{% for tool in tools %}{{ tool }}{% endfor %}{% endif %}"#;
-        let processor = ChatTemplateProcessor::with_template(with_tools.to_string());
+            r#"{% if tools %}[TOOLS]{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(with_tools.to_string());
+        assert!(processor.supports_tools());
+        // Second call must return cached result
         assert!(processor.supports_tools());
 
-        // Template without tools
+        // Template without tools — rendering is identical with/without tools
         let without = r#"{% for m in messages %}{{ m.content }}{% endfor %}"#;
-        let processor = ChatTemplateProcessor::with_template(without.to_string());
+        let mut processor = ChatTemplateProcessor::with_template(without.to_string());
         assert!(!processor.supports_tools());
+    }
+
+    #[test]
+    fn test_supports_tools_caching() {
+        let template =
+            r#"{% if tools %}[TOOLS]{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(template.to_string());
+        // Not cached yet
+        assert!(processor.supports_tools_cached.is_none());
+        // First call computes
+        let _ = processor.supports_tools();
+        // Now cached
+        assert!(processor.supports_tools_cached.is_some());
     }
 
     #[test]

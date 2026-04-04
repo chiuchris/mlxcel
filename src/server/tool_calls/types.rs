@@ -39,6 +39,10 @@ pub enum ToolCallFormat {
     FunctionaryV31,
     /// Functionary v3.2: `>>>name\n{"key": "val"}`
     FunctionaryV32,
+    /// Command R7B: `Action: fn_name\nAction Input: {"key": "val"}`
+    CommandR,
+    /// Granite 3.3: `<response><tool_call>...</tool_call></response>`
+    Granite,
     /// Generic JSON: raw `{"name": ..., "arguments": ...}` object
     GenericJson,
 }

@@ -243,40 +243,69 @@ pub fn try_functionary_v31(text: &str) -> Option<ToolCallParseResult> {
 
 /// Try parsing Functionary v3.2 format:
 /// `>>>fn_name\n{"key": "val"}`
+///
+/// Only matches `>>>` at the start of a line (position 0 or after `\n`).
+/// This prevents false positives when `>>>` appears mid-line (e.g. in shell
+/// output or blockquotes).
 pub fn try_functionary_v32(text: &str) -> Option<ToolCallParseResult> {
-    let prefix = ">>>";
-    if !text.contains(prefix) {
+    let trimmed = text.trim();
+    // Guard: >>> must appear at line start (position 0 or after a newline)
+    if !trimmed.starts_with(">>>") && !trimmed.contains("\n>>>") {
         return None;
     }
 
     let mut calls = Vec::new();
     let mut content = String::new();
+    let mut found_first = false;
 
-    // Collect content before the first >>> marker
-    if let Some(first_pos) = text.find(prefix) {
-        let before = text[..first_pos].trim();
-        if !before.is_empty() {
-            content = before.to_string();
+    // Walk line by line, treating each ">>>" line-start as a segment header.
+    // Lines before the first ">>>" header become the `content` prefix.
+    let mut current_name: Option<String> = None;
+    let mut current_args_lines: Vec<&str> = Vec::new();
+
+    for line in trimmed.lines() {
+        if let Some(stripped) = line.strip_prefix(">>>") {
+            // Flush any pending call
+            if let Some(name) = current_name.take() {
+                let json_str = current_args_lines.join("\n");
+                let json_str = json_str.trim();
+                if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
+                    calls.push(ParsedToolCall {
+                        name,
+                        arguments: json_str.to_string(),
+                    });
+                }
+                current_args_lines.clear();
+            }
+
+            found_first = true;
+            let name = stripped.trim().to_string();
+            // Skip "all" which is a common delimiter for general text
+            if name != "all" && !name.is_empty() {
+                current_name = Some(name);
+            }
+        } else if found_first {
+            if current_name.is_some() {
+                current_args_lines.push(line);
+            }
+        } else {
+            // Content before the first >>> marker
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
         }
     }
 
-    for segment in text.split(prefix).skip(1) {
-        let segment = segment.trim();
-        if let Some(newline_pos) = segment.find('\n') {
-            let name = segment[..newline_pos].trim().to_string();
-            let json_str = segment[newline_pos + 1..].trim();
-
-            // Skip "all" which is a common delimiter for general text
-            if name == "all" || name.is_empty() {
-                continue;
-            }
-
-            if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
-                calls.push(ParsedToolCall {
-                    name,
-                    arguments: json_str.to_string(),
-                });
-            }
+    // Flush last pending call
+    if let Some(name) = current_name.take() {
+        let json_str = current_args_lines.join("\n");
+        let json_str = json_str.trim().to_string();
+        if serde_json::from_str::<serde_json::Value>(&json_str).is_ok() {
+            calls.push(ParsedToolCall {
+                name,
+                arguments: json_str,
+            });
         }
     }
 
@@ -287,8 +316,108 @@ pub fn try_functionary_v32(text: &str) -> Option<ToolCallParseResult> {
     Some(ToolCallParseResult {
         format: Some(ToolCallFormat::FunctionaryV32),
         tool_calls: calls,
-        content,
+        content: content.trim().to_string(),
     })
+}
+
+/// Try parsing Command R7B format:
+/// `Action: function_name\nAction Input: {"key": "val"}`
+///
+/// Multiple calls may appear sequentially, each starting with `Action:`.
+pub fn try_command_r(text: &str) -> Option<ToolCallParseResult> {
+    // Guard: text must contain both the "Action:" and "Action Input:" markers.
+    // Checking only "Action:" would cause false positives on normal prose
+    // such as "Required Action: none".
+    if !text.contains("Action:") || !text.contains("Action Input:") {
+        return None;
+    }
+
+    let mut calls = Vec::new();
+    let mut content = String::new();
+    let mut found_first = false;
+    let mut pending_name: Option<String> = None;
+
+    for line in text.lines() {
+        let trimmed_line = line.trim();
+        if let Some(name) = trimmed_line.strip_prefix("Action:") {
+            // Flush any pending action that had no Action Input line
+            pending_name = Some(name.trim().to_string());
+            if !found_first {
+                found_first = true;
+            }
+        } else if let Some(json_part) = trimmed_line.strip_prefix("Action Input:") {
+            if let Some(name) = pending_name.take() {
+                let json_str = json_part.trim();
+                if serde_json::from_str::<serde_json::Value>(json_str).is_ok() {
+                    calls.push(ParsedToolCall {
+                        name,
+                        arguments: json_str.to_string(),
+                    });
+                }
+            }
+        } else if !found_first {
+            // Accumulate content before the first Action: marker
+            if !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(line);
+        }
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    Some(ToolCallParseResult {
+        format: Some(ToolCallFormat::CommandR),
+        tool_calls: calls,
+        content: content.trim().to_string(),
+    })
+}
+
+/// Try parsing Granite 3.3 format:
+/// `<response><tool_call>{"name": ..., "arguments": ...}</tool_call></response>`
+///
+/// Strips the outer `<response>...</response>` wrapper and delegates to the
+/// Hermes parser, which handles the inner `<tool_call>` tags.
+pub fn try_granite(text: &str) -> Option<ToolCallParseResult> {
+    let trimmed = text.trim();
+    if !trimmed.contains("<response>") {
+        return None;
+    }
+
+    // Extract the content inside <response>...</response>
+    let start_tag = "<response>";
+    let end_tag = "</response>";
+
+    let inner_start = trimmed.find(start_tag)? + start_tag.len();
+    let inner_end = trimmed[inner_start..].find(end_tag);
+
+    let inner = if let Some(end_offset) = inner_end {
+        &trimmed[inner_start..inner_start + end_offset]
+    } else {
+        // No closing tag: take everything after the opening tag
+        &trimmed[inner_start..]
+    };
+
+    // Extract any content before the <response> tag
+    let prefix = trimmed[..trimmed.find(start_tag).unwrap_or(0)].trim();
+
+    // Delegate to the Hermes parser for the inner content
+    let mut result = try_hermes(inner.trim())?;
+
+    // Prepend any prefix content
+    if !prefix.is_empty() {
+        if result.content.is_empty() {
+            result.content = prefix.to_string();
+        } else {
+            result.content = format!("{prefix}\n{}", result.content);
+        }
+    }
+
+    // Override the format to Granite
+    result.format = Some(ToolCallFormat::Granite);
+    Some(result)
 }
 
 /// Try parsing generic JSON format:
@@ -464,6 +593,146 @@ mod tests {
         let result = try_functionary_v32(text).unwrap();
         assert_eq!(result.tool_calls.len(), 1);
         assert_eq!(result.tool_calls[0].name, "get_weather");
+    }
+
+    #[test]
+    fn functionary_v32_multiple_calls() {
+        let text = ">>>fn_a\n{\"x\": 1}\n>>>fn_b\n{\"y\": 2}";
+        let result = try_functionary_v32(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "fn_a");
+        assert_eq!(result.tool_calls[1].name, "fn_b");
+    }
+
+    #[test]
+    fn functionary_v32_no_false_positive_mid_line() {
+        // >>> appearing mid-line (e.g. shell output) must NOT match
+        let text = "The output was: foo>>>bar\nsome more text";
+        assert!(try_functionary_v32(text).is_none());
+    }
+
+    #[test]
+    fn functionary_v32_no_false_positive_blockquote() {
+        // >>> in a blockquote-like context mid-sentence must not match
+        let text = "Here is an example: >>>function_name\n{}";
+        assert!(try_functionary_v32(text).is_none());
+    }
+
+    #[test]
+    fn functionary_v32_content_before_first_marker() {
+        let text = "Some preamble\n>>>get_weather\n{\"location\": \"Berlin\"}";
+        let result = try_functionary_v32(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.content, "Some preamble");
+    }
+
+    // -- Command R --
+
+    #[test]
+    fn command_r_single_call() {
+        let text = "Action: get_weather\nAction Input: {\"location\": \"Paris\"}";
+        let result = try_command_r(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert!(result.tool_calls[0].arguments.contains("Paris"));
+        assert_eq!(result.format, Some(ToolCallFormat::CommandR));
+    }
+
+    #[test]
+    fn command_r_multiple_calls() {
+        let text = "Action: fn_a\nAction Input: {\"x\": 1}\nAction: fn_b\nAction Input: {\"y\": 2}";
+        let result = try_command_r(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "fn_a");
+        assert_eq!(result.tool_calls[1].name, "fn_b");
+    }
+
+    #[test]
+    fn command_r_with_content_before() {
+        let text = "I need to check the weather.\nAction: get_weather\nAction Input: {\"city\": \"Tokyo\"}";
+        let result = try_command_r(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.content.contains("check the weather"));
+    }
+
+    #[test]
+    fn command_r_no_match() {
+        assert!(try_command_r("Hello, world!").is_none());
+        assert!(try_command_r("Action without colon").is_none());
+    }
+
+    #[test]
+    fn command_r_invalid_json_skipped() {
+        let text = "Action: fn\nAction Input: not-json";
+        assert!(try_command_r(text).is_none());
+    }
+
+    // -- Granite 3.3 --
+
+    #[test]
+    fn granite_single_call() {
+        let text = r#"<response><tool_call>{"name": "get_weather", "arguments": {"city": "Seoul"}}</tool_call></response>"#;
+        let result = try_granite(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert!(result.tool_calls[0].arguments.contains("Seoul"));
+        assert_eq!(result.format, Some(ToolCallFormat::Granite));
+    }
+
+    #[test]
+    fn granite_multiple_calls() {
+        let text = r#"<response><tool_call>{"name": "a", "arguments": {}}</tool_call><tool_call>{"name": "b", "arguments": {"x": 1}}</tool_call></response>"#;
+        let result = try_granite(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "a");
+        assert_eq!(result.tool_calls[1].name, "b");
+    }
+
+    #[test]
+    fn granite_with_content_before_response_tag() {
+        let text = r#"Let me help.<response><tool_call>{"name": "search", "arguments": {"q": "rust"}}</tool_call></response>"#;
+        let result = try_granite(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert!(result.content.contains("Let me help"));
+    }
+
+    #[test]
+    fn granite_no_match() {
+        assert!(try_granite("Hello, world!").is_none());
+        assert!(
+            try_granite("<tool_call>{\"name\": \"fn\", \"arguments\": {}}</tool_call>").is_none()
+        );
+    }
+
+    // -- DeepSeek V3/R1 (Hermes format with think blocks) --
+
+    #[test]
+    fn deepseek_tool_call_via_hermes_with_think_block() {
+        // DeepSeek wraps reasoning in <think> blocks; tool calls use <tool_call> tags.
+        // Hermes parser handles the tool calls after think-block stripping in parser.rs.
+        let text = r#"<think>Let me call the weather API.</think>
+<tool_call>{"name": "get_weather", "arguments": {"location": "Beijing"}}</tool_call>"#;
+
+        // Strip think blocks as the parser does
+        let cleaned: String = {
+            let mut result = String::new();
+            let mut remaining = text;
+            while let Some(start) = remaining.find("<think>") {
+                result.push_str(&remaining[..start]);
+                if let Some(end) = remaining[start..].find("</think>") {
+                    remaining = &remaining[start + end + "</think>".len()..];
+                } else {
+                    remaining = "";
+                }
+            }
+            result.push_str(remaining);
+            result
+        };
+
+        let result = try_hermes(cleaned.trim()).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        assert!(result.tool_calls[0].arguments.contains("Beijing"));
     }
 
     // -- Generic JSON --

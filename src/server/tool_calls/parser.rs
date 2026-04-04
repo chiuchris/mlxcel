@@ -64,12 +64,14 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
 
     // Try each format in order of specificity (most distinctive markers first)
     let parsers: &[fn(&str) -> Option<ToolCallParseResult>] = &[
-        formats::try_hermes,
-        formats::try_mistral_nemo,
-        formats::try_functionary_v31,
-        formats::try_functionary_v32,
-        formats::try_llama3,
-        formats::try_generic_json,
+        formats::try_granite, // <response><tool_call> — more specific than bare Hermes
+        formats::try_hermes,  // <tool_call> — Hermes/Qwen/DeepSeek
+        formats::try_mistral_nemo, // [TOOL_CALLS]
+        formats::try_functionary_v31, // <function=name>
+        formats::try_functionary_v32, // >>>name\n
+        formats::try_llama3,  // {"name": ..., "parameters": ...}
+        formats::try_generic_json, // {"name": ..., "arguments": ...}
+        formats::try_command_r, // Action: / Action Input: — least specific
     ];
 
     for parser in parsers {
@@ -191,6 +193,48 @@ mod tests {
         let result = parse_tool_calls(output, Some(&tools));
         assert!(result.has_tool_calls());
         assert_eq!(result.tool_calls[0].name, "calc");
+    }
+
+    #[test]
+    fn parse_command_r_format() {
+        let output = "Action: search\nAction Input: {\"query\": \"rust\"}";
+        let tools = vec![make_tool("search")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "search");
+    }
+
+    #[test]
+    fn parse_granite_format() {
+        let output = r#"<response><tool_call>{"name": "get_info", "arguments": {"id": 42}}</tool_call></response>"#;
+        let tools = vec![make_tool("get_info")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "get_info");
+    }
+
+    #[test]
+    fn parse_deepseek_format_via_hermes() {
+        // DeepSeek uses <tool_call> (Hermes style) after <think> blocks
+        let output = "<think>Reasoning step.</think>\n<tool_call>{\"name\": \"fn\", \"arguments\": {\"k\": \"v\"}}</tool_call>";
+        let tools = vec![make_tool("fn")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls[0].name, "fn");
+    }
+
+    #[test]
+    fn parse_granite_takes_precedence_over_hermes() {
+        // Granite format wraps in <response>; must be matched by Granite handler, not Hermes
+        let output =
+            r#"<response><tool_call>{"name": "fn", "arguments": {}}</tool_call></response>"#;
+        let tools = vec![make_tool("fn")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(
+            result.format,
+            Some(crate::server::tool_calls::ToolCallFormat::Granite)
+        );
     }
 
     #[test]
