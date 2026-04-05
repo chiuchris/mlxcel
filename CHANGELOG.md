@@ -4,6 +4,27 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.16] - 2026-04-05
+
+### Added
+- Audio input support for server chat completions endpoint (#217, #220)
+- Gemma 4 audio encoder and audio-language model support (#217, #218)
+- Metal 4 fused attention path (#197, #210)
+- OpenAI-compatible tool calling support (#212, #213)
+- M5 GPU acceleration experiments (#209)
+- M5 Neural Accelerator rollout research (#203)
+
+### Changed
+- Unify attention dispatch for Metal 4 path (#201)
+
+### Fixed
+- Propagate client disconnection to BatchScheduler to prevent orphaned sequences (#219, #221)
+- Harden tool calling with input limits, parser improvements, and format handlers (#215, #216)
+- Remove eval() calls from qwen3_moe forward hot path (#211)
+- Resolve Gemma SDPA crash on M1 by reducing threadgroup memory for head_dim=256 (#208)
+- Update compiled.cpp patch for upstream MLX API change (#207)
+- Add str.split() support in chat template for Gemma 4 multi-turn (#206)
+
 ## [v0.0.15] - 2026-04-03
 
 ### Added
@@ -316,6 +337,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.16]: https://github.com/lablup/mlxcel/compare/v0.0.15...v0.0.16
 [v0.0.15]: https://github.com/lablup/mlxcel/compare/v0.0.14...v0.0.15
 [v0.0.14]: https://github.com/lablup/mlxcel/compare/v0.0.13...v0.0.14
 [v0.0.13]: https://github.com/lablup/mlxcel/compare/v0.0.12...v0.0.13

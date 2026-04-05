@@ -1,3 +1,21 @@
+mlxcel (0.0.16-1~jammy1) jammy; urgency=medium
+
+  * Feat: Add audio input support for server chat completions endpoint
+  * Feat: Implement Gemma 4 audio encoder and audio-language model support
+  * Feat: Start Metal 4 fused attention path
+  * Feat: Implement OpenAI-compatible tool calling support
+  * Feat: Add M5 GPU acceleration experiments
+  * Feat: Continue M5 Neural Accelerator rollout research
+  * Update: Unify attention dispatch for Metal 4 path
+  * Fix: Propagate client disconnection to BatchScheduler
+  * Fix: Harden tool calling with input limits and parser improvements
+  * Fix: Remove eval() calls from qwen3_moe forward hot path
+  * Fix: Resolve Gemma SDPA crash on M1 for head_dim=256
+  * Fix: Update compiled.cpp patch for upstream MLX API change
+  * Fix: Add str.split() support in chat template for Gemma 4 multi-turn
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 05 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.15-1~jammy1) jammy; urgency=medium
 
   * Feat: Add Gemma 4 text and VLM model support

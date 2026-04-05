@@ -1590,7 +1590,7 @@ dependencies = [
 
 [[package]]
 name = "mlxcel"
-version = "0.0.15"
+version = "0.0.16"
 dependencies = [
  "anyhow",
  "async-stream",
