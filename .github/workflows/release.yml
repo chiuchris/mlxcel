@@ -232,16 +232,34 @@ jobs:
             echo "Cargo target cache age: ${AGE_DAYS}d — keeping"
           fi
 
-      - name: Purge stale MLX build cache
+      - name: Validate MLX build cache
+        env:
+          # Must match GIT_TAG in src/lib/mlx-cpp/CMakeLists.txt and
+          # MLX_EXPECTED_COMMIT in src/lib/mlxcel-core/build.rs
+          MLX_EXPECTED_COMMIT: "6a9a121d09546fec051038535b444bc797fac045"
         run: |
-          # Remove cached _deps/ directories that may contain stale MLX build
-          # artifacts from a previous MLX commit.
-          echo "Searching for _deps/ in $CARGO_TARGET_DIR ..."
-          find "$CARGO_TARGET_DIR" -path "*/_deps" -type d 2>/dev/null | head -20
-          find "$CARGO_TARGET_DIR" -path "*/_deps" -type d -exec rm -rf {} + 2>/dev/null || true
+          # Check every _deps directory for a valid .mlx-build-commit marker.
+          # If the marker is missing or doesn't match, purge that _deps/ entirely.
+          # This ensures stale MLX source/objects never survive across MLX upgrades.
+          FOUND=0
+          PURGED=0
+          for deps_dir in $(find "$CARGO_TARGET_DIR" -path "*/_deps" -type d 2>/dev/null); do
+            FOUND=$((FOUND + 1))
+            MARKER="$deps_dir/.mlx-build-commit"
+            if [ -f "$MARKER" ] && [ "$(cat "$MARKER")" = "$MLX_EXPECTED_COMMIT" ]; then
+              echo "Valid cache: $deps_dir"
+            else
+              echo "Stale cache (marker=$(cat "$MARKER" 2>/dev/null || echo 'missing')): purging $deps_dir"
+              rm -rf "$deps_dir"
+              PURGED=$((PURGED + 1))
+            fi
+          done
           # Also clean workspace target/ from any previous actions/cache restore
-          find target -path "*/_deps" -type d -exec rm -rf {} + 2>/dev/null || true
-          echo "Purged _deps/ directories"
+          for deps_dir in $(find target -path "*/_deps" -type d 2>/dev/null); do
+            rm -rf "$deps_dir"
+            PURGED=$((PURGED + 1))
+          done
+          echo "Checked $FOUND cache(s), purged $PURGED"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
