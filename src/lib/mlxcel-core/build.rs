@@ -269,6 +269,7 @@ fn link_cuda() {
     println!("cargo:rustc-link-lib=dylib=cudart");
     println!("cargo:rustc-link-lib=dylib=cublas");
     println!("cargo:rustc-link-lib=dylib=cublasLt");
+    println!("cargo:rustc-link-lib=dylib=cufft");
 
     // CUDA driver API (cuLaunchKernel, cuModuleLoad, etc.)
     println!("cargo:rustc-link-lib=dylib=cuda");
