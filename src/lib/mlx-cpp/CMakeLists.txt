@@ -90,7 +90,10 @@ if(EXISTS "${_mlx_cached_source_dir}/CMakeLists.txt")
   else()
     message(STATUS "Cached MLX source at ${_mlx_cached_commit} does not match "
                    "expected ${_mlx_expected_git_tag} — re-fetching")
-    file(REMOVE_RECURSE "${_mlx_cached_source_dir}" "${_mlx_cached_binary_dir}")
+    file(REMOVE_RECURSE
+         "${_mlx_cached_source_dir}"
+         "${_mlx_cached_binary_dir}"
+         "${CMAKE_BINARY_DIR}/_deps/mlx-subbuild")
   endif()
 endif()
 
