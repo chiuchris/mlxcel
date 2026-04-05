@@ -97,6 +97,22 @@ jobs:
           p12-file-base64: ${{ secrets.DEV_ID_CERT_P12 }}
           p12-password: ${{ secrets.DEV_ID_CERT_PASSWORD }}
 
+      - name: Install Apple WWDR intermediate certificates
+        run: |
+          # Self-hosted runners may lack the Apple WWDR intermediate certs
+          # needed to build the certificate chain for code signing.
+          for url in \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG2.cer" \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer" \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG5.cer" \
+            "https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer"; do
+            CERT_FILE=$(basename "$url")
+            curl -sL "$url" -o "/tmp/$CERT_FILE"
+            security import "/tmp/$CERT_FILE" -k ~/Library/Keychains/signing_temp.keychain-db -T /usr/bin/codesign 2>/dev/null || true
+            rm -f "/tmp/$CERT_FILE"
+          done
+
       - name: Code sign macOS binaries
         run: |
           BIN_DIR="$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
