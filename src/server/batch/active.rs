@@ -147,6 +147,7 @@ mod tests {
             logprobs_config: Default::default(),
             vlm_embeddings: None,
             images: Vec::new(),
+            audio: Vec::new(),
             generated_tokens: Vec::new(),
             generated_text: String::new(),
             decode_state,

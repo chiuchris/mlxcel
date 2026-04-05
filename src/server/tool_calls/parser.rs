@@ -65,6 +65,7 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
     // Try each format in order of specificity (most distinctive markers first)
     let parsers: &[fn(&str) -> Option<ToolCallParseResult>] = &[
         formats::try_granite, // <response><tool_call> — more specific than bare Hermes
+        formats::try_gemma4,  // <|tool_call>call:... — pipe-delimited, before Hermes
         formats::try_hermes,  // <tool_call> — Hermes/Qwen/DeepSeek
         formats::try_mistral_nemo, // [TOOL_CALLS]
         formats::try_functionary_v31, // <function=name>
@@ -221,6 +222,31 @@ mod tests {
         let result = parse_tool_calls(output, Some(&tools));
         assert!(result.has_tool_calls());
         assert_eq!(result.tool_calls[0].name, "fn");
+    }
+
+    #[test]
+    fn parse_gemma4_format() {
+        let output = "<|tool_call>call:get_weather{location:<|\"|>Tokyo<|\"|>}<tool_call|>";
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["location"], "Tokyo");
+        assert_eq!(
+            result.format,
+            Some(crate::server::tool_calls::ToolCallFormat::Gemma4)
+        );
+    }
+
+    #[test]
+    fn parse_gemma4_filters_unknown_tools() {
+        let output = "<|tool_call>call:unknown_fn{key:<|\"|>val<|\"|>}<tool_call|>";
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(!result.has_tool_calls());
     }
 
     #[test]

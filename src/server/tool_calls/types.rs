@@ -43,6 +43,8 @@ pub enum ToolCallFormat {
     CommandR,
     /// Granite 3.3: `<response><tool_call>...</tool_call></response>`
     Granite,
+    /// Gemma 4: `<|tool_call>call:name{key:<|"|>val<|"|>}<tool_call|>`
+    Gemma4,
     /// Generic JSON: raw `{"name": ..., "arguments": ...}` object
     GenericJson,
 }
