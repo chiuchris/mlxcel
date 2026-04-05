@@ -91,34 +91,59 @@ jobs:
         env:
           RUSTFLAGS: "-C target-cpu=apple-m1"
 
-      - name: Import Distribution certificate
-        uses: apple-actions/import-codesign-certs@v3
-        with:
-          p12-file-base64: ${{ secrets.DEV_ID_CERT_P12 }}
-          p12-password: ${{ secrets.DEV_ID_CERT_PASSWORD }}
-
-      - name: Install Apple WWDR intermediate certificates
+      - name: Prepare signing certificate (rcodesign)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.DEV_ID_CERT_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.DEV_ID_CERT_PASSWORD }}
         run: |
-          # Self-hosted runners may lack the Apple WWDR intermediate certs
-          # needed to build the certificate chain for code signing.
-          for url in \
-            "https://www.apple.com/certificateauthority/AppleWWDRCAG2.cer" \
-            "https://www.apple.com/certificateauthority/AppleWWDRCAG3.cer" \
-            "https://www.apple.com/certificateauthority/AppleWWDRCAG4.cer" \
-            "https://www.apple.com/certificateauthority/AppleWWDRCAG5.cer" \
-            "https://www.apple.com/certificateauthority/AppleWWDRCAG6.cer"; do
-            CERT_FILE=$(basename "$url")
-            curl -sL "$url" -o "/tmp/$CERT_FILE"
-            security import "/tmp/$CERT_FILE" -k ~/Library/Keychains/signing_temp.keychain-db -T /usr/bin/codesign 2>/dev/null || true
-            rm -f "/tmp/$CERT_FILE"
-          done
+          # Use rcodesign instead of Apple's codesign to bypass macOS 26 keychain
+          # session issues on self-hosted runners. rcodesign reads PEM directly —
+          # no keychain, no SecurityAgent, no GUI session required.
+          echo "$APPLE_CERTIFICATE" | base64 --decode > $RUNNER_TEMP/original.p12
+
+          # Extract to unencrypted PEM (cert + private key) using -legacy flag
+          # for p12 files with legacy RC2-40-CBC encryption.
+          openssl pkcs12 -in $RUNNER_TEMP/original.p12 \
+            -passin "pass:$APPLE_CERTIFICATE_PASSWORD" \
+            -legacy -nodes -out $RUNNER_TEMP/signing.pem 2>/dev/null
+
+          rm -f $RUNNER_TEMP/original.p12
+
+          if [ ! -s "$RUNNER_TEMP/signing.pem" ]; then
+            echo "::error::Failed to extract certificate from p12"
+            exit 1
+          fi
+
+          echo "=== Certificate details ==="
+          openssl x509 -in $RUNNER_TEMP/signing.pem -noout -subject -dates 2>/dev/null || true
+
+          echo "PEM_FILE=$RUNNER_TEMP/signing.pem" >> $GITHUB_ENV
+
+      - name: Install rcodesign
+        run: |
+          RCODESIGN_VERSION="0.29.0"
+          RCODESIGN_DIR="$HOME/.rcodesign"
+          RCODESIGN_BIN="$RCODESIGN_DIR/rcodesign"
+
+          if [ -f "$RCODESIGN_BIN" ] && "$RCODESIGN_BIN" --version 2>/dev/null | grep -q "$RCODESIGN_VERSION"; then
+            echo "rcodesign $RCODESIGN_VERSION already installed"
+          else
+            echo "Installing rcodesign $RCODESIGN_VERSION..."
+            mkdir -p "$RCODESIGN_DIR"
+            curl -sL "https://github.com/indygreg/apple-platform-rs/releases/download/apple-codesign%2F${RCODESIGN_VERSION}/apple-codesign-${RCODESIGN_VERSION}-aarch64-apple-darwin.tar.gz" \
+              | tar xz -C "$RCODESIGN_DIR" --strip-components=1
+          fi
+          echo "$RCODESIGN_DIR" >> $GITHUB_PATH
 
       - name: Code sign macOS binaries
         run: |
           BIN_DIR="$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
           for BIN in mlxcel mlxcel-server; do
-            codesign --force --timestamp --options runtime \
-                     --sign "Distribution" "$BIN_DIR/$BIN"
+            echo "Signing $BIN..."
+            rcodesign sign \
+              --pem-file "$PEM_FILE" \
+              --code-signature-flags runtime \
+              "$BIN_DIR/$BIN"
           done
 
       - name: Locate mlx.metallib
