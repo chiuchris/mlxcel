@@ -19,10 +19,11 @@ use cmake::Config;
 use std::{env, path::PathBuf};
 
 fn main() {
-    let _out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
 
     // Build MLX using cmake
     let mlx_dst = build_mlx();
+    mark_mlx_cache_valid(&out_dir);
     let mlx_include = mlx_dst.join("build/include");
     let mlx_lib = mlx_dst.join("build/lib");
 
@@ -117,59 +118,43 @@ fn main() {
 /// Expected MLX git commit — must match GIT_TAG in mlx-cpp/CMakeLists.txt.
 const MLX_EXPECTED_COMMIT: &str = "6a9a121d09546fec051038535b444bc797fac045";
 
-/// Purge stale cached MLX source before CMake runs.
+/// Purge stale cached MLX build artifacts before CMake runs.
 ///
-/// The CI cargo cache may restore a `_deps/mlx-src` from a previous MLX
-/// commit. If CMake's FetchContent finds an existing source dir it tries a
-/// `git update` instead of a fresh clone, which fails when the `.git` dir is
-/// missing or the checkout is from a different commit. Validating *before*
-/// CMake avoids this entirely.
+/// CI caches may restore `_deps/` from a previous build. Even when the git
+/// source checkout is correct, stale CMake build artifacts (object files in
+/// `_deps/mlx-build/`) can cause compilation to succeed using outdated `.o`
+/// files because make skips recompilation when timestamps look current.
+///
+/// Instead of fragile git-based validation, we use a simple marker file:
+/// after a successful build, `_deps/.mlx-build-commit` records the commit.
+/// If the marker is missing or doesn't match, we purge the entire `_deps/`.
 fn purge_stale_mlx_cache(out_dir: &std::path::Path) {
     let deps_dir = out_dir.join("build/_deps");
-    let mlx_src = deps_dir.join("mlx-src");
-    if !mlx_src.join("CMakeLists.txt").exists() {
-        return; // No cached source — nothing to do
+    if !deps_dir.exists() {
+        return;
     }
 
-    // Check 1: git HEAD matches expected commit
-    let head_commit = std::process::Command::new("git")
-        .args(["rev-parse", "HEAD"])
-        .current_dir(&mlx_src)
-        .output()
+    let marker = deps_dir.join(".mlx-build-commit");
+    let cached_commit = std::fs::read_to_string(&marker)
         .ok()
-        .and_then(|o| {
-            if o.status.success() {
-                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
-            } else {
-                None
-            }
-        });
+        .map(|s| s.trim().to_string());
 
-    let commit_matches = head_commit
-        .as_deref()
-        .is_some_and(|c| c == MLX_EXPECTED_COMMIT);
-
-    // Check 2: working tree is clean (no modified/missing files vs HEAD).
-    // A previous failed FetchContent can leave HEAD at the right commit but
-    // with stale file contents from an older checkout.
-    let tree_clean = commit_matches
-        && std::process::Command::new("git")
-            .args(["diff", "--quiet", "HEAD"])
-            .current_dir(&mlx_src)
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-
-    if !tree_clean {
-        eprintln!(
-            "mlxcel-core: cached MLX source invalid (commit={}, expected={}), purging _deps/",
-            head_commit.as_deref().unwrap_or("unknown"),
-            MLX_EXPECTED_COMMIT
-        );
-        // Remove the entire _deps to ensure FetchContent starts completely fresh
-        // (source, build artifacts, subbuild stamps, and any sub-dependencies).
-        let _ = std::fs::remove_dir_all(&deps_dir);
+    if cached_commit.as_deref() == Some(MLX_EXPECTED_COMMIT) {
+        return; // Cache is valid
     }
+
+    eprintln!(
+        "mlxcel-core: MLX build cache stale (cached={}, expected={}), purging _deps/",
+        cached_commit.as_deref().unwrap_or("none"),
+        MLX_EXPECTED_COMMIT
+    );
+    let _ = std::fs::remove_dir_all(&deps_dir);
+}
+
+/// Write a marker after successful MLX build so future runs can validate the cache.
+fn mark_mlx_cache_valid(out_dir: &std::path::Path) {
+    let marker = out_dir.join("build/_deps/.mlx-build-commit");
+    let _ = std::fs::write(marker, MLX_EXPECTED_COMMIT);
 }
 
 fn build_mlx() -> PathBuf {
