@@ -131,7 +131,8 @@ fn purge_stale_mlx_cache(out_dir: &std::path::Path) {
         return; // No cached source — nothing to do
     }
 
-    let commit_ok = std::process::Command::new("git")
+    // Check 1: git HEAD matches expected commit
+    let head_commit = std::process::Command::new("git")
         .args(["rev-parse", "HEAD"])
         .current_dir(&mlx_src)
         .output()
@@ -142,12 +143,27 @@ fn purge_stale_mlx_cache(out_dir: &std::path::Path) {
             } else {
                 None
             }
-        })
+        });
+
+    let commit_matches = head_commit
+        .as_deref()
         .is_some_and(|c| c == MLX_EXPECTED_COMMIT);
 
-    if !commit_ok {
+    // Check 2: working tree is clean (no modified/missing files vs HEAD).
+    // A previous failed FetchContent can leave HEAD at the right commit but
+    // with stale file contents from an older checkout.
+    let tree_clean = commit_matches
+        && std::process::Command::new("git")
+            .args(["diff", "--quiet", "HEAD"])
+            .current_dir(&mlx_src)
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+
+    if !tree_clean {
         eprintln!(
-            "mlxcel-core: cached MLX source does not match {}, purging _deps/",
+            "mlxcel-core: cached MLX source invalid (commit={}, expected={}), purging _deps/",
+            head_commit.as_deref().unwrap_or("unknown"),
             MLX_EXPECTED_COMMIT
         );
         // Remove the entire _deps to ensure FetchContent starts completely fresh
