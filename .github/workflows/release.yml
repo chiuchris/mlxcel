@@ -40,6 +40,20 @@ jobs:
             macos-cargo-aarch64-apple-darwin-${{ hashFiles('**/Cargo.toml') }}
             macos-cargo-aarch64-apple-darwin-
 
+      - name: Verify build environment
+        run: |
+          echo "=== macOS ==="
+          sw_vers
+          echo ""
+          echo "=== Xcode SDK ==="
+          xcrun --show-sdk-version
+          echo ""
+          echo "=== Metal version ==="
+          echo "__METAL_VERSION__" | xcrun -sdk macosx metal -E -x metal -P - | tail -1
+          echo ""
+          echo "=== Metal compiler ==="
+          xcrun -sdk macosx metal --version
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
