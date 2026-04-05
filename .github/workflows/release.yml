@@ -18,8 +18,9 @@ jobs:
   # ============================================================================
   build-macos:
     name: Build macOS (Apple Silicon)
-    runs-on: macos-15
+    runs-on: self-hosted-macos-26-arm64 # Self-hosted Apple Silicon runner with macOS 26 SDK + Metal 4
     environment: packaging
+    timeout-minutes: 90
 
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -28,17 +29,33 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: macos-cargo-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            macos-cargo-aarch64-apple-darwin-${{ hashFiles('**/Cargo.toml') }}
-            macos-cargo-aarch64-apple-darwin-
+      # Use persistent cache paths for self-hosted runner (outside workspace)
+      - name: Setup persistent cache paths (self-hosted)
+        run: |
+          # Set persistent cargo target directory to enable incremental builds
+          # on self-hosted runner (avoids recompiling from scratch every run)
+          CARGO_TARGET="$HOME/.cargo-target/mlxcel"
+          mkdir -p "$CARGO_TARGET"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> $GITHUB_ENV
+
+          # Prune stale cargo target cache if older than 7 days
+          # Prevents unbounded disk growth from accumulated build artifacts
+          MARKER="$CARGO_TARGET/.last-clean"
+          SHOULD_CLEAN=false
+          if [ ! -f "$MARKER" ]; then
+            SHOULD_CLEAN=true
+          elif [ "$(find "$MARKER" -mtime +7 2>/dev/null)" ]; then
+            SHOULD_CLEAN=true
+          fi
+          if [ "$SHOULD_CLEAN" = true ]; then
+            echo "Cargo target cache older than 7 days — cleaning"
+            rm -rf "$CARGO_TARGET"
+            mkdir -p "$CARGO_TARGET"
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$MARKER"
+          else
+            AGE_DAYS=$(( ($(date +%s) - $(stat -f %m "$MARKER")) / 86400 ))
+            echo "Cargo target cache age: ${AGE_DAYS}d — keeping"
+          fi
 
       - name: Verify build environment
         run: |
@@ -72,7 +89,7 @@ jobs:
 
       - name: Code sign macOS binaries
         run: |
-          BIN_DIR="target/aarch64-apple-darwin/release"
+          BIN_DIR="$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
           for BIN in mlxcel mlxcel-server; do
             codesign --force --timestamp --options runtime \
                      --sign "Distribution" "$BIN_DIR/$BIN"
@@ -80,7 +97,7 @@ jobs:
 
       - name: Locate mlx.metallib
         run: |
-          METALLIB=$(find target/aarch64-apple-darwin/release/build/mlxcel-core-*/out/build/lib -name "mlx.metallib" 2>/dev/null | head -1)
+          METALLIB=$(find "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/build/mlxcel-core-"*/out/build/lib -name "mlx.metallib" 2>/dev/null | head -1)
           if [ -z "$METALLIB" ]; then
             echo "::error::mlx.metallib not found in build output"
             exit 1
@@ -90,7 +107,7 @@ jobs:
 
       - name: Package binaries
         run: |
-          BIN_DIR="target/aarch64-apple-darwin/release"
+          BIN_DIR="$CARGO_TARGET_DIR/aarch64-apple-darwin/release"
           mkdir -p package
           cp "$BIN_DIR/mlxcel" package/
           cp "$BIN_DIR/mlxcel-server" package/
