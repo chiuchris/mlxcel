@@ -57,6 +57,16 @@ jobs:
             echo "Cargo target cache age: ${AGE_DAYS}d — keeping"
           fi
 
+      - name: Ensure build tools
+        run: |
+          # cmake is required by mlxcel-core and sentencepiece-sys build scripts
+          if ! command -v cmake &>/dev/null; then
+            echo "cmake not found, installing via Homebrew..."
+            brew install cmake
+          fi
+          echo "cmake: $(cmake --version | head -1)"
+          echo "git: $(git --version)"
+
       - name: Verify build environment
         run: |
           echo "=== macOS ==="
@@ -163,6 +173,15 @@ jobs:
           restore-keys: |
             linux-cargo-cuda-${{ matrix.variant }}-${{ hashFiles('**/Cargo.toml') }}
             linux-cargo-cuda-${{ matrix.variant }}-
+
+      - name: Purge stale MLX build cache
+        run: |
+          # Remove cached _deps/ directories that may contain stale MLX build
+          # artifacts from a previous commit. The cargo cache can restore object
+          # files compiled from an older MLX version, and CMake won't recompile
+          # them if timestamps look current.
+          find target -path "*/_deps" -type d -exec rm -rf {} + 2>/dev/null || true
+          echo "Purged any cached _deps/ directories"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
