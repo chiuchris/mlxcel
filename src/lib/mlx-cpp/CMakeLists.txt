@@ -70,34 +70,13 @@ endfunction()
 
 set(_mlx_cached_source_dir "${CMAKE_BINARY_DIR}/_deps/mlx-src")
 set(_mlx_cached_binary_dir "${CMAKE_BINARY_DIR}/_deps/mlx-build")
-set(_mlx_expected_git_tag "6a9a121d09546fec051038535b444bc797fac045")
 
 # Reuse an already-populated source tree when present so offline rebuilds can
 # proceed without re-running FetchContent. This is especially useful when Cargo
 # changes the build hash but the developer already has a cached MLX checkout.
-# Verify the cached commit matches our pinned tag to avoid stale CI caches.
-set(_mlx_cache_valid FALSE)
+# NOTE: Stale-cache validation is handled by build.rs (purge_stale_mlx_cache)
+# which runs *before* CMake, ensuring _deps/ is either valid or absent.
 if(EXISTS "${_mlx_cached_source_dir}/CMakeLists.txt")
-  execute_process(
-    COMMAND git rev-parse HEAD
-    WORKING_DIRECTORY "${_mlx_cached_source_dir}"
-    OUTPUT_VARIABLE _mlx_cached_commit
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-    RESULT_VARIABLE _git_result
-    ERROR_QUIET)
-  if(_git_result EQUAL 0 AND _mlx_cached_commit STREQUAL _mlx_expected_git_tag)
-    set(_mlx_cache_valid TRUE)
-  else()
-    message(STATUS "Cached MLX source at ${_mlx_cached_commit} does not match "
-                   "expected ${_mlx_expected_git_tag} — re-fetching")
-    file(REMOVE_RECURSE
-         "${_mlx_cached_source_dir}"
-         "${_mlx_cached_binary_dir}"
-         "${CMAKE_BINARY_DIR}/_deps/mlx-subbuild")
-  endif()
-endif()
-
-if(_mlx_cache_valid)
   set(mlx_SOURCE_DIR "${_mlx_cached_source_dir}")
   set(mlx_BINARY_DIR "${_mlx_cached_binary_dir}")
   message(STATUS "Using cached MLX source from ${mlx_SOURCE_DIR}")
@@ -105,7 +84,7 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG ${_mlx_expected_git_tag})
+    GIT_TAG 6a9a121d09546fec051038535b444bc797fac045)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.

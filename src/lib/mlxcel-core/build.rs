@@ -114,7 +114,52 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");
 }
 
+/// Expected MLX git commit — must match GIT_TAG in mlx-cpp/CMakeLists.txt.
+const MLX_EXPECTED_COMMIT: &str = "6a9a121d09546fec051038535b444bc797fac045";
+
+/// Purge stale cached MLX source before CMake runs.
+///
+/// The CI cargo cache may restore a `_deps/mlx-src` from a previous MLX
+/// commit. If CMake's FetchContent finds an existing source dir it tries a
+/// `git update` instead of a fresh clone, which fails when the `.git` dir is
+/// missing or the checkout is from a different commit. Validating *before*
+/// CMake avoids this entirely.
+fn purge_stale_mlx_cache(out_dir: &std::path::Path) {
+    let deps_dir = out_dir.join("build/_deps");
+    let mlx_src = deps_dir.join("mlx-src");
+    if !mlx_src.join("CMakeLists.txt").exists() {
+        return; // No cached source — nothing to do
+    }
+
+    let commit_ok = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(&mlx_src)
+        .output()
+        .ok()
+        .and_then(|o| {
+            if o.status.success() {
+                Some(String::from_utf8_lossy(&o.stdout).trim().to_string())
+            } else {
+                None
+            }
+        })
+        .is_some_and(|c| c == MLX_EXPECTED_COMMIT);
+
+    if !commit_ok {
+        eprintln!(
+            "mlxcel-core: cached MLX source does not match {}, purging _deps/",
+            MLX_EXPECTED_COMMIT
+        );
+        // Remove the entire _deps to ensure FetchContent starts completely fresh
+        // (source, build artifacts, subbuild stamps, and any sub-dependencies).
+        let _ = std::fs::remove_dir_all(&deps_dir);
+    }
+}
+
 fn build_mlx() -> PathBuf {
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    purge_stale_mlx_cache(&out_dir);
+
     let mut config = Config::new("../mlx-cpp");
     config.very_verbose(true);
     config.define("CMAKE_INSTALL_PREFIX", ".");
