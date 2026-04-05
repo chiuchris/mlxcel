@@ -158,30 +158,49 @@ jobs:
             cuda_arch: "90a"
             asset_name: mlxcel-linux-aarch64-cuda13-gh200
 
+    timeout-minutes: 120
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Cache cargo
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: linux-cargo-cuda-${{ matrix.variant }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            linux-cargo-cuda-${{ matrix.variant }}-${{ hashFiles('**/Cargo.toml') }}
-            linux-cargo-cuda-${{ matrix.variant }}-
+      # Use persistent cache paths for self-hosted runner (outside workspace)
+      - name: Setup persistent cache paths (self-hosted)
+        run: |
+          # Set persistent cargo target directory to enable incremental builds
+          # on self-hosted runner (avoids recompiling from scratch every run)
+          CARGO_TARGET="$HOME/.cargo-target/mlxcel-cuda-${{ matrix.variant }}"
+          mkdir -p "$CARGO_TARGET"
+          echo "CARGO_TARGET_DIR=$CARGO_TARGET" >> $GITHUB_ENV
+
+          # Prune stale cargo target cache if older than 7 days
+          MARKER="$CARGO_TARGET/.last-clean"
+          SHOULD_CLEAN=false
+          if [ ! -f "$MARKER" ]; then
+            SHOULD_CLEAN=true
+          elif [ "$(find "$MARKER" -mtime +7 2>/dev/null)" ]; then
+            SHOULD_CLEAN=true
+          fi
+          if [ "$SHOULD_CLEAN" = true ]; then
+            echo "Cargo target cache older than 7 days — cleaning"
+            rm -rf "$CARGO_TARGET"
+            mkdir -p "$CARGO_TARGET"
+            date -u +"%Y-%m-%dT%H:%M:%SZ" > "$MARKER"
+          else
+            AGE_DAYS=$(( ($(date +%s) - $(stat -c %Y "$MARKER")) / 86400 ))
+            echo "Cargo target cache age: ${AGE_DAYS}d — keeping"
+          fi
 
       - name: Purge stale MLX build cache
         run: |
           # Remove cached _deps/ directories that may contain stale MLX build
-          # artifacts from a previous commit. The cargo cache can restore object
-          # files compiled from an older MLX version, and CMake won't recompile
-          # them if timestamps look current.
+          # artifacts from a previous MLX commit.
+          echo "Searching for _deps/ in $CARGO_TARGET_DIR ..."
+          find "$CARGO_TARGET_DIR" -path "*/_deps" -type d 2>/dev/null | head -20
+          find "$CARGO_TARGET_DIR" -path "*/_deps" -type d -exec rm -rf {} + 2>/dev/null || true
+          # Also clean workspace target/ from any previous actions/cache restore
           find target -path "*/_deps" -type d -exec rm -rf {} + 2>/dev/null || true
-          echo "Purged any cached _deps/ directories"
+          echo "Purged _deps/ directories"
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -193,7 +212,7 @@ jobs:
 
       - name: Package binaries
         run: |
-          BIN_DIR="target/release"
+          BIN_DIR="$CARGO_TARGET_DIR/release"
           mkdir -p package
           cp "$BIN_DIR/mlxcel" package/
           cp "$BIN_DIR/mlxcel-server" package/
