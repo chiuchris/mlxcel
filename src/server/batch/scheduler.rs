@@ -974,7 +974,15 @@ impl BatchScheduler {
 
         // Align each continuation chunk to a 32-token tile boundary on M5+.
         let actual_chunk_len = chunk.len();
-        let kv_offset = caches.first().map_or(0, |c| c.offset);
+        // For non-batching models the scheduler's dummy caches always have
+        // offset=0.  Use the prefill_offset (number of tokens already
+        // processed) as the KV offset instead, which is accurate regardless
+        // of whether the model uses internal or scheduler-managed caches.
+        let kv_offset = if self.model.supports_batching() {
+            caches.first().map_or(0, |c| c.offset)
+        } else {
+            offset as i32
+        };
         let (eff_chunk, pad_mask_opt) = if should_align_prefill() {
             let padded_len = align_to_na_tile(actual_chunk_len);
             if padded_len > actual_chunk_len {

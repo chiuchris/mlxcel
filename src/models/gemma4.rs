@@ -668,7 +668,11 @@ impl Attention {
         values: &MlxArray,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        if mask.is_none() && self.n_kv_heads > 1 {
+        let local_mask = trim_mask_to_keys(mask, keys);
+
+        // When mask was discarded (undersized) or originally None,
+        // use causal attention if possible.
+        if local_mask.is_none() && self.n_kv_heads > 1 {
             return mlxcel_core::causal_attention(
                 queries,
                 keys,
@@ -679,7 +683,6 @@ impl Attention {
             );
         }
 
-        let local_mask = trim_mask_to_keys(mask, keys);
         let mask_ptr = local_mask
             .as_ref()
             .map(|m| m.as_ref().unwrap() as *const MlxArray)
@@ -860,9 +863,21 @@ fn trim_mask_to_keys(mask: Option<&MlxArray>, keys: &MlxArray) -> Option<UniqueP
     let mask_len = *mask_shape.last().unwrap_or(&0);
     if mask_len == key_len {
         Some(mlxcel_core::copy(mask))
-    } else {
-        let start = (mask_len - key_len).max(0);
+    } else if mask_len > key_len {
+        let start = mask_len - key_len;
         Some(slice_axis(mask, -1, start, mask_len))
+    } else {
+        // mask is smaller than key length — this happens when an external
+        // mask was created with stale offset (e.g. during chunked prefill on
+        // non-batching models).  Discard the undersized caller mask and let
+        // the attention kernel fall back to its internal causal handling by
+        // returning None, which will cause the caller to pass a null mask.
+        tracing::warn!(
+            mask_len,
+            key_len,
+            "trim_mask_to_keys: mask shorter than key length, discarding caller mask"
+        );
+        None
     }
 }
 
