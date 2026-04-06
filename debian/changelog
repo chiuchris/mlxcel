@@ -1,3 +1,9 @@
+mlxcel (0.0.17-1~jammy1) jammy; urgency=medium
+
+  * Fix: Resolve broadcast crash in Gemma 4 chunked prefill with undersized attention mask
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sun, 06 Apr 2026 12:00:00 +0900
+
 mlxcel (0.0.16-1~jammy1) jammy; urgency=medium
 
   * Feat: Add audio input support for server chat completions endpoint

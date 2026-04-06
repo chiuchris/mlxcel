@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.17] - 2026-04-06
+
+### Fixed
+- Resolve broadcast crash in Gemma 4 chunked prefill with undersized attention mask (#224)
+
 ## [v0.0.16] - 2026-04-05
 
 ### Added
@@ -337,6 +342,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.17]: https://github.com/lablup/mlxcel/compare/v0.0.16...v0.0.17
 [v0.0.16]: https://github.com/lablup/mlxcel/compare/v0.0.15...v0.0.16
 [v0.0.15]: https://github.com/lablup/mlxcel/compare/v0.0.14...v0.0.15
 [v0.0.14]: https://github.com/lablup/mlxcel/compare/v0.0.13...v0.0.14
