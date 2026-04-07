@@ -16,6 +16,12 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no CUDA implementation.");    \
   }
 
+#define NO_GPU_USE_FALLBACK(func)     \
+  bool func::use_fallback(Stream s) { \
+    return true;                      \
+  }                                   \
+  NO_GPU_MULTI(func)
+
 #define NO_GPU(func)                                                  \
   void func::eval_gpu(const std::vector<array>& inputs, array& out) { \
     throw std::runtime_error(#func " has no CUDA implementation.");   \

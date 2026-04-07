@@ -50,15 +50,33 @@ BUILD_TYPE="release"
 # Full hardware string for CSV content (e.g. Apple_M1_Ultra_128GB)
 detect_hardware_full() {
   local chip mem
-  chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
-  mem=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fGB", $1/1073741824}')
+  if [[ "$(uname)" == "Darwin" ]]; then
+    chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
+    mem=$(sysctl -n hw.memsize 2>/dev/null | awk '{printf "%.0fGB", $1/1073741824}')
+  else
+    # Linux: detect NVIDIA GPU or fall back to CPU
+    local gpu_name
+    gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || echo "")
+    local cuda_ver
+    cuda_ver=$(nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9]*\.[0-9]*\).*/\1/p' || echo "")
+    if [[ -n "$gpu_name" ]]; then
+      # Avoid double "NVIDIA" prefix if gpu_name already starts with it
+      if [[ "$gpu_name" == NVIDIA* ]]; then
+        chip="${gpu_name}"
+      else
+        chip="NVIDIA_${gpu_name}"
+      fi
+      [[ -n "$cuda_ver" ]] && chip="${chip}_CUDA${cuda_ver}"
+    else
+      chip=$(cat /proc/cpuinfo 2>/dev/null | grep "model name" | head -1 | sed 's/.*: //' || echo "unknown")
+    fi
+    mem=$(free -b 2>/dev/null | awk '/^Mem:/{printf "%.0fGB", $2/1073741824}' || echo "")
+  fi
   echo "${chip}_${mem}" | tr ' ' '_'
 }
 
 # Short hardware name for filenames (e.g. m1ultra, m5max, gb10)
 detect_hardware_short() {
-  local model
-  model=$(sysctl -n hw.model 2>/dev/null || echo "unknown")
   local full
   full=$(detect_hardware_full)
 
@@ -76,13 +94,15 @@ detect_hardware_short() {
     *M5_Ultra*)  echo "m5ultra" ;;
     *M5_Max*)    echo "m5max" ;;
     *GB10*)      echo "gb10" ;;
-    *)           echo "$model" | tr '[:upper:]' '[:lower:]' | tr ',' '_' ;;
+    *)           echo "${full}" | tr '[:upper:]' '[:lower:]' | tr ',' '_' | cut -c1-20 ;;
   esac
 }
 
-# Detect backend from binary
+# Detect backend from binary / platform
 detect_backend() {
-  if "$MLXCEL" generate --help 2>&1 | grep -q "cuda"; then
+  if [[ "$(uname)" == "Linux" ]] && nvidia-smi &>/dev/null; then
+    echo "cuda"
+  elif "$MLXCEL" generate --help 2>&1 | grep -q "cuda"; then
     echo "cuda"
   else
     echo "metal"
