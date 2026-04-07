@@ -1,114 +1,14 @@
 // Copyright © 2026 Apple Inc.
-// Optimized by mlxcel: shared memory x-tile broadcast, __restrict__ qualifiers
-// Fix: replaced early return with valid_row flag to prevent block.sync() deadlock
+// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
+// Includes GatherQMM via gather_qmv_kernel using shared qmv_kernel_impl.
 
 #include "mlx/backend/cuda/kernel_utils.cuh"
+#include "mlx/backend/cuda/quantized/qmm/cute_dequant.cuh"
 #include "mlx/backend/cuda/quantized/qmm/qmm.h"
 #include "mlx/dtype_utils.h"
 
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
-#include <cute/numeric/numeric_types.hpp>
-#include <cutlass/numeric_conversion.h>
-
-namespace cutlass {
-
-using uint3b_t = integer_subbyte<3, false>;
-using uint5b_t = integer_subbyte<5, false>;
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint3b_t, N, Round> {
-  static_assert(N % 8 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint3b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 8; ++i) {
-      auto* s = s_base + i * 3;
-      result[i * 8] = T(s[0] & 0x07);
-      result[i * 8 + 1] = T((s[0] & 0x38) >> 3);
-      result[i * 8 + 2] = T((s[0] & 0xc0) >> 6) + T((s[1] & 0x01) << 2);
-      result[i * 8 + 3] = T((s[1] & 0x0e) >> 1);
-      result[i * 8 + 4] = T((s[1] & 0x70) >> 4);
-      result[i * 8 + 5] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x03) << 1);
-      result[i * 8 + 6] = T((s[2] & 0x1c) >> 2);
-      result[i * 8 + 7] = T((s[2] & 0xe0) >> 5);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint5b_t, N, Round> {
-  static_assert(N % 8 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint5b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 8; ++i) {
-      auto* s = s_base + i * 5;
-      result[i * 8] = T(s[0] & 0x1f);
-      result[i * 8 + 1] = T((s[0] & 0xe0) >> 5) + T((s[1] & 0x03) << 3);
-      result[i * 8 + 2] = T((s[1] & 0x7c) >> 2);
-      result[i * 8 + 3] = T((s[1] & 0x80) >> 7) + T((s[2] & 0x0f) << 1);
-      result[i * 8 + 4] = T((s[2] & 0xf0) >> 4) + T((s[3] & 0x01) << 4);
-      result[i * 8 + 5] = T((s[3] & 0x3e) >> 1);
-      result[i * 8 + 6] = T((s[3] & 0xc0) >> 6) + T((s[4] & 0x07) << 2);
-      result[i * 8 + 7] = T((s[4] & 0xf8) >> 3);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-template <typename T, int N, FloatRoundStyle Round>
-struct NumericArrayConverter<T, uint6b_t, N, Round> {
-  static_assert(N % 4 == 0);
-
-  using result_type = Array<T, N>;
-  using source_type = Array<uint6b_t, N>;
-
-  CUTLASS_HOST_DEVICE
-  static result_type convert(const source_type& source) {
-    result_type result;
-    auto* s_base = reinterpret_cast<const uint8_t*>(&source);
-    CUTLASS_PRAGMA_UNROLL
-    for (int i = 0; i < N / 4; ++i) {
-      auto* s = s_base + i * 3;
-      result[i * 4] = T(s[0] & 0x3f);
-      result[i * 4 + 1] = T((s[0] >> 6) & 0x03) + T((s[1] & 0x0f) << 2);
-      result[i * 4 + 2] = T((s[1] >> 4) & 0x0f) + T((s[2] & 0x03) << 4);
-      result[i * 4 + 3] = T((s[2] >> 2) & 0x3f);
-    }
-    return result;
-  }
-
-  CUTLASS_HOST_DEVICE
-  result_type operator()(const source_type& s) const {
-    return convert(s);
-  }
-};
-
-} // namespace cutlass
 
 namespace mlx::core {
 
@@ -121,7 +21,7 @@ namespace cg = cooperative_groups;
 // out = fma(x, w_dq, out)
 template <int N, bool has_bias, typename T, typename Q, typename S>
 __device__ __forceinline__ void
-dequant_fma(const T* __restrict__ x, const Q* __restrict__ w, S scale, T bias, T* out) {
+dequant_fma(const T* x, const Q* w, S scale, T bias, T* out) {
   // Read x/w into registers.
   auto x_vec = *(reinterpret_cast<const cutlass::Array<T, N>*>(x));
   auto w_vec = *(reinterpret_cast<const cutlass::Array<Q, N>*>(w));
@@ -157,7 +57,7 @@ template <
     typename S,
     typename = cuda::std::enable_if_t<!cuda::std::is_same_v<T, float>>>
 __device__ __forceinline__ void
-dequant_fma(const T* __restrict__ x, const Q* __restrict__ w, S scale, T bias, float* out) {
+dequant_fma(const T* x, const Q* w, S scale, T bias, float* out) {
   // Read x/w into registers.
   auto x_vec = *(reinterpret_cast<const cutlass::Array<T, N>*>(x));
   auto w_vec = *(reinterpret_cast<const cutlass::Array<Q, N>*>(w));
@@ -184,7 +84,6 @@ dequant_fma(const T* __restrict__ x, const Q* __restrict__ w, S scale, T bias, f
 }
 
 template <
-    int rows_per_block,
     int elems_per_thread,
     int group_size,
     bool has_bias,
@@ -192,30 +91,17 @@ template <
     typename T,
     typename Q,
     typename S>
-__global__ void qmv_kernel(
-    const T* __restrict__ x,
-    const Q* __restrict__ w,
-    const S* __restrict__ scales,
-    const T* __restrict__ biases,
-    T* __restrict__ out,
+__device__ __forceinline__ void qmv_kernel_impl(
+    const T* x,
+    const Q* w,
+    const S* scales,
+    const T* biases,
+    T* out,
+    int row,
+    int w_batch,
     int n,
-    int k,
-    bool broadcast_w) {
-  auto grid = cg::this_grid();
-  auto block = cg::this_thread_block();
-  auto warp = cg::tiled_partition<WARP_SIZE>(block);
-
-  // The row that this warp handles.
-  // Use valid_row flag instead of early return so ALL threads participate
-  // in block.sync() barriers (prevents deadlock when N % rows_per_block != 0).
-  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
-  bool valid_row = (row < n);
-
-  // Advance pointers of x/out (same for all warps in block, safe regardless of row validity).
-  int m = grid.dim_blocks().y;
-  int l = block.group_index().z;
-  x += block.group_index().y * k + m * k * l;
-  out += block.group_index().y * n + m * n * l;
+    int k) {
+  auto warp = cg::tiled_partition<WARP_SIZE>(cg::this_thread_block());
 
   // For sub-byte Q, pointer moves by 8bits for each advance, e.g. w += 1 would
   // move past 2 elements for 4-bit Q.
@@ -225,80 +111,43 @@ __global__ void qmv_kernel(
   // How many groups (and scales/biases) in a row.
   int groups_per_row = k / group_size;
 
-  // Advance w/scales/biases to current row (only for valid rows to avoid OOB).
-  if (valid_row) {
-    int w_batch = broadcast_w ? 0 : l;
-    w += (static_cast<int64_t>(row) + n * w_batch) * w_step(k);
-    scales += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
-    if constexpr (has_bias) {
-      biases += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
-    }
+  // Advance w/scales/biases to current row.
+  w += (static_cast<int64_t>(row) + n * w_batch) * w_step(k);
+  scales += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
+  if constexpr (has_bias) {
+    biases += (static_cast<int64_t>(row) + n * w_batch) * groups_per_row;
   }
-
-  // Shared memory tile for x vector (shared across all warps in block).
-  constexpr int elems_per_warp = WARP_SIZE * elems_per_thread;
-  __shared__ T x_tile[elems_per_warp];
-  constexpr int block_size = WARP_SIZE * rows_per_block;
-  int tid = block.thread_rank();
 
   // Accumulations of current row.
   cuda::std::conditional_t<(bits >= 8), float, T> sums[elems_per_thread] = {};
 
-  // Loop over k dimension — ALL threads participate in load and sync.
+  auto dequant_fma_tile = [&](int idx) {
+    S scale = scales[idx / group_size];
+    T bias{0};
+    if constexpr (has_bias) {
+      bias = biases[idx / group_size];
+    }
+    dequant_fma<elems_per_thread, has_bias>(
+        x + idx, w + w_step(idx), scale, bias, sums);
+  };
+
+  // Loop over k dimension.
+  constexpr int elems_per_warp = WARP_SIZE * elems_per_thread;
   for (int r = 0; r < k / elems_per_warp; ++r) {
-    int base = r * elems_per_warp;
-
-    // Cooperatively load x tile into shared memory.
-    for (int j = tid; j < elems_per_warp; j += block_size) {
-      x_tile[j] = x[base + j];
-    }
-    block.sync();
-
-    // Compute using shared memory x (only for valid rows).
-    if (valid_row) {
-      int local_idx = warp.thread_rank() * elems_per_thread;
-      int global_idx = base + local_idx;
-      S scale = scales[global_idx / group_size];
-      T bias{0};
-      if constexpr (has_bias) {
-        bias = biases[global_idx / group_size];
-      }
-      dequant_fma<elems_per_thread, has_bias>(
-          x_tile + local_idx, w + w_step(global_idx), scale, bias, sums);
-    }
-
-    block.sync(); // Ensure all warps done before next tile load
+    int idx = warp.thread_rank() * elems_per_thread + r * elems_per_warp;
+    dequant_fma_tile(idx);
   }
 
-  // Handle remaining elements in k dimension — same pattern.
+  // Handle remaining elements in k dimension.
   if constexpr (has_residue_k) {
     int rest = k % elems_per_warp;
-    int base = k - rest;
-
-    // Cooperatively load residue x tile into shared memory.
-    for (int j = tid; j < rest; j += block_size) {
-      x_tile[j] = x[base + j];
+    int idx = warp.thread_rank() * elems_per_thread + k - rest;
+    if (idx < k) {
+      dequant_fma_tile(idx);
     }
-    block.sync();
-
-    if (valid_row) {
-      int local_idx = warp.thread_rank() * elems_per_thread;
-      int global_idx = base + local_idx;
-      if (global_idx < k) {
-        S scale = scales[global_idx / group_size];
-        T bias{0};
-        if constexpr (has_bias) {
-          bias = biases[global_idx / group_size];
-        }
-        dequant_fma<elems_per_thread, has_bias>(
-            x_tile + local_idx, w + w_step(global_idx), scale, bias, sums);
-      }
-    }
-
-    block.sync();
   }
 
-  // Reduce — warp-level operation, safe for all warps (invalid warps contribute 0).
+  // Result for current row.
   float sum{0};
 #pragma unroll
   for (int i = 0; i < elems_per_thread; ++i) {
@@ -306,10 +155,89 @@ __global__ void qmv_kernel(
   }
   sum = cg::reduce(warp, sum, cg::plus<float>{});
 
-  // Write result only for valid rows.
-  if (valid_row && warp.thread_rank() == 0) {
+  // Write result for current warp, which maps to rows 1-to-1.
+  if (warp.thread_rank() == 0) {
     out[row] = static_cast<T>(sum);
   }
+}
+
+template <
+    int rows_per_block,
+    int elems_per_thread,
+    int group_size,
+    bool has_bias,
+    bool has_residue_k,
+    typename T,
+    typename Q,
+    typename S>
+__global__ void qmv_kernel(
+    const T* x,
+    const Q* w,
+    const S* scales,
+    const T* biases,
+    T* out,
+    int n,
+    int k,
+    bool broadcast_w) {
+  auto grid = cg::this_grid();
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<WARP_SIZE>(block);
+
+  // The row that this warp handles.
+  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
+  if (row >= n) {
+    return;
+  }
+
+  // Advance pointers of x/out for M and batch dimensions.
+  int m = grid.dim_blocks().y;
+  int l = block.group_index().z;
+  x += block.group_index().y * k + m * k * l;
+  out += block.group_index().y * n + m * n * l;
+  int w_batch = broadcast_w ? 0 : l;
+
+  qmv_kernel_impl<elems_per_thread, group_size, has_bias, has_residue_k>(
+      x, w, scales, biases, out, row, w_batch, n, k);
+}
+
+template <
+    int rows_per_block,
+    int elems_per_thread,
+    int group_size,
+    bool has_bias,
+    bool has_residue_k,
+    typename T,
+    typename Q,
+    typename S>
+__global__ void gather_qmv_kernel(
+    const T* x,
+    const Q* w,
+    const S* scales,
+    const T* biases,
+    T* out,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices,
+    int n,
+    int k) {
+  auto grid = cg::this_grid();
+  auto block = cg::this_thread_block();
+  auto warp = cg::tiled_partition<WARP_SIZE>(block);
+
+  int row = block.group_index().x * rows_per_block + warp.meta_group_rank();
+  if (row >= n) {
+    return;
+  }
+
+  int m = grid.dim_blocks().y;
+  int l = block.group_index().z;
+  uint32_t x_idx = lhs_indices[l];
+  uint32_t w_idx = rhs_indices[l];
+
+  x += block.group_index().y * k + m * k * x_idx;
+  out += block.group_index().y * n + m * n * l;
+
+  qmv_kernel_impl<elems_per_thread, group_size, has_bias, has_residue_k>(
+      x, w, scales, biases, out, row, w_idx, n, k);
 }
 
 template <
@@ -342,6 +270,51 @@ void qmv(
 
   dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
     auto* kernel = &qmv_kernel<
+        rows_per_block,
+        elems_per_thread,
+        group_size,
+        has_bias,
+        has_residue_k.value,
+        T,
+        Q,
+        S>;
+    launch_kernel(
+        reinterpret_cast<void*>(kernel), num_blocks, block_dims, args);
+  });
+}
+
+template <
+    int group_size,
+    bool has_bias,
+    typename T,
+    typename Q,
+    typename S,
+    typename F>
+void gather_qmv(
+    const T* x,
+    const Q* w,
+    const S* scales,
+    const T* biases,
+    T* out,
+    const uint32_t* lhs_indices,
+    const uint32_t* rhs_indices,
+    int m,
+    int n,
+    int k,
+    int l,
+    F&& launch_kernel) {
+  constexpr int rows_per_block = 8;
+  constexpr int elems_per_thread =
+      (cute::sizeof_bits_v<T> <= 16 && cute::sizeof_bits_v<Q> <= 4) ? 16 : 8;
+
+  dim3 num_blocks{
+      uint32_t(cuda::ceil_div(n, rows_per_block)), uint32_t(m), uint32_t(l)};
+  dim3 block_dims{WARP_SIZE, rows_per_block};
+  void* args[] = {
+      &x, &w, &scales, &biases, &out, &lhs_indices, &rhs_indices, &n, &k};
+
+  dispatch_bool(k % (WARP_SIZE * elems_per_thread), [&](auto has_residue_k) {
+    auto* kernel = &gather_qmv_kernel<
         rows_per_block,
         elems_per_thread,
         group_size,
@@ -463,6 +436,61 @@ void qmv(
               k,
               l,
               broadcast_w,
+              [&](auto* kernel, dim3 num_blocks, dim3 block_dims, void** args) {
+                encoder.add_kernel_node_raw(
+                    kernel, num_blocks, block_dims, {}, 0, args);
+              });
+        });
+  });
+}
+
+void gather_qmv(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& lhs_indices,
+    const array& rhs_indices,
+    array& out,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder) {
+  const char* tag = "[gather_qmm]";
+  int m = out.shape(-2);
+  int n = out.shape(-1);
+  int k = x.shape(-1);
+  int l = out.size() / (m * n);
+
+  dispatch_element_types(out.dtype(), tag, [&]<typename T>() {
+    dispatch_quant_types<T>(
+        bits,
+        group_size,
+        mode,
+        tag,
+        [&]<typename Q, typename S, int group_size>() {
+          encoder.set_input_array(x);
+          encoder.set_input_array(w);
+          encoder.set_input_array(scales);
+          if (biases) {
+            encoder.set_input_array(*biases);
+          }
+          encoder.set_input_array(lhs_indices);
+          encoder.set_input_array(rhs_indices);
+          encoder.set_output_array(out);
+          constexpr bool has_bias = !cutlass::has_negative_zero_v<Q>;
+          cu::gather_qmv<group_size, has_bias>(
+              gpu_ptr<T>(x),
+              gpu_ptr<Q>(w),
+              gpu_ptr<S>(scales),
+              biases ? gpu_ptr<T>(*biases) : nullptr,
+              gpu_ptr<T>(out),
+              gpu_ptr<uint32_t>(lhs_indices),
+              gpu_ptr<uint32_t>(rhs_indices),
+              m,
+              n,
+              k,
+              l,
               [&](auto* kernel, dim3 num_blocks, dim3 block_dims, void** args) {
                 encoder.add_kernel_node_raw(
                     kernel, num_blocks, block_dims, {}, 0, args);

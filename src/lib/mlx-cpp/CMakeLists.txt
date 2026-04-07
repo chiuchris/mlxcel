@@ -84,7 +84,7 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG 6a9a121d09546fec051038535b444bc797fac045)
+    GIT_TAG b98831ad0e4b7c9c0f09d89ee76baea7d1bded5b)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.

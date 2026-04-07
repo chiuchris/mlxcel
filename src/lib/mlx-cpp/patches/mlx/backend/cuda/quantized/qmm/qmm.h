@@ -1,5 +1,5 @@
 // Copyright © 2026 Apple Inc.
-// Modified by mlxcel: Added gather_qmv declaration for GatherQMM CUDA support.
+// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
 
 #pragma once
 
@@ -32,6 +32,53 @@ void qmm_sm90(
     int group_size,
     cu::CommandEncoder& encoder,
     Stream s);
+
+bool supports_qmm_sm80(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::Device& device);
+
+void qmm_sm80(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder);
+
+bool supports_qmm_naive(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    const array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::Device& device);
+
+void qmm_naive(
+    const array& x,
+    const array& w,
+    const array& scales,
+    const std::optional<array>& biases,
+    array& out,
+    bool transpose,
+    int bits,
+    int group_size,
+    QuantizationMode mode,
+    cu::CommandEncoder& encoder);
 
 bool supports_fp_qmv(
     const array& x,

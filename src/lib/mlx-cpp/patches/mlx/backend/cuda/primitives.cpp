@@ -1,7 +1,5 @@
 // Copyright © 2025 Apple Inc.
-// Modified by mlxcel: Removed GatherQMM, FFT, MaskedScatter from NO_GPU list.
-// GatherQMM CUDA implementation is in quantized.cpp via gather_qmv kernel.
-// FFT and MaskedScatter now have upstream CUDA implementations in fft.cu and indexing.cpp.
+// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
 
 #include "mlx/distributed/primitives.h"
 #include <cuda_runtime.h>
@@ -27,7 +25,6 @@ namespace mlx::core {
     throw std::runtime_error(#func " has no CUDA implementation.");   \
   }
 
-NO_GPU(BlockMaskedMM)
 NO_GPU_MULTI(LUF)
 NO_GPU_MULTI(QRF)
 NO_GPU_MULTI(SVD)
