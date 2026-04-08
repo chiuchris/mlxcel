@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.18] - 2026-04-08
+
+### Added
+- GatherQMM CUDA implementation via upstream MLX upgrade to b98831ad (#226)
+- SM80 and naive QMM dispatch paths for non-Hopper CUDA GPUs (#226)
+- Gemma 4 CUDA support: all 7 variants (e2b, e4b, 26b, 31b in 4bit/8bit) (#227)
+- Qwen 3.5 CUDA support: 27b-4bit, 9b-bf16, 35b-MoE-4bit (#227)
+
+### Fixed
+- Mixed-type bf16/float JIT compilation failures in CUDA binary_ops.cuh (#227)
+- Remove stale NO_GPU(BlockMaskedMM) override that conflicted with upstream implementation (#226)
+- Gemma 3-4b and Gemma 3n (e2b, e4b) recovered on CUDA via binary_ops fix (#227)
+
+### Changed
+- Upgrade MLX C++ upstream from 6a9a121d to b98831ad (#226)
+- Replace custom gather_qmv.cu with upstream integrated qmv.cu (#226)
+- Sync CUDA quantized.cpp with upstream SM80/naive dispatch paths (#226)
+
+### Performance
+- GB10 CUDA: 14 models recovered from FAIL, 24 models improved >10%
+- mamba2-1.3b +180%, minicpm-2b +131%, llama-3.1-8b +130%, hunyuan-dense +125%, llama-3.2-1b +115%
+
 ## [v0.0.17] - 2026-04-06
 
 ### Fixed
@@ -342,6 +364,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.18]: https://github.com/lablup/mlxcel/compare/v0.0.17...v0.0.18
 [v0.0.17]: https://github.com/lablup/mlxcel/compare/v0.0.16...v0.0.17
 [v0.0.16]: https://github.com/lablup/mlxcel/compare/v0.0.15...v0.0.16
 [v0.0.15]: https://github.com/lablup/mlxcel/compare/v0.0.14...v0.0.15

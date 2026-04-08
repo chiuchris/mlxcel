@@ -1,3 +1,12 @@
+mlxcel (0.0.18-1~jammy1) jammy; urgency=medium
+
+  * Update: Upgrade MLX upstream to b98831ad with GatherQMM CUDA and SM80/naive QMM
+  * Fix: Add mixed-type bf16/float overloads to CUDA binary_ops for Gemma 4 and Qwen 3.5
+  * Fix: Remove stale NO_GPU(BlockMaskedMM) override conflicting with upstream
+  * Perf: GB10 CUDA 14 models recovered, 24 models 10-180% faster
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Tue, 08 Apr 2026 12:00:00 +0900
+
 mlxcel (0.0.17-1~jammy1) jammy; urgency=medium
 
   * Fix: Resolve broadcast crash in Gemma 4 chunked prefill with undersized attention mask
