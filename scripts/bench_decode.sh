@@ -35,6 +35,7 @@ VLM_PROMPT="What is in this image?"
 MAX_TOKENS=100
 WARMUP_TOKENS=20
 TIMEOUT=300
+JIT_PREHEAT_TIMEOUT=600
 VLM_IMAGE="tests/fixtures/test_image.png"
 VLM_MODE=0
 OUTPUT=""
@@ -125,6 +126,7 @@ Options:
   --max-tokens N      Max tokens to generate (default: 100)
   --warmup-tokens N   Tokens for warmup pass (default: 20)
   --timeout N         Timeout per run in seconds (default: 300)
+  --jit-preheat-timeout N  Timeout for CUDA JIT warmup in seconds (default: 600)
   --output PATH       Write CSV to specific file (overrides auto-naming)
   --suffix TAG        Append suffix to auto-generated filename (e.g. --suffix baseline)
   --help              Show this help
@@ -187,9 +189,16 @@ bench_one() {
     extra_args+=(--image "$VLM_IMAGE")
   fi
 
-  # --- Warmup pass (preheat Metal shaders & memory maps) ---
+  # --- Warmup pass (preheat Metal shaders / CUDA JIT kernels & memory maps) ---
+  # On CUDA, the first run of a model triggers JIT kernel compilation which can
+  # take several minutes. Use JIT_PREHEAT_TIMEOUT (default 600s) for the warmup
+  # pass so these models are not incorrectly marked as FAIL:warmup.
+  local warmup_timeout="$TIMEOUT"
+  if [[ "$BACKEND" == "cuda" ]]; then
+    warmup_timeout="$JIT_PREHEAT_TIMEOUT"
+  fi
   >&2 printf '>>> [warmup] %s ...\n' "$model_name"
-  if ! timeout "$TIMEOUT" "$MLXCEL" generate \
+  if ! timeout "$warmup_timeout" "$MLXCEL" generate \
       -m "$model_path" -p "$prompt" -n "$WARMUP_TOKENS" \
       ${extra_args[@]+"${extra_args[@]}"} --profile >/dev/null 2>&1; then
     >&2 echo "    warmup failed"
@@ -235,6 +244,7 @@ while [[ $# -gt 0 ]]; do
     --max-tokens)     MAX_TOKENS="$2"; shift 2 ;;
     --warmup-tokens)  WARMUP_TOKENS="$2"; shift 2 ;;
     --timeout)        TIMEOUT="$2"; shift 2 ;;
+    --jit-preheat-timeout) JIT_PREHEAT_TIMEOUT="$2"; shift 2 ;;
     --output)         OUTPUT="$2"; shift 2 ;;
     --suffix)         SUFFIX="$2"; shift 2 ;;
     --help)           usage; exit 0 ;;
@@ -293,6 +303,33 @@ is_gpu_crash_model() {
 # ---------------------------------------------------------------------------
 # Run
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# CUDA JIT preheat: on first run after build, CUDA JIT-compiles many kernels
+# (binary ops, reduce, etc.) which can take 3-8 minutes per model. Run one
+# small model first so shared kernels are cached before the benchmark loop.
+# ---------------------------------------------------------------------------
+if [[ "$BACKEND" == "cuda" && "$MODEL_ARG" == "all" ]]; then
+  # Find a small model to preheat with
+  preheat_model=""
+  for candidate in smollm-135m-4bit ernie-4.5-0.3b-4bit qwen2.5-0.5b-bf16; do
+    if [[ -d "$MODELS_DIR/$candidate" ]]; then
+      preheat_model="$MODELS_DIR/$candidate"
+      break
+    fi
+  done
+  if [[ -n "$preheat_model" ]]; then
+    >&2 echo "=== CUDA JIT preheat: $(basename "$preheat_model") ==="
+    >&2 echo "    First run compiles CUDA JIT kernels (may take several minutes)..."
+    if timeout "$JIT_PREHEAT_TIMEOUT" "$MLXCEL" generate \
+        -m "$preheat_model" -p "Hello" -n 5 --profile >/dev/null 2>&1; then
+      >&2 echo "    JIT preheat complete."
+    else
+      >&2 echo "    JIT preheat failed (non-fatal, continuing)."
+    fi
+    >&2 echo ""
+  fi
+fi
+
 if [[ "$MODEL_ARG" == "all" ]]; then
   # First pass: run all models except known GPU-crash models
   for dir in "$MODELS_DIR"/*/; do
