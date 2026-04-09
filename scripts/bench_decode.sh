@@ -115,6 +115,45 @@ HARDWARE_SHORT=$(detect_hardware_short)
 BACKEND=$(detect_backend)
 
 # ---------------------------------------------------------------------------
+# Memory-based model size check
+# ---------------------------------------------------------------------------
+# Detect available system memory in bytes.
+detect_memory_bytes() {
+  if [[ "$(uname)" == "Darwin" ]]; then
+    sysctl -n hw.memsize 2>/dev/null || echo 0
+  else
+    free -b 2>/dev/null | awk '/^Mem:/{print $2}' || echo 0
+  fi
+}
+
+SYSTEM_MEMORY_BYTES=$(detect_memory_bytes)
+# Reserve 15% for OS/runtime overhead; use 85% as the usable limit.
+MEMORY_LIMIT_BYTES=$(( SYSTEM_MEMORY_BYTES * 85 / 100 ))
+
+# Estimate model weight size from safetensors files (bytes).
+# Returns 0 if no safetensors files found.
+estimate_model_size() {
+  local model_path="$1"
+  local total=0
+  local size
+  for f in "$model_path"/*.safetensors; do
+    [[ -f "$f" ]] || continue
+    size=$(stat --format='%s' "$f" 2>/dev/null || stat -f'%z' "$f" 2>/dev/null || echo 0)
+    total=$((total + size))
+  done
+  echo "$total"
+}
+
+# Check if a model likely fits in memory.  Returns 0 (fits) or 1 (too large).
+model_fits_in_memory() {
+  local model_path="$1"
+  local model_bytes
+  model_bytes=$(estimate_model_size "$model_path")
+  [[ "$model_bytes" -eq 0 ]] && return 0  # can't determine size, try anyway
+  [[ "$model_bytes" -le "$MEMORY_LIMIT_BYTES" ]]
+}
+
+# ---------------------------------------------------------------------------
 usage() {
   cat <<'EOF'
 Usage: bench_decode.sh <model_path|all> [options]
@@ -177,6 +216,15 @@ bench_one() {
   local model_path="$1"
   local model_name
   model_name=$(basename "$model_path")
+
+  # Skip models that won't fit in memory
+  if ! model_fits_in_memory "$model_path"; then
+    local model_mb=$(( $(estimate_model_size "$model_path") / 1048576 ))
+    local limit_mb=$(( MEMORY_LIMIT_BYTES / 1048576 ))
+    >&2 printf '>>> [skip]   %s (%d MB > %d MB limit)\n' "$model_name" "$model_mb" "$limit_mb"
+    echo "${model_name},${model_path},,,,,,,$DATE,$HARDWARE_FULL,$MLX_VERSION,$BUILD_TYPE,$MAX_TOKENS,\"$TEXT_PROMPT\",SKIP:oom_estimate"
+    return
+  fi
 
   local prompt="$TEXT_PROMPT"
   local extra_args=()
