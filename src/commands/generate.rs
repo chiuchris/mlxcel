@@ -24,7 +24,9 @@ use std::time::{Duration, Instant};
 
 use mlxcel::{
     CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
-    SpeculativeGenerator, initialize_runtime, load_model, load_model_with_adapter,
+    SpeculativeGenerator,
+    distributed::{ensure_single_rank_runtime, resolve_model_shard_plan, shard_config_from_cli},
+    initialize_runtime, load_model, load_model_with_adapter,
     quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
@@ -94,6 +96,20 @@ fn load_generation_model(
     let load_elapsed = load_start.elapsed();
     println!("Model loaded in {:.3}s.", load_elapsed.as_secs_f64());
     Ok(result)
+}
+
+fn validate_tensor_parallel_args(args: &GenerateArgs) -> Result<()> {
+    let shard_config = shard_config_from_cli(
+        args.tensor_parallel.tp_size,
+        &args.tensor_parallel.tp_moe_mode,
+        &args.tensor_parallel.tp_embedding_mode,
+        &args.tensor_parallel.tp_lm_head_mode,
+    )?;
+    let summary = resolve_model_shard_plan(&args.model.model, shard_config)?;
+    if summary.shard_config.tp_size > 1 {
+        println!("Tensor parallel request: {}", summary.summary_line());
+    }
+    ensure_single_rank_runtime(&summary, "mlxcel generate")
 }
 
 fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str) -> String {
@@ -401,6 +417,7 @@ fn run_generation_mode<M: LanguageModel>(
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
     print_runtime_setup(&runtime);
+    validate_tensor_parallel_args(&args)?;
 
     // Quantization recommendation and BF16 warning (before loading the model).
     let hw = mlxcel_core::hardware::get_hardware();

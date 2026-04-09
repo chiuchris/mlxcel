@@ -14,8 +14,11 @@
 
 use super::{
     apply_user_chat_template, generated_suffix, generation_stats_from_duration, resolve_cli_prompt,
+    validate_tensor_parallel_args,
 };
 use mlxcel::server::chat_template::ChatTemplateProcessor;
+use std::fs;
+use std::path::PathBuf;
 use std::time::Duration;
 
 #[test]
@@ -51,7 +54,7 @@ fn apply_user_chat_template_wraps_prompt_as_user_message() {
 fn resolve_cli_prompt_skips_template_when_disabled() {
     let processor = ChatTemplateProcessor::with_template("wrapped".to_string());
 
-    let prompt = resolve_cli_prompt("Hello", true, Some(&processor));
+    let prompt = resolve_cli_prompt("Hello", true, Some(&processor), 0);
 
     assert_eq!(prompt, "Hello");
 }
@@ -60,7 +63,7 @@ fn resolve_cli_prompt_skips_template_when_disabled() {
 fn resolve_cli_prompt_falls_back_on_template_errors() {
     let processor = ChatTemplateProcessor::with_template("{% if %}".to_string());
 
-    let prompt = resolve_cli_prompt("Hello", false, Some(&processor));
+    let prompt = resolve_cli_prompt("Hello", false, Some(&processor), 0);
 
     assert_eq!(prompt, "Hello");
 }
@@ -73,4 +76,94 @@ fn generated_suffix_strips_prompt_prefix() {
 #[test]
 fn generated_suffix_falls_back_when_prefix_is_missing() {
     assert_eq!(generated_suffix("world", "Hello"), "world");
+}
+
+fn temp_model_dir(name: &str) -> PathBuf {
+    let path = std::env::temp_dir().join(format!(
+        "mlxcel-generate-test-{name}-{}",
+        uuid::Uuid::new_v4()
+    ));
+    fs::create_dir_all(&path).unwrap();
+    path
+}
+
+fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
+    crate::GenerateArgs {
+        model: crate::ModelOptions {
+            model: model_path,
+            adapter: None,
+            draft_model: None,
+            num_draft_tokens: 3,
+        },
+        generation: crate::GenerationOptions {
+            prompt: "Hello".to_string(),
+            image: Vec::new(),
+            audio: None,
+            max_tokens: 16,
+            profile: false,
+            no_chat_template: false,
+            recommend_quant: false,
+            kv_cache_mode: "fp16".to_string(),
+        },
+        sampling: crate::SamplingOptions {
+            temp: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            min_p: 0.0,
+            repetition_penalty: 1.0,
+            dry_multiplier: 0.0,
+            dry_base: 1.75,
+            dry_allowed_length: 2,
+            dry_penalty_last_n: 0,
+        },
+        tensor_parallel: crate::TensorParallelOptions {
+            tp_size: 1,
+            tp_moe_mode: "expert_parallel".to_string(),
+            tp_embedding_mode: "replicated".to_string(),
+            tp_lm_head_mode: "replicated".to_string(),
+        },
+    }
+}
+
+#[test]
+fn validate_tensor_parallel_args_accepts_single_rank() {
+    let dir = temp_model_dir("tp1");
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let args = sample_generate_args(dir.clone());
+    validate_tensor_parallel_args(&args).unwrap();
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_tensor_parallel_args_rejects_multi_rank_runtime() {
+    let dir = temp_model_dir("tp2");
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let mut args = sample_generate_args(dir.clone());
+    args.tensor_parallel.tp_size = 2;
+
+    let error = validate_tensor_parallel_args(&args).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("multi-rank inference is not wired")
+    );
+
+    fs::remove_dir_all(dir).unwrap();
 }

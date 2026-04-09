@@ -143,10 +143,12 @@ pub use tensor_parallel::{
     CommPattern, CrossoverAnalysis, CrossoverEntry, EmbeddingMode, LayerShardPlan,
     LockstepBenchmarkResult, ModelShardPlan, MoeShardMode, RingTopology, ScalingAnalysis,
     ShardConfig, ShardSpec, ShardStrategy, ShardedMemoryReport, TPBenchmarkConfig,
-    TPBenchmarkResult, all_gather, all_reduce_sum, compute_byte_ranges, compute_shard_spec,
-    compute_sharded_shape, dtype_byte_size, format_tp_benchmark_report, generate_shard_plan,
-    reduce_scatter, ring_allreduce_data_volume, run_crossover_analysis, run_lockstep_benchmark,
-    run_scaling_analysis, run_tp_benchmark, shard_tensor_data, validate_sharded_memory,
+    TPBenchmarkResult, TensorParallelPlanSummary, all_gather, all_reduce_sum, compute_byte_ranges,
+    compute_shard_spec, compute_sharded_shape, dtype_byte_size, ensure_single_rank_runtime,
+    format_tp_benchmark_report, generate_shard_plan, reduce_scatter, resolve_model_shard_plan,
+    ring_allreduce_data_volume, run_crossover_analysis, run_lockstep_benchmark,
+    run_scaling_analysis, run_tp_benchmark, shard_config_from_cli, shard_tensor_data,
+    validate_sharded_memory,
 };
 pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,

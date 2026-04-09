@@ -26,6 +26,9 @@ use anyhow::{Context, Result};
 use tower::Service;
 
 use crate::SamplingConfig;
+use crate::distributed::{
+    ensure_single_rank_runtime, resolve_model_shard_plan, shard_config_from_cli,
+};
 
 use super::batch::BatchObservability;
 use super::{
@@ -333,6 +336,20 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
     Ok(())
 }
 
+fn validate_tensor_parallel_startup(startup: &ServerStartupConfig) -> Result<()> {
+    let shard_config = shard_config_from_cli(
+        startup.tp_size,
+        &startup.tp_moe_mode,
+        &startup.tp_embedding_mode,
+        &startup.tp_lm_head_mode,
+    )?;
+    let summary = resolve_model_shard_plan(&startup.model_path, shard_config)?;
+    if summary.shard_config.tp_size > 1 {
+        tracing::info!("Tensor parallel request: {}", summary.summary_line());
+    }
+    ensure_single_rank_runtime(&summary, "mlxcel-server")
+}
+
 fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
     tracing::info!("Starting mlxcel server on {}", addr);
     tracing::info!("Endpoints:");
@@ -447,6 +464,7 @@ async fn resolve_distributed_config(
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+    validate_tensor_parallel_startup(&startup)?;
 
     if startup.ubatch_size_provided {
         tracing::info!("--ubatch-size is not applicable on Apple Silicon unified memory; ignored");

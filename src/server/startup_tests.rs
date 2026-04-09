@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use super::{
     ServerStartupConfig, build_server_config, resolve_api_key, resolve_chat_template,
-    resolve_default_max_tokens, resolve_dry_penalty_last_n,
+    resolve_default_max_tokens, resolve_dry_penalty_last_n, validate_tensor_parallel_startup,
 };
 use crate::server::chat_template::ChatMessage;
 
@@ -164,4 +164,52 @@ fn build_server_config_propagates_no_batch_flag() {
     };
     let config = build_server_config(&startup, None);
     assert!(config.no_batch);
+}
+
+#[test]
+fn validate_tensor_parallel_startup_accepts_single_rank() {
+    let dir = temp_path("tp-single");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        ..ServerStartupConfig::default()
+    };
+    validate_tensor_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_tensor_parallel_startup_rejects_multi_rank_runtime() {
+    let dir = temp_path("tp-multi");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let error = validate_tensor_parallel_startup(&startup).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("multi-rank inference is not wired")
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
 }

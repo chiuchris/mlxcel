@@ -69,6 +69,9 @@ pub(crate) struct GenerateArgs {
 
     #[command(flatten)]
     pub(crate) sampling: SamplingOptions,
+
+    #[command(flatten)]
+    pub(crate) tensor_parallel: TensorParallelOptions,
 }
 
 /// Model loading options
@@ -185,6 +188,39 @@ pub(crate) struct SamplingOptions {
     /// DRY lookback window size (0 = use full history)
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub(crate) dry_penalty_last_n: usize,
+}
+
+/// Tensor-parallel options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Tensor Parallel Options")]
+pub(crate) struct TensorParallelOptions {
+    /// Number of tensor-parallel ranks (must be a power of 2)
+    #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
+    pub(crate) tp_size: usize,
+
+    /// MoE expert sharding mode: "expert_parallel" or "within_expert"
+    #[arg(
+        long = "tp-moe-mode",
+        default_value = "expert_parallel",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_moe_mode: String,
+
+    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    #[arg(
+        long = "tp-embedding-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_embedding_mode: String,
+
+    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    #[arg(
+        long = "tp-lm-head-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_lm_head_mode: String,
 }
 
 /// Server options
@@ -569,3 +605,7 @@ fn print_supported_models() {
 
     println!("For the full list, see: docs/model_implementations.md");
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;
