@@ -29,6 +29,7 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
+use crate::distributed::{ShardConfig, TensorParallelLlamaModel, validate_supported_runtime};
 use crate::lora;
 use crate::model_metadata::{
     DirectoryLoadRoute, ModelLoadPolicy, WeightLoadRoute, is_ministral3_config, is_mistral4_config,
@@ -306,6 +307,35 @@ pub fn load_model(model_path: &Path) -> Result<(LoadedModel, MlxcelTokenizer)> {
         ) => {
             unreachable!("Mistral3 routes require config context")
         }
+    };
+
+    let tokenizer = tokenizer::load_tokenizer(model_path)?;
+    Ok((model, tokenizer))
+}
+
+pub fn load_model_with_tensor_parallel(
+    model_path: &Path,
+    adapter_path: Option<&Path>,
+    shard_config: &ShardConfig,
+) -> Result<(LoadedModel, MlxcelTokenizer)> {
+    if shard_config.tp_size == 1 {
+        return match adapter_path {
+            Some(adapter) => load_model_with_adapter(model_path, adapter),
+            None => load_model(model_path),
+        };
+    }
+
+    let model_path = resolve_model_dir(model_path);
+    let model_path = model_path.as_path();
+    let support = validate_supported_runtime(model_path, shard_config.clone(), adapter_path)?;
+    let model = match support.summary.model_type {
+        ModelType::Llama => LoadedModel::TensorParallelLlama(
+            TensorParallelLlamaModel::from_model_dir(model_path, shard_config.clone())?,
+        ),
+        other => anyhow::bail!(
+            "tensor-parallel runtime does not support model type: {:?}",
+            other
+        ),
     };
 
     let tokenizer = tokenizer::load_tokenizer(model_path)?;

@@ -91,6 +91,7 @@ pub mod cache_manager;
 pub mod collective;
 pub mod config;
 pub mod inference;
+pub mod llama_runtime;
 pub mod parallel_attention;
 pub mod parallel_ffn;
 pub mod parallel_moe;
@@ -120,6 +121,9 @@ pub use config::{EmbeddingMode, MoeShardMode, ShardConfig};
 pub use inference::{
     TensorParallelPlanSummary, ensure_single_rank_runtime, resolve_model_shard_plan,
     shard_config_from_cli,
+};
+pub use llama_runtime::{
+    TensorParallelLlamaModel, TensorParallelRuntimeSupport, validate_supported_runtime,
 };
 pub use parallel_attention::{
     AttentionType, KVAssignment, TPAttentionConfig, TPAttentionMetadata, compute_all_rank_metadata,

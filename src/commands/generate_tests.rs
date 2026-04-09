@@ -144,7 +144,7 @@ fn validate_tensor_parallel_args_accepts_single_rank() {
 }
 
 #[test]
-fn validate_tensor_parallel_args_rejects_multi_rank_runtime() {
+fn validate_tensor_parallel_args_accepts_supported_multi_rank_runtime() {
     let dir = temp_model_dir("tp2");
     fs::write(
         dir.join("config.json"),
@@ -158,12 +158,7 @@ fn validate_tensor_parallel_args_rejects_multi_rank_runtime() {
     let mut args = sample_generate_args(dir.clone());
     args.tensor_parallel.tp_size = 2;
 
-    let error = validate_tensor_parallel_args(&args).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("multi-rank inference is not wired")
-    );
+    validate_tensor_parallel_args(&args).unwrap();
 
     fs::remove_dir_all(dir).unwrap();
 }

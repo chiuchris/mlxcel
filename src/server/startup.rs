@@ -27,7 +27,7 @@ use tower::Service;
 
 use crate::SamplingConfig;
 use crate::distributed::{
-    ensure_single_rank_runtime, resolve_model_shard_plan, shard_config_from_cli,
+    resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
 };
 
 use super::batch::BatchObservability;
@@ -261,6 +261,14 @@ pub(super) fn build_server_config(
     startup: &ServerStartupConfig,
     api_key: Option<String>,
 ) -> ServerConfig {
+    let tensor_parallel = shard_config_from_cli(
+        startup.tp_size,
+        &startup.tp_moe_mode,
+        &startup.tp_embedding_mode,
+        &startup.tp_lm_head_mode,
+    )
+    .expect("tensor parallel config was already validated during startup");
+
     ServerConfig {
         api_key,
         timeout_seconds: startup.timeout,
@@ -291,8 +299,9 @@ pub(super) fn build_server_config(
         prefill_chunk_size: startup.prefill_chunk_size,
         enable_preemption: startup.enable_preemption,
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
-        no_batch: startup.no_batch,
+        no_batch: startup.no_batch || tensor_parallel.tp_size > 1,
         max_batch_prefill: startup.max_batch_prefill.max(1),
+        tensor_parallel,
     }
 }
 
@@ -347,7 +356,12 @@ fn validate_tensor_parallel_startup(startup: &ServerStartupConfig) -> Result<()>
     if summary.shard_config.tp_size > 1 {
         tracing::info!("Tensor parallel request: {}", summary.summary_line());
     }
-    ensure_single_rank_runtime(&summary, "mlxcel-server")
+    validate_supported_runtime(
+        &startup.model_path,
+        summary.shard_config.clone(),
+        startup.adapter_path.as_deref(),
+    )
+    .map(|_| ())
 }
 
 fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
@@ -517,6 +531,9 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
     let config = build_server_config(&startup, api_key);
+    if config.tensor_parallel.tp_size > 1 {
+        tracing::info!("Tensor parallel runtime enabled; forcing legacy sequential worker");
+    }
     let chat_template = resolve_chat_template(
         startup.chat_template.as_deref(),
         startup.chat_template_file.as_deref(),

@@ -25,8 +25,8 @@ use std::time::{Duration, Instant};
 use mlxcel::{
     CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
     SpeculativeGenerator,
-    distributed::{ensure_single_rank_runtime, resolve_model_shard_plan, shard_config_from_cli},
-    initialize_runtime, load_model, load_model_with_adapter,
+    distributed::{resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime},
+    initialize_runtime, load_model, load_model_with_adapter, load_model_with_tensor_parallel,
     quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
@@ -87,7 +87,19 @@ fn load_generation_model(
 ) -> Result<(mlxcel::LoadedModel, mlxcel::tokenizer::MlxcelTokenizer)> {
     println!("Loading model from {:?}...", args.model.model);
     let load_start = Instant::now();
-    let result = if let Some(ref adapter_path) = args.model.adapter {
+    let shard_config = shard_config_from_cli(
+        args.tensor_parallel.tp_size,
+        &args.tensor_parallel.tp_moe_mode,
+        &args.tensor_parallel.tp_embedding_mode,
+        &args.tensor_parallel.tp_lm_head_mode,
+    )?;
+    let result = if shard_config.tp_size > 1 {
+        load_model_with_tensor_parallel(
+            &args.model.model,
+            args.model.adapter.as_deref(),
+            &shard_config,
+        )
+    } else if let Some(ref adapter_path) = args.model.adapter {
         println!("Loading LoRA adapter from {:?}...", adapter_path);
         load_model_with_adapter(&args.model.model, adapter_path)
     } else {
@@ -109,7 +121,12 @@ fn validate_tensor_parallel_args(args: &GenerateArgs) -> Result<()> {
     if summary.shard_config.tp_size > 1 {
         println!("Tensor parallel request: {}", summary.summary_line());
     }
-    ensure_single_rank_runtime(&summary, "mlxcel generate")
+    validate_supported_runtime(
+        &args.model.model,
+        summary.shard_config.clone(),
+        args.model.adapter.as_deref(),
+    )
+    .map(|_| ())
 }
 
 fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str) -> String {

@@ -167,6 +167,17 @@ fn build_server_config_propagates_no_batch_flag() {
 }
 
 #[test]
+fn build_server_config_forces_no_batch_for_tensor_parallel() {
+    let startup = ServerStartupConfig {
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert!(config.no_batch);
+    assert_eq!(config.tensor_parallel.tp_size, 2);
+}
+
+#[test]
 fn validate_tensor_parallel_startup_accepts_single_rank() {
     let dir = temp_path("tp-single");
     std::fs::write(
@@ -188,7 +199,7 @@ fn validate_tensor_parallel_startup_accepts_single_rank() {
 }
 
 #[test]
-fn validate_tensor_parallel_startup_rejects_multi_rank_runtime() {
+fn validate_tensor_parallel_startup_accepts_supported_multi_rank_runtime() {
     let dir = temp_path("tp-multi");
     std::fs::write(
         dir.join("config.json"),
@@ -204,12 +215,7 @@ fn validate_tensor_parallel_startup_rejects_multi_rank_runtime() {
         tp_size: 2,
         ..ServerStartupConfig::default()
     };
-    let error = validate_tensor_parallel_startup(&startup).unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("multi-rank inference is not wired")
-    );
+    validate_tensor_parallel_startup(&startup).unwrap();
 
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -46,6 +46,8 @@ pub(crate) struct WorkerSchedulerConfig {
     pub preemption_policy: crate::server::config::PreemptionPolicy,
     /// Maximum number of requests to batch together for prefill (default: 1).
     pub max_batch_prefill: usize,
+    /// Tensor-parallel runtime configuration.
+    pub tensor_parallel: crate::distributed::ShardConfig,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -62,7 +64,13 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         tracing::info!("Model worker thread starting, loading model...");
 
         let load_start = Instant::now();
-        let result = if let Some(adapter) = adapter_path {
+        let result = if sched_config.tensor_parallel.tp_size > 1 {
+            crate::load_model_with_tensor_parallel(
+                &model_path,
+                adapter_path.as_deref(),
+                &sched_config.tensor_parallel,
+            )
+        } else if let Some(adapter) = adapter_path {
             tracing::info!("Loading LoRA adapter from {:?}", adapter);
             crate::load_model_with_adapter(&model_path, &adapter)
         } else {
@@ -141,6 +149,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
 pub(crate) fn spawn_legacy_model_worker(
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
+    tensor_parallel: crate::distributed::ShardConfig,
     request_rx: mpsc::Receiver<ModelRequest>,
     loaded: Arc<AtomicBool>,
     worker_model_id: String,
@@ -153,7 +162,13 @@ pub(crate) fn spawn_legacy_model_worker(
         );
 
         let load_start = Instant::now();
-        let result = if let Some(adapter) = adapter_path {
+        let result = if tensor_parallel.tp_size > 1 {
+            crate::load_model_with_tensor_parallel(
+                &model_path,
+                adapter_path.as_deref(),
+                &tensor_parallel,
+            )
+        } else if let Some(adapter) = adapter_path {
             tracing::info!("Loading LoRA adapter from {:?}", adapter);
             crate::load_model_with_adapter(&model_path, &adapter)
         } else {
