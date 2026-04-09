@@ -1,5 +1,7 @@
 // Copyright © 2025 Apple Inc.
-// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
+// Patched by mlxcel: ensure input contiguity in QuantizedMatmul for
+// non-contiguous 3D batched weights (e.g. GLM-4 MLA embed_q with
+// transpose=false).
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
@@ -18,12 +20,16 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
-  const array& x = inputs[0];
-  const array& w = inputs[1];
-  const array& scales = inputs[2];
+  // Ensure row-contiguous inputs so that all dispatch paths can accept them.
+  // Without this, 3D batched weights (e.g. MLA embed_q [heads, latent, packed])
+  // may be non-contiguous after reshape/transpose and get rejected by every
+  // supports_* check, causing a "No implementation" error.
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
+  array w = ensure_row_contiguous(inputs[1], encoder, s);
+  array scales = ensure_row_contiguous(inputs[2], encoder, s);
   std::optional<array> biases;
   if (inputs.size() > 3) {
-    biases = inputs[3];
+    biases = ensure_row_contiguous(inputs[3], encoder, s);
   }
 
   auto supports = [&](auto&& f) {
