@@ -29,7 +29,9 @@ use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
-use crate::distributed::{ShardConfig, TensorParallelLlamaModel, validate_supported_runtime};
+use crate::distributed::{
+    ShardConfig, TensorParallelLlamaModel, TensorParallelQwen3Model, validate_supported_runtime,
+};
 use crate::lora;
 use crate::model_metadata::{
     DirectoryLoadRoute, ModelLoadPolicy, WeightLoadRoute, is_ministral3_config, is_mistral4_config,
@@ -331,6 +333,9 @@ pub fn load_model_with_tensor_parallel(
     let model = match support.summary.model_type {
         ModelType::Llama => LoadedModel::TensorParallelLlama(
             TensorParallelLlamaModel::from_model_dir(model_path, shard_config.clone())?,
+        ),
+        ModelType::Qwen3 => LoadedModel::TensorParallelQwen3(
+            TensorParallelQwen3Model::from_model_dir(model_path, shard_config.clone())?,
         ),
         other => anyhow::bail!(
             "tensor-parallel runtime does not support model type: {:?}",

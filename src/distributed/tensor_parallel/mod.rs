@@ -123,7 +123,8 @@ pub use inference::{
     shard_config_from_cli,
 };
 pub use llama_runtime::{
-    TensorParallelLlamaModel, TensorParallelRuntimeSupport, validate_supported_runtime,
+    TensorParallelLlamaModel, TensorParallelQwen3Model, TensorParallelRuntimeKind,
+    TensorParallelRuntimeSupport, validate_supported_runtime,
 };
 pub use parallel_attention::{
     AttentionType, KVAssignment, TPAttentionConfig, TPAttentionMetadata, compute_all_rank_metadata,

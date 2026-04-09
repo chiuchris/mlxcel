@@ -43,6 +43,7 @@ use mlxcel_core::generate::LanguageModel;
 pub enum LoadedModel {
     Llama(models::Llama3Model),
     TensorParallelLlama(crate::distributed::TensorParallelLlamaModel),
+    TensorParallelQwen3(crate::distributed::TensorParallelQwen3Model),
     Llama4(models::Llama4Wrapper),
     Qwen2(models::Qwen2Model),
     Qwen3(models::Qwen3Model),
@@ -139,6 +140,7 @@ macro_rules! delegate_language_model {
         match $self {
             LoadedModel::Llama(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::TensorParallelLlama(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelQwen3(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Llama4(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen3(inner) => LanguageModel::$method(inner, $($arg),*),

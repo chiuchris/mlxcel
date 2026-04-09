@@ -18,12 +18,16 @@ use std::fs;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::weights::WeightMap;
 
-use super::{TensorParallelLlamaModel, logical_weight_name, validate_supported_runtime};
+use super::{
+    TensorParallelLlamaModel, TensorParallelQwen3Model, local_llama_args, logical_weight_name,
+    validate_supported_runtime,
+};
 use crate::distributed::tensor_parallel::{ShardConfig, generate_shard_plan};
-use crate::models::llama3::{Llama3Model, ModelArgs};
+use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
+use crate::models::qwen3::{ModelArgs as Qwen3ModelArgs, Qwen3Model};
 
-fn make_test_model_args() -> ModelArgs {
-    ModelArgs {
+fn make_test_model_args() -> LlamaModelArgs {
+    LlamaModelArgs {
         model_type: "llama".to_string(),
         hidden_size: 4,
         num_hidden_layers: 1,
@@ -39,6 +43,25 @@ fn make_test_model_args() -> ModelArgs {
         rope_scaling: None,
         quantization: None,
         tie_word_embeddings: false,
+    }
+}
+
+fn make_test_qwen3_args() -> Qwen3ModelArgs {
+    Qwen3ModelArgs {
+        model_type: "qwen3".to_string(),
+        hidden_size: 4,
+        num_hidden_layers: 1,
+        intermediate_size: 8,
+        num_attention_heads: 2,
+        rms_norm_eps: 1e-5,
+        vocab_size: 8,
+        num_key_value_heads: 2,
+        head_dim: 2,
+        max_position_embeddings: None,
+        rope_theta: 10_000.0,
+        rope_scaling: None,
+        tie_word_embeddings: false,
+        quantization: None,
     }
 }
 
@@ -157,6 +180,23 @@ fn make_test_weight_map() -> WeightMap {
     weights
 }
 
+fn make_test_qwen3_weight_map() -> WeightMap {
+    let mut weights = make_test_weight_map();
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.q_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.k_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    weights
+}
+
 #[test]
 fn logical_weight_name_maps_auxiliary_quantization_keys_to_weight_name() {
     assert_eq!(
@@ -189,6 +229,25 @@ fn validate_supported_runtime_accepts_llama_replicated_path() {
 }
 
 #[test]
+fn validate_supported_runtime_accepts_qwen3_replicated_path() {
+    let dir = std::env::temp_dir().join(format!("mlxcel-tp-qwen3-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "qwen3",
+            "num_hidden_layers": 1
+        }"#,
+    )
+    .unwrap();
+
+    let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
+    assert!(support.force_no_batch);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn tensor_parallel_llama_matches_full_model_logits() {
     let args = make_test_model_args();
     let weights = make_test_weight_map();
@@ -200,6 +259,55 @@ fn tensor_parallel_llama_matches_full_model_logits() {
     )
     .unwrap();
     let tp = TensorParallelLlamaModel::from_full_weights(&args, &weights, &plan).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+fn local_llama_args_preserves_computed_head_dim_when_config_omits_it() {
+    let args = LlamaModelArgs {
+        model_type: "llama".to_string(),
+        hidden_size: 896,
+        num_hidden_layers: 1,
+        intermediate_size: 4864,
+        num_attention_heads: 14,
+        rms_norm_eps: 1e-5,
+        vocab_size: 1024,
+        head_dim: None,
+        num_key_value_heads: Some(2),
+        attention_bias: false,
+        mlp_bias: false,
+        rope_theta: 1_000_000.0,
+        rope_scaling: None,
+        quantization: None,
+        tie_word_embeddings: true,
+    };
+    let plan = generate_shard_plan("llama", 1, &ShardConfig::with_tp_size(2)).unwrap();
+
+    let local = local_llama_args(&args, &plan).unwrap();
+
+    assert_eq!(local.head_dim, Some(64));
+    assert_eq!(local.num_attention_heads, 7);
+}
+
+#[test]
+fn tensor_parallel_qwen3_matches_full_model_logits() {
+    let args = make_test_qwen3_args();
+    let weights = make_test_qwen3_weight_map();
+    let full = Qwen3Model::from_weights(&weights, &args).unwrap();
+    let plan = generate_shard_plan(
+        "qwen3",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelQwen3Model::from_full_weights(&args, &weights, &plan).unwrap();
 
     let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
     let mut full_caches = full.make_caches();
