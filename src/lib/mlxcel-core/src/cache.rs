@@ -197,11 +197,7 @@ impl KVCache {
         match &self.keys {
             Some(k) => {
                 let shape = ffi::array_shape(k);
-                if shape.len() >= 3 {
-                    shape[2]
-                } else {
-                    0
-                }
+                if shape.len() >= 3 { shape[2] } else { 0 }
             }
             None => 0,
         }
@@ -569,11 +565,7 @@ impl RotatingKVCache {
     pub fn seq_len(&self) -> i32 {
         if let Some(ref keys) = self.keys {
             let shape = ffi::array_shape(keys);
-            if shape.len() >= 3 {
-                shape[2]
-            } else {
-                0
-            }
+            if shape.len() >= 3 { shape[2] } else { 0 }
         } else {
             0
         }
@@ -998,6 +990,83 @@ impl ChunkedKVCache {
         } else {
             0
         }
+    }
+}
+
+/// Structure-of-arrays metadata for batched decode position handling.
+///
+/// This keeps per-sequence offsets, query lengths, visible KV lengths, and
+/// window sizes in a kernel-friendly representation instead of relying on
+/// scalar `cache.offset` assumptions inside batched model code.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchedAttentionMetadata {
+    pub rope_offsets: Vec<i32>,
+    pub query_lens: Vec<i32>,
+    pub kv_lens: Vec<i32>,
+    pub window_sizes: Vec<i32>,
+}
+
+impl BatchedAttentionMetadata {
+    /// Build heterogeneous per-sequence metadata from standard KV caches.
+    pub fn from_kv_caches(
+        caches: &[&mut KVCache],
+        query_lens: &[i32],
+        window_sizes: &[i32],
+    ) -> Result<Self, String> {
+        let batch = caches.len();
+        if query_lens.len() != batch {
+            return Err(format!(
+                "expected {} query lengths for batched attention metadata, got {}",
+                batch,
+                query_lens.len()
+            ));
+        }
+        if window_sizes.len() != batch {
+            return Err(format!(
+                "expected {} window sizes for batched attention metadata, got {}",
+                batch,
+                window_sizes.len()
+            ));
+        }
+
+        let mut rope_offsets = Vec::with_capacity(batch);
+        let mut kv_lens = Vec::with_capacity(batch);
+        for (cache, &query_len) in caches.iter().zip(query_lens.iter()) {
+            if query_len < 0 {
+                return Err(format!(
+                    "query length must be non-negative for batched attention metadata, got {query_len}"
+                ));
+            }
+            let offset = cache.offset;
+            rope_offsets.push(offset);
+            kv_lens.push(offset + query_len);
+        }
+
+        Ok(Self {
+            rope_offsets,
+            query_lens: query_lens.to_vec(),
+            kv_lens,
+            window_sizes: window_sizes.to_vec(),
+        })
+    }
+
+    /// Build uniform metadata for full-attention batched decode/prefill paths.
+    pub fn uniform_kv_caches(
+        caches: &[&mut KVCache],
+        query_len: i32,
+        window_size: i32,
+    ) -> Result<Self, String> {
+        let query_lens = vec![query_len; caches.len()];
+        let window_sizes = vec![window_size; caches.len()];
+        Self::from_kv_caches(caches, &query_lens, &window_sizes)
+    }
+
+    pub fn len(&self) -> usize {
+        self.rope_offsets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rope_offsets.is_empty()
     }
 }
 
@@ -1997,5 +2066,31 @@ mod tests {
         }
         pool.sync_paged_state_with_dense(id).unwrap();
         assert_eq!(pool.get_paged_state(id).unwrap().layer(0).unwrap().len, 2);
+    }
+
+    #[test]
+    fn batched_decode_metadata_tracks_heterogeneous_lengths() {
+        let mut cache_a = KVCache::new();
+        cache_a.offset = 3;
+        let mut cache_b = KVCache::new();
+        cache_b.offset = 9;
+        let caches = vec![&mut cache_a, &mut cache_b];
+
+        let metadata =
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 4], &[0, 32]).unwrap();
+
+        assert_eq!(metadata.rope_offsets, vec![3, 9]);
+        assert_eq!(metadata.query_lens, vec![1, 4]);
+        assert_eq!(metadata.kv_lens, vec![4, 13]);
+        assert_eq!(metadata.window_sizes, vec![0, 32]);
+    }
+
+    #[test]
+    fn batched_attention_metadata_rejects_mismatched_lengths() {
+        let mut cache = KVCache::new();
+        let caches = vec![&mut cache];
+
+        assert!(BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 2], &[0]).is_err());
+        assert!(BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0, 1]).is_err());
     }
 }

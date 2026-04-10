@@ -78,6 +78,30 @@ fn test_softmax() {
 }
 
 #[test]
+fn test_fast_rope_batched_matches_per_sequence_offsets() {
+    let x = from_slice_f32(
+        &[
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+        ],
+        &[2, 1, 2, 4],
+    );
+    let actual = fast_rope_batched(&x, 4, false, 10000.0, 1.0, &[0, 3]);
+
+    let first = slice(&x, &[0, 0, 0, 0], &[1, i32::MAX, i32::MAX, i32::MAX]);
+    let first = fast_rope(&first, 4, false, 10000.0, 1.0, 0);
+    let second = slice(&x, &[1, 0, 0, 0], &[2, i32::MAX, i32::MAX, i32::MAX]);
+    let second = fast_rope(&second, 4, false, 10000.0, 1.0, 3);
+    let expected = concatenate(&first, &second, 0);
+
+    eval(&actual);
+    eval(&expected);
+    let close = allclose(&actual, &expected, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
+#[test]
 fn test_rms_norm() {
     let x = ones(&[1, 4], dtype::FLOAT32);
     let weight = ones(&[4], dtype::FLOAT32);

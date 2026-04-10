@@ -1787,11 +1787,11 @@ mod ffi {
 
         /// Quantize weights — scales
         fn quantize_weights_scales(w: &MlxArray, group_size: i32, bits: i32)
-            -> UniquePtr<MlxArray>;
+        -> UniquePtr<MlxArray>;
 
         /// Quantize weights — biases
         fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
-            -> UniquePtr<MlxArray>;
+        -> UniquePtr<MlxArray>;
 
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()
@@ -1842,6 +1842,58 @@ fn use_bool_causal_mask_path() -> bool {
             Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
         )
     })
+}
+
+/// Apply RoPE to a batched tensor using independent per-sequence offsets.
+///
+/// This keeps batched decode call sites on a vectorized metadata path even
+/// before a native array-offset RoPE kernel exists. The current helper slices
+/// the batch dimension and reuses MLX's scalar-offset fast kernel for each
+/// sequence, then concatenates the results back together.
+///
+/// Used by: Llama3 batched decode, Qwen3 batched decode
+pub fn fast_rope_batched(
+    x: &MlxArray,
+    dims: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+    offsets: &[i32],
+) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let batch = shape.first().copied().unwrap_or(0).max(0) as usize;
+    assert_eq!(
+        batch,
+        offsets.len(),
+        "fast_rope_batched expected {} offsets, got {}",
+        batch,
+        offsets.len()
+    );
+
+    if batch == 0 {
+        return ffi::copy(x);
+    }
+    if batch == 1 {
+        return ffi::fast_rope(x, dims, traditional, base, scale, offsets[0]);
+    }
+
+    let rank = shape.len();
+    let mut begin = vec![0; rank];
+    let mut end = vec![i32::MAX; rank];
+    end[0] = 1;
+
+    let first = ffi::slice(x, &begin, &end);
+    let mut result = ffi::fast_rope(&first, dims, traditional, base, scale, offsets[0]);
+
+    for (batch_idx, &offset) in offsets.iter().enumerate().skip(1) {
+        begin[0] = batch_idx as i32;
+        end[0] = batch_idx as i32 + 1;
+        let chunk = ffi::slice(x, &begin, &end);
+        let chunk = ffi::fast_rope(&chunk, dims, traditional, base, scale, offset);
+        result = crate::concatenate(&result, &chunk, 0);
+    }
+
+    result
 }
 
 /// Causal SDPA wrapper with transparent M5 Neural Accelerator routing.

@@ -18,6 +18,7 @@
 //! - Q/K normalization (RMSNorm after projection, before RoPE)
 //! - Explicit head_dim in config
 
+use mlxcel_core::cache::BatchedAttentionMetadata;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::pipeline_hint;
@@ -158,12 +159,13 @@ impl Attention {
     /// Split-attention forward for batched decode.
     ///
     /// Receives pre-projected Q/K/V tensors of shape `[B, T, proj_dim]`,
-    /// splits them per-sequence for Q/K normalization, RoPE, and attention
-    /// with individual KV caches (different offsets), then concatenates
+    /// applies Q/K normalization and RoPE using batched positional metadata,
+    /// then runs per-sequence cache updates and attention before concatenating
     /// the results back into `[B, T, hidden_dim]`.
     ///
-    /// Key difference from Llama3: Q/K normalization (RMSNorm) is applied
-    /// per-sequence after reshape, before RoPE.
+    /// Key difference from Llama3: Q/K normalization (RMSNorm) still happens
+    /// before RoPE, but it now stays batched instead of forcing a per-sequence
+    /// loop for positional handling.
     ///
     /// Used by: Qwen3 batched decode (TransformerBlock::forward_batched)
     pub fn forward_split_attention(
@@ -172,51 +174,68 @@ impl Attention {
         k_batched: &MlxArray,
         v_batched: &MlxArray,
         caches: &mut [&mut KVCache],
+        metadata: &BatchedAttentionMetadata,
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         let b = caches.len();
         let seq_len = mlxcel_core::array_shape(q_batched)[1];
+        debug_assert_eq!(metadata.len(), b);
         let mut attn_outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(b);
 
+        let q_batched = mlxcel_core::reshape(
+            q_batched,
+            &[b as i32, seq_len, self.num_heads, self.head_dim],
+        );
+        let k_batched = mlxcel_core::reshape(
+            k_batched,
+            &[b as i32, seq_len, self.num_kv_heads, self.head_dim],
+        );
+        let v_batched = mlxcel_core::reshape(
+            v_batched,
+            &[b as i32, seq_len, self.num_kv_heads, self.head_dim],
+        );
+
+        let q_batched = self.q_norm.forward(&q_batched);
+        let k_batched = self.k_norm.forward(&k_batched);
+
+        let q_batched = mlxcel_core::transpose_axes(&q_batched, &[0, 2, 1, 3]);
+        let k_batched = mlxcel_core::transpose_axes(&k_batched, &[0, 2, 1, 3]);
+        let v_batched = mlxcel_core::transpose_axes(&v_batched, &[0, 2, 1, 3]);
+
+        let q_batched = mlxcel_core::fast_rope_batched(
+            &q_batched,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            &metadata.rope_offsets,
+        );
+        let k_batched = mlxcel_core::fast_rope_batched(
+            &k_batched,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            1.0,
+            &metadata.rope_offsets,
+        );
+
         for (i, cache) in caches.iter_mut().enumerate() {
-            // Slice [B, T, proj_dim] -> [1, T, proj_dim] for sequence i.
+            // Slice [B, heads, T, dim] -> [1, heads, T, dim] for sequence i.
             let q_i = mlxcel_core::slice(
-                q_batched,
-                &[i as i32, 0, 0],
-                &[i as i32 + 1, seq_len, i32::MAX],
+                &q_batched,
+                &[i as i32, 0, 0, 0],
+                &[i as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
             );
             let k_i = mlxcel_core::slice(
-                k_batched,
-                &[i as i32, 0, 0],
-                &[i as i32 + 1, seq_len, i32::MAX],
+                &k_batched,
+                &[i as i32, 0, 0, 0],
+                &[i as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
             );
             let v_i = mlxcel_core::slice(
-                v_batched,
-                &[i as i32, 0, 0],
-                &[i as i32 + 1, seq_len, i32::MAX],
+                &v_batched,
+                &[i as i32, 0, 0, 0],
+                &[i as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
             );
-
-            // Reshape to [1, T, n_heads, head_dim].
-            let q_i = mlxcel_core::reshape(&q_i, &[1, seq_len, self.num_heads, self.head_dim]);
-            let k_i = mlxcel_core::reshape(&k_i, &[1, seq_len, self.num_kv_heads, self.head_dim]);
-            let v_i = mlxcel_core::reshape(&v_i, &[1, seq_len, self.num_kv_heads, self.head_dim]);
-
-            // Apply Q/K normalization BEFORE transpose (Qwen3-specific)
-            let q_i = self.q_norm.forward(&q_i);
-            let k_i = self.k_norm.forward(&k_i);
-
-            // Transpose to [1, n_heads, 1, head_dim]
-            let q_i = mlxcel_core::transpose_axes(&q_i, &[0, 2, 1, 3]);
-            let k_i = mlxcel_core::transpose_axes(&k_i, &[0, 2, 1, 3]);
-            let v_i = mlxcel_core::transpose_axes(&v_i, &[0, 2, 1, 3]);
-
-            let offset = cache.offset;
-
-            // Apply RoPE per-sequence (each has different offset)
-            let q_i =
-                mlxcel_core::fast_rope(&q_i, self.rope_dims, false, self.rope_base, 1.0, offset);
-            let k_i =
-                mlxcel_core::fast_rope(&k_i, self.rope_dims, false, self.rope_base, 1.0, offset);
 
             // Update KV cache
             let (cache_k, cache_v) = cache.update_and_fetch(k_i, v_i);
@@ -402,12 +421,15 @@ impl TransformerBlock {
 
         // Batched Q/K/V projection (fused single matmul)
         let (q, k, v) = self.self_attn.qkv_proj.forward(&normed);
+        let seq_len = mlxcel_core::array_shape(&q)[1];
+        let metadata = BatchedAttentionMetadata::uniform_kv_caches(caches, seq_len, 0)
+            .expect("valid qwen3 batched attention metadata");
 
-        // Per-sequence attention with individual KV caches
-        // (includes Q/K normalization + RoPE per-sequence)
+        // Per-sequence attention still owns cache mutation, but positional
+        // metadata and RoPE now stay on a batched path.
         let attn_concat = self
             .self_attn
-            .forward_split_attention(&q, &k, &v, caches, mask);
+            .forward_split_attention(&q, &k, &v, caches, &metadata, mask);
 
         // Batched output projection
         let attn_out = self.self_attn.o_proj.forward(&attn_concat);
