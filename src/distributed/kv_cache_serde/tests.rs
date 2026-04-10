@@ -583,13 +583,10 @@ fn restore_into_sequence_cache_set_round_trip() {
 
     // Build a SequenceCacheSet with one layer (direct construction for test use)
     let seq_id = mlxcel_core::cache::SequenceId::from_raw(99);
-    let mut cache_set = mlxcel_core::cache::SequenceCacheSet {
-        caches: vec![mlxcel_core::cache::KVCache::new()],
+    let mut cache_set = mlxcel_core::cache::SequenceCacheSet::dense_external(
         seq_id,
-        prompt_len: 0,
-        current_offset: 0,
-        created_at: std::time::Instant::now(),
-    };
+        vec![mlxcel_core::cache::KVCache::new()],
+    );
 
     restore_into_sequence_cache_set(&recovered, &mut cache_set).unwrap();
 

@@ -647,41 +647,26 @@ impl BatchScheduler {
             None
         };
 
-        // Collect cache pointers (one cache slice per sequence).
-        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> = Vec::with_capacity(b);
-        let mut valid = true;
-        for seq in &seqs {
-            match self.cache_pool.get_caches_mut(seq.seq_id) {
-                Some(caches) => {
-                    cache_ptrs.push((caches.as_mut_ptr(), caches.len()));
+        let batch_ids: Vec<SequenceId> = seqs.iter().map(|seq| seq.seq_id).collect();
+        let mut batch_caches = match self.cache_pool.get_batch_caches_mut(&batch_ids) {
+            Ok(caches) => caches,
+            Err(err) => {
+                tracing::warn!("batched prefill: {err}, falling back");
+                // Re-queue all sequences for sequential processing.
+                for seq in seqs {
+                    self.execute_full_prefill(seq);
                 }
-                None => {
-                    tracing::warn!(
-                        "batched prefill: cache not found for seq {}, falling back",
-                        seq.seq_id
-                    );
-                    valid = false;
-                    break;
-                }
+                return;
             }
-        }
+        };
 
-        if !valid {
+        if batch_caches.len() != b {
             // Re-queue all sequences for sequential processing.
             for seq in seqs {
                 self.execute_full_prefill(seq);
             }
             return;
         }
-
-        // SAFETY: Each seq_id maps to a distinct SequenceCacheSet entry in the
-        // CachePool HashMap (allocation guarantees uniqueness). No two slices
-        // alias the same memory. Pointers remain valid because cache_pool is not
-        // mutated between extraction and the forward_batched call.
-        let mut batch_caches: Vec<&mut [mlxcel_core::layers::KVCache]> = cache_ptrs
-            .iter()
-            .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
-            .collect();
 
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
         let raw_logits =
@@ -1285,29 +1270,13 @@ impl BatchScheduler {
             "execute_batched_decode: duplicate SequenceId in seq_ids"
         );
 
-        let mut cache_ptrs: Vec<(*mut mlxcel_core::layers::KVCache, usize)> = Vec::with_capacity(b);
-        for &seq_id in seq_ids {
-            match self.cache_pool.get_caches_mut(seq_id) {
-                Some(caches) => {
-                    cache_ptrs.push((caches.as_mut_ptr(), caches.len()));
-                }
-                None => {
-                    tracing::error!("Cache not found for {seq_id} during batched decode");
-                    return;
-                }
+        let mut batch_caches = match self.cache_pool.get_batch_caches_mut(seq_ids) {
+            Ok(caches) => caches,
+            Err(err) => {
+                tracing::error!("{err} during batched decode");
+                return;
             }
-        }
-
-        // SAFETY: CachePool stores each SequenceId in a separate HashMap entry
-        // (SequenceCacheSet), so the Vec<KVCache> backing each slice is a
-        // distinct heap allocation. The debug_assert above verifies no
-        // duplicate SequenceIds are present, guaranteeing no two slices alias
-        // the same memory. The raw pointers remain valid because cache_pool is
-        // not mutated between pointer extraction and the forward_batched call.
-        let mut batch_caches: Vec<&mut [mlxcel_core::layers::KVCache]> = cache_ptrs
-            .iter()
-            .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
-            .collect();
+        };
 
         let logits = self.model.forward_batched(&input, &mut batch_caches, None);
 

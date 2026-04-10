@@ -202,6 +202,22 @@ pub trait LanguageModel {
     /// Used by: Qwen3.5 mixed-cache map cleanup, server batch scheduler
     fn release_sequence_state(&self, _caches: &mut [KVCache]) {}
 
+    /// Describe how one sequence's runtime state should be allocated.
+    ///
+    /// Phase 0 keeps the default behavior aligned with today's
+    /// `supports_batching()` split while giving the control plane an explicit
+    /// backend/layout seam for future paged and model-owned sequence state.
+    ///
+    /// Used by: `CachePool::allocate()`
+    fn sequence_state_layout(&self) -> crate::cache::SequenceStateLayout {
+        let num_layers = self.num_layers();
+        if self.supports_batching() {
+            crate::cache::SequenceStateLayout::dense_kv_cache(num_layers)
+        } else {
+            crate::cache::SequenceStateLayout::model_owned(num_layers)
+        }
+    }
+
     /// Whether this model supports tile-aligned padded prefill on M5+ hardware.
     ///
     /// Pure transformer models return `true` (the default) because padding

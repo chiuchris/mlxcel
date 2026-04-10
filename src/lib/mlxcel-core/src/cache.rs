@@ -1022,12 +1022,55 @@ impl std::fmt::Display for SequenceId {
     }
 }
 
+/// Logical owner/backend for one sequence's runtime state.
+///
+/// Phase 0 keeps all backends represented through the existing `Vec<KVCache>`
+/// surface so behavior stays unchanged while the control plane gains an
+/// explicit seam for future paged and model-owned state backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SequenceStateBackend {
+    /// Standard per-layer external KV caches stored directly in the sequence.
+    DenseKvCache,
+    /// Model-owned/internal state. The exposed `Vec<KVCache>` acts only as a
+    /// compatibility placeholder for existing generation and scheduler paths.
+    ModelOwned,
+}
+
+/// Backend/layout descriptor for allocating one sequence's runtime state.
+///
+/// Used by: `LanguageModel::sequence_state_layout()`, `CachePool::allocate()`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SequenceStateLayout {
+    pub backend: SequenceStateBackend,
+    pub num_layers: usize,
+}
+
+impl SequenceStateLayout {
+    /// Allocate per-layer dense external KV caches for this sequence.
+    pub const fn dense_kv_cache(num_layers: usize) -> Self {
+        Self {
+            backend: SequenceStateBackend::DenseKvCache,
+            num_layers,
+        }
+    }
+
+    /// Allocate model-owned/internal sequence state with placeholder KV slots.
+    pub const fn model_owned(num_layers: usize) -> Self {
+        Self {
+            backend: SequenceStateBackend::ModelOwned,
+            num_layers,
+        }
+    }
+}
+
 /// One sequence's full set of layer caches.
 ///
 /// Created by `CachePool::allocate` and tied to a single generation request.
 /// The caller owns mutable access while the sequence is active and must call
 /// `CachePool::release` when generation finishes.
 pub struct SequenceCacheSet {
+    /// Logical owner/backend for this sequence's state.
+    pub backend: SequenceStateBackend,
     /// Per-layer KV caches (one entry per model layer).
     pub caches: Vec<KVCache>,
     /// Unique identifier assigned by the pool.
@@ -1041,6 +1084,35 @@ pub struct SequenceCacheSet {
 }
 
 impl SequenceCacheSet {
+    fn with_backend(
+        seq_id: SequenceId,
+        backend: SequenceStateBackend,
+        caches: Vec<KVCache>,
+    ) -> Self {
+        Self {
+            backend,
+            caches,
+            seq_id,
+            prompt_len: 0,
+            current_offset: 0,
+            created_at: Instant::now(),
+        }
+    }
+
+    /// Allocate a sequence state backed by standard external KV caches.
+    pub fn dense_external(seq_id: SequenceId, caches: Vec<KVCache>) -> Self {
+        Self::with_backend(seq_id, SequenceStateBackend::DenseKvCache, caches)
+    }
+
+    /// Allocate a sequence state for model-owned/internal caches.
+    ///
+    /// The returned KV caches are placeholders that preserve today's runtime
+    /// contracts while the control plane keeps track of the real owner.
+    pub fn model_owned_placeholder(seq_id: SequenceId, num_layers: usize) -> Self {
+        let caches = (0..num_layers).map(|_| KVCache::new()).collect();
+        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, caches)
+    }
+
     /// Total memory footprint of all layer caches in bytes.
     pub fn nbytes(&self) -> usize {
         self.caches.iter().map(|c| c.nbytes()).sum()
@@ -1085,41 +1157,30 @@ impl CachePool {
         &mut self,
         model: &dyn crate::generate::LanguageModel,
     ) -> Result<SequenceId, String> {
-        if model.supports_batching() {
-            if self.active.len() >= self.max_sequences {
-                return Err(format!(
-                    "CachePool: max capacity ({}) reached, cannot allocate new sequence",
-                    self.max_sequences
-                ));
-            }
-            let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
-            let caches = model.make_caches();
-            let entry = SequenceCacheSet {
-                caches,
-                seq_id: id,
-                prompt_len: 0,
-                current_offset: 0,
-                created_at: Instant::now(),
-            };
-            self.active.insert(id, entry);
-            Ok(id)
-        } else {
-            // Non-batching models: allocate a placeholder with dummy caches.
-            // Do NOT call make_caches() here — that would reset the model's
-            // internal caches and corrupt any in-flight generation.
-            let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
-            let num_layers = model.num_layers();
-            let caches = (0..num_layers).map(|_| KVCache::new()).collect();
-            let entry = SequenceCacheSet {
-                caches,
-                seq_id: id,
-                prompt_len: 0,
-                current_offset: 0,
-                created_at: Instant::now(),
-            };
-            self.active.insert(id, entry);
-            Ok(id)
+        let layout = model.sequence_state_layout();
+        if layout.backend == SequenceStateBackend::DenseKvCache
+            && self.active.len() >= self.max_sequences
+        {
+            return Err(format!(
+                "CachePool: max capacity ({}) reached, cannot allocate new sequence",
+                self.max_sequences
+            ));
         }
+
+        let id = SequenceId(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let entry = match layout.backend {
+            SequenceStateBackend::DenseKvCache => {
+                SequenceCacheSet::dense_external(id, model.make_caches())
+            }
+            SequenceStateBackend::ModelOwned => {
+                // Model-owned state uses placeholder KV caches.
+                // Do NOT call make_caches() here — that would reset the model's
+                // internal caches and corrupt any in-flight generation.
+                SequenceCacheSet::model_owned_placeholder(id, layout.num_layers)
+            }
+        };
+        self.active.insert(id, entry);
+        Ok(id)
     }
 
     /// Return a mutable reference to the full `SequenceCacheSet` for the
@@ -1132,6 +1193,36 @@ impl CachePool {
     /// in `model.forward()`, or `None` if the ID is not active.
     pub fn get_caches_mut(&mut self, id: SequenceId) -> Option<&mut [KVCache]> {
         self.active.get_mut(&id).map(|s| s.caches.as_mut_slice())
+    }
+
+    /// Return cache slices for multiple active sequences in one call.
+    ///
+    /// This centralizes the aliasing/unsafe boundary so scheduler code does
+    /// not need to reconstruct `&mut [KVCache]` slices from raw pointers.
+    pub fn get_batch_caches_mut<'a>(
+        &'a mut self,
+        ids: &[SequenceId],
+    ) -> Result<Vec<&'a mut [KVCache]>, String> {
+        let mut cache_ptrs: Vec<(*mut KVCache, usize)> = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let (ptr, len) = {
+                let caches = self
+                    .get_caches_mut(id)
+                    .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
+                (caches.as_mut_ptr(), caches.len())
+            };
+            cache_ptrs.push((ptr, len));
+        }
+
+        // SAFETY: each `SequenceId` maps to a distinct `SequenceCacheSet`
+        // allocation inside the HashMap, and callers ensure the same id is not
+        // requested twice in one batch. The returned slices are tied to the
+        // lifetime of `&mut self` and no mutation of `self.active` occurs
+        // between pointer extraction and slice reconstruction.
+        Ok(cache_ptrs
+            .iter()
+            .map(|&(ptr, len)| unsafe { std::slice::from_raw_parts_mut(ptr, len) })
+            .collect())
     }
 
     /// Release a sequence's caches, reclaiming the pool slot.
@@ -1248,6 +1339,8 @@ mod tests {
 
         assert_ne!(id1, id2);
         assert_eq!(pool.active_count(), 2);
+        assert_eq!(pool.get_mut(id1).unwrap().backend, SequenceStateBackend::DenseKvCache);
+        assert_eq!(pool.get_mut(id2).unwrap().backend, SequenceStateBackend::DenseKvCache);
 
         // Each sequence should have 4 layer caches
         assert_eq!(pool.get_caches_mut(id1).unwrap().len(), 4);
@@ -1323,6 +1416,24 @@ mod tests {
             // Second layer still empty
             assert!(caches[1].is_empty());
         }
+    }
+
+    #[test]
+    fn cache_pool_collects_batch_cache_slices() {
+        let model = StubModel { num_layers: 2 };
+        let mut pool = CachePool::new(4);
+
+        let id1 = pool.allocate(&model).unwrap();
+        let id2 = pool.allocate(&model).unwrap();
+
+        let mut batch = pool.get_batch_caches_mut(&[id1, id2]).unwrap();
+        assert_eq!(batch.len(), 2);
+        batch[0][0].offset = 3;
+        batch[1][1].offset = 5;
+        drop(batch);
+
+        assert_eq!(pool.get_caches_mut(id1).unwrap()[0].offset, 3);
+        assert_eq!(pool.get_caches_mut(id2).unwrap()[1].offset, 5);
     }
 
     #[test]
@@ -1429,15 +1540,21 @@ mod tests {
         // sequence is generating.
         let first = pool.allocate(&model);
         assert!(first.is_ok());
+        let first = first.unwrap();
         assert_eq!(pool.active_count(), 1);
+        assert_eq!(
+            pool.get_mut(first).unwrap().backend,
+            SequenceStateBackend::ModelOwned
+        );
 
         let second = pool.allocate(&model);
         assert!(second.is_ok());
+        let second = second.unwrap();
         assert_eq!(pool.active_count(), 2);
 
         // Release both
-        pool.release(first.unwrap());
-        pool.release(second.unwrap());
+        pool.release(first);
+        pool.release(second);
         assert_eq!(pool.active_count(), 0);
     }
 }

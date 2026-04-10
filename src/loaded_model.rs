@@ -289,6 +289,10 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, release_sequence_state(caches))
     }
 
+    fn sequence_state_layout(&self) -> mlxcel_core::cache::SequenceStateLayout {
+        delegate_language_model!(self, sequence_state_layout())
+    }
+
     fn supports_padded_prefill(&self) -> bool {
         delegate_language_model!(self, supports_padded_prefill())
     }
