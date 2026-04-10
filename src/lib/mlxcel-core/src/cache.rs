@@ -25,6 +25,13 @@
 //! method always returns FP16 tensors (dequantized on read), so the attention
 //! computation is unaffected.
 
+mod paged;
+
+pub use paged::{
+    PagedBlockId, PagedBlockPool, PagedCacheStats, PagedKvLayout, PagedLayerState,
+    PagedSequenceState,
+};
+
 use crate::concatenate;
 use crate::dtype;
 use crate::ffi;
@@ -1031,6 +1038,8 @@ impl std::fmt::Display for SequenceId {
 pub enum SequenceStateBackend {
     /// Standard per-layer external KV caches stored directly in the sequence.
     DenseKvCache,
+    /// Paged block tables plus logical sequence metadata.
+    PagedKvCache,
     /// Model-owned/internal state. The exposed `Vec<KVCache>` acts only as a
     /// compatibility placeholder for existing generation and scheduler paths.
     ModelOwned,
@@ -1039,10 +1048,11 @@ pub enum SequenceStateBackend {
 /// Backend/layout descriptor for allocating one sequence's runtime state.
 ///
 /// Used by: `LanguageModel::sequence_state_layout()`, `CachePool::allocate()`
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SequenceStateLayout {
     pub backend: SequenceStateBackend,
     pub num_layers: usize,
+    pub paged_layout: Option<PagedKvLayout>,
 }
 
 impl SequenceStateLayout {
@@ -1051,6 +1061,16 @@ impl SequenceStateLayout {
         Self {
             backend: SequenceStateBackend::DenseKvCache,
             num_layers,
+            paged_layout: None,
+        }
+    }
+
+    /// Allocate per-layer paged KV state for this sequence.
+    pub fn paged_kv_cache(paged_layout: PagedKvLayout) -> Self {
+        Self {
+            backend: SequenceStateBackend::PagedKvCache,
+            num_layers: paged_layout.num_layers,
+            paged_layout: Some(paged_layout),
         }
     }
 
@@ -1059,6 +1079,7 @@ impl SequenceStateLayout {
         Self {
             backend: SequenceStateBackend::ModelOwned,
             num_layers,
+            paged_layout: None,
         }
     }
 }
@@ -1073,6 +1094,8 @@ pub struct SequenceCacheSet {
     pub backend: SequenceStateBackend,
     /// Per-layer KV caches (one entry per model layer).
     pub caches: Vec<KVCache>,
+    /// Paged block-table state when `backend == PagedKvCache`.
+    pub paged: Option<PagedSequenceState>,
     /// Unique identifier assigned by the pool.
     pub seq_id: SequenceId,
     /// Number of prompt tokens originally prefilled.
@@ -1081,6 +1104,7 @@ pub struct SequenceCacheSet {
     pub current_offset: i32,
     /// Wall-clock time when this cache set was allocated.
     pub created_at: Instant,
+    paged_layout: Option<PagedKvLayout>,
 }
 
 impl SequenceCacheSet {
@@ -1088,20 +1112,42 @@ impl SequenceCacheSet {
         seq_id: SequenceId,
         backend: SequenceStateBackend,
         caches: Vec<KVCache>,
+        paged: Option<PagedSequenceState>,
+        paged_layout: Option<PagedKvLayout>,
     ) -> Self {
         Self {
             backend,
             caches,
+            paged,
             seq_id,
             prompt_len: 0,
             current_offset: 0,
             created_at: Instant::now(),
+            paged_layout,
         }
     }
 
     /// Allocate a sequence state backed by standard external KV caches.
     pub fn dense_external(seq_id: SequenceId, caches: Vec<KVCache>) -> Self {
-        Self::with_backend(seq_id, SequenceStateBackend::DenseKvCache, caches)
+        Self::with_backend(
+            seq_id,
+            SequenceStateBackend::DenseKvCache,
+            caches,
+            None,
+            None,
+        )
+    }
+
+    /// Allocate a sequence state backed by paged block tables.
+    pub fn paged(seq_id: SequenceId, paged_layout: PagedKvLayout) -> Self {
+        let paged = PagedSequenceState::new(&paged_layout);
+        Self::with_backend(
+            seq_id,
+            SequenceStateBackend::PagedKvCache,
+            Vec::new(),
+            Some(paged),
+            Some(paged_layout),
+        )
     }
 
     /// Allocate a sequence state for model-owned/internal caches.
@@ -1110,12 +1156,39 @@ impl SequenceCacheSet {
     /// contracts while the control plane keeps track of the real owner.
     pub fn model_owned_placeholder(seq_id: SequenceId, num_layers: usize) -> Self {
         let caches = (0..num_layers).map(|_| KVCache::new()).collect();
-        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, caches)
+        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, caches, None, None)
     }
 
     /// Total memory footprint of all layer caches in bytes.
     pub fn nbytes(&self) -> usize {
-        self.caches.iter().map(|c| c.nbytes()).sum()
+        let dense_bytes: usize = self.caches.iter().map(|c| c.nbytes()).sum();
+        let paged_bytes = self
+            .paged
+            .as_ref()
+            .zip(self.paged_layout.as_ref())
+            .map_or(0, |(state, layout)| state.used_bytes(layout));
+        dense_bytes + paged_bytes
+    }
+
+    pub fn paged_state(&self) -> Option<&PagedSequenceState> {
+        self.paged.as_ref()
+    }
+
+    pub fn paged_state_mut(&mut self) -> Option<&mut PagedSequenceState> {
+        self.paged.as_mut()
+    }
+
+    pub fn paged_stats(&self) -> Option<PagedCacheStats> {
+        self.paged
+            .as_ref()
+            .zip(self.paged_layout.as_ref())
+            .map(|(state, layout)| PagedCacheStats {
+                allocated_blocks: state.reserved_blocks(),
+                live_blocks: state.reserved_blocks(),
+                free_blocks: 0,
+                bytes_reserved: state.reserved_bytes(layout),
+                bytes_in_use: state.used_bytes(layout),
+            })
     }
 }
 
@@ -1131,6 +1204,7 @@ pub struct CachePool {
     next_id: AtomicU64,
     active: HashMap<SequenceId, SequenceCacheSet>,
     max_sequences: usize,
+    paged_pool: Option<PagedBlockPool>,
 }
 
 impl CachePool {
@@ -1140,6 +1214,7 @@ impl CachePool {
             next_id: AtomicU64::new(0),
             active: HashMap::new(),
             max_sequences,
+            paged_pool: None,
         }
     }
 
@@ -1172,6 +1247,13 @@ impl CachePool {
             SequenceStateBackend::DenseKvCache => {
                 SequenceCacheSet::dense_external(id, model.make_caches())
             }
+            SequenceStateBackend::PagedKvCache => {
+                let paged_layout = layout.paged_layout.ok_or_else(|| {
+                    "CachePool: paged backend requires a paged layout".to_string()
+                })?;
+                self.ensure_paged_pool(&paged_layout)?;
+                SequenceCacheSet::paged(id, paged_layout)
+            }
             SequenceStateBackend::ModelOwned => {
                 // Model-owned state uses placeholder KV caches.
                 // Do NOT call make_caches() here — that would reset the model's
@@ -1187,6 +1269,14 @@ impl CachePool {
     /// given sequence, or `None` if the ID is not active.
     pub fn get_mut(&mut self, id: SequenceId) -> Option<&mut SequenceCacheSet> {
         self.active.get_mut(&id)
+    }
+
+    pub fn get_paged_state(&self, id: SequenceId) -> Option<&PagedSequenceState> {
+        self.active.get(&id)?.paged_state()
+    }
+
+    pub fn get_paged_state_mut(&mut self, id: SequenceId) -> Option<&mut PagedSequenceState> {
+        self.active.get_mut(&id)?.paged_state_mut()
     }
 
     /// Return a mutable slice of the per-layer KV caches for direct use
@@ -1229,7 +1319,13 @@ impl CachePool {
     ///
     /// This is a no-op if `id` is not currently active.
     pub fn release(&mut self, id: SequenceId) {
-        self.active.remove(&id);
+        if let Some(mut sequence) = self.active.remove(&id) {
+            if let Some(pool) = self.paged_pool.as_mut() {
+                if let Some(state) = sequence.paged_state_mut() {
+                    let _ = pool.release_sequence(state);
+                }
+            }
+        }
     }
 
     /// Number of sequences currently holding active cache sets.
@@ -1242,9 +1338,88 @@ impl CachePool {
         self.active.values().map(|s| s.nbytes()).sum()
     }
 
+    pub fn append_paged_tokens(
+        &mut self,
+        id: SequenceId,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<(), String> {
+        let pool = self
+            .paged_pool
+            .as_mut()
+            .ok_or_else(|| "CachePool: paged backend is not initialized".to_string())?;
+        let state = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?
+            .paged_state_mut()
+            .ok_or_else(|| format!("CachePool: sequence {id} is not paged"))?;
+        pool.append_tokens(state, layer_idx, token_count)
+    }
+
+    pub fn trim_paged_tokens(
+        &mut self,
+        id: SequenceId,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<usize, String> {
+        let pool = self
+            .paged_pool
+            .as_mut()
+            .ok_or_else(|| "CachePool: paged backend is not initialized".to_string())?;
+        let state = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?
+            .paged_state_mut()
+            .ok_or_else(|| format!("CachePool: sequence {id} is not paged"))?;
+        pool.trim_tokens(state, layer_idx, token_count)
+    }
+
+    pub fn rewind_paged_tokens(
+        &mut self,
+        id: SequenceId,
+        layer_idx: usize,
+        token_count: usize,
+    ) -> Result<usize, String> {
+        let pool = self
+            .paged_pool
+            .as_mut()
+            .ok_or_else(|| "CachePool: paged backend is not initialized".to_string())?;
+        let state = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?
+            .paged_state_mut()
+            .ok_or_else(|| format!("CachePool: sequence {id} is not paged"))?;
+        pool.rewind_tokens(state, layer_idx, token_count)
+    }
+
+    pub fn paged_stats(&self) -> Option<PagedCacheStats> {
+        let pool = self.paged_pool.as_ref()?;
+        Some(
+            pool.stats_for_sequences(
+                self.active
+                    .values()
+                    .filter_map(|sequence| sequence.paged_state()),
+            ),
+        )
+    }
+
     /// Maximum number of concurrent sequences this pool allows.
     pub fn max_sequences(&self) -> usize {
         self.max_sequences
+    }
+
+    fn ensure_paged_pool(&mut self, layout: &PagedKvLayout) -> Result<(), String> {
+        if let Some(pool) = self.paged_pool.as_ref() {
+            if pool.layout() != layout {
+                return Err("CachePool: paged layout mismatch for active paged backend".to_string());
+            }
+            return Ok(());
+        }
+        self.paged_pool = Some(PagedBlockPool::new(layout.clone()));
+        Ok(())
     }
 }
 
@@ -1329,6 +1504,37 @@ mod tests {
         }
     }
 
+    struct PagedModel {
+        layout: PagedKvLayout,
+    }
+
+    impl crate::generate::LanguageModel for PagedModel {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> UniquePtr<MlxArray> {
+            ffi::zeros(&[1], 0)
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            Vec::new()
+        }
+
+        fn num_layers(&self) -> usize {
+            self.layout.num_layers
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+
+        fn sequence_state_layout(&self) -> SequenceStateLayout {
+            SequenceStateLayout::paged_kv_cache(self.layout.clone())
+        }
+    }
+
     #[test]
     fn cache_pool_allocate_and_release() {
         let model = StubModel { num_layers: 4 };
@@ -1339,8 +1545,14 @@ mod tests {
 
         assert_ne!(id1, id2);
         assert_eq!(pool.active_count(), 2);
-        assert_eq!(pool.get_mut(id1).unwrap().backend, SequenceStateBackend::DenseKvCache);
-        assert_eq!(pool.get_mut(id2).unwrap().backend, SequenceStateBackend::DenseKvCache);
+        assert_eq!(
+            pool.get_mut(id1).unwrap().backend,
+            SequenceStateBackend::DenseKvCache
+        );
+        assert_eq!(
+            pool.get_mut(id2).unwrap().backend,
+            SequenceStateBackend::DenseKvCache
+        );
 
         // Each sequence should have 4 layer caches
         assert_eq!(pool.get_caches_mut(id1).unwrap().len(), 4);
@@ -1556,5 +1768,132 @@ mod tests {
         pool.release(first);
         pool.release(second);
         assert_eq!(pool.active_count(), 0);
+    }
+
+    #[test]
+    fn paged_layout_validates_block_geometry() {
+        assert!(PagedKvLayout::uniform(2, 0, 128).is_err());
+        assert!(PagedKvLayout::uniform(2, 4, 130).is_err());
+        assert!(PagedKvLayout::new(4, Vec::new()).is_err());
+    }
+
+    #[test]
+    fn cache_pool_allocates_paged_sequence_state() {
+        let layout = PagedKvLayout::uniform(2, 4, 128).unwrap();
+        let model = PagedModel {
+            layout: layout.clone(),
+        };
+        let mut pool = CachePool::new(4);
+
+        let id = pool.allocate(&model).unwrap();
+        let entry = pool.get_mut(id).unwrap();
+        assert_eq!(entry.backend, SequenceStateBackend::PagedKvCache);
+        assert!(entry.caches.is_empty());
+        assert_eq!(entry.paged_state().unwrap().layers.len(), layout.num_layers);
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 0,
+                live_blocks: 0,
+                free_blocks: 0,
+                bytes_reserved: 0,
+                bytes_in_use: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn cache_pool_paged_append_trim_release_and_reuse() {
+        let layout = PagedKvLayout::uniform(2, 4, 128).unwrap();
+        let model = PagedModel {
+            layout: layout.clone(),
+        };
+        let mut pool = CachePool::new(4);
+
+        let id1 = pool.allocate(&model).unwrap();
+        pool.append_paged_tokens(id1, 0, 6).unwrap();
+
+        let (first_block, second_block) = {
+            let layer = pool.get_paged_state(id1).unwrap().layer(0).unwrap();
+            assert_eq!(layer.len, 6);
+            assert_eq!(layer.visible_len(), 6);
+            assert_eq!(layer.reserved_blocks(), 2);
+            (layer.block_ids[0], layer.block_ids[1])
+        };
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 2,
+                live_blocks: 2,
+                free_blocks: 0,
+                bytes_reserved: 256,
+                bytes_in_use: 192,
+            }
+        );
+        assert_eq!(pool.memory_usage_bytes(), 192);
+
+        assert_eq!(pool.trim_paged_tokens(id1, 0, 1).unwrap(), 1);
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 2,
+                live_blocks: 2,
+                free_blocks: 0,
+                bytes_reserved: 256,
+                bytes_in_use: 160,
+            }
+        );
+
+        assert_eq!(pool.rewind_paged_tokens(id1, 0, 2).unwrap(), 2);
+        {
+            let layer = pool.get_paged_state(id1).unwrap().layer(0).unwrap();
+            assert_eq!(layer.len, 3);
+            assert_eq!(layer.block_ids, vec![first_block]);
+        }
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 2,
+                live_blocks: 1,
+                free_blocks: 1,
+                bytes_reserved: 128,
+                bytes_in_use: 96,
+            }
+        );
+
+        pool.append_paged_tokens(id1, 1, 4).unwrap();
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 3,
+                live_blocks: 2,
+                free_blocks: 1,
+                bytes_reserved: 256,
+                bytes_in_use: 224,
+            }
+        );
+
+        pool.release(id1);
+        assert_eq!(
+            pool.paged_stats().unwrap(),
+            PagedCacheStats {
+                allocated_blocks: 3,
+                live_blocks: 0,
+                free_blocks: 3,
+                bytes_reserved: 0,
+                bytes_in_use: 0,
+            }
+        );
+
+        let id2 = pool.allocate(&model).unwrap();
+        pool.append_paged_tokens(id2, 0, 4).unwrap();
+        let reused_block = pool
+            .get_paged_state(id2)
+            .unwrap()
+            .layer(0)
+            .unwrap()
+            .block_ids[0];
+        assert_eq!(reused_block, first_block);
+        assert_ne!(reused_block, second_block);
     }
 }
