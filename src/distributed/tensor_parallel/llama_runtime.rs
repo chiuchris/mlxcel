@@ -352,7 +352,7 @@ impl LanguageModel for TensorParallelGemma3Model {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = reduce_sum_f32(attn_parts);
             let post_attn = self.ranks[0].layers[layer_idx]
                 .post_attention_layernorm
                 .forward(&attn_out);
@@ -366,7 +366,7 @@ impl LanguageModel for TensorParallelGemma3Model {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = reduce_sum_f32(ffn_parts);
             let post_ff = self.ranks[0].layers[layer_idx]
                 .post_feedforward_layernorm
                 .forward(&ff_out);
@@ -416,7 +416,7 @@ impl LanguageModel for TensorParallelGemma3Model {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = reduce_sum_f32(attn_parts);
             let post_attn = self.ranks[0].layers[layer_idx]
                 .post_attention_layernorm
                 .forward(&attn_out);
@@ -430,7 +430,7 @@ impl LanguageModel for TensorParallelGemma3Model {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = reduce_sum_f32(ffn_parts);
             let post_ff = self.ranks[0].layers[layer_idx]
                 .post_feedforward_layernorm
                 .forward(&ff_out);
@@ -1102,8 +1102,34 @@ fn split_rank_caches<'a>(
 fn reduce_sum(parts: Vec<UniquePtr<MlxArray>>) -> UniquePtr<MlxArray> {
     let mut parts = parts.into_iter();
     let mut acc = parts.next().expect("reduce_sum requires at least one part");
+    let dtype = mlxcel_core::array_dtype(&acc);
+    if matches!(
+        dtype,
+        mlxcel_core::dtype::FLOAT16 | mlxcel_core::dtype::BFLOAT16
+    ) {
+        let mut acc_f32 = mlxcel_core::astype(&acc, mlxcel_core::dtype::FLOAT32);
+        for part in parts {
+            let part_f32 = mlxcel_core::astype(&part, mlxcel_core::dtype::FLOAT32);
+            acc_f32 = mlxcel_core::add(&acc_f32, &part_f32);
+        }
+        acc = mlxcel_core::astype(&acc_f32, dtype);
+    } else {
+        for part in parts {
+            acc = mlxcel_core::add(&acc, &part);
+        }
+    }
+    acc
+}
+
+fn reduce_sum_f32(parts: Vec<UniquePtr<MlxArray>>) -> UniquePtr<MlxArray> {
+    let mut parts = parts.into_iter();
+    let first = parts
+        .next()
+        .expect("reduce_sum_f32 requires at least one part");
+    let mut acc = mlxcel_core::astype(&first, mlxcel_core::dtype::FLOAT32);
     for part in parts {
-        acc = mlxcel_core::add(&acc, &part);
+        let part_f32 = mlxcel_core::astype(&part, mlxcel_core::dtype::FLOAT32);
+        acc = mlxcel_core::add(&acc, &part_f32);
     }
     acc
 }

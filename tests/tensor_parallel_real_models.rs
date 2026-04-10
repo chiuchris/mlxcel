@@ -40,7 +40,12 @@ fn decode_tokens(tokenizer: &MlxcelTokenizer, tokens: &[i32]) -> String {
     tokenizer.decode(&tokens, true).unwrap_or_default()
 }
 
-fn assert_tp_matches_single_rank(model_dir: &Path, prompt: &str, max_tokens: usize) {
+fn assert_tp_matches_single_rank(
+    model_dir: &Path,
+    prompt: &str,
+    max_tokens: usize,
+    tp_size: usize,
+) {
     if !model_dir.exists() {
         eprintln!(
             "Skipping test: model directory not found at {}",
@@ -58,7 +63,8 @@ fn assert_tp_matches_single_rank(model_dir: &Path, prompt: &str, max_tokens: usi
 
     let (single_rank_model, tokenizer) = load_model(model_dir).unwrap();
     let (tensor_parallel_model, _) =
-        load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(2)).unwrap();
+        load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
+            .unwrap();
     let prompt_tokens = prompt_tokens(&tokenizer, prompt);
     let sampling = SamplingConfig::greedy();
 
@@ -83,11 +89,13 @@ fn assert_tp_matches_single_rank(model_dir: &Path, prompt: &str, max_tokens: usi
     assert_eq!(
         single_rank_tokens,
         tensor_parallel_tokens,
-        "generated token mismatch for {}\nsingle-rank: {:?}\ntp=2: {:?}\nsingle-rank text: {}\ntp=2 text: {}",
+        "generated token mismatch for {}\nsingle-rank: {:?}\ntp={}: {:?}\nsingle-rank text: {}\ntp={} text: {}",
         model_dir.display(),
         single_rank_tokens,
+        tp_size,
         tensor_parallel_tokens,
         decode_tokens(&tokenizer, &single_rank_tokens),
+        tp_size,
         decode_tokens(&tokenizer, &tensor_parallel_tokens)
     );
 }
@@ -99,6 +107,7 @@ fn llama_tp2_matches_single_rank_greedy_long_generation() {
         &repo_model_dir("llama-3.2-1b-4bit"),
         "Continue this sequence with more entries separated by commas: 1, 2, 3, 4, 5,",
         32,
+        2,
     );
 }
 
@@ -109,6 +118,7 @@ fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
         &repo_model_dir("qwen3-0.6b-4bit"),
         "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
         32,
+        2,
     );
 }
 
@@ -119,6 +129,7 @@ fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
         &repo_model_dir("ernie-4.5-0.3b-4bit"),
         "Continue this sequence with more entries separated by commas: red, blue, green,",
         32,
+        2,
     );
 }
 
@@ -129,6 +140,7 @@ fn hunyuan_v1_dense_tp2_matches_single_rank_greedy_long_generation() {
         &repo_model_dir("hunyuan-1.8b-4bit"),
         "Continue this sequence with more entries separated by commas: spring, summer, autumn,",
         32,
+        2,
     );
 }
 
@@ -139,5 +151,28 @@ fn gemma3_tp2_matches_single_rank_greedy_long_generation() {
         &repo_model_dir("gemma3-1b-4bit"),
         "Continue this sequence with more entries separated by commas: north, south, east,",
         32,
+        2,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn llama_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("llama-3.2-1b-4bit"),
+        "Continue this sequence with more entries separated by commas: 1, 2, 3, 4, 5,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn gemma3_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("gemma3-1b-4bit"),
+        "Continue this sequence with more entries separated by commas: north, south, east,",
+        32,
+        4,
     );
 }
