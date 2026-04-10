@@ -40,6 +40,119 @@ fn decode_tokens(tokenizer: &MlxcelTokenizer, tokens: &[i32]) -> String {
     tokenizer.decode(&tokens, true).unwrap_or_default()
 }
 
+fn assert_tp_matches_single_rank_stepwise(
+    model_dir: &Path,
+    prompt: &str,
+    tp_size: usize,
+    decode_token: i32,
+) {
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let runtime = initialize_runtime();
+    eprintln!(
+        "Comparing TP stepwise parity on {} using {}",
+        model_dir.display(),
+        runtime.device
+    );
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
+
+    let (full_model, tokenizer) = load_model(model_dir).unwrap();
+    let prompt_tokens = prompt_tokens(&tokenizer, prompt);
+    let prompt_ids = mlxcel_core::from_slice_i32(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let decode_ids = mlxcel_core::from_slice_i32(&[decode_token], &[1, 1]);
+    let mut full_caches = full_model.make_caches();
+    let full_prefill = full_model.forward(&prompt_ids, &mut full_caches, None);
+    let full_decode = full_model.forward(&decode_ids, &mut full_caches, None);
+
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
+
+    let (tp_model, _) =
+        load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
+            .unwrap();
+    let mut tp_caches = tp_model.make_caches();
+    let tp_prefill = tp_model.forward(&prompt_ids, &mut tp_caches, None);
+    let tp_decode = tp_model.forward(&decode_ids, &mut tp_caches, None);
+
+    let atol = 1e-4f32;
+    let prefill_close = mlxcel_core::allclose(&full_prefill, &tp_prefill, atol as f64, atol as f64);
+    let decode_close = mlxcel_core::allclose(&full_decode, &tp_decode, atol as f64, atol as f64);
+    let mut prefill_ok = mlxcel_core::item_bool(&prefill_close);
+    if !prefill_ok {
+        let diff = mlxcel_core::subtract(&full_prefill, &tp_prefill);
+        let abs_diff = mlxcel_core::abs(&diff);
+        let max_diff = mlxcel_core::max_all(&abs_diff);
+        mlxcel_core::eval(&max_diff);
+        let max_diff_val = mlxcel_core::item_f32(&max_diff);
+        prefill_ok = max_diff_val <= atol;
+        let full_finite = mlxcel_core::all_all(&mlxcel_core::isfinite(&full_prefill));
+        let tp_finite = mlxcel_core::all_all(&mlxcel_core::isfinite(&tp_prefill));
+        mlxcel_core::eval(&full_finite);
+        mlxcel_core::eval(&tp_finite);
+        let seq_len = mlxcel_core::array_shape(&full_prefill)[1];
+        let full_argmax = mlxcel_core::argmax_last_axis(&full_prefill);
+        let tp_argmax = mlxcel_core::argmax_last_axis(&tp_prefill);
+        mlxcel_core::eval(&full_argmax);
+        mlxcel_core::eval(&tp_argmax);
+        let full_last = mlxcel_core::slice(&full_argmax, &[0, seq_len - 1], &[1, seq_len]);
+        let tp_last = mlxcel_core::slice(&tp_argmax, &[0, seq_len - 1], &[1, seq_len]);
+        mlxcel_core::eval(&full_last);
+        mlxcel_core::eval(&tp_last);
+        eprintln!(
+            "prefill max_abs_diff={} full_last_argmax={} tp_last_argmax={} full_finite={} tp_finite={}",
+            max_diff_val,
+            mlxcel_core::item_i32(&full_last),
+            mlxcel_core::item_i32(&tp_last),
+            mlxcel_core::item_bool(&full_finite),
+            mlxcel_core::item_bool(&tp_finite)
+        );
+    }
+    let mut decode_ok = mlxcel_core::item_bool(&decode_close);
+    if !decode_ok {
+        let diff = mlxcel_core::subtract(&full_decode, &tp_decode);
+        let abs_diff = mlxcel_core::abs(&diff);
+        let max_diff = mlxcel_core::max_all(&abs_diff);
+        mlxcel_core::eval(&max_diff);
+        let max_diff_val = mlxcel_core::item_f32(&max_diff);
+        decode_ok = max_diff_val <= atol;
+        let full_finite = mlxcel_core::all_all(&mlxcel_core::isfinite(&full_decode));
+        let tp_finite = mlxcel_core::all_all(&mlxcel_core::isfinite(&tp_decode));
+        mlxcel_core::eval(&full_finite);
+        mlxcel_core::eval(&tp_finite);
+        let full_argmax = mlxcel_core::argmax_last_axis(&full_decode);
+        let tp_argmax = mlxcel_core::argmax_last_axis(&tp_decode);
+        mlxcel_core::eval(&full_argmax);
+        mlxcel_core::eval(&tp_argmax);
+        eprintln!(
+            "decode max_abs_diff={} full_argmax={} tp_argmax={} full_finite={} tp_finite={}",
+            max_diff_val,
+            mlxcel_core::item_i32(&full_argmax),
+            mlxcel_core::item_i32(&tp_argmax),
+            mlxcel_core::item_bool(&full_finite),
+            mlxcel_core::item_bool(&tp_finite)
+        );
+    }
+    assert!(
+        prefill_ok,
+        "prefill logits mismatch for {} at tp={}",
+        model_dir.display(),
+        tp_size
+    );
+    assert!(
+        decode_ok,
+        "decode logits mismatch for {} at tp={}",
+        model_dir.display(),
+        tp_size
+    );
+}
+
 fn assert_tp_matches_single_rank(
     model_dir: &Path,
     prompt: &str,
@@ -63,14 +176,10 @@ fn assert_tp_matches_single_rank(
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
 
-    let (tokenizer, single_rank_tokens, tensor_parallel_tokens) = {
+    let (tokenizer, prompt_tokens, single_rank_tokens) = {
         let (single_rank_model, tokenizer) = load_model(model_dir).unwrap();
-        let (tensor_parallel_model, _) =
-            load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
-                .unwrap();
         let prompt_tokens = prompt_tokens(&tokenizer, prompt);
         let sampling = SamplingConfig::greedy();
-
         let mut single_rank_generator = CxxGenerator::new(single_rank_model.num_layers());
         let single_rank_tokens = single_rank_generator.generate(
             &single_rank_model,
@@ -78,16 +187,23 @@ fn assert_tp_matches_single_rank(
             max_tokens,
             &sampling,
         );
+        (tokenizer, prompt_tokens, single_rank_tokens)
+    };
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
 
+    let tensor_parallel_tokens = {
+        let (tensor_parallel_model, _) =
+            load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
+                .unwrap();
+        let sampling = SamplingConfig::greedy();
         let mut tensor_parallel_generator = CxxGenerator::new(tensor_parallel_model.num_layers());
-        let tensor_parallel_tokens = tensor_parallel_generator.generate(
+        tensor_parallel_generator.generate(
             &tensor_parallel_model,
             &prompt_tokens,
             max_tokens,
             &sampling,
-        );
-
-        (tokenizer, single_rank_tokens, tensor_parallel_tokens)
+        )
     };
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
@@ -190,6 +306,60 @@ fn qwen3_4b_tp4_matches_single_rank_greedy_long_generation() {
 }
 
 #[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_5_tp2_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen3.5-0.8b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        24,
+        2,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_5_4b_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen3.5-4b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_5_9b_tp2_matches_single_rank_stepwise() {
+    assert_tp_matches_single_rank_stepwise(
+        &repo_model_dir("qwen3.5-9b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        2,
+        11,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_5_9b_tp4_matches_single_rank_stepwise() {
+    assert_tp_matches_single_rank_stepwise(
+        &repo_model_dir("qwen3.5-9b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        4,
+        11,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_5_27b_tp4_matches_single_rank_stepwise() {
+    assert_tp_matches_single_rank_stepwise(
+        &repo_model_dir("qwen3.5-27b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        4,
+        11,
+    );
+}
+
 #[ignore = "requires local model weights and extended real-model generation"]
 fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(

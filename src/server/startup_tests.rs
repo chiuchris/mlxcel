@@ -312,6 +312,28 @@ fn validate_tensor_parallel_startup_accepts_qwen3_multi_rank_runtime() {
 }
 
 #[test]
+fn validate_tensor_parallel_startup_accepts_qwen35_multi_rank_runtime() {
+    let dir = temp_path("tp-qwen35");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "qwen3_5",
+            "num_hidden_layers": 24
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    validate_tensor_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn validate_tensor_parallel_startup_accepts_ernie45_multi_rank_runtime() {
     let dir = temp_path("tp-ernie45");
     std::fs::write(

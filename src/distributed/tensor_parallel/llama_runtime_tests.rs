@@ -20,8 +20,8 @@ use mlxcel_core::weights::WeightMap;
 
 use super::{
     TensorParallelErnie45Model, TensorParallelGemma3Model, TensorParallelHunyuanV1DenseModel,
-    TensorParallelLlamaModel, TensorParallelQwen3Model, local_llama_args, logical_weight_name,
-    validate_supported_runtime,
+    TensorParallelLlamaModel, TensorParallelQwen3Model, TensorParallelQwen35Model,
+    local_llama_args, logical_weight_name, validate_supported_runtime,
 };
 use crate::distributed::tensor_parallel::{ShardConfig, generate_shard_plan};
 use crate::models::ernie4_5::{Ernie45Model, ModelArgs as Ernie45ModelArgs};
@@ -30,6 +30,7 @@ use crate::models::hunyuan_v1_dense::{HunyuanV1DenseModel, ModelArgs as HunyuanV
 use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
 use crate::models::qwen2::Qwen2Model;
 use crate::models::qwen3::{ModelArgs as Qwen3ModelArgs, Qwen3Model};
+use crate::models::qwen3_5::{Qwen35Config, Qwen35Model};
 
 fn make_test_model_args() -> LlamaModelArgs {
     LlamaModelArgs {
@@ -67,6 +68,37 @@ fn make_test_qwen3_args() -> Qwen3ModelArgs {
         rope_scaling: None,
         tie_word_embeddings: false,
         quantization: None,
+    }
+}
+
+fn make_test_qwen35_args() -> Qwen35Config {
+    Qwen35Config {
+        model_type: "qwen3_5".to_string(),
+        hidden_size: 8,
+        num_hidden_layers: 1,
+        intermediate_size: 8,
+        num_attention_heads: 2,
+        num_key_value_heads: 2,
+        head_dim: Some(4),
+        linear_num_value_heads: 2,
+        linear_num_key_heads: 2,
+        linear_key_head_dim: 2,
+        linear_value_head_dim: 2,
+        linear_conv_kernel_dim: 4,
+        num_experts: 0,
+        num_experts_per_tok: 0,
+        decoder_sparse_step: 1,
+        moe_intermediate_size: 0,
+        shared_expert_intermediate_size: 0,
+        rope_parameters: None,
+        full_attention_interval: 2,
+        rms_norm_eps: 1e-6,
+        tie_word_embeddings: false,
+        attention_bias: false,
+        vocab_size: 8,
+        quantization: None,
+        mlp_only_layers: Vec::new(),
+        norm_topk_prob: true,
     }
 }
 
@@ -138,6 +170,43 @@ fn tensor(values: &[f32], shape: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core::
 
 fn insert_tensor(weights: &mut WeightMap, name: &str, values: &[f32], shape: &[i32]) {
     weights.insert(name.to_string(), tensor(values, shape));
+}
+
+fn seq_values(len: usize, start: f32, step: f32) -> Vec<f32> {
+    (0..len).map(|idx| start + idx as f32 * step).collect()
+}
+
+fn concat_axis(
+    parts: Vec<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
+    axis: i32,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let mut iter = parts.into_iter();
+    let first = iter.next().expect("concat_axis requires at least one part");
+    iter.fold(first, |acc, part| {
+        mlxcel_core::concatenate(&acc, &part, axis)
+    })
+}
+
+fn sum_parts(
+    parts: Vec<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let mut iter = parts.into_iter();
+    let first = iter.next().expect("sum_parts requires at least one part");
+    iter.fold(first, |acc, part| mlxcel_core::add(&acc, &part))
+}
+
+fn slice_last_dim(
+    tensor: &mlxcel_core::MlxArray,
+    start: i32,
+    end: i32,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let shape = mlxcel_core::array_shape(tensor);
+    let mut starts = vec![0; shape.len()];
+    let mut stops = shape.clone();
+    let last = shape.len() - 1;
+    starts[last] = start;
+    stops[last] = end;
+    mlxcel_core::slice(tensor, &starts, &stops)
 }
 
 fn make_test_weight_map() -> WeightMap {
@@ -260,6 +329,108 @@ fn make_test_qwen3_weight_map() -> WeightMap {
         "model.layers.0.self_attn.k_norm.weight",
         &[1.0, 1.0],
         &[2],
+    );
+    weights
+}
+
+fn make_test_qwen35_weight_map() -> WeightMap {
+    let mut weights = HashMap::new();
+    insert_tensor(
+        &mut weights,
+        "model.embed_tokens.weight",
+        &seq_values(64, 0.01, 0.01),
+        &[8, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.in_proj_qkv.weight",
+        &seq_values(96, 0.01, 0.005),
+        &[12, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.in_proj_z.weight",
+        &seq_values(32, 0.02, 0.005),
+        &[4, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.in_proj_b.weight",
+        &seq_values(16, 0.03, 0.005),
+        &[2, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.in_proj_a.weight",
+        &seq_values(16, 0.04, 0.005),
+        &[2, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.conv1d.weight",
+        &seq_values(48, 0.05, 0.0025),
+        &[12, 4, 1],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.dt_bias",
+        &[0.1, 0.2],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.A_log",
+        &[0.3, 0.4],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.linear_attn.out_proj.weight",
+        &seq_values(32, 0.06, 0.005),
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.gate_proj.weight",
+        &seq_values(64, 0.07, 0.005),
+        &[8, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.up_proj.weight",
+        &seq_values(64, 0.08, 0.005),
+        &[8, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.down_proj.weight",
+        &seq_values(64, 0.09, 0.005),
+        &[8, 8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.input_layernorm.weight",
+        &[1.0; 8],
+        &[8],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.post_attention_layernorm.weight",
+        &[1.0; 8],
+        &[8],
+    );
+    insert_tensor(&mut weights, "model.norm.weight", &[1.0; 8], &[8]);
+    insert_tensor(
+        &mut weights,
+        "lm_head.weight",
+        &seq_values(64, 0.1, 0.01),
+        &[8, 8],
     );
     weights
 }
@@ -426,6 +597,25 @@ fn validate_supported_runtime_accepts_qwen3_replicated_path() {
         r#"{
             "model_type": "qwen3",
             "num_hidden_layers": 1
+        }"#,
+    )
+    .unwrap();
+
+    let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
+    assert!(!support.force_no_batch);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_supported_runtime_accepts_qwen35_replicated_path() {
+    let dir = std::env::temp_dir().join(format!("mlxcel-tp-qwen35-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "qwen3_5",
+            "num_hidden_layers": 24
         }"#,
     )
     .unwrap();
@@ -606,6 +796,497 @@ fn tensor_parallel_qwen3_matches_full_model_logits() {
     let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
     let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
     assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+fn tensor_parallel_qwen35_matches_full_model_logits() {
+    let args = make_test_qwen35_args();
+    let weights = make_test_qwen35_weight_map();
+    let full = Qwen35Model::from_weights(&weights, &args).unwrap();
+    let plan = generate_shard_plan(
+        "qwen3_5",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelQwen35Model::from_full_weights(&args, &weights, &plan, None).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+#[ignore = "requires local qwen3.5 large weights and CUDA runtime"]
+fn tensor_parallel_qwen35_text_only_9b_debug_linear_attn_stages() {
+    let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join("qwen3.5-9b-4bit");
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let config_path = model_dir.join("config.json");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config_str = crate::models::sanitize_config_json(&config_str);
+    let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    let mut text_config = config_json
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| config_json.clone());
+    if text_config.get("quantization").is_none()
+        && let Some(quantization) = config_json.get("quantization")
+    {
+        text_config
+            .as_object_mut()
+            .unwrap()
+            .insert("quantization".to_string(), quantization.clone());
+    }
+    let args: Qwen35Config = serde_json::from_value(text_config).unwrap();
+    let mut weights = super::load_qwen35_tp_text_weights(&model_dir, &config_json, &args).unwrap();
+    super::ensure_qwen35_lm_head_weights(&mut weights);
+
+    let full = Qwen35Model::from_weights(&weights, &args).unwrap();
+    let plan = generate_shard_plan(
+        "qwen3_5",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelQwen35Model::from_full_weights(&args, &weights, &plan, None).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[11, 22, 33, 44], &[1, 4]);
+    let hidden = full.embed_tokens.forward(&input_ids);
+    let attn_norm = full.layers[0].input_layernorm.forward(&hidden);
+    let mask = mlxcel_core::astype(
+        &mlxcel_core::from_slice_i32(&[1, 1, 1, 1], &[1, 4]),
+        mlxcel_core::dtype::BOOL,
+    );
+
+    let full_attn = match &full.layers[0].attention {
+        crate::models::qwen3_5::Qwen35AttentionVariant::Linear(attn) => attn,
+        _ => panic!("expected linear attention in layer 0"),
+    };
+    let full_dbg = full_attn.debug_prefill_no_cache(&attn_norm, Some(&mask));
+    let full_runtime_attn = full_attn.forward(&attn_norm, None, None);
+
+    let local_k_dim =
+        ((args.linear_num_key_heads * args.linear_key_head_dim) / plan.tp_size) as i32;
+    let local_v_dim =
+        ((args.linear_num_value_heads * args.linear_value_head_dim) / plan.tp_size) as i32;
+
+    let mut qkv_q_parts = Vec::new();
+    let mut qkv_k_parts = Vec::new();
+    let mut qkv_v_parts = Vec::new();
+    let mut z_parts = Vec::new();
+    let mut b_parts = Vec::new();
+    let mut a_parts = Vec::new();
+    let mut conv_q_parts = Vec::new();
+    let mut conv_k_parts = Vec::new();
+    let mut conv_v_parts = Vec::new();
+    let mut q_parts = Vec::new();
+    let mut k_parts = Vec::new();
+    let mut v_parts = Vec::new();
+    let mut beta_parts = Vec::new();
+    let mut g_parts = Vec::new();
+    let mut gated_parts = Vec::new();
+    let mut normed_parts = Vec::new();
+    let mut projected_parts = Vec::new();
+
+    for rank in &tp.ranks {
+        let rank_attn = match &rank.layers[0].attention {
+            crate::models::qwen3_5::Qwen35AttentionVariant::Linear(attn) => attn,
+            _ => panic!("expected linear attention in rank layer 0"),
+        };
+        let dbg = rank_attn.debug_prefill_no_cache(&attn_norm, Some(&mask));
+        qkv_q_parts.push(slice_last_dim(&dbg.qkv, 0, local_k_dim));
+        qkv_k_parts.push(slice_last_dim(&dbg.qkv, local_k_dim, local_k_dim * 2));
+        qkv_v_parts.push(slice_last_dim(
+            &dbg.qkv,
+            local_k_dim * 2,
+            local_k_dim * 2 + local_v_dim,
+        ));
+        z_parts.push(mlxcel_core::reshape(&dbg.z, &[1, 4, -1]));
+        b_parts.push(dbg.b_proj);
+        a_parts.push(dbg.a);
+        conv_q_parts.push(slice_last_dim(&dbg.conv_out, 0, local_k_dim));
+        conv_k_parts.push(slice_last_dim(&dbg.conv_out, local_k_dim, local_k_dim * 2));
+        conv_v_parts.push(slice_last_dim(
+            &dbg.conv_out,
+            local_k_dim * 2,
+            local_k_dim * 2 + local_v_dim,
+        ));
+        q_parts.push(mlxcel_core::reshape(&dbg.q, &[1, 4, -1]));
+        k_parts.push(mlxcel_core::reshape(&dbg.k, &[1, 4, -1]));
+        v_parts.push(mlxcel_core::reshape(&dbg.v, &[1, 4, -1]));
+        beta_parts.push(dbg.beta);
+        g_parts.push(dbg.g);
+        gated_parts.push(mlxcel_core::reshape(&dbg.gated_out, &[1, 4, -1]));
+        normed_parts.push(dbg.normed_out);
+        projected_parts.push(dbg.projected);
+    }
+
+    let recon_qkv = {
+        let q = concat_axis(qkv_q_parts, -1);
+        let k = concat_axis(qkv_k_parts, -1);
+        let qk = mlxcel_core::concatenate(&q, &k, -1);
+        let v = concat_axis(qkv_v_parts, -1);
+        mlxcel_core::concatenate(&qk, &v, -1)
+    };
+    let recon_z = concat_axis(z_parts, -1);
+    let recon_b = concat_axis(b_parts, -1);
+    let recon_a = concat_axis(a_parts, -1);
+    let recon_conv = {
+        let q = concat_axis(conv_q_parts, -1);
+        let k = concat_axis(conv_k_parts, -1);
+        let qk = mlxcel_core::concatenate(&q, &k, -1);
+        let v = concat_axis(conv_v_parts, -1);
+        mlxcel_core::concatenate(&qk, &v, -1)
+    };
+    let recon_q = concat_axis(q_parts, -1);
+    let recon_k = concat_axis(k_parts, -1);
+    let recon_v = concat_axis(v_parts, -1);
+    let recon_beta = concat_axis(beta_parts, -1);
+    let recon_g = concat_axis(g_parts, -1);
+    let recon_gated = concat_axis(gated_parts, -1);
+    let recon_normed = concat_axis(normed_parts, -1);
+    let recon_projected = super::reduce_sum_f32(projected_parts);
+    let tp_runtime_hidden_parts: Vec<_> = tp
+        .ranks
+        .iter()
+        .map(|rank| match &rank.layers[0].attention {
+            crate::models::qwen3_5::Qwen35AttentionVariant::Linear(attn) => {
+                attn.forward_hidden_tp(&attn_norm, None, None)
+            }
+            _ => panic!("expected linear attention in rank layer 0"),
+        })
+        .collect();
+    let tp_runtime_attn = tp.full_linear_out_projs[0]
+        .as_ref()
+        .unwrap()
+        .forward(&super::concat_last_dim(tp_runtime_hidden_parts));
+
+    let full_z = mlxcel_core::reshape(&full_dbg.z, &[1, 4, -1]);
+    let full_q = mlxcel_core::reshape(&full_dbg.q, &[1, 4, -1]);
+    let full_k = mlxcel_core::reshape(&full_dbg.k, &[1, 4, -1]);
+    let full_v = mlxcel_core::reshape(&full_dbg.v, &[1, 4, -1]);
+    let full_gated = mlxcel_core::reshape(&full_dbg.gated_out, &[1, 4, -1]);
+
+    for (stage, lhs, rhs) in [
+        ("qkv", &full_dbg.qkv, &recon_qkv),
+        ("z", &full_z, &recon_z),
+        ("b", &full_dbg.b_proj, &recon_b),
+        ("a", &full_dbg.a, &recon_a),
+        ("conv", &full_dbg.conv_out, &recon_conv),
+        ("q", &full_q, &recon_q),
+        ("k", &full_k, &recon_k),
+        ("v", &full_v, &recon_v),
+        ("beta", &full_dbg.beta, &recon_beta),
+        ("g", &full_dbg.g, &recon_g),
+        ("gated", &full_gated, &recon_gated),
+        ("normed", &full_dbg.normed_out, &recon_normed),
+        ("projected", &full_dbg.projected, &recon_projected),
+    ] {
+        let close = mlxcel_core::allclose(lhs, rhs, 1e-4, 1e-4);
+        eprintln!("{stage}_close={}", mlxcel_core::item_bool(&close));
+    }
+
+    let runtime_attn_close =
+        mlxcel_core::allclose(&full_runtime_attn, &tp_runtime_attn, 1e-4, 1e-4);
+    eprintln!(
+        "runtime_attn_close={}",
+        mlxcel_core::item_bool(&runtime_attn_close)
+    );
+
+    let projected_close = mlxcel_core::allclose(&full_dbg.projected, &recon_projected, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&projected_close));
+}
+
+#[test]
+#[ignore = "requires local qwen3.5 large weights and CUDA runtime"]
+fn tensor_parallel_qwen35_text_only_9b_prefill_logits_match_full_model() {
+    let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join("qwen3.5-9b-4bit");
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let config_path = model_dir.join("config.json");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config_str = crate::models::sanitize_config_json(&config_str);
+    let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    let mut text_config = config_json
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| config_json.clone());
+    if text_config.get("quantization").is_none()
+        && let Some(quantization) = config_json.get("quantization")
+    {
+        text_config
+            .as_object_mut()
+            .unwrap()
+            .insert("quantization".to_string(), quantization.clone());
+    }
+    let args: Qwen35Config = serde_json::from_value(text_config).unwrap();
+    let mut weights = super::load_qwen35_tp_text_weights(&model_dir, &config_json, &args).unwrap();
+    super::ensure_qwen35_lm_head_weights(&mut weights);
+    let mrope = super::qwen35_mrope_params(&args);
+
+    let mut full = Qwen35Model::from_weights(&weights, &args).unwrap();
+    if let Some((mrope_section, rope_theta, rope_dims)) = mrope.clone() {
+        full.set_mrope(mrope_section, rope_theta, rope_dims);
+    }
+    let plan = generate_shard_plan(
+        "qwen3_5",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelQwen35Model::from_full_weights(&args, &weights, &plan, mrope).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[11, 22, 33, 44], &[1, 4]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+#[ignore = "requires local qwen3.5 large weights and CUDA runtime"]
+fn tensor_parallel_qwen35_text_only_9b_debug_layerwise_runtime_divergence() {
+    run_qwen35_text_only_layerwise_runtime_divergence("qwen3.5-9b-4bit", 2);
+}
+
+#[test]
+#[ignore = "requires local qwen3.5 large weights and CUDA runtime"]
+fn tensor_parallel_qwen35_text_only_27b_debug_layerwise_runtime_divergence() {
+    run_qwen35_text_only_layerwise_runtime_divergence("qwen3.5-27b-4bit", 4);
+}
+
+fn run_qwen35_text_only_layerwise_runtime_divergence(model_name: &str, tp_size: usize) {
+    let model_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("models")
+        .join(model_name);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let config_path = model_dir.join("config.json");
+    let config_str = fs::read_to_string(&config_path).unwrap();
+    let config_str = crate::models::sanitize_config_json(&config_str);
+    let config_json: serde_json::Value = serde_json::from_str(&config_str).unwrap();
+    let mut text_config = config_json
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| config_json.clone());
+    if text_config.get("quantization").is_none()
+        && let Some(quantization) = config_json.get("quantization")
+    {
+        text_config
+            .as_object_mut()
+            .unwrap()
+            .insert("quantization".to_string(), quantization.clone());
+    }
+    let args: Qwen35Config = serde_json::from_value(text_config).unwrap();
+    let mut weights = super::load_qwen35_tp_text_weights(&model_dir, &config_json, &args).unwrap();
+    super::ensure_qwen35_lm_head_weights(&mut weights);
+    let mrope = super::qwen35_mrope_params(&args);
+
+    let mut full = Qwen35Model::from_weights(&weights, &args).unwrap();
+    if let Some((mrope_section, rope_theta, rope_dims)) = mrope.clone() {
+        full.set_mrope(mrope_section, rope_theta, rope_dims);
+    }
+    let plan = generate_shard_plan(
+        "qwen3_5",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(tp_size),
+    )
+    .unwrap();
+    let tp = TensorParallelQwen35Model::from_full_weights(&args, &weights, &plan, mrope).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[11, 22, 33, 44], &[1, 4]);
+    let mut full_h = full.embed_tokens.forward(&input_ids);
+    let mut tp_h = tp.ranks[0].embed_tokens.forward(&input_ids);
+    let mut full_caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = full
+        .layers
+        .iter()
+        .map(|layer| {
+            if layer.is_linear {
+                crate::models::qwen3_next::Qwen3NextCache::Linear(
+                    crate::models::gated_delta::GatedDeltaCache::new(),
+                )
+            } else {
+                crate::models::qwen3_next::Qwen3NextCache::Attention(
+                    mlxcel_core::layers::KVCache::new(),
+                )
+            }
+        })
+        .collect();
+    let mut tp_caches = tp.fresh_rank_caches();
+    let seq_len = 4;
+    let fa_mask = Some(mlxcel_core::utils::create_causal_mask(seq_len, 0));
+
+    for layer_idx in 0..args.num_hidden_layers {
+        let full_attn_norm = full.layers[layer_idx].input_layernorm.forward(&full_h);
+        let full_attn_out = match (
+            &full.layers[layer_idx].attention,
+            &mut full_caches[layer_idx],
+        ) {
+            (
+                crate::models::qwen3_5::Qwen35AttentionVariant::Linear(attn),
+                crate::models::qwen3_next::Qwen3NextCache::Linear(cache),
+            ) => attn.forward(&full_attn_norm, None, Some(&mut *cache)),
+            (
+                crate::models::qwen3_5::Qwen35AttentionVariant::FullAttention(attn),
+                crate::models::qwen3_next::Qwen3NextCache::Attention(cache),
+            ) => attn.forward_with_position_ids(
+                &full_attn_norm,
+                &mut *cache,
+                fa_mask.as_deref(),
+                None,
+            ),
+            _ => unreachable!(),
+        };
+        full_h = mlxcel_core::add(&full_h, &full_attn_out);
+
+        let tp_attn_norm = tp.ranks[0].layers[layer_idx].input_layernorm.forward(&tp_h);
+        let tp_attn_parts: Vec<_> = tp
+            .ranks
+            .iter()
+            .zip(tp_caches.iter_mut())
+            .map(|(rank, caches)| {
+                match (&rank.layers[layer_idx].attention, &mut caches[layer_idx]) {
+                    (
+                        crate::models::qwen3_5::Qwen35AttentionVariant::Linear(attn),
+                        crate::models::qwen3_next::Qwen3NextCache::Linear(cache),
+                    ) => attn.forward_hidden_tp(&tp_attn_norm, None, Some(cache)),
+                    (
+                        crate::models::qwen3_5::Qwen35AttentionVariant::FullAttention(attn),
+                        crate::models::qwen3_next::Qwen3NextCache::Attention(cache),
+                    ) => attn.forward_hidden_with_position_ids(
+                        &tp_attn_norm,
+                        cache,
+                        fa_mask.as_deref(),
+                        None,
+                    ),
+                    _ => unreachable!(),
+                }
+            })
+            .collect();
+        let tp_attn_out = if tp.ranks[0].layers[layer_idx].is_linear {
+            tp.full_linear_out_projs[layer_idx]
+                .as_ref()
+                .unwrap()
+                .forward(&super::concat_last_dim(tp_attn_parts))
+        } else {
+            tp.full_attention_out_projs[layer_idx]
+                .as_ref()
+                .unwrap()
+                .forward(&super::concat_last_dim(tp_attn_parts))
+        };
+        tp_h = mlxcel_core::add(&tp_h, &tp_attn_out);
+
+        let attn_close = mlxcel_core::allclose(&full_h, &tp_h, 1e-4, 1e-4);
+        eprintln!(
+            "layer={layer_idx} after_attn={}",
+            mlxcel_core::item_bool(&attn_close)
+        );
+        if !mlxcel_core::item_bool(&attn_close) {
+            panic!("diverged after attention at layer {layer_idx}");
+        }
+
+        let full_ffn_norm = full.layers[layer_idx]
+            .post_attention_layernorm
+            .forward(&full_h);
+        let full_ffn = match &full.layers[layer_idx].mlp {
+            crate::models::qwen3_5::Qwen35MLPVariant::Dense(mlp) => mlp.forward(&full_ffn_norm),
+            crate::models::qwen3_5::Qwen35MLPVariant::MoE(_) => unreachable!(),
+        };
+        let full_ff_hidden = match &full.layers[layer_idx].mlp {
+            crate::models::qwen3_5::Qwen35MLPVariant::Dense(mlp) => {
+                mlp.forward_hidden(&full_ffn_norm)
+            }
+            crate::models::qwen3_5::Qwen35MLPVariant::MoE(_) => unreachable!(),
+        };
+        full_h = mlxcel_core::add(&full_h, &full_ffn);
+
+        let tp_ffn_norm = tp.ranks[0].layers[layer_idx]
+            .post_attention_layernorm
+            .forward(&tp_h);
+        let tp_ffn_parts: Vec<_> = tp
+            .ranks
+            .iter()
+            .map(|rank| match &rank.layers[layer_idx].mlp {
+                crate::models::qwen3_5::Qwen35MLPVariant::Dense(mlp) => {
+                    mlp.forward_hidden(&tp_ffn_norm)
+                }
+                crate::models::qwen3_5::Qwen35MLPVariant::MoE(_) => unreachable!(),
+            })
+            .collect();
+        let tp_ff_hidden = super::concat_last_dim(tp_ffn_parts);
+        let hidden_close = mlxcel_core::allclose(&full_ff_hidden, &tp_ff_hidden, 1e-4, 1e-4);
+        eprintln!(
+            "layer={layer_idx} ffn_hidden={}",
+            mlxcel_core::item_bool(&hidden_close)
+        );
+        let tp_ffn = tp.full_mlp_down_projs[layer_idx].forward(&tp_ff_hidden);
+        let ffn_close = mlxcel_core::allclose(&full_ffn, &tp_ffn, 1e-4, 1e-4);
+        eprintln!(
+            "layer={layer_idx} ffn_out={}",
+            mlxcel_core::item_bool(&ffn_close)
+        );
+        tp_h = mlxcel_core::add(&tp_h, &tp_ffn);
+
+        let layer_close = mlxcel_core::allclose(&full_h, &tp_h, 1e-4, 1e-4);
+        eprintln!(
+            "layer={layer_idx} after_ffn={}",
+            mlxcel_core::item_bool(&layer_close)
+        );
+        if !mlxcel_core::item_bool(&layer_close) {
+            panic!("diverged after ffn at layer {layer_idx}");
+        }
+    }
+
+    let full_norm = full.norm.forward(&full_h);
+    let tp_norm = tp.ranks[0].norm.forward(&tp_h);
+    let norm_close = mlxcel_core::allclose(&full_norm, &tp_norm, 1e-4, 1e-4);
+    eprintln!("final_norm={}", mlxcel_core::item_bool(&norm_close));
+
+    let full_logits = if let Some(ref lm_head) = full.lm_head {
+        lm_head.forward(&full_norm)
+    } else {
+        full.embed_tokens.as_linear(&full_norm)
+    };
+    let tp_logits = tp.final_logits(&tp_norm);
+    let logits_close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    eprintln!("final_logits={}", mlxcel_core::item_bool(&logits_close));
+    if !mlxcel_core::item_bool(&logits_close) {
+        let diff = mlxcel_core::subtract(&full_logits, &tp_logits);
+        let abs_diff = mlxcel_core::abs(&diff);
+        let max_diff = mlxcel_core::max_all(&abs_diff);
+        mlxcel_core::eval(&max_diff);
+        eprintln!("final_logits_max_abs={}", mlxcel_core::item_f32(&max_diff));
+        panic!("diverged at final logits");
+    }
 }
 
 #[test]
