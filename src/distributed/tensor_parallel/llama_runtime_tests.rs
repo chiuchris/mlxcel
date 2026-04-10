@@ -28,6 +28,7 @@ use crate::models::ernie4_5::{Ernie45Model, ModelArgs as Ernie45ModelArgs};
 use crate::models::gemma3::{Gemma3Wrapper, ModelArgs as Gemma3ModelArgs};
 use crate::models::hunyuan_v1_dense::{HunyuanV1DenseModel, ModelArgs as HunyuanV1DenseModelArgs};
 use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
+use crate::models::qwen2::Qwen2Model;
 use crate::models::qwen3::{ModelArgs as Qwen3ModelArgs, Qwen3Model};
 
 fn make_test_model_args() -> LlamaModelArgs {
@@ -436,6 +437,25 @@ fn validate_supported_runtime_accepts_qwen3_replicated_path() {
 }
 
 #[test]
+fn validate_supported_runtime_accepts_qwen2_replicated_path() {
+    let dir = std::env::temp_dir().join(format!("mlxcel-tp-qwen2-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "qwen2",
+            "num_hidden_layers": 24
+        }"#,
+    )
+    .unwrap();
+
+    let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
+    assert!(support.force_no_batch);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn validate_supported_runtime_accepts_ernie45_replicated_path() {
     let dir = std::env::temp_dir().join(format!("mlxcel-tp-ernie45-{}", uuid::Uuid::new_v4()));
     fs::create_dir_all(&dir).unwrap();
@@ -542,6 +562,28 @@ fn local_llama_args_preserves_computed_head_dim_when_config_omits_it() {
 
     assert_eq!(local.head_dim, Some(64));
     assert_eq!(local.num_attention_heads, 7);
+}
+
+#[test]
+fn tensor_parallel_qwen2_matches_full_model_logits() {
+    let args = make_test_model_args();
+    let weights = make_test_weight_map();
+    let full = Qwen2Model::from_weights(&weights, &args).unwrap();
+    let plan = generate_shard_plan(
+        "qwen2",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelLlamaModel::from_full_weights(&args, &weights, &plan).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
 }
 
 #[test]

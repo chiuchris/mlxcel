@@ -333,7 +333,7 @@ pub fn load_model_with_tensor_parallel(
     let model_path = model_path.as_path();
     let support = validate_supported_runtime(model_path, shard_config.clone(), adapter_path)?;
     let model = match support.summary.model_type {
-        ModelType::Llama => LoadedModel::TensorParallelLlama(
+        ModelType::Llama | ModelType::Qwen2 => LoadedModel::TensorParallelLlama(
             TensorParallelLlamaModel::from_model_dir(model_path, shard_config.clone())?,
         ),
         ModelType::Qwen3 => LoadedModel::TensorParallelQwen3(

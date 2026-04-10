@@ -50,6 +50,7 @@ pub struct TensorParallelRuntimeSupport {
 pub struct TensorParallelLlamaModel {
     ranks: Vec<crate::models::Llama3Model>,
     num_layers_per_rank: usize,
+    prefer_precise_reduction: bool,
 }
 
 impl TensorParallelLlamaModel {
@@ -87,6 +88,7 @@ impl TensorParallelLlamaModel {
         Ok(Self {
             ranks,
             num_layers_per_rank: args.num_hidden_layers,
+            prefer_precise_reduction: args.tie_word_embeddings,
         })
     }
 }
@@ -116,7 +118,11 @@ impl LanguageModel for TensorParallelLlamaModel {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = if self.prefer_precise_reduction {
+                reduce_sum_f32(attn_parts)
+            } else {
+                reduce_sum(attn_parts)
+            };
             h = mlxcel_core::add(&h, &attn_out);
 
             let ffn_norm = self.ranks[0].layers[layer_idx]
@@ -127,7 +133,11 @@ impl LanguageModel for TensorParallelLlamaModel {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = if self.prefer_precise_reduction {
+                reduce_sum_f32(ffn_parts)
+            } else {
+                reduce_sum(ffn_parts)
+            };
             h = mlxcel_core::add(&h, &ff_out);
         }
 
@@ -163,7 +173,11 @@ impl LanguageModel for TensorParallelLlamaModel {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = if self.prefer_precise_reduction {
+                reduce_sum_f32(attn_parts)
+            } else {
+                reduce_sum(attn_parts)
+            };
             h = mlxcel_core::add(&h, &attn_out);
 
             let ffn_norm = self.ranks[0].layers[layer_idx]
@@ -174,7 +188,11 @@ impl LanguageModel for TensorParallelLlamaModel {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = if self.prefer_precise_reduction {
+                reduce_sum_f32(ffn_parts)
+            } else {
+                reduce_sum(ffn_parts)
+            };
             h = mlxcel_core::add(&h, &ff_out);
         }
 
@@ -858,7 +876,7 @@ pub fn validate_supported_runtime(
     );
     let kind = kind.ok_or_else(|| {
         anyhow::anyhow!(
-            "tensor-parallel runtime currently supports only dense Llama/Qwen3/ERNIE/Hunyuan models, got {:?} ({})",
+            "tensor-parallel runtime currently supports only dense Llama/Qwen2/Qwen3/Gemma3/ERNIE/Hunyuan models, got {:?} ({})",
             summary.model_type,
             summary.architecture
         )
@@ -904,6 +922,10 @@ fn local_llama_args(
     local.num_attention_heads /= plan.tp_size;
     local.num_key_value_heads = Some(num_kv_heads / plan.tp_size);
     local.intermediate_size /= plan.tp_size;
+    // TP ranks load a replicated lm_head copy even for tied-embedding checkpoints.
+    // `load_and_sanitize_weights()` guarantees `lm_head.*` exists by copying from
+    // `model.embed_tokens.*` when the original checkpoint ties embeddings.
+    local.tie_word_embeddings = false;
     Ok(local)
 }
 
@@ -1058,6 +1080,9 @@ fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParalle
         ModelType::Llama if is_llama_style_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::LlamaStyle)
         }
+        ModelType::Qwen2 if is_qwen2_architecture(&summary.architecture) => {
+            Some(TensorParallelRuntimeKind::LlamaStyle)
+        }
         ModelType::Qwen3 if is_qwen3_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::Qwen3)
         }
@@ -1079,6 +1104,10 @@ fn is_llama_style_architecture(architecture: &str) -> bool {
         architecture,
         "llama" | "llama3" | "mistral" | "yi" | "tinyllama" | "vicuna"
     )
+}
+
+fn is_qwen2_architecture(architecture: &str) -> bool {
+    matches!(architecture, "qwen2" | "qwen2.5")
 }
 
 fn is_qwen3_architecture(architecture: &str) -> bool {

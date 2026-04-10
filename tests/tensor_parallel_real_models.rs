@@ -136,6 +136,28 @@ fn llama31_8b_tp4_matches_single_rank_greedy_long_generation() {
 
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
+fn qwen2_5_tp2_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen2.5-0.5b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        24,
+        2,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen2_5_7b_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen2.5-7b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
 fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("qwen3-0.6b-4bit"),

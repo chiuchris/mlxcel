@@ -30,7 +30,7 @@ use mlxcel::server::{ServerStartupInput, start_server};
     about = "llama-server compatible HTTP server for MLX inference on Apple Silicon and CUDA GPUs",
     after_help = "\
 Tensor Parallel Runtime:
-  Current multi-rank support: dense Llama, Qwen3, Gemma 3 text, ERNIE 4.5, Hunyuan v1 Dense
+  Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Gemma 3 text, ERNIE 4.5, Hunyuan v1 Dense
   Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
                        LoRA unsupported, sequential worker forced for tp_size > 1"
 )]
@@ -297,8 +297,8 @@ struct Args {
 
     /// Number of tensor-parallel ranks (must be a power of 2).
     ///
-    /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
-    /// Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen2/2.5,
+    /// Qwen3, Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     tp_size: usize,
 
