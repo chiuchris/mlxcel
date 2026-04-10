@@ -60,6 +60,8 @@ fn assert_tp_matches_single_rank(
         model_dir.display(),
         runtime.device
     );
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
 
     let (single_rank_model, tokenizer) = load_model(model_dir).unwrap();
     let (tensor_parallel_model, _) =
@@ -79,6 +81,8 @@ fn assert_tp_matches_single_rank(
         max_tokens,
         &sampling,
     );
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
 
     assert!(
         single_rank_tokens.len() >= 8,
@@ -124,6 +128,17 @@ fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
 
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen3-0.6b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
 fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("ernie-4.5-0.3b-4bit"),
@@ -135,12 +150,34 @@ fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
 
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
+fn ernie45_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("ernie-4.5-0.3b-4bit"),
+        "Continue this sequence with more entries separated by commas: red, blue, green,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
 fn hunyuan_v1_dense_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("hunyuan-1.8b-4bit"),
         "Continue this sequence with more entries separated by commas: spring, summer, autumn,",
         32,
         2,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn hunyuan_v1_dense_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("hunyuan-1.8b-4bit"),
+        "Continue this sequence with more entries separated by commas: spring, summer, autumn,",
+        32,
+        4,
     );
 }
 

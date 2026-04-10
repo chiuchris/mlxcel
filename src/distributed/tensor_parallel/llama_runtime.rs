@@ -615,7 +615,7 @@ impl TensorParallelErnie45Model {
     ) -> Result<Self> {
         let mut ranks = Vec::with_capacity(plan.tp_size);
         for rank in 0..plan.tp_size {
-            let rank_weights = shard_weight_map(weights, plan, rank)?;
+            let rank_weights = shard_ernie45_weight_map(weights, plan, rank, args)?;
             let rank_args = local_ernie45_args(args, plan)?;
             let rank_model = crate::models::Ernie45Model::from_weights(&rank_weights, &rank_args)
                 .map_err(anyhow::Error::msg)?;
@@ -662,7 +662,7 @@ impl LanguageModel for TensorParallelErnie45Model {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = reduce_sum_f32(attn_parts);
             h = mlxcel_core::add(&h, &attn_out);
 
             let ffn_norm = self.ranks[0].layers[layer_idx]
@@ -673,7 +673,7 @@ impl LanguageModel for TensorParallelErnie45Model {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = reduce_sum_f32(ffn_parts);
             h = mlxcel_core::add(&h, &ff_out);
         }
 
@@ -784,7 +784,7 @@ impl LanguageModel for TensorParallelHunyuanV1DenseModel {
                     )
                 })
                 .collect();
-            let attn_out = reduce_sum(attn_parts);
+            let attn_out = reduce_sum_f32(attn_parts);
             h = mlxcel_core::add(&h, &attn_out);
 
             let ffn_norm = self.ranks[0].layers[layer_idx]
@@ -795,7 +795,7 @@ impl LanguageModel for TensorParallelHunyuanV1DenseModel {
                 .iter()
                 .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
                 .collect();
-            let ff_out = reduce_sum(ffn_parts);
+            let ff_out = reduce_sum_f32(ffn_parts);
             h = mlxcel_core::add(&h, &ff_out);
         }
 
@@ -988,8 +988,16 @@ fn local_ernie45_args(
     );
     let num_kv_heads = args.num_kv_heads();
     ensure!(
-        num_kv_heads >= plan.tp_size && num_kv_heads.is_multiple_of(plan.tp_size),
-        "num_key_value_heads ({num_kv_heads}) must be divisible by tp_size ({}) for the current tensor-parallel runtime",
+        num_kv_heads > 0,
+        "num_key_value_heads must be greater than zero for ERNIE 4.5 tensor parallelism"
+    );
+    ensure!(
+        if num_kv_heads < plan.tp_size {
+            plan.tp_size.is_multiple_of(num_kv_heads)
+        } else {
+            num_kv_heads.is_multiple_of(plan.tp_size)
+        },
+        "num_key_value_heads ({num_kv_heads}) must divide tp_size ({}) or be divisible by it for ERNIE 4.5 tensor parallelism",
         plan.tp_size
     );
     ensure!(
@@ -1000,7 +1008,11 @@ fn local_ernie45_args(
     let mut local = args.clone();
     local.head_dim = Some(args.head_dim());
     local.num_attention_heads /= plan.tp_size;
-    local.num_key_value_heads = Some(num_kv_heads / plan.tp_size);
+    local.num_key_value_heads = Some(if num_kv_heads < plan.tp_size {
+        1
+    } else {
+        num_kv_heads / plan.tp_size
+    });
     local.intermediate_size /= plan.tp_size;
     Ok(local)
 }
@@ -1180,6 +1192,58 @@ fn shard_gemma3_weight_map(
                 padded: false,
                 pad_count: 0,
                 strategy: ShardStrategy::Replicated,
+            }
+        } else {
+            compute_shard_spec(&logical_name, &shape, plan, rank)?
+        };
+
+        let sharded_tensor = shard_tensor(tensor, &spec)?;
+        sharded.insert(name.clone(), sharded_tensor);
+    }
+
+    Ok(sharded)
+}
+
+fn shard_ernie45_weight_map(
+    weights: &WeightMap,
+    plan: &ModelShardPlan,
+    rank: usize,
+    args: &crate::models::ernie4_5::ModelArgs,
+) -> Result<WeightMap> {
+    let mut sharded = HashMap::with_capacity(weights.len());
+    let replicate_kv = args.num_kv_heads() < plan.tp_size;
+    let head_dim = args.head_dim();
+    let total_kv_heads = args.num_kv_heads();
+    let ranks_per_kv = if replicate_kv {
+        plan.tp_size / total_kv_heads
+    } else {
+        1
+    };
+
+    for (name, tensor) in weights {
+        let logical_name = logical_weight_name(name);
+        let shape = mlxcel_core::array_shape(tensor);
+        let shape: Vec<usize> = shape
+            .into_iter()
+            .map(|dim| usize::try_from(dim).context("negative tensor dimension"))
+            .collect::<Result<_>>()?;
+
+        let spec = if replicate_kv
+            && (logical_name.ends_with(".self_attn.k_proj.weight")
+                || logical_name.ends_with(".self_attn.v_proj.weight"))
+        {
+            let kv_index = rank / ranks_per_kv;
+            let start_index = kv_index * head_dim;
+            let end_index = start_index + head_dim;
+            ShardSpec {
+                rank,
+                tp_size: plan.tp_size,
+                shard_axis: 0,
+                start_index,
+                end_index,
+                padded: false,
+                pad_count: 0,
+                strategy: ShardStrategy::ColumnParallel,
             }
         } else {
             compute_shard_spec(&logical_name, &shape, plan, rank)?
