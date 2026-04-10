@@ -1,3 +1,13 @@
+mlxcel (0.0.19-1~jammy1) jammy; urgency=medium
+
+  * Feat: Improve sharded/multi-file safetensors loading robustness
+  * Fix: Ensure input contiguity in QuantizedMatmul for MLA models on CUDA
+  * Fix: Skip models exceeding system memory in bench script
+  * Fix: Increase CUDA warmup timeout and add JIT preheat to bench script
+  * CI: Add Teams release notification via Power Automate webhook
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 10 Apr 2026 12:00:00 +0900
+
 mlxcel (0.0.18-1~jammy1) jammy; urgency=medium
 
   * Update: Upgrade MLX upstream to b98831ad with GatherQMM CUDA and SM80/naive QMM
