@@ -393,7 +393,10 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("real.safetensors");
-        std::fs::File::create(&file).unwrap().write_all(b"").unwrap();
+        std::fs::File::create(&file)
+            .unwrap()
+            .write_all(b"")
+            .unwrap();
 
         let (is_sym, exists) = check_symlink(&file);
         assert!(!is_sym);
@@ -446,26 +449,17 @@ mod tests {
     fn test_validate_index_shards_rejects_path_traversal() {
         let dir = tempfile::tempdir().unwrap();
         // Parent directory traversal
-        let result = validate_index_shards(
-            dir.path(),
-            &["../secret.safetensors".to_string()],
-        );
+        let result = validate_index_shards(dir.path(), &["../secret.safetensors".to_string()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid shard filename"));
 
         // Absolute path
-        let result = validate_index_shards(
-            dir.path(),
-            &["/etc/passwd".to_string()],
-        );
+        let result = validate_index_shards(dir.path(), &["/etc/passwd".to_string()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid shard filename"));
 
         // Subdirectory traversal
-        let result = validate_index_shards(
-            dir.path(),
-            &["subdir/model.safetensors".to_string()],
-        );
+        let result = validate_index_shards(dir.path(), &["subdir/model.safetensors".to_string()]);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid shard filename"));
     }
