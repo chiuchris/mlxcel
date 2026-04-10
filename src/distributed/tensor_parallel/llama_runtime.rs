@@ -34,6 +34,8 @@ use super::{
 pub enum TensorParallelRuntimeKind {
     LlamaStyle,
     Qwen3,
+    Ernie45,
+    HunyuanV1Dense,
 }
 
 #[derive(Debug, Clone)]
@@ -371,6 +373,249 @@ impl LanguageModel for TensorParallelQwen3Model {
     }
 }
 
+pub struct TensorParallelErnie45Model {
+    ranks: Vec<crate::models::Ernie45Model>,
+    num_layers_per_rank: usize,
+}
+
+impl TensorParallelErnie45Model {
+    pub fn from_model_dir(model_dir: &Path, shard_config: ShardConfig) -> Result<Self> {
+        let support = validate_supported_runtime(model_dir, shard_config, None)?;
+        ensure!(
+            support.kind == TensorParallelRuntimeKind::Ernie45,
+            "tensor-parallel Ernie45 runtime cannot load {:?}",
+            support.summary.model_type
+        );
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: crate::models::ernie4_5::ModelArgs =
+            serde_json::from_str(&config_str).context("failed to parse ernie4_5 config")?;
+        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        Self::from_full_weights(&args, &weights, &support.summary.plan)
+    }
+
+    fn from_full_weights(
+        args: &crate::models::ernie4_5::ModelArgs,
+        weights: &WeightMap,
+        plan: &ModelShardPlan,
+    ) -> Result<Self> {
+        let mut ranks = Vec::with_capacity(plan.tp_size);
+        for rank in 0..plan.tp_size {
+            let rank_weights = shard_weight_map(weights, plan, rank)?;
+            let rank_args = local_ernie45_args(args, plan)?;
+            let rank_model = crate::models::Ernie45Model::from_weights(&rank_weights, &rank_args)
+                .map_err(anyhow::Error::msg)?;
+            ranks.push(rank_model);
+        }
+
+        Ok(Self {
+            ranks,
+            num_layers_per_rank: args.num_hidden_layers,
+        })
+    }
+
+    fn final_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Some(ref lm_head) = self.ranks[0].lm_head {
+            lm_head.forward(hidden)
+        } else {
+            self.ranks[0].embed_tokens.as_linear(hidden)
+        }
+    }
+}
+
+impl LanguageModel for TensorParallelErnie45Model {
+    fn forward(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut rank_caches = split_rank_caches(caches, self.num_layers_per_rank, self.ranks.len())
+            .expect("tensor-parallel caches must match num_layers");
+        let mut h = self.ranks[0].embed_tokens.forward(input_ids);
+
+        for layer_idx in 0..self.num_layers_per_rank {
+            let attn_norm = self.ranks[0].layers[layer_idx].input_layernorm.forward(&h);
+            let attn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .zip(rank_caches.iter_mut())
+                .map(|(rank, caches)| {
+                    rank.layers[layer_idx].self_attn.forward(
+                        &attn_norm,
+                        &mut caches[layer_idx],
+                        mask,
+                    )
+                })
+                .collect();
+            let attn_out = reduce_sum(attn_parts);
+            h = mlxcel_core::add(&h, &attn_out);
+
+            let ffn_norm = self.ranks[0].layers[layer_idx]
+                .post_attention_layernorm
+                .forward(&h);
+            let ffn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
+                .collect();
+            let ff_out = reduce_sum(ffn_parts);
+            h = mlxcel_core::add(&h, &ff_out);
+        }
+
+        let h = self.ranks[0].norm.forward(&h);
+        self.final_logits(&h)
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        Some(self.ranks[0].embed_tokens.forward(input_ids))
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        (0..self.num_layers()).map(|_| KVCache::new()).collect()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers_per_rank * self.ranks.len()
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        self.ranks[0].eos_token_ids()
+    }
+
+    fn supports_batching(&self) -> bool {
+        false
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        false
+    }
+}
+
+pub struct TensorParallelHunyuanV1DenseModel {
+    ranks: Vec<crate::models::HunyuanV1DenseModel>,
+    num_layers_per_rank: usize,
+}
+
+impl TensorParallelHunyuanV1DenseModel {
+    pub fn from_model_dir(model_dir: &Path, shard_config: ShardConfig) -> Result<Self> {
+        let support = validate_supported_runtime(model_dir, shard_config, None)?;
+        ensure!(
+            support.kind == TensorParallelRuntimeKind::HunyuanV1Dense,
+            "tensor-parallel Hunyuan v1 dense runtime cannot load {:?}",
+            support.summary.model_type
+        );
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: crate::models::hunyuan_v1_dense::ModelArgs =
+            serde_json::from_str(&config_str).context("failed to parse hunyuan_v1_dense config")?;
+        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        Self::from_full_weights(&args, &weights, &support.summary.plan)
+    }
+
+    fn from_full_weights(
+        args: &crate::models::hunyuan_v1_dense::ModelArgs,
+        weights: &WeightMap,
+        plan: &ModelShardPlan,
+    ) -> Result<Self> {
+        let mut ranks = Vec::with_capacity(plan.tp_size);
+        for rank in 0..plan.tp_size {
+            let rank_weights = shard_weight_map(weights, plan, rank)?;
+            let rank_args = local_hunyuan_v1_dense_args(args, plan)?;
+            let rank_model =
+                crate::models::HunyuanV1DenseModel::from_weights(&rank_weights, &rank_args)
+                    .map_err(anyhow::Error::msg)?;
+            ranks.push(rank_model);
+        }
+
+        Ok(Self {
+            ranks,
+            num_layers_per_rank: args.num_hidden_layers,
+        })
+    }
+
+    fn final_logits(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Some(ref lm_head) = self.ranks[0].lm_head {
+            lm_head.forward(hidden)
+        } else {
+            self.ranks[0].embed_tokens.as_linear(hidden)
+        }
+    }
+}
+
+impl LanguageModel for TensorParallelHunyuanV1DenseModel {
+    fn forward(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut rank_caches = split_rank_caches(caches, self.num_layers_per_rank, self.ranks.len())
+            .expect("tensor-parallel caches must match num_layers");
+        let mut h = self.ranks[0].embed_tokens.forward(input_ids);
+
+        for layer_idx in 0..self.num_layers_per_rank {
+            let attn_norm = self.ranks[0].layers[layer_idx].input_layernorm.forward(&h);
+            let attn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .zip(rank_caches.iter_mut())
+                .map(|(rank, caches)| {
+                    rank.layers[layer_idx].self_attn.forward(
+                        &attn_norm,
+                        &mut caches[layer_idx],
+                        mask,
+                    )
+                })
+                .collect();
+            let attn_out = reduce_sum(attn_parts);
+            h = mlxcel_core::add(&h, &attn_out);
+
+            let ffn_norm = self.ranks[0].layers[layer_idx]
+                .post_attention_layernorm
+                .forward(&h);
+            let ffn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
+                .collect();
+            let ff_out = reduce_sum(ffn_parts);
+            h = mlxcel_core::add(&h, &ff_out);
+        }
+
+        let h = self.ranks[0].norm.forward(&h);
+        self.final_logits(&h)
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        Some(self.ranks[0].embed_tokens.forward(input_ids))
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        (0..self.num_layers()).map(|_| KVCache::new()).collect()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers_per_rank * self.ranks.len()
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        self.ranks[0].eos_token_ids()
+    }
+
+    fn supports_batching(&self) -> bool {
+        false
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        false
+    }
+}
+
 pub fn validate_supported_runtime(
     model_path: &Path,
     shard_config: ShardConfig,
@@ -401,7 +646,7 @@ pub fn validate_supported_runtime(
     );
     let kind = kind.ok_or_else(|| {
         anyhow::anyhow!(
-            "tensor-parallel runtime currently supports only dense Llama/Qwen3 models, got {:?} ({})",
+            "tensor-parallel runtime currently supports only dense Llama/Qwen3/ERNIE/Hunyuan models, got {:?} ({})",
             summary.model_type,
             summary.architecture
         )
@@ -481,6 +726,77 @@ fn local_qwen3_args(
     Ok(local)
 }
 
+fn local_ernie45_args(
+    args: &crate::models::ernie4_5::ModelArgs,
+    plan: &ModelShardPlan,
+) -> Result<crate::models::ernie4_5::ModelArgs> {
+    ensure!(
+        args.num_attention_heads.is_multiple_of(plan.tp_size),
+        "num_attention_heads ({}) must be divisible by tp_size ({})",
+        args.num_attention_heads,
+        plan.tp_size
+    );
+    ensure!(
+        args.intermediate_size.is_multiple_of(plan.tp_size),
+        "intermediate_size ({}) must be divisible by tp_size ({})",
+        args.intermediate_size,
+        plan.tp_size
+    );
+    let num_kv_heads = args.num_kv_heads();
+    ensure!(
+        num_kv_heads >= plan.tp_size && num_kv_heads.is_multiple_of(plan.tp_size),
+        "num_key_value_heads ({num_kv_heads}) must be divisible by tp_size ({}) for the current tensor-parallel runtime",
+        plan.tp_size
+    );
+    ensure!(
+        !args.use_bias,
+        "tensor-parallel runtime currently supports bias-free ERNIE 4.5 models only"
+    );
+
+    let mut local = args.clone();
+    local.head_dim = Some(args.head_dim());
+    local.num_attention_heads /= plan.tp_size;
+    local.num_key_value_heads = Some(num_kv_heads / plan.tp_size);
+    local.intermediate_size /= plan.tp_size;
+    Ok(local)
+}
+
+fn local_hunyuan_v1_dense_args(
+    args: &crate::models::hunyuan_v1_dense::ModelArgs,
+    plan: &ModelShardPlan,
+) -> Result<crate::models::hunyuan_v1_dense::ModelArgs> {
+    ensure!(
+        args.num_attention_heads.is_multiple_of(plan.tp_size),
+        "num_attention_heads ({}) must be divisible by tp_size ({})",
+        args.num_attention_heads,
+        plan.tp_size
+    );
+    ensure!(
+        args.intermediate_size.is_multiple_of(plan.tp_size),
+        "intermediate_size ({}) must be divisible by tp_size ({})",
+        args.intermediate_size,
+        plan.tp_size
+    );
+    ensure!(
+        args.num_key_value_heads >= plan.tp_size
+            && args.num_key_value_heads.is_multiple_of(plan.tp_size),
+        "num_key_value_heads ({}) must be divisible by tp_size ({}) for the current tensor-parallel runtime",
+        args.num_key_value_heads,
+        plan.tp_size
+    );
+    ensure!(
+        !args.attention_bias,
+        "tensor-parallel runtime currently supports bias-free Hunyuan v1 dense models only"
+    );
+
+    let mut local = args.clone();
+    local.head_dim = Some(args.head_dim());
+    local.num_attention_heads /= plan.tp_size;
+    local.num_key_value_heads /= plan.tp_size;
+    local.intermediate_size /= plan.tp_size;
+    Ok(local)
+}
+
 fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParallelRuntimeKind> {
     match summary.model_type {
         ModelType::Llama if is_llama_style_architecture(&summary.architecture) => {
@@ -488,6 +804,12 @@ fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParalle
         }
         ModelType::Qwen3 if is_qwen3_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::Qwen3)
+        }
+        ModelType::Ernie45 if summary.architecture == "ernie4_5" => {
+            Some(TensorParallelRuntimeKind::Ernie45)
+        }
+        ModelType::HunyuanV1Dense if summary.architecture == "hunyuan_v1_dense" => {
+            Some(TensorParallelRuntimeKind::HunyuanV1Dense)
         }
         _ => None,
     }

@@ -30,7 +30,8 @@ use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
 use crate::distributed::{
-    ShardConfig, TensorParallelLlamaModel, TensorParallelQwen3Model, validate_supported_runtime,
+    ShardConfig, TensorParallelErnie45Model, TensorParallelHunyuanV1DenseModel,
+    TensorParallelLlamaModel, TensorParallelQwen3Model, validate_supported_runtime,
 };
 use crate::lora;
 use crate::model_metadata::{
@@ -336,6 +337,12 @@ pub fn load_model_with_tensor_parallel(
         ),
         ModelType::Qwen3 => LoadedModel::TensorParallelQwen3(
             TensorParallelQwen3Model::from_model_dir(model_path, shard_config.clone())?,
+        ),
+        ModelType::Ernie45 => LoadedModel::TensorParallelErnie45(
+            TensorParallelErnie45Model::from_model_dir(model_path, shard_config.clone())?,
+        ),
+        ModelType::HunyuanV1Dense => LoadedModel::TensorParallelHunyuanV1Dense(
+            TensorParallelHunyuanV1DenseModel::from_model_dir(model_path, shard_config.clone())?,
         ),
         other => anyhow::bail!(
             "tensor-parallel runtime does not support model type: {:?}",

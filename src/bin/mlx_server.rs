@@ -19,14 +19,20 @@ use mlxcel::server::{ServerStartupInput, start_server};
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
 ///
-/// Drop-in replacement for llama-server (llama.cpp) using Apple Silicon MLX backend.
-/// Supports OpenAI-compatible API endpoints and llama-server native endpoints.
+/// Drop-in replacement for llama-server (llama.cpp) using Apple Silicon MLX or
+/// CUDA backends. Supports OpenAI-compatible API endpoints and llama-server
+/// native endpoints.
 #[derive(Parser, Debug)]
 #[command(
     name = "mlxcel-server",
     author = "Lablup Inc.",
     version,
-    about = "llama-server compatible HTTP server for MLX inference on Apple Silicon"
+    about = "llama-server compatible HTTP server for MLX inference on Apple Silicon and CUDA GPUs",
+    after_help = "\
+Tensor Parallel Runtime:
+  Current multi-rank support: dense Llama, Qwen3, ERNIE 4.5, Hunyuan v1 Dense
+  Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
+                       LoRA unsupported, sequential worker forced for tp_size > 1"
 )]
 struct Args {
     /// Path to the model directory
@@ -119,7 +125,8 @@ struct Args {
     ///
     /// When set, requests are processed one at a time in FIFO order with no
     /// batch scheduler overhead. Equivalent to using `--max-batch-size 1` but
-    /// with explicit sequential semantics and no prefill chunking.
+    /// with explicit sequential semantics and no prefill chunking. This is
+    /// forced automatically when `--tp-size > 1`.
     #[arg(long = "no-batch")]
     no_batch: bool,
 
@@ -288,7 +295,10 @@ struct Args {
     #[arg(long = "pp-layers", value_name = "RANGES")]
     pp_layers: Option<String>,
 
-    /// Number of tensor-parallel ranks (must be a power of 2)
+    /// Number of tensor-parallel ranks (must be a power of 2).
+    ///
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
+    /// ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     tp_size: usize,
 
@@ -300,7 +310,9 @@ struct Args {
     )]
     tp_moe_mode: String,
 
-    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    /// Embedding sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-embedding-mode",
         default_value = "replicated",
@@ -308,7 +320,9 @@ struct Args {
     )]
     tp_embedding_mode: String,
 
-    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    /// LM head sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-lm-head-mode",
         default_value = "replicated",

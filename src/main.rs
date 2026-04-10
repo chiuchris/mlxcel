@@ -18,17 +18,17 @@ use std::path::PathBuf;
 
 mod commands;
 
-/// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon
+/// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs
 ///
 /// A Rust implementation for running Large Language Models, Vision-Language
-/// Models, and Vision-Language-Action Models efficiently on Apple Silicon
-/// using the MLX framework.
+/// Models, and Vision-Language-Action Models efficiently on Apple Silicon and
+/// CUDA GPUs using the MLX framework.
 #[derive(Parser, Debug)]
 #[command(
     name = "mlxcel",
     author = "Lablup Inc.",
     version,
-    about = "High-performance LLM/VLM/VLA inference on Apple Silicon",
+    about = "High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs",
     long_about = None,
     after_help = "\
 Environment Variables:
@@ -37,6 +37,11 @@ Environment Variables:
                            \"max\"  — pin all GPU memory (may OOM on large models)
                            \"0\"    — no limit (default)
                            \"96GB\" — explicit limit (supports GB, MB, or bytes)
+
+Tensor Parallel Runtime:
+  Current multi-rank support: dense Llama, Qwen3, ERNIE 4.5, Hunyuan v1 Dense
+  Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
+                       LoRA unsupported, serve forces sequential worker for tp_size > 1
 
 For more information, visit: https://github.com/lablup/mlxcel"
 )]
@@ -194,7 +199,10 @@ pub(crate) struct SamplingOptions {
 #[derive(Args, Debug)]
 #[command(next_help_heading = "Tensor Parallel Options")]
 pub(crate) struct TensorParallelOptions {
-    /// Number of tensor-parallel ranks (must be a power of 2)
+    /// Number of tensor-parallel ranks (must be a power of 2).
+    ///
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
+    /// ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     pub(crate) tp_size: usize,
 
@@ -206,7 +214,9 @@ pub(crate) struct TensorParallelOptions {
     )]
     pub(crate) tp_moe_mode: String,
 
-    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    /// Embedding sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-embedding-mode",
         default_value = "replicated",
@@ -214,7 +224,9 @@ pub(crate) struct TensorParallelOptions {
     )]
     pub(crate) tp_embedding_mode: String,
 
-    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    /// LM head sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-lm-head-mode",
         default_value = "replicated",
@@ -282,7 +294,8 @@ pub(crate) struct ServeArgs {
     ///
     /// When set, requests are processed one at a time in FIFO order with no
     /// batch scheduler overhead. Equivalent to using `--max-batch-size 1` but
-    /// with explicit sequential semantics and no prefill chunking.
+    /// with explicit sequential semantics and no prefill chunking. This is
+    /// forced automatically when `--tp-size > 1`.
     #[arg(long)]
     no_batch: bool,
 
@@ -477,10 +490,11 @@ pub(crate) struct ServeArgs {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
-    /// Number of tensor-parallel ranks (must be a power of 2)
+    /// Number of tensor-parallel ranks (must be a power of 2).
     ///
-    /// When set to N > 1, model weights are sharded across N ranks using
-    /// column-parallel (Q/K/V, gate/up) and row-parallel (O, down) strategies.
+    /// When set to N > 1, model weights are sharded across N in-process ranks.
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
+    /// ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     tp_size: usize,
 
@@ -492,7 +506,9 @@ pub(crate) struct ServeArgs {
     )]
     tp_moe_mode: String,
 
-    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    /// Embedding sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-embedding-mode",
         default_value = "replicated",
@@ -500,7 +516,9 @@ pub(crate) struct ServeArgs {
     )]
     tp_embedding_mode: String,
 
-    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    /// LM head sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-lm-head-mode",
         default_value = "replicated",

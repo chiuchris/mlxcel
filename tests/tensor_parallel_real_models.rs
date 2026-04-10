@@ -111,3 +111,23 @@ fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
         32,
     );
 }
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("ernie-4.5-0.3b-4bit"),
+        "Continue this sequence with more entries separated by commas: red, blue, green,",
+        32,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn hunyuan_v1_dense_tp2_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("hunyuan-1.8b-4bit"),
+        "Continue this sequence with more entries separated by commas: spring, summer, autumn,",
+        32,
+    );
+}
