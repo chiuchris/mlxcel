@@ -39,7 +39,7 @@ Environment Variables:
                            \"96GB\" — explicit limit (supports GB, MB, or bytes)
 
 Tensor Parallel Runtime:
-  Current multi-rank support: dense Llama, Qwen3, ERNIE 4.5, Hunyuan v1 Dense
+  Current multi-rank support: dense Llama, Qwen3, Gemma 3 text, ERNIE 4.5, Hunyuan v1 Dense
   Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
                        LoRA unsupported, serve forces sequential worker for tp_size > 1
 
@@ -202,7 +202,7 @@ pub(crate) struct TensorParallelOptions {
     /// Number of tensor-parallel ranks (must be a power of 2).
     ///
     /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
-    /// ERNIE 4.5, and Hunyuan v1 Dense models.
+    /// Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     pub(crate) tp_size: usize,
 
@@ -494,7 +494,7 @@ pub(crate) struct ServeArgs {
     ///
     /// When set to N > 1, model weights are sharded across N in-process ranks.
     /// Current multi-rank runtime support is limited to dense Llama, Qwen3,
-    /// ERNIE 4.5, and Hunyuan v1 Dense models.
+    /// Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     tp_size: usize,
 

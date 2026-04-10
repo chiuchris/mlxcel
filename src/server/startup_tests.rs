@@ -285,3 +285,25 @@ fn validate_tensor_parallel_startup_accepts_hunyuan_v1_dense_multi_rank_runtime(
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn validate_tensor_parallel_startup_accepts_gemma3_multi_rank_runtime() {
+    let dir = temp_path("tp-gemma3");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma3_text",
+            "num_hidden_layers": 26
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    validate_tensor_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}

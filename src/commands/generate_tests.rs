@@ -222,3 +222,23 @@ fn validate_tensor_parallel_args_accepts_hunyuan_v1_dense_multi_rank_runtime() {
 
     fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn validate_tensor_parallel_args_accepts_gemma3_multi_rank_runtime() {
+    let dir = temp_model_dir("tp-gemma3");
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma3_text",
+            "num_hidden_layers": 26
+        }"#,
+    )
+    .unwrap();
+
+    let mut args = sample_generate_args(dir.clone());
+    args.tensor_parallel.tp_size = 2;
+
+    validate_tensor_parallel_args(&args).unwrap();
+
+    fs::remove_dir_all(dir).unwrap();
+}

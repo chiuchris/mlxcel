@@ -14,6 +14,7 @@
 
 //! In-process tensor-parallel runtime for dense Llama/Qwen-family models.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -34,6 +35,7 @@ use super::{
 pub enum TensorParallelRuntimeKind {
     LlamaStyle,
     Qwen3,
+    Gemma3,
     Ernie45,
     HunyuanV1Dense,
 }
@@ -254,6 +256,216 @@ impl TensorParallelQwen3Model {
         } else {
             self.ranks[0].embed_tokens.as_linear(hidden)
         }
+    }
+}
+
+pub struct TensorParallelGemma3Model {
+    ranks: Vec<crate::models::Gemma3Model>,
+    rank_caches: RefCell<Vec<Vec<crate::models::gemma3::Cache>>>,
+    num_layers_per_rank: usize,
+}
+
+impl TensorParallelGemma3Model {
+    pub fn from_model_dir(model_dir: &Path, shard_config: ShardConfig) -> Result<Self> {
+        let support = validate_supported_runtime(model_dir, shard_config, None)?;
+        ensure!(
+            support.kind == TensorParallelRuntimeKind::Gemma3,
+            "tensor-parallel Gemma3 runtime cannot load {:?}",
+            support.summary.model_type
+        );
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: crate::models::gemma3::ModelArgs =
+            serde_json::from_str(&config_str).context("failed to parse gemma3 config")?;
+        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        Self::from_full_weights(&args, &weights, &support.summary.plan)
+    }
+
+    fn from_full_weights(
+        args: &crate::models::gemma3::ModelArgs,
+        weights: &WeightMap,
+        plan: &ModelShardPlan,
+    ) -> Result<Self> {
+        let mut ranks = Vec::with_capacity(plan.tp_size);
+        for rank in 0..plan.tp_size {
+            let rank_weights = shard_gemma3_weight_map(weights, plan, rank, args)?;
+            let rank_args = local_gemma3_args(args, plan)?;
+            let rank_model = crate::models::Gemma3Model::from_weights(&rank_weights, &rank_args)
+                .map_err(anyhow::Error::msg)?;
+            ranks.push(rank_model);
+        }
+
+        let rank_caches = ranks
+            .iter()
+            .map(crate::models::Gemma3Model::make_caches)
+            .collect();
+
+        Ok(Self {
+            ranks,
+            rank_caches: RefCell::new(rank_caches),
+            num_layers_per_rank: args.num_hidden_layers,
+        })
+    }
+
+    fn reset_caches(&self) {
+        *self.rank_caches.borrow_mut() = self
+            .ranks
+            .iter()
+            .map(crate::models::Gemma3Model::make_caches)
+            .collect();
+    }
+}
+
+impl LanguageModel for TensorParallelGemma3Model {
+    fn forward(
+        &self,
+        input_ids: &MlxArray,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut rank_caches = self.rank_caches.borrow_mut();
+        let mut h = self.ranks[0].get_embed_tokens(input_ids);
+        let seq_len = mlxcel_core::array_shape(input_ids)[1];
+
+        let (global_mask, sliding_mask) =
+            gemma3_masks(mask, seq_len, &mut rank_caches[0], &self.ranks[0]);
+
+        for layer_idx in 0..self.num_layers_per_rank {
+            let attn_norm = self.ranks[0].layers[layer_idx].input_layernorm.forward(&h);
+            let layer_mask = gemma3_layer_mask(
+                layer_idx,
+                self.ranks[0].sliding_window_pattern,
+                global_mask.as_deref(),
+                sliding_mask.as_deref(),
+            );
+            let attn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .zip(rank_caches.iter_mut())
+                .map(|(rank, caches)| {
+                    rank.layers[layer_idx].self_attn.forward(
+                        &attn_norm,
+                        gemma3_cache_interface(&mut caches[layer_idx]),
+                        layer_mask,
+                    )
+                })
+                .collect();
+            let attn_out = reduce_sum(attn_parts);
+            let post_attn = self.ranks[0].layers[layer_idx]
+                .post_attention_layernorm
+                .forward(&attn_out);
+            h = mlxcel_core::compiled_clip_residual(&h, &post_attn);
+
+            let ffn_norm = self.ranks[0].layers[layer_idx]
+                .pre_feedforward_layernorm
+                .forward(&h);
+            let ffn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
+                .collect();
+            let ff_out = reduce_sum(ffn_parts);
+            let post_ff = self.ranks[0].layers[layer_idx]
+                .post_feedforward_layernorm
+                .forward(&ff_out);
+            h = mlxcel_core::compiled_clip_residual(&h, &post_ff);
+        }
+
+        let h = self.ranks[0].norm.forward(&h);
+        self.ranks[0].lm_head.forward(&h)
+    }
+
+    fn forward_with_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let mut rank_caches = self.rank_caches.borrow_mut();
+        let mut h = if let Some(embeddings) = input_embeddings {
+            let h = mlxcel_core::copy(embeddings);
+            mlxcel_core::multiply_scalar(&h, (self.ranks[0].hidden_size as f32).sqrt())
+        } else {
+            self.ranks[0].get_embed_tokens(input_ids)
+        };
+        let seq_len = mlxcel_core::array_shape(input_ids)[1];
+
+        let (global_mask, sliding_mask) =
+            gemma3_masks(mask, seq_len, &mut rank_caches[0], &self.ranks[0]);
+
+        for layer_idx in 0..self.num_layers_per_rank {
+            let attn_norm = self.ranks[0].layers[layer_idx].input_layernorm.forward(&h);
+            let layer_mask = gemma3_layer_mask(
+                layer_idx,
+                self.ranks[0].sliding_window_pattern,
+                global_mask.as_deref(),
+                sliding_mask.as_deref(),
+            );
+            let attn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .zip(rank_caches.iter_mut())
+                .map(|(rank, caches)| {
+                    rank.layers[layer_idx].self_attn.forward(
+                        &attn_norm,
+                        gemma3_cache_interface(&mut caches[layer_idx]),
+                        layer_mask,
+                    )
+                })
+                .collect();
+            let attn_out = reduce_sum(attn_parts);
+            let post_attn = self.ranks[0].layers[layer_idx]
+                .post_attention_layernorm
+                .forward(&attn_out);
+            h = mlxcel_core::compiled_clip_residual(&h, &post_attn);
+
+            let ffn_norm = self.ranks[0].layers[layer_idx]
+                .pre_feedforward_layernorm
+                .forward(&h);
+            let ffn_parts: Vec<_> = self
+                .ranks
+                .iter()
+                .map(|rank| rank.layers[layer_idx].mlp.forward(&ffn_norm))
+                .collect();
+            let ff_out = reduce_sum(ffn_parts);
+            let post_ff = self.ranks[0].layers[layer_idx]
+                .post_feedforward_layernorm
+                .forward(&ff_out);
+            h = mlxcel_core::compiled_clip_residual(&h, &post_ff);
+        }
+
+        let h = self.ranks[0].norm.forward(&h);
+        self.ranks[0].lm_head.forward(&h)
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        Some(self.ranks[0].embed_tokens.forward(input_ids))
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        self.reset_caches();
+        (0..self.num_layers_per_rank)
+            .map(|_| KVCache::new())
+            .collect()
+    }
+
+    fn num_layers(&self) -> usize {
+        self.num_layers_per_rank
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        vec![0, 1, 106]
+    }
+
+    fn supports_batching(&self) -> bool {
+        false
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        false
     }
 }
 
@@ -726,6 +938,38 @@ fn local_qwen3_args(
     Ok(local)
 }
 
+fn local_gemma3_args(
+    args: &crate::models::gemma3::ModelArgs,
+    plan: &ModelShardPlan,
+) -> Result<crate::models::gemma3::ModelArgs> {
+    ensure!(
+        args.num_attention_heads.is_multiple_of(plan.tp_size),
+        "num_attention_heads ({}) must be divisible by tp_size ({})",
+        args.num_attention_heads,
+        plan.tp_size
+    );
+    ensure!(
+        args.intermediate_size.is_multiple_of(plan.tp_size),
+        "intermediate_size ({}) must be divisible by tp_size ({})",
+        args.intermediate_size,
+        plan.tp_size
+    );
+    ensure!(
+        args.num_key_value_heads > 0,
+        "num_key_value_heads must be greater than zero for Gemma3 tensor parallelism"
+    );
+
+    let mut local = args.clone();
+    local.num_attention_heads /= plan.tp_size;
+    if args.num_key_value_heads >= plan.tp_size
+        && args.num_key_value_heads.is_multiple_of(plan.tp_size)
+    {
+        local.num_key_value_heads /= plan.tp_size;
+    }
+    local.intermediate_size /= plan.tp_size;
+    Ok(local)
+}
+
 fn local_ernie45_args(
     args: &crate::models::ernie4_5::ModelArgs,
     plan: &ModelShardPlan,
@@ -805,6 +1049,9 @@ fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParalle
         ModelType::Qwen3 if is_qwen3_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::Qwen3)
         }
+        ModelType::Gemma3 if is_gemma3_architecture(&summary.architecture) => {
+            Some(TensorParallelRuntimeKind::Gemma3)
+        }
         ModelType::Ernie45 if summary.architecture == "ernie4_5" => {
             Some(TensorParallelRuntimeKind::Ernie45)
         }
@@ -824,6 +1071,10 @@ fn is_llama_style_architecture(architecture: &str) -> bool {
 
 fn is_qwen3_architecture(architecture: &str) -> bool {
     architecture == "qwen3"
+}
+
+fn is_gemma3_architecture(architecture: &str) -> bool {
+    matches!(architecture, "gemma3" | "gemma3_text")
 }
 
 fn split_rank_caches<'a>(
@@ -871,6 +1122,111 @@ fn shard_weight_map(weights: &WeightMap, plan: &ModelShardPlan, rank: usize) -> 
         sharded.insert(name.clone(), sharded_tensor);
     }
     Ok(sharded)
+}
+
+fn shard_gemma3_weight_map(
+    weights: &WeightMap,
+    plan: &ModelShardPlan,
+    rank: usize,
+    args: &crate::models::gemma3::ModelArgs,
+) -> Result<WeightMap> {
+    let mut sharded = HashMap::with_capacity(weights.len());
+    let replicate_kv = args.num_key_value_heads < plan.tp_size;
+
+    for (name, tensor) in weights {
+        let logical_name = logical_weight_name(name);
+        let shape = mlxcel_core::array_shape(tensor);
+        let shape: Vec<usize> = shape
+            .into_iter()
+            .map(|dim| usize::try_from(dim).context("negative tensor dimension"))
+            .collect::<Result<_>>()?;
+
+        let spec = if replicate_kv
+            && (logical_name.ends_with(".self_attn.k_proj.weight")
+                || logical_name.ends_with(".self_attn.v_proj.weight"))
+        {
+            ShardSpec {
+                rank,
+                tp_size: plan.tp_size,
+                shard_axis: 0,
+                start_index: 0,
+                end_index: shape.first().copied().unwrap_or(0),
+                padded: false,
+                pad_count: 0,
+                strategy: ShardStrategy::Replicated,
+            }
+        } else {
+            compute_shard_spec(&logical_name, &shape, plan, rank)?
+        };
+
+        let sharded_tensor = shard_tensor(tensor, &spec)?;
+        sharded.insert(name.clone(), sharded_tensor);
+    }
+
+    Ok(sharded)
+}
+
+fn gemma3_masks(
+    mask: Option<&MlxArray>,
+    seq_len: i32,
+    rank0_caches: &mut [crate::models::gemma3::Cache],
+    rank0: &crate::models::Gemma3Model,
+) -> (Option<UniquePtr<MlxArray>>, Option<UniquePtr<MlxArray>>) {
+    if let Some(mask) = mask {
+        return (Some(mlxcel_core::copy(mask)), Some(mlxcel_core::copy(mask)));
+    }
+    if seq_len == 1 {
+        return (None, None);
+    }
+
+    let global_idx = rank0.sliding_window_pattern - 1;
+    let global_offset = gemma3_cache_offset(&mut rank0_caches[global_idx]);
+    let global_mask = Some(mlxcel_core::utils::create_causal_mask(
+        seq_len,
+        global_offset,
+    ));
+    let sliding_mask = if rank0.sliding_window_pattern > 1 {
+        let sliding_offset = gemma3_cache_offset(&mut rank0_caches[0]);
+        let max_cache = rank0.sliding_window as i32;
+        let effective_offset = sliding_offset.min((max_cache - seq_len).max(0));
+        Some(mlxcel_core::utils::create_causal_mask_with_window(
+            seq_len,
+            effective_offset,
+            Some(max_cache),
+        ))
+    } else {
+        None
+    };
+    (global_mask, sliding_mask)
+}
+
+fn gemma3_layer_mask<'a>(
+    layer_idx: usize,
+    sliding_window_pattern: usize,
+    global_mask: Option<&'a MlxArray>,
+    sliding_mask: Option<&'a MlxArray>,
+) -> Option<&'a MlxArray> {
+    if sliding_window_pattern <= 1 {
+        return global_mask;
+    }
+    let is_global = (layer_idx % sliding_window_pattern) == (sliding_window_pattern - 1);
+    if is_global { global_mask } else { sliding_mask }
+}
+
+fn gemma3_cache_offset(cache: &mut crate::models::gemma3::Cache) -> i32 {
+    match cache {
+        crate::models::gemma3::Cache::Standard(cache) => cache.offset,
+        crate::models::gemma3::Cache::Rotating(cache) => cache.offset,
+    }
+}
+
+fn gemma3_cache_interface(
+    cache: &mut crate::models::gemma3::Cache,
+) -> &mut dyn crate::models::gemma3::CacheInterface {
+    match cache {
+        crate::models::gemma3::Cache::Standard(cache) => cache,
+        crate::models::gemma3::Cache::Rotating(cache) => cache,
+    }
 }
 
 fn logical_weight_name(name: &str) -> String {

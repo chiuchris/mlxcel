@@ -19,11 +19,13 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::weights::WeightMap;
 
 use super::{
-    TensorParallelErnie45Model, TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel,
-    TensorParallelQwen3Model, local_llama_args, logical_weight_name, validate_supported_runtime,
+    TensorParallelErnie45Model, TensorParallelGemma3Model, TensorParallelHunyuanV1DenseModel,
+    TensorParallelLlamaModel, TensorParallelQwen3Model, local_llama_args, logical_weight_name,
+    validate_supported_runtime,
 };
 use crate::distributed::tensor_parallel::{ShardConfig, generate_shard_plan};
 use crate::models::ernie4_5::{Ernie45Model, ModelArgs as Ernie45ModelArgs};
+use crate::models::gemma3::{Gemma3Wrapper, ModelArgs as Gemma3ModelArgs};
 use crate::models::hunyuan_v1_dense::{HunyuanV1DenseModel, ModelArgs as HunyuanV1DenseModelArgs};
 use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
 use crate::models::qwen3::{ModelArgs as Qwen3ModelArgs, Qwen3Model};
@@ -103,6 +105,28 @@ fn make_test_hunyuan_v1_dense_args() -> HunyuanV1DenseModelArgs {
         rope_scaling: None,
         tie_word_embeddings: false,
         head_dim: Some(2),
+        quantization: None,
+    }
+}
+
+fn make_test_gemma3_args() -> Gemma3ModelArgs {
+    Gemma3ModelArgs {
+        model_type: "gemma3_text".to_string(),
+        hidden_size: 4,
+        num_hidden_layers: 1,
+        intermediate_size: 8,
+        num_attention_heads: 2,
+        head_dim: 2,
+        rms_norm_eps: 1e-6,
+        vocab_size: 8,
+        num_key_value_heads: 1,
+        rope_theta: 10_000.0,
+        rope_local_base_freq: 10_000.0,
+        query_pre_attn_scalar: 2.0,
+        sliding_window: 8,
+        sliding_window_pattern: 1,
+        max_position_embeddings: 4096,
+        rope_scaling: None,
         quantization: None,
     }
 }
@@ -256,6 +280,111 @@ fn make_test_hunyuan_v1_dense_weight_map() -> WeightMap {
     weights
 }
 
+fn make_test_gemma3_weight_map() -> WeightMap {
+    let mut weights = HashMap::new();
+    insert_tensor(
+        &mut weights,
+        "model.embed_tokens.weight",
+        &[
+            0.00, 0.10, 0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90, 1.00, 1.10, 1.20, 1.30,
+            1.40, 1.50, 1.60, 1.70, 1.80, 1.90, 2.00, 2.10, 2.20, 2.30, 2.40, 2.50, 2.60, 2.70,
+            2.80, 2.90, 3.00, 3.10,
+        ],
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.q_proj.weight",
+        &[
+            0.1, 0.2, 0.3, 0.4, 0.2, 0.3, 0.4, 0.5, 0.3, 0.4, 0.5, 0.6, 0.4, 0.5, 0.6, 0.7,
+        ],
+        &[4, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.k_proj.weight",
+        &[0.7, 0.6, 0.5, 0.4, 0.6, 0.5, 0.4, 0.3],
+        &[2, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.v_proj.weight",
+        &[0.05, 0.10, 0.15, 0.20, 0.10, 0.15, 0.20, 0.25],
+        &[2, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.o_proj.weight",
+        &[
+            0.20, 0.10, 0.30, 0.40, 0.10, 0.30, 0.20, 0.40, 0.40, 0.30, 0.10, 0.20, 0.30, 0.40,
+            0.20, 0.10,
+        ],
+        &[4, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.q_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.self_attn.k_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.gate_proj.weight",
+        &[
+            0.10, 0.20, 0.30, 0.40, 0.20, 0.30, 0.40, 0.50, 0.30, 0.40, 0.50, 0.60, 0.40, 0.50,
+            0.60, 0.70, 0.50, 0.60, 0.70, 0.80, 0.60, 0.70, 0.80, 0.90, 0.70, 0.80, 0.90, 1.00,
+            0.80, 0.90, 1.00, 1.10,
+        ],
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.up_proj.weight",
+        &[
+            0.15, 0.25, 0.35, 0.45, 0.25, 0.35, 0.45, 0.55, 0.35, 0.45, 0.55, 0.65, 0.45, 0.55,
+            0.65, 0.75, 0.55, 0.65, 0.75, 0.85, 0.65, 0.75, 0.85, 0.95, 0.75, 0.85, 0.95, 1.05,
+            0.85, 0.95, 1.05, 1.15,
+        ],
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "model.layers.0.mlp.down_proj.weight",
+        &[
+            0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35,
+            0.40, 0.45, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.20, 0.25, 0.30, 0.35,
+            0.40, 0.45, 0.50, 0.55,
+        ],
+        &[4, 8],
+    );
+    for norm_name in [
+        "model.layers.0.input_layernorm.weight",
+        "model.layers.0.post_attention_layernorm.weight",
+        "model.layers.0.pre_feedforward_layernorm.weight",
+        "model.layers.0.post_feedforward_layernorm.weight",
+        "model.norm.weight",
+    ] {
+        insert_tensor(&mut weights, norm_name, &[1.0, 1.0, 1.0, 1.0], &[4]);
+    }
+    insert_tensor(
+        &mut weights,
+        "lm_head.weight",
+        &[
+            0.10, 0.20, 0.30, 0.40, 0.20, 0.30, 0.40, 0.50, 0.30, 0.40, 0.50, 0.60, 0.40, 0.50,
+            0.60, 0.70, 0.50, 0.60, 0.70, 0.80, 0.60, 0.70, 0.80, 0.90, 0.70, 0.80, 0.90, 1.00,
+            0.80, 0.90, 1.00, 1.10,
+        ],
+        &[8, 4],
+    );
+    weights
+}
+
 #[test]
 fn logical_weight_name_maps_auxiliary_quantization_keys_to_weight_name() {
     assert_eq!(
@@ -337,6 +466,25 @@ fn validate_supported_runtime_accepts_hunyuan_v1_dense_replicated_path() {
         r#"{
             "model_type": "hunyuan_v1_dense",
             "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
+    assert!(support.force_no_batch);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_supported_runtime_accepts_gemma3_replicated_path() {
+    let dir = std::env::temp_dir().join(format!("mlxcel-tp-gemma3-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma3_text",
+            "num_hidden_layers": 26
         }"#,
     )
     .unwrap();
@@ -452,6 +600,29 @@ fn tensor_parallel_hunyuan_v1_dense_matches_full_model_logits() {
     )
     .unwrap();
     let tp = TensorParallelHunyuanV1DenseModel::from_full_weights(&args, &weights, &plan).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+fn tensor_parallel_gemma3_matches_full_model_logits() {
+    let args = make_test_gemma3_args();
+    let weights = make_test_gemma3_weight_map();
+    let full =
+        Gemma3Wrapper::new(crate::models::Gemma3Model::from_weights(&weights, &args).unwrap());
+    let plan = generate_shard_plan(
+        "gemma3_text",
+        args.num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelGemma3Model::from_full_weights(&args, &weights, &plan).unwrap();
 
     let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
     let mut full_caches = full.make_caches();

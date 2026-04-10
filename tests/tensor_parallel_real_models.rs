@@ -131,3 +131,13 @@ fn hunyuan_v1_dense_tp2_matches_single_rank_greedy_long_generation() {
         32,
     );
 }
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn gemma3_tp2_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("gemma3-1b-4bit"),
+        "Continue this sequence with more entries separated by commas: north, south, east,",
+        32,
+    );
+}

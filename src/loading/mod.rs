@@ -30,8 +30,9 @@ use std::path::{Path, PathBuf};
 
 use crate::LoadedModel;
 use crate::distributed::{
-    ShardConfig, TensorParallelErnie45Model, TensorParallelHunyuanV1DenseModel,
-    TensorParallelLlamaModel, TensorParallelQwen3Model, validate_supported_runtime,
+    ShardConfig, TensorParallelErnie45Model, TensorParallelGemma3Model,
+    TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel, TensorParallelQwen3Model,
+    validate_supported_runtime,
 };
 use crate::lora;
 use crate::model_metadata::{
@@ -337,6 +338,9 @@ pub fn load_model_with_tensor_parallel(
         ),
         ModelType::Qwen3 => LoadedModel::TensorParallelQwen3(
             TensorParallelQwen3Model::from_model_dir(model_path, shard_config.clone())?,
+        ),
+        ModelType::Gemma3 => LoadedModel::TensorParallelGemma3(
+            TensorParallelGemma3Model::from_model_dir(model_path, shard_config.clone())?,
         ),
         ModelType::Ernie45 => LoadedModel::TensorParallelErnie45(
             TensorParallelErnie45Model::from_model_dir(model_path, shard_config.clone())?,
