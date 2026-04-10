@@ -342,3 +342,23 @@ jobs:
             -H "Content-Type: application/json" \
             --data-binary @card.json \
             "$WEBHOOK_URL"
+
+  # ============================================================================
+  # Promote pre-release to full release after all jobs succeed
+  # ============================================================================
+  promote-release:
+    name: Promote to full release
+    needs: [build-macos, build-linux-cuda]
+    if: always() && github.event_name == 'release' && github.event.release.prerelease && needs.build-macos.result == 'success' && needs.build-linux-cuda.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Mark release as non-prerelease
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --prerelease=false
