@@ -202,8 +202,8 @@ fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_llama() {
 }
 
 #[test]
-fn resolve_tensor_parallel_runtime_support_keeps_gemma3_on_sequential_worker() {
-    let dir = temp_path("tp-gemma3-no-batch");
+fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_gemma3() {
+    let dir = temp_path("tp-gemma3-batching");
     std::fs::write(
         dir.join("config.json"),
         r#"{
@@ -219,7 +219,7 @@ fn resolve_tensor_parallel_runtime_support_keeps_gemma3_on_sequential_worker() {
         ..ServerStartupConfig::default()
     };
     let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     std::fs::remove_dir_all(dir).unwrap();
 }

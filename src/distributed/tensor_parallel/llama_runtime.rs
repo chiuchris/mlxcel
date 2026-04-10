@@ -279,7 +279,7 @@ impl TensorParallelQwen3Model {
 
 pub struct TensorParallelGemma3Model {
     ranks: Vec<crate::models::Gemma3Model>,
-    rank_caches: RefCell<Vec<Vec<crate::models::gemma3::Cache>>>,
+    rank_caches: RefCell<HashMap<usize, Vec<Vec<crate::models::gemma3::Cache>>>>,
     num_layers_per_rank: usize,
 }
 
@@ -315,24 +315,65 @@ impl TensorParallelGemma3Model {
             ranks.push(rank_model);
         }
 
-        let rank_caches = ranks
-            .iter()
-            .map(crate::models::Gemma3Model::make_caches)
-            .collect();
-
         Ok(Self {
             ranks,
-            rank_caches: RefCell::new(rank_caches),
+            rank_caches: RefCell::new(HashMap::new()),
             num_layers_per_rank: args.num_hidden_layers,
         })
     }
 
-    fn reset_caches(&self) {
-        *self.rank_caches.borrow_mut() = self
-            .ranks
+    fn fresh_rank_caches(&self) -> Vec<Vec<crate::models::gemma3::Cache>> {
+        self.ranks
             .iter()
             .map(crate::models::Gemma3Model::make_caches)
-            .collect();
+            .collect()
+    }
+
+    fn cache_key(caches: &[KVCache]) -> usize {
+        caches.as_ptr() as usize
+    }
+
+    fn sequence_needs_reset(
+        external_caches: &[KVCache],
+        rank_caches: &[Vec<crate::models::gemma3::Cache>],
+    ) -> bool {
+        external_caches.iter().all(|cache| cache.offset == 0)
+            && rank_caches
+                .iter()
+                .flatten()
+                .any(|cache| gemma3_cache_offset_ref(cache) > 0)
+    }
+
+    fn sync_external_offsets(
+        external_caches: &mut [KVCache],
+        rank_caches: &[crate::models::gemma3::Cache],
+    ) {
+        for (external, internal) in external_caches.iter_mut().zip(rank_caches.iter()) {
+            external.offset = gemma3_cache_offset_ref(internal);
+        }
+    }
+
+    fn rank_caches_for_key<'a>(
+        &'a self,
+        cache_key: usize,
+        external_caches: &[KVCache],
+    ) -> std::cell::RefMut<'a, Vec<Vec<crate::models::gemma3::Cache>>> {
+        let needs_reset = {
+            let cache_sets = self.rank_caches.borrow();
+            cache_sets
+                .get(&cache_key)
+                .is_some_and(|rank_caches| Self::sequence_needs_reset(external_caches, rank_caches))
+        };
+
+        let mut cache_sets = self.rank_caches.borrow_mut();
+        if needs_reset || !cache_sets.contains_key(&cache_key) {
+            cache_sets.insert(cache_key, self.fresh_rank_caches());
+        }
+        std::cell::RefMut::map(cache_sets, |cache_sets| {
+            cache_sets
+                .get_mut(&cache_key)
+                .expect("gemma3 sequence cache entry must exist")
+        })
     }
 }
 
@@ -340,10 +381,11 @@ impl LanguageModel for TensorParallelGemma3Model {
     fn forward(
         &self,
         input_ids: &MlxArray,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut rank_caches = self.rank_caches.borrow_mut();
+        let cache_key = Self::cache_key(caches);
+        let mut rank_caches = self.rank_caches_for_key(cache_key, caches);
         let mut h = self.ranks[0].get_embed_tokens(input_ids);
         let seq_len = mlxcel_core::array_shape(input_ids)[1];
 
@@ -392,6 +434,7 @@ impl LanguageModel for TensorParallelGemma3Model {
         }
 
         let h = self.ranks[0].norm.forward(&h);
+        Self::sync_external_offsets(caches, &rank_caches[0]);
         self.ranks[0].lm_head.forward(&h)
     }
 
@@ -399,10 +442,11 @@ impl LanguageModel for TensorParallelGemma3Model {
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut rank_caches = self.rank_caches.borrow_mut();
+        let cache_key = Self::cache_key(caches);
+        let mut rank_caches = self.rank_caches_for_key(cache_key, caches);
         let mut h = if let Some(embeddings) = input_embeddings {
             let h = mlxcel_core::copy(embeddings);
             mlxcel_core::multiply_scalar(&h, (self.ranks[0].hidden_size as f32).sqrt())
@@ -456,6 +500,7 @@ impl LanguageModel for TensorParallelGemma3Model {
         }
 
         let h = self.ranks[0].norm.forward(&h);
+        Self::sync_external_offsets(caches, &rank_caches[0]);
         self.ranks[0].lm_head.forward(&h)
     }
 
@@ -464,7 +509,6 @@ impl LanguageModel for TensorParallelGemma3Model {
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
-        self.reset_caches();
         (0..self.num_layers_per_rank)
             .map(|_| KVCache::new())
             .collect()
@@ -479,11 +523,20 @@ impl LanguageModel for TensorParallelGemma3Model {
     }
 
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_batched_prefill(&self) -> bool {
         false
+    }
+
+    fn release_sequence_state(&self, caches: &mut [KVCache]) {
+        self.rank_caches
+            .borrow_mut()
+            .remove(&Self::cache_key(caches));
+        for cache in caches.iter_mut() {
+            cache.offset = 0;
+        }
     }
 }
 
@@ -890,7 +943,14 @@ pub fn validate_supported_runtime(
 }
 
 fn runtime_supports_server_batching(kind: TensorParallelRuntimeKind) -> bool {
-    !matches!(kind, TensorParallelRuntimeKind::Gemma3)
+    matches!(
+        kind,
+        TensorParallelRuntimeKind::LlamaStyle
+            | TensorParallelRuntimeKind::Qwen3
+            | TensorParallelRuntimeKind::Gemma3
+            | TensorParallelRuntimeKind::Ernie45
+            | TensorParallelRuntimeKind::HunyuanV1Dense
+    )
 }
 
 fn local_llama_args(
@@ -1337,6 +1397,13 @@ fn gemma3_layer_mask<'a>(
 }
 
 fn gemma3_cache_offset(cache: &mut crate::models::gemma3::Cache) -> i32 {
+    match cache {
+        crate::models::gemma3::Cache::Standard(cache) => cache.offset,
+        crate::models::gemma3::Cache::Rotating(cache) => cache.offset,
+    }
+}
+
+fn gemma3_cache_offset_ref(cache: &crate::models::gemma3::Cache) -> i32 {
     match cache {
         crate::models::gemma3::Cache::Standard(cache) => cache.offset,
         crate::models::gemma3::Cache::Rotating(cache) => cache.offset,

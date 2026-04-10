@@ -510,7 +510,7 @@ fn validate_supported_runtime_accepts_gemma3_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }
