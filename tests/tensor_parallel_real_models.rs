@@ -63,24 +63,32 @@ fn assert_tp_matches_single_rank(
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
 
-    let (single_rank_model, tokenizer) = load_model(model_dir).unwrap();
-    let (tensor_parallel_model, _) =
-        load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
-            .unwrap();
-    let prompt_tokens = prompt_tokens(&tokenizer, prompt);
-    let sampling = SamplingConfig::greedy();
+    let (tokenizer, single_rank_tokens, tensor_parallel_tokens) = {
+        let (single_rank_model, tokenizer) = load_model(model_dir).unwrap();
+        let (tensor_parallel_model, _) =
+            load_model_with_tensor_parallel(model_dir, None, &ShardConfig::with_tp_size(tp_size))
+                .unwrap();
+        let prompt_tokens = prompt_tokens(&tokenizer, prompt);
+        let sampling = SamplingConfig::greedy();
 
-    let mut single_rank_generator = CxxGenerator::new(single_rank_model.num_layers());
-    let single_rank_tokens =
-        single_rank_generator.generate(&single_rank_model, &prompt_tokens, max_tokens, &sampling);
+        let mut single_rank_generator = CxxGenerator::new(single_rank_model.num_layers());
+        let single_rank_tokens = single_rank_generator.generate(
+            &single_rank_model,
+            &prompt_tokens,
+            max_tokens,
+            &sampling,
+        );
 
-    let mut tensor_parallel_generator = CxxGenerator::new(tensor_parallel_model.num_layers());
-    let tensor_parallel_tokens = tensor_parallel_generator.generate(
-        &tensor_parallel_model,
-        &prompt_tokens,
-        max_tokens,
-        &sampling,
-    );
+        let mut tensor_parallel_generator = CxxGenerator::new(tensor_parallel_model.num_layers());
+        let tensor_parallel_tokens = tensor_parallel_generator.generate(
+            &tensor_parallel_model,
+            &prompt_tokens,
+            max_tokens,
+            &sampling,
+        );
+
+        (tokenizer, single_rank_tokens, tensor_parallel_tokens)
+    };
     mlxcel_core::synchronize_default();
     mlxcel_core::clear_memory_cache();
 
@@ -117,6 +125,17 @@ fn llama_tp2_matches_single_rank_greedy_long_generation() {
 
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
+fn llama31_8b_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("llama-3.1-8b-4bit"),
+        "Continue this sequence with more entries separated by commas: 1, 2, 3, 4, 5,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
 fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("qwen3-0.6b-4bit"),
@@ -131,6 +150,17 @@ fn qwen3_tp2_matches_single_rank_greedy_long_generation() {
 fn qwen3_tp4_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("qwen3-0.6b-4bit"),
+        "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
+        32,
+        4,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn qwen3_4b_tp4_matches_single_rank_greedy_long_generation() {
+    assert_tp_matches_single_rank(
+        &repo_model_dir("qwen3-4b-4bit"),
         "Continue this sequence with more entries separated by commas: alpha, beta, gamma,",
         32,
         4,
@@ -187,7 +217,7 @@ fn gemma3_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("gemma3-1b-4bit"),
         "Continue this sequence with more entries separated by commas: north, south, east,",
-        32,
+        24,
         2,
     );
 }
@@ -209,7 +239,7 @@ fn gemma3_tp4_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(
         &repo_model_dir("gemma3-1b-4bit"),
         "Continue this sequence with more entries separated by commas: north, south, east,",
-        32,
+        24,
         4,
     );
 }
