@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.20] - 2026-04-10
+
+### Added
+- In-process tensor parallel runtime for Llama (#235)
+- Tensor parallel support for Qwen2, Qwen3, and Qwen3.5 text models (#235)
+- Gemma 3 tensor-parallel runtime with tp4 parity stabilization (#235)
+- Gemma 4 tensor-parallel support (#235)
+- Dense TP support for ERNIE 4.5 and Hunyuan v1 models (#235)
+- Server batching support for tensor parallel runtimes (#235)
+- Tensor-parallel config wiring into CLI and server entrypoints (#235)
+
+### Fixed
+- Qwen 3.5 tensor-parallel parity on large CUDA models (#235)
+
+### Changed
+- Expand tp4 parity coverage to larger models and server end-to-end tests (#235)
+
+## [v0.0.19] - 2026-04-10
+
+### Added
+- Improved sharded/multi-file safetensors loading robustness
+- Teams release notification via Power Automate webhook
+
+### Fixed
+- Ensure input contiguity in QuantizedMatmul for MLA models on CUDA
+- Skip models exceeding system memory in bench script
+- Increase CUDA warmup timeout and add JIT preheat to bench script
+
 ## [v0.0.18] - 2026-04-08
 
 ### Added
@@ -364,6 +392,8 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.20]: https://github.com/lablup/mlxcel/compare/v0.0.19...v0.0.20
+[v0.0.19]: https://github.com/lablup/mlxcel/compare/v0.0.18...v0.0.19
 [v0.0.18]: https://github.com/lablup/mlxcel/compare/v0.0.17...v0.0.18
 [v0.0.17]: https://github.com/lablup/mlxcel/compare/v0.0.16...v0.0.17
 [v0.0.16]: https://github.com/lablup/mlxcel/compare/v0.0.15...v0.0.16

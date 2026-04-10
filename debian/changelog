@@ -1,3 +1,13 @@
+mlxcel (0.0.20-1~jammy1) jammy; urgency=medium
+
+  * Feat: In-process tensor parallel runtime for Llama, Qwen2/3/3.5, Gemma 3/4, ERNIE, Hunyuan
+  * Feat: Server batching support for tensor parallel runtimes
+  * Feat: Gemma 4 tensor-parallel support
+  * Fix: Qwen 3.5 tensor-parallel parity on large CUDA models
+  * Test: Expand tp4 parity coverage for Qwen3, ERNIE, Hunyuan, Gemma 3
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Thu, 10 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.19-1~jammy1) jammy; urgency=medium
 
   * Feat: Improve sharded/multi-file safetensors loading robustness
