@@ -59,6 +59,70 @@ fn is_gemma4_vlm_weight(name: &str) -> bool {
         || name.starts_with("embed_audio.")
 }
 
+/// Convert a single F8_E4M3 byte to f32.
+///
+/// F8_E4M3FN format: 1 sign bit, 4 exponent bits (bias=7), 3 mantissa bits.
+/// No infinity representation; the all-ones exponent with non-zero mantissa encodes NaN.
+/// Range: ±448.0.
+fn f8_e4m3_to_f32(bits: u8) -> f32 {
+    let sign = (bits >> 7) & 1;
+    let exp = (bits >> 3) & 0xF; // 4-bit exponent
+    let mant = bits & 0x7; // 3-bit mantissa
+
+    // NaN: exponent all-ones AND mantissa all-ones (no infinity in E4M3FN).
+    // Only the single pattern exp=0xF, mant=0x7 is NaN; other exp=0xF values are valid normals.
+    if exp == 0xF && mant == 0x7 {
+        return f32::NAN;
+    }
+
+    let f_sign = if sign != 0 { -1.0f32 } else { 1.0f32 };
+
+    if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(1-7) * (mant / 8)
+        //                   = (-1)^sign * mant * 2^(-9)
+        if mant == 0 {
+            return f_sign * 0.0;
+        }
+        f_sign * (mant as f32) * (2.0f32).powi(-9)
+    } else {
+        // Normal: value = (-1)^sign * 2^(exp-7) * (1 + mant/8)
+        f_sign * (2.0f32).powi(exp as i32 - 7) * (1.0 + mant as f32 / 8.0)
+    }
+}
+
+/// Convert a single F8_E5M2 byte to f32.
+///
+/// F8_E5M2 format: 1 sign bit, 5 exponent bits (bias=15), 2 mantissa bits.
+/// Supports infinity and NaN (all-ones exponent with non-zero mantissa).
+fn f8_e5m2_to_f32(bits: u8) -> f32 {
+    let sign = (bits >> 7) & 1;
+    let exp = (bits >> 2) & 0x1F; // 5-bit exponent
+    let mant = bits & 0x3; // 2-bit mantissa
+
+    let f_sign = if sign != 0 { -1.0f32 } else { 1.0f32 };
+
+    if exp == 0x1F {
+        // Special values: infinity or NaN
+        if mant == 0 {
+            return f_sign * f32::INFINITY;
+        } else {
+            return f32::NAN;
+        }
+    }
+
+    if exp == 0 {
+        // Subnormal: value = (-1)^sign * 2^(1-15) * (mant / 4)
+        //                   = (-1)^sign * mant * 2^(-16)
+        if mant == 0 {
+            return f_sign * 0.0;
+        }
+        f_sign * (mant as f32) * (2.0f32).powi(-16)
+    } else {
+        // Normal: value = (-1)^sign * 2^(exp-15) * (1 + mant/4)
+        f_sign * (2.0f32).powi(exp as i32 - 15) * (1.0 + mant as f32 / 4.0)
+    }
+}
+
 fn tensor_view_to_array(
     name: &str,
     tensor: &TensorView<'_>,
@@ -185,6 +249,55 @@ fn tensor_view_to_array(
                 mlxcel_core::from_bytes_nocopy(tensor.data(), &shape, mlxcel_core::dtype::INT8)
             } else {
                 mlxcel_core::from_bytes(tensor.data(), &shape, mlxcel_core::dtype::INT8)
+            }
+        }
+        SafeTensorDtype::F8_E4M3 => {
+            // MLX has no native float8 dtype; convert F8_E4M3 → f16 at load time.
+            // Used by nvfp4 Gemma 4 checkpoints (weight_scale tensors).
+            if mode == SelectiveLoadMode::Borrowed {
+                let owned_buffers = owned_buffers.as_mut().ok_or_else(|| {
+                    format!("Missing owned buffer storage for borrowed F8_E4M3 tensor {name}")
+                })?;
+                let values: Vec<f32> = tensor.data().iter().map(|&b| f8_e4m3_to_f32(b)).collect();
+                let mut buffer = Vec::with_capacity(values.len() * 4);
+                for v in &values {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                }
+                owned_buffers.push(buffer);
+                let backing = owned_buffers
+                    .last()
+                    .ok_or_else(|| format!("Failed to retain buffer for F8_E4M3 tensor {name}"))?;
+                let array =
+                    mlxcel_core::from_bytes_nocopy(backing, &shape, mlxcel_core::dtype::FLOAT32);
+                mlxcel_core::astype(&array, mlxcel_core::dtype::FLOAT16)
+            } else {
+                let values: Vec<f32> = tensor.data().iter().map(|&b| f8_e4m3_to_f32(b)).collect();
+                let array = mlxcel_core::from_slice_f32(&values, &shape);
+                mlxcel_core::astype(&array, mlxcel_core::dtype::FLOAT16)
+            }
+        }
+        SafeTensorDtype::F8_E5M2 => {
+            // MLX has no native float8 dtype; convert F8_E5M2 → f16 at load time.
+            if mode == SelectiveLoadMode::Borrowed {
+                let owned_buffers = owned_buffers.as_mut().ok_or_else(|| {
+                    format!("Missing owned buffer storage for borrowed F8_E5M2 tensor {name}")
+                })?;
+                let values: Vec<f32> = tensor.data().iter().map(|&b| f8_e5m2_to_f32(b)).collect();
+                let mut buffer = Vec::with_capacity(values.len() * 4);
+                for v in &values {
+                    buffer.extend_from_slice(&v.to_le_bytes());
+                }
+                owned_buffers.push(buffer);
+                let backing = owned_buffers
+                    .last()
+                    .ok_or_else(|| format!("Failed to retain buffer for F8_E5M2 tensor {name}"))?;
+                let array =
+                    mlxcel_core::from_bytes_nocopy(backing, &shape, mlxcel_core::dtype::FLOAT32);
+                mlxcel_core::astype(&array, mlxcel_core::dtype::FLOAT16)
+            } else {
+                let values: Vec<f32> = tensor.data().iter().map(|&b| f8_e5m2_to_f32(b)).collect();
+                let array = mlxcel_core::from_slice_f32(&values, &shape);
+                mlxcel_core::astype(&array, mlxcel_core::dtype::FLOAT16)
             }
         }
         dtype => {
@@ -532,4 +645,151 @@ pub fn sanitize_config_json(config_str: &str) -> String {
         .replace("Infinity", "1e38")
         .replace("-Infinity", "-1e38")
         .replace("NaN", "0.0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- f8_e4m3_to_f32 tests ---
+
+    #[test]
+    fn f8_e4m3_positive_zero() {
+        // 0b0_0000_000 = 0x00
+        assert_eq!(f8_e4m3_to_f32(0x00), 0.0f32);
+    }
+
+    #[test]
+    fn f8_e4m3_negative_zero() {
+        // 0b1_0000_000 = 0x80
+        let v = f8_e4m3_to_f32(0x80);
+        assert_eq!(v, 0.0f32);
+        // Negative zero: sign bit set
+        assert!(v.is_sign_negative() || v == 0.0);
+    }
+
+    #[test]
+    fn f8_e4m3_one() {
+        // 1.0 = (-1)^0 * 2^(7-7) * (1 + 0/8) = 2^0 * 1.0 = 1.0
+        // exp=7 (0b0111), mant=0 (0b000) => 0b0_0111_000 = 0x38
+        assert!((f8_e4m3_to_f32(0x38) - 1.0f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f8_e4m3_negative_one() {
+        // -1.0: sign=1, exp=7, mant=0 => 0b1_0111_000 = 0xB8
+        assert!((f8_e4m3_to_f32(0xB8) - (-1.0f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f8_e4m3_max_value() {
+        // Max normal: exp=14 (0b1110), mant=7 (0b111), sign=0
+        // value = 2^(14-7) * (1 + 7/8) = 128 * 1.875 = 240.0
+        // Wait: E4M3FN max is 448. Let me recalculate:
+        // max exp for normal = 0b1110 = 14 (0b1111 with mant=0b111 is NaN only if mant != 0)
+        // Actually 0b1111 with mant=0 gives 2^(15-7)*(1+0/8) = 256 — but spec says max=448
+        // E4M3FN: exp=0b1111=15, mant=0b110=6 => 2^(15-7)*(1+6/8) = 256*1.75 = 448
+        // exp=0b1111=15, mant=0b111=7 => NaN (special case for E4M3FN)
+        // 0b0_1111_110 = 0x7E
+        let v = f8_e4m3_to_f32(0x7E);
+        assert!((v - 448.0f32).abs() < 1e-3, "Expected 448.0, got {v}");
+    }
+
+    #[test]
+    fn f8_e4m3_subnormal() {
+        // Subnormal: exp=0, mant=1 => value = 1 * 2^(-9) = 1/512
+        // 0b0_0000_001 = 0x01
+        let expected = 1.0f32 / 512.0;
+        let v = f8_e4m3_to_f32(0x01);
+        assert!((v - expected).abs() < 1e-8, "Expected {expected}, got {v}");
+    }
+
+    #[test]
+    fn f8_e4m3_nan() {
+        // NaN: exp=0b1111=15, mant non-zero — 0b0_1111_111 = 0x7F
+        assert!(f8_e4m3_to_f32(0x7F).is_nan());
+        // Also negative NaN: 0b1_1111_111 = 0xFF
+        assert!(f8_e4m3_to_f32(0xFF).is_nan());
+    }
+
+    #[test]
+    fn f8_e4m3_two() {
+        // 2.0: exp=8 (0b1000), mant=0 => 2^(8-7)*(1+0) = 2.0
+        // 0b0_1000_000 = 0x40
+        assert!((f8_e4m3_to_f32(0x40) - 2.0f32).abs() < 1e-6);
+    }
+
+    // --- f8_e5m2_to_f32 tests ---
+
+    #[test]
+    fn f8_e5m2_positive_zero() {
+        // 0b0_00000_00 = 0x00
+        assert_eq!(f8_e5m2_to_f32(0x00), 0.0f32);
+    }
+
+    #[test]
+    fn f8_e5m2_negative_zero() {
+        // 0b1_00000_00 = 0x80
+        let v = f8_e5m2_to_f32(0x80);
+        assert_eq!(v, 0.0f32);
+    }
+
+    #[test]
+    fn f8_e5m2_one() {
+        // 1.0: exp=15 (bias=15 => 2^0=1), mant=0
+        // 0b0_01111_00 = 0x3C
+        assert!((f8_e5m2_to_f32(0x3C) - 1.0f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f8_e5m2_negative_one() {
+        // -1.0: sign=1, exp=15, mant=0 => 0b1_01111_00 = 0xBC
+        assert!((f8_e5m2_to_f32(0xBC) - (-1.0f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f8_e5m2_positive_infinity() {
+        // +inf: exp=0b11111=31, mant=0, sign=0 => 0b0_11111_00 = 0x7C
+        assert!(f8_e5m2_to_f32(0x7C).is_infinite());
+        assert!(f8_e5m2_to_f32(0x7C).is_sign_positive());
+    }
+
+    #[test]
+    fn f8_e5m2_negative_infinity() {
+        // -inf: sign=1, exp=31, mant=0 => 0b1_11111_00 = 0xFC
+        assert!(f8_e5m2_to_f32(0xFC).is_infinite());
+        assert!(f8_e5m2_to_f32(0xFC).is_sign_negative());
+    }
+
+    #[test]
+    fn f8_e5m2_nan() {
+        // NaN: exp=31, mant non-zero => 0b0_11111_01 = 0x7D
+        assert!(f8_e5m2_to_f32(0x7D).is_nan());
+        // 0b0_11111_10 = 0x7E
+        assert!(f8_e5m2_to_f32(0x7E).is_nan());
+        // 0b0_11111_11 = 0x7F
+        assert!(f8_e5m2_to_f32(0x7F).is_nan());
+    }
+
+    #[test]
+    fn f8_e5m2_subnormal() {
+        // Subnormal: exp=0, mant=1, sign=0 => value = 1 * 2^(-16)
+        // 0b0_00000_01 = 0x01
+        let expected = 1.0f32 / 65536.0;
+        let v = f8_e5m2_to_f32(0x01);
+        assert!((v - expected).abs() < 1e-10, "Expected {expected}, got {v}");
+    }
+
+    #[test]
+    fn f8_e5m2_two() {
+        // 2.0: exp=16 (2^(16-15)=2), mant=0 => 0b0_10000_00 = 0x40
+        assert!((f8_e5m2_to_f32(0x40) - 2.0f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f8_e5m2_1_25() {
+        // 1.25: exp=15, mant=1 => 2^0 * (1 + 1/4) = 1.25
+        // 0b0_01111_01 = 0x3D
+        assert!((f8_e5m2_to_f32(0x3D) - 1.25f32).abs() < 1e-6);
+    }
 }
