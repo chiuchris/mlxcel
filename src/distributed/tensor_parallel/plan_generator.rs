@@ -73,6 +73,7 @@ pub fn generate_shard_plan(
 
         // Gemma family
         "gemma" | "gemma2" | "gemma3" | "gemma3n" => build_gemma_plan(num_layers, config),
+        "gemma4" | "gemma4_text" => build_gemma4_plan(num_layers, config),
 
         // Phi family
         "phi" | "phi3" | "phi3small" | "phi4mm" => build_phi_plan(num_layers, config),
@@ -470,6 +471,41 @@ fn build_gemma_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShar
         embedding_strategy: resolve_embedding_strategy(config.embedding_mode),
         lm_head_strategy: resolve_embedding_strategy(config.lm_head_mode),
         architecture: "gemma".to_string(),
+    })
+}
+
+/// Gemma 4 text models: mixed sliding/full attention with optional dense/MoE FFN.
+fn build_gemma4_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShardPlan> {
+    let prefix = "language_model.model.layers.{}";
+    let mut plans = attention_plans(prefix);
+    plans.extend(ffn_plans(prefix));
+    plans.extend(vec![
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.gate_proj.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 1,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.up_proj.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 1,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.down_proj.weight"),
+            strategy: ShardStrategy::RowParallel,
+            shard_axis: 2,
+            comm_pattern: CommPattern::AllReduce,
+        },
+    ]);
+    Ok(ModelShardPlan {
+        tp_size: config.tp_size,
+        num_layers,
+        layer_plans: plans,
+        embedding_strategy: resolve_embedding_strategy(config.embedding_mode),
+        lm_head_strategy: resolve_embedding_strategy(config.lm_head_mode),
+        architecture: "gemma4".to_string(),
     })
 }
 

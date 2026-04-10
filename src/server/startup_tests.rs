@@ -225,6 +225,93 @@ fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_gemma3() {
 }
 
 #[test]
+fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_gemma4() {
+    let dir = temp_path("tp-gemma4-batching");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 42
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
+    assert!(!support.force_no_batch);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolve_tensor_parallel_runtime_support_forces_no_batch_for_gemma4_e2b_fallback() {
+    let dir = temp_path("tp-gemma4-e2b-fallback");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "hidden_size": 1536,
+                "num_hidden_layers": 35,
+                "intermediate_size": 6144,
+                "num_attention_heads": 8,
+                "head_dim": 256,
+                "rms_norm_eps": 1e-6,
+                "vocab_size": 262144,
+                "vocab_size_per_layer_input": 262144,
+                "num_key_value_heads": 1,
+                "num_global_key_value_heads": null,
+                "num_kv_shared_layers": 20,
+                "hidden_size_per_layer_input": 256,
+                "rope_traditional": false,
+                "rope_parameters": {
+                    "sliding_attention": {"rope_theta": 10000.0, "partial_rotary_factor": 1.0},
+                    "full_attention": {"rope_theta": 1000000.0, "partial_rotary_factor": 0.25}
+                },
+                "sliding_window": 512,
+                "sliding_window_pattern": 1,
+                "max_position_embeddings": 131072,
+                "attention_k_eq_v": false,
+                "final_logit_softcapping": 30.0,
+                "use_double_wide_mlp": true,
+                "enable_moe_block": false,
+                "num_experts": null,
+                "top_k_experts": null,
+                "moe_intermediate_size": null,
+                "layer_types": [
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention",
+                    "sliding_attention","sliding_attention","sliding_attention","sliding_attention","full_attention"
+                ]
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
+    assert!(support.force_no_batch);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn validate_tensor_parallel_startup_accepts_single_rank() {
     let dir = temp_path("tp-single");
     std::fs::write(
@@ -385,6 +472,31 @@ fn validate_tensor_parallel_startup_accepts_gemma3_multi_rank_runtime() {
         r#"{
             "model_type": "gemma3_text",
             "num_hidden_layers": 26
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    validate_tensor_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_tensor_parallel_startup_accepts_gemma4_multi_rank_runtime() {
+    let dir = temp_path("tp-gemma4");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 26
+            }
         }"#,
     )
     .unwrap();

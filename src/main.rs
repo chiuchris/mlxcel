@@ -39,9 +39,10 @@ Environment Variables:
                            \"96GB\" — explicit limit (supports GB, MB, or bytes)
 
 Tensor Parallel Runtime:
-  Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Gemma 3 text, ERNIE 4.5, Hunyuan v1 Dense
+  Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, Hunyuan v1 Dense
   Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
-                       LoRA unsupported, server batching supported for all listed dense runtimes
+                       LoRA unsupported, server batching supported for listed dense runtimes
+                       except Gemma 4 E2B-style conservative fallback checkpoints
 
 For more information, visit: https://github.com/lablup/mlxcel"
 )]
@@ -202,7 +203,8 @@ pub(crate) struct TensorParallelOptions {
     /// Number of tensor-parallel ranks (must be a power of 2).
     ///
     /// Current multi-rank runtime support is limited to dense Llama, Qwen2/2.5,
-    /// Qwen3, Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
+    /// Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, and
+    /// Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     pub(crate) tp_size: usize,
 

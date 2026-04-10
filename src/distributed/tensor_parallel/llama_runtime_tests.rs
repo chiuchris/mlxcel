@@ -19,13 +19,14 @@ use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::weights::WeightMap;
 
 use super::{
-    TensorParallelErnie45Model, TensorParallelGemma3Model, TensorParallelHunyuanV1DenseModel,
-    TensorParallelLlamaModel, TensorParallelQwen3Model, TensorParallelQwen35Model,
+    TensorParallelErnie45Model, TensorParallelGemma3Model, TensorParallelGemma4Model,
+    TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel, TensorParallelQwen3Model, TensorParallelQwen35Model,
     local_llama_args, logical_weight_name, validate_supported_runtime,
 };
 use crate::distributed::tensor_parallel::{ShardConfig, generate_shard_plan};
 use crate::models::ernie4_5::{Ernie45Model, ModelArgs as Ernie45ModelArgs};
 use crate::models::gemma3::{Gemma3Wrapper, ModelArgs as Gemma3ModelArgs};
+use crate::models::gemma4::{Gemma4Wrapper, ModelArgs as Gemma4ModelArgs, RopeParameters as Gemma4RopeParameters};
 use crate::models::hunyuan_v1_dense::{HunyuanV1DenseModel, ModelArgs as HunyuanV1DenseModelArgs};
 use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
 use crate::models::qwen2::Qwen2Model;
@@ -160,6 +161,59 @@ fn make_test_gemma3_args() -> Gemma3ModelArgs {
         sliding_window_pattern: 1,
         max_position_embeddings: 4096,
         rope_scaling: None,
+        quantization: None,
+    }
+}
+
+fn make_test_gemma4_args() -> Gemma4ModelArgs {
+    let mut rope_parameters = HashMap::new();
+    rope_parameters.insert(
+        "sliding_attention".to_string(),
+        Gemma4RopeParameters {
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 1.0,
+        },
+    );
+    rope_parameters.insert(
+        "full_attention".to_string(),
+        Gemma4RopeParameters {
+            rope_theta: 10_000.0,
+            partial_rotary_factor: 1.0,
+        },
+    );
+
+    Gemma4ModelArgs {
+        model_type: "gemma4".to_string(),
+        text_config: serde_json::json!({
+            "model_type": "gemma4_text",
+            "hidden_size": 4,
+            "num_hidden_layers": 1,
+            "intermediate_size": 8,
+            "num_attention_heads": 2,
+            "head_dim": 2,
+            "rms_norm_eps": 1e-6,
+            "vocab_size": 8,
+            "vocab_size_per_layer_input": 0,
+            "num_key_value_heads": 1,
+            "num_global_key_value_heads": null,
+            "num_kv_shared_layers": 0,
+            "hidden_size_per_layer_input": 0,
+            "rope_traditional": false,
+            "rope_parameters": rope_parameters,
+            "sliding_window": 8,
+            "sliding_window_pattern": 1,
+            "max_position_embeddings": 4096,
+            "attention_k_eq_v": false,
+            "final_logit_softcapping": null,
+            "use_double_wide_mlp": false,
+            "enable_moe_block": false,
+            "num_experts": null,
+            "top_k_experts": null,
+            "moe_intermediate_size": null,
+            "layer_types": ["sliding_attention"],
+            "quantization": null
+        }),
+        eos_token_id: Some(serde_json::json!([1])),
         quantization: None,
     }
 }
@@ -557,6 +611,101 @@ fn make_test_gemma3_weight_map() -> WeightMap {
     weights
 }
 
+fn make_test_gemma4_weight_map() -> WeightMap {
+    let mut weights = HashMap::new();
+    insert_tensor(
+        &mut weights,
+        "language_model.model.embed_tokens.weight",
+        &seq_values(32, 0.0, 0.1),
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+        &[
+            0.1, 0.2, 0.3, 0.4, 0.2, 0.3, 0.4, 0.5, 0.3, 0.4, 0.5, 0.6, 0.4, 0.5, 0.6, 0.7,
+        ],
+        &[4, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.k_proj.weight",
+        &[0.7, 0.6, 0.5, 0.4, 0.6, 0.5, 0.4, 0.3],
+        &[2, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.v_proj.weight",
+        &[0.05, 0.10, 0.15, 0.20, 0.10, 0.15, 0.20, 0.25],
+        &[2, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.o_proj.weight",
+        &[
+            0.20, 0.10, 0.30, 0.40, 0.10, 0.30, 0.20, 0.40, 0.40, 0.30, 0.10, 0.20, 0.30, 0.40,
+            0.20, 0.10,
+        ],
+        &[4, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.q_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.self_attn.k_norm.weight",
+        &[1.0, 1.0],
+        &[2],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.mlp.gate_proj.weight",
+        &seq_values(32, 0.01, 0.01),
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.mlp.up_proj.weight",
+        &seq_values(32, 0.02, 0.01),
+        &[8, 4],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.mlp.down_proj.weight",
+        &seq_values(32, 0.03, 0.01),
+        &[4, 8],
+    );
+    for norm in [
+        "input_layernorm",
+        "post_attention_layernorm",
+        "pre_feedforward_layernorm",
+        "post_feedforward_layernorm",
+    ] {
+        insert_tensor(
+            &mut weights,
+            &format!("language_model.model.layers.0.{norm}.weight"),
+            &[1.0, 1.0, 1.0, 1.0],
+            &[4],
+        );
+    }
+    insert_tensor(
+        &mut weights,
+        "language_model.model.layers.0.layer_scalar",
+        &[1.0],
+        &[1],
+    );
+    insert_tensor(
+        &mut weights,
+        "language_model.model.norm.weight",
+        &[1.0, 1.0, 1.0, 1.0],
+        &[4],
+    );
+    weights
+}
+
 #[test]
 fn logical_weight_name_maps_auxiliary_quantization_keys_to_weight_name() {
     assert_eq!(
@@ -695,6 +844,28 @@ fn validate_supported_runtime_accepts_gemma3_replicated_path() {
         r#"{
             "model_type": "gemma3_text",
             "num_hidden_layers": 26
+        }"#,
+    )
+    .unwrap();
+
+    let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
+    assert!(!support.force_no_batch);
+
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_supported_runtime_accepts_gemma4_replicated_path() {
+    let dir = std::env::temp_dir().join(format!("mlxcel-tp-gemma4-{}", uuid::Uuid::new_v4()));
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma4",
+            "text_config": {
+                "model_type": "gemma4_text",
+                "num_hidden_layers": 26
+            }
         }"#,
     )
     .unwrap();
@@ -1353,5 +1524,25 @@ fn tensor_parallel_gemma3_matches_full_model_logits() {
     let full_logits = full.forward(&input_ids, &mut full_caches, None);
     let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
     let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-4, 1e-4);
+    assert!(mlxcel_core::item_bool(&close));
+}
+
+#[test]
+fn tensor_parallel_gemma4_matches_full_model_logits() {
+    let args = make_test_gemma4_args();
+    let weights = make_test_gemma4_weight_map();
+    let full =
+        Gemma4Wrapper::new(crate::models::Gemma4Model::from_weights(&weights, &args).unwrap());
+    let plan = generate_shard_plan("gemma4", args.text_args().num_hidden_layers, &ShardConfig::with_tp_size(2))
+        .unwrap();
+    let tp = TensorParallelGemma4Model::from_full_weights(&args, &weights, &plan).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+    let mut full_caches = full.make_caches();
+    let mut tp_caches = tp.make_caches();
+    let full_logits = full.forward(&input_ids, &mut full_caches, None);
+    let tp_logits = tp.forward(&input_ids, &mut tp_caches, None);
+
+    let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-5, 1e-5);
     assert!(mlxcel_core::item_bool(&close));
 }

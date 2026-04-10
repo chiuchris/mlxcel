@@ -37,6 +37,7 @@ pub enum TensorParallelRuntimeKind {
     Qwen3,
     Qwen35,
     Gemma3,
+    Gemma4,
     Ernie45,
     HunyuanV1Dense,
 }
@@ -741,6 +742,433 @@ impl LanguageModel for TensorParallelGemma3Model {
     }
 }
 
+pub struct TensorParallelGemma4Model {
+    ranks: Vec<crate::models::Gemma4Model>,
+    full_attention_layers: Vec<Option<crate::models::gemma4::Attention>>,
+    full_expert_layers: Vec<Option<crate::models::gemma4::Experts>>,
+    fallback_loaded_model: Option<Box<crate::LoadedModel>>,
+    rank_caches: RefCell<HashMap<usize, Vec<Vec<crate::models::gemma4::Cache>>>>,
+    num_layers_per_rank: usize,
+}
+
+impl TensorParallelGemma4Model {
+    pub fn from_model_dir(model_dir: &Path, shard_config: ShardConfig) -> Result<Self> {
+        let support = validate_supported_runtime(model_dir, shard_config, None)?;
+        ensure!(
+            support.kind == TensorParallelRuntimeKind::Gemma4,
+            "tensor-parallel Gemma4 runtime cannot load {:?}",
+            support.summary.model_type
+        );
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .with_context(|| format!("failed to read {}", config_path.display()))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: crate::models::gemma4::ModelArgs =
+            serde_json::from_str(&config_str).context("failed to parse gemma4 config")?;
+        let config_value: serde_json::Value =
+            serde_json::from_str(&config_str).context("failed to parse gemma4 config value")?;
+        let text_config = args.text_args();
+        if gemma4_requires_loaded_model_fallback(
+            &text_config,
+            &support.summary.plan,
+        ) {
+            let (fallback_loaded_model, _) = crate::load_model(model_dir)?;
+            return Ok(Self {
+                ranks: Vec::new(),
+                full_attention_layers: Vec::new(),
+                full_expert_layers: Vec::new(),
+                fallback_loaded_model: Some(Box::new(fallback_loaded_model)),
+                rank_caches: RefCell::new(HashMap::new()),
+                num_layers_per_rank: text_config.num_hidden_layers,
+            });
+        }
+        let is_quantized = config_value.get("quantization").is_some()
+            || config_value
+                .get("text_config")
+                .and_then(|text| text.get("quantization"))
+                .is_some();
+        let mut weights = if is_quantized {
+            let (weights, _backing) = models::load_gemma4_text_weights_with_backing(model_dir)
+                .map_err(anyhow::Error::msg)?;
+            weights
+        } else {
+            models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?
+        };
+        models::sanitize_tied_embeddings(&mut weights, &config_value);
+        Self::from_full_weights(&args, &weights, &support.summary.plan)
+    }
+
+    fn from_full_weights(
+        args: &crate::models::gemma4::ModelArgs,
+        weights: &WeightMap,
+        plan: &ModelShardPlan,
+    ) -> Result<Self> {
+        let text_config = args.text_args();
+        let use_full_attention_fallback = text_config.num_key_value_heads == 1 && plan.tp_size > 1;
+        let mut ranks = Vec::with_capacity(plan.tp_size);
+        for rank in 0..plan.tp_size {
+            let rank_weights = shard_gemma4_weight_map(weights, plan, rank, args)?;
+            let rank_args = local_gemma4_args(args, plan)?;
+            let rank_model = crate::models::Gemma4Model::from_weights(&rank_weights, &rank_args)
+                .map_err(anyhow::Error::msg)?;
+            ranks.push(rank_model);
+        }
+        let full_attention_layers = (0..text_config.num_hidden_layers)
+            .map(|layer_idx| {
+                if use_full_attention_fallback
+                    || text_config.layer_types[layer_idx].as_str() == "full_attention"
+                {
+                    crate::models::gemma4::Attention::from_weights(
+                        weights,
+                        &text_config,
+                        layer_idx,
+                        &format!("language_model.model.layers.{layer_idx}.self_attn"),
+                    )
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)?;
+        let full_expert_layers = (0..text_config.num_hidden_layers)
+            .map(|layer_idx| {
+                if text_config.enable_moe_block {
+                    crate::models::gemma4::Experts::from_weights(
+                        weights,
+                        &text_config,
+                        &format!("language_model.model.layers.{layer_idx}.experts"),
+                    )
+                    .map(Some)
+                } else {
+                    Ok(None)
+                }
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(anyhow::Error::msg)?;
+
+        Ok(Self {
+            ranks,
+            full_attention_layers,
+            full_expert_layers,
+            fallback_loaded_model: None,
+            rank_caches: RefCell::new(HashMap::new()),
+            num_layers_per_rank: text_config.num_hidden_layers,
+        })
+    }
+
+    fn fresh_rank_caches(&self) -> Vec<Vec<crate::models::gemma4::Cache>> {
+        if self.fallback_loaded_model.is_some() {
+            Vec::new()
+        } else {
+            self.ranks
+                .iter()
+                .map(crate::models::Gemma4Model::make_caches)
+                .collect()
+        }
+    }
+
+    fn cache_key(caches: &[KVCache]) -> usize {
+        caches.as_ptr() as usize
+    }
+
+    fn sequence_needs_reset(
+        external_caches: &[KVCache],
+        rank_caches: &[Vec<crate::models::gemma4::Cache>],
+    ) -> bool {
+        external_caches.iter().all(|cache| cache.offset == 0)
+            && rank_caches
+                .iter()
+                .flatten()
+                .any(|cache| gemma4_cache_offset_ref(cache) > 0)
+    }
+
+    fn sync_external_offsets(
+        external_caches: &mut [KVCache],
+        rank_caches: &[crate::models::gemma4::Cache],
+    ) {
+        for (external, internal) in external_caches.iter_mut().zip(rank_caches.iter()) {
+            external.offset = gemma4_cache_offset_ref(internal);
+        }
+    }
+
+    fn rank_caches_for_key<'a>(
+        &'a self,
+        cache_key: usize,
+        external_caches: &[KVCache],
+    ) -> std::cell::RefMut<'a, Vec<Vec<crate::models::gemma4::Cache>>> {
+        let needs_reset = {
+            let cache_sets = self.rank_caches.borrow();
+            cache_sets
+                .get(&cache_key)
+                .is_some_and(|rank_caches| Self::sequence_needs_reset(external_caches, rank_caches))
+        };
+
+        let mut cache_sets = self.rank_caches.borrow_mut();
+        if needs_reset || !cache_sets.contains_key(&cache_key) {
+            cache_sets.insert(cache_key, self.fresh_rank_caches());
+        }
+        std::cell::RefMut::map(cache_sets, |cache_sets| {
+            cache_sets
+                .get_mut(&cache_key)
+                .expect("gemma4 sequence cache entry must exist")
+        })
+    }
+
+    fn forward_impl(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        if let Some(model) = self.fallback_loaded_model.as_ref() {
+            return if let Some(embeddings) = input_embeddings {
+                LanguageModel::forward_with_embeddings(model.as_ref(), input_ids, Some(embeddings), caches, mask)
+            } else {
+                LanguageModel::forward(model.as_ref(), input_ids, caches, mask)
+            };
+        }
+        let cache_key = Self::cache_key(caches);
+        let mut rank_caches = self.rank_caches_for_key(cache_key, caches);
+
+        let text_config = &self.ranks[0].text_model.config;
+        let mut h = match input_embeddings {
+            Some(embeddings) => mlxcel_core::copy(embeddings),
+            None => self.ranks[0].text_model.embed_tokens.forward(input_ids),
+        };
+        h = mlxcel_core::multiply_scalar(&h, (text_config.hidden_size as f32).sqrt());
+        let shape = mlxcel_core::array_shape(&h);
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        let per_layer_inputs = if text_config.hidden_size_per_layer_input > 0 {
+            let raw_inputs = self.ranks[0].text_model.get_per_layer_inputs(input_ids);
+            Some(
+                self.ranks[0]
+                    .text_model
+                    .project_per_layer_inputs(&h, Some(&raw_inputs)),
+            )
+        } else {
+            None
+        };
+
+        let (global_mask, sliding_mask) = gemma4_masks(mask, seq_len, &mut rank_caches[0], text_config);
+        let n_layers = self.num_layers_per_rank;
+        let mut shared_kv_store: Vec<HashMap<usize, (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32)>> =
+            (0..self.ranks.len()).map(|_| HashMap::new()).collect();
+
+        for layer_idx in 0..n_layers {
+            let layer0 = &self.ranks[0].text_model.layers[layer_idx];
+            let residual = mlxcel_core::copy(&h);
+            let attn_norm = layer0.input_layernorm.forward(&h);
+            let layer_mask = match layer0.layer_type.as_str() {
+                "full_attention" => global_mask.as_deref(),
+                _ => sliding_mask.as_deref(),
+            };
+            let attn_out = if let Some(full_attn) = self.full_attention_layers[layer_idx].as_ref() {
+                let cache = gemma4_cache_interface(&mut rank_caches[0][layer_idx]);
+                let mut shared_kv = None;
+                if full_attn.is_kv_shared_layer
+                    && let Some(ref_idx) = full_attn.kv_shared_layer_index
+                    && let Some((keys, values, ref_offset)) = shared_kv_store[0].get(&ref_idx)
+                {
+                    cache.set_offset(*ref_offset);
+                    shared_kv = Some((keys.as_ref().unwrap(), values.as_ref().unwrap()));
+                }
+                let pre_offset = cache.offset();
+                let (attn_out, stored_kv) = full_attn.forward(&attn_norm, layer_mask, cache, shared_kv);
+                if let Some((keys, values)) = stored_kv {
+                    shared_kv_store[0].insert(layer_idx, (keys, values, pre_offset));
+                }
+                attn_out
+            } else {
+                let attn_parts: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .zip(rank_caches.iter_mut())
+                    .zip(shared_kv_store.iter_mut())
+                    .map(|((rank, caches), shared_store)| {
+                        let cache = gemma4_cache_interface(&mut caches[layer_idx]);
+                        let mut shared_kv = None;
+                        if rank.text_model.layers[layer_idx].self_attn.is_kv_shared_layer
+                            && let Some(ref_idx) =
+                                rank.text_model.layers[layer_idx].self_attn.kv_shared_layer_index
+                            && let Some((keys, values, ref_offset)) = shared_store.get(&ref_idx)
+                        {
+                            cache.set_offset(*ref_offset);
+                            shared_kv = Some((keys.as_ref().unwrap(), values.as_ref().unwrap()));
+                        }
+                        let pre_offset = cache.offset();
+                        let (attn_out, stored_kv) = rank.text_model.layers[layer_idx]
+                            .self_attn
+                            .forward(&attn_norm, layer_mask, cache, shared_kv);
+                        if let Some((keys, values)) = stored_kv {
+                            shared_store.insert(layer_idx, (keys, values, pre_offset));
+                        }
+                        attn_out
+                    })
+                    .collect();
+                reduce_sum_f32(attn_parts)
+            };
+            let post_attn = layer0.post_attention_layernorm.forward(&attn_out);
+            h = mlxcel_core::add(&residual, &post_attn);
+
+            let residual = mlxcel_core::copy(&h);
+            let ff = if layer0.router.is_some() && layer0.experts.is_some() {
+                let dense_norm = layer0.pre_feedforward_layernorm.forward(&h);
+                let dense_parts: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|rank| rank.text_model.layers[layer_idx].mlp.forward(&dense_norm))
+                    .collect();
+                let dense = reduce_sum_f32(dense_parts);
+                let dense = layer0
+                    .post_feedforward_layernorm_1
+                    .as_ref()
+                    .expect("Gemma4 TP missing post_feedforward_layernorm_1")
+                    .forward(&dense);
+
+                let (top_k_indices, top_k_weights) = layer0
+                    .router
+                    .as_ref()
+                    .expect("Gemma4 TP missing router")
+                    .forward(&h);
+                let routed_norm = layer0
+                    .pre_feedforward_layernorm_2
+                    .as_ref()
+                    .expect("Gemma4 TP missing pre_feedforward_layernorm_2")
+                    .forward(&h);
+                let routed = self.full_expert_layers[layer_idx]
+                    .as_ref()
+                    .expect("Gemma4 TP missing full experts")
+                    .forward(&routed_norm, &top_k_indices, &top_k_weights);
+                let routed = layer0
+                    .post_feedforward_layernorm_2
+                    .as_ref()
+                    .expect("Gemma4 TP missing post_feedforward_layernorm_2")
+                    .forward(&routed);
+                mlxcel_core::add(&dense, &routed)
+            } else {
+                let ff_norm = layer0.pre_feedforward_layernorm.forward(&h);
+                let ff_parts: Vec<_> = self
+                    .ranks
+                    .iter()
+                    .map(|rank| rank.text_model.layers[layer_idx].mlp.forward(&ff_norm))
+                    .collect();
+                reduce_sum_f32(ff_parts)
+            };
+            let ff = layer0.post_feedforward_layernorm.forward(&ff);
+            h = mlxcel_core::add(&residual, &ff);
+
+            if let Some(inputs) = per_layer_inputs.as_ref()
+                && let (Some(gate_proj), Some(proj), Some(post_norm)) = (
+                    layer0.per_layer_input_gate.as_ref(),
+                    layer0.per_layer_projection.as_ref(),
+                    layer0.post_per_layer_input_norm.as_ref(),
+                )
+            {
+                let residual = mlxcel_core::copy(&h);
+                let layer_input = crate::models::gemma4::slice_layer_input(
+                    inputs,
+                    layer_idx as i32,
+                    batch,
+                    seq_len,
+                    text_config.hidden_size_per_layer_input as i32,
+                );
+                let gate = gate_proj.forward(&h);
+                let gate = mlxcel_core::gelu_approx(&gate);
+                let gate = mlxcel_core::multiply(&gate, &layer_input);
+                let gate = proj.forward(&gate);
+                let gate = post_norm.forward(&gate);
+                h = mlxcel_core::add(&residual, &gate);
+            }
+
+            h = mlxcel_core::multiply(&h, &layer0.layer_scalar);
+        }
+
+        let h = self.ranks[0].text_model.norm.forward(&h);
+        Self::sync_external_offsets(caches, &rank_caches[0]);
+        let mut logits = self.ranks[0].text_model.embed_tokens.as_linear(&h);
+        if let Some(cap) = self.ranks[0].config.final_logit_softcapping {
+            logits = mlxcel_core::compiled_softcap(&logits, cap);
+        }
+        logits
+    }
+}
+
+impl LanguageModel for TensorParallelGemma4Model {
+    fn forward(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_impl(input_ids, None, caches, mask)
+    }
+
+    fn forward_with_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
+        if let Some(model) = self.fallback_loaded_model.as_ref() {
+            LanguageModel::embed_tokens(model.as_ref(), input_ids)
+        } else {
+            Some(self.ranks[0].text_model.embed_tokens.forward(input_ids))
+        }
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        if let Some(model) = self.fallback_loaded_model.as_ref() {
+            LanguageModel::make_caches(model.as_ref())
+        } else {
+            (0..self.num_layers_per_rank)
+                .map(|_| KVCache::new())
+                .collect()
+        }
+    }
+
+    fn num_layers(&self) -> usize {
+        if let Some(model) = self.fallback_loaded_model.as_ref() {
+            LanguageModel::num_layers(model.as_ref())
+        } else {
+            self.num_layers_per_rank
+        }
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        if let Some(model) = self.fallback_loaded_model.as_ref() {
+            LanguageModel::eos_token_ids(model.as_ref())
+        } else {
+            self.ranks[0].eos_token_ids.clone()
+        }
+    }
+
+    fn supports_batching(&self) -> bool {
+        self.fallback_loaded_model.is_none()
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        false
+    }
+
+    fn release_sequence_state(&self, caches: &mut [KVCache]) {
+        self.rank_caches
+            .borrow_mut()
+            .remove(&Self::cache_key(caches));
+        for cache in caches.iter_mut() {
+            cache.offset = 0;
+        }
+    }
+}
+
 impl LanguageModel for TensorParallelQwen3Model {
     fn forward(
         &self,
@@ -1362,16 +1790,18 @@ pub fn validate_supported_runtime(
     );
     let kind = kind.ok_or_else(|| {
         anyhow::anyhow!(
-            "tensor-parallel runtime currently supports only dense Llama/Qwen2/Qwen3/Qwen3.5/Gemma3/ERNIE/Hunyuan models, got {:?} ({})",
+            "tensor-parallel runtime currently supports only dense Llama/Qwen2/Qwen3/Qwen3.5/Gemma3/Gemma4/ERNIE/Hunyuan models, got {:?} ({})",
             summary.model_type,
             summary.architecture
         )
     })?;
 
+    let force_no_batch =
+        !runtime_supports_server_batching(kind) || gemma4_force_no_batch(model_path, kind, &summary)?;
     Ok(TensorParallelRuntimeSupport {
         kind,
         summary,
-        force_no_batch: !runtime_supports_server_batching(kind),
+        force_no_batch,
     })
 }
 
@@ -1382,9 +1812,40 @@ fn runtime_supports_server_batching(kind: TensorParallelRuntimeKind) -> bool {
             | TensorParallelRuntimeKind::Qwen3
             | TensorParallelRuntimeKind::Qwen35
             | TensorParallelRuntimeKind::Gemma3
+            | TensorParallelRuntimeKind::Gemma4
             | TensorParallelRuntimeKind::Ernie45
             | TensorParallelRuntimeKind::HunyuanV1Dense
     )
+}
+
+fn gemma4_force_no_batch(
+    model_path: &Path,
+    kind: TensorParallelRuntimeKind,
+    summary: &TensorParallelPlanSummary,
+) -> Result<bool> {
+    if kind != TensorParallelRuntimeKind::Gemma4 {
+        return Ok(false);
+    }
+    let config_path = model_path.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_str = crate::models::sanitize_config_json(&config_str);
+    let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) else {
+        return Ok(false);
+    };
+    let text_config_value = config_json
+        .get("text_config")
+        .cloned()
+        .unwrap_or_else(|| config_json.clone());
+    let Ok(text_config) =
+        serde_json::from_value::<crate::models::gemma4::TextConfig>(text_config_value)
+    else {
+        return Ok(false);
+    };
+    Ok(gemma4_requires_loaded_model_fallback(
+        &text_config,
+        &summary.plan,
+    ))
 }
 
 fn local_llama_args(
@@ -1551,6 +2012,76 @@ fn local_gemma3_args(
     Ok(local)
 }
 
+fn local_gemma4_args(
+    args: &crate::models::gemma4::ModelArgs,
+    plan: &ModelShardPlan,
+) -> Result<crate::models::gemma4::ModelArgs> {
+    let mut text_config = args.text_args();
+    ensure!(
+        text_config.num_attention_heads.is_multiple_of(plan.tp_size),
+        "num_attention_heads ({}) must be divisible by tp_size ({})",
+        text_config.num_attention_heads,
+        plan.tp_size
+    );
+    ensure!(
+        text_config.intermediate_size.is_multiple_of(plan.tp_size),
+        "intermediate_size ({}) must be divisible by tp_size ({})",
+        text_config.intermediate_size,
+        plan.tp_size
+    );
+    ensure!(
+        text_config.num_key_value_heads > 0,
+        "num_key_value_heads must be greater than zero for Gemma4 tensor parallelism"
+    );
+    ensure!(
+        if text_config.num_key_value_heads < plan.tp_size {
+            plan.tp_size.is_multiple_of(text_config.num_key_value_heads)
+        } else {
+            text_config.num_key_value_heads.is_multiple_of(plan.tp_size)
+        },
+        "num_key_value_heads ({}) must divide tp_size ({}) or be divisible by it for Gemma4 tensor parallelism",
+        text_config.num_key_value_heads,
+        plan.tp_size
+    );
+
+    if text_config.attention_k_eq_v {
+        let global_kv_heads = text_config
+            .num_global_key_value_heads
+            .unwrap_or(text_config.num_key_value_heads);
+        ensure!(
+            global_kv_heads > 0,
+            "num_global_key_value_heads must be greater than zero for Gemma4 full-attention tensor parallelism"
+        );
+        ensure!(
+            if global_kv_heads < plan.tp_size {
+                plan.tp_size.is_multiple_of(global_kv_heads)
+            } else {
+                global_kv_heads.is_multiple_of(plan.tp_size)
+            },
+            "num_global_key_value_heads ({global_kv_heads}) must divide tp_size ({}) or be divisible by it for Gemma4 tensor parallelism",
+            plan.tp_size
+        );
+        text_config.num_global_key_value_heads = Some(if global_kv_heads <= plan.tp_size {
+            global_kv_heads
+        } else {
+            global_kv_heads / plan.tp_size
+        });
+    }
+
+    text_config.num_attention_heads /= plan.tp_size;
+    text_config.num_key_value_heads = if text_config.num_key_value_heads <= plan.tp_size {
+        text_config.num_key_value_heads
+    } else {
+        text_config.num_key_value_heads / plan.tp_size
+    };
+    text_config.intermediate_size /= plan.tp_size;
+
+    let mut local = args.clone();
+    local.text_config =
+        serde_json::to_value(text_config).context("failed to serialize Gemma4 text config")?;
+    Ok(local)
+}
+
 fn local_ernie45_args(
     args: &crate::models::ernie4_5::ModelArgs,
     plan: &ModelShardPlan,
@@ -1653,6 +2184,9 @@ fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParalle
         ModelType::Gemma3 if is_gemma3_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::Gemma3)
         }
+        ModelType::Gemma4 | ModelType::Gemma4VLM if is_gemma4_architecture(&summary.architecture) => {
+            Some(TensorParallelRuntimeKind::Gemma4)
+        }
         ModelType::Ernie45 if summary.architecture == "ernie4_5" => {
             Some(TensorParallelRuntimeKind::Ernie45)
         }
@@ -1684,6 +2218,20 @@ fn is_qwen35_architecture(architecture: &str) -> bool {
 
 fn is_gemma3_architecture(architecture: &str) -> bool {
     matches!(architecture, "gemma3" | "gemma3_text")
+}
+
+fn is_gemma4_architecture(architecture: &str) -> bool {
+    matches!(architecture, "gemma4" | "gemma4_text")
+}
+
+fn gemma4_requires_loaded_model_fallback(
+    config: &crate::models::gemma4::TextConfig,
+    plan: &ModelShardPlan,
+) -> bool {
+    plan.tp_size > 1
+        && config.num_key_value_heads == 1
+        && config.hidden_size_per_layer_input > 0
+        && config.num_kv_shared_layers > 0
 }
 
 fn split_rank_caches<'a>(
@@ -1801,6 +2349,182 @@ fn shard_gemma3_weight_map(
                 pad_count: 0,
                 strategy: ShardStrategy::Replicated,
             }
+        } else {
+            compute_shard_spec(&logical_name, &shape, plan, rank)?
+        };
+
+        let sharded_tensor = shard_tensor(tensor, &spec)?;
+        sharded.insert(name.clone(), sharded_tensor);
+    }
+
+    Ok(sharded)
+}
+
+fn gemma4_layer_index(name: &str) -> Option<usize> {
+    let marker = ".layers.";
+    let start = name.find(marker)? + marker.len();
+    let rest = &name[start..];
+    let end = rest.find('.')?;
+    rest[..end].parse().ok()
+}
+
+fn gemma4_kv_shard_spec(
+    logical_name: &str,
+    shape: &[usize],
+    plan: &ModelShardPlan,
+    rank: usize,
+    config: &crate::models::gemma4::TextConfig,
+) -> Option<ShardSpec> {
+    if !(logical_name.ends_with(".self_attn.k_proj.weight")
+        || logical_name.ends_with(".self_attn.v_proj.weight"))
+    {
+        return None;
+    }
+
+    let layer_idx = gemma4_layer_index(logical_name)?;
+    let is_full_attention = config.layer_types[layer_idx].as_str() == "full_attention";
+    let total_kv_heads = if config.attention_k_eq_v && is_full_attention {
+        config
+            .num_global_key_value_heads
+            .unwrap_or(config.num_key_value_heads)
+    } else {
+        config.num_key_value_heads
+    };
+    if total_kv_heads > plan.tp_size {
+        return None;
+    }
+    Some(ShardSpec {
+        rank,
+        tp_size: plan.tp_size,
+        shard_axis: 0,
+        start_index: 0,
+        end_index: shape.first().copied().unwrap_or(0),
+        padded: false,
+        pad_count: 0,
+        strategy: ShardStrategy::Replicated,
+    })
+}
+
+fn gemma4_quant_params(config: &crate::models::gemma4::TextConfig) -> (usize, usize) {
+    config
+        .quantization
+        .as_ref()
+        .map(|q| (q.group_size, q.bits))
+        .unwrap_or((64, 4))
+}
+
+fn group_shard_range(total_groups: usize, tp_size: usize, rank: usize) -> (usize, usize) {
+    let base = total_groups / tp_size;
+    let remainder = total_groups % tp_size;
+    let start = if rank < remainder {
+        rank * (base + 1)
+    } else {
+        remainder * (base + 1) + (rank - remainder) * base
+    };
+    let size = if rank < remainder { base + 1 } else { base };
+    (start, start + size)
+}
+
+fn gemma4_moe_intermediate_shard_spec(
+    name: &str,
+    logical_name: &str,
+    shape: &[usize],
+    plan: &ModelShardPlan,
+    rank: usize,
+    config: &crate::models::gemma4::TextConfig,
+) -> Option<ShardSpec> {
+    let is_gate_or_up = logical_name.ends_with(".experts.switch_glu.gate_proj.weight")
+        || logical_name.ends_with(".experts.switch_glu.up_proj.weight");
+    let is_down = logical_name.ends_with(".experts.switch_glu.down_proj.weight");
+    if !is_gate_or_up && !is_down {
+        return None;
+    }
+
+    let (group_size, bits) = gemma4_quant_params(config);
+    let packed_per_u32 = 32 / bits;
+
+    let total_groups = if is_gate_or_up {
+        shape[1].div_ceil(group_size)
+    } else if name.ends_with(".weight") {
+        (shape[2] * packed_per_u32).div_ceil(group_size)
+    } else {
+        shape[2]
+    };
+    let (start_group, end_group) = group_shard_range(total_groups, plan.tp_size, rank);
+
+    if is_gate_or_up {
+        let start_index = start_group * group_size;
+        let end_index = (end_group * group_size).min(shape[1]);
+        return Some(ShardSpec {
+            rank,
+            tp_size: plan.tp_size,
+            shard_axis: 1,
+            start_index,
+            end_index,
+            padded: false,
+            pad_count: 0,
+            strategy: ShardStrategy::ColumnParallel,
+        });
+    }
+
+    if name.ends_with(".weight") {
+        let packed_per_group = group_size / packed_per_u32;
+        let start_index = start_group * packed_per_group;
+        let end_index = (end_group * packed_per_group).min(shape[2]);
+        Some(ShardSpec {
+            rank,
+            tp_size: plan.tp_size,
+            shard_axis: 2,
+            start_index,
+            end_index,
+            padded: false,
+            pad_count: 0,
+            strategy: ShardStrategy::RowParallel,
+        })
+    } else {
+        Some(ShardSpec {
+            rank,
+            tp_size: plan.tp_size,
+            shard_axis: 2,
+            start_index: start_group,
+            end_index: end_group.min(shape[2]),
+            padded: false,
+            pad_count: 0,
+            strategy: ShardStrategy::RowParallel,
+        })
+    }
+}
+
+fn shard_gemma4_weight_map(
+    weights: &WeightMap,
+    plan: &ModelShardPlan,
+    rank: usize,
+    args: &crate::models::gemma4::ModelArgs,
+) -> Result<WeightMap> {
+    let mut sharded = HashMap::with_capacity(weights.len());
+    let text_config = args.text_args();
+
+    for (name, tensor) in weights {
+        let logical_name = logical_weight_name(name);
+        let shape = mlxcel_core::array_shape(tensor);
+        let shape: Vec<usize> = shape
+            .into_iter()
+            .map(|dim| usize::try_from(dim).context("negative tensor dimension"))
+            .collect::<Result<_>>()?;
+
+        let spec = if let Some(spec) =
+            gemma4_kv_shard_spec(&logical_name, &shape, plan, rank, &text_config)
+        {
+            spec
+        } else if let Some(spec) = gemma4_moe_intermediate_shard_spec(
+            name,
+            &logical_name,
+            &shape,
+            plan,
+            rank,
+            &text_config,
+        ) {
+            spec
         } else {
             compute_shard_spec(&logical_name, &shape, plan, rank)?
         };
@@ -2058,6 +2782,47 @@ fn gemma3_cache_interface(
         crate::models::gemma3::Cache::Standard(cache) => cache,
         crate::models::gemma3::Cache::Rotating(cache) => cache,
     }
+}
+
+fn gemma4_masks(
+    mask: Option<&MlxArray>,
+    seq_len: i32,
+    rank0_caches: &mut [crate::models::gemma4::Cache],
+    config: &crate::models::gemma4::TextConfig,
+) -> (Option<UniquePtr<MlxArray>>, Option<UniquePtr<MlxArray>>) {
+    if let Some(mask) = mask {
+        return (Some(mlxcel_core::copy(mask)), Some(mlxcel_core::copy(mask)));
+    }
+    if seq_len == 1 {
+        return (None, None);
+    }
+
+    let global_offset = crate::models::gemma4::first_cache_offset(rank0_caches, "full_attention");
+    let sliding_offset =
+        crate::models::gemma4::first_cache_offset(rank0_caches, "sliding_attention");
+    let sliding_effective_offset = sliding_offset.min((config.sliding_window as i32 - seq_len).max(0));
+
+    (
+        Some(mlxcel_core::utils::create_causal_mask(seq_len, global_offset)),
+        Some(mlxcel_core::utils::create_causal_mask_with_window(
+            seq_len,
+            sliding_effective_offset,
+            Some(config.sliding_window as i32),
+        )),
+    )
+}
+
+fn gemma4_cache_offset_ref(cache: &crate::models::gemma4::Cache) -> i32 {
+    match cache {
+        crate::models::gemma4::Cache::Standard(cache) => cache.offset,
+        crate::models::gemma4::Cache::Rotating(cache) => cache.offset,
+    }
+}
+
+fn gemma4_cache_interface(
+    cache: &mut crate::models::gemma4::Cache,
+) -> &mut dyn crate::models::gemma4::CacheInterface {
+    cache.as_interface()
 }
 
 fn qwen3_next_cache_offset_ref(cache: &crate::models::qwen3_next::Qwen3NextCache) -> i32 {
