@@ -334,6 +334,7 @@ jobs:
           }' > card.json
 
       - name: POST to Teams workflow
+        if: env.WEBHOOK_URL != ''
         env:
           WEBHOOK_URL: ${{ secrets.TEAMS_RELEASE_NOTIFICATION_WORKFLOW_URL }}
         run: |
