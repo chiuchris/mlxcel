@@ -299,7 +299,7 @@ pub(super) fn build_server_config(
         prefill_chunk_size: startup.prefill_chunk_size,
         enable_preemption: startup.enable_preemption,
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
-        no_batch: startup.no_batch || tensor_parallel.tp_size > 1,
+        no_batch: startup.no_batch,
         max_batch_prefill: startup.max_batch_prefill.max(1),
         tensor_parallel,
     }
@@ -345,7 +345,14 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn validate_tensor_parallel_startup(startup: &ServerStartupConfig) -> Result<()> {
+    resolve_tensor_parallel_runtime_support(startup).map(|_| ())
+}
+
+fn resolve_tensor_parallel_runtime_support(
+    startup: &ServerStartupConfig,
+) -> Result<crate::distributed::TensorParallelRuntimeSupport> {
     let shard_config = shard_config_from_cli(
         startup.tp_size,
         &startup.tp_moe_mode,
@@ -361,7 +368,6 @@ fn validate_tensor_parallel_startup(startup: &ServerStartupConfig) -> Result<()>
         summary.shard_config.clone(),
         startup.adapter_path.as_deref(),
     )
-    .map(|_| ())
 }
 
 fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
@@ -478,7 +484,7 @@ async fn resolve_distributed_config(
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
-    validate_tensor_parallel_startup(&startup)?;
+    let tp_support = resolve_tensor_parallel_runtime_support(&startup)?;
 
     if startup.ubatch_size_provided {
         tracing::info!("--ubatch-size is not applicable on Apple Silicon unified memory; ignored");
@@ -530,9 +536,16 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     let _node_registry = resolve_distributed_config(&startup).await?;
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
-    let config = build_server_config(&startup, api_key);
+    let mut config = build_server_config(&startup, api_key);
+    config.no_batch |= tp_support.force_no_batch;
     if config.tensor_parallel.tp_size > 1 {
-        tracing::info!("Tensor parallel runtime enabled; forcing legacy sequential worker");
+        if config.no_batch {
+            tracing::info!(
+                "Tensor parallel runtime enabled; using legacy sequential worker for this runtime"
+            );
+        } else {
+            tracing::info!("Tensor parallel runtime enabled; batch scheduler remains active");
+        }
     }
     let chat_template = resolve_chat_template(
         startup.chat_template.as_deref(),

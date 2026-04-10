@@ -32,7 +32,7 @@ use mlxcel::server::{ServerStartupInput, start_server};
 Tensor Parallel Runtime:
   Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Gemma 3 text, ERNIE 4.5, Hunyuan v1 Dense
   Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
-                       LoRA unsupported, sequential worker forced for tp_size > 1"
+                       LoRA unsupported, Gemma 3 server path still uses sequential worker"
 )]
 struct Args {
     /// Path to the model directory
@@ -125,8 +125,9 @@ struct Args {
     ///
     /// When set, requests are processed one at a time in FIFO order with no
     /// batch scheduler overhead. Equivalent to using `--max-batch-size 1` but
-    /// with explicit sequential semantics and no prefill chunking. This is
-    /// forced automatically when `--tp-size > 1`.
+    /// with explicit sequential semantics and no prefill chunking.
+    /// Some TP runtimes with internal mixed caches, such as Gemma 3 text,
+    /// still force this mode automatically.
     #[arg(long = "no-batch")]
     no_batch: bool,
 

@@ -217,7 +217,7 @@ impl LanguageModel for TensorParallelLlamaModel {
     }
 
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_batched_prefill(&self) -> bool {
@@ -595,7 +595,7 @@ impl LanguageModel for TensorParallelQwen3Model {
     }
 
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_batched_prefill(&self) -> bool {
@@ -716,7 +716,7 @@ impl LanguageModel for TensorParallelErnie45Model {
     }
 
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_batched_prefill(&self) -> bool {
@@ -838,7 +838,7 @@ impl LanguageModel for TensorParallelHunyuanV1DenseModel {
     }
 
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_batched_prefill(&self) -> bool {
@@ -885,8 +885,12 @@ pub fn validate_supported_runtime(
     Ok(TensorParallelRuntimeSupport {
         kind,
         summary,
-        force_no_batch: true,
+        force_no_batch: !runtime_supports_server_batching(kind),
     })
+}
+
+fn runtime_supports_server_batching(kind: TensorParallelRuntimeKind) -> bool {
+    !matches!(kind, TensorParallelRuntimeKind::Gemma3)
 }
 
 fn local_llama_args(

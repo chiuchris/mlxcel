@@ -412,7 +412,7 @@ fn validate_supported_runtime_accepts_llama_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -431,7 +431,7 @@ fn validate_supported_runtime_accepts_qwen3_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -450,7 +450,7 @@ fn validate_supported_runtime_accepts_qwen2_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -469,7 +469,7 @@ fn validate_supported_runtime_accepts_ernie45_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }
@@ -491,7 +491,7 @@ fn validate_supported_runtime_accepts_hunyuan_v1_dense_replicated_path() {
     .unwrap();
 
     let support = validate_supported_runtime(&dir, ShardConfig::with_tp_size(2), None).unwrap();
-    assert!(support.force_no_batch);
+    assert!(!support.force_no_batch);
 
     fs::remove_dir_all(dir).unwrap();
 }

@@ -16,7 +16,8 @@ use std::path::PathBuf;
 
 use super::{
     ServerStartupConfig, build_server_config, resolve_api_key, resolve_chat_template,
-    resolve_default_max_tokens, resolve_dry_penalty_last_n, validate_tensor_parallel_startup,
+    resolve_default_max_tokens, resolve_dry_penalty_last_n,
+    resolve_tensor_parallel_runtime_support, validate_tensor_parallel_startup,
 };
 use crate::server::chat_template::ChatMessage;
 
@@ -167,14 +168,60 @@ fn build_server_config_propagates_no_batch_flag() {
 }
 
 #[test]
-fn build_server_config_forces_no_batch_for_tensor_parallel() {
+fn build_server_config_preserves_batch_scheduler_for_tensor_parallel() {
     let startup = ServerStartupConfig {
         tp_size: 2,
         ..ServerStartupConfig::default()
     };
     let config = build_server_config(&startup, None);
-    assert!(config.no_batch);
+    assert!(!config.no_batch);
     assert_eq!(config.tensor_parallel.tp_size, 2);
+}
+
+#[test]
+fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_llama() {
+    let dir = temp_path("tp-llama-batching");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 32
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
+    assert!(!support.force_no_batch);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolve_tensor_parallel_runtime_support_keeps_gemma3_on_sequential_worker() {
+    let dir = temp_path("tp-gemma3-no-batch");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "gemma3_text",
+            "num_hidden_layers": 26
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        tp_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
+    assert!(support.force_no_batch);
+
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
