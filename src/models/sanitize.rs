@@ -123,6 +123,264 @@ fn f8_e5m2_to_f32(bits: u8) -> f32 {
     }
 }
 
+/// Convert a 4-bit FP4 E2M1 nibble to f32.
+///
+/// FP4 E2M1: 1 sign bit, 2 exponent bits (bias=1), 1 mantissa bit.
+/// Values: {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} x {+1, -1}
+fn fp4_e2m1_to_f32(nibble: u8) -> f32 {
+    let sign = (nibble >> 3) & 1;
+    let exp = (nibble >> 1) & 0x3; // 2-bit exponent
+    let mant = nibble & 0x1; // 1-bit mantissa
+
+    let f_sign = if sign != 0 { -1.0f32 } else { 1.0f32 };
+
+    if exp == 0 {
+        // Subnormal: (-1)^sign * 2^(1-1) * (0 + mant/2) = mant * 0.5
+        if mant == 0 {
+            return f_sign * 0.0;
+        }
+        f_sign * 0.5
+    } else {
+        // Normal: (-1)^sign * 2^(exp-1) * (1 + mant/2)
+        f_sign * (2.0f32).powi(exp as i32 - 1) * (1.0 + mant as f32 * 0.5)
+    }
+}
+
+/// Convert f16 bits to f32.
+fn f16_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x3FF) as u32;
+
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign << 31);
+        }
+        // Subnormal f16
+        let mut m = mant;
+        let mut e = 0i32;
+        while m & 0x400 == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x3FF;
+        let f32_exp = (127 - 15 + 1 + e) as u32;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (m << 13))
+    } else if exp == 0x1F {
+        if mant == 0 {
+            f32::from_bits((sign << 31) | (0xFF << 23))
+        } else {
+            f32::NAN
+        }
+    } else {
+        let f32_exp = exp + 127 - 15;
+        f32::from_bits((sign << 31) | (f32_exp << 23) | (mant << 13))
+    }
+}
+
+/// Remap NVFP4-style weight keys to the MLX-community naming convention.
+///
+/// nvfp4 Gemma 4 checkpoints use `model.language_model.X` prefixes while the
+/// model code expects `language_model.model.X`. This function performs the
+/// following remapping:
+///
+/// - `model.language_model.X` → `language_model.model.X`
+/// - `model.embed_vision.X`   → `embed_vision.X`
+/// - `model.lm_head.X`        → `lm_head.X`
+///
+/// If no keys matching the nvfp4 pattern are found, this is a no-op.
+fn normalize_nvfp4_keys(weights: &mut mlxcel_core::weights::WeightMap) {
+    let nvfp4_keys: Vec<String> = weights
+        .keys()
+        .filter(|k| k.starts_with("model.language_model."))
+        .cloned()
+        .collect();
+
+    if nvfp4_keys.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "Remapping {} NVFP4-style weight keys to MLX-community convention...",
+        nvfp4_keys.len()
+    );
+
+    // Collect all key-value pairs that need remapping, then reinsert.
+    let remappings: Vec<(String, String)> = weights
+        .keys()
+        .filter_map(|k| {
+            let new_key = if let Some(rest) = k.strip_prefix("model.language_model.") {
+                format!("language_model.model.{rest}")
+            } else if let Some(rest) = k.strip_prefix("model.embed_vision.") {
+                format!("embed_vision.{rest}")
+            } else if let Some(rest) = k.strip_prefix("model.lm_head.") {
+                format!("lm_head.{rest}")
+            } else {
+                return None; // No remapping needed
+            };
+            Some((k.clone(), new_key))
+        })
+        .collect();
+
+    for (old_key, new_key) in remappings {
+        if let Some(arr) = weights.remove(&old_key) {
+            weights.insert(new_key, arr);
+        }
+    }
+}
+
+/// Dequantize NVFP4-packed weights in-place.
+///
+/// Detects weight groups by the presence of `{prefix}.weight_scale_2` keys.
+/// For each group, unpacks FP4 E2M1 nibbles from U8 storage and applies
+/// per-block (weight_scale) and global (weight_scale_2) scale factors to
+/// produce dequantized f16 weights.
+///
+/// After dequantization the auxiliary keys `weight_scale`, `weight_scale_2`,
+/// and `input_scale` are removed from the weight map.
+fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
+    // Collect prefixes first to avoid borrowing conflicts during mutation.
+    let fp4_prefixes: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".weight_scale_2"))
+        .map(|k| k.strip_suffix(".weight_scale_2").unwrap().to_string())
+        .collect();
+
+    if fp4_prefixes.is_empty() {
+        return;
+    }
+
+    eprintln!(
+        "Dequantizing {} NVFP4 weight groups to f16...",
+        fp4_prefixes.len()
+    );
+
+    for prefix in fp4_prefixes {
+        let weight_key = format!("{prefix}.weight");
+        let scale_key = format!("{prefix}.weight_scale");
+        let scale2_key = format!("{prefix}.weight_scale_2");
+        let input_scale_key = format!("{prefix}.input_scale");
+
+        // Verify all required keys exist before proceeding.
+        if !weights.contains_key(&weight_key) || !weights.contains_key(&scale_key) {
+            // Remove orphaned scale2 key and continue.
+            weights.remove(&scale2_key);
+            continue;
+        }
+
+        let (weight_shape, weight_bytes, scale_bytes, scale2_val) = {
+            let weight_arr = weights.get(&weight_key).unwrap();
+            let scale_arr = weights.get(&scale_key).unwrap();
+            let scale2_arr = weights.get(&scale2_key).unwrap();
+
+            mlxcel_core::eval(weight_arr);
+            mlxcel_core::eval(scale_arr);
+            mlxcel_core::eval(scale2_arr);
+
+            let weight_shape = mlxcel_core::array_shape(weight_arr);
+            let weight_bytes = mlxcel_core::array_to_raw_bytes(weight_arr);
+            let scale_bytes = mlxcel_core::array_to_raw_bytes(scale_arr);
+            let scale2_val = mlxcel_core::item_f32(scale2_arr);
+
+            (weight_shape, weight_bytes, scale_bytes, scale2_val)
+        };
+
+        // Validate weight tensor is 2-D with positive dimensions.
+        if weight_shape.len() < 2 {
+            eprintln!(
+                "Skipping NVFP4 dequant for {prefix}: weight tensor is {}-D (expected 2-D)",
+                weight_shape.len()
+            );
+            weights.remove(&scale2_key);
+            continue;
+        }
+        if weight_shape[0] <= 0 || weight_shape[1] <= 0 {
+            eprintln!(
+                "Skipping NVFP4 dequant for {prefix}: non-positive dimensions [{}, {}]",
+                weight_shape[0], weight_shape[1]
+            );
+            weights.remove(&scale2_key);
+            continue;
+        }
+
+        // weight_shape = [out_dim, in_dim/2] (packed U8 — 2 FP4 nibbles per byte)
+        let out_dim = weight_shape[0] as usize;
+        let packed_dim = weight_shape[1] as usize; // in_dim / 2
+        let in_dim = packed_dim * 2;
+
+        let group_size: usize = 16;
+
+        // in_dim must be a multiple of group_size for scale indexing to be valid.
+        if in_dim % group_size != 0 {
+            eprintln!(
+                "Skipping NVFP4 dequant for {prefix}: in_dim {in_dim} is not a multiple of group_size {group_size}"
+            );
+            weights.remove(&scale2_key);
+            continue;
+        }
+        let num_groups = in_dim / group_size;
+
+        // Validate raw byte buffer lengths match expected sizes before indexing.
+        let expected_weight_bytes = out_dim * packed_dim;
+        let expected_scale_bytes = out_dim * num_groups * 2; // F16 = 2 bytes each
+        if weight_bytes.len() < expected_weight_bytes {
+            eprintln!(
+                "Skipping NVFP4 dequant for {prefix}: weight_bytes length {} < expected {}",
+                weight_bytes.len(),
+                expected_weight_bytes
+            );
+            weights.remove(&scale2_key);
+            continue;
+        }
+        if scale_bytes.len() < expected_scale_bytes {
+            eprintln!(
+                "Skipping NVFP4 dequant for {prefix}: scale_bytes length {} < expected {}",
+                scale_bytes.len(),
+                expected_scale_bytes
+            );
+            weights.remove(&scale2_key);
+            continue;
+        }
+
+        let mut dequant_f32 = Vec::with_capacity(out_dim * in_dim);
+
+        for row in 0..out_dim {
+            for col in 0..in_dim {
+                let byte_idx = row * packed_dim + col / 2;
+                let nibble = if col % 2 == 0 {
+                    weight_bytes[byte_idx] & 0x0F // low nibble
+                } else {
+                    (weight_bytes[byte_idx] >> 4) & 0x0F // high nibble
+                };
+                let fp4_val = fp4_e2m1_to_f32(nibble);
+
+                // Block scale (F16 stored as 2-byte little-endian).
+                let group_idx = col / group_size;
+                let scale_flat_idx = row * num_groups + group_idx;
+                let scale_f16_bits = u16::from_le_bytes([
+                    scale_bytes[scale_flat_idx * 2],
+                    scale_bytes[scale_flat_idx * 2 + 1],
+                ]);
+                let scale_val = f16_to_f32(scale_f16_bits);
+
+                dequant_f32.push(fp4_val * scale_val * scale2_val);
+            }
+        }
+
+        // Create a new f16 array with shape [out_dim, in_dim].
+        let new_shape = vec![out_dim as i32, in_dim as i32];
+        let new_arr = mlxcel_core::from_slice_f32(&dequant_f32, &new_shape);
+        let new_arr_f16 = mlxcel_core::astype(&new_arr, mlxcel_core::dtype::FLOAT16);
+        mlxcel_core::eval(&new_arr_f16);
+
+        // Replace the packed weight and remove auxiliary keys.
+        weights.insert(weight_key, new_arr_f16);
+        weights.remove(&scale_key);
+        weights.remove(&scale2_key);
+        weights.remove(&input_scale_key); // may not exist; remove is a no-op then
+    }
+}
+
 fn tensor_view_to_array(
     name: &str,
     tensor: &TensorView<'_>,
@@ -552,11 +810,20 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
         .map(|config_str| sanitize_config_json(&config_str))
         .and_then(|config_str| serde_json::from_str::<Value>(&config_str).ok());
 
-    let mut weights = if parsed_config.as_ref().is_some_and(is_gemma4_model_config) {
+    let is_gemma4 = parsed_config.as_ref().is_some_and(is_gemma4_model_config);
+
+    let mut weights = if is_gemma4 {
         load_gemma4_text_weights(model_dir)?
     } else {
         mlxcel_core::weights::load_weights_from_dir(model_dir)?
     };
+
+    // Apply NVFP4 key normalization and dequantization for Gemma 4 nvfp4
+    // checkpoints before tied-embedding sanitization so that lookups succeed.
+    if is_gemma4 {
+        normalize_nvfp4_keys(&mut weights);
+        dequantize_nvfp4_weights(&mut weights);
+    }
 
     let mut is_quantized = false;
     if let Some(config) = parsed_config.as_ref() {
@@ -791,5 +1058,167 @@ mod tests {
         // 1.25: exp=15, mant=1 => 2^0 * (1 + 1/4) = 1.25
         // 0b0_01111_01 = 0x3D
         assert!((f8_e5m2_to_f32(0x3D) - 1.25f32).abs() < 1e-6);
+    }
+
+    // --- fp4_e2m1_to_f32 tests (all 16 nibble values) ---
+
+    #[test]
+    fn fp4_e2m1_all_positive_values() {
+        // FP4 E2M1: sign|exp[1:0]|mant
+        // Positive: sign=0
+        // 0b0_00_0 = 0x0 → 0.0 (subnormal, mant=0)
+        assert_eq!(fp4_e2m1_to_f32(0x0), 0.0f32);
+        // 0b0_00_1 = 0x1 → 0.5 (subnormal, mant=1)
+        assert!((fp4_e2m1_to_f32(0x1) - 0.5f32).abs() < 1e-6);
+        // 0b0_01_0 = 0x2 → 2^0 * 1.0 = 1.0
+        assert!((fp4_e2m1_to_f32(0x2) - 1.0f32).abs() < 1e-6);
+        // 0b0_01_1 = 0x3 → 2^0 * 1.5 = 1.5
+        assert!((fp4_e2m1_to_f32(0x3) - 1.5f32).abs() < 1e-6);
+        // 0b0_10_0 = 0x4 → 2^1 * 1.0 = 2.0
+        assert!((fp4_e2m1_to_f32(0x4) - 2.0f32).abs() < 1e-6);
+        // 0b0_10_1 = 0x5 → 2^1 * 1.5 = 3.0
+        assert!((fp4_e2m1_to_f32(0x5) - 3.0f32).abs() < 1e-6);
+        // 0b0_11_0 = 0x6 → 2^2 * 1.0 = 4.0
+        assert!((fp4_e2m1_to_f32(0x6) - 4.0f32).abs() < 1e-6);
+        // 0b0_11_1 = 0x7 → 2^2 * 1.5 = 6.0
+        assert!((fp4_e2m1_to_f32(0x7) - 6.0f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn fp4_e2m1_all_negative_values() {
+        // Negative: sign=1 (bit 3 set)
+        // 0b1_00_0 = 0x8 → -0.0
+        assert_eq!(fp4_e2m1_to_f32(0x8), -0.0f32);
+        // 0b1_00_1 = 0x9 → -0.5
+        assert!((fp4_e2m1_to_f32(0x9) - (-0.5f32)).abs() < 1e-6);
+        // 0b1_01_0 = 0xA → -1.0
+        assert!((fp4_e2m1_to_f32(0xA) - (-1.0f32)).abs() < 1e-6);
+        // 0b1_01_1 = 0xB → -1.5
+        assert!((fp4_e2m1_to_f32(0xB) - (-1.5f32)).abs() < 1e-6);
+        // 0b1_10_0 = 0xC → -2.0
+        assert!((fp4_e2m1_to_f32(0xC) - (-2.0f32)).abs() < 1e-6);
+        // 0b1_10_1 = 0xD → -3.0
+        assert!((fp4_e2m1_to_f32(0xD) - (-3.0f32)).abs() < 1e-6);
+        // 0b1_11_0 = 0xE → -4.0
+        assert!((fp4_e2m1_to_f32(0xE) - (-4.0f32)).abs() < 1e-6);
+        // 0b1_11_1 = 0xF → -6.0
+        assert!((fp4_e2m1_to_f32(0xF) - (-6.0f32)).abs() < 1e-6);
+    }
+
+    // --- f16_to_f32 tests ---
+
+    #[test]
+    fn f16_to_f32_positive_zero() {
+        // +0.0: 0x0000
+        assert_eq!(f16_to_f32(0x0000), 0.0f32);
+    }
+
+    #[test]
+    fn f16_to_f32_negative_zero() {
+        // -0.0: 0x8000
+        let v = f16_to_f32(0x8000);
+        assert!(v == 0.0f32 && v.is_sign_negative());
+    }
+
+    #[test]
+    fn f16_to_f32_one() {
+        // 1.0: sign=0, exp=15 (0b01111), mant=0 → 0x3C00
+        assert!((f16_to_f32(0x3C00) - 1.0f32).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_to_f32_negative_one() {
+        // -1.0: sign=1, exp=15, mant=0 → 0xBC00
+        assert!((f16_to_f32(0xBC00) - (-1.0f32)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn f16_to_f32_positive_infinity() {
+        // +inf: exp=0x1F, mant=0, sign=0 → 0x7C00
+        assert!(f16_to_f32(0x7C00).is_infinite());
+        assert!(f16_to_f32(0x7C00).is_sign_positive());
+    }
+
+    #[test]
+    fn f16_to_f32_nan() {
+        // NaN: exp=0x1F, mant≠0 → e.g. 0x7E00
+        assert!(f16_to_f32(0x7E00).is_nan());
+    }
+
+    #[test]
+    fn f16_to_f32_subnormal() {
+        // Smallest positive subnormal f16: exp=0, mant=1 → 0x0001
+        // value = 2^(-14) * (1/1024) ≈ 5.96e-8
+        let v = f16_to_f32(0x0001);
+        let expected = 2.0f32.powi(-24);
+        assert!((v - expected).abs() < 1e-10, "Expected {expected}, got {v}");
+    }
+
+    #[test]
+    fn f16_to_f32_two() {
+        // 2.0: exp=16, mant=0 → 0x4000
+        assert!((f16_to_f32(0x4000) - 2.0f32).abs() < 1e-6);
+    }
+
+    // --- normalize_nvfp4_keys tests ---
+
+    #[test]
+    fn normalize_nvfp4_keys_remaps_language_model_prefix() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "model.language_model.layers.0.mlp.gate_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.language_model.embed_tokens.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[2.0f32], &[1]),
+        );
+        normalize_nvfp4_keys(&mut weights);
+        assert!(
+            weights.contains_key("language_model.model.layers.0.mlp.gate_proj.weight"),
+            "Expected remapped key not found"
+        );
+        assert!(
+            weights.contains_key("language_model.model.embed_tokens.weight"),
+            "Expected remapped embed_tokens key not found"
+        );
+        assert!(
+            !weights.contains_key("model.language_model.layers.0.mlp.gate_proj.weight"),
+            "Old key should be removed"
+        );
+    }
+
+    #[test]
+    fn normalize_nvfp4_keys_remaps_embed_vision_and_lm_head() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "model.language_model.norm.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.embed_vision.proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.lm_head.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        normalize_nvfp4_keys(&mut weights);
+        assert!(weights.contains_key("embed_vision.proj.weight"));
+        assert!(weights.contains_key("lm_head.weight"));
+        assert!(!weights.contains_key("model.embed_vision.proj.weight"));
+        assert!(!weights.contains_key("model.lm_head.weight"));
+    }
+
+    #[test]
+    fn normalize_nvfp4_keys_noop_when_no_nvfp4_keys() {
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "language_model.model.layers.0.mlp.gate_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        normalize_nvfp4_keys(&mut weights);
+        // The existing key should remain unchanged.
+        assert!(weights.contains_key("language_model.model.layers.0.mlp.gate_proj.weight"));
     }
 }

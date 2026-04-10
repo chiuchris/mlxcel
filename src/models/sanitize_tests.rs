@@ -215,3 +215,121 @@ fn load_and_sanitize_weights_selectively_keeps_gemma4_text_tensors() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// Verify that loading an nvfp4 Gemma 4 checkpoint:
+/// 1. Remaps `model.language_model.X` → `language_model.model.X`
+/// 2. Dequantizes the packed U8 FP4 weight tensor to F16
+///
+/// Test data: 2×16 packed U8 weights (nibble 0x2 = FP4 E2M1 value 1.0),
+/// 2×2 F16 block scales (all 1.0 = 0x3C00), global F32 scale 1.0.
+/// Expected output: 2×32 F16 tensor with all values = 1.0.
+#[test]
+fn load_and_sanitize_weights_dequantizes_nvfp4_gemma4_checkpoint() {
+    let dir = temp_model_dir("gemma4_nvfp4");
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // Non-quantized Gemma 4 config so the bf16→f16 path is active but
+    // no quantization field blocks nvfp4 dequantization.
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "model_type": "gemma4",
+            "tie_word_embeddings": false,
+            "text_config": {
+                "model_type": "gemma4"
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Shape: [out_dim=2, packed_dim=16]. Each byte encodes two FP4 E2M1
+    // nibbles. Nibble 0x2 = 1.0, so byte 0x22 → [1.0, 1.0]. Expected
+    // dequantized shape: [2, 32].
+    let out_dim: usize = 2;
+    let packed_dim: usize = 16; // in_dim / 2 = 32 / 2
+    let weight_data = vec![0x22u8; out_dim * packed_dim];
+
+    // F16 block scales: shape [out_dim=2, num_groups=2]. 1.0 in F16 = 0x3C00
+    // (little-endian bytes [0x00, 0x3C]).
+    let f16_one: [u8; 2] = [0x00, 0x3C];
+    let num_groups = 2usize;
+    let mut scale_data = Vec::with_capacity(out_dim * num_groups * 2);
+    for _ in 0..(out_dim * num_groups) {
+        scale_data.extend_from_slice(&f16_one);
+    }
+
+    // Global F32 scale: 1-element F32 tensor with value 1.0.
+    // 1.0 in F32 little-endian = [0x00, 0x00, 0x80, 0x3F].
+    let scale2_data: Vec<u8> = vec![0x00, 0x00, 0x80, 0x3F];
+
+    // Use nvfp4-style key prefix: `model.language_model.layers.0.mlp.gate_proj`
+    let prefix = "model.language_model.layers.0.mlp.gate_proj";
+    write_safetensors(
+        &dir.join("model.safetensors"),
+        &[
+            (
+                &format!("{prefix}.weight"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::U8,
+                    shape: vec![out_dim, packed_dim],
+                    data: weight_data,
+                },
+            ),
+            (
+                &format!("{prefix}.weight_scale"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F16,
+                    shape: vec![out_dim, num_groups],
+                    data: scale_data,
+                },
+            ),
+            (
+                &format!("{prefix}.weight_scale_2"),
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![1],
+                    data: scale2_data,
+                },
+            ),
+        ],
+    );
+
+    let weights = super::sanitize::load_and_sanitize_weights(&dir).unwrap();
+
+    // After normalize_nvfp4_keys, the key should be remapped.
+    let expected_key = "language_model.model.layers.0.mlp.gate_proj.weight";
+    assert!(
+        weights.contains_key(expected_key),
+        "Expected dequantized key '{expected_key}' not found; keys: {:?}",
+        weights.keys().collect::<Vec<_>>()
+    );
+
+    // Auxiliary scale keys must have been removed.
+    assert!(!weights.contains_key(&format!("{prefix}.weight_scale")));
+    assert!(!weights.contains_key(&format!("{prefix}.weight_scale_2")));
+
+    // The dequantized weight must be F16 with shape [out_dim, in_dim].
+    let w = weights.get(expected_key).unwrap();
+    assert_eq!(
+        mlxcel_core::array_dtype(w),
+        dtype::FLOAT16,
+        "Expected F16 after dequantization"
+    );
+    let w_f32 = mlxcel_core::astype(w, dtype::FLOAT32);
+    mlxcel_core::eval(&w_f32);
+    let shape = mlxcel_core::array_shape(&w_f32);
+    assert_eq!(shape, vec![out_dim as i32, 32i32], "Expected shape [2, 32]");
+
+    // All values should be 1.0 * 1.0 * 1.0 = 1.0 within f16 precision.
+    let w_bytes = mlxcel_core::array_to_raw_bytes(&w_f32);
+    for chunk in w_bytes.chunks_exact(4) {
+        let v = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        assert!(
+            (v - 1.0f32).abs() < 1e-3,
+            "Expected 1.0, got {v}; nibble=0x2 (1.0) * scale=1.0 * scale2=1.0 should equal 1.0"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
