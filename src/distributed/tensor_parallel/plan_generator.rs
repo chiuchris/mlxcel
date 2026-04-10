@@ -61,8 +61,9 @@ pub fn generate_shard_plan(
         "llama4" => build_llama4_plan(num_layers, config),
 
         // Qwen family
-        "qwen2" | "qwen2.5" | "qwen3" | "qwen3_5" | "qwen3.5" => {
-            build_qwen_plan(num_layers, config)
+        "qwen2" | "qwen2.5" | "qwen3" => build_qwen_plan(num_layers, config),
+        "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3.5_text" => {
+            build_qwen35_plan(num_layers, config)
         }
 
         // Qwen MoE variants
@@ -72,6 +73,7 @@ pub fn generate_shard_plan(
 
         // Gemma family
         "gemma" | "gemma2" | "gemma3" | "gemma3n" => build_gemma_plan(num_layers, config),
+        "gemma4" | "gemma4_text" => build_gemma4_plan(num_layers, config),
 
         // Phi family
         "phi" | "phi3" | "phi3small" | "phi4mm" => build_phi_plan(num_layers, config),
@@ -357,6 +359,71 @@ fn build_qwen_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShard
     })
 }
 
+/// Qwen 3.5 dense models: hybrid full-attention + GatedDeltaNet linear attention.
+fn build_qwen35_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShardPlan> {
+    let prefix = "model.layers.{}";
+    let mut plans = attention_plans(prefix);
+    plans.extend(ffn_plans(prefix));
+    plans.extend(vec![
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.in_proj_qkv.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.in_proj_z.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.in_proj_b.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.in_proj_a.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.out_proj.weight"),
+            strategy: ShardStrategy::RowParallel,
+            shard_axis: 1,
+            comm_pattern: CommPattern::AllReduce,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.conv1d.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.dt_bias"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.linear_attn.A_log"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 0,
+            comm_pattern: CommPattern::None,
+        },
+    ]);
+    Ok(ModelShardPlan {
+        tp_size: config.tp_size,
+        num_layers,
+        layer_plans: plans,
+        embedding_strategy: resolve_embedding_strategy(config.embedding_mode),
+        lm_head_strategy: resolve_embedding_strategy(config.lm_head_mode),
+        architecture: "qwen3_5".to_string(),
+    })
+}
+
 /// Qwen MoE variants.
 fn build_qwen_moe_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShardPlan> {
     let prefix = "model.layers.{}";
@@ -404,6 +471,41 @@ fn build_gemma_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShar
         embedding_strategy: resolve_embedding_strategy(config.embedding_mode),
         lm_head_strategy: resolve_embedding_strategy(config.lm_head_mode),
         architecture: "gemma".to_string(),
+    })
+}
+
+/// Gemma 4 text models: mixed sliding/full attention with optional dense/MoE FFN.
+fn build_gemma4_plan(num_layers: usize, config: &ShardConfig) -> Result<ModelShardPlan> {
+    let prefix = "language_model.model.layers.{}";
+    let mut plans = attention_plans(prefix);
+    plans.extend(ffn_plans(prefix));
+    plans.extend(vec![
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.gate_proj.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 1,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.up_proj.weight"),
+            strategy: ShardStrategy::ColumnParallel,
+            shard_axis: 1,
+            comm_pattern: CommPattern::None,
+        },
+        LayerShardPlan {
+            weight_pattern: format!("{prefix}.experts.switch_glu.down_proj.weight"),
+            strategy: ShardStrategy::RowParallel,
+            shard_axis: 2,
+            comm_pattern: CommPattern::AllReduce,
+        },
+    ]);
+    Ok(ModelShardPlan {
+        tp_size: config.tp_size,
+        num_layers,
+        layer_plans: plans,
+        embedding_strategy: resolve_embedding_strategy(config.embedding_mode),
+        lm_head_strategy: resolve_embedding_strategy(config.lm_head_mode),
+        architecture: "gemma4".to_string(),
     })
 }
 

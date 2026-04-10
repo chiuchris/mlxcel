@@ -25,7 +25,9 @@
 //!
 //! Reference: mlx-lm/mlx_lm/models/qwen3_5.py
 
-use crate::models::gated_delta::{GatedDeltaCache, RMSNormGated, gated_delta_update};
+use crate::models::gated_delta::{
+    GatedDeltaCache, RMSNormGated, compute_g, gated_delta_ops, gated_delta_update,
+};
 use crate::models::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig, SparseMoeBlock,
 };
@@ -213,7 +215,7 @@ impl Qwen35Config {
 // GatedDeltaNet - Qwen3.5 variant with separate projections.
 /// GatedDeltaNet for Qwen3.5 with separate in_proj_qkv, in_proj_z, in_proj_b, in_proj_a
 #[allow(dead_code)]
-struct Qwen35GatedDeltaNet {
+pub(crate) struct Qwen35GatedDeltaNet {
     hidden_size: usize,
     num_v_heads: usize,
     num_k_heads: usize,
@@ -235,16 +237,60 @@ struct Qwen35GatedDeltaNet {
     out_proj: UnifiedLinear,
 }
 
+#[cfg(test)]
+pub(crate) struct Qwen35LinearDebugTensors {
+    pub qkv: UniquePtr<MlxArray>,
+    pub z: UniquePtr<MlxArray>,
+    pub b_proj: UniquePtr<MlxArray>,
+    pub a: UniquePtr<MlxArray>,
+    pub conv_out: UniquePtr<MlxArray>,
+    pub q: UniquePtr<MlxArray>,
+    pub k: UniquePtr<MlxArray>,
+    pub v: UniquePtr<MlxArray>,
+    pub beta: UniquePtr<MlxArray>,
+    pub g: UniquePtr<MlxArray>,
+    pub gated_out: UniquePtr<MlxArray>,
+    pub normed_out: UniquePtr<MlxArray>,
+    pub projected: UniquePtr<MlxArray>,
+}
+
 impl Qwen35GatedDeltaNet {
-    fn forward(
+    pub(crate) fn forward(
         &self,
         inputs: &MlxArray,
         mask: Option<&MlxArray>,
         mut cache: Option<&mut GatedDeltaCache>,
     ) -> UniquePtr<MlxArray> {
+        let out = self.forward_hidden_internal(inputs, mask, cache.as_deref_mut(), true);
+        self.out_proj.forward(&out)
+    }
+
+    pub(crate) fn forward_hidden_tp(
+        &self,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: Option<&mut GatedDeltaCache>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_hidden_internal(inputs, mask, cache, true)
+    }
+
+    fn forward_hidden_internal(
+        &self,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+        mut cache: Option<&mut GatedDeltaCache>,
+        force_ops_path: bool,
+    ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(inputs);
         let b = shape[0];
         let s = shape[1];
+
+        let forced_mask = if force_ops_path && mask.is_none() {
+            Some(mlxcel_core::ones(&[b, s], dtype::BOOL))
+        } else {
+            None
+        };
+        let effective_mask = forced_mask.as_deref().or(mask);
 
         // Separate projections (different from Qwen3Next's combined projections)
         let qkv = self.in_proj_qkv.forward(inputs);
@@ -283,7 +329,7 @@ impl Qwen35GatedDeltaNet {
 
         // Guard: discard mask if batch dimension doesn't match (continuous batching).
         // Uses guarded_mask consistently for both the conv masking and gated_delta_update.
-        let guarded_mask = mask.filter(|m| {
+        let guarded_mask = effective_mask.filter(|m| {
             let mask_shape = mlxcel_core::array_shape(m);
             mask_shape[0] == b
         });
@@ -406,9 +452,114 @@ impl Qwen35GatedDeltaNet {
 
         // Apply norm with gating
         let out = self.norm.forward(&out, Some(&z));
-        let out = mlxcel_core::reshape(&out, &[b, s, -1]);
+        mlxcel_core::reshape(&out, &[b, s, -1])
+    }
 
-        self.out_proj.forward(&out)
+    #[cfg(test)]
+    pub(crate) fn debug_prefill_no_cache(
+        &self,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+    ) -> Qwen35LinearDebugTensors {
+        let shape = mlxcel_core::array_shape(inputs);
+        let b = shape[0];
+        let s = shape[1];
+
+        let qkv = self.in_proj_qkv.forward(inputs);
+        let z = self.in_proj_z.forward(inputs);
+        let z_reshaped =
+            mlxcel_core::reshape(&z, &[b, s, self.num_v_heads as i32, self.head_v_dim as i32]);
+        let b_proj = self.in_proj_b.forward(inputs);
+        let a = self.in_proj_a.forward(inputs);
+
+        let input_dtype = mlxcel_core::array_dtype(&qkv);
+        let conv_state = mlxcel_core::zeros(
+            &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
+            input_dtype,
+        );
+        let guarded_mask = mask.filter(|m| mlxcel_core::array_shape(m)[0] == b);
+        let qkv_masked = if let Some(m) = guarded_mask {
+            let m_exp = mlxcel_core::expand_dims(m, -1);
+            let zero = mlxcel_core::full_f32(&[1], 0.0, input_dtype);
+            mlxcel_core::where_cond(&m_exp, &qkv, &zero)
+        } else {
+            mlxcel_core::copy(&qkv)
+        };
+        let conv_input = concatenate(&conv_state, &qkv_masked, 1);
+        let conv_out = mlxcel_core::conv1d(
+            &conv_input,
+            &self.conv1d_weight,
+            1,
+            0,
+            1,
+            self.conv_dim as i32,
+        );
+        let conv_out = silu(&conv_out);
+
+        let conv_seq = mlxcel_core::array_shape(&conv_out)[1];
+        let q_out = mlxcel_core::slice(&conv_out, &[0, 0, 0], &[b, conv_seq, self.key_dim as i32]);
+        let k_out = mlxcel_core::slice(
+            &conv_out,
+            &[0, 0, self.key_dim as i32],
+            &[b, conv_seq, (2 * self.key_dim) as i32],
+        );
+        let v_out = mlxcel_core::slice(
+            &conv_out,
+            &[0, 0, (2 * self.key_dim) as i32],
+            &[b, conv_seq, self.conv_dim as i32],
+        );
+
+        let q = mlxcel_core::reshape(
+            &q_out,
+            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+        );
+        let k = mlxcel_core::reshape(
+            &k_out,
+            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+        );
+        let v = mlxcel_core::reshape(
+            &v_out,
+            &[b, s, self.num_v_heads as i32, self.head_v_dim as i32],
+        );
+
+        let inv_scale = (self.head_k_dim as f32).powf(-0.5);
+        let q_dtype = mlxcel_core::array_dtype(&q);
+        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, q_dtype);
+
+        let q_sq = mlxcel_core::square(&q);
+        let q_sq_mean = mlxcel_core::mean_axis(&q_sq, -1, true);
+        let q_rms = mlxcel_core::sqrt(&mlxcel_core::add(&q_sq_mean, &eps_arr));
+        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, q_dtype);
+        let q = mlxcel_core::multiply(&mlxcel_core::divide(&q, &q_rms), &scale_q);
+
+        let k_sq = mlxcel_core::square(&k);
+        let k_sq_mean = mlxcel_core::mean_axis(&k_sq, -1, true);
+        let k_rms = mlxcel_core::sqrt(&mlxcel_core::add(&k_sq_mean, &eps_arr));
+        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, q_dtype);
+        let k = mlxcel_core::multiply(&mlxcel_core::divide(&k, &k_rms), &scale_k);
+
+        let beta = mlxcel_core::sigmoid(&b_proj);
+        let g = compute_g(&self.a_log, &a, &self.dt_bias);
+        let (gated_out, _) = gated_delta_ops(&q, &k, &v, &g, &beta, None, guarded_mask);
+        let normed_out = self.norm.forward(&gated_out, Some(&z_reshaped));
+        let normed_out = mlxcel_core::reshape(&normed_out, &[b, s, -1]);
+        let projected = self.out_proj.forward(&normed_out);
+
+        Qwen35LinearDebugTensors {
+            qkv,
+            z: z_reshaped,
+            b_proj,
+            a,
+            conv_out,
+            q,
+            k,
+            v,
+            beta,
+            g,
+            gated_out,
+            normed_out,
+            projected,
+        }
     }
 
     fn from_weights(
@@ -513,23 +664,23 @@ impl Qwen35GatedDeltaNet {
 
 // Decoder Layer.
 /// Attention variant for Qwen3.5
-enum Qwen35AttentionVariant {
+pub(crate) enum Qwen35AttentionVariant {
     FullAttention(Qwen3NextAttention),
     Linear(Qwen35GatedDeltaNet),
 }
 
 /// MLP variant for Qwen3.5
-enum Qwen35MLPVariant {
+pub(crate) enum Qwen35MLPVariant {
     Dense(MLP),
     MoE(SparseMoeBlock),
 }
 
-struct Qwen35DecoderLayer {
-    is_linear: bool,
-    attention: Qwen35AttentionVariant,
-    mlp: Qwen35MLPVariant,
-    input_layernorm: RMSNorm,
-    post_attention_layernorm: RMSNorm,
+pub(crate) struct Qwen35DecoderLayer {
+    pub(crate) is_linear: bool,
+    pub(crate) attention: Qwen35AttentionVariant,
+    pub(crate) mlp: Qwen35MLPVariant,
+    pub(crate) input_layernorm: RMSNorm,
+    pub(crate) post_attention_layernorm: RMSNorm,
 }
 
 impl Qwen35DecoderLayer {
@@ -624,11 +775,11 @@ impl Qwen35DecoderLayer {
 
 // Qwen3.5 Model.
 pub struct Qwen35Model {
-    embed_tokens: UnifiedEmbedding,
-    layers: Vec<Qwen35DecoderLayer>,
-    norm: RMSNorm,
-    lm_head: Option<UnifiedLinear>,
-    config: Qwen35Config,
+    pub(crate) embed_tokens: UnifiedEmbedding,
+    pub(crate) layers: Vec<Qwen35DecoderLayer>,
+    pub(crate) norm: RMSNorm,
+    pub(crate) lm_head: Option<UnifiedLinear>,
+    pub(crate) config: Qwen35Config,
     /// Internal caches for LanguageModel trait compatibility
     /// Using RefCell to allow mutation through shared reference (required by trait)
     internal_caches: RefCell<Vec<Qwen3NextCache>>,

@@ -21,6 +21,7 @@
 use std::path::PathBuf;
 
 use crate::SamplingConfig;
+use crate::distributed::ShardConfig;
 use crate::server::batch::RequestPriority;
 use mlxcel_core::sampling::LogprobsConfig;
 
@@ -106,6 +107,8 @@ pub struct ServerConfig {
     /// Default: 1 (no batching, backward compatible).
     /// Recommended: 4–8 on M5 Pro/Max hardware.
     pub max_batch_prefill: usize,
+    /// Tensor-parallel loading/runtime options resolved at startup.
+    pub tensor_parallel: ShardConfig,
 }
 
 impl Default for ServerConfig {
@@ -142,6 +145,7 @@ impl Default for ServerConfig {
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,
             max_batch_prefill: 1,
+            tensor_parallel: ShardConfig::default(),
         }
     }
 }

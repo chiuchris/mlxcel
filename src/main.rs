@@ -18,17 +18,17 @@ use std::path::PathBuf;
 
 mod commands;
 
-/// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon
+/// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs
 ///
 /// A Rust implementation for running Large Language Models, Vision-Language
-/// Models, and Vision-Language-Action Models efficiently on Apple Silicon
-/// using the MLX framework.
+/// Models, and Vision-Language-Action Models efficiently on Apple Silicon and
+/// CUDA GPUs using the MLX framework.
 #[derive(Parser, Debug)]
 #[command(
     name = "mlxcel",
     author = "Lablup Inc.",
     version,
-    about = "High-performance LLM/VLM/VLA inference on Apple Silicon",
+    about = "High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs",
     long_about = None,
     after_help = "\
 Environment Variables:
@@ -37,6 +37,12 @@ Environment Variables:
                            \"max\"  — pin all GPU memory (may OOM on large models)
                            \"0\"    — no limit (default)
                            \"96GB\" — explicit limit (supports GB, MB, or bytes)
+
+Tensor Parallel Runtime:
+  Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, Hunyuan v1 Dense
+  Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
+                       LoRA unsupported, server batching supported for listed dense runtimes
+                       except Gemma 4 E2B-style conservative fallback checkpoints
 
 For more information, visit: https://github.com/lablup/mlxcel"
 )]
@@ -69,6 +75,9 @@ pub(crate) struct GenerateArgs {
 
     #[command(flatten)]
     pub(crate) sampling: SamplingOptions,
+
+    #[command(flatten)]
+    pub(crate) tensor_parallel: TensorParallelOptions,
 }
 
 /// Model loading options
@@ -185,6 +194,47 @@ pub(crate) struct SamplingOptions {
     /// DRY lookback window size (0 = use full history)
     #[arg(long, default_value_t = 0, value_name = "N")]
     pub(crate) dry_penalty_last_n: usize,
+}
+
+/// Tensor-parallel options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Tensor Parallel Options")]
+pub(crate) struct TensorParallelOptions {
+    /// Number of tensor-parallel ranks (must be a power of 2).
+    ///
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen2/2.5,
+    /// Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, and
+    /// Hunyuan v1 Dense models.
+    #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
+    pub(crate) tp_size: usize,
+
+    /// MoE expert sharding mode: "expert_parallel" or "within_expert"
+    #[arg(
+        long = "tp-moe-mode",
+        default_value = "expert_parallel",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_moe_mode: String,
+
+    /// Embedding sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
+    #[arg(
+        long = "tp-embedding-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_embedding_mode: String,
+
+    /// LM head sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
+    #[arg(
+        long = "tp-lm-head-mode",
+        default_value = "replicated",
+        value_name = "MODE"
+    )]
+    pub(crate) tp_lm_head_mode: String,
 }
 
 /// Server options
@@ -441,10 +491,11 @@ pub(crate) struct ServeArgs {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
-    /// Number of tensor-parallel ranks (must be a power of 2)
+    /// Number of tensor-parallel ranks (must be a power of 2).
     ///
-    /// When set to N > 1, model weights are sharded across N ranks using
-    /// column-parallel (Q/K/V, gate/up) and row-parallel (O, down) strategies.
+    /// When set to N > 1, model weights are sharded across N in-process ranks.
+    /// Current multi-rank runtime support is limited to dense Llama, Qwen2/2.5,
+    /// Qwen3, Gemma 3 text, ERNIE 4.5, and Hunyuan v1 Dense models.
     #[arg(long = "tp-size", default_value_t = 1, value_name = "N")]
     tp_size: usize,
 
@@ -456,7 +507,9 @@ pub(crate) struct ServeArgs {
     )]
     tp_moe_mode: String,
 
-    /// Embedding sharding mode: "vocab_parallel" or "replicated"
+    /// Embedding sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-embedding-mode",
         default_value = "replicated",
@@ -464,7 +517,9 @@ pub(crate) struct ServeArgs {
     )]
     tp_embedding_mode: String,
 
-    /// LM head sharding mode: "vocab_parallel" or "replicated"
+    /// LM head sharding mode: "vocab_parallel" or "replicated".
+    ///
+    /// The current in-process tensor-parallel runtime requires "replicated".
     #[arg(
         long = "tp-lm-head-mode",
         default_value = "replicated",
@@ -569,3 +624,7 @@ fn print_supported_models() {
 
     println!("For the full list, see: docs/model_implementations.md");
 }
+
+#[cfg(test)]
+#[path = "main_tests.rs"]
+mod tests;

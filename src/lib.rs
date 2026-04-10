@@ -51,4 +51,6 @@ pub use multimodal::{
 // Re-export split modules
 pub use loaded_model::LoadedModel;
 pub use loaded_model_capabilities::VlmRuntimeRef;
-pub use loading::{load_model, load_model_with_adapter, read_eos_token_ids};
+pub use loading::{
+    load_model, load_model_with_adapter, load_model_with_tensor_parallel, read_eos_token_ids,
+};

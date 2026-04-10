@@ -128,6 +128,7 @@ impl ModelProvider {
             Self::new_with_legacy_worker(
                 model_path,
                 adapter_path,
+                config.tensor_parallel.clone(),
                 batch_metrics,
                 batch_observability,
             )
@@ -155,6 +156,7 @@ impl ModelProvider {
     pub(crate) fn new_with_legacy_worker(
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
+        tensor_parallel: crate::distributed::ShardConfig,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -174,6 +176,7 @@ impl ModelProvider {
         let worker_handle = model_worker::spawn_legacy_model_worker(
             model_path,
             adapter_path,
+            tensor_parallel,
             request_rx,
             loaded_clone,
             worker_model_id,
@@ -255,6 +258,7 @@ impl ModelProvider {
             enable_preemption,
             preemption_policy,
             max_batch_prefill: max_batch_prefill.max(1),
+            tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -314,6 +318,7 @@ impl ModelProvider {
             enable_preemption: false,
             preemption_policy: crate::server::config::PreemptionPolicy::default(),
             max_batch_prefill: 1,
+            tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

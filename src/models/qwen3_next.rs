@@ -530,6 +530,17 @@ impl Qwen3NextAttention {
         mask: Option<&MlxArray>,
         position_ids: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        let output = self.forward_hidden_with_position_ids(x, cache, mask, position_ids);
+        self.o_proj.forward(&output)
+    }
+
+    pub(crate) fn forward_hidden_with_position_ids(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+        position_ids: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(x);
         let b = shape[0];
         let l = shape[1];
@@ -633,9 +644,7 @@ impl Qwen3NextAttention {
 
         // Apply sigmoid gating to output
         let gate_sigmoid = mlxcel_core::sigmoid(&gate);
-        let output = mlxcel_core::multiply(&output, &gate_sigmoid);
-
-        self.o_proj.forward(&output)
+        mlxcel_core::multiply(&output, &gate_sigmoid)
     }
 
     pub(crate) fn from_weights(
@@ -694,10 +703,14 @@ pub(crate) struct MLP {
 
 impl MLP {
     pub(crate) fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        let gated = self.forward_hidden(x);
+        self.down_proj.forward(&gated)
+    }
+
+    pub(crate) fn forward_hidden(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
         let gate = silu(&self.gate_proj.forward(x));
         let up = self.up_proj.forward(x);
-        let gated = mlxcel_core::multiply(&gate, &up);
-        self.down_proj.forward(&gated)
+        mlxcel_core::multiply(&gate, &up)
     }
 
     pub(crate) fn from_weights(

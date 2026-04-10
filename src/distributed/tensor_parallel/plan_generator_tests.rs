@@ -373,9 +373,17 @@ fn phimoe_plan() {
 fn qwen3_5_plan() {
     let config = ShardConfig::with_tp_size(2);
     let plan = generate_shard_plan("qwen3_5", 36, &config).unwrap();
-    assert_eq!(plan.architecture, "qwen");
+    assert_eq!(plan.architecture, "qwen3_5");
     assert_has_attention_plans(&plan);
     assert_has_ffn_plans(&plan);
+    assert!(
+        plan.plan_for_weight("model.layers.0.linear_attn.in_proj_qkv.weight")
+            .is_some()
+    );
+    assert!(
+        plan.plan_for_weight("model.layers.0.linear_attn.out_proj.weight")
+            .is_some()
+    );
 }
 
 #[test]

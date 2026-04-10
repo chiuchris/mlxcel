@@ -38,6 +38,7 @@ fn sample_args() -> crate::ServeArgs {
         ubatch_size: None,
         enable_preemption: false,
         preemption_policy: "longest-first".to_string(),
+        max_batch_prefill: 1,
         timeout: 30,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),
@@ -82,6 +83,7 @@ fn sample_args() -> crate::ServeArgs {
         _mlock: false,
         _no_mmap: false,
         _cont_batching: false,
+        kv_cache_mode: "fp16".to_string(),
     }
 }
 

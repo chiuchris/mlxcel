@@ -35,18 +35,18 @@ use mlxcel_core::utils::{
 };
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct QuantizationArgs {
     pub group_size: usize,
     pub bits: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RopeParameters {
     #[serde(default = "default_rope_theta")]
     pub rope_theta: f32,
@@ -62,7 +62,7 @@ fn default_partial_rotary_factor() -> f32 {
     1.0
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct TextConfig {
     pub model_type: String,
     pub hidden_size: usize,
@@ -183,13 +183,13 @@ impl TextConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct RootQuantization {
     pub group_size: usize,
     pub bits: usize,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ModelArgs {
     pub model_type: String,
     pub text_config: serde_json::Value,
@@ -349,9 +349,9 @@ fn scatter_unsort(x: &MlxArray, inv_order: &MlxArray, orig_shape: &[i32]) -> Uni
 }
 
 pub struct MLP {
-    gate_proj: UnifiedLinear,
-    up_proj: UnifiedLinear,
-    down_proj: UnifiedLinear,
+    pub(crate) gate_proj: UnifiedLinear,
+    pub(crate) up_proj: UnifiedLinear,
+    pub(crate) down_proj: UnifiedLinear,
 }
 
 impl MLP {
@@ -424,12 +424,12 @@ impl MLP {
 }
 
 pub struct Router {
-    norm: RMSNormNoScale,
-    proj: UnifiedLinear,
-    scale: UniquePtr<MlxArray>,
-    per_expert_scale: UniquePtr<MlxArray>,
-    hidden_root_scale: f32,
-    top_k_experts: i32,
+    pub(crate) norm: RMSNormNoScale,
+    pub(crate) proj: UnifiedLinear,
+    pub(crate) scale: UniquePtr<MlxArray>,
+    pub(crate) per_expert_scale: UniquePtr<MlxArray>,
+    pub(crate) hidden_root_scale: f32,
+    pub(crate) top_k_experts: i32,
 }
 
 impl Router {
@@ -581,7 +581,7 @@ pub enum Cache {
 }
 
 impl Cache {
-    fn as_interface(&mut self) -> &mut dyn CacheInterface {
+    pub(crate) fn as_interface(&mut self) -> &mut dyn CacheInterface {
         match self {
             Self::Standard(cache) => cache,
             Self::Rotating(cache) => cache,
@@ -591,21 +591,21 @@ impl Cache {
 
 pub struct Attention {
     projection: AttentionProjection,
-    o_proj: UnifiedLinear,
-    q_norm: RMSNorm,
-    k_norm: RMSNorm,
-    v_norm: RMSNormNoScale,
-    n_heads: i32,
-    n_kv_heads: i32,
-    head_dim: i32,
-    rope_dims: i32,
-    rope_theta: f32,
-    scale: f32,
-    is_kv_shared_layer: bool,
-    kv_shared_layer_index: Option<usize>,
-    store_full_length_kv: bool,
-    use_k_eq_v: bool,
-    window_size: i32,
+    pub(crate) o_proj: UnifiedLinear,
+    pub(crate) q_norm: RMSNorm,
+    pub(crate) k_norm: RMSNorm,
+    pub(crate) v_norm: RMSNormNoScale,
+    pub(crate) n_heads: i32,
+    pub(crate) n_kv_heads: i32,
+    pub(crate) head_dim: i32,
+    pub(crate) rope_dims: i32,
+    pub(crate) rope_theta: f32,
+    pub(crate) scale: f32,
+    pub(crate) is_kv_shared_layer: bool,
+    pub(crate) kv_shared_layer_index: Option<usize>,
+    pub(crate) store_full_length_kv: bool,
+    pub(crate) use_k_eq_v: bool,
+    pub(crate) window_size: i32,
 }
 
 impl Attention {
@@ -672,7 +672,7 @@ impl Attention {
 
         // When mask was discarded (undersized) or originally None,
         // use causal attention if possible.
-        if local_mask.is_none() && self.n_kv_heads > 1 {
+        if local_mask.is_none() {
             return mlxcel_core::causal_attention(
                 queries,
                 keys,
@@ -882,22 +882,22 @@ fn trim_mask_to_keys(mask: Option<&MlxArray>, keys: &MlxArray) -> Option<UniqueP
 }
 
 pub struct DecoderLayer {
-    self_attn: Attention,
-    mlp: MLP,
-    input_layernorm: RMSNorm,
-    post_attention_layernorm: RMSNorm,
-    pre_feedforward_layernorm: RMSNorm,
-    post_feedforward_layernorm: RMSNorm,
-    router: Option<Router>,
-    experts: Option<Experts>,
-    post_feedforward_layernorm_1: Option<RMSNorm>,
-    pre_feedforward_layernorm_2: Option<RMSNorm>,
-    post_feedforward_layernorm_2: Option<RMSNorm>,
-    per_layer_input_gate: Option<UnifiedLinear>,
-    per_layer_projection: Option<UnifiedLinear>,
-    post_per_layer_input_norm: Option<RMSNorm>,
-    layer_scalar: UniquePtr<MlxArray>,
-    layer_type: String,
+    pub(crate) self_attn: Attention,
+    pub(crate) mlp: MLP,
+    pub(crate) input_layernorm: RMSNorm,
+    pub(crate) post_attention_layernorm: RMSNorm,
+    pub(crate) pre_feedforward_layernorm: RMSNorm,
+    pub(crate) post_feedforward_layernorm: RMSNorm,
+    pub(crate) router: Option<Router>,
+    pub(crate) experts: Option<Experts>,
+    pub(crate) post_feedforward_layernorm_1: Option<RMSNorm>,
+    pub(crate) pre_feedforward_layernorm_2: Option<RMSNorm>,
+    pub(crate) post_feedforward_layernorm_2: Option<RMSNorm>,
+    pub(crate) per_layer_input_gate: Option<UnifiedLinear>,
+    pub(crate) per_layer_projection: Option<UnifiedLinear>,
+    pub(crate) post_per_layer_input_norm: Option<RMSNorm>,
+    pub(crate) layer_scalar: UniquePtr<MlxArray>,
+    pub(crate) layer_type: String,
 }
 
 impl DecoderLayer {
@@ -1101,13 +1101,13 @@ impl DecoderLayer {
 }
 
 pub struct Gemma4TextModel {
-    embed_tokens: UnifiedEmbedding,
-    embed_tokens_per_layer: Option<UnifiedEmbedding>,
-    per_layer_model_projection: Option<ScaledLinear>,
-    per_layer_projection_norm: Option<RMSNorm>,
-    layers: Vec<DecoderLayer>,
-    norm: RMSNorm,
-    config: TextConfig,
+    pub(crate) embed_tokens: UnifiedEmbedding,
+    pub(crate) embed_tokens_per_layer: Option<UnifiedEmbedding>,
+    pub(crate) per_layer_model_projection: Option<ScaledLinear>,
+    pub(crate) per_layer_projection_norm: Option<RMSNorm>,
+    pub(crate) layers: Vec<DecoderLayer>,
+    pub(crate) norm: RMSNorm,
+    pub(crate) config: TextConfig,
 }
 
 impl Gemma4TextModel {
@@ -1342,7 +1342,7 @@ impl Gemma4TextModel {
         })
     }
 
-    fn make_caches(&self) -> Vec<Cache> {
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
         self.config
             .layer_types
             .iter()
@@ -1357,7 +1357,7 @@ impl Gemma4TextModel {
     }
 }
 
-fn first_cache_offset(caches: &mut [Cache], layer_type: &str) -> i32 {
+pub(crate) fn first_cache_offset(caches: &mut [Cache], layer_type: &str) -> i32 {
     for cache in caches.iter_mut() {
         match (layer_type, cache) {
             ("full_attention", Cache::Standard(c)) => return c.offset,
@@ -1368,7 +1368,7 @@ fn first_cache_offset(caches: &mut [Cache], layer_type: &str) -> i32 {
     0
 }
 
-fn slice_layer_input(
+pub(crate) fn slice_layer_input(
     layer_inputs: &MlxArray,
     layer_idx: i32,
     batch: i32,
@@ -1384,9 +1384,9 @@ fn slice_layer_input(
 }
 
 pub struct Gemma4Model {
-    text_model: Gemma4TextModel,
-    config: TextConfig,
-    eos_token_ids: Vec<i32>,
+    pub(crate) text_model: Gemma4TextModel,
+    pub(crate) config: TextConfig,
+    pub(crate) eos_token_ids: Vec<i32>,
     _weight_backing: super::sanitize::Gemma4WeightBacking,
 }
 
@@ -1461,7 +1461,7 @@ impl Gemma4Model {
         logits
     }
 
-    fn make_caches(&self) -> Vec<Cache> {
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
         self.text_model.make_caches()
     }
 }

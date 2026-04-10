@@ -42,6 +42,13 @@ use mlxcel_core::generate::LanguageModel;
 /// that manage their internal cache state since they require mixed cache types.
 pub enum LoadedModel {
     Llama(models::Llama3Model),
+    TensorParallelLlama(crate::distributed::TensorParallelLlamaModel),
+    TensorParallelQwen3(crate::distributed::TensorParallelQwen3Model),
+    TensorParallelQwen35(crate::distributed::TensorParallelQwen35Model),
+    TensorParallelGemma3(crate::distributed::TensorParallelGemma3Model),
+    TensorParallelGemma4(crate::distributed::TensorParallelGemma4Model),
+    TensorParallelErnie45(crate::distributed::TensorParallelErnie45Model),
+    TensorParallelHunyuanV1Dense(crate::distributed::TensorParallelHunyuanV1DenseModel),
     Llama4(models::Llama4Wrapper),
     Qwen2(models::Qwen2Model),
     Qwen3(models::Qwen3Model),
@@ -137,6 +144,13 @@ macro_rules! delegate_language_model {
     ($self:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
         match $self {
             LoadedModel::Llama(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelLlama(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelQwen3(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelQwen35(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelGemma3(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelGemma4(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelErnie45(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::TensorParallelHunyuanV1Dense(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Llama4(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Qwen3(inner) => LanguageModel::$method(inner, $($arg),*),
