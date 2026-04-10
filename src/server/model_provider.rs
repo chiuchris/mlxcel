@@ -142,6 +142,7 @@ impl ModelProvider {
                 config.enable_preemption,
                 config.preemption_policy,
                 config.max_batch_prefill,
+                config.decode_storage_backend,
                 batch_metrics,
                 batch_observability,
             )
@@ -218,6 +219,7 @@ impl ModelProvider {
             enable_preemption,
             preemption_policy,
             1,
+            crate::server::DecodeStorageBackend::Dense,
             batch_metrics,
             batch_observability,
         )
@@ -235,6 +237,7 @@ impl ModelProvider {
         enable_preemption: bool,
         preemption_policy: crate::server::config::PreemptionPolicy,
         max_batch_prefill: usize,
+        decode_storage_backend: crate::server::DecodeStorageBackend,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -258,6 +261,7 @@ impl ModelProvider {
             enable_preemption,
             preemption_policy,
             max_batch_prefill: max_batch_prefill.max(1),
+            decode_storage_backend,
             tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 
@@ -318,6 +322,7 @@ impl ModelProvider {
             enable_preemption: false,
             preemption_policy: crate::server::config::PreemptionPolicy::default(),
             max_batch_prefill: 1,
+            decode_storage_backend: crate::server::DecodeStorageBackend::Dense,
             tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 

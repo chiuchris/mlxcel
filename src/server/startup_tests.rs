@@ -19,6 +19,7 @@ use super::{
     resolve_default_max_tokens, resolve_dry_penalty_last_n,
     resolve_tensor_parallel_runtime_support, validate_tensor_parallel_startup,
 };
+use crate::server::DecodeStorageBackend;
 use crate::server::chat_template::ChatMessage;
 
 fn temp_path(name: &str) -> PathBuf {
@@ -176,6 +177,19 @@ fn build_server_config_preserves_batch_scheduler_for_tensor_parallel() {
     let config = build_server_config(&startup, None);
     assert!(!config.no_batch);
     assert_eq!(config.tensor_parallel.tp_size, 2);
+}
+
+#[test]
+fn decode_storage_backend_parses_dense_and_paged() {
+    assert_eq!(
+        "dense".parse::<DecodeStorageBackend>().unwrap(),
+        DecodeStorageBackend::Dense
+    );
+    assert_eq!(
+        "paged".parse::<DecodeStorageBackend>().unwrap(),
+        DecodeStorageBackend::Paged
+    );
+    assert!("unknown".parse::<DecodeStorageBackend>().is_err());
 }
 
 #[test]

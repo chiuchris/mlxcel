@@ -514,6 +514,19 @@ impl KVCache {
         let vs_bytes = self.val_scales.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         k_bytes + v_bytes + ks_bytes + vs_bytes
     }
+
+    /// Estimated storage bytes per reserved token slot in the backing buffer.
+    ///
+    /// This uses the allocated buffer capacity rather than the visible offset
+    /// so callers can mirror dense-cache physical storage into paged block
+    /// accounting even when the buffer is step-allocated.
+    pub fn bytes_per_reserved_token(&self) -> usize {
+        let capacity = self.buffer_seq_len();
+        if capacity <= 0 {
+            return 0;
+        }
+        self.nbytes() / capacity as usize
+    }
 }
 
 impl Default for KVCache {
@@ -1232,7 +1245,17 @@ impl CachePool {
         &mut self,
         model: &dyn crate::generate::LanguageModel,
     ) -> Result<SequenceId, String> {
-        let layout = model.sequence_state_layout();
+        self.allocate_with_layout(model, None)
+    }
+
+    /// Allocate a fresh cache set using either the model default layout or an
+    /// explicit server-side override.
+    pub fn allocate_with_layout(
+        &mut self,
+        model: &dyn crate::generate::LanguageModel,
+        layout_override: Option<SequenceStateLayout>,
+    ) -> Result<SequenceId, String> {
+        let layout = layout_override.unwrap_or_else(|| model.sequence_state_layout());
         if layout.backend == SequenceStateBackend::DenseKvCache
             && self.active.len() >= self.max_sequences
         {
@@ -1252,7 +1275,13 @@ impl CachePool {
                     "CachePool: paged backend requires a paged layout".to_string()
                 })?;
                 self.ensure_paged_pool(&paged_layout)?;
-                SequenceCacheSet::paged(id, paged_layout)
+                SequenceCacheSet::with_backend(
+                    id,
+                    SequenceStateBackend::PagedKvCache,
+                    model.make_caches(),
+                    Some(PagedSequenceState::new(&paged_layout)),
+                    Some(paged_layout),
+                )
             }
             SequenceStateBackend::ModelOwned => {
                 // Model-owned state uses placeholder KV caches.
@@ -1404,6 +1433,41 @@ impl CachePool {
                     .filter_map(|sequence| sequence.paged_state()),
             ),
         )
+    }
+
+    /// Mirror the visible dense-cache offsets into the paged backend state for
+    /// one sequence.
+    ///
+    /// This keeps server decode/pre-fill lifecycle bookkeeping aligned while
+    /// the actual model execution still runs on dense compatibility caches.
+    pub fn sync_paged_state_with_dense(&mut self, id: SequenceId) -> Result<(), String> {
+        let pool = match self.paged_pool.as_mut() {
+            Some(pool) => pool,
+            None => return Ok(()),
+        };
+        let sequence = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
+        let target_lens: Vec<usize> = sequence
+            .caches
+            .iter()
+            .map(|cache| cache.seq_len().max(0) as usize)
+            .collect();
+        let state = match sequence.paged_state_mut() {
+            Some(state) => state,
+            None => return Ok(()),
+        };
+
+        for (layer_idx, target_len) in target_lens.into_iter().enumerate() {
+            let current_len = state.layers[layer_idx].len;
+            if target_len > current_len {
+                pool.append_tokens(state, layer_idx, target_len - current_len)?;
+            } else if target_len < current_len {
+                pool.trim_tokens(state, layer_idx, current_len - target_len)?;
+            }
+        }
+        Ok(())
     }
 
     /// Maximum number of concurrent sequences this pool allows.
@@ -1895,5 +1959,43 @@ mod tests {
             .block_ids[0];
         assert_eq!(reused_block, first_block);
         assert_ne!(reused_block, second_block);
+    }
+
+    #[test]
+    fn cache_pool_can_override_dense_model_with_paged_sequence_state() {
+        let model = StubModel { num_layers: 2 };
+        let mut pool = CachePool::new(4);
+        let layout = SequenceStateLayout::paged_kv_cache(PagedKvLayout::uniform(2, 4, 4).unwrap());
+
+        let id = pool.allocate_with_layout(&model, Some(layout)).unwrap();
+        let entry = pool.get_mut(id).unwrap();
+
+        assert_eq!(entry.backend, SequenceStateBackend::PagedKvCache);
+        assert_eq!(entry.caches.len(), 2);
+        assert!(entry.paged_state().is_some());
+    }
+
+    #[test]
+    fn sync_paged_state_with_dense_cache_offsets_tracks_rewinds() {
+        let model = StubModel { num_layers: 1 };
+        let mut pool = CachePool::new(4);
+        let layout = SequenceStateLayout::paged_kv_cache(PagedKvLayout::uniform(1, 4, 4).unwrap());
+        let id = pool.allocate_with_layout(&model, Some(layout)).unwrap();
+
+        {
+            let caches = pool.get_caches_mut(id).unwrap();
+            let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+            let values = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+            caches[0].update(keys, values);
+        }
+        pool.sync_paged_state_with_dense(id).unwrap();
+        assert_eq!(pool.get_paged_state(id).unwrap().layer(0).unwrap().len, 4);
+
+        {
+            let caches = pool.get_caches_mut(id).unwrap();
+            assert_eq!(caches[0].trim(2), 2);
+        }
+        pool.sync_paged_state_with_dense(id).unwrap();
+        assert_eq!(pool.get_paged_state(id).unwrap().layer(0).unwrap().len, 2);
     }
 }

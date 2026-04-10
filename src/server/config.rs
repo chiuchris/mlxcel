@@ -25,6 +25,30 @@ use crate::distributed::ShardConfig;
 use crate::server::batch::RequestPriority;
 use mlxcel_core::sampling::LogprobsConfig;
 
+/// Storage backend used by the server batch scheduler for decode-time state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DecodeStorageBackend {
+    /// Existing dense per-sequence KV caches.
+    #[default]
+    Dense,
+    /// Paged block-table state mirrored alongside dense compatibility caches.
+    Paged,
+}
+
+impl std::str::FromStr for DecodeStorageBackend {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "" | "dense" => Ok(Self::Dense),
+            "paged" => Ok(Self::Paged),
+            other => Err(format!(
+                "unknown decode storage backend \"{other}\"; expected \"dense\" or \"paged\""
+            )),
+        }
+    }
+}
+
 /// Bridge between server request params and `mlxcel-core` `SamplingConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerGenerateOptions {
@@ -107,6 +131,8 @@ pub struct ServerConfig {
     /// Default: 1 (no batching, backward compatible).
     /// Recommended: 4–8 on M5 Pro/Max hardware.
     pub max_batch_prefill: usize,
+    /// Decode-time storage backend used by the batch scheduler.
+    pub decode_storage_backend: DecodeStorageBackend,
     /// Tensor-parallel loading/runtime options resolved at startup.
     pub tensor_parallel: ShardConfig,
 }
@@ -145,6 +171,7 @@ impl Default for ServerConfig {
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,
             max_batch_prefill: 1,
+            decode_storage_backend: DecodeStorageBackend::Dense,
             tensor_parallel: ShardConfig::default(),
         }
     }

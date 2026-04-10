@@ -257,6 +257,21 @@ fn parse_preemption_policy(s: &str) -> crate::server::PreemptionPolicy {
     }
 }
 
+fn resolve_decode_storage_backend() -> crate::server::DecodeStorageBackend {
+    match std::env::var("MLXCEL_SERVER_DECODE_STORAGE") {
+        Ok(raw) => match raw.parse::<crate::server::DecodeStorageBackend>() {
+            Ok(backend) => backend,
+            Err(err) => {
+                tracing::warn!(
+                    "{err}; falling back to dense decode storage (set MLXCEL_SERVER_DECODE_STORAGE=dense|paged)"
+                );
+                crate::server::DecodeStorageBackend::Dense
+            }
+        },
+        Err(_) => crate::server::DecodeStorageBackend::Dense,
+    }
+}
+
 pub(super) fn build_server_config(
     startup: &ServerStartupConfig,
     api_key: Option<String>,
@@ -301,6 +316,7 @@ pub(super) fn build_server_config(
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
         no_batch: startup.no_batch,
         max_batch_prefill: startup.max_batch_prefill.max(1),
+        decode_storage_backend: resolve_decode_storage_backend(),
         tensor_parallel,
     }
 }

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use mlxcel_core::cache::{CachePool, SequenceId};
+use mlxcel_core::cache::{CachePool, PagedKvLayout, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
@@ -45,7 +45,7 @@ use mlxcel_core::{MlxStream, UniquePtr};
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::observability::BatchObservability;
-use crate::server::config::PreemptionPolicy;
+use crate::server::config::{DecodeStorageBackend, PreemptionPolicy};
 use crate::server::model_provider::model_worker::{
     StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
     prepare_request_vlm_embeddings,
@@ -67,6 +67,20 @@ use super::sequence::{
 fn should_align_prefill() -> bool {
     let hw = hardware::get_hardware();
     hw.has_neural_accelerator && hw.macos_supports_na
+}
+
+const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
+
+fn effective_decode_storage_backend(
+    requested: DecodeStorageBackend,
+    max_batch_size: usize,
+    supports_batching: bool,
+) -> DecodeStorageBackend {
+    if requested == DecodeStorageBackend::Paged && (max_batch_size <= 1 || !supports_batching) {
+        DecodeStorageBackend::Dense
+    } else {
+        requested
+    }
 }
 
 /// Core batch scheduler that drives the model worker loop.
@@ -122,6 +136,8 @@ pub struct BatchScheduler {
     /// run a single batched forward pass. Falls back to sequential prefill
     /// when only one request is pending or on any error.
     max_batch_prefill: usize,
+    /// Decode-time sequence-state backend used by this scheduler.
+    decode_storage_backend: DecodeStorageBackend,
 }
 
 impl BatchScheduler {
@@ -162,6 +178,7 @@ impl BatchScheduler {
             false,
             PreemptionPolicy::default(),
             1,
+            DecodeStorageBackend::Dense,
         )
     }
 
@@ -180,9 +197,20 @@ impl BatchScheduler {
         enable_preemption: bool,
         preemption_policy: PreemptionPolicy,
         max_batch_prefill: usize,
+        decode_storage_backend: DecodeStorageBackend,
     ) -> Self {
         let generation_stream = new_generation_stream();
         let max_batch_size = max_batch_size.max(1);
+        let effective_decode_storage = effective_decode_storage_backend(
+            decode_storage_backend,
+            max_batch_size,
+            model.supports_batching(),
+        );
+        if effective_decode_storage != decode_storage_backend {
+            tracing::info!(
+                "Paged decode storage requested but unavailable for this worker; falling back to dense"
+            );
+        };
         // Non-batching models use lightweight placeholder entries in the pool
         // (no real KV caches), so we size the pool to cover both the active
         // batch and the prefill queue so requests can be queued while another
@@ -205,6 +233,7 @@ impl BatchScheduler {
             chunked_prefill_seq: None,
             shutdown_requested: false,
             max_batch_prefill: max_batch_prefill.max(1),
+            decode_storage_backend: effective_decode_storage,
         }
     }
 
@@ -273,8 +302,35 @@ impl BatchScheduler {
             active,
             queued,
             self.cache_pool.active_count(),
-            0, // cache bytes estimation not yet implemented
+            self.cache_pool.memory_usage_bytes() as u64,
         );
+    }
+
+    fn allocate_sequence_state(&mut self) -> Result<SequenceId, String> {
+        let layout_override = self.sequence_state_layout_override();
+        self.cache_pool
+            .allocate_with_layout(&self.model, layout_override)
+    }
+
+    fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
+        if self.decode_storage_backend != DecodeStorageBackend::Paged {
+            return None;
+        }
+
+        let num_layers = self.model.num_layers();
+        let paged_layout = PagedKvLayout::uniform(
+            num_layers,
+            DEFAULT_PAGED_BLOCK_SIZE,
+            DEFAULT_PAGED_BLOCK_SIZE,
+        )
+        .expect("valid paged decode layout");
+        Some(SequenceStateLayout::paged_kv_cache(paged_layout))
+    }
+
+    fn sync_sequence_storage(&mut self, seq_id: SequenceId) {
+        if let Err(err) = self.cache_pool.sync_paged_state_with_dense(seq_id) {
+            tracing::warn!("Failed to sync paged state for {seq_id}: {err}");
+        }
     }
 
     // ------------------------------------------------------------------
@@ -340,7 +396,7 @@ impl BatchScheduler {
         let mut prompt_tokens: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
         let sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
 
-        let seq_id = match self.cache_pool.allocate(&self.model) {
+        let seq_id = match self.allocate_sequence_state() {
             Ok(id) => id,
             Err(err) => {
                 tracing::warn!("Cache pool allocation failed: {err}");
@@ -704,6 +760,8 @@ impl BatchScheduler {
                 }
             }
 
+            self.sync_sequence_storage(seq.seq_id);
+
             seq.prefill_offset = actual_len;
             self.batch_observability.record_prefill_start(actual_len);
 
@@ -740,14 +798,6 @@ impl BatchScheduler {
         let needs_history = seq.sampling.needs_token_history();
         let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
 
-        let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
-            Some(c) => c,
-            None => {
-                self.abort_sequence(seq, "Cache not found for sequence during prefill");
-                return;
-            }
-        };
-
         // Run prefill (with or without VLM embeddings).
         // On M5+ hardware pad the prompt to a 32-token tile boundary for
         // optimal Neural Accelerator throughput.
@@ -768,58 +818,68 @@ impl BatchScheduler {
 
         let eff_len = effective_tokens.len() as i32;
         let input = mlxcel_core::from_slice_i32(&effective_tokens, &[1, eff_len]);
-
-        let raw_logits = if let Some(ref embeddings) = seq.vlm_embeddings {
-            // VLM path: apply provided mask or the tile-alignment mask.
-            match prepared_embedding_refs(embeddings) {
-                Ok((input_embeds, caller_mask)) => {
-                    // Caller-supplied mask takes precedence; tile-alignment mask
-                    // is used only when the caller does not provide one.
-                    let effective_mask =
-                        caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
-                    let logits = self.model.forward_with_embeddings(
-                        &input,
-                        Some(input_embeds),
-                        caches,
-                        effective_mask,
-                    );
-                    mlxcel_core::eval(&logits);
-                    self.model.after_prefill();
-                    logits
-                }
-                Err(err) => {
-                    self.abort_sequence(seq, &err.to_string());
+        let logits = {
+            let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+                Some(c) => c,
+                None => {
+                    self.abort_sequence(seq, "Cache not found for sequence during prefill");
                     return;
                 }
-            }
-        } else {
-            self.model.forward(
-                &input,
-                caches,
-                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-            )
-        };
+            };
 
-        // Extract logits at the last real token position and trim padding from
-        // KV caches so the decode phase begins with the correct cache offset.
-        let logits = if pad_mask_opt.is_some() && effective_tokens.len() > actual_len {
-            let padded_len = effective_tokens.len();
-            let shape = mlxcel_core::array_shape(&raw_logits);
-            let vocab = shape[2];
-            let sliced = mlxcel_core::slice(
-                &raw_logits,
-                &[0, actual_len as i32 - 1, 0],
-                &[shape[0], actual_len as i32, vocab],
-            );
-            // Trim padding positions from all KV caches.
-            let excess = (padded_len - actual_len) as i32;
-            for c in caches.iter_mut() {
-                c.trim(excess);
+            let raw_logits = if let Some(ref embeddings) = seq.vlm_embeddings {
+                // VLM path: apply provided mask or the tile-alignment mask.
+                match prepared_embedding_refs(embeddings) {
+                    Ok((input_embeds, caller_mask)) => {
+                        // Caller-supplied mask takes precedence; tile-alignment mask
+                        // is used only when the caller does not provide one.
+                        let effective_mask =
+                            caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+                        let logits = self.model.forward_with_embeddings(
+                            &input,
+                            Some(input_embeds),
+                            caches,
+                            effective_mask,
+                        );
+                        mlxcel_core::eval(&logits);
+                        self.model.after_prefill();
+                        logits
+                    }
+                    Err(err) => {
+                        self.abort_sequence(seq, &err.to_string());
+                        return;
+                    }
+                }
+            } else {
+                self.model.forward(
+                    &input,
+                    caches,
+                    pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                )
+            };
+
+            // Extract logits at the last real token position and trim padding from
+            // KV caches so the decode phase begins with the correct cache offset.
+            if pad_mask_opt.is_some() && effective_tokens.len() > actual_len {
+                let padded_len = effective_tokens.len();
+                let shape = mlxcel_core::array_shape(&raw_logits);
+                let vocab = shape[2];
+                let sliced = mlxcel_core::slice(
+                    &raw_logits,
+                    &[0, actual_len as i32 - 1, 0],
+                    &[shape[0], actual_len as i32, vocab],
+                );
+                // Trim padding positions from all KV caches.
+                let excess = (padded_len - actual_len) as i32;
+                for c in caches.iter_mut() {
+                    c.trim(excess);
+                }
+                sliced
+            } else {
+                raw_logits
             }
-            sliced
-        } else {
-            raw_logits
         };
+        self.sync_sequence_storage(seq.seq_id);
 
         mlxcel_core::clear_memory_cache();
         seq.prefill_offset = actual_len;
@@ -849,14 +909,6 @@ impl BatchScheduler {
         let end = chunk_size.min(seq.prompt_tokens.len());
         let chunk = &seq.prompt_tokens[..end];
 
-        let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
-            Some(c) => c,
-            None => {
-                self.abort_sequence(seq, "Cache not found for sequence during chunked prefill");
-                return;
-            }
-        };
-
         // Align the first chunk to a 32-token tile boundary on M5+ hardware.
         let actual_chunk_len = chunk.len();
         let (eff_chunk, pad_mask_opt) = if should_align_prefill() {
@@ -876,43 +928,53 @@ impl BatchScheduler {
 
         let eff_len = eff_chunk.len() as i32;
         let input = mlxcel_core::from_slice_i32(&eff_chunk, &[1, eff_len]);
-
-        // VLM embeddings are applied only on the first chunk.
-        if let Some(ref embeddings) = seq.vlm_embeddings {
-            match prepared_embedding_refs(embeddings) {
-                Ok((input_embeds, caller_mask)) => {
-                    let effective_mask =
-                        caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
-                    let logits = self.model.forward_with_embeddings(
-                        &input,
-                        Some(input_embeds),
-                        caches,
-                        effective_mask,
-                    );
-                    mlxcel_core::eval(&logits);
-                    self.model.after_prefill();
-                }
-                Err(err) => {
-                    self.abort_sequence(seq, &err.to_string());
+        {
+            let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+                Some(c) => c,
+                None => {
+                    self.abort_sequence(seq, "Cache not found for sequence during chunked prefill");
                     return;
                 }
-            }
-        } else {
-            let logits = self.model.forward(
-                &input,
-                caches,
-                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-            );
-            mlxcel_core::eval(&logits);
-        }
+            };
 
-        // Trim padding positions from KV caches when the chunk was padded.
-        if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
-            let excess = (eff_chunk.len() - actual_chunk_len) as i32;
-            for c in caches.iter_mut() {
-                c.trim(excess);
+            // VLM embeddings are applied only on the first chunk.
+            if let Some(ref embeddings) = seq.vlm_embeddings {
+                match prepared_embedding_refs(embeddings) {
+                    Ok((input_embeds, caller_mask)) => {
+                        let effective_mask =
+                            caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
+                        let logits = self.model.forward_with_embeddings(
+                            &input,
+                            Some(input_embeds),
+                            caches,
+                            effective_mask,
+                        );
+                        mlxcel_core::eval(&logits);
+                        self.model.after_prefill();
+                    }
+                    Err(err) => {
+                        self.abort_sequence(seq, &err.to_string());
+                        return;
+                    }
+                }
+            } else {
+                let logits = self.model.forward(
+                    &input,
+                    caches,
+                    pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+                );
+                mlxcel_core::eval(&logits);
+            }
+
+            // Trim padding positions from KV caches when the chunk was padded.
+            if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
+                let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+                for c in caches.iter_mut() {
+                    c.trim(excess);
+                }
             }
         }
+        self.sync_sequence_storage(seq.seq_id);
 
         mlxcel_core::clear_memory_cache();
         seq.prefill_offset = end;
@@ -949,24 +1011,25 @@ impl BatchScheduler {
         let end = (offset + chunk_size).min(total);
         let chunk = &seq.prompt_tokens[offset..end];
 
-        let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
-            Some(c) => c,
-            None => {
-                self.abort_sequence(seq, "Cache not found during chunked prefill continuation");
-                return;
-            }
-        };
-
         // Align each continuation chunk to a 32-token tile boundary on M5+.
         let actual_chunk_len = chunk.len();
         // For non-batching models the scheduler's dummy caches always have
         // offset=0.  Use the prefill_offset (number of tokens already
         // processed) as the KV offset instead, which is accurate regardless
         // of whether the model uses internal or scheduler-managed caches.
-        let kv_offset = if self.model.supports_batching() {
-            caches.first().map_or(0, |c| c.offset)
-        } else {
-            offset as i32
+        let kv_offset = {
+            let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+                Some(c) => c,
+                None => {
+                    self.abort_sequence(seq, "Cache not found during chunked prefill continuation");
+                    return;
+                }
+            };
+            if self.model.supports_batching() {
+                caches.first().map_or(0, |c| c.offset)
+            } else {
+                offset as i32
+            }
         };
         let (eff_chunk, pad_mask_opt) = if should_align_prefill() {
             let padded_len = align_to_na_tile(actual_chunk_len);
@@ -988,19 +1051,31 @@ impl BatchScheduler {
 
         let eff_len = eff_chunk.len() as i32;
         let input = mlxcel_core::from_slice_i32(&eff_chunk, &[1, eff_len]);
-        let logits = self.model.forward(
-            &input,
-            caches,
-            pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
-        );
+        let logits = {
+            let caches = match self.cache_pool.get_caches_mut(seq.seq_id) {
+                Some(c) => c,
+                None => {
+                    self.abort_sequence(seq, "Cache not found during chunked prefill continuation");
+                    return;
+                }
+            };
 
-        // Trim padding positions from KV caches when the chunk was padded.
-        if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
-            let excess = (eff_chunk.len() - actual_chunk_len) as i32;
-            for c in caches.iter_mut() {
-                c.trim(excess);
+            let logits = self.model.forward(
+                &input,
+                caches,
+                pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
+            );
+
+            // Trim padding positions from KV caches when the chunk was padded.
+            if pad_mask_opt.is_some() && eff_chunk.len() > actual_chunk_len {
+                let excess = (eff_chunk.len() - actual_chunk_len) as i32;
+                for c in caches.iter_mut() {
+                    c.trim(excess);
+                }
             }
-        }
+            logits
+        };
+        self.sync_sequence_storage(seq.seq_id);
 
         seq.prefill_offset = end;
 
@@ -1164,7 +1239,7 @@ impl BatchScheduler {
             victim.merged_eos.clear();
 
             // Allocate a fresh cache slot
-            match self.cache_pool.allocate(&self.model) {
+            match self.allocate_sequence_state() {
                 Ok(new_id) => {
                     victim.seq_id = new_id;
                     if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
@@ -1279,6 +1354,11 @@ impl BatchScheduler {
         };
 
         let logits = self.model.forward_batched(&input, &mut batch_caches, None);
+        drop(batch_caches);
+
+        for &seq_id in seq_ids {
+            self.sync_sequence_storage(seq_id);
+        }
 
         for (i, &seq_id) in seq_ids.iter().enumerate() {
             let seq_logits =
@@ -1367,16 +1447,18 @@ impl BatchScheduler {
             *seq.generated_tokens.last().unwrap_or(&0)
         };
 
-        let caches = match self.cache_pool.get_caches_mut(seq_id) {
-            Some(c) => c,
-            None => {
-                tracing::error!("Cache not found for {seq_id} during decode");
-                return;
-            }
-        };
-
         let input = mlxcel_core::from_slice_i32(&[last_token], &[1, 1]);
-        let logits = self.model.forward(&input, caches, None);
+        let logits = {
+            let caches = match self.cache_pool.get_caches_mut(seq_id) {
+                Some(c) => c,
+                None => {
+                    tracing::error!("Cache not found for {seq_id} during decode");
+                    return;
+                }
+            };
+            self.model.forward(&input, caches, None)
+        };
+        self.sync_sequence_storage(seq_id);
 
         // Use cached token_history from SequenceInfo (incrementally maintained)
         // and cached merged_eos (computed once during prefill) to avoid

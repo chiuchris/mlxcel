@@ -46,6 +46,8 @@ pub(crate) struct WorkerSchedulerConfig {
     pub preemption_policy: crate::server::config::PreemptionPolicy,
     /// Maximum number of requests to batch together for prefill (default: 1).
     pub max_batch_prefill: usize,
+    /// Decode-time storage backend for server sequence state.
+    pub decode_storage_backend: crate::server::DecodeStorageBackend,
     /// Tensor-parallel runtime configuration.
     pub tensor_parallel: crate::distributed::ShardConfig,
 }
@@ -108,9 +110,13 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         } else {
             String::new()
         };
+        let decode_storage_info = match sched_config.decode_storage_backend {
+            crate::server::DecodeStorageBackend::Dense => String::new(),
+            crate::server::DecodeStorageBackend::Paged => ", decode_storage=paged".to_string(),
+        };
         tracing::info!(
             "Starting BatchScheduler (max_batch_size={}, \
-             max_queue_depth={}{chunk_info}{batch_prefill_info})",
+             max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info})",
             sched_config.max_batch_size,
             sched_config.max_queue_depth,
         );
@@ -128,6 +134,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.enable_preemption,
             sched_config.preemption_policy,
             sched_config.max_batch_prefill,
+            sched_config.decode_storage_backend,
         );
         scheduler.run();
     })
@@ -217,6 +224,7 @@ pub(crate) fn spawn_legacy_model_worker(
             false, // enable_preemption = false
             crate::server::config::PreemptionPolicy::default(),
             1, // max_batch_prefill = 1 → sequential prefill
+            crate::server::DecodeStorageBackend::Dense,
         );
         scheduler.run();
     })

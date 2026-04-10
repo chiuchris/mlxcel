@@ -25,11 +25,13 @@ use std::time::Instant;
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::SamplingConfig;
 
+use super::effective_decode_storage_backend;
 use crate::server::batch::active::ActiveBatch;
 use crate::server::batch::queue::PrefillQueue;
 use crate::server::batch::sequence::{
     BatchSchedulerAction, RequestPriority, SequenceInfo, SequenceState,
 };
+use crate::server::config::DecodeStorageBackend;
 use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
 
@@ -664,4 +666,20 @@ fn merged_eos_deduplicates_overlapping_tokens() {
     assert!(merged.contains(&2));
     assert!(merged.contains(&100));
     assert!(merged.contains(&200));
+}
+
+#[test]
+fn paged_decode_storage_falls_back_when_batching_is_unavailable() {
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, false),
+        DecodeStorageBackend::Dense
+    );
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 1, true),
+        DecodeStorageBackend::Dense
+    );
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, true),
+        DecodeStorageBackend::Paged
+    );
 }
