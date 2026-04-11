@@ -27,7 +27,7 @@
 use crate::models::model_owned::{
     ModelOwnedSequenceState, dispatch_paged_decode_from_visible_caches,
 };
-use mlxcel_core::cache::{CachePool, SequenceId, SequenceStateLayout};
+use mlxcel_core::cache::{CachePool, RotatingPagedDecodeMetadata, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
@@ -213,17 +213,77 @@ impl Attention {
             mlxcel_core::fast_rope_batched(&k, self.head_dim, false, self.rope_base, 1.0, &offsets);
 
         if let Some(context) = decode_context {
-            if let Some(attn_out) = dispatch_paged_decode_from_visible_caches(
-                &q,
-                &k,
-                &v,
-                caches,
-                self.scale,
-                context,
-                |cache, k_i, v_i| Ok(cache.update_and_fetch(k_i, v_i)),
-            )
-            .expect("valid gemma3 paged decode inputs")
-            {
+            let paged_attn = if self.is_sliding && context.is_paged_decode() {
+                let mut cache_keys = Vec::with_capacity(caches.len());
+                let mut cache_values = Vec::with_capacity(caches.len());
+                let mut kv_lens = Vec::with_capacity(caches.len());
+                let mut logical_starts = Vec::with_capacity(caches.len());
+
+                for (batch_idx, cache) in caches.iter_mut().enumerate() {
+                    let k_i = mlxcel_core::slice(
+                        &k,
+                        &[batch_idx as i32, 0, 0, 0],
+                        &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+                    );
+                    let v_i = mlxcel_core::slice(
+                        &v,
+                        &[batch_idx as i32, 0, 0, 0],
+                        &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+                    );
+                    let _ = cache.update_and_fetch(k_i, v_i);
+                    kv_lens.push(cache.visible_len() as i32);
+                    logical_starts.push(cache.rotating_logical_start().unwrap_or_default());
+                    cache_keys.push(
+                        cache
+                            .keys_ptr()
+                            .expect("gemma3 rotating cache should expose key buffer"),
+                    );
+                    cache_values.push(
+                        cache
+                            .values_ptr()
+                            .expect("gemma3 rotating cache should expose value buffer"),
+                    );
+                }
+
+                let metadata = RotatingPagedDecodeMetadata::from_parts(
+                    &kv_lens,
+                    &logical_starts,
+                    context.paged_block_size,
+                )
+                .expect("valid gemma3 rotating paged decode metadata");
+                let attn = if context.use_native_paged_kernel {
+                    mlxcel_core::layers::paged_decode_attention_rotating_compat(
+                        &q,
+                        &cache_keys,
+                        &cache_values,
+                        &metadata,
+                        self.scale,
+                    )
+                } else {
+                    mlxcel_core::layers::paged_decode_attention_rotating_fallback(
+                        &q,
+                        &cache_keys,
+                        &cache_values,
+                        &metadata,
+                        self.scale,
+                    )
+                }
+                .expect("valid gemma3 rotating paged decode inputs");
+                Some(attn)
+            } else {
+                dispatch_paged_decode_from_visible_caches(
+                    &q,
+                    &k,
+                    &v,
+                    caches,
+                    self.scale,
+                    context,
+                    |cache, k_i, v_i| Ok(cache.update_and_fetch(k_i, v_i)),
+                )
+                .expect("valid gemma3 paged decode inputs")
+            };
+
+            if let Some(attn_out) = paged_attn {
                 tracing::debug!(
                     batch_size = batch,
                     block_size = context.paged_block_size,
@@ -594,7 +654,40 @@ impl Cache {
     fn visible_len(&self) -> usize {
         match self {
             Cache::Standard(c) => c.seq_len().max(0) as usize,
-            Cache::Rotating(c) => c.seq_len().max(0) as usize,
+            Cache::Rotating(c) => c.visible_len().max(0) as usize,
+        }
+    }
+
+    fn rotating_logical_start(&self) -> Option<i32> {
+        match self {
+            Cache::Standard(_) => None,
+            Cache::Rotating(c) => Some(c.logical_start()),
+        }
+    }
+
+    fn keys_ptr(&self) -> Option<*const MlxArray> {
+        match self {
+            Cache::Standard(c) => c
+                .keys
+                .as_ref()
+                .map(|keys| keys.as_ref().unwrap() as *const _),
+            Cache::Rotating(c) => c
+                .keys
+                .as_ref()
+                .map(|keys| keys.as_ref().unwrap() as *const _),
+        }
+    }
+
+    fn values_ptr(&self) -> Option<*const MlxArray> {
+        match self {
+            Cache::Standard(c) => c
+                .values
+                .as_ref()
+                .map(|values| values.as_ref().unwrap() as *const _),
+            Cache::Rotating(c) => c
+                .values
+                .as_ref()
+                .map(|values| values.as_ref().unwrap() as *const _),
         }
     }
 }

@@ -1817,7 +1817,9 @@ fn validate_paged_decode_inputs(
         ));
     }
     if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
-        return Err("paged decode attention received a null dense compatibility cache pointer".to_string());
+        return Err(
+            "paged decode attention received a null dense compatibility cache pointer".to_string(),
+        );
     }
     if metadata.len() != batch {
         return Err(format!(
@@ -1833,10 +1835,17 @@ fn validate_paged_decode_inputs(
             metadata.block_table_offsets.len()
         ));
     }
-    if metadata.block_table_offsets.last().copied().unwrap_or_default() as usize
+    if metadata
+        .block_table_offsets
+        .last()
+        .copied()
+        .unwrap_or_default() as usize
         != metadata.block_tables.len()
     {
-        return Err("paged decode attention block table offsets do not cover the flattened block table".to_string());
+        return Err(
+            "paged decode attention block table offsets do not cover the flattened block table"
+                .to_string(),
+        );
     }
 
     Ok(())
@@ -1914,7 +1923,9 @@ pub fn paged_decode_attention_dense_fallback(
             format!("paged decode fallback built no visible key blocks for batch index {batch_idx}")
         })?;
         let value_visible = value_visible.ok_or_else(|| {
-            format!("paged decode fallback built no visible value blocks for batch index {batch_idx}")
+            format!(
+                "paged decode fallback built no visible value blocks for batch index {batch_idx}"
+            )
         })?;
 
         outputs.push(unsafe {
@@ -1961,6 +1972,214 @@ pub fn paged_decode_attention_dense_compat(
             &metadata.kv_lens,
             &metadata.block_tables,
             &metadata.block_table_offsets,
+            metadata.block_size,
+            scale,
+        )
+    })
+}
+
+fn validate_rotating_paged_decode_inputs(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+) -> Result<(), String> {
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return Err(format!(
+            "rotating paged decode attention expected q rank 4, got shape {:?}",
+            q_shape
+        ));
+    }
+    if q_shape[2] != 1 {
+        return Err(format!(
+            "rotating paged decode attention only supports decode-only q_len == 1, got {}",
+            q_shape[2]
+        ));
+    }
+
+    let batch = q_shape[0].max(0) as usize;
+    if cache_keys.len() != batch || cache_values.len() != batch {
+        return Err(format!(
+            "rotating paged decode attention expected {} cache pointers, got {} keys and {} values",
+            batch,
+            cache_keys.len(),
+            cache_values.len()
+        ));
+    }
+    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
+        return Err(
+            "rotating paged decode attention received a null ring-buffer cache pointer".to_string(),
+        );
+    }
+    if metadata.len() != batch {
+        return Err(format!(
+            "rotating paged decode attention expected {} metadata entries, got {}",
+            batch,
+            metadata.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Reference paged decode path over rotating ring-buffer KV caches.
+pub fn paged_decode_attention_rotating_fallback(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+
+    let q_shape = ffi::array_shape(q);
+    let batch = q_shape[0].max(0) as usize;
+    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+
+    for batch_idx in 0..batch {
+        let kv_len = metadata.kv_lens[batch_idx];
+        let logical_start = metadata.logical_starts[batch_idx];
+        if kv_len <= 0 {
+            return Err(format!(
+                "rotating paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
+            ));
+        }
+
+        let q_i = ffi::slice(
+            q,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
+        );
+
+        let key_cache = unsafe { &*cache_keys[batch_idx] };
+        let value_cache = unsafe { &*cache_values[batch_idx] };
+        let buffer_len = ffi::array_shape(key_cache)
+            .get(2)
+            .copied()
+            .unwrap_or_default();
+        if buffer_len <= 0 {
+            return Err(format!(
+                "rotating paged decode fallback requires non-empty buffer for batch index {batch_idx}"
+            ));
+        }
+        if logical_start < 0 || logical_start >= buffer_len {
+            return Err(format!(
+                "rotating paged decode fallback received invalid logical_start={logical_start} for buffer_len={buffer_len}"
+            ));
+        }
+
+        let block_count = (kv_len + metadata.block_size - 1) / metadata.block_size;
+        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
+        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
+        for logical_block in 0..block_count {
+            let logical_pos = logical_block * metadata.block_size;
+            let logical_end = (logical_pos + metadata.block_size).min(kv_len);
+            let token_count = logical_end - logical_pos;
+            if token_count <= 0 {
+                continue;
+            }
+
+            let physical_start = (logical_start + logical_pos).rem_euclid(buffer_len);
+            let physical_end = physical_start + token_count;
+            let key_block = if physical_end <= buffer_len {
+                ffi::slice(
+                    key_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, physical_end, i32::MAX],
+                )
+            } else {
+                let key_tail = ffi::slice(
+                    key_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, buffer_len, i32::MAX],
+                );
+                let key_head = ffi::slice(
+                    key_cache,
+                    &[0, 0, 0, 0],
+                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
+                );
+                crate::concatenate(&key_tail, &key_head, 2)
+            };
+            let value_block = if physical_end <= buffer_len {
+                ffi::slice(
+                    value_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, physical_end, i32::MAX],
+                )
+            } else {
+                let value_tail = ffi::slice(
+                    value_cache,
+                    &[0, 0, physical_start, 0],
+                    &[1, i32::MAX, buffer_len, i32::MAX],
+                );
+                let value_head = ffi::slice(
+                    value_cache,
+                    &[0, 0, 0, 0],
+                    &[1, i32::MAX, physical_end - buffer_len, i32::MAX],
+                );
+                crate::concatenate(&value_tail, &value_head, 2)
+            };
+
+            key_visible = Some(match key_visible {
+                Some(prev) => crate::concatenate(&prev, &key_block, 2),
+                None => key_block,
+            });
+            value_visible = Some(match value_visible {
+                Some(prev) => crate::concatenate(&prev, &value_block, 2),
+                None => value_block,
+            });
+        }
+
+        let key_visible = key_visible.ok_or_else(|| {
+            format!(
+                "rotating paged decode fallback built no visible key blocks for batch index {batch_idx}"
+            )
+        })?;
+        let value_visible = value_visible.ok_or_else(|| {
+            format!(
+                "rotating paged decode fallback built no visible value blocks for batch index {batch_idx}"
+            )
+        })?;
+
+        outputs.push(unsafe {
+            attention_from_ptr(
+                &q_i,
+                &key_visible,
+                &value_visible,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        });
+    }
+
+    let mut result = outputs
+        .drain(..1)
+        .next()
+        .ok_or_else(|| "rotating paged decode fallback received an empty batch".to_string())?;
+    for output in outputs {
+        result = crate::concatenate(&result, &output, 0);
+    }
+    Ok(result)
+}
+
+/// Native paged decode path over rotating ring-buffer KV caches.
+pub fn paged_decode_attention_rotating_compat(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::RotatingPagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_rotating_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+    Ok(unsafe {
+        ffi::paged_decode_attention_rotating_compat(
+            q,
+            cache_keys,
+            cache_values,
+            &metadata.kv_lens,
+            &metadata.logical_starts,
             metadata.block_size,
             scale,
         )

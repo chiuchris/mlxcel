@@ -156,6 +156,52 @@ fn test_paged_decode_attention_dense_compat_matches_fallback() {
 }
 
 #[test]
+fn test_paged_decode_attention_rotating_compat_matches_fallback_after_wrap() {
+    let q = from_slice_f32(&[0.5, 1.0, 1.5, 2.0], &[2, 1, 1, 2]);
+
+    // Sequence 0 ring buffer physically stores logical tokens [2, 3, 4] as [4, 2, 3].
+    let cache_k_0 = from_slice_f32(&[4.0, 0.0, 2.0, 0.0, 3.0, 0.0], &[1, 1, 3, 2]);
+    let cache_v_0 = from_slice_f32(&[0.4, 0.0, 0.2, 0.0, 0.3, 0.0], &[1, 1, 3, 2]);
+    // Sequence 1 ring buffer physically stores logical tokens [8, 9, 10, 11] as [10, 11, 8, 9].
+    let cache_k_1 = from_slice_f32(&[10.0, 1.0, 11.0, 1.1, 8.0, 0.8, 9.0, 0.9], &[1, 1, 4, 2]);
+    let cache_v_1 = from_slice_f32(&[1.0, 0.1, 1.1, 0.11, 0.8, 0.08, 0.9, 0.09], &[1, 1, 4, 2]);
+
+    let cache_keys = vec![
+        cache_k_0.as_ref().unwrap() as *const MlxArray,
+        cache_k_1.as_ref().unwrap() as *const MlxArray,
+    ];
+    let cache_values = vec![
+        cache_v_0.as_ref().unwrap() as *const MlxArray,
+        cache_v_1.as_ref().unwrap() as *const MlxArray,
+    ];
+    let metadata =
+        crate::cache::RotatingPagedDecodeMetadata::from_parts(&[3, 4], &[1, 2], 2).unwrap();
+
+    let fallback = crate::layers::paged_decode_attention_rotating_fallback(
+        &q,
+        &cache_keys,
+        &cache_values,
+        &metadata,
+        1.0,
+    )
+    .unwrap();
+    let native = crate::layers::paged_decode_attention_rotating_compat(
+        &q,
+        &cache_keys,
+        &cache_values,
+        &metadata,
+        1.0,
+    )
+    .unwrap();
+
+    eval(&fallback);
+    eval(&native);
+    let close = allclose(&fallback, &native, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
+#[test]
 fn test_rms_norm() {
     let x = ones(&[1, 4], dtype::FLOAT32);
     let weight = ones(&[4], dtype::FLOAT32);

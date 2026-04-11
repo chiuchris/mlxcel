@@ -991,6 +991,20 @@ mod ffi {
             scale: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Decode-only paged attention over rotating ring-buffer KV caches.
+        ///
+        /// `logical_starts[i]` identifies the physical start of the logical
+        /// visible window within `cache_keys[i]` / `cache_values[i]`.
+        unsafe fn paged_decode_attention_rotating_compat(
+            q: &MlxArray,
+            cache_keys: &[*const MlxArray],
+            cache_values: &[*const MlxArray],
+            kv_lens: &[i32],
+            logical_starts: &[i32],
+            block_size: i32,
+            scale: f32,
+        ) -> UniquePtr<MlxArray>;
+
         fn sdpa_supports_fast_path(
             q: &MlxArray,
             k: &MlxArray,
@@ -1803,11 +1817,11 @@ mod ffi {
 
         /// Quantize weights — scales
         fn quantize_weights_scales(w: &MlxArray, group_size: i32, bits: i32)
-        -> UniquePtr<MlxArray>;
+            -> UniquePtr<MlxArray>;
 
         /// Quantize weights — biases
         fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
-        -> UniquePtr<MlxArray>;
+            -> UniquePtr<MlxArray>;
 
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()

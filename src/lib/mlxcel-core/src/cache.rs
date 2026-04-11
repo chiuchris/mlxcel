@@ -197,7 +197,11 @@ impl KVCache {
         match &self.keys {
             Some(k) => {
                 let shape = ffi::array_shape(k);
-                if shape.len() >= 3 { shape[2] } else { 0 }
+                if shape.len() >= 3 {
+                    shape[2]
+                } else {
+                    0
+                }
             }
             None => 0,
         }
@@ -565,7 +569,11 @@ impl RotatingKVCache {
     pub fn seq_len(&self) -> i32 {
         if let Some(ref keys) = self.keys {
             let shape = ffi::array_shape(keys);
-            if shape.len() >= 3 { shape[2] } else { 0 }
+            if shape.len() >= 3 {
+                shape[2]
+            } else {
+                0
+            }
         } else {
             0
         }
@@ -777,6 +785,25 @@ impl RotatingKVCache {
     /// Get the current offset
     pub fn get_offset(&self) -> i32 {
         self.offset
+    }
+
+    /// Visible length exposed to decode attention.
+    pub fn visible_len(&self) -> i32 {
+        self.seq_len().min(self.offset).max(0)
+    }
+
+    /// Physical start index of the logical oldest token in the ring buffer.
+    ///
+    /// Before the cache wraps, the visible region starts at index 0. After
+    /// wrapping, `idx` tracks the next write position, which is also the
+    /// oldest logical token in the ring.
+    pub fn logical_start(&self) -> i32 {
+        let visible_len = self.visible_len();
+        if visible_len == 0 || self.offset <= visible_len {
+            0
+        } else {
+            self.idx.rem_euclid(visible_len)
+        }
     }
 }
 
@@ -1084,6 +1111,71 @@ pub struct PagedDecodeMetadata {
     pub block_tables: Vec<i32>,
 }
 
+/// Decode-only paged attention metadata for ring-buffer-backed rotating caches.
+///
+/// `logical_starts[i]` identifies the physical buffer index of the oldest
+/// visible token for sequence `i`, allowing native paged decode kernels to
+/// gather wrapped sliding-window buffers without first materializing a dense
+/// linearized copy in Rust.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RotatingPagedDecodeMetadata {
+    pub block_size: i32,
+    pub kv_lens: Vec<i32>,
+    pub logical_starts: Vec<i32>,
+}
+
+impl RotatingPagedDecodeMetadata {
+    pub fn from_parts(
+        kv_lens: &[i32],
+        logical_starts: &[i32],
+        block_size: i32,
+    ) -> Result<Self, String> {
+        if block_size <= 0 {
+            return Err(format!(
+                "rotating paged decode metadata requires block_size > 0, got {block_size}"
+            ));
+        }
+        if kv_lens.len() != logical_starts.len() {
+            return Err(format!(
+                "rotating paged decode metadata length mismatch: {} kv_lens vs {} logical_starts",
+                kv_lens.len(),
+                logical_starts.len()
+            ));
+        }
+        for (&kv_len, &logical_start) in kv_lens.iter().zip(logical_starts.iter()) {
+            if kv_len < 0 {
+                return Err(format!(
+                    "rotating paged decode metadata requires non-negative kv lengths, got {kv_len}"
+                ));
+            }
+            if logical_start < 0 {
+                return Err(format!(
+                    "rotating paged decode metadata requires non-negative logical starts, got {logical_start}"
+                ));
+            }
+            if kv_len > 0 && logical_start >= kv_len {
+                return Err(format!(
+                    "rotating paged decode metadata requires logical_start < kv_len when kv_len > 0, got logical_start={logical_start}, kv_len={kv_len}"
+                ));
+            }
+        }
+
+        Ok(Self {
+            block_size,
+            kv_lens: kv_lens.to_vec(),
+            logical_starts: logical_starts.to_vec(),
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.kv_lens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kv_lens.is_empty()
+    }
+}
+
 impl PagedDecodeMetadata {
     pub fn from_attention_metadata(
         metadata: &BatchedAttentionMetadata,
@@ -1302,7 +1394,13 @@ impl SequenceCacheSet {
 
     /// Allocate a sequence state for model-owned/internal caches.
     pub fn model_owned(seq_id: SequenceId) -> Self {
-        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, Vec::new(), None, None)
+        Self::with_backend(
+            seq_id,
+            SequenceStateBackend::ModelOwned,
+            Vec::new(),
+            None,
+            None,
+        )
     }
 
     /// Total memory footprint of all layer caches in bytes.
@@ -1420,9 +1518,7 @@ impl CachePool {
                     Some(paged_layout),
                 )
             }
-            SequenceStateBackend::ModelOwned => {
-                SequenceCacheSet::model_owned(id)
-            }
+            SequenceStateBackend::ModelOwned => SequenceCacheSet::model_owned(id),
         };
         self.active.insert(id, entry);
         Ok(id)
@@ -1570,7 +1666,9 @@ impl CachePool {
     }
 
     pub fn paged_block_size(&self) -> Option<usize> {
-        self.paged_pool.as_ref().map(|pool| pool.layout().block_size)
+        self.paged_pool
+            .as_ref()
+            .map(|pool| pool.layout().block_size)
     }
 
     /// Mirror the visible dense-cache offsets into the paged backend state for
