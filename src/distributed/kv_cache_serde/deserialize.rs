@@ -22,7 +22,10 @@
 use anyhow::{Context, Result, bail};
 
 use super::serialize::CACHE_FORMAT_VERSION;
-use super::types::{CacheType, RawTensorData, SerializableCacheState, validate_raw_tensor};
+use super::types::{
+    CACHE_FORMAT_VERSION_V1, CacheType, RawTensorData, SerializableCacheState,
+    SerializableSequenceBackend, validate_raw_tensor,
+};
 
 /// Deserialize a `SerializableCacheState` from the binary wire format.
 ///
@@ -37,8 +40,10 @@ pub fn deserialize_cache_state(buf: &[u8]) -> Result<SerializableCacheState> {
     }
 
     let version = buf[0];
-    if version != CACHE_FORMAT_VERSION {
-        bail!("unsupported cache format version: {version} (expected {CACHE_FORMAT_VERSION})");
+    if version != CACHE_FORMAT_VERSION_V1 && version != CACHE_FORMAT_VERSION {
+        bail!(
+            "unsupported cache format version: {version} (expected {CACHE_FORMAT_VERSION_V1} or {CACHE_FORMAT_VERSION})"
+        );
     }
 
     let _cache_type = CacheType::try_from(buf[1]).context("invalid cache type discriminant")?;
@@ -64,6 +69,19 @@ pub fn deserialize_cache_state(buf: &[u8]) -> Result<SerializableCacheState> {
             "layer count mismatch: header says {num_layers}, JSON has {}",
             state.entries.len()
         );
+    }
+
+    if state.metadata.num_layers != num_layers {
+        bail!(
+            "metadata layer count mismatch: header says {num_layers}, metadata has {}",
+            state.metadata.num_layers
+        );
+    }
+
+    if let Some(paged_state) = state.paged_state.as_ref() {
+        paged_state
+            .validate()
+            .context("invalid paged sequence state in cache payload")?;
     }
 
     // Tensor data is embedded in the JSON via RawTensorData.
@@ -141,8 +159,58 @@ pub fn restore_into_sequence_cache_set(
     state: &SerializableCacheState,
     cache_set: &mut mlxcel_core::cache::SequenceCacheSet,
 ) -> Result<()> {
-    restore_into_kv_caches(state, &mut cache_set.caches)?;
+    if !state.entries.is_empty() || !cache_set.caches.is_empty() {
+        restore_into_kv_caches(state, &mut cache_set.caches)?;
+    }
     cache_set.prompt_len = state.metadata.prompt_len;
     cache_set.current_offset = state.metadata.current_offset;
+
+    match (&state.paged_state, cache_set.backend) {
+        (Some(serialized), mlxcel_core::cache::SequenceStateBackend::PagedKvCache) => {
+            let runtime = serialized.to_runtime()?;
+            cache_set.paged = Some(runtime);
+        }
+        (Some(_), _) => {
+            bail!("cannot restore paged state into a non-paged sequence cache set");
+        }
+        (None, mlxcel_core::cache::SequenceStateBackend::PagedKvCache)
+            if state.sequence_backend == SerializableSequenceBackend::PagedKvCache =>
+        {
+            bail!("paged sequence payload is missing paged_state metadata");
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+/// Restore serialized cache state directly into an active `CachePool` slot.
+///
+/// Used by: decode-side distributed cache ingestion where paged allocator
+/// bookkeeping must be rebuilt alongside the sequence state.
+pub fn restore_into_cache_pool_sequence(
+    state: &SerializableCacheState,
+    cache_pool: &mut mlxcel_core::cache::CachePool,
+    seq_id: mlxcel_core::cache::SequenceId,
+) -> Result<()> {
+    {
+        let cache_set = cache_pool
+            .get_mut(seq_id)
+            .ok_or_else(|| anyhow::anyhow!("CachePool: sequence {seq_id} not found"))?;
+        if !state.entries.is_empty() || !cache_set.caches.is_empty() {
+            restore_into_kv_caches(state, &mut cache_set.caches)?;
+        }
+        cache_set.prompt_len = state.metadata.prompt_len;
+        cache_set.current_offset = state.metadata.current_offset;
+    }
+
+    if let Some(serialized) = state.paged_state.as_ref() {
+        cache_pool
+            .restore_paged_state(seq_id, serialized.to_runtime()?)
+            .map_err(anyhow::Error::msg)?;
+    } else if state.sequence_backend == SerializableSequenceBackend::PagedKvCache {
+        bail!("paged sequence payload is missing paged_state metadata");
+    }
+
     Ok(())
 }

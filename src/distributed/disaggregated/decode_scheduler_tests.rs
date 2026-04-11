@@ -1,6 +1,7 @@
 use super::*;
 use crate::distributed::kv_cache_serde::types::{
     CacheMetadata, CacheType, SerializableCacheState, SerializableSamplingState,
+    SerializableSequenceBackend,
 };
 use crate::distributed::request_tracker::RequestId;
 
@@ -40,6 +41,8 @@ fn make_cache_state(prompt_len: usize) -> SerializableCacheState {
         sampling_state: Some(default_sampling()),
         token_history: Vec::new(),
         sequence_id: 1,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     }
 }
 

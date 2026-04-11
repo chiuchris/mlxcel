@@ -213,6 +213,7 @@ impl BatchScheduler {
             tracing::info!(
                 "Paged decode storage requested but unavailable for this worker; falling back to dense"
             );
+            batch_observability.record_decode_storage_fallback();
         };
         // Non-batching models use lightweight placeholder entries in the pool
         // (no real KV caches), so we size the pool to cover both the active
@@ -299,6 +300,8 @@ impl BatchScheduler {
     fn publish_metrics(&self) {
         let active = self.active_batch.len();
         let queued = self.prefill_queue.len();
+        let paged_stats = self.cache_pool.paged_stats();
+        let paged_block_size = self.cache_pool.paged_block_size().unwrap_or(0);
         self.batch_metrics.set_active_count(active);
         self.batch_metrics.set_queue_depth(queued);
         self.batch_observability.update_gauges(
@@ -306,6 +309,8 @@ impl BatchScheduler {
             queued,
             self.cache_pool.active_count(),
             self.cache_pool.memory_usage_bytes() as u64,
+            paged_block_size,
+            paged_stats,
         );
     }
 

@@ -25,6 +25,7 @@
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use mlxcel_core::cache::PagedCacheStats;
 use serde::Serialize;
 
 /// Detailed observability counters for the batch scheduler.
@@ -57,6 +58,20 @@ pub struct BatchObservability {
     pub cache_pool_active: AtomicUsize,
     /// Estimated memory bytes held by active KV caches.
     pub cache_pool_bytes: AtomicU64,
+    /// Paged decode block size in tokens.
+    pub cache_pool_paged_block_size: AtomicUsize,
+    /// Total blocks currently known to the paged allocator.
+    pub cache_pool_paged_blocks_allocated: AtomicU64,
+    /// Blocks currently in live use by active sequences.
+    pub cache_pool_paged_blocks_live: AtomicU64,
+    /// Reusable blocks currently on the free list.
+    pub cache_pool_paged_blocks_free: AtomicU64,
+    /// Reserved bytes across active paged sequences.
+    pub cache_pool_paged_bytes_reserved: AtomicU64,
+    /// Visible bytes currently in use across active paged sequences.
+    pub cache_pool_paged_bytes_in_use: AtomicU64,
+    /// Times paged decode was requested but fell back to dense.
+    pub decode_storage_fallbacks: AtomicU64,
 }
 
 impl Default for BatchObservability {
@@ -79,6 +94,13 @@ impl BatchObservability {
             current_queue_depth: AtomicUsize::new(0),
             cache_pool_active: AtomicUsize::new(0),
             cache_pool_bytes: AtomicU64::new(0),
+            cache_pool_paged_block_size: AtomicUsize::new(0),
+            cache_pool_paged_blocks_allocated: AtomicU64::new(0),
+            cache_pool_paged_blocks_live: AtomicU64::new(0),
+            cache_pool_paged_blocks_free: AtomicU64::new(0),
+            cache_pool_paged_bytes_reserved: AtomicU64::new(0),
+            cache_pool_paged_bytes_in_use: AtomicU64::new(0),
+            decode_storage_fallbacks: AtomicU64::new(0),
         }
     }
 
@@ -109,6 +131,12 @@ impl BatchObservability {
         self.sequences_completed.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record that requested paged decode fell back to dense execution.
+    pub fn record_decode_storage_fallback(&self) {
+        self.decode_storage_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     // -- Gauge updates (called by the scheduler thread) --
 
     /// Update the point-in-time gauge values.
@@ -118,6 +146,8 @@ impl BatchObservability {
         queue_depth: usize,
         cache_active: usize,
         cache_bytes: u64,
+        paged_block_size: usize,
+        paged_stats: Option<PagedCacheStats>,
     ) {
         self.current_batch_size.store(batch_size, Ordering::Relaxed);
         self.current_queue_depth
@@ -125,6 +155,20 @@ impl BatchObservability {
         self.cache_pool_active
             .store(cache_active, Ordering::Relaxed);
         self.cache_pool_bytes.store(cache_bytes, Ordering::Relaxed);
+
+        let stats = paged_stats.unwrap_or_default();
+        self.cache_pool_paged_block_size
+            .store(paged_block_size, Ordering::Relaxed);
+        self.cache_pool_paged_blocks_allocated
+            .store(stats.allocated_blocks as u64, Ordering::Relaxed);
+        self.cache_pool_paged_blocks_live
+            .store(stats.live_blocks as u64, Ordering::Relaxed);
+        self.cache_pool_paged_blocks_free
+            .store(stats.free_blocks as u64, Ordering::Relaxed);
+        self.cache_pool_paged_bytes_reserved
+            .store(stats.bytes_reserved as u64, Ordering::Relaxed);
+        self.cache_pool_paged_bytes_in_use
+            .store(stats.bytes_in_use as u64, Ordering::Relaxed);
     }
 
     // -- Snapshot for HTTP handlers --
@@ -142,6 +186,19 @@ impl BatchObservability {
             current_queue_depth: self.current_queue_depth.load(Ordering::Relaxed),
             cache_pool_active: self.cache_pool_active.load(Ordering::Relaxed),
             cache_pool_bytes: self.cache_pool_bytes.load(Ordering::Relaxed),
+            cache_pool_paged_block_size: self.cache_pool_paged_block_size.load(Ordering::Relaxed),
+            cache_pool_paged_blocks_allocated: self
+                .cache_pool_paged_blocks_allocated
+                .load(Ordering::Relaxed),
+            cache_pool_paged_blocks_live: self.cache_pool_paged_blocks_live.load(Ordering::Relaxed),
+            cache_pool_paged_blocks_free: self.cache_pool_paged_blocks_free.load(Ordering::Relaxed),
+            cache_pool_paged_bytes_reserved: self
+                .cache_pool_paged_bytes_reserved
+                .load(Ordering::Relaxed),
+            cache_pool_paged_bytes_in_use: self
+                .cache_pool_paged_bytes_in_use
+                .load(Ordering::Relaxed),
+            decode_storage_fallbacks: self.decode_storage_fallbacks.load(Ordering::Relaxed),
         }
     }
 }
@@ -162,6 +219,13 @@ pub struct ObservabilitySnapshot {
     pub current_queue_depth: usize,
     pub cache_pool_active: usize,
     pub cache_pool_bytes: u64,
+    pub cache_pool_paged_block_size: usize,
+    pub cache_pool_paged_blocks_allocated: u64,
+    pub cache_pool_paged_blocks_live: u64,
+    pub cache_pool_paged_blocks_free: u64,
+    pub cache_pool_paged_bytes_reserved: u64,
+    pub cache_pool_paged_bytes_in_use: u64,
+    pub decode_storage_fallbacks: u64,
 }
 
 #[cfg(test)]
@@ -182,6 +246,13 @@ mod tests {
         assert_eq!(snap.current_queue_depth, 0);
         assert_eq!(snap.cache_pool_active, 0);
         assert_eq!(snap.cache_pool_bytes, 0);
+        assert_eq!(snap.cache_pool_paged_block_size, 0);
+        assert_eq!(snap.cache_pool_paged_blocks_allocated, 0);
+        assert_eq!(snap.cache_pool_paged_blocks_live, 0);
+        assert_eq!(snap.cache_pool_paged_blocks_free, 0);
+        assert_eq!(snap.cache_pool_paged_bytes_reserved, 0);
+        assert_eq!(snap.cache_pool_paged_bytes_in_use, 0);
+        assert_eq!(snap.decode_storage_fallbacks, 0);
     }
 
     #[test]
@@ -216,12 +287,31 @@ mod tests {
     #[test]
     fn update_gauges_sets_values() {
         let obs = BatchObservability::new();
-        obs.update_gauges(4, 10, 8, 1024 * 1024);
+        obs.update_gauges(
+            4,
+            10,
+            8,
+            1024 * 1024,
+            32,
+            Some(PagedCacheStats {
+                allocated_blocks: 16,
+                live_blocks: 12,
+                free_blocks: 4,
+                bytes_reserved: 8192,
+                bytes_in_use: 6144,
+            }),
+        );
         let snap = obs.snapshot();
         assert_eq!(snap.current_batch_size, 4);
         assert_eq!(snap.current_queue_depth, 10);
         assert_eq!(snap.cache_pool_active, 8);
         assert_eq!(snap.cache_pool_bytes, 1024 * 1024);
+        assert_eq!(snap.cache_pool_paged_block_size, 32);
+        assert_eq!(snap.cache_pool_paged_blocks_allocated, 16);
+        assert_eq!(snap.cache_pool_paged_blocks_live, 12);
+        assert_eq!(snap.cache_pool_paged_blocks_free, 4);
+        assert_eq!(snap.cache_pool_paged_bytes_reserved, 8192);
+        assert_eq!(snap.cache_pool_paged_bytes_in_use, 6144);
     }
 
     #[test]
@@ -229,9 +319,11 @@ mod tests {
         let obs = BatchObservability::new();
         obs.record_prefill_start(100);
         obs.record_decode_step(2);
+        obs.record_decode_storage_fallback();
         let snap = obs.snapshot();
         let json = serde_json::to_string(&snap).unwrap();
         assert!(json.contains("\"sequences_started\":1"));
         assert!(json.contains("\"total_decode_tokens\":2"));
+        assert!(json.contains("\"decode_storage_fallbacks\":1"));
     }
 }

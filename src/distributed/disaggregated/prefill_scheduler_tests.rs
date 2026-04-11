@@ -1,8 +1,9 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::*;
 use crate::distributed::kv_cache_serde::types::{
     CacheMetadata, CacheType, SerializableCacheState, SerializableSamplingState,
+    SerializableSequenceBackend,
 };
 use crate::distributed::request_tracker::RequestId;
 
@@ -58,6 +59,8 @@ fn make_prefill_result(request_id: RequestId, prompt_len: usize) -> PrefillResul
             sampling_state: Some(default_sampling()),
             token_history: Vec::new(),
             sequence_id: 1,
+            sequence_backend: SerializableSequenceBackend::DenseKvCache,
+            paged_state: None,
         },
         prefill_duration: Duration::from_millis(100),
         prompt_len,
@@ -304,6 +307,8 @@ fn prefill_result_throughput() {
             sampling_state: None,
             token_history: Vec::new(),
             sequence_id: 0,
+            sequence_backend: SerializableSequenceBackend::DenseKvCache,
+            paged_state: None,
         },
         prefill_duration: Duration::from_secs(1),
         prompt_len: 1000,

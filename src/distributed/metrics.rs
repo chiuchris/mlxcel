@@ -23,6 +23,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use mlxcel_core::cache::PagedCacheStats;
 use serde::{Deserialize, Serialize};
 
 /// Latency percentile snapshot computed from a sliding window of samples.
@@ -61,6 +62,22 @@ pub struct NodeMetrics {
     pub total_requests: u64,
     /// Total tokens generated since startup.
     pub total_tokens: u64,
+    /// Paged KV allocator and usage snapshot when paged decode is enabled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub paged_kv: Option<PagedKvMetrics>,
+    /// Number of times paged decode was requested but fell back to dense execution.
+    pub paged_decode_fallbacks: u64,
+}
+
+/// Snapshot of paged KV allocator state for operations and routing decisions.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PagedKvMetrics {
+    pub block_size: u32,
+    pub allocated_blocks: u64,
+    pub live_blocks: u64,
+    pub free_blocks: u64,
+    pub bytes_reserved: u64,
+    pub bytes_in_use: u64,
 }
 
 /// Configuration for the metrics collector.
@@ -110,6 +127,10 @@ struct MetricsInner {
     /// Memory snapshot (updated externally).
     memory_used_bytes: u64,
     memory_total_bytes: u64,
+    /// Latest paged KV allocator snapshot.
+    paged_kv: Option<PagedKvMetrics>,
+    /// Count of paged decode fallback events.
+    paged_decode_fallbacks: u64,
 }
 
 impl MetricsCollector {
@@ -126,6 +147,8 @@ impl MetricsCollector {
                 total_tokens: 0,
                 memory_used_bytes: 0,
                 memory_total_bytes: 0,
+                paged_kv: None,
+                paged_decode_fallbacks: 0,
             })),
             config,
         }
@@ -183,6 +206,31 @@ impl MetricsCollector {
         inner.memory_total_bytes = total_bytes;
     }
 
+    /// Update the latest paged KV allocator snapshot.
+    pub fn update_paged_kv(&self, block_size: usize, stats: PagedCacheStats) {
+        let mut inner = self.inner.write().expect("metrics lock poisoned");
+        inner.paged_kv = Some(PagedKvMetrics {
+            block_size: block_size as u32,
+            allocated_blocks: stats.allocated_blocks as u64,
+            live_blocks: stats.live_blocks as u64,
+            free_blocks: stats.free_blocks as u64,
+            bytes_reserved: stats.bytes_reserved as u64,
+            bytes_in_use: stats.bytes_in_use as u64,
+        });
+    }
+
+    /// Clear paged KV metrics when a node is no longer using the paged backend.
+    pub fn clear_paged_kv(&self) {
+        let mut inner = self.inner.write().expect("metrics lock poisoned");
+        inner.paged_kv = None;
+    }
+
+    /// Record that paged decode fell back to dense execution.
+    pub fn record_paged_decode_fallback(&self) {
+        let mut inner = self.inner.write().expect("metrics lock poisoned");
+        inner.paged_decode_fallbacks += 1;
+    }
+
     /// Compute and return a snapshot of the current node metrics.
     pub fn snapshot(&self) -> NodeMetrics {
         let inner = self.inner.read().expect("metrics lock poisoned");
@@ -200,6 +248,8 @@ impl MetricsCollector {
             active_requests: inner.active_requests,
             total_requests: inner.total_requests,
             total_tokens: inner.total_tokens,
+            paged_kv: inner.paged_kv.clone(),
+            paged_decode_fallbacks: inner.paged_decode_fallbacks,
         }
     }
 
@@ -213,6 +263,8 @@ impl MetricsCollector {
         inner.active_requests = 0;
         inner.total_requests = 0;
         inner.total_tokens = 0;
+        inner.paged_kv = None;
+        inner.paged_decode_fallbacks = 0;
     }
 }
 

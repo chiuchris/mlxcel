@@ -89,7 +89,28 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_batch_current_size {batch_size}\n\
          # HELP mlxcel_cache_pool_active Active cache entries\n\
          # TYPE mlxcel_cache_pool_active gauge\n\
-         mlxcel_cache_pool_active {cache_active}\n",
+         mlxcel_cache_pool_active {cache_active}\n\
+         # HELP mlxcel_cache_pool_paged_block_size Paged decode block size in tokens\n\
+         # TYPE mlxcel_cache_pool_paged_block_size gauge\n\
+         mlxcel_cache_pool_paged_block_size {paged_block_size}\n\
+         # HELP mlxcel_cache_pool_paged_blocks_allocated Total paged KV blocks tracked by the allocator\n\
+         # TYPE mlxcel_cache_pool_paged_blocks_allocated gauge\n\
+         mlxcel_cache_pool_paged_blocks_allocated {paged_blocks_allocated}\n\
+         # HELP mlxcel_cache_pool_paged_blocks_live Paged KV blocks currently in live use\n\
+         # TYPE mlxcel_cache_pool_paged_blocks_live gauge\n\
+         mlxcel_cache_pool_paged_blocks_live {paged_blocks_live}\n\
+         # HELP mlxcel_cache_pool_paged_blocks_free Paged KV blocks currently free for reuse\n\
+         # TYPE mlxcel_cache_pool_paged_blocks_free gauge\n\
+         mlxcel_cache_pool_paged_blocks_free {paged_blocks_free}\n\
+         # HELP mlxcel_cache_pool_paged_bytes_reserved Reserved bytes across paged sequences\n\
+         # TYPE mlxcel_cache_pool_paged_bytes_reserved gauge\n\
+         mlxcel_cache_pool_paged_bytes_reserved {paged_bytes_reserved}\n\
+         # HELP mlxcel_cache_pool_paged_bytes_in_use Visible bytes in use across paged sequences\n\
+         # TYPE mlxcel_cache_pool_paged_bytes_in_use gauge\n\
+         mlxcel_cache_pool_paged_bytes_in_use {paged_bytes_in_use}\n\
+         # HELP mlxcel_decode_storage_fallbacks_total Number of paged decode fallback events\n\
+         # TYPE mlxcel_decode_storage_fallbacks_total counter\n\
+         mlxcel_decode_storage_fallbacks_total {decode_storage_fallbacks}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
         seq_started = obs.sequences_started,
         seq_completed = obs.sequences_completed,
@@ -99,6 +120,13 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         prefill_chunks = obs.prefill_chunks_processed,
         batch_size = obs.current_batch_size,
         cache_active = obs.cache_pool_active,
+        paged_block_size = obs.cache_pool_paged_block_size,
+        paged_blocks_allocated = obs.cache_pool_paged_blocks_allocated,
+        paged_blocks_live = obs.cache_pool_paged_blocks_live,
+        paged_blocks_free = obs.cache_pool_paged_blocks_free,
+        paged_bytes_reserved = obs.cache_pool_paged_bytes_reserved,
+        paged_bytes_in_use = obs.cache_pool_paged_bytes_in_use,
+        decode_storage_fallbacks = obs.decode_storage_fallbacks,
     );
 
     (

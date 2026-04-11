@@ -17,11 +17,12 @@
 //! # Wire Format (little-endian)
 //!
 //! ```text
-//! [version: u8]           // Cache serialization version (1)
+//! [version: u8]           // Cache serialization version (2 current, 1 legacy)
 //! [cache_type: u8]        // Standard=0, Rotating=1, Chunked=2
 //! [num_layers: u32 LE]    // Number of cache layers
 //! [metadata_len: u32 LE]  // JSON metadata length
-//! [metadata: bytes]       // JSON-encoded SerializableCacheState (includes tensor data)
+//! [metadata: bytes]       // JSON-encoded SerializableCacheState (includes tensor data,
+//!                         // backend metadata, and optional paged sequence state)
 //! For each layer:
 //!   [has_data: u8]        // 0 = empty layer, 1 = has key/value tensors
 //! ```
@@ -31,11 +32,12 @@
 use anyhow::{Context, Result};
 
 use super::types::{
-    CacheMetadata, CacheType, RawTensorData, SerializableCacheEntry, SerializableCacheState,
+    CACHE_FORMAT_VERSION_V2, CacheMetadata, CacheType, RawTensorData, SerializableCacheEntry,
+    SerializableCacheState, SerializablePagedSequenceState, SerializableSequenceBackend,
 };
 
 /// Current cache serialization format version.
-pub const CACHE_FORMAT_VERSION: u8 = 1;
+pub const CACHE_FORMAT_VERSION: u8 = CACHE_FORMAT_VERSION_V2;
 
 /// Serialize a `SerializableCacheState` into the binary wire format.
 ///
@@ -194,5 +196,10 @@ pub fn serialize_sequence_cache_set(
         sampling_state,
         token_history,
         sequence_id: cache_set.seq_id.as_u64(),
+        sequence_backend: SerializableSequenceBackend::from_runtime(cache_set.backend),
+        paged_state: cache_set
+            .paged_state()
+            .zip(cache_set.paged_layout())
+            .map(|(state, layout)| SerializablePagedSequenceState::from_runtime(state, layout)),
     }
 }

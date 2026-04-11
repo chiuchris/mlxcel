@@ -1336,6 +1336,10 @@ impl SequenceCacheSet {
                 bytes_in_use: state.used_bytes(layout),
             })
     }
+
+    pub fn paged_layout(&self) -> Option<&PagedKvLayout> {
+        self.paged_layout.as_ref()
+    }
 }
 
 /// Pool that allocates and recycles per-sequence cache sets.
@@ -1565,6 +1569,10 @@ impl CachePool {
         )
     }
 
+    pub fn paged_block_size(&self) -> Option<usize> {
+        self.paged_pool.as_ref().map(|pool| pool.layout().block_size)
+    }
+
     /// Mirror the visible dense-cache offsets into the paged backend state for
     /// one sequence.
     ///
@@ -1618,6 +1626,69 @@ impl CachePool {
                 pool.trim_tokens(state, layer_idx, current_len - target_len)?;
             }
         }
+        Ok(())
+    }
+
+    /// Restore externally serialized paged state into an active sequence and
+    /// register its blocks with the shared allocator.
+    pub fn restore_paged_state(
+        &mut self,
+        id: SequenceId,
+        restored: PagedSequenceState,
+    ) -> Result<(), String> {
+        let layout = {
+            let sequence = self
+                .active
+                .get(&id)
+                .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
+            if sequence.backend != SequenceStateBackend::PagedKvCache {
+                return Err(format!(
+                    "CachePool: sequence {id} is not using the paged backend"
+                ));
+            }
+
+            sequence
+                .paged_layout
+                .clone()
+                .ok_or_else(|| format!("CachePool: sequence {id} is missing paged layout"))?
+        };
+        if restored.block_size != layout.block_size {
+            return Err(format!(
+                "CachePool: restored block size {} does not match layout block size {}",
+                restored.block_size, layout.block_size
+            ));
+        }
+        if restored.layers.len() != layout.num_layers {
+            return Err(format!(
+                "CachePool: restored layer count {} does not match layout layer count {}",
+                restored.layers.len(),
+                layout.num_layers
+            ));
+        }
+
+        let mut existing = {
+            let sequence = self
+                .active
+                .get_mut(&id)
+                .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
+            sequence.paged.take()
+        };
+
+        self.ensure_paged_pool(&layout)?;
+        let pool = self
+            .paged_pool
+            .as_mut()
+            .expect("paged pool must exist after ensure_paged_pool");
+        if let Some(existing) = existing.as_mut() {
+            pool.release_sequence(existing)?;
+        }
+        pool.restore_sequence(&restored)?;
+
+        let sequence = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
+        sequence.paged = Some(restored);
         Ok(())
     }
 
@@ -2014,6 +2085,57 @@ mod tests {
                 bytes_reserved: 0,
                 bytes_in_use: 0,
             }
+        );
+    }
+
+    #[test]
+    fn cache_pool_restores_paged_sequence_state_into_allocator() {
+        let layout = PagedKvLayout::uniform(2, 4, 128).unwrap();
+        let model = PagedModel {
+            layout: layout.clone(),
+        };
+        let mut pool = CachePool::new(4);
+        let id = pool.allocate(&model).unwrap();
+
+        let restored = PagedSequenceState {
+            block_size: layout.block_size,
+            layers: vec![
+                PagedLayerState {
+                    block_ids: vec![PagedBlockId::from_raw(7), PagedBlockId::from_raw(8)],
+                    len: 6,
+                    logical_start: 0,
+                },
+                PagedLayerState {
+                    block_ids: vec![PagedBlockId::from_raw(42)],
+                    len: 3,
+                    logical_start: 0,
+                },
+            ],
+        };
+
+        pool.restore_paged_state(id, restored).unwrap();
+
+        assert_eq!(
+            pool.paged_stats(),
+            Some(PagedCacheStats {
+                allocated_blocks: 3,
+                live_blocks: 3,
+                free_blocks: 0,
+                bytes_reserved: 384,
+                bytes_in_use: 288,
+            })
+        );
+
+        pool.append_paged_tokens(id, 1, 2).unwrap();
+        assert_eq!(
+            pool.paged_stats(),
+            Some(PagedCacheStats {
+                allocated_blocks: 4,
+                live_blocks: 4,
+                free_blocks: 0,
+                bytes_reserved: 512,
+                bytes_in_use: 352,
+            })
         );
     }
 

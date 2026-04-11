@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::distributed::config::{ClusterConfig, NodeRole};
-use crate::distributed::metrics::MetricsConfig;
+use crate::distributed::metrics::{MetricsConfig, PagedKvMetrics};
 use crate::distributed::registry::NodeStatus;
 
 fn test_config() -> HeartbeatConfig {
@@ -52,6 +52,15 @@ fn heartbeat_payload_with_metrics() {
         metrics: Some(NodeMetrics {
             throughput_tokens_per_sec: 100.0,
             total_tokens: 500,
+            paged_kv: Some(PagedKvMetrics {
+                block_size: 32,
+                allocated_blocks: 12,
+                live_blocks: 10,
+                free_blocks: 2,
+                bytes_reserved: 8192,
+                bytes_in_use: 6144,
+            }),
+            paged_decode_fallbacks: 1,
             ..Default::default()
         }),
     };
@@ -61,6 +70,8 @@ fn heartbeat_payload_with_metrics() {
     let m = restored.metrics.unwrap();
     assert_eq!(m.throughput_tokens_per_sec, 100.0);
     assert_eq!(m.total_tokens, 500);
+    assert_eq!(m.paged_kv.unwrap().block_size, 32);
+    assert_eq!(m.paged_decode_fallbacks, 1);
 }
 
 #[test]

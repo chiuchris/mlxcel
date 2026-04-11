@@ -287,6 +287,42 @@ impl PagedBlockPool {
         Ok(())
     }
 
+    /// Register an externally restored paged sequence state with this pool.
+    ///
+    /// Used by: distributed cache deserialization on decode nodes.
+    pub fn restore_sequence(&mut self, state: &PagedSequenceState) -> Result<(), String> {
+        if state.block_size != self.layout.block_size {
+            return Err(format!(
+                "PagedBlockPool: restored block size {} does not match pool block size {}",
+                state.block_size, self.layout.block_size
+            ));
+        }
+        if state.layers.len() != self.layout.num_layers {
+            return Err(format!(
+                "PagedBlockPool: restored layer count {} does not match pool layer count {}",
+                state.layers.len(),
+                self.layout.num_layers
+            ));
+        }
+
+        for (layer_idx, layer) in state.layers.iter().enumerate() {
+            let required_blocks = layer.visible_len().div_ceil(self.layout.block_size);
+            if layer.block_ids.len() < required_blocks {
+                return Err(format!(
+                    "PagedBlockPool: restored layer {layer_idx} has {} blocks for visible length {}, requires at least {}",
+                    layer.block_ids.len(),
+                    layer.visible_len(),
+                    required_blocks
+                ));
+            }
+
+            for &block_id in &layer.block_ids {
+                self.restore_block(block_id, layer_idx)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn stats_for_sequences<'a>(
         &self,
         sequences: impl IntoIterator<Item = &'a PagedSequenceState>,
@@ -348,6 +384,42 @@ impl PagedBlockPool {
         }
         record.in_use = false;
         self.free_lists[record.layer_idx].push(block_id);
+        Ok(())
+    }
+
+    fn restore_block(&mut self, block_id: PagedBlockId, layer_idx: usize) -> Result<(), String> {
+        self.validate_layer(layer_idx)?;
+
+        if let Some(record) = self.blocks.get_mut(&block_id) {
+            if record.layer_idx != layer_idx {
+                return Err(format!(
+                    "PagedBlockPool: restored block {block_id} belongs to layer {}, not {}",
+                    record.layer_idx, layer_idx
+                ));
+            }
+            if record.in_use {
+                return Err(format!(
+                    "PagedBlockPool: restored block {block_id} is already marked in use"
+                ));
+            }
+            if let Some(pos) = self.free_lists[layer_idx]
+                .iter()
+                .position(|candidate| *candidate == block_id)
+            {
+                self.free_lists[layer_idx].swap_remove(pos);
+            }
+            record.in_use = true;
+        } else {
+            self.blocks.insert(
+                block_id,
+                PagedBlockRecord {
+                    layer_idx,
+                    in_use: true,
+                },
+            );
+        }
+
+        self.next_block_id = self.next_block_id.max(block_id.as_u64().saturating_add(1));
         Ok(())
     }
 

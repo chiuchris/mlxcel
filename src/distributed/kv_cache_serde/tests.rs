@@ -172,6 +172,8 @@ fn full_state_serialize_deserialize_round_trip() {
         }),
         token_history: vec![100, 200, 300],
         sequence_id: 42,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     // Serialize
@@ -235,6 +237,8 @@ fn multi_layer_state_round_trip() {
         sampling_state: None,
         token_history: vec![],
         sequence_id: 7,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     let bytes = serialize_cache_state(&state).unwrap();
@@ -274,6 +278,8 @@ fn empty_cache_state_round_trip() {
         sampling_state: None,
         token_history: vec![],
         sequence_id: 0,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     let bytes = serialize_cache_state(&state).unwrap();
@@ -311,6 +317,8 @@ fn restore_into_kv_caches_round_trip() {
         sampling_state: None,
         token_history: vec![],
         sequence_id: 1,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     // Serialize and deserialize
@@ -386,6 +394,8 @@ fn restore_layer_count_mismatch_fails() {
         sampling_state: None,
         token_history: vec![],
         sequence_id: 0,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     let mut target = vec![mlxcel_core::cache::KVCache::new()]; // only 1 layer
@@ -576,6 +586,8 @@ fn restore_into_sequence_cache_set_round_trip() {
         sampling_state: None,
         token_history: vec![],
         sequence_id: 99,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     };
 
     let bytes = serialize_cache_state(&state).unwrap();
@@ -594,6 +606,97 @@ fn restore_into_sequence_cache_set_round_trip() {
     assert_eq!(cache_set.current_offset, 4);
     assert!(!cache_set.caches[0].is_empty());
     assert_eq!(cache_set.caches[0].offset, source.offset);
+}
+
+#[test]
+fn deserialize_v1_payload_defaults_to_dense_backend() {
+    let metadata_json = serde_json::json!({
+        "cache_type": CacheType::Standard,
+        "entries": [],
+        "metadata": {
+            "prompt_len": 0,
+            "current_offset": 0,
+            "num_layers": 0,
+            "layer_offsets": [],
+            "max_size": null,
+            "layer_indices": null,
+            "chunk_size": null,
+            "start_positions": null
+        },
+        "sampling_state": null,
+        "token_history": [],
+        "sequence_id": 5
+    });
+    let metadata_bytes = serde_json::to_vec(&metadata_json).unwrap();
+
+    let mut buf = Vec::new();
+    buf.push(CACHE_FORMAT_VERSION_V1);
+    buf.push(CacheType::Standard as u8);
+    buf.extend_from_slice(&(0u32).to_le_bytes());
+    buf.extend_from_slice(&(metadata_bytes.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&metadata_bytes);
+
+    let recovered = deserialize_cache_state(&buf).unwrap();
+    assert_eq!(
+        recovered.sequence_backend,
+        SerializableSequenceBackend::DenseKvCache
+    );
+    assert!(recovered.paged_state.is_none());
+}
+
+#[test]
+fn restore_into_sequence_cache_set_restores_paged_state() {
+    let layout = mlxcel_core::cache::PagedKvLayout::uniform(2, 4, 128).unwrap();
+    let state = SerializableCacheState {
+        cache_type: CacheType::Standard,
+        entries: vec![],
+        metadata: CacheMetadata {
+            prompt_len: 6,
+            current_offset: 6,
+            num_layers: 0,
+            layer_offsets: vec![],
+            max_size: None,
+            layer_indices: None,
+            chunk_size: None,
+            start_positions: None,
+        },
+        sampling_state: None,
+        token_history: vec![],
+        sequence_id: 777,
+        sequence_backend: SerializableSequenceBackend::PagedKvCache,
+        paged_state: Some(SerializablePagedSequenceState {
+            block_size: 4,
+            bytes_per_block: vec![128, 128],
+            layers: vec![
+                SerializablePagedLayerState {
+                    block_ids: vec![10, 11],
+                    len: 6,
+                    logical_start: 0,
+                },
+                SerializablePagedLayerState {
+                    block_ids: vec![20],
+                    len: 3,
+                    logical_start: 1,
+                },
+            ],
+        }),
+    };
+
+    let mut cache_set = mlxcel_core::cache::SequenceCacheSet::paged(
+        mlxcel_core::cache::SequenceId::from_raw(777),
+        layout,
+    );
+    restore_into_sequence_cache_set(&state, &mut cache_set).unwrap();
+
+    let paged = cache_set.paged_state().unwrap();
+    assert_eq!(paged.block_size, 4);
+    assert_eq!(paged.layers[0].block_ids[0].as_u64(), 10);
+    assert_eq!(paged.layers[0].block_ids[1].as_u64(), 11);
+    assert_eq!(paged.layers[1].block_ids[0].as_u64(), 20);
+    assert_eq!(paged.layers[1].len, 3);
+    assert_eq!(paged.layers[1].logical_start, 1);
+    assert_eq!(cache_set.prompt_len, 6);
+    assert_eq!(cache_set.current_offset, 6);
 }
 
 // ---------------------------------------------------------------------------

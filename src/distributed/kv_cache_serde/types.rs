@@ -22,6 +22,14 @@
 use serde::{Deserialize, Serialize};
 
 use super::super::tensor_protocol::TensorDtype;
+use mlxcel_core::cache::{
+    PagedBlockId, PagedKvLayout, PagedLayerState, PagedSequenceState, SequenceStateBackend,
+};
+
+/// Legacy cache serialization format version.
+pub const CACHE_FORMAT_VERSION_V1: u8 = 1;
+/// Current cache serialization format version.
+pub const CACHE_FORMAT_VERSION_V2: u8 = 2;
 
 /// Discriminant for the cache variant being serialized.
 #[repr(u8)]
@@ -34,6 +42,133 @@ pub enum CacheType {
     Rotating = 1,
     /// Chunked KV cache (Llama 4 iGQA).
     Chunked = 2,
+}
+
+/// Runtime storage backend associated with one serialized sequence.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[non_exhaustive]
+pub enum SerializableSequenceBackend {
+    /// Standard dense per-layer KV cache storage.
+    #[default]
+    DenseKvCache = 0,
+    /// Dense compatibility caches plus mirrored paged block-table state.
+    PagedKvCache = 1,
+    /// Model-owned/internal state (no external dense KV ownership guarantee).
+    ModelOwned = 2,
+}
+
+impl SerializableSequenceBackend {
+    pub fn from_runtime(backend: SequenceStateBackend) -> Self {
+        match backend {
+            SequenceStateBackend::DenseKvCache => Self::DenseKvCache,
+            SequenceStateBackend::PagedKvCache => Self::PagedKvCache,
+            SequenceStateBackend::ModelOwned => Self::ModelOwned,
+        }
+    }
+}
+
+/// One paged layer's logical-to-physical mapping in transfer-safe form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializablePagedLayerState {
+    pub block_ids: Vec<u64>,
+    pub len: usize,
+    pub logical_start: usize,
+}
+
+impl SerializablePagedLayerState {
+    pub fn from_runtime(layer: &PagedLayerState) -> Self {
+        Self {
+            block_ids: layer.block_ids.iter().map(|block| block.as_u64()).collect(),
+            len: layer.len,
+            logical_start: layer.logical_start,
+        }
+    }
+
+    pub fn to_runtime(&self) -> PagedLayerState {
+        PagedLayerState {
+            block_ids: self
+                .block_ids
+                .iter()
+                .copied()
+                .map(PagedBlockId::from_raw)
+                .collect(),
+            len: self.len,
+            logical_start: self.logical_start.min(self.len),
+        }
+    }
+}
+
+/// Paged KV metadata that must survive prefill/decode transfer boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SerializablePagedSequenceState {
+    pub block_size: usize,
+    pub bytes_per_block: Vec<usize>,
+    pub layers: Vec<SerializablePagedLayerState>,
+}
+
+impl SerializablePagedSequenceState {
+    pub fn from_runtime(state: &PagedSequenceState, layout: &PagedKvLayout) -> Self {
+        Self {
+            block_size: state.block_size,
+            bytes_per_block: layout.bytes_per_block.clone(),
+            layers: state
+                .layers
+                .iter()
+                .map(SerializablePagedLayerState::from_runtime)
+                .collect(),
+        }
+    }
+
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let layout = self.layout()?;
+        if self.layers.len() != layout.num_layers {
+            anyhow::bail!(
+                "paged sequence layer count mismatch: state has {}, layout has {}",
+                self.layers.len(),
+                layout.num_layers
+            );
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            if layer.logical_start > layer.len {
+                anyhow::bail!(
+                    "paged layer {layer_idx} logical_start {} exceeds len {}",
+                    layer.logical_start,
+                    layer.len
+                );
+            }
+            let visible_len = layer.len.saturating_sub(layer.logical_start);
+            let required_blocks = visible_len.div_ceil(layout.block_size);
+            if layer.block_ids.len() < required_blocks {
+                anyhow::bail!(
+                    "paged layer {layer_idx} has {} blocks for visible length {}, requires at least {}",
+                    layer.block_ids.len(),
+                    visible_len,
+                    required_blocks
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    pub fn layout(&self) -> anyhow::Result<PagedKvLayout> {
+        PagedKvLayout::new(self.block_size, self.bytes_per_block.clone())
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub fn to_runtime(&self) -> anyhow::Result<PagedSequenceState> {
+        self.validate()?;
+        Ok(PagedSequenceState {
+            block_size: self.block_size,
+            layers: self
+                .layers
+                .iter()
+                .map(SerializablePagedLayerState::to_runtime)
+                .collect(),
+        })
+    }
 }
 
 impl TryFrom<u8> for CacheType {
@@ -138,6 +273,12 @@ pub struct SerializableCacheState {
     pub token_history: Vec<i32>,
     /// Unique sequence ID (from CachePool).
     pub sequence_id: u64,
+    /// Logical runtime backend that owned this sequence at transfer time.
+    #[serde(default)]
+    pub sequence_backend: SerializableSequenceBackend,
+    /// Mirrored paged sequence state for paged-backed decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub paged_state: Option<SerializablePagedSequenceState>,
 }
 
 /// Convert MLX dtype code to `TensorDtype` for the tensor protocol.

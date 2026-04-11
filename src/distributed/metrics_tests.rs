@@ -1,6 +1,8 @@
 use std::collections::VecDeque;
 use std::time::Duration;
 
+use mlxcel_core::cache::PagedCacheStats;
+
 use super::*;
 
 #[test]
@@ -99,6 +101,42 @@ fn collector_token_tracking() {
 }
 
 #[test]
+fn collector_paged_kv_metrics() {
+    let collector = MetricsCollector::new(MetricsConfig::default());
+    collector.update_paged_kv(
+        32,
+        PagedCacheStats {
+            allocated_blocks: 10,
+            live_blocks: 8,
+            free_blocks: 2,
+            bytes_reserved: 4096,
+            bytes_in_use: 3072,
+        },
+    );
+
+    let snap = collector.snapshot();
+    let paged = snap.paged_kv.expect("paged metrics should be present");
+    assert_eq!(paged.block_size, 32);
+    assert_eq!(paged.allocated_blocks, 10);
+    assert_eq!(paged.live_blocks, 8);
+    assert_eq!(paged.free_blocks, 2);
+    assert_eq!(paged.bytes_reserved, 4096);
+    assert_eq!(paged.bytes_in_use, 3072);
+}
+
+#[test]
+fn collector_paged_decode_fallbacks() {
+    let collector = MetricsCollector::new(MetricsConfig::default());
+    collector.record_paged_decode_fallback();
+    collector.record_paged_decode_fallback();
+    let snap = collector.snapshot();
+    assert_eq!(snap.paged_decode_fallbacks, 2);
+
+    collector.clear_paged_kv();
+    assert!(collector.snapshot().paged_kv.is_none());
+}
+
+#[test]
 fn collector_reset() {
     let collector = MetricsCollector::new(MetricsConfig::default());
 
@@ -113,6 +151,8 @@ fn collector_reset() {
     assert_eq!(snap.network_bytes_sent, 0);
     assert_eq!(snap.active_requests, 0);
     assert_eq!(snap.total_requests, 0);
+    assert!(snap.paged_kv.is_none());
+    assert_eq!(snap.paged_decode_fallbacks, 0);
 }
 
 #[test]

@@ -48,6 +48,7 @@ use mlxcel::distributed::disaggregated::stream_bridge::{
 };
 use mlxcel::distributed::kv_cache_serde::types::{
     CacheMetadata, CacheType, SerializableCacheState, SerializableSamplingState,
+    SerializableSequenceBackend,
 };
 use mlxcel::distributed::metrics::ClusterMetrics;
 use mlxcel::distributed::registry::{NodeRegistry, NodeStatus};
@@ -95,6 +96,8 @@ fn test_cache_state(prompt_len: usize, num_layers: usize) -> SerializableCacheSt
         sampling_state: Some(test_sampling_state()),
         token_history: (0..prompt_len as i32).collect(),
         sequence_id: 0,
+        sequence_backend: SerializableSequenceBackend::DenseKvCache,
+        paged_state: None,
     }
 }
 
