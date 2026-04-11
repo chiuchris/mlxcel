@@ -1787,6 +1787,186 @@ pub unsafe fn attention_from_ptr(
     attention(q, k, v, scale, mask, softcap, window_size)
 }
 
+fn validate_paged_decode_inputs(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+) -> Result<(), String> {
+    let q_shape = ffi::array_shape(q);
+    if q_shape.len() != 4 {
+        return Err(format!(
+            "paged decode attention expected q rank 4, got shape {:?}",
+            q_shape
+        ));
+    }
+    if q_shape[2] != 1 {
+        return Err(format!(
+            "paged decode attention only supports decode-only q_len == 1, got {}",
+            q_shape[2]
+        ));
+    }
+
+    let batch = q_shape[0].max(0) as usize;
+    if cache_keys.len() != batch || cache_values.len() != batch {
+        return Err(format!(
+            "paged decode attention expected {} cache pointers, got {} keys and {} values",
+            batch,
+            cache_keys.len(),
+            cache_values.len()
+        ));
+    }
+    if cache_keys.iter().any(|ptr| ptr.is_null()) || cache_values.iter().any(|ptr| ptr.is_null()) {
+        return Err("paged decode attention received a null dense compatibility cache pointer".to_string());
+    }
+    if metadata.len() != batch {
+        return Err(format!(
+            "paged decode attention expected {} metadata entries, got {}",
+            batch,
+            metadata.len()
+        ));
+    }
+    if metadata.block_table_offsets.len() != batch + 1 {
+        return Err(format!(
+            "paged decode attention expected {} block offsets, got {}",
+            batch + 1,
+            metadata.block_table_offsets.len()
+        ));
+    }
+    if metadata.block_table_offsets.last().copied().unwrap_or_default() as usize
+        != metadata.block_tables.len()
+    {
+        return Err("paged decode attention block table offsets do not cover the flattened block table".to_string());
+    }
+
+    Ok(())
+}
+
+/// Reference paged decode path over dense compatibility KV caches.
+///
+/// This stays entirely in Rust/FFI wrappers and is primarily used as a
+/// correctness baseline and benchmark fallback for the native paged decode
+/// kernel.
+pub fn paged_decode_attention_dense_fallback(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+
+    let q_shape = ffi::array_shape(q);
+    let batch = q_shape[0].max(0) as usize;
+    let mut outputs: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+
+    for batch_idx in 0..batch {
+        let kv_len = metadata.kv_lens[batch_idx];
+        if kv_len <= 0 {
+            return Err(format!(
+                "paged decode fallback requires kv_len > 0 for batch index {batch_idx}, got {kv_len}"
+            ));
+        }
+
+        let q_i = ffi::slice(
+            q,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, 1, i32::MAX],
+        );
+
+        let table_begin = metadata.block_table_offsets[batch_idx] as usize;
+        let table_end = metadata.block_table_offsets[batch_idx + 1] as usize;
+        let key_cache = unsafe { &*cache_keys[batch_idx] };
+        let value_cache = unsafe { &*cache_values[batch_idx] };
+
+        let mut key_visible: Option<UniquePtr<MlxArray>> = None;
+        let mut value_visible: Option<UniquePtr<MlxArray>> = None;
+
+        for &logical_block in &metadata.block_tables[table_begin..table_end] {
+            let block_start = logical_block * metadata.block_size;
+            if block_start >= kv_len {
+                continue;
+            }
+            let block_end = (block_start + metadata.block_size).min(kv_len);
+
+            let key_block = ffi::slice(
+                key_cache,
+                &[0, 0, block_start, 0],
+                &[1, i32::MAX, block_end, i32::MAX],
+            );
+            let value_block = ffi::slice(
+                value_cache,
+                &[0, 0, block_start, 0],
+                &[1, i32::MAX, block_end, i32::MAX],
+            );
+
+            key_visible = Some(match key_visible {
+                Some(prev) => crate::concatenate(&prev, &key_block, 2),
+                None => key_block,
+            });
+            value_visible = Some(match value_visible {
+                Some(prev) => crate::concatenate(&prev, &value_block, 2),
+                None => value_block,
+            });
+        }
+
+        let key_visible = key_visible.ok_or_else(|| {
+            format!("paged decode fallback built no visible key blocks for batch index {batch_idx}")
+        })?;
+        let value_visible = value_visible.ok_or_else(|| {
+            format!("paged decode fallback built no visible value blocks for batch index {batch_idx}")
+        })?;
+
+        outputs.push(unsafe {
+            attention_from_ptr(
+                &q_i,
+                &key_visible,
+                &value_visible,
+                scale,
+                std::ptr::null(),
+                0.0,
+                0,
+            )
+        });
+    }
+
+    let mut result = outputs
+        .drain(..1)
+        .next()
+        .ok_or_else(|| "paged decode fallback received an empty batch".to_string())?;
+    for output in outputs {
+        result = crate::concatenate(&result, &output, 0);
+    }
+    Ok(result)
+}
+
+/// Native paged decode path over dense compatibility KV caches.
+///
+/// The C++ bridge consumes the logical block table metadata and performs the
+/// per-sequence block gathering plus SDPA dispatch natively, reducing Rust-side
+/// FFI churn on the decode hot path.
+pub fn paged_decode_attention_dense_compat(
+    q: &MlxArray,
+    cache_keys: &[*const MlxArray],
+    cache_values: &[*const MlxArray],
+    metadata: &crate::cache::PagedDecodeMetadata,
+    scale: f32,
+) -> Result<UniquePtr<MlxArray>, String> {
+    validate_paged_decode_inputs(q, cache_keys, cache_values, metadata)?;
+    Ok(unsafe {
+        ffi::paged_decode_attention_dense_compat(
+            q,
+            cache_keys,
+            cache_values,
+            &metadata.kv_lens,
+            &metadata.block_tables,
+            &metadata.block_table_offsets,
+            metadata.block_size,
+            scale,
+        )
+    })
+}
+
 /// Metal 4 fused attention dispatch with automatic hardware detection.
 ///
 /// Dispatches SDPA to the Metal 4 fused kernel when the hardware supports it,

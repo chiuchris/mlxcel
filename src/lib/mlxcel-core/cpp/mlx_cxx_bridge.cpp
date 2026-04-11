@@ -17,6 +17,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <stdexcept>
 
 namespace mlx_cxx {
 
@@ -2347,6 +2348,117 @@ std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, "causal", std::nullopt
     ));
+}
+
+std::unique_ptr<MlxArray> paged_decode_attention_dense_compat(
+    const MlxArray& q,
+    rust::Slice<const MlxArray* const> cache_keys,
+    rust::Slice<const MlxArray* const> cache_values,
+    rust::Slice<const int32_t> kv_lens,
+    rust::Slice<const int32_t> block_tables,
+    rust::Slice<const int32_t> block_table_offsets,
+    int32_t block_size,
+    float scale
+) {
+    if (block_size <= 0) {
+        throw std::invalid_argument("paged_decode_attention_dense_compat: block_size must be > 0");
+    }
+
+    const auto q_shape = q.inner.shape();
+    if (q_shape.size() != 4 || q_shape[2] != 1) {
+        throw std::invalid_argument("paged_decode_attention_dense_compat: expected q shape [B, H, 1, D]");
+    }
+
+    const size_t batch = static_cast<size_t>(q_shape[0]);
+    if (cache_keys.size() != batch || cache_values.size() != batch || kv_lens.size() != batch) {
+        throw std::invalid_argument("paged_decode_attention_dense_compat: batch metadata length mismatch");
+    }
+    if (block_table_offsets.size() != batch + 1) {
+        throw std::invalid_argument("paged_decode_attention_dense_compat: block_table_offsets must have length B + 1");
+    }
+
+    std::vector<array> outputs;
+    outputs.reserve(batch);
+
+    for (size_t batch_idx = 0; batch_idx < batch; ++batch_idx) {
+        const MlxArray* key_cache = cache_keys[batch_idx];
+        const MlxArray* value_cache = cache_values[batch_idx];
+        if (key_cache == nullptr || value_cache == nullptr) {
+            throw std::invalid_argument("paged_decode_attention_dense_compat: null cache pointer");
+        }
+
+        const int32_t kv_len = kv_lens[batch_idx];
+        if (kv_len <= 0) {
+            throw std::invalid_argument("paged_decode_attention_dense_compat: kv_len must be > 0");
+        }
+
+        const int32_t table_begin = block_table_offsets[batch_idx];
+        const int32_t table_end = block_table_offsets[batch_idx + 1];
+        if (table_begin < 0 || table_end < table_begin ||
+            static_cast<size_t>(table_end) > block_tables.size()) {
+            throw std::invalid_argument("paged_decode_attention_dense_compat: invalid block table offsets");
+        }
+
+        std::vector<array> key_blocks;
+        std::vector<array> value_blocks;
+        key_blocks.reserve(table_end - table_begin);
+        value_blocks.reserve(table_end - table_begin);
+
+        for (int32_t table_idx = table_begin; table_idx < table_end; ++table_idx) {
+            const int32_t logical_block = block_tables[table_idx];
+            if (logical_block < 0) {
+                throw std::invalid_argument("paged_decode_attention_dense_compat: block indices must be non-negative");
+            }
+
+            const int32_t block_start = logical_block * block_size;
+            if (block_start >= kv_len) {
+                continue;
+            }
+            const int32_t block_end = std::min(block_start + block_size, kv_len);
+
+            key_blocks.push_back(mlx::core::slice(
+                key_cache->inner,
+                {0, 0, block_start, 0},
+                {1, static_cast<int>(key_cache->inner.shape(1)), block_end,
+                 static_cast<int>(key_cache->inner.shape(3))}
+            ));
+            value_blocks.push_back(mlx::core::slice(
+                value_cache->inner,
+                {0, 0, block_start, 0},
+                {1, static_cast<int>(value_cache->inner.shape(1)), block_end,
+                 static_cast<int>(value_cache->inner.shape(3))}
+            ));
+        }
+
+        if (key_blocks.empty() || value_blocks.empty()) {
+            throw std::invalid_argument("paged_decode_attention_dense_compat: empty visible block list");
+        }
+
+        array key_visible =
+            key_blocks.size() == 1 ? key_blocks.front() : mlx::core::concatenate(key_blocks, 2);
+        array value_visible = value_blocks.size() == 1
+            ? value_blocks.front()
+            : mlx::core::concatenate(value_blocks, 2);
+
+        auto q_i = mlx::core::slice(
+            q.inner,
+            {static_cast<int>(batch_idx), 0, 0, 0},
+            {static_cast<int>(batch_idx + 1), static_cast<int>(q_shape[1]), 1,
+             static_cast<int>(q_shape[3])}
+        );
+        auto attn_i = mlx::core::fast::scaled_dot_product_attention(
+            q_i, key_visible, value_visible, scale, "", std::nullopt
+        );
+        outputs.push_back(std::move(attn_i));
+    }
+
+    if (outputs.empty()) {
+        throw std::invalid_argument("paged_decode_attention_dense_compat: empty batch");
+    }
+    if (outputs.size() == 1) {
+        return std::make_unique<MlxArray>(std::move(outputs.front()));
+    }
+    return std::make_unique<MlxArray>(mlx::core::concatenate(outputs, 0));
 }
 
 namespace {

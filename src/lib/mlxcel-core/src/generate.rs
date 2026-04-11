@@ -272,6 +272,25 @@ pub trait LanguageModel {
         false
     }
 
+    /// Batched decode with explicit runtime context from the scheduler.
+    ///
+    /// This extends `forward_batched()` without forcing all model families to
+    /// plumb scheduler-specific state through their existing dense path. The
+    /// default implementation ignores the context and delegates to
+    /// `forward_batched()`.
+    ///
+    /// Used by: BatchScheduler decode backend dispatch, paged decode profiling
+    fn forward_batched_with_context(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let _ = context;
+        self.forward_batched(input_ids, batch_caches, mask)
+    }
+
     /// Batched decode: process B sequences in one forward pass.
     ///
     /// `input_ids` has shape `[B, 1]` where B is the batch size (one new
@@ -315,6 +334,47 @@ pub trait LanguageModel {
             result = crate::concatenate(&result, &logits_i, 0);
         }
         result
+    }
+}
+
+/// Decode-time storage backend hint supplied by the runtime.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeStorageBackend {
+    Dense,
+    Paged,
+}
+
+/// Optional scheduler/runtime context for batched decode dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeBatchContext {
+    pub storage_backend: DecodeStorageBackend,
+    pub paged_block_size: i32,
+    pub use_native_paged_kernel: bool,
+}
+
+impl DecodeBatchContext {
+    pub fn dense() -> Self {
+        Self {
+            storage_backend: DecodeStorageBackend::Dense,
+            paged_block_size: 0,
+            use_native_paged_kernel: false,
+        }
+    }
+
+    pub fn paged(block_size: i32) -> Self {
+        Self::paged_with_native(block_size, true)
+    }
+
+    pub fn paged_with_native(block_size: i32, use_native_paged_kernel: bool) -> Self {
+        Self {
+            storage_backend: DecodeStorageBackend::Paged,
+            paged_block_size: block_size,
+            use_native_paged_kernel,
+        }
+    }
+
+    pub fn is_paged_decode(self) -> bool {
+        self.storage_backend == DecodeStorageBackend::Paged && self.paged_block_size > 0
     }
 }
 

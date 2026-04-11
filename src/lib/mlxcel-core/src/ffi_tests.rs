@@ -102,6 +102,60 @@ fn test_fast_rope_batched_matches_per_sequence_offsets() {
 }
 
 #[test]
+fn test_paged_decode_attention_dense_compat_matches_fallback() {
+    let q = from_slice_f32(&[1.0, 0.5, 0.25, 1.25], &[2, 1, 1, 2]);
+
+    let cache_k_0 = from_slice_f32(&[1.0, 0.0, 0.0, 1.0, 1.0, 1.0], &[1, 1, 3, 2]);
+    let cache_v_0 = from_slice_f32(&[0.5, 0.0, 0.0, 0.5, 1.0, 1.0], &[1, 1, 3, 2]);
+    let cache_k_1 = from_slice_f32(
+        &[1.0, 0.0, 0.0, 1.0, 0.5, 0.5, 1.0, 1.0, 0.25, 1.25],
+        &[1, 1, 5, 2],
+    );
+    let cache_v_1 = from_slice_f32(
+        &[0.2, 0.8, 0.8, 0.2, 0.5, 0.5, 1.2, 0.4, 0.3, 1.3],
+        &[1, 1, 5, 2],
+    );
+
+    let cache_keys = vec![
+        cache_k_0.as_ref().unwrap() as *const MlxArray,
+        cache_k_1.as_ref().unwrap() as *const MlxArray,
+    ];
+    let cache_values = vec![
+        cache_v_0.as_ref().unwrap() as *const MlxArray,
+        cache_v_1.as_ref().unwrap() as *const MlxArray,
+    ];
+    let metadata = crate::cache::PagedDecodeMetadata {
+        block_size: 2,
+        kv_lens: vec![3, 5],
+        block_table_offsets: vec![0, 2, 5],
+        block_tables: vec![0, 1, 0, 1, 2],
+    };
+
+    let fallback = crate::layers::paged_decode_attention_dense_fallback(
+        &q,
+        &cache_keys,
+        &cache_values,
+        &metadata,
+        1.0,
+    )
+    .unwrap();
+    let native = crate::layers::paged_decode_attention_dense_compat(
+        &q,
+        &cache_keys,
+        &cache_values,
+        &metadata,
+        1.0,
+    )
+    .unwrap();
+
+    eval(&fallback);
+    eval(&native);
+    let close = allclose(&fallback, &native, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
+#[test]
 fn test_rms_norm() {
     let x = ones(&[1, 4], dtype::FLOAT32);
     let weight = ones(&[4], dtype::FLOAT32);

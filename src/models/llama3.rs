@@ -17,9 +17,11 @@
 //! This implements the standard Llama architecture for dense models
 //! like Llama 3.1 8B Instruct.
 
-use mlxcel_core::cache::BatchedAttentionMetadata;
-use mlxcel_core::generate::LanguageModel;
-use mlxcel_core::layers::{FusedQKVLinear, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
+use mlxcel_core::cache::{BatchedAttentionMetadata, PagedDecodeMetadata};
+use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
+use mlxcel_core::layers::{
+    FusedQKVLinear, KVCache, KVCacheMode, RMSNorm, UnifiedEmbedding, UnifiedLinear,
+};
 use mlxcel_core::utils::pipeline_hint;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -238,6 +240,7 @@ impl Attention {
         caches: &mut [&mut KVCache],
         metadata: &BatchedAttentionMetadata,
         mask: Option<&MlxArray>,
+        decode_context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         let b = caches.len();
         let seq_len = mlxcel_core::array_shape(q_batched)[1];
@@ -277,6 +280,72 @@ impl Attention {
             1.0,
             &metadata.rope_offsets,
         );
+
+        let paged_decode = decode_context.and_then(|context| {
+            if seq_len != 1 || mask.is_some() || !context.is_paged_decode() {
+                return None;
+            }
+            if caches.iter().any(|cache| cache.mode != KVCacheMode::Fp16) {
+                return None;
+            }
+            let metadata =
+                PagedDecodeMetadata::from_attention_metadata(metadata, context.paged_block_size)
+                    .ok()?;
+            Some((context.use_native_paged_kernel, metadata))
+        });
+
+        if let Some((use_native_kernel, paged_metadata)) = paged_decode {
+            tracing::debug!(
+                batch_size = b,
+                block_size = paged_metadata.block_size,
+                native_kernel = use_native_kernel,
+                "Llama3 paged decode attention dispatch"
+            );
+            let mut cache_keys: Vec<*const MlxArray> = Vec::with_capacity(b);
+            let mut cache_values: Vec<*const MlxArray> = Vec::with_capacity(b);
+
+            for (i, cache) in caches.iter_mut().enumerate() {
+                let k_i = mlxcel_core::slice(
+                    &k_batched,
+                    &[i as i32, 0, 0, 0],
+                    &[i as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+                );
+                let v_i = mlxcel_core::slice(
+                    &v_batched,
+                    &[i as i32, 0, 0, 0],
+                    &[i as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+                );
+                cache.update(k_i, v_i);
+                cache_keys.push(cache.keys.as_ref().unwrap().as_ref().unwrap() as *const MlxArray);
+                cache_values
+                    .push(cache.values.as_ref().unwrap().as_ref().unwrap() as *const MlxArray);
+            }
+
+            let attn_out = if use_native_kernel {
+                mlxcel_core::layers::paged_decode_attention_dense_compat(
+                    &q_batched,
+                    &cache_keys,
+                    &cache_values,
+                    &paged_metadata,
+                    self.scale,
+                )
+            } else {
+                mlxcel_core::layers::paged_decode_attention_dense_fallback(
+                    &q_batched,
+                    &cache_keys,
+                    &cache_values,
+                    &paged_metadata,
+                    self.scale,
+                )
+            }
+            .expect("valid llama3 paged decode attention inputs");
+
+            let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+            return mlxcel_core::reshape(
+                &attn_out,
+                &[b as i32, seq_len, self.num_heads * self.head_dim],
+            );
+        }
 
         for (i, cache) in caches.iter_mut().enumerate() {
             // Slice [B, heads, T, dim] -> [1, heads, T, dim] for sequence i.
@@ -471,6 +540,7 @@ impl TransformerBlock {
         x: &MlxArray,
         caches: &mut [&mut KVCache],
         mask: Option<&MlxArray>,
+        decode_context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         // Batched pre-attention norm
         let normed = self.input_layernorm.forward(x);
@@ -483,9 +553,15 @@ impl TransformerBlock {
 
         // Per-sequence attention still owns cache mutation, but positional
         // metadata and RoPE now stay on a batched path.
-        let attn_concat = self
-            .self_attn
-            .forward_split_attention(&q, &k, &v, caches, &metadata, mask);
+        let attn_concat = self.self_attn.forward_split_attention(
+            &q,
+            &k,
+            &v,
+            caches,
+            &metadata,
+            mask,
+            decode_context,
+        );
 
         // Batched output projection
         let attn_out = self.self_attn.o_proj.forward(&attn_concat);
@@ -606,6 +682,7 @@ impl Llama3Model {
         input_ids: &MlxArray,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
+        decode_context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         let b = batch_caches.len();
 
@@ -620,7 +697,7 @@ impl Llama3Model {
                 .map(|caches| &mut caches[layer_idx])
                 .collect();
 
-            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, mask);
+            h = self.layers[layer_idx].forward_batched(&h, &mut layer_caches, mask, decode_context);
         }
 
         // Batched final norm: [B, 1, hidden_dim]
@@ -754,7 +831,17 @@ impl LanguageModel for Llama3Model {
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.forward_batched_impl(input_ids, batch_caches, mask)
+        self.forward_batched_impl(input_ids, batch_caches, mask, None)
+    }
+
+    fn forward_batched_with_context(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_batched_impl(input_ids, batch_caches, mask, context)
     }
 
     fn supports_batched_prefill(&self) -> bool {

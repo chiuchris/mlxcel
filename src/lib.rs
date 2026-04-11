@@ -41,7 +41,10 @@ pub use execution::quant_advisor;
 pub use execution::runtime::{RuntimeDevice, RuntimeSetup, initialize_runtime};
 pub use execution::sampling;
 pub use mlxcel_core::generate;
-pub use mlxcel_core::generate::{CxxGenerator, GenerationStats, LanguageModel, SamplingConfig};
+pub use mlxcel_core::generate::{
+    CxxGenerator, DecodeBatchContext, DecodeStorageBackend, GenerationStats, LanguageModel,
+    SamplingConfig,
+};
 pub use mlxcel_core::speculative::SpeculativeGenerator;
 pub use multimodal::{
     minicpmo_prompt, moondream3_prompt, phi3v_prompt, phi4_siglip_prompt, phi4mm_prompt, qwen_vl,

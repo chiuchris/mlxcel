@@ -32,7 +32,9 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use mlxcel_core::cache::{CachePool, PagedKvLayout, SequenceId, SequenceStateLayout};
-use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::generate::{
+    DecodeBatchContext, DecodeStorageBackend as CoreDecodeStorageBackend, LanguageModel,
+};
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
@@ -1353,7 +1355,20 @@ impl BatchScheduler {
             }
         };
 
-        let logits = self.model.forward_batched(&input, &mut batch_caches, None);
+        let decode_context = match self.decode_storage_backend {
+            DecodeStorageBackend::Dense => DecodeBatchContext::dense(),
+            DecodeStorageBackend::Paged => DecodeBatchContext {
+                storage_backend: CoreDecodeStorageBackend::Paged,
+                paged_block_size: DEFAULT_PAGED_BLOCK_SIZE as i32,
+                use_native_paged_kernel: true,
+            },
+        };
+        let logits = self.model.forward_batched_with_context(
+            &input,
+            &mut batch_caches,
+            None,
+            Some(&decode_context),
+        );
         drop(batch_caches);
 
         for &seq_id in seq_ids {

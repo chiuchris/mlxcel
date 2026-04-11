@@ -1070,6 +1070,70 @@ impl BatchedAttentionMetadata {
     }
 }
 
+/// Decode-only paged attention metadata derived from per-sequence KV lengths.
+///
+/// The current dense-compat kernel treats `block_tables` as logical block
+/// indices (`0..num_blocks`) for each sequence. A future physical paged-KV
+/// backend can reuse the same shape while replacing these entries with actual
+/// physical block identifiers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PagedDecodeMetadata {
+    pub block_size: i32,
+    pub kv_lens: Vec<i32>,
+    pub block_table_offsets: Vec<i32>,
+    pub block_tables: Vec<i32>,
+}
+
+impl PagedDecodeMetadata {
+    pub fn from_attention_metadata(
+        metadata: &BatchedAttentionMetadata,
+        block_size: i32,
+    ) -> Result<Self, String> {
+        if block_size <= 0 {
+            return Err(format!(
+                "paged decode metadata requires block_size > 0, got {block_size}"
+            ));
+        }
+
+        let mut block_table_offsets = Vec::with_capacity(metadata.kv_lens.len() + 1);
+        let mut block_tables = Vec::new();
+        block_table_offsets.push(0);
+
+        for &kv_len in &metadata.kv_lens {
+            if kv_len < 0 {
+                return Err(format!(
+                    "paged decode metadata requires non-negative kv lengths, got {kv_len}"
+                ));
+            }
+
+            let block_count = if kv_len == 0 {
+                0
+            } else {
+                (kv_len + block_size - 1) / block_size
+            };
+            for logical_block in 0..block_count {
+                block_tables.push(logical_block);
+            }
+            block_table_offsets.push(block_tables.len() as i32);
+        }
+
+        Ok(Self {
+            block_size,
+            kv_lens: metadata.kv_lens.clone(),
+            block_table_offsets,
+            block_tables,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.kv_lens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.kv_lens.is_empty()
+    }
+}
+
 impl Default for ChunkedKVCache {
     fn default() -> Self {
         Self::new(8192)
@@ -2092,5 +2156,34 @@ mod tests {
 
         assert!(BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 2], &[0]).is_err());
         assert!(BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0, 1]).is_err());
+    }
+
+    #[test]
+    fn paged_decode_metadata_builds_logical_block_tables() {
+        let metadata = BatchedAttentionMetadata {
+            rope_offsets: vec![0, 4],
+            query_lens: vec![1, 1],
+            kv_lens: vec![3, 5],
+            window_sizes: vec![0, 0],
+        };
+
+        let paged = PagedDecodeMetadata::from_attention_metadata(&metadata, 2).unwrap();
+
+        assert_eq!(paged.block_size, 2);
+        assert_eq!(paged.kv_lens, vec![3, 5]);
+        assert_eq!(paged.block_table_offsets, vec![0, 2, 5]);
+        assert_eq!(paged.block_tables, vec![0, 1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn paged_decode_metadata_rejects_invalid_block_size() {
+        let metadata = BatchedAttentionMetadata {
+            rope_offsets: vec![0],
+            query_lens: vec![1],
+            kv_lens: vec![1],
+            window_sizes: vec![0],
+        };
+
+        assert!(PagedDecodeMetadata::from_attention_metadata(&metadata, 0).is_err());
     }
 }
