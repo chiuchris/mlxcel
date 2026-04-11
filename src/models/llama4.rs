@@ -20,7 +20,9 @@
 use crate::models::llama4_helpers::{
     create_chunked_attention_mask, get_weight_copy, load_quantized_linear,
 };
-use crate::models::model_owned::ModelOwnedSequenceState;
+use crate::models::model_owned::{
+    ModelOwnedSequenceState, dispatch_paged_decode_from_backing_caches,
+};
 use mlxcel_core::cache::{CachePool, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
 use mlxcel_core::layers::{ChunkedKVCache, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
@@ -45,9 +47,9 @@ impl Llama4Cache {
     /// In Python mlx-vlm, `BatchKVCache` can return an `mx.array`-valued offset
     /// when doing batch inference, requiring a `.max().item()` guard before using
     /// it in `mx.arange`. In Rust, offset is always `i32` (scalar), so no such
-    /// guard is needed. Batch inference is also disabled for Llama4Wrapper
-    /// (`supports_batching()` returns false), making array-valued offsets
-    /// structurally impossible.
+    /// guard is needed. Batched decode now threads per-sequence offsets
+    /// explicitly through vectorized metadata instead of exposing array-valued
+    /// offsets from the cache type itself.
     pub fn offset(&self) -> i32 {
         match self {
             Llama4Cache::Chunked(c) => c.get_offset(),
@@ -101,6 +103,36 @@ impl Llama4Cache {
                 .unwrap_or(0),
             Llama4Cache::Regular(c) => c.seq_len().max(0) as usize,
         }
+    }
+
+    pub fn keys_ptr(&self) -> Option<*const MlxArray> {
+        match self {
+            Llama4Cache::Chunked(c) => c
+                .keys
+                .as_ref()
+                .and_then(|keys| keys.as_ref().map(|arr| arr as *const _)),
+            Llama4Cache::Regular(c) => c
+                .keys
+                .as_ref()
+                .and_then(|keys| keys.as_ref().map(|arr| arr as *const _)),
+        }
+    }
+
+    pub fn values_ptr(&self) -> Option<*const MlxArray> {
+        match self {
+            Llama4Cache::Chunked(c) => c
+                .values
+                .as_ref()
+                .and_then(|values| values.as_ref().map(|arr| arr as *const _)),
+            Llama4Cache::Regular(c) => c
+                .values
+                .as_ref()
+                .and_then(|values| values.as_ref().map(|arr| arr as *const _)),
+        }
+    }
+
+    pub fn is_chunked(&self) -> bool {
+        matches!(self, Llama4Cache::Chunked(_))
     }
 }
 
@@ -599,6 +631,97 @@ impl CxxAttention {
         self.o_proj.forward(&attn_out)
     }
 
+    fn forward_batched_decode_chunked(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut Llama4Cache],
+        context: &DecodeBatchContext,
+    ) -> Result<Option<UniquePtr<MlxArray>>, String> {
+        let shape = mlxcel_core::array_shape(x);
+        if shape[1] != 1 || !self.use_rope || !caches.iter().all(|cache| cache.is_chunked()) {
+            return Ok(None);
+        }
+
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        let q = mlxcel_core::reshape(&q, &[batch, seq_len, self.num_heads, self.head_dim]);
+        let k = mlxcel_core::reshape(&k, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
+        let v = mlxcel_core::reshape(&v, &[batch, seq_len, self.num_kv_heads, self.head_dim]);
+
+        let mut q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let mut k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        let offsets: Vec<i32> = caches.iter().map(|cache| cache.offset()).collect();
+        q = mlxcel_core::fast_rope_batched(
+            &q,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            self.rope_scale,
+            &offsets,
+        );
+        k = mlxcel_core::fast_rope_batched(
+            &k,
+            self.rope_dims,
+            false,
+            self.rope_base,
+            self.rope_scale,
+            &offsets,
+        );
+
+        if self.use_qk_norm {
+            let q_dtype = mlxcel_core::array_dtype(&q);
+            let norm_weight = mlxcel_core::ones(&[self.head_dim], q_dtype);
+            q = mlxcel_core::fast_rms_norm(&q, &norm_weight, 1e-6);
+            k = mlxcel_core::fast_rms_norm(&k, &norm_weight, 1e-6);
+        }
+
+        let Some(attn_out) = dispatch_paged_decode_from_backing_caches(
+            &q,
+            &k,
+            &v,
+            caches,
+            self.scale,
+            context,
+            |cache, k_i, v_i| {
+                let _ = cache.update_and_fetch(k_i, v_i);
+                Ok(())
+            },
+            |cache| {
+                cache
+                    .keys_ptr()
+                    .ok_or_else(|| "llama4 chunked cache missing key backing array".to_string())
+            },
+            |cache| {
+                cache
+                    .values_ptr()
+                    .ok_or_else(|| "llama4 chunked cache missing value backing array".to_string())
+            },
+            |cache| Ok(cache.visible_len() as i32),
+        )?
+        else {
+            return Ok(None);
+        };
+
+        tracing::debug!(
+            batch_size = batch,
+            block_size = context.paged_block_size,
+            native_kernel = context.use_native_paged_kernel,
+            "Llama4 chunked paged decode attention dispatch"
+        );
+
+        let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out =
+            mlxcel_core::reshape(&attn_out, &[batch, seq_len, self.num_heads * self.head_dim]);
+        Ok(Some(self.o_proj.forward(&attn_out)))
+    }
+
     /// Legacy forward pass with regular KVCache (kept for compatibility)
     pub fn forward(
         &self,
@@ -879,6 +1002,44 @@ impl TransformerBlock {
         mlxcel_core::add(&h, &ff_out)
     }
 
+    fn forward_batched_decode_llama4(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut Llama4Cache],
+        decode_context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        if let Some(context) = decode_context {
+            let normed = self.input_layernorm.forward(x);
+            if let Some(attn_out) = self
+                .self_attn
+                .forward_batched_decode_chunked(&normed, caches, context)
+                .expect("valid llama4 chunked paged decode inputs")
+            {
+                let h = mlxcel_core::add(x, &attn_out);
+                let normed = self.post_attention_layernorm.forward(&h);
+                let ff_out = self.feed_forward.forward(&normed);
+                return mlxcel_core::add(&h, &ff_out);
+            }
+        }
+
+        let shape = mlxcel_core::array_shape(x);
+        let mut outputs = Vec::with_capacity(caches.len());
+        for (batch_idx, cache) in caches.iter_mut().enumerate() {
+            let x_i = mlxcel_core::slice(
+                x,
+                &[batch_idx as i32, 0, 0],
+                &[batch_idx as i32 + 1, shape[1], shape[2]],
+            );
+            outputs.push(self.forward_llama4(&x_i, cache, None));
+        }
+
+        let mut out = outputs.remove(0);
+        for output in outputs {
+            out = mlxcel_core::concatenate(&out, &output, 0);
+        }
+        out
+    }
+
     /// Legacy forward pass with regular KVCache
     pub fn forward(
         &self,
@@ -1088,6 +1249,34 @@ impl Llama4CxxModel {
 
         for (i, layer) in self.layers.iter().enumerate() {
             h = layer.forward(&h, &mut caches[i], None);
+        }
+
+        let h = self.norm.forward(&h);
+        self.lm_head.forward(&h)
+    }
+
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [Vec<Llama4Cache>],
+        decode_context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+
+        for caches in batch_caches.iter_mut() {
+            for (idx, cache) in caches.iter_mut().enumerate() {
+                if (idx + 1) % 4 != 0 {
+                    cache.maybe_trim_front();
+                }
+            }
+        }
+
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let mut layer_caches: Vec<&mut Llama4Cache> = batch_caches
+                .iter_mut()
+                .map(|caches| &mut caches[layer_idx])
+                .collect();
+            h = layer.forward_batched_decode_llama4(&h, &mut layer_caches, decode_context);
         }
 
         let h = self.norm.forward(&h);
@@ -1600,36 +1789,51 @@ impl LanguageModel for Llama4Wrapper {
         seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
-        _context: Option<&DecodeBatchContext>,
+        context: Option<&DecodeBatchContext>,
     ) -> UniquePtr<MlxArray> {
         let shape = mlxcel_core::array_shape(input_ids);
+        if shape[1] != 1 || mask.is_some() {
+            let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
+            let mut result = self.forward_with_sequence_id(
+                &input_0,
+                seq_ids.and_then(|ids| ids.first().copied()),
+                batch_caches[0],
+                mask,
+            );
+            for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+                let input_i = mlxcel_core::slice(
+                    input_ids,
+                    &[batch_idx as i32, 0],
+                    &[batch_idx as i32 + 1, shape[1]],
+                );
+                let logits_i = self.forward_with_sequence_id(
+                    &input_i,
+                    seq_ids.and_then(|ids| ids.get(batch_idx).copied()),
+                    caches,
+                    mask,
+                );
+                result = mlxcel_core::concatenate(&result, &logits_i, 0);
+            }
+            return result;
+        }
+
         tracing::debug!(
             batch_size = batch_caches.len(),
             seq_len = shape[1],
-            "Llama4 model-owned batched decode compatibility dispatch"
+            "Llama4 model-owned batched decode dispatch"
         );
-        let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
-        let mut result = self.forward_with_sequence_id(
-            &input_0,
-            seq_ids.and_then(|ids| ids.first().copied()),
-            batch_caches[0],
-            mask,
-        );
-        for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
-            let input_i = mlxcel_core::slice(
-                input_ids,
-                &[batch_idx as i32, 0],
-                &[batch_idx as i32 + 1, shape[1]],
-            );
-            let logits_i = self.forward_with_sequence_id(
-                &input_i,
-                seq_ids.and_then(|ids| ids.get(batch_idx).copied()),
-                caches,
-                mask,
-            );
-            result = mlxcel_core::concatenate(&result, &logits_i, 0);
-        }
-        result
+        self.sequence_state
+            .with_batched_sequence_states(
+                seq_ids.expect("llama4 batched decode requires sequence ids"),
+                |sequence_caches| {
+                    self.model.forward_batched_decode_with_caches(
+                        input_ids,
+                        sequence_caches,
+                        context,
+                    )
+                },
+            )
+            .expect("llama4 batched decode requires sequence-local cache state")
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

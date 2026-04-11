@@ -732,6 +732,17 @@ std::unique_ptr<MlxArray> paged_decode_attention_dense_compat(
     float scale
 );
 
+// Decode-only paged attention over rotating ring-buffer KV caches.
+std::unique_ptr<MlxArray> paged_decode_attention_rotating_compat(
+    const MlxArray& q,
+    rust::Slice<const MlxArray* const> cache_keys,
+    rust::Slice<const MlxArray* const> cache_values,
+    rust::Slice<const int32_t> kv_lens,
+    rust::Slice<const int32_t> logical_starts,
+    int32_t block_size,
+    float scale
+);
+
 // Upstream MLX SDPA capability helpers for Metal/NAX instrumentation.
 bool sdpa_supports_fast_path(
     const MlxArray& q,

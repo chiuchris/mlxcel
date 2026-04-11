@@ -113,6 +113,7 @@ impl<T> ModelOwnedSequenceState<T> {
     }
 }
 
+// Used by: Gemma3 paged decode, model-owned cache families with materialized visible views
 pub(crate) fn dispatch_paged_decode_from_visible_caches<C, F>(
     q_batched: &MlxArray,
     k_batched: &MlxArray,
@@ -177,6 +178,78 @@ where
         );
         visible_keys.push(visible_k);
         visible_values.push(visible_v);
+    }
+
+    let metadata = PagedDecodeMetadata::from_visible_lengths(&kv_lens, context.paged_block_size)?;
+    let attn = if context.use_native_paged_kernel {
+        mlxcel_core::layers::paged_decode_attention_dense_compat(
+            q_batched,
+            &cache_keys,
+            &cache_values,
+            &metadata,
+            scale,
+        )
+    } else {
+        mlxcel_core::layers::paged_decode_attention_dense_fallback(
+            q_batched,
+            &cache_keys,
+            &cache_values,
+            &metadata,
+            scale,
+        )
+    }?;
+
+    Ok(Some(attn))
+}
+
+// Used by: Llama4 paged decode, future chunked/sliding model-owned cache families
+pub(crate) fn dispatch_paged_decode_from_backing_caches<C, F, G, H, I>(
+    q_batched: &MlxArray,
+    k_batched: &MlxArray,
+    v_batched: &MlxArray,
+    caches: &mut [&mut C],
+    scale: f32,
+    context: &DecodeBatchContext,
+    mut update_cache: F,
+    mut keys_ptr: G,
+    mut values_ptr: H,
+    mut visible_len: I,
+) -> Result<Option<UniquePtr<MlxArray>>, String>
+where
+    F: FnMut(&mut C, UniquePtr<MlxArray>, UniquePtr<MlxArray>) -> Result<(), String>,
+    G: FnMut(&C) -> Result<*const MlxArray, String>,
+    H: FnMut(&C) -> Result<*const MlxArray, String>,
+    I: FnMut(&C) -> Result<i32, String>,
+{
+    if !context.is_paged_decode() {
+        return Ok(None);
+    }
+
+    let q_shape = mlxcel_core::array_shape(q_batched);
+    if q_shape.len() != 4 || q_shape[2] != 1 {
+        return Ok(None);
+    }
+
+    let mut cache_keys = Vec::with_capacity(caches.len());
+    let mut cache_values = Vec::with_capacity(caches.len());
+    let mut kv_lens = Vec::with_capacity(caches.len());
+
+    for (batch_idx, cache) in caches.iter_mut().enumerate() {
+        let k_i = mlxcel_core::slice(
+            k_batched,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+        );
+        let v_i = mlxcel_core::slice(
+            v_batched,
+            &[batch_idx as i32, 0, 0, 0],
+            &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+        );
+
+        update_cache(cache, k_i, v_i)?;
+        kv_lens.push(visible_len(cache)?);
+        cache_keys.push(keys_ptr(cache)?);
+        cache_values.push(values_ptr(cache)?);
     }
 
     let metadata = PagedDecodeMetadata::from_visible_lengths(&kv_lens, context.paged_block_size)?;
