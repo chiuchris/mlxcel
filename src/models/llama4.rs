@@ -21,6 +21,7 @@ use crate::models::llama4_helpers::{
     create_chunked_attention_mask, get_weight_copy, load_quantized_linear,
 };
 use crate::models::model_owned::ModelOwnedSequenceState;
+use mlxcel_core::cache::{CachePool, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
 use mlxcel_core::layers::{ChunkedKVCache, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -88,6 +89,17 @@ impl Llama4Cache {
         match self {
             Llama4Cache::Chunked(c) => c.update_and_fetch(keys, values),
             Llama4Cache::Regular(c) => c.update_and_fetch(keys, values),
+        }
+    }
+
+    pub fn visible_len(&self) -> usize {
+        match self {
+            Llama4Cache::Chunked(c) => c
+                .keys
+                .as_ref()
+                .map(|keys| mlxcel_core::array_shape(keys)[2].max(0) as usize)
+                .unwrap_or(0),
+            Llama4Cache::Regular(c) => c.seq_len().max(0) as usize,
         }
     }
 }
@@ -1471,29 +1483,31 @@ impl LanguageModel for Llama4Wrapper {
     fn forward(
         &self,
         input_ids: &MlxArray,
-        caches: &mut [KVCache],
+        _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
-            self.model.forward_igqa(input_ids, sequence_caches, None)
-        })
+        self.sequence_state
+            .with_sequence_state(None, |sequence_caches| {
+                self.model.forward_igqa(input_ids, sequence_caches, None)
+            })
     }
 
     fn forward_with_embeddings(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        caches: &mut [KVCache],
+        _caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
-            self.model.forward_igqa_with_embeddings(
-                input_ids,
-                input_embeddings,
-                sequence_caches,
-                None,
-            )
-        })
+        self.sequence_state
+            .with_sequence_state(None, |sequence_caches| {
+                self.model.forward_igqa_with_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    None,
+                )
+            })
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
@@ -1501,25 +1515,85 @@ impl LanguageModel for Llama4Wrapper {
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
-        self.sequence_state
-            .make_sequence_placeholders(self.model.make_llama4_caches())
+        Vec::new()
     }
 
     fn num_layers(&self) -> usize {
         self.model.layers.len()
     }
 
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.model.layers.len())
+    }
+
     fn supports_batching(&self) -> bool {
         true
     }
 
-    fn release_sequence_state(&self, caches: &mut [KVCache]) {
-        self.sequence_state.release_sequence_state(caches)
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.sequence_state
+            .prepare_sequence_state(seq_id, self.model.make_llama4_caches());
     }
 
-    fn forward_batched_with_context(
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.sequence_state.release_sequence_state(seq_id)
+    }
+
+    fn forward_with_sequence_id(
         &self,
         input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_llama4_caches(),
+            |sequence_caches| self.model.forward_igqa(input_ids, sequence_caches, None),
+        )
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_llama4_caches(),
+            |sequence_caches| {
+                self.model.forward_igqa_with_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    None,
+                )
+            },
+        )
+    }
+
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_sequence_state(Some(seq_id), |sequence_caches| {
+                let visible_lens: Vec<usize> = sequence_caches
+                    .iter()
+                    .map(Llama4Cache::visible_len)
+                    .collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &visible_lens)
+            })
+    }
+
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [KVCache]],
         mask: Option<&MlxArray>,
         _context: Option<&DecodeBatchContext>,
@@ -1531,14 +1605,24 @@ impl LanguageModel for Llama4Wrapper {
             "Llama4 model-owned batched decode compatibility dispatch"
         );
         let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
-        let mut result = self.forward(&input_0, batch_caches[0], mask);
+        let mut result = self.forward_with_sequence_id(
+            &input_0,
+            seq_ids.and_then(|ids| ids.first().copied()),
+            batch_caches[0],
+            mask,
+        );
         for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
             let input_i = mlxcel_core::slice(
                 input_ids,
                 &[batch_idx as i32, 0],
                 &[batch_idx as i32 + 1, shape[1]],
             );
-            let logits_i = self.forward(&input_i, caches, mask);
+            let logits_i = self.forward_with_sequence_id(
+                &input_i,
+                seq_ids.and_then(|ids| ids.get(batch_idx).copied()),
+                caches,
+                mask,
+            );
             result = mlxcel_core::concatenate(&result, &logits_i, 0);
         }
         result

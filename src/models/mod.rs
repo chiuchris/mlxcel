@@ -166,11 +166,11 @@ pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
 pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
-pub(crate) use sanitize::{load_gemma4_text_weights_with_backing, load_gemma4_vlm_weights};
 pub use sanitize::{
     convert_bf16_weights, load_and_sanitize_weights, sanitize_config_json,
     sanitize_tied_embeddings, warn_bf16_precision,
 };
+pub(crate) use sanitize::{load_gemma4_text_weights_with_backing, load_gemma4_vlm_weights};
 pub use smollm3::SmolLM3Model;
 pub use solar_open::SolarOpenModel;
 pub use stablelm::StableLMModel;

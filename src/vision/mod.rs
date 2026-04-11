@@ -250,6 +250,120 @@ impl LanguageModel for VisionLanguageModel {
     fn eos_token_ids(&self) -> Vec<i32> {
         self.text_model.eos_token_ids()
     }
+
+    fn after_prefill(&self) {
+        self.text_model.after_prefill()
+    }
+
+    fn trim_internal_caches(&self, excess: i32) {
+        self.text_model.trim_internal_caches(excess)
+    }
+
+    fn release_sequence_state(&self, caches: &mut [KVCache]) {
+        self.text_model.release_sequence_state(caches)
+    }
+
+    fn prepare_sequence_state(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        self.text_model.prepare_sequence_state(seq_id)
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        self.text_model.release_sequence_state_by_id(seq_id)
+    }
+
+    fn sequence_state_layout(&self) -> mlxcel_core::cache::SequenceStateLayout {
+        self.text_model.sequence_state_layout()
+    }
+
+    fn supports_padded_prefill(&self) -> bool {
+        self.text_model.supports_padded_prefill()
+    }
+
+    fn supports_maskless_padded_prefill(&self) -> bool {
+        self.text_model.supports_maskless_padded_prefill()
+    }
+
+    fn supports_batching(&self) -> bool {
+        self.text_model.supports_batching()
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        self.text_model.supports_batched_prefill()
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_with_sequence_id(input_ids, seq_id, caches, mask)
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model.forward_with_embeddings_and_sequence_id(
+            input_ids,
+            input_embeddings,
+            seq_id,
+            caches,
+            mask,
+        )
+    }
+
+    fn sync_sequence_storage(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        cache_pool: &mut mlxcel_core::cache::CachePool,
+    ) -> Result<(), String> {
+        self.text_model.sync_sequence_storage(seq_id, cache_pool)
+    }
+
+    fn forward_batched(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_batched(input_ids, batch_caches, mask)
+    }
+
+    fn forward_batched_with_context(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_batched_with_context(input_ids, batch_caches, mask, context)
+    }
+
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model.forward_batched_with_context_and_ids(
+            input_ids,
+            seq_ids,
+            batch_caches,
+            mask,
+            context,
+        )
+    }
 }
 
 #[cfg(test)]

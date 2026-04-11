@@ -289,6 +289,14 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, release_sequence_state(caches))
     }
 
+    fn prepare_sequence_state(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        delegate_language_model!(self, prepare_sequence_state(seq_id))
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        delegate_language_model!(self, release_sequence_state_by_id(seq_id))
+    }
+
     fn sequence_state_layout(&self) -> mlxcel_core::cache::SequenceStateLayout {
         delegate_language_model!(self, sequence_state_layout())
     }
@@ -324,6 +332,61 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(
             self,
             forward_batched_with_context(input_ids, batch_caches, mask, context)
+        )
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [mlxcel_core::layers::KVCache],
+        mask: Option<&mlxcel_core::MlxArray>,
+    ) -> UniquePtr<mlxcel_core::MlxArray> {
+        delegate_language_model!(
+            self,
+            forward_with_sequence_id(input_ids, seq_id, caches, mask)
+        )
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        input_embeddings: Option<&mlxcel_core::MlxArray>,
+        seq_id: Option<mlxcel_core::cache::SequenceId>,
+        caches: &mut [mlxcel_core::layers::KVCache],
+        mask: Option<&mlxcel_core::MlxArray>,
+    ) -> UniquePtr<mlxcel_core::MlxArray> {
+        delegate_language_model!(
+            self,
+            forward_with_embeddings_and_sequence_id(
+                input_ids,
+                input_embeddings,
+                seq_id,
+                caches,
+                mask
+            )
+        )
+    }
+
+    fn sync_sequence_storage(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        cache_pool: &mut mlxcel_core::cache::CachePool,
+    ) -> Result<(), String> {
+        delegate_language_model!(self, sync_sequence_storage(seq_id, cache_pool))
+    }
+
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &mlxcel_core::MlxArray,
+        seq_ids: Option<&[mlxcel_core::cache::SequenceId]>,
+        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
+        mask: Option<&mlxcel_core::MlxArray>,
+        context: Option<&mlxcel_core::generate::DecodeBatchContext>,
+    ) -> UniquePtr<mlxcel_core::MlxArray> {
+        delegate_language_model!(
+            self,
+            forward_batched_with_context_and_ids(input_ids, seq_ids, batch_caches, mask, context)
         )
     }
 

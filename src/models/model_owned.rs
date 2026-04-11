@@ -15,14 +15,13 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-use mlxcel_core::cache::PagedDecodeMetadata;
+use mlxcel_core::cache::{PagedDecodeMetadata, SequenceId};
 use mlxcel_core::generate::DecodeBatchContext;
-use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
 pub(crate) struct ModelOwnedSequenceState<T> {
     internal: RefCell<Vec<T>>,
-    sequences: RefCell<HashMap<usize, Vec<T>>>,
+    sequences: RefCell<HashMap<SequenceId, Vec<T>>>,
 }
 
 impl<T> ModelOwnedSequenceState<T> {
@@ -37,24 +36,46 @@ impl<T> ModelOwnedSequenceState<T> {
         *self.internal.borrow_mut() = internal;
     }
 
-    pub(crate) fn make_sequence_placeholders(&self, state: Vec<T>) -> Vec<KVCache> {
-        let caches: Vec<KVCache> = (0..state.len()).map(|_| KVCache::new()).collect();
-        self.sequences
-            .borrow_mut()
-            .insert(Self::cache_key(&caches), state);
-        caches
+    pub(crate) fn prepare_sequence_state(&self, seq_id: SequenceId, state: Vec<T>) {
+        self.sequences.borrow_mut().insert(seq_id, state);
+    }
+
+    pub(crate) fn replace_sequence_state(&self, seq_id: SequenceId, state: Vec<T>) {
+        self.sequences.borrow_mut().insert(seq_id, state);
     }
 
     pub(crate) fn with_sequence_state<R>(
         &self,
-        caches: &mut [KVCache],
+        seq_id: Option<SequenceId>,
         f: impl FnOnce(&mut [T]) -> R,
     ) -> R {
-        let key = Self::cache_key(caches);
-        let sequence_state = { self.sequences.borrow_mut().remove(&key) };
+        let sequence_state = seq_id.and_then(|id| self.sequences.borrow_mut().remove(&id));
         if let Some(mut sequence_state) = sequence_state {
             let result = f(&mut sequence_state);
-            self.sequences.borrow_mut().insert(key, sequence_state);
+            self.sequences
+                .borrow_mut()
+                .insert(seq_id.expect("sequence id must exist"), sequence_state);
+            return result;
+        }
+
+        let mut internal = self.internal.borrow_mut();
+        f(&mut internal)
+    }
+
+    pub(crate) fn with_or_create_sequence_state<R>(
+        &self,
+        seq_id: Option<SequenceId>,
+        init: impl FnOnce() -> Vec<T>,
+        f: impl FnOnce(&mut [T]) -> R,
+    ) -> R {
+        if let Some(seq_id) = seq_id {
+            let mut sequence_state = self
+                .sequences
+                .borrow_mut()
+                .remove(&seq_id)
+                .unwrap_or_else(init);
+            let result = f(&mut sequence_state);
+            self.sequences.borrow_mut().insert(seq_id, sequence_state);
             return result;
         }
 
@@ -64,19 +85,15 @@ impl<T> ModelOwnedSequenceState<T> {
 
     pub(crate) fn with_batched_sequence_states<R>(
         &self,
-        batch_caches: &mut [&mut [KVCache]],
+        seq_ids: &[SequenceId],
         f: impl FnOnce(&mut [Vec<T>]) -> R,
     ) -> Result<R, String> {
-        let keys: Vec<usize> = batch_caches
-            .iter()
-            .map(|caches| Self::cache_key(caches))
-            .collect();
-        let mut extracted = Vec::with_capacity(keys.len());
+        let mut extracted = Vec::with_capacity(seq_ids.len());
         {
             let mut sequences = self.sequences.borrow_mut();
-            for &key in &keys {
-                let state = sequences.remove(&key).ok_or_else(|| {
-                    format!("missing model-owned sequence state for cache key {key}")
+            for &seq_id in seq_ids {
+                let state = sequences.remove(&seq_id).ok_or_else(|| {
+                    format!("missing model-owned sequence state for sequence {seq_id}")
                 })?;
                 extracted.push(state);
             }
@@ -85,18 +102,14 @@ impl<T> ModelOwnedSequenceState<T> {
         let result = f(&mut extracted);
 
         let mut sequences = self.sequences.borrow_mut();
-        for (key, state) in keys.into_iter().zip(extracted.into_iter()) {
-            sequences.insert(key, state);
+        for (seq_id, state) in seq_ids.iter().copied().zip(extracted.into_iter()) {
+            sequences.insert(seq_id, state);
         }
         Ok(result)
     }
 
-    pub(crate) fn release_sequence_state(&self, caches: &mut [KVCache]) {
-        self.sequences.borrow_mut().remove(&Self::cache_key(caches));
-    }
-
-    pub(crate) fn cache_key(caches: &[KVCache]) -> usize {
-        caches.as_ptr() as usize
+    pub(crate) fn release_sequence_state(&self, seq_id: SequenceId) {
+        self.sequences.borrow_mut().remove(&seq_id);
     }
 }
 

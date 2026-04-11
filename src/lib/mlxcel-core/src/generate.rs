@@ -24,7 +24,7 @@
 //! - Shared sampling policy delegated to `crate::sampling`
 //! - Shared decode setup delegated to `crate::generation_policy`
 
-use crate::cache::KVCacheMode;
+use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxStream};
 use crate::generation_policy::{
@@ -202,6 +202,13 @@ pub trait LanguageModel {
     /// Used by: Qwen3.5 mixed-cache map cleanup, server batch scheduler
     fn release_sequence_state(&self, _caches: &mut [KVCache]) {}
 
+    /// Prepare model-owned/runtime sequence state before the scheduler starts
+    /// using this `SequenceId`.
+    fn prepare_sequence_state(&self, _seq_id: SequenceId) {}
+
+    /// Release model-owned/runtime sequence state by its scheduler `SequenceId`.
+    fn release_sequence_state_by_id(&self, _seq_id: SequenceId) {}
+
     /// Describe how one sequence's runtime state should be allocated.
     ///
     /// Phase 0 keeps the default behavior aligned with today's
@@ -272,6 +279,40 @@ pub trait LanguageModel {
         false
     }
 
+    /// Single-sequence forward with optional scheduler sequence identity.
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let _ = seq_id;
+        self.forward(input_ids, caches, mask)
+    }
+
+    /// Embedding-prefill forward with optional scheduler sequence identity.
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let _ = seq_id;
+        self.forward_with_embeddings(input_ids, input_embeddings, caches, mask)
+    }
+
+    /// Synchronize model-owned sequence storage into the runtime backend state.
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        cache_pool.sync_paged_state_with_dense(seq_id)
+    }
+
     /// Batched decode with explicit runtime context from the scheduler.
     ///
     /// This extends `forward_batched()` without forcing all model families to
@@ -289,6 +330,19 @@ pub trait LanguageModel {
     ) -> UniquePtr<MlxArray> {
         let _ = context;
         self.forward_batched(input_ids, batch_caches, mask)
+    }
+
+    /// Batched forward with optional scheduler sequence identities.
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let _ = seq_ids;
+        self.forward_batched_with_context(input_ids, batch_caches, mask, context)
     }
 
     /// Batched decode: process B sequences in one forward pass.

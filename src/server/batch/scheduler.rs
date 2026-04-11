@@ -144,6 +144,7 @@ pub struct BatchScheduler {
 
 impl BatchScheduler {
     fn release_sequence_caches(&mut self, seq_id: SequenceId) {
+        self.model.release_sequence_state_by_id(seq_id);
         if let Some(caches) = self.cache_pool.get_caches_mut(seq_id) {
             self.model.release_sequence_state(caches);
         }
@@ -310,8 +311,11 @@ impl BatchScheduler {
 
     fn allocate_sequence_state(&mut self) -> Result<SequenceId, String> {
         let layout_override = self.sequence_state_layout_override();
-        self.cache_pool
-            .allocate_with_layout(&self.model, layout_override)
+        let seq_id = self
+            .cache_pool
+            .allocate_with_layout(&self.model, layout_override)?;
+        self.model.prepare_sequence_state(seq_id);
+        Ok(seq_id)
     }
 
     fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
@@ -330,7 +334,10 @@ impl BatchScheduler {
     }
 
     fn sync_sequence_storage(&mut self, seq_id: SequenceId) {
-        if let Err(err) = self.cache_pool.sync_paged_state_with_dense(seq_id) {
+        if let Err(err) = self
+            .model
+            .sync_sequence_storage(seq_id, &mut self.cache_pool)
+        {
             tracing::warn!("Failed to sync paged state for {seq_id}: {err}");
         }
     }
@@ -727,9 +734,13 @@ impl BatchScheduler {
         }
 
         // Single batched forward pass: [B, padded_len] → [B, padded_len, vocab]
-        let raw_logits =
-            self.model
-                .forward_batched(&input, &mut batch_caches, stacked_mask.as_deref());
+        let raw_logits = self.model.forward_batched_with_context_and_ids(
+            &input,
+            Some(&batch_ids),
+            &mut batch_caches,
+            stacked_mask.as_deref(),
+            None,
+        );
 
         mlxcel_core::eval(&raw_logits);
         mlxcel_core::clear_memory_cache();
@@ -837,9 +848,10 @@ impl BatchScheduler {
                         // is used only when the caller does not provide one.
                         let effective_mask =
                             caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
-                        let logits = self.model.forward_with_embeddings(
+                        let logits = self.model.forward_with_embeddings_and_sequence_id(
                             &input,
                             Some(input_embeds),
+                            Some(seq.seq_id),
                             caches,
                             effective_mask,
                         );
@@ -853,8 +865,9 @@ impl BatchScheduler {
                     }
                 }
             } else {
-                self.model.forward(
+                self.model.forward_with_sequence_id(
                     &input,
+                    Some(seq.seq_id),
                     caches,
                     pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
                 )
@@ -945,9 +958,10 @@ impl BatchScheduler {
                     Ok((input_embeds, caller_mask)) => {
                         let effective_mask =
                             caller_mask.or(pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()));
-                        let logits = self.model.forward_with_embeddings(
+                        let logits = self.model.forward_with_embeddings_and_sequence_id(
                             &input,
                             Some(input_embeds),
+                            Some(seq.seq_id),
                             caches,
                             effective_mask,
                         );
@@ -960,8 +974,9 @@ impl BatchScheduler {
                     }
                 }
             } else {
-                let logits = self.model.forward(
+                let logits = self.model.forward_with_sequence_id(
                     &input,
+                    Some(seq.seq_id),
                     caches,
                     pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
                 );
@@ -1062,8 +1077,9 @@ impl BatchScheduler {
                 }
             };
 
-            let logits = self.model.forward(
+            let logits = self.model.forward_with_sequence_id(
                 &input,
+                Some(seq.seq_id),
                 caches,
                 pad_mask_opt.as_ref().map(|m| m.as_ref().unwrap()),
             );
@@ -1363,8 +1379,9 @@ impl BatchScheduler {
                 use_native_paged_kernel: true,
             },
         };
-        let logits = self.model.forward_batched_with_context(
+        let logits = self.model.forward_batched_with_context_and_ids(
             &input,
+            Some(seq_ids),
             &mut batch_caches,
             None,
             Some(&decode_context),
@@ -1471,7 +1488,8 @@ impl BatchScheduler {
                     return;
                 }
             };
-            self.model.forward(&input, caches, None)
+            self.model
+                .forward_with_sequence_id(&input, Some(seq_id), caches, None)
         };
         self.sync_sequence_storage(seq_id);
 
