@@ -264,6 +264,16 @@ pub trait LanguageModel {
         true
     }
 
+    /// Whether the server batch scheduler may use the paged decode backend
+    /// for this model family.
+    ///
+    /// This is stricter than `supports_batching()`: a model can participate in
+    /// batched decode while still opting out of paged decode until its
+    /// attention path, cache semantics, and operational validation are ready.
+    fn supports_paged_decode_backend(&self) -> bool {
+        false
+    }
+
     /// Whether this model supports full-sequence batched prefill.
     ///
     /// This is stricter than decode batching. A model may support

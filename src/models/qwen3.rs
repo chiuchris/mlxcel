@@ -788,4 +788,8 @@ impl LanguageModel for Qwen3Model {
     fn supports_maskless_padded_prefill(&self) -> bool {
         true
     }
+
+    fn supports_paged_decode_backend(&self) -> bool {
+        true
+    }
 }

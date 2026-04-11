@@ -111,6 +111,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             String::new()
         };
         let decode_storage_info = match sched_config.decode_storage_backend {
+            crate::server::DecodeStorageBackend::Auto => ", decode_storage=auto".to_string(),
             crate::server::DecodeStorageBackend::Dense => String::new(),
             crate::server::DecodeStorageBackend::Paged => ", decode_storage=paged".to_string(),
         };

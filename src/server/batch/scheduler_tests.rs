@@ -671,15 +671,35 @@ fn merged_eos_deduplicates_overlapping_tokens() {
 #[test]
 fn paged_decode_storage_falls_back_when_batching_is_unavailable() {
     assert_eq!(
-        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, false),
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, false, true),
         DecodeStorageBackend::Dense
     );
     assert_eq!(
-        effective_decode_storage_backend(DecodeStorageBackend::Paged, 1, true),
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 1, true, true),
         DecodeStorageBackend::Dense
     );
     assert_eq!(
-        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, true),
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, true, false),
+        DecodeStorageBackend::Dense
+    );
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Paged, 4, true, true),
         DecodeStorageBackend::Paged
+    );
+}
+
+#[test]
+fn auto_decode_storage_prefers_paged_only_for_supported_workers() {
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Auto, 4, true, true),
+        DecodeStorageBackend::Paged
+    );
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Auto, 4, true, false),
+        DecodeStorageBackend::Dense
+    );
+    assert_eq!(
+        effective_decode_storage_backend(DecodeStorageBackend::Auto, 1, true, true),
+        DecodeStorageBackend::Dense
     );
 }

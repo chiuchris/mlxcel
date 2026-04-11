@@ -28,8 +28,10 @@ use mlxcel_core::sampling::LogprobsConfig;
 /// Storage backend used by the server batch scheduler for decode-time state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DecodeStorageBackend {
-    /// Existing dense per-sequence KV caches.
+    /// Select paged decode automatically for workers that support it.
     #[default]
+    Auto,
+    /// Existing dense per-sequence KV caches.
     Dense,
     /// Paged block-table state mirrored alongside dense compatibility caches.
     Paged,
@@ -40,10 +42,11 @@ impl std::str::FromStr for DecodeStorageBackend {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "" | "dense" => Ok(Self::Dense),
+            "" | "auto" => Ok(Self::Auto),
+            "dense" => Ok(Self::Dense),
             "paged" => Ok(Self::Paged),
             other => Err(format!(
-                "unknown decode storage backend \"{other}\"; expected \"dense\" or \"paged\""
+                "unknown decode storage backend \"{other}\"; expected \"auto\", \"dense\", or \"paged\""
             )),
         }
     }
@@ -171,7 +174,7 @@ impl Default for ServerConfig {
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,
             max_batch_prefill: 1,
-            decode_storage_backend: DecodeStorageBackend::Dense,
+            decode_storage_backend: DecodeStorageBackend::Auto,
             tensor_parallel: ShardConfig::default(),
         }
     }

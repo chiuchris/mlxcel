@@ -263,12 +263,12 @@ fn resolve_decode_storage_backend() -> crate::server::DecodeStorageBackend {
             Ok(backend) => backend,
             Err(err) => {
                 tracing::warn!(
-                    "{err}; falling back to dense decode storage (set MLXCEL_SERVER_DECODE_STORAGE=dense|paged)"
+                    "{err}; falling back to automatic decode storage selection (set MLXCEL_SERVER_DECODE_STORAGE=auto|dense|paged)"
                 );
-                crate::server::DecodeStorageBackend::Dense
+                crate::server::DecodeStorageBackend::Auto
             }
         },
-        Err(_) => crate::server::DecodeStorageBackend::Dense,
+        Err(_) => crate::server::DecodeStorageBackend::Auto,
     }
 }
 

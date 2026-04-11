@@ -16,7 +16,7 @@ use std::path::PathBuf;
 
 use super::{
     ServerStartupConfig, build_server_config, resolve_api_key, resolve_chat_template,
-    resolve_default_max_tokens, resolve_dry_penalty_last_n,
+    resolve_decode_storage_backend, resolve_default_max_tokens, resolve_dry_penalty_last_n,
     resolve_tensor_parallel_runtime_support, validate_tensor_parallel_startup,
 };
 use crate::server::DecodeStorageBackend;
@@ -180,7 +180,11 @@ fn build_server_config_preserves_batch_scheduler_for_tensor_parallel() {
 }
 
 #[test]
-fn decode_storage_backend_parses_dense_and_paged() {
+fn decode_storage_backend_parses_auto_dense_and_paged() {
+    assert_eq!(
+        "auto".parse::<DecodeStorageBackend>().unwrap(),
+        DecodeStorageBackend::Auto
+    );
     assert_eq!(
         "dense".parse::<DecodeStorageBackend>().unwrap(),
         DecodeStorageBackend::Dense
@@ -190,6 +194,22 @@ fn decode_storage_backend_parses_dense_and_paged() {
         DecodeStorageBackend::Paged
     );
     assert!("unknown".parse::<DecodeStorageBackend>().is_err());
+}
+
+#[test]
+fn resolve_decode_storage_backend_defaults_to_auto() {
+    let key = "MLXCEL_SERVER_DECODE_STORAGE";
+    let prev = std::env::var_os(key);
+    unsafe { std::env::remove_var(key) };
+
+    let resolved = resolve_decode_storage_backend();
+
+    match prev {
+        Some(value) => unsafe { std::env::set_var(key, value) },
+        None => unsafe { std::env::remove_var(key) },
+    }
+
+    assert_eq!(resolved, DecodeStorageBackend::Auto);
 }
 
 #[test]
