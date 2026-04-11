@@ -287,6 +287,10 @@ impl LanguageModel for VisionLanguageModel {
         self.text_model.supports_batching()
     }
 
+    fn supports_paged_decode_backend(&self) -> bool {
+        self.text_model.supports_paged_decode_backend()
+    }
+
     fn supports_batched_prefill(&self) -> bool {
         self.text_model.supports_batched_prefill()
     }

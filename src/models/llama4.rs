@@ -1530,6 +1530,10 @@ impl LanguageModel for Llama4Wrapper {
         true
     }
 
+    fn supports_paged_decode_backend(&self) -> bool {
+        true
+    }
+
     fn prepare_sequence_state(&self, seq_id: SequenceId) {
         self.sequence_state
             .prepare_sequence_state(seq_id, self.model.make_llama4_caches());

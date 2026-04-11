@@ -313,6 +313,10 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, supports_batching())
     }
 
+    fn supports_paged_decode_backend(&self) -> bool {
+        delegate_language_model!(self, supports_paged_decode_backend())
+    }
+
     fn forward_batched(
         &self,
         input_ids: &mlxcel_core::MlxArray,

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::ServerConfig;
+use super::{DecodeStorageBackend, ServerConfig};
 
 #[test]
 fn server_config_default_matches_llama_server_compatibility_defaults() {
@@ -39,4 +39,5 @@ fn server_config_default_matches_llama_server_compatibility_defaults() {
     assert_eq!(config.max_batch_size, 1);
     assert_eq!(config.max_queue_depth, 1024);
     assert!(!config.no_batch);
+    assert_eq!(config.decode_storage_backend, DecodeStorageBackend::Auto);
 }

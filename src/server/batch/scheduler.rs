@@ -77,11 +77,15 @@ fn effective_decode_storage_backend(
     requested: DecodeStorageBackend,
     max_batch_size: usize,
     supports_batching: bool,
+    supports_paged_decode_backend: bool,
 ) -> DecodeStorageBackend {
-    if requested == DecodeStorageBackend::Paged && (max_batch_size <= 1 || !supports_batching) {
-        DecodeStorageBackend::Dense
-    } else {
-        requested
+    let paged_available = max_batch_size > 1 && supports_batching && supports_paged_decode_backend;
+    match requested {
+        DecodeStorageBackend::Auto | DecodeStorageBackend::Paged if paged_available => {
+            DecodeStorageBackend::Paged
+        }
+        DecodeStorageBackend::Auto | DecodeStorageBackend::Paged => DecodeStorageBackend::Dense,
+        DecodeStorageBackend::Dense => DecodeStorageBackend::Dense,
     }
 }
 
@@ -208,13 +212,16 @@ impl BatchScheduler {
             decode_storage_backend,
             max_batch_size,
             model.supports_batching(),
+            model.supports_paged_decode_backend(),
         );
-        if effective_decode_storage != decode_storage_backend {
+        if decode_storage_backend == DecodeStorageBackend::Paged
+            && effective_decode_storage != decode_storage_backend
+        {
             tracing::info!(
                 "Paged decode storage requested but unavailable for this worker; falling back to dense"
             );
             batch_observability.record_decode_storage_fallback();
-        };
+        }
         // Non-batching models use lightweight placeholder entries in the pool
         // (no real KV caches), so we size the pool to cover both the active
         // batch and the prefill queue so requests can be queued while another
@@ -1377,7 +1384,14 @@ impl BatchScheduler {
         };
 
         let decode_context = match self.decode_storage_backend {
-            DecodeStorageBackend::Dense => DecodeBatchContext::dense(),
+            DecodeStorageBackend::Auto | DecodeStorageBackend::Dense => {
+                debug_assert_ne!(
+                    self.decode_storage_backend,
+                    DecodeStorageBackend::Auto,
+                    "scheduler should normalize decode storage backend before decode dispatch"
+                );
+                DecodeBatchContext::dense()
+            }
             DecodeStorageBackend::Paged => DecodeBatchContext {
                 storage_backend: CoreDecodeStorageBackend::Paged,
                 paged_block_size: DEFAULT_PAGED_BLOCK_SIZE as i32,

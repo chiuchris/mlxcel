@@ -851,4 +851,8 @@ impl LanguageModel for Llama3Model {
     fn supports_maskless_padded_prefill(&self) -> bool {
         true
     }
+
+    fn supports_paged_decode_backend(&self) -> bool {
+        true
+    }
 }
