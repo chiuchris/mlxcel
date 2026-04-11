@@ -19,6 +19,7 @@
 mod detection;
 mod gemma3n_helpers;
 mod llama4_helpers;
+mod model_owned;
 mod sanitize;
 
 // Shared modules

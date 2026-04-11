@@ -24,6 +24,10 @@
 //! - clip_residual_f16 for float16 safety
 //! - Embedding scaling: h *= sqrt(hidden_size)
 
+use crate::models::model_owned::{
+    ModelOwnedSequenceState, dispatch_paged_decode_from_visible_caches,
+};
+use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
 };
@@ -175,6 +179,118 @@ impl Attention {
         let attn_out = mlxcel_core::reshape(&attn_out, &[b, l, self.num_heads * self.head_dim]);
 
         // Output projection
+        self.o_proj.forward(&attn_out)
+    }
+
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut Cache],
+        decode_context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(x);
+        let batch = shape[0] as usize;
+        let seq_len = shape[1];
+
+        let (q, k, v) = self.qkv_proj.forward(x);
+
+        let q = mlxcel_core::reshape(&q, &[shape[0], seq_len, self.num_heads, self.head_dim]);
+        let k = mlxcel_core::reshape(&k, &[shape[0], seq_len, self.num_kv_heads, self.head_dim]);
+        let v = mlxcel_core::reshape(&v, &[shape[0], seq_len, self.num_kv_heads, self.head_dim]);
+
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        let q = self.q_norm.forward(&q);
+        let k = self.k_norm.forward(&k);
+
+        let offsets: Vec<i32> = caches.iter().map(|cache| cache.offset()).collect();
+        let q = mlxcel_core::fast_rope_batched(
+            &q,
+            self.head_dim,
+            false,
+            self.rope_base,
+            1.0,
+            &offsets,
+        );
+        let k = mlxcel_core::fast_rope_batched(
+            &k,
+            self.head_dim,
+            false,
+            self.rope_base,
+            1.0,
+            &offsets,
+        );
+
+        if let Some(context) = decode_context {
+            if let Some(attn_out) = dispatch_paged_decode_from_visible_caches(
+                &q,
+                &k,
+                &v,
+                caches,
+                self.scale,
+                context,
+                |cache, k_i, v_i| Ok(cache.update_and_fetch(k_i, v_i)),
+            )
+            .expect("valid gemma3 paged decode inputs")
+            {
+                tracing::debug!(
+                    batch_size = batch,
+                    block_size = context.paged_block_size,
+                    native_kernel = context.use_native_paged_kernel,
+                    sliding = self.is_sliding,
+                    "Gemma3 paged decode attention dispatch"
+                );
+                let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+                let attn_out = mlxcel_core::reshape(
+                    &attn_out,
+                    &[batch as i32, seq_len, self.num_heads * self.head_dim],
+                );
+                return self.o_proj.forward(&attn_out);
+            }
+        }
+
+        let mut outputs = Vec::with_capacity(batch);
+        for (batch_idx, cache) in caches.iter_mut().enumerate() {
+            let q_i = mlxcel_core::slice(
+                &q,
+                &[batch_idx as i32, 0, 0, 0],
+                &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+            );
+            let k_i = mlxcel_core::slice(
+                &k,
+                &[batch_idx as i32, 0, 0, 0],
+                &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+            );
+            let v_i = mlxcel_core::slice(
+                &v,
+                &[batch_idx as i32, 0, 0, 0],
+                &[batch_idx as i32 + 1, i32::MAX, i32::MAX, i32::MAX],
+            );
+            let (cache_k, cache_v) = cache.update_and_fetch(k_i, v_i);
+            outputs.push(unsafe {
+                mlxcel_core::layers::attention_from_ptr(
+                    &q_i,
+                    &cache_k,
+                    &cache_v,
+                    self.scale,
+                    std::ptr::null(),
+                    0.0,
+                    self.window_size,
+                )
+            });
+        }
+
+        let mut attn_out = outputs.remove(0);
+        for output in outputs {
+            attn_out = mlxcel_core::concatenate(&attn_out, &output, 0);
+        }
+        let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = mlxcel_core::reshape(
+            &attn_out,
+            &[batch as i32, seq_len, self.num_heads * self.head_dim],
+        );
         self.o_proj.forward(&attn_out)
     }
 
@@ -356,6 +472,25 @@ impl TransformerBlock {
         mlxcel_core::compiled_clip_residual(&h, &post_ff_normed)
     }
 
+    fn forward_batched_decode(
+        &self,
+        x: &MlxArray,
+        caches: &mut [&mut Cache],
+        decode_context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+        let attn_out = self
+            .self_attn
+            .forward_batched_decode(&normed, caches, decode_context);
+        let post_attn_normed = self.post_attention_layernorm.forward(&attn_out);
+        let h = mlxcel_core::compiled_clip_residual(x, &post_attn_normed);
+
+        let normed = self.pre_feedforward_layernorm.forward(&h);
+        let ff_out = self.mlp.forward(&normed);
+        let post_ff_normed = self.post_feedforward_layernorm.forward(&ff_out);
+        mlxcel_core::compiled_clip_residual(&h, &post_ff_normed)
+    }
+
     pub fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
@@ -446,6 +581,24 @@ impl Cache {
         match self {
             Cache::Standard(c) => c,
             Cache::Rotating(c) => c,
+        }
+    }
+
+    fn offset(&self) -> i32 {
+        match self {
+            Cache::Standard(c) => c.offset,
+            Cache::Rotating(c) => c.offset,
+        }
+    }
+
+    fn update_and_fetch(
+        &mut self,
+        k: UniquePtr<MlxArray>,
+        v: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        match self {
+            Cache::Standard(c) => c.update_and_fetch(k, v),
+            Cache::Rotating(c) => c.update_and_fetch(k, v),
         }
     }
 }
@@ -580,6 +733,30 @@ impl Gemma3Model {
             .collect()
     }
 
+    fn forward_batched_decode_with_caches(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [Vec<Cache>],
+        decode_context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let mut h = self.embed_tokens.forward(input_ids);
+        let scale = (self.hidden_size as f32).sqrt();
+        h = mlxcel_core::multiply_scalar(&h, scale);
+
+        let n = self.layers.len();
+        for (layer_idx, layer) in self.layers.iter().enumerate() {
+            let mut layer_caches: Vec<&mut Cache> = batch_caches
+                .iter_mut()
+                .map(|caches| &mut caches[layer_idx])
+                .collect();
+            h = layer.forward_batched_decode(&h, &mut layer_caches, decode_context);
+            pipeline_hint(&h, layer_idx, n);
+        }
+
+        let h = self.norm.forward(&h);
+        self.lm_head.forward(&h)
+    }
+
     /// Load model from directory
     pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, ModelArgs), String> {
         let model_dir = model_dir.as_ref();
@@ -643,14 +820,11 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .ok_or_else(|| format!("Weight not found: {}", name))
 }
 
-// LanguageModel trait implementation.
-use std::cell::RefCell;
-
 /// Wrapper for Gemma3Model that implements LanguageModel trait
 /// Uses internal cache management for sliding window attention
 pub struct Gemma3Wrapper {
     model: Gemma3Model,
-    caches: RefCell<Vec<Cache>>,
+    sequence_state: ModelOwnedSequenceState<Cache>,
 }
 
 impl Gemma3Wrapper {
@@ -658,13 +832,12 @@ impl Gemma3Wrapper {
         let caches = model.make_caches();
         Self {
             model,
-            caches: RefCell::new(caches),
+            sequence_state: ModelOwnedSequenceState::new(caches),
         }
     }
 
     pub fn reset_caches(&self) {
-        let caches = self.model.make_caches();
-        *self.caches.borrow_mut() = caches;
+        self.sequence_state.replace_internal(self.model.make_caches());
     }
 }
 
@@ -672,27 +845,30 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
     fn forward(
         &self,
         input_ids: &MlxArray,
-        _caches: &mut [mlxcel_core::layers::KVCache],
+        caches: &mut [mlxcel_core::layers::KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches(input_ids, &mut caches)
+        self.sequence_state
+            .with_sequence_state(caches, |sequence_caches| {
+                self.model.forward_with_caches(input_ids, sequence_caches)
+            })
     }
 
     fn forward_with_embeddings(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        _caches: &mut [mlxcel_core::layers::KVCache],
+        caches: &mut [mlxcel_core::layers::KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches_and_embeddings(
-            input_ids,
-            input_embeddings,
-            &mut caches,
-            mask,
-        )
+        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
+            self.model.forward_with_caches_and_embeddings(
+                input_ids,
+                input_embeddings,
+                sequence_caches,
+                mask,
+            )
+        })
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
@@ -705,12 +881,8 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
     }
 
     fn make_caches(&self) -> Vec<mlxcel_core::layers::KVCache> {
-        // Reset internal caches
-        self.reset_caches();
-        // Return dummy caches (won't be used - internal caches are used instead)
-        (0..self.model.layers.len())
-            .map(|_| mlxcel_core::layers::KVCache::new())
-            .collect()
+        self.sequence_state
+            .make_sequence_placeholders(self.model.make_caches())
     }
 
     fn num_layers(&self) -> usize {
@@ -718,7 +890,42 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
     }
 
     fn supports_batching(&self) -> bool {
-        false // Gemma3 uses internal RefCell mixed caches (KV + Rotating), not compatible with per-sequence KV isolation
+        true
+    }
+
+    fn release_sequence_state(&self, caches: &mut [mlxcel_core::layers::KVCache]) {
+        self.sequence_state.release_sequence_state(caches)
+    }
+
+    fn forward_batched_with_context(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        if shape[1] != 1 || mask.is_some() {
+            let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
+            let mut result = self.forward(&input_0, batch_caches[0], mask);
+            for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+                let input_i = mlxcel_core::slice(
+                    input_ids,
+                    &[batch_idx as i32, 0],
+                    &[batch_idx as i32 + 1, shape[1]],
+                );
+                let logits_i = self.forward(&input_i, caches, mask);
+                result = mlxcel_core::concatenate(&result, &logits_i, 0);
+            }
+            return result;
+        }
+
+        self.sequence_state
+            .with_batched_sequence_states(batch_caches, |sequence_caches| {
+                self.model
+                    .forward_batched_decode_with_caches(input_ids, sequence_caches, context)
+            })
+            .expect("gemma3 batched decode requires sequence-local cache state")
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

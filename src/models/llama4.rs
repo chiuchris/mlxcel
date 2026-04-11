@@ -20,7 +20,8 @@
 use crate::models::llama4_helpers::{
     create_chunked_attention_mask, get_weight_copy, load_quantized_linear,
 };
-use mlxcel_core::generate::LanguageModel;
+use crate::models::model_owned::ModelOwnedSequenceState;
+use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
 use mlxcel_core::layers::{ChunkedKVCache, KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
@@ -1444,14 +1445,11 @@ impl LanguageModel for Llama4CxxModel {
     }
 }
 
-// Llama4Wrapper - Wrapper for iGQA with internal cache management.
-use std::cell::RefCell;
-
 /// Wrapper for Llama4CxxModel that implements LanguageModel trait
 /// Uses internal Llama4Cache management for iGQA (interleaved GQA) attention pattern
 pub struct Llama4Wrapper {
     model: Llama4CxxModel,
-    caches: RefCell<Vec<Llama4Cache>>,
+    sequence_state: ModelOwnedSequenceState<Llama4Cache>,
 }
 
 impl Llama4Wrapper {
@@ -1459,13 +1457,13 @@ impl Llama4Wrapper {
         let caches = model.make_llama4_caches();
         Self {
             model,
-            caches: RefCell::new(caches),
+            sequence_state: ModelOwnedSequenceState::new(caches),
         }
     }
 
     pub fn reset_caches(&self) {
-        let caches = self.model.make_llama4_caches();
-        *self.caches.borrow_mut() = caches;
+        self.sequence_state
+            .replace_internal(self.model.make_llama4_caches());
     }
 }
 
@@ -1473,23 +1471,29 @@ impl LanguageModel for Llama4Wrapper {
     fn forward(
         &self,
         input_ids: &MlxArray,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_igqa(input_ids, &mut caches, None)
+        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
+            self.model.forward_igqa(input_ids, sequence_caches, None)
+        })
     }
 
     fn forward_with_embeddings(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
-        _caches: &mut [KVCache],
+        caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model
-            .forward_igqa_with_embeddings(input_ids, input_embeddings, &mut caches, None)
+        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
+            self.model.forward_igqa_with_embeddings(
+                input_ids,
+                input_embeddings,
+                sequence_caches,
+                None,
+            )
+        })
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
@@ -1497,12 +1501,8 @@ impl LanguageModel for Llama4Wrapper {
     }
 
     fn make_caches(&self) -> Vec<KVCache> {
-        // Reset internal caches
-        self.reset_caches();
-        // Return dummy caches (won't be used - internal Llama4Cache is used instead)
-        (0..self.model.layers.len())
-            .map(|_| KVCache::new())
-            .collect()
+        self.sequence_state
+            .make_sequence_placeholders(self.model.make_llama4_caches())
     }
 
     fn num_layers(&self) -> usize {
@@ -1510,15 +1510,38 @@ impl LanguageModel for Llama4Wrapper {
     }
 
     fn supports_batching(&self) -> bool {
-        // Llama4 uses internal RefCell<Vec<Llama4Cache>>, which combines
-        // ChunkedKVCache and KVCache in an interleaved pattern and is not
-        // compatible with the per-sequence KV isolation required for batching.
-        //
-        // As a consequence, the array-valued offset issue present in Python
-        // mlx-vlm's BatchKVCache (where `cache.offset` is an `mx.array`
-        // requiring `.max().item()` before use in `mx.arange`) cannot arise
-        // in this Rust implementation. All offset values are plain `i32`.
-        false
+        true
+    }
+
+    fn release_sequence_state(&self, caches: &mut [KVCache]) {
+        self.sequence_state.release_sequence_state(caches)
+    }
+
+    fn forward_batched_with_context(
+        &self,
+        input_ids: &MlxArray,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        _context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(input_ids);
+        tracing::debug!(
+            batch_size = batch_caches.len(),
+            seq_len = shape[1],
+            "Llama4 model-owned batched decode compatibility dispatch"
+        );
+        let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
+        let mut result = self.forward(&input_0, batch_caches[0], mask);
+        for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
+            let input_i = mlxcel_core::slice(
+                input_ids,
+                &[batch_idx as i32, 0],
+                &[batch_idx as i32 + 1, shape[1]],
+            );
+            let logits_i = self.forward(&input_i, caches, mask);
+            result = mlxcel_core::concatenate(&result, &logits_i, 0);
+        }
+        result
     }
 
     fn eos_token_ids(&self) -> Vec<i32> {

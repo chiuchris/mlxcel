@@ -1089,17 +1089,21 @@ impl PagedDecodeMetadata {
         metadata: &BatchedAttentionMetadata,
         block_size: i32,
     ) -> Result<Self, String> {
+        Self::from_visible_lengths(&metadata.kv_lens, block_size)
+    }
+
+    pub fn from_visible_lengths(kv_lens: &[i32], block_size: i32) -> Result<Self, String> {
         if block_size <= 0 {
             return Err(format!(
                 "paged decode metadata requires block_size > 0, got {block_size}"
             ));
         }
 
-        let mut block_table_offsets = Vec::with_capacity(metadata.kv_lens.len() + 1);
+        let mut block_table_offsets = Vec::with_capacity(kv_lens.len() + 1);
         let mut block_tables = Vec::new();
         block_table_offsets.push(0);
 
-        for &kv_len in &metadata.kv_lens {
+        for &kv_len in kv_lens {
             if kv_len < 0 {
                 return Err(format!(
                     "paged decode metadata requires non-negative kv lengths, got {kv_len}"
@@ -1119,7 +1123,7 @@ impl PagedDecodeMetadata {
 
         Ok(Self {
             block_size,
-            kv_lens: metadata.kv_lens.clone(),
+            kv_lens: kv_lens.to_vec(),
             block_table_offsets,
             block_tables,
         })
