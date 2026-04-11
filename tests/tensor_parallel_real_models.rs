@@ -84,14 +84,21 @@ fn assert_tp_matches_single_rank_stepwise(
     let prefill_shape = mlxcel_core::array_shape(&full_prefill);
     let seq_len = prefill_shape[1];
     let vocab_size = prefill_shape[2];
-    let full_prefill_last =
-        mlxcel_core::slice(&full_prefill, &[0, seq_len - 1, 0], &[1, seq_len, vocab_size]);
+    let full_prefill_last = mlxcel_core::slice(
+        &full_prefill,
+        &[0, seq_len - 1, 0],
+        &[1, seq_len, vocab_size],
+    );
     let tp_prefill_last =
         mlxcel_core::slice(&tp_prefill, &[0, seq_len - 1, 0], &[1, seq_len, vocab_size]);
 
     let atol = 1e-4f32;
-    let prefill_close =
-        mlxcel_core::allclose(&full_prefill_last, &tp_prefill_last, atol as f64, atol as f64);
+    let prefill_close = mlxcel_core::allclose(
+        &full_prefill_last,
+        &tp_prefill_last,
+        atol as f64,
+        atol as f64,
+    );
     let decode_close = mlxcel_core::allclose(&full_decode, &tp_decode, atol as f64, atol as f64);
     let mut prefill_ok = mlxcel_core::item_bool(&prefill_close);
     if !prefill_ok {

@@ -20,13 +20,15 @@ use mlxcel_core::weights::WeightMap;
 
 use super::{
     TensorParallelErnie45Model, TensorParallelGemma3Model, TensorParallelGemma4Model,
-    TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel, TensorParallelQwen3Model, TensorParallelQwen35Model,
-    local_llama_args, logical_weight_name, validate_supported_runtime,
+    TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel, TensorParallelQwen3Model,
+    TensorParallelQwen35Model, local_llama_args, logical_weight_name, validate_supported_runtime,
 };
 use crate::distributed::tensor_parallel::{ShardConfig, generate_shard_plan};
 use crate::models::ernie4_5::{Ernie45Model, ModelArgs as Ernie45ModelArgs};
 use crate::models::gemma3::{Gemma3Wrapper, ModelArgs as Gemma3ModelArgs};
-use crate::models::gemma4::{Gemma4Wrapper, ModelArgs as Gemma4ModelArgs, RopeParameters as Gemma4RopeParameters};
+use crate::models::gemma4::{
+    Gemma4Wrapper, ModelArgs as Gemma4ModelArgs, RopeParameters as Gemma4RopeParameters,
+};
 use crate::models::hunyuan_v1_dense::{HunyuanV1DenseModel, ModelArgs as HunyuanV1DenseModelArgs};
 use crate::models::llama3::{Llama3Model, ModelArgs as LlamaModelArgs};
 use crate::models::qwen2::Qwen2Model;
@@ -1533,8 +1535,12 @@ fn tensor_parallel_gemma4_matches_full_model_logits() {
     let weights = make_test_gemma4_weight_map();
     let full =
         Gemma4Wrapper::new(crate::models::Gemma4Model::from_weights(&weights, &args).unwrap());
-    let plan = generate_shard_plan("gemma4", args.text_args().num_hidden_layers, &ShardConfig::with_tp_size(2))
-        .unwrap();
+    let plan = generate_shard_plan(
+        "gemma4",
+        args.text_args().num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
     let tp = TensorParallelGemma4Model::from_full_weights(&args, &weights, &plan).unwrap();
 
     let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);

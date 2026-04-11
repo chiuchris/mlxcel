@@ -146,12 +146,12 @@ pub use tensor_parallel::{
     TPBenchmarkResult, TensorParallelErnie45Model, TensorParallelGemma3Model,
     TensorParallelGemma4Model, TensorParallelHunyuanV1DenseModel, TensorParallelLlamaModel,
     TensorParallelPlanSummary, TensorParallelQwen3Model, TensorParallelQwen35Model,
-    TensorParallelRuntimeKind, TensorParallelRuntimeSupport, all_gather, all_reduce_sum, compute_byte_ranges,
-    compute_shard_spec, compute_sharded_shape, dtype_byte_size, ensure_single_rank_runtime,
-    format_tp_benchmark_report, generate_shard_plan, reduce_scatter, resolve_model_shard_plan,
-    ring_allreduce_data_volume, run_crossover_analysis, run_lockstep_benchmark,
-    run_scaling_analysis, run_tp_benchmark, shard_config_from_cli, shard_tensor_data,
-    validate_sharded_memory, validate_supported_runtime,
+    TensorParallelRuntimeKind, TensorParallelRuntimeSupport, all_gather, all_reduce_sum,
+    compute_byte_ranges, compute_shard_spec, compute_sharded_shape, dtype_byte_size,
+    ensure_single_rank_runtime, format_tp_benchmark_report, generate_shard_plan, reduce_scatter,
+    resolve_model_shard_plan, ring_allreduce_data_volume, run_crossover_analysis,
+    run_lockstep_benchmark, run_scaling_analysis, run_tp_benchmark, shard_config_from_cli,
+    shard_tensor_data, validate_sharded_memory, validate_supported_runtime,
 };
 pub use tensor_protocol::{
     PROTOCOL_VERSION, QuantizationMode, TensorDtype, TensorFlags, TensorHeader, TensorKind,

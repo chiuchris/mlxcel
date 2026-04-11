@@ -27,6 +27,7 @@
 use crate::models::model_owned::{
     ModelOwnedSequenceState, dispatch_paged_decode_from_visible_caches,
 };
+use mlxcel_core::cache::{CachePool, SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::{
     FusedQKVLinear, GemmaRMSNorm, KVCache, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
@@ -206,22 +207,10 @@ impl Attention {
         let k = self.k_norm.forward(&k);
 
         let offsets: Vec<i32> = caches.iter().map(|cache| cache.offset()).collect();
-        let q = mlxcel_core::fast_rope_batched(
-            &q,
-            self.head_dim,
-            false,
-            self.rope_base,
-            1.0,
-            &offsets,
-        );
-        let k = mlxcel_core::fast_rope_batched(
-            &k,
-            self.head_dim,
-            false,
-            self.rope_base,
-            1.0,
-            &offsets,
-        );
+        let q =
+            mlxcel_core::fast_rope_batched(&q, self.head_dim, false, self.rope_base, 1.0, &offsets);
+        let k =
+            mlxcel_core::fast_rope_batched(&k, self.head_dim, false, self.rope_base, 1.0, &offsets);
 
         if let Some(context) = decode_context {
             if let Some(attn_out) = dispatch_paged_decode_from_visible_caches(
@@ -601,6 +590,13 @@ impl Cache {
             Cache::Rotating(c) => c.update_and_fetch(k, v),
         }
     }
+
+    fn visible_len(&self) -> usize {
+        match self {
+            Cache::Standard(c) => c.seq_len().max(0) as usize,
+            Cache::Rotating(c) => c.seq_len().max(0) as usize,
+        }
+    }
 }
 
 // Gemma3 Model.
@@ -837,7 +833,8 @@ impl Gemma3Wrapper {
     }
 
     pub fn reset_caches(&self) {
-        self.sequence_state.replace_internal(self.model.make_caches());
+        self.sequence_state
+            .replace_internal(self.model.make_caches());
     }
 }
 
@@ -848,10 +845,7 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
         caches: &mut [mlxcel_core::layers::KVCache],
         _mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state
-            .with_sequence_state(caches, |sequence_caches| {
-                self.model.forward_with_caches(input_ids, sequence_caches)
-            })
+        self.forward_with_sequence_id(input_ids, None, caches, None)
     }
 
     fn forward_with_embeddings(
@@ -861,14 +855,13 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
         caches: &mut [mlxcel_core::layers::KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        self.sequence_state.with_sequence_state(caches, |sequence_caches| {
-            self.model.forward_with_caches_and_embeddings(
-                input_ids,
-                input_embeddings,
-                sequence_caches,
-                mask,
-            )
-        })
+        self.forward_with_embeddings_and_sequence_id(
+            input_ids,
+            input_embeddings,
+            None,
+            caches,
+            mask,
+        )
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {
@@ -881,25 +874,83 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
     }
 
     fn make_caches(&self) -> Vec<mlxcel_core::layers::KVCache> {
-        self.sequence_state
-            .make_sequence_placeholders(self.model.make_caches())
+        Vec::new()
     }
 
     fn num_layers(&self) -> usize {
         self.model.layers.len()
     }
 
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.model.layers.len())
+    }
+
     fn supports_batching(&self) -> bool {
         true
     }
 
-    fn release_sequence_state(&self, caches: &mut [mlxcel_core::layers::KVCache]) {
-        self.sequence_state.release_sequence_state(caches)
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.sequence_state
+            .prepare_sequence_state(seq_id, self.model.make_caches());
     }
 
-    fn forward_batched_with_context(
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.sequence_state.release_sequence_state(seq_id)
+    }
+
+    fn forward_with_sequence_id(
         &self,
         input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [mlxcel_core::layers::KVCache],
+        _mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| self.model.forward_with_caches(input_ids, sequence_caches),
+        )
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [mlxcel_core::layers::KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_with_caches_and_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                )
+            },
+        )
+    }
+
+    fn sync_sequence_storage(
+        &self,
+        seq_id: SequenceId,
+        cache_pool: &mut CachePool,
+    ) -> Result<(), String> {
+        self.sequence_state
+            .with_sequence_state(Some(seq_id), |sequence_caches| {
+                let visible_lens: Vec<usize> =
+                    sequence_caches.iter().map(Cache::visible_len).collect();
+                cache_pool.sync_paged_state_with_lengths(seq_id, &visible_lens)
+            })
+    }
+
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
         batch_caches: &mut [&mut [mlxcel_core::layers::KVCache]],
         mask: Option<&MlxArray>,
         context: Option<&DecodeBatchContext>,
@@ -907,24 +958,40 @@ impl mlxcel_core::generate::LanguageModel for Gemma3Wrapper {
         let shape = mlxcel_core::array_shape(input_ids);
         if shape[1] != 1 || mask.is_some() {
             let input_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, shape[1]]);
-            let mut result = self.forward(&input_0, batch_caches[0], mask);
+            let mut result = self.forward_with_sequence_id(
+                &input_0,
+                seq_ids.and_then(|ids| ids.first().copied()),
+                batch_caches[0],
+                mask,
+            );
             for (batch_idx, caches) in batch_caches.iter_mut().enumerate().skip(1) {
                 let input_i = mlxcel_core::slice(
                     input_ids,
                     &[batch_idx as i32, 0],
                     &[batch_idx as i32 + 1, shape[1]],
                 );
-                let logits_i = self.forward(&input_i, caches, mask);
+                let logits_i = self.forward_with_sequence_id(
+                    &input_i,
+                    seq_ids.and_then(|ids| ids.get(batch_idx).copied()),
+                    caches,
+                    mask,
+                );
                 result = mlxcel_core::concatenate(&result, &logits_i, 0);
             }
             return result;
         }
 
         self.sequence_state
-            .with_batched_sequence_states(batch_caches, |sequence_caches| {
-                self.model
-                    .forward_batched_decode_with_caches(input_ids, sequence_caches, context)
-            })
+            .with_batched_sequence_states(
+                seq_ids.expect("gemma3 batched decode requires sequence ids"),
+                |sequence_caches| {
+                    self.model.forward_batched_decode_with_caches(
+                        input_ids,
+                        sequence_caches,
+                        context,
+                    )
+                },
+            )
             .expect("gemma3 batched decode requires sequence-local cache state")
     }
 

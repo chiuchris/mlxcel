@@ -1301,12 +1301,8 @@ impl SequenceCacheSet {
     }
 
     /// Allocate a sequence state for model-owned/internal caches.
-    ///
-    /// The returned KV caches are placeholders that preserve today's runtime
-    /// contracts while the control plane keeps track of the real owner.
-    pub fn model_owned_placeholder(seq_id: SequenceId, num_layers: usize) -> Self {
-        let caches = (0..num_layers).map(|_| KVCache::new()).collect();
-        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, caches, None, None)
+    pub fn model_owned(seq_id: SequenceId) -> Self {
+        Self::with_backend(seq_id, SequenceStateBackend::ModelOwned, Vec::new(), None, None)
     }
 
     /// Total memory footprint of all layer caches in bytes.
@@ -1421,10 +1417,7 @@ impl CachePool {
                 )
             }
             SequenceStateBackend::ModelOwned => {
-                // Model-owned state uses placeholder KV caches.
-                // Do NOT call make_caches() here — that would reset the model's
-                // internal caches and corrupt any in-flight generation.
-                SequenceCacheSet::model_owned_placeholder(id, layout.num_layers)
+                SequenceCacheSet::model_owned(id)
             }
         };
         self.active.insert(id, entry);
@@ -1578,10 +1571,6 @@ impl CachePool {
     /// This keeps server decode/pre-fill lifecycle bookkeeping aligned while
     /// the actual model execution still runs on dense compatibility caches.
     pub fn sync_paged_state_with_dense(&mut self, id: SequenceId) -> Result<(), String> {
-        let pool = match self.paged_pool.as_mut() {
-            Some(pool) => pool,
-            None => return Ok(()),
-        };
         let sequence = self
             .active
             .get_mut(&id)
@@ -1591,12 +1580,37 @@ impl CachePool {
             .iter()
             .map(|cache| cache.seq_len().max(0) as usize)
             .collect();
+        self.sync_paged_state_with_lengths(id, &target_lens)
+    }
+
+    /// Mirror explicit visible lengths into the paged backend state for one sequence.
+    pub fn sync_paged_state_with_lengths(
+        &mut self,
+        id: SequenceId,
+        target_lens: &[usize],
+    ) -> Result<(), String> {
+        let pool = match self.paged_pool.as_mut() {
+            Some(pool) => pool,
+            None => return Ok(()),
+        };
+        let sequence = self
+            .active
+            .get_mut(&id)
+            .ok_or_else(|| format!("CachePool: sequence {id} not found"))?;
         let state = match sequence.paged_state_mut() {
             Some(state) => state,
             None => return Ok(()),
         };
 
-        for (layer_idx, target_len) in target_lens.into_iter().enumerate() {
+        if target_lens.len() != state.layers.len() {
+            return Err(format!(
+                "CachePool: expected {} paged layer lengths for {id}, got {}",
+                state.layers.len(),
+                target_lens.len()
+            ));
+        }
+
+        for (layer_idx, target_len) in target_lens.iter().copied().enumerate() {
             let current_len = state.layers[layer_idx].len;
             if target_len > current_len {
                 pool.append_tokens(state, layer_idx, target_len - current_len)?;

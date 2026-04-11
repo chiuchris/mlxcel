@@ -768,10 +768,7 @@ impl TensorParallelGemma4Model {
         let config_value: serde_json::Value =
             serde_json::from_str(&config_str).context("failed to parse gemma4 config value")?;
         let text_config = args.text_args();
-        if gemma4_requires_loaded_model_fallback(
-            &text_config,
-            &support.summary.plan,
-        ) {
+        if gemma4_requires_loaded_model_fallback(&text_config, &support.summary.plan) {
             let (fallback_loaded_model, _) = crate::load_model(model_dir)?;
             return Ok(Self {
                 ranks: Vec::new(),
@@ -924,7 +921,13 @@ impl TensorParallelGemma4Model {
     ) -> UniquePtr<MlxArray> {
         if let Some(model) = self.fallback_loaded_model.as_ref() {
             return if let Some(embeddings) = input_embeddings {
-                LanguageModel::forward_with_embeddings(model.as_ref(), input_ids, Some(embeddings), caches, mask)
+                LanguageModel::forward_with_embeddings(
+                    model.as_ref(),
+                    input_ids,
+                    Some(embeddings),
+                    caches,
+                    mask,
+                )
             } else {
                 LanguageModel::forward(model.as_ref(), input_ids, caches, mask)
             };
@@ -953,10 +956,12 @@ impl TensorParallelGemma4Model {
             None
         };
 
-        let (global_mask, sliding_mask) = gemma4_masks(mask, seq_len, &mut rank_caches[0], text_config);
+        let (global_mask, sliding_mask) =
+            gemma4_masks(mask, seq_len, &mut rank_caches[0], text_config);
         let n_layers = self.num_layers_per_rank;
-        let mut shared_kv_store: Vec<HashMap<usize, (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32)>> =
-            (0..self.ranks.len()).map(|_| HashMap::new()).collect();
+        let mut shared_kv_store: Vec<
+            HashMap<usize, (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32)>,
+        > = (0..self.ranks.len()).map(|_| HashMap::new()).collect();
 
         for layer_idx in 0..n_layers {
             let layer0 = &self.ranks[0].text_model.layers[layer_idx];
@@ -977,7 +982,8 @@ impl TensorParallelGemma4Model {
                     shared_kv = Some((keys.as_ref().unwrap(), values.as_ref().unwrap()));
                 }
                 let pre_offset = cache.offset();
-                let (attn_out, stored_kv) = full_attn.forward(&attn_norm, layer_mask, cache, shared_kv);
+                let (attn_out, stored_kv) =
+                    full_attn.forward(&attn_norm, layer_mask, cache, shared_kv);
                 if let Some((keys, values)) = stored_kv {
                     shared_kv_store[0].insert(layer_idx, (keys, values, pre_offset));
                 }
@@ -991,9 +997,12 @@ impl TensorParallelGemma4Model {
                     .map(|((rank, caches), shared_store)| {
                         let cache = gemma4_cache_interface(&mut caches[layer_idx]);
                         let mut shared_kv = None;
-                        if rank.text_model.layers[layer_idx].self_attn.is_kv_shared_layer
-                            && let Some(ref_idx) =
-                                rank.text_model.layers[layer_idx].self_attn.kv_shared_layer_index
+                        if rank.text_model.layers[layer_idx]
+                            .self_attn
+                            .is_kv_shared_layer
+                            && let Some(ref_idx) = rank.text_model.layers[layer_idx]
+                                .self_attn
+                                .kv_shared_layer_index
                             && let Some((keys, values, ref_offset)) = shared_store.get(&ref_idx)
                         {
                             cache.set_offset(*ref_offset);
@@ -1796,8 +1805,8 @@ pub fn validate_supported_runtime(
         )
     })?;
 
-    let force_no_batch =
-        !runtime_supports_server_batching(kind) || gemma4_force_no_batch(model_path, kind, &summary)?;
+    let force_no_batch = !runtime_supports_server_batching(kind)
+        || gemma4_force_no_batch(model_path, kind, &summary)?;
     Ok(TensorParallelRuntimeSupport {
         kind,
         summary,
@@ -2184,7 +2193,9 @@ fn runtime_kind_for(summary: &TensorParallelPlanSummary) -> Option<TensorParalle
         ModelType::Gemma3 if is_gemma3_architecture(&summary.architecture) => {
             Some(TensorParallelRuntimeKind::Gemma3)
         }
-        ModelType::Gemma4 | ModelType::Gemma4VLM if is_gemma4_architecture(&summary.architecture) => {
+        ModelType::Gemma4 | ModelType::Gemma4VLM
+            if is_gemma4_architecture(&summary.architecture) =>
+        {
             Some(TensorParallelRuntimeKind::Gemma4)
         }
         ModelType::Ernie45 if summary.architecture == "ernie4_5" => {
@@ -2800,10 +2811,14 @@ fn gemma4_masks(
     let global_offset = crate::models::gemma4::first_cache_offset(rank0_caches, "full_attention");
     let sliding_offset =
         crate::models::gemma4::first_cache_offset(rank0_caches, "sliding_attention");
-    let sliding_effective_offset = sliding_offset.min((config.sliding_window as i32 - seq_len).max(0));
+    let sliding_effective_offset =
+        sliding_offset.min((config.sliding_window as i32 - seq_len).max(0));
 
     (
-        Some(mlxcel_core::utils::create_causal_mask(seq_len, global_offset)),
+        Some(mlxcel_core::utils::create_causal_mask(
+            seq_len,
+            global_offset,
+        )),
         Some(mlxcel_core::utils::create_causal_mask_with_window(
             seq_len,
             sliding_effective_offset,
