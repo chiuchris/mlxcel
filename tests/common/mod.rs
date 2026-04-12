@@ -19,6 +19,17 @@ pub fn repo_model_dir(name: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
+pub fn repo_binary_path(name: &str) -> PathBuf {
+    let env_key = format!("CARGO_BIN_EXE_{name}");
+    if let Some(path) = std::env::var_os(&env_key) {
+        return PathBuf::from(path);
+    }
+
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.join("target").join("debug").join(name)
+}
+
+#[allow(dead_code)]
 pub fn extract_generated_body(stdout: &str) -> Option<&str> {
     let start = stdout.rfind("Generating...\n")?;
     let start = start + "Generating...\n".len();
