@@ -353,3 +353,9 @@ fn pipeline_remote_runtime_qwen35_real_model_parity_and_cleanup() {
 fn pipeline_remote_runtime_glm4_real_model_parity_and_cleanup() {
     assert_remote_runtime_matches_full_model("glm4-flash-4bit", &[2, 3], 4, 470, None);
 }
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
+fn pipeline_remote_runtime_glm_moe_dsa_real_model_parity_and_cleanup() {
+    assert_remote_runtime_matches_full_model("glm5-4bit", &[2, 3], 4, 480, None);
+}

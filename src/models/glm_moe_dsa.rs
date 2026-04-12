@@ -272,3 +272,92 @@ impl LanguageModel for GlmMoeDsaModel {
         vec![151329, 151336, 151338] // GLM EOS tokens
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_args() -> ModelArgs {
+        ModelArgs {
+            model_type: "glm_moe_dsa".to_string(),
+            vocab_size: 10,
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 4,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            moe_intermediate_size: 64,
+            n_shared_experts: Some(1),
+            n_routed_experts: Some(8),
+            routed_scaling_factor: 1.25,
+            kv_lora_rank: 128,
+            q_lora_rank: 256,
+            qk_rope_head_dim: 64,
+            v_head_dim: 128,
+            qk_nope_head_dim: 128,
+            topk_method: "noaux_tc".to_string(),
+            scoring_func: "sigmoid".to_string(),
+            norm_topk_prob: true,
+            n_group: 2,
+            topk_group: 1,
+            num_experts_per_tok: 4,
+            moe_layer_freq: 1,
+            first_k_dense_replace: 0,
+            max_position_embeddings: 131072,
+            rms_norm_eps: 1e-6,
+            attention_bias: false,
+            tie_word_embeddings: true,
+            quantization: None,
+            rope_parameters: None,
+            rope_scaling: None,
+            rope_theta: 10000.0,
+            index_head_dim: None,
+            index_n_heads: None,
+            index_topk: None,
+        }
+    }
+
+    #[test]
+    fn glm_moe_dsa_prefers_rope_parameters_over_direct_fields() {
+        let mut args = sample_args();
+        let mut rope_parameters = HashMap::new();
+        rope_parameters.insert("rope_theta".to_string(), serde_json::json!(500000.0));
+        rope_parameters.insert("type".to_string(), serde_json::json!("yarn"));
+        rope_parameters.insert("factor".to_string(), serde_json::json!(32.0));
+        rope_parameters.insert("mscale_all_dim".to_string(), serde_json::json!(1.5));
+        args.rope_parameters = Some(rope_parameters);
+        args.rope_theta = 1234.0;
+        args.rope_scaling = Some(deepseek_v32::RopeScaling {
+            scaling_type: Some("ignored".to_string()),
+            factor: Some(2.0),
+            mscale_all_dim: Some(3.0),
+        });
+
+        let mapped = args.to_dsv32_args();
+
+        assert_eq!(mapped.rope_theta, 500000.0);
+        let rope_scaling = mapped.rope_scaling.expect("rope scaling");
+        assert_eq!(rope_scaling.scaling_type.as_deref(), Some("yarn"));
+        assert_eq!(rope_scaling.factor, Some(32.0));
+        assert_eq!(rope_scaling.mscale_all_dim, Some(1.5));
+    }
+
+    #[test]
+    fn glm_moe_dsa_falls_back_to_direct_rope_fields() {
+        let mut args = sample_args();
+        args.rope_theta = 320000.0;
+        args.rope_scaling = Some(deepseek_v32::RopeScaling {
+            scaling_type: Some("linear".to_string()),
+            factor: Some(8.0),
+            mscale_all_dim: None,
+        });
+
+        let mapped = args.to_dsv32_args();
+
+        assert_eq!(mapped.rope_theta, 320000.0);
+        let rope_scaling = mapped.rope_scaling.expect("rope scaling");
+        assert_eq!(rope_scaling.scaling_type.as_deref(), Some("linear"));
+        assert_eq!(rope_scaling.factor, Some(8.0));
+        assert_eq!(rope_scaling.mscale_all_dim, None);
+    }
+}

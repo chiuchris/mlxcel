@@ -30,6 +30,7 @@ mod common;
 mod gemma3;
 mod gemma4;
 mod glm4;
+mod glm_moe_dsa;
 mod gpt_oss;
 mod llama;
 mod qwen3;
@@ -48,6 +49,7 @@ use super::partition::StageAssignment;
 use gemma3::Gemma3StageExecutor;
 use gemma4::Gemma4StageExecutor;
 use glm4::{Glm4MoeLiteStageExecutor, Glm4MoeStageExecutor, Glm4StageExecutor};
+use glm_moe_dsa::GlmMoeDsaStageExecutor;
 use gpt_oss::GptOssStageExecutor;
 use llama::LlamaStageExecutor;
 use qwen3::Qwen3StageExecutor;
@@ -207,6 +209,11 @@ fn load_family_backend(
             stage_index,
         )?)),
         ModelType::Glm4MoeLite => Ok(Box::new(Glm4MoeLiteStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::GlmMoeDsa => Ok(Box::new(GlmMoeDsaStageExecutor::load(
             model_dir,
             filter,
             stage_index,

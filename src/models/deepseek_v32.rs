@@ -27,6 +27,7 @@
 //! optimization from upstream commit 7e67225: use take_along_axis to directly
 //! select relevant KV entries instead of creating sparse masks (~40% speedup).
 
+use crate::distributed::pipeline::{LayerFilter, StageExecutionOutput};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{silu, slice_axis, stack_arrays};
@@ -1070,6 +1071,143 @@ fn load_switch_linear(
         }
         let weight = mlxcel_core::utils::stack_arrays(&expert_weights, 0);
         Ok(SwitchLinear::Regular { weight })
+    }
+}
+
+pub(crate) struct DeepSeekV32StageModel {
+    filter: LayerFilter,
+    embed_tokens: Option<UnifiedEmbedding>,
+    layers: Vec<DecoderLayer>,
+    norm: Option<RMSNorm>,
+    lm_head: Option<UnifiedLinear>,
+}
+
+impl DeepSeekV32StageModel {
+    pub(crate) fn from_filtered_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let group_size = args.group_size();
+        let bits = args.bits();
+        let load_embeddings = filter.has_embedding || (args.tie_word_embeddings && filter.has_lm_head);
+
+        let embed_tokens = if load_embeddings {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                "model.embed_tokens",
+                group_size,
+                bits,
+            )?)
+        } else {
+            None
+        };
+
+        let mut layers = Vec::with_capacity(filter.num_layers());
+        for layer_idx in filter.layer_range.clone() {
+            layers.push(load_decoder_layer(weights, args, layer_idx)?);
+        }
+
+        if layers.is_empty() {
+            return Err(format!(
+                "stage {} did not load any layers from range {}..{}",
+                stage_index, filter.layer_range.start, filter.layer_range.end
+            ));
+        }
+
+        let norm = if filter.has_lm_head {
+            Some(RMSNorm::new(
+                get_weight_copy(weights, "model.norm.weight")?,
+                args.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+
+        let lm_head = if filter.has_lm_head && !args.tie_word_embeddings {
+            Some(UnifiedLinear::from_weights(
+                weights, "lm_head", group_size, bits,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            filter: filter.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+
+    pub(crate) fn make_caches(&self) -> Vec<KVCache> {
+        (0..self.layers.len()).map(|_| KVCache::new()).collect()
+    }
+
+    pub(crate) fn execute_from_token_ids(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+    ) -> Result<StageExecutionOutput, String> {
+        let hidden = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| {
+                "stage does not host embeddings; hidden-state input required".to_string()
+            })?
+            .forward(input_ids);
+        self.execute_hidden(hidden, caches)
+    }
+
+    pub(crate) fn execute_from_hidden_states(
+        &self,
+        hidden_states: UniquePtr<MlxArray>,
+        caches: &mut [KVCache],
+    ) -> Result<StageExecutionOutput, String> {
+        if self.filter.has_embedding {
+            return Err("entry stage expects token IDs, not hidden states".to_string());
+        }
+        self.execute_hidden(hidden_states, caches)
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        caches: &mut [KVCache],
+    ) -> Result<StageExecutionOutput, String> {
+        if caches.len() != self.layers.len() {
+            return Err(format!(
+                "stage cache count mismatch: expected {}, got {}",
+                self.layers.len(),
+                caches.len()
+            ));
+        }
+
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            hidden = layer.forward(&hidden, None, cache);
+        }
+
+        let hidden = if let Some(norm) = &self.norm {
+            norm.forward(&hidden)
+        } else {
+            hidden
+        };
+
+        if self.filter.has_lm_head {
+            let logits = if let Some(lm_head) = &self.lm_head {
+                lm_head.forward(&hidden)
+            } else {
+                self.embed_tokens
+                    .as_ref()
+                    .ok_or_else(|| "final tied-word-embedding stage missing embeddings".to_string())?
+                    .as_linear(&hidden)
+            };
+            Ok(StageExecutionOutput::Logits(logits))
+        } else {
+            Ok(StageExecutionOutput::HiddenStates(hidden))
+        }
     }
 }
 
