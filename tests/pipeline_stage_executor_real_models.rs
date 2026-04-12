@@ -46,7 +46,7 @@ fn two_stage_assignments(total_layers: usize) -> [StageAssignment; 2] {
     ]
 }
 
-fn assert_two_stage_llama_matches_full_model(model_dir: &Path, prompt: &[i32], decode_token: i32) {
+fn assert_two_stage_model_matches_full_model(model_dir: &Path, prompt: &[i32], decode_token: i32) {
     if !model_dir.exists() {
         eprintln!(
             "Skipping test: model directory not found at {}",
@@ -122,7 +122,7 @@ fn assert_two_stage_llama_matches_full_model(model_dir: &Path, prompt: &[i32], d
     );
 }
 
-fn assert_two_stage_llama_worker_loop_matches_full_model(
+fn assert_two_stage_model_worker_loop_matches_full_model(
     model_dir: &Path,
     prompt: &[i32],
     decode_token: i32,
@@ -191,7 +191,7 @@ fn assert_two_stage_llama_worker_loop_matches_full_model(
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
 fn pipeline_stage_executor_llama_real_model_parity() {
-    assert_two_stage_llama_matches_full_model(
+    assert_two_stage_model_matches_full_model(
         &repo_model_dir("llama-3.2-1b-4bit"),
         &[128000, 9906],
         13,
@@ -201,9 +201,29 @@ fn pipeline_stage_executor_llama_real_model_parity() {
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
 fn pipeline_stage_worker_loop_llama_real_model_parity() {
-    assert_two_stage_llama_worker_loop_matches_full_model(
+    assert_two_stage_model_worker_loop_matches_full_model(
         &repo_model_dir("llama-3.2-1b-4bit"),
         &[128000, 9906],
         13,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_gpt_oss_real_model_parity() {
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("gpt-oss-20b-mxfp4"),
+        &[42, 43],
+        44,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_gpt_oss_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("gpt-oss-20b-mxfp4"),
+        &[42, 43],
+        44,
     );
 }

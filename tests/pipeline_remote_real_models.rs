@@ -20,7 +20,7 @@ fn reserve_port(bind_ip: IpAddr) -> u16 {
     port
 }
 
-fn spawn_llama_remote_runtime(
+fn spawn_remote_runtime(
     model_dir: &std::path::Path,
     bind_ip: IpAddr,
     transport_backend: TransportBackend,
@@ -30,8 +30,10 @@ fn spawn_llama_remote_runtime(
     RemoteStageServiceHandle,
 ) {
     let num_layers = resolve_in_process_pipeline_num_layers(model_dir).unwrap();
+    let split = num_layers / 2;
+    let pp_layers = format!("0-{},{}-{}", split - 1, split, num_layers - 1);
     let assignments =
-        resolve_in_process_stage_assignments(num_layers, None, Some("0-7,8-15")).unwrap();
+        resolve_in_process_stage_assignments(num_layers, None, Some(&pp_layers)).unwrap();
 
     let stage0_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
     let stage1_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
@@ -84,7 +86,7 @@ fn pipeline_remote_runtime_llama_real_model_parity_and_cleanup() {
     }
 
     let (model, _) = mlxcel::load_model(&model_dir).unwrap();
-    let (runtime, stage0, stage1) = spawn_llama_remote_runtime(
+    let (runtime, stage0, stage1) = spawn_remote_runtime(
         &model_dir,
         "127.0.0.1".parse().unwrap(),
         TransportBackend::Tcp,
@@ -153,7 +155,7 @@ fn pipeline_remote_runtime_llama_drain_and_shutdown_transition() {
         return;
     }
 
-    let (runtime, stage0, stage1) = spawn_llama_remote_runtime(
+    let (runtime, stage0, stage1) = spawn_remote_runtime(
         &model_dir,
         "127.0.0.1".parse().unwrap(),
         TransportBackend::Tcp,
@@ -205,7 +207,7 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
 
     let (model, _) = mlxcel::load_model(&model_dir).unwrap();
     let (runtime, stage0, stage1) =
-        spawn_llama_remote_runtime(&model_dir, bind_ip, TransportBackend::Thunderbolt);
+        spawn_remote_runtime(&model_dir, bind_ip, TransportBackend::Thunderbolt);
 
     let prompt_ids = mlxcel_core::from_slice_i32(&[128000, 9906], &[1, 2]);
     let decode_ids = mlxcel_core::from_slice_i32(&[13], &[1, 1]);
@@ -215,6 +217,54 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
     let full_decode = model.forward(&decode_ids, &mut full_caches, None);
 
     let seq_id = SequenceId::from_raw(99);
+    runtime.prepare_sequence_state(seq_id);
+    let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
+    let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
+
+    let atol = 1e-4f64;
+    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
+        &full_prefill,
+        &remote_prefill,
+        atol,
+        atol
+    )));
+    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
+        &full_decode,
+        &remote_decode,
+        atol,
+        atol
+    )));
+
+    runtime.release_sequence_state_by_id(seq_id);
+    runtime.shutdown().unwrap();
+    stage0.shutdown().unwrap();
+    stage1.shutdown().unwrap();
+}
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
+fn pipeline_remote_runtime_gpt_oss_real_model_parity_and_cleanup() {
+    let model_dir = repo_model_dir("gpt-oss-20b-mxfp4");
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let (model, _) = mlxcel::load_model(&model_dir).unwrap();
+    let (runtime, stage0, stage1) =
+        spawn_remote_runtime(&model_dir, "127.0.0.1".parse().unwrap(), TransportBackend::Tcp);
+
+    let prompt_ids = mlxcel_core::from_slice_i32(&[42, 43], &[1, 2]);
+    let decode_ids = mlxcel_core::from_slice_i32(&[44], &[1, 1]);
+
+    let mut full_caches = model.make_caches();
+    let full_prefill = model.forward(&prompt_ids, &mut full_caches, None);
+    let full_decode = model.forward(&decode_ids, &mut full_caches, None);
+
+    let seq_id = SequenceId::from_raw(420);
     runtime.prepare_sequence_state(seq_id);
     let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
     let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
