@@ -186,3 +186,9 @@ fn pipeline_server_remote_coordinator_qwen3_matches_dense_baseline() {
 fn pipeline_server_remote_coordinator_qwen35_matches_dense_baseline() {
     assert_remote_coordinator_matches_dense_baseline("qwen3.5-0.8b-4bit", "Hello", None);
 }
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote stage services"]
+fn pipeline_server_remote_coordinator_glm4_matches_dense_baseline() {
+    assert_remote_coordinator_matches_dense_baseline("glm4-flash-4bit", "Hello", None);
+}

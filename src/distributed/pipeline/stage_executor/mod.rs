@@ -29,6 +29,7 @@
 mod common;
 mod gemma3;
 mod gemma4;
+mod glm4;
 mod gpt_oss;
 mod llama;
 mod qwen3;
@@ -46,6 +47,7 @@ use super::partial_loading::LayerFilter;
 use super::partition::StageAssignment;
 use gemma3::Gemma3StageExecutor;
 use gemma4::Gemma4StageExecutor;
+use glm4::{Glm4MoeLiteStageExecutor, Glm4MoeStageExecutor, Glm4StageExecutor};
 use gpt_oss::GptOssStageExecutor;
 use llama::LlamaStageExecutor;
 use qwen3::Qwen3StageExecutor;
@@ -190,6 +192,21 @@ fn load_family_backend(
             stage_index,
         )?)),
         ModelType::Gemma4 | ModelType::Gemma4VLM => Ok(Box::new(Gemma4StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::Glm4 => Ok(Box::new(Glm4StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::Glm4Moe => Ok(Box::new(Glm4MoeStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::Glm4MoeLite => Ok(Box::new(Glm4MoeLiteStageExecutor::load(
             model_dir,
             filter,
             stage_index,

@@ -1121,8 +1121,13 @@ impl GptOssStageModel {
 
         let mut layers = Vec::with_capacity(filter.num_layers());
         for layer_idx in filter.layer_range.clone() {
-            let layer =
-                TransformerBlock::from_weights(weights, args, layer_idx, yarn_freqs_ref, rope_mscale)?;
+            let layer = TransformerBlock::from_weights(
+                weights,
+                args,
+                layer_idx,
+                yarn_freqs_ref,
+                rope_mscale,
+            )?;
             layers.push(layer);
         }
 
@@ -1254,7 +1259,9 @@ impl GptOssStageModel {
                     .embed_tokens
                     .as_ref()
                     .ok_or_else(|| "tied-word-embedding stage missing embeddings".to_string())?;
-                Ok(StageExecutionOutput::Logits(embed_tokens.as_linear(&hidden)))
+                Ok(StageExecutionOutput::Logits(
+                    embed_tokens.as_linear(&hidden),
+                ))
             }
             _ => Ok(StageExecutionOutput::HiddenStates(hidden)),
         }

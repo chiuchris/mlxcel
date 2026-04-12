@@ -137,14 +137,23 @@ impl<L: TransformerStageLayer> TransformerStageModel<L> {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> Result<StageExecutionOutput> {
-        ensure!(
-            caches.len() == self.layers.len(),
-            "stage cache count mismatch: expected {}, got {}",
-            self.layers.len(),
-            caches.len()
-        );
+        let hidden = self.prepare_hidden(input)?;
+        self.execute_hidden(hidden, caches, mask)
+    }
 
-        let mut hidden = match input {
+    pub fn execute_with_computed_mask(
+        &self,
+        input: StageExecutionInput<'_>,
+        caches: &mut [KVCache],
+        build_mask: impl FnOnce(&MlxArray, &[KVCache]) -> Option<UniquePtr<MlxArray>>,
+    ) -> Result<StageExecutionOutput> {
+        let hidden = self.prepare_hidden(input)?;
+        let computed_mask = build_mask(hidden.as_ref().unwrap(), caches);
+        self.execute_hidden(hidden, caches, computed_mask.as_deref())
+    }
+
+    fn prepare_hidden(&self, input: StageExecutionInput<'_>) -> Result<UniquePtr<MlxArray>> {
+        Ok(match input {
             StageExecutionInput::TokenIds(input_ids) => self
                 .embed_tokens
                 .as_ref()
@@ -158,7 +167,21 @@ impl<L: TransformerStageLayer> TransformerStageModel<L> {
                 }
                 copy(hidden_states)
             }
-        };
+        })
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> Result<StageExecutionOutput> {
+        ensure!(
+            caches.len() == self.layers.len(),
+            "stage cache count mismatch: expected {}, got {}",
+            self.layers.len(),
+            caches.len()
+        );
 
         let n = self.layers.len();
         for (i, layer) in self.layers.iter().enumerate() {
