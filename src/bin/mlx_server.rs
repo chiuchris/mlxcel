@@ -33,7 +33,41 @@ Tensor Parallel Runtime:
   Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, Hunyuan v1 Dense
   Current constraints: --tp-embedding-mode replicated, --tp-lm-head-mode replicated
                        LoRA unsupported, server batching supported for listed dense runtimes
-                       except Gemma 4 E2B-style conservative fallback checkpoints"
+                       except Gemma 4 E2B-style conservative fallback checkpoints
+
+Remote Pipeline Parallel Example (TCP):
+  1. Generate a shared cluster config:
+       CLUSTER_NAME=studio-pp \\
+       TRANSPORT_BACKEND=tcp \\
+       COORDINATOR_CONTROL_ADDR=192.168.1.22:19000 \\
+       STAGE0_ADDR=192.168.1.22:19001 \\
+       STAGE1_ADDR=192.168.1.24:19001 \\
+       scripts/benchmark_pipeline_remote_rollout.sh write-config \\
+         examples/distributed/generated_pipeline_remote_2node_tcp.toml
+
+  2. Start stage-1 on machine B:
+       mlxcel-server -m models/llama-3.2-1b-4bit \\
+         --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
+         --node-id stage-1 --host 0.0.0.0 --port 18081 --no-warmup
+
+  3. Start stage-0 on machine A:
+       mlxcel-server -m models/llama-3.2-1b-4bit \\
+         --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
+         --node-id stage-0 --host 0.0.0.0 --port 18081 --no-warmup
+
+  4. Start the coordinator on machine A:
+       mlxcel-server -m models/llama-3.2-1b-4bit --alias llama-remote-pp \\
+         --distributed-config examples/distributed/generated_pipeline_remote_2node_tcp.toml \\
+         --node-id coordinator --host 0.0.0.0 --port 18080 \\
+         --parallel 2 --max-batch-size 2 --pp-micro-batch-size 2 \\
+         --metrics --no-warmup
+
+Thunderbolt mode:
+  Use the same workflow with TRANSPORT_BACKEND=thunderbolt and each node's
+  Thunderbolt Bridge IP (for example 169.254.x.x). The current Thunderbolt
+  path uses the shared TCP transport core over the Bridge network.
+
+See also: docs/PIPELINE_PARALLELISM.md"
 )]
 struct Args {
     /// Path to the model directory
