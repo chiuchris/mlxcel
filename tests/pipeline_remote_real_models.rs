@@ -341,3 +341,9 @@ fn pipeline_remote_runtime_gemma4_real_model_parity_and_cleanup() {
 fn pipeline_remote_runtime_qwen3_real_model_parity_and_cleanup() {
     assert_remote_runtime_matches_full_model("qwen3-0.6b-4bit", &[2, 3], 4, 450, None);
 }
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
+fn pipeline_remote_runtime_qwen35_real_model_parity_and_cleanup() {
+    assert_remote_runtime_matches_full_model("qwen3.5-0.8b-4bit", &[2, 3], 4, 460, None);
+}
