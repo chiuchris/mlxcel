@@ -77,6 +77,9 @@ pub(crate) struct GenerateArgs {
     pub(crate) sampling: SamplingOptions,
 
     #[command(flatten)]
+    pub(crate) pipeline_parallel: PipelineParallelOptions,
+
+    #[command(flatten)]
     pub(crate) tensor_parallel: TensorParallelOptions,
 }
 
@@ -235,6 +238,26 @@ pub(crate) struct TensorParallelOptions {
         value_name = "MODE"
     )]
     pub(crate) tp_lm_head_mode: String,
+}
+
+/// Pipeline-parallel options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Pipeline Parallel Options")]
+pub(crate) struct PipelineParallelOptions {
+    /// Number of pipeline stages. Values <= 1 disable pipeline mode.
+    #[arg(long = "pp-size", default_value_t = 1, value_name = "N")]
+    pub(crate) pp_size: usize,
+
+    /// Manual pipeline-parallel layer partition (e.g. "0-15,16-31").
+    ///
+    /// When omitted and `--pp-size >= 2`, the CLI path auto-partitions
+    /// the model into equal-capacity in-process stages.
+    #[arg(long = "pp-layers", value_name = "RANGES")]
+    pub(crate) pp_layers: Option<String>,
+
+    /// Micro-batch size for pipeline parallelism.
+    #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
+    pub(crate) pp_micro_batch_size: usize,
 }
 
 /// Server options

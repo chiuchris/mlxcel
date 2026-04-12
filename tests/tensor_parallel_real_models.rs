@@ -12,18 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::{Path, PathBuf};
+mod common;
 
+use std::path::Path;
+
+use common::repo_model_dir;
 use mlxcel::{
     CxxGenerator, LanguageModel, SamplingConfig, distributed::ShardConfig, initialize_runtime,
     load_model, load_model_with_tensor_parallel, tokenizer::MlxcelTokenizer,
 };
-
-fn repo_model_dir(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("models")
-        .join(name)
-}
 
 fn prompt_tokens(tokenizer: &MlxcelTokenizer, prompt: &str) -> Vec<i32> {
     let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");

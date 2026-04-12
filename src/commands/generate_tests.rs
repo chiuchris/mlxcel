@@ -13,8 +13,9 @@
 // limitations under the License.
 
 use super::{
-    apply_user_chat_template, generated_suffix, generation_stats_from_duration, resolve_cli_prompt,
-    validate_tensor_parallel_args,
+    apply_user_chat_template, cli_pipeline_requested, generated_suffix,
+    generation_stats_from_duration, resolve_cli_pipeline_assignments, resolve_cli_prompt,
+    validate_pipeline_parallel_args, validate_tensor_parallel_args,
 };
 use mlxcel::server::chat_template::ChatTemplateProcessor;
 use std::fs;
@@ -115,6 +116,11 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             dry_base: 1.75,
             dry_allowed_length: 2,
             dry_penalty_last_n: 0,
+        },
+        pipeline_parallel: crate::PipelineParallelOptions {
+            pp_size: 1,
+            pp_layers: None,
+            pp_micro_batch_size: 1,
         },
         tensor_parallel: crate::TensorParallelOptions {
             tp_size: 1,
@@ -304,4 +310,69 @@ fn validate_tensor_parallel_args_accepts_gemma4_multi_rank_runtime() {
     validate_tensor_parallel_args(&args).unwrap();
 
     fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn cli_pipeline_requested_is_disabled_by_default() {
+    let args = sample_generate_args(temp_model_dir("pp-disabled"));
+    assert!(!cli_pipeline_requested(&args));
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_args_requires_two_stages_without_manual_ranges() {
+    let mut args = sample_generate_args(temp_model_dir("pp-too-small"));
+    args.pipeline_parallel.pp_size = 1;
+
+    assert!(validate_pipeline_parallel_args(&args).is_ok());
+
+    args.pipeline_parallel.pp_layers = Some("0-1".to_string());
+    assert!(validate_pipeline_parallel_args(&args).is_ok());
+
+    args.pipeline_parallel.pp_layers = None;
+    args.pipeline_parallel.pp_size = 0;
+    assert!(validate_pipeline_parallel_args(&args).is_ok());
+
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
+    let mut args = sample_generate_args(temp_model_dir("pp-incompatible"));
+    args.pipeline_parallel.pp_size = 2;
+    args.model.adapter = Some(PathBuf::from("adapter"));
+    assert!(validate_pipeline_parallel_args(&args).is_err());
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn resolve_cli_pipeline_assignments_honors_manual_ranges() {
+    let mut args = sample_generate_args(temp_model_dir("pp-manual"));
+    args.pipeline_parallel.pp_size = 2;
+    args.pipeline_parallel.pp_layers = Some("0-3,4-7".to_string());
+
+    let assignments = resolve_cli_pipeline_assignments(8, &args).unwrap();
+
+    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments[0].layer_range, 0..4);
+    assert_eq!(assignments[1].layer_range, 4..8);
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn resolve_cli_pipeline_assignments_auto_splits_layers_across_stages() {
+    let mut args = sample_generate_args(temp_model_dir("pp-auto"));
+    args.pipeline_parallel.pp_size = 3;
+
+    let assignments = resolve_cli_pipeline_assignments(9, &args).unwrap();
+
+    assert_eq!(assignments.len(), 3);
+    assert_eq!(assignments[0].layer_range.start, 0);
+    assert_eq!(assignments[2].layer_range.end, 9);
+    assert!(
+        assignments
+            .iter()
+            .all(|stage| !stage.layer_range.is_empty())
+    );
+    fs::remove_dir_all(args.model.model).unwrap();
 }
