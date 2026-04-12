@@ -277,3 +277,20 @@ fn pipeline_stage_worker_loop_gemma4_real_model_parity() {
         Some(13),
     );
 }
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_qwen3_real_model_parity() {
+    assert_two_stage_model_matches_full_model(&repo_model_dir("qwen3-0.6b-4bit"), &[2, 3], 4, None);
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_qwen3_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("qwen3-0.6b-4bit"),
+        &[2, 3],
+        4,
+        None,
+    );
+}
