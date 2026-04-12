@@ -41,6 +41,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail, ensure};
+use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::distributed::request_tracker::RequestId;
@@ -352,7 +353,7 @@ impl fmt::Display for PipelineResponse {
 // ---------------------------------------------------------------------------
 
 /// Health status of a pipeline stage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum StageHealth {
     /// Stage is operating normally.
@@ -435,6 +436,8 @@ pub struct PipelineCoordinator {
     metrics: PipelineMetrics,
     /// Monotonically increasing sequence ID counter.
     next_sequence_id: SequenceId,
+    /// Whether the pipeline is draining and refusing new requests.
+    draining: bool,
 }
 
 /// Internal tracking entry for an in-flight request.
@@ -474,6 +477,7 @@ impl PipelineCoordinator {
             stage_health: vec![StageHealth::Unknown; num_stages],
             metrics,
             next_sequence_id: 0,
+            draining: false,
         })
     }
 
@@ -490,6 +494,9 @@ impl PipelineCoordinator {
         &mut self,
         mut request: PipelineRequest,
     ) -> Result<oneshot::Receiver<PipelineResponse>> {
+        if self.draining {
+            bail!("pipeline is draining; cannot accept new requests");
+        }
         // Check capacity.
         if self.in_flight.len() >= self.config.max_in_flight {
             bail!(
@@ -674,6 +681,47 @@ impl PipelineCoordinator {
         }
     }
 
+    /// Begin a graceful drain. Existing requests may finish, but new requests
+    /// are rejected until the coordinator is shut down or recreated.
+    pub fn begin_drain(&mut self) {
+        self.draining = true;
+    }
+
+    /// Whether the pipeline is draining.
+    pub fn is_draining(&self) -> bool {
+        self.draining
+    }
+
+    /// Whether the drain has completed and there are no in-flight requests.
+    pub fn drain_complete(&self) -> bool {
+        self.draining && self.in_flight.is_empty()
+    }
+
+    /// Force shutdown of the pipeline coordinator and fail all remaining
+    /// in-flight requests.
+    pub fn shutdown(&mut self, reason: impl Into<String>) -> Vec<FailedRequest> {
+        self.draining = true;
+        let reason = reason.into();
+        let mut failed = Vec::with_capacity(self.in_flight.len());
+        for (_, mut entry) in self.in_flight.drain() {
+            let failed_request = FailedRequest {
+                request_id: entry.request.request_id.clone(),
+                sequence_id: entry.request.sequence_id,
+                failed_stage: entry.current_stage,
+                reason: reason.clone(),
+            };
+            if let Some(tx) = entry.response_tx.take() {
+                let _ = tx.send(PipelineResponse::error(
+                    entry.request.request_id.clone(),
+                    entry.request.sequence_id,
+                    reason.clone(),
+                ));
+            }
+            failed.push(failed_request);
+        }
+        failed
+    }
+
     /// Get the health status of a stage.
     pub fn stage_health(&self, stage_index: u32) -> StageHealth {
         self.stage_health
@@ -696,7 +744,9 @@ impl PipelineCoordinator {
 
     /// Whether the pipeline can accept more requests.
     pub fn can_accept(&self) -> bool {
-        self.in_flight.len() < self.config.max_in_flight && self.all_stages_usable()
+        !self.draining
+            && self.in_flight.len() < self.config.max_in_flight
+            && self.all_stages_usable()
     }
 
     /// Reference to the serving config.

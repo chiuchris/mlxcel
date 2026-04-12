@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use super::*;
+use crate::distributed::mock_transport::{MockRouter, MockTransport, MockTransportConfig};
 use crate::distributed::request_tracker::RequestId;
 use crate::distributed::tensor_protocol::TensorDtype;
 
@@ -438,4 +440,89 @@ async fn test_concurrent_micro_batches() {
     }
     // Should receive in order (FIFO channel).
     assert_eq!(received_mbs, vec![0, 1, 2, 3]);
+}
+
+#[tokio::test]
+async fn test_transport_stage_link_round_trip_and_lifecycle() {
+    let router = MockRouter::new();
+    let upstream_transport = Arc::new(
+        MockTransport::new(
+            "stage-0:9000".to_string(),
+            router.clone(),
+            MockTransportConfig::default(),
+        )
+        .await,
+    );
+    let downstream_transport = Arc::new(
+        MockTransport::new(
+            "stage-1:9001".to_string(),
+            router,
+            MockTransportConfig::default(),
+        )
+        .await,
+    );
+
+    let upstream_state = Arc::new(Mutex::new(StageLifecycleState {
+        health: StageHealth::Healthy,
+        ..Default::default()
+    }));
+    let downstream_state = Arc::new(Mutex::new(StageLifecycleState {
+        health: StageHealth::Healthy,
+        ..Default::default()
+    }));
+    downstream_state
+        .lock()
+        .expect("state lock")
+        .mark_request_started();
+
+    install_stage_control_service(upstream_transport.clone(), upstream_state.clone())
+        .await
+        .expect("install upstream control");
+    install_stage_control_service(downstream_transport.clone(), downstream_state.clone())
+        .await
+        .expect("install downstream control");
+
+    let link = TransportStageLink::new(0, 1, upstream_transport, downstream_transport)
+        .expect("build transport link");
+
+    link.upstream
+        .send_activation(dummy_forward_msg(0, 7))
+        .await
+        .expect("send forward");
+    let (from, received) = link
+        .downstream
+        .recv_activation()
+        .await
+        .expect("recv forward");
+    assert_eq!(from, "stage-0:9000");
+    assert_eq!(received.micro_batch_id, 7);
+
+    link.downstream
+        .send_activation(dummy_reverse_msg(1, 7))
+        .await
+        .expect("send reverse");
+    let (from, received) = link.upstream.recv_activation().await.expect("recv reverse");
+    assert_eq!(from, "stage-1:9001");
+    assert!(received.is_reverse_path);
+
+    let health = link.upstream.probe_health().await.expect("probe health");
+    assert_eq!(health.health, StageHealth::Healthy);
+    assert_eq!(health.in_flight_requests, 1);
+
+    let drained = link.upstream.begin_drain().await.expect("begin drain");
+    assert!(drained.draining);
+
+    let barrier = link.upstream.barrier(42).await.expect("barrier");
+    assert_eq!(barrier.last_barrier_id, Some(42));
+
+    let cancelled = link
+        .upstream
+        .cancel_request(&RequestId::from_string("req-42".to_string()).unwrap())
+        .await
+        .expect("cancel");
+    assert_eq!(cancelled.in_flight_requests, 0);
+
+    let shutdown = link.upstream.shutdown_peer().await.expect("shutdown");
+    assert!(shutdown.shutdown);
+    assert_eq!(shutdown.health, StageHealth::Failed);
 }

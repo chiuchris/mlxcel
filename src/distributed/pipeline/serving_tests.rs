@@ -257,6 +257,43 @@ fn coordinator_allocate_sequence_id() {
 }
 
 #[test]
+fn coordinator_begin_drain_blocks_new_requests() {
+    let config = PipelineServingConfig::new(2, 0).unwrap();
+    let mut coord = PipelineCoordinator::new(config).unwrap();
+
+    let req = PipelineRequest::new(RequestId::new(), 0, vec![1, 2, 3], 10);
+    let _rx = coord.submit_request(req).unwrap();
+    coord.begin_drain();
+
+    assert!(coord.is_draining());
+    assert!(!coord.drain_complete());
+    assert!(!coord.can_accept());
+    let err = coord
+        .submit_request(PipelineRequest::new(RequestId::new(), 0, vec![9], 4))
+        .unwrap_err();
+    assert!(err.to_string().contains("draining"));
+}
+
+#[test]
+fn coordinator_shutdown_fails_inflight_requests_and_completes_drain() {
+    let config = PipelineServingConfig::new(2, 0).unwrap();
+    let mut coord = PipelineCoordinator::new(config).unwrap();
+
+    let req = PipelineRequest::new(RequestId::new(), 0, vec![1, 2, 3], 10);
+    let mut rx = coord.submit_request(req).unwrap();
+
+    let failed = coord.shutdown("pipeline shutdown");
+    assert_eq!(failed.len(), 1);
+    assert!(coord.is_draining());
+    assert!(coord.drain_complete());
+    assert_eq!(coord.in_flight_count(), 0);
+
+    let response = rx.try_recv().expect("shutdown response");
+    assert!(response.is_error());
+    assert_eq!(response.error.as_deref(), Some("pipeline shutdown"));
+}
+
+#[test]
 fn coordinator_multi_token_accumulation() {
     // Verify that tokens accumulate across multiple decode steps and the
     // response is only delivered when is_finished becomes true.
