@@ -34,6 +34,101 @@ fn wait_for_loaded(provider: &ModelProvider) {
     panic!("model provider did not finish loading within 30s");
 }
 
+fn assert_remote_coordinator_matches_dense_baseline(model_name: &str, prompt: &str) {
+    let model_dir = repo_model_dir(model_name);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let num_layers = resolve_in_process_pipeline_num_layers(&model_dir).unwrap();
+    let split = num_layers / 2;
+    let pp_layers = format!("0-{},{}-{}", split - 1, split, num_layers - 1);
+    let assignments =
+        resolve_in_process_stage_assignments(num_layers, None, Some(&pp_layers)).unwrap();
+
+    let coordinator_addr = format!("127.0.0.1:{}", reserve_port());
+    let stage0_addr = format!("127.0.0.1:{}", reserve_port());
+    let stage1_addr = format!("127.0.0.1:{}", reserve_port());
+
+    let stage1 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
+        model_dir: model_dir.clone(),
+        bind_address: stage1_addr.clone(),
+        transport_backend: TransportBackend::Tcp,
+        stage_assignment: assignments[1].clone(),
+        num_stages: 2,
+        upstream_peer: Some(stage0_addr.clone()),
+        downstream_peer: None,
+    })
+    .unwrap();
+    let stage0 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
+        model_dir: model_dir.clone(),
+        bind_address: stage0_addr.clone(),
+        transport_backend: TransportBackend::Tcp,
+        stage_assignment: assignments[0].clone(),
+        num_stages: 2,
+        upstream_peer: None,
+        downstream_peer: Some(stage1_addr.clone()),
+    })
+    .unwrap();
+
+    let dense_provider = ModelProvider::new_with_server_config(
+        model_dir.clone(),
+        None,
+        &ServerConfig::default(),
+        Arc::new(BatchMetrics::new()),
+        Arc::new(BatchObservability::new()),
+    )
+    .unwrap();
+    let remote_provider = ModelProvider::new_with_server_config(
+        model_dir.clone(),
+        None,
+        &ServerConfig {
+            pipeline_parallel_runtime: Some(PipelineParallelRuntimeConfig::RemoteCoordinator(
+                RemotePipelineRuntimeConfig {
+                    stage_peers: vec![stage0_addr.clone(), stage1_addr.clone()],
+                    transport_backend: TransportBackend::Tcp,
+                    bind_address: coordinator_addr,
+                    stage_timeout: Duration::from_secs(5),
+                },
+            )),
+            ..ServerConfig::default()
+        },
+        Arc::new(BatchMetrics::new()),
+        Arc::new(BatchObservability::new()),
+    )
+    .unwrap();
+
+    wait_for_loaded(&dense_provider);
+    wait_for_loaded(&remote_provider);
+
+    let options = ServerGenerateOptions {
+        max_tokens: 8,
+        sampling: SamplingConfig::greedy(),
+        stop_sequences: None,
+        priority: RequestPriority::Normal,
+        logprobs: Default::default(),
+    };
+
+    let dense = dense_provider
+        .generate(prompt.to_string(), options.clone())
+        .unwrap();
+    let remote = remote_provider
+        .generate(prompt.to_string(), options)
+        .unwrap();
+
+    drop(remote_provider);
+    drop(dense_provider);
+    stage0.shutdown().unwrap();
+    stage1.shutdown().unwrap();
+
+    assert_eq!(dense.text, remote.text);
+    assert_eq!(dense.completion_tokens, remote.completion_tokens);
+}
+
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote stage services"]
 fn pipeline_server_remote_coordinator_llama_matches_dense_baseline() {
@@ -134,96 +229,11 @@ fn pipeline_server_remote_coordinator_llama_matches_dense_baseline() {
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote stage services"]
 fn pipeline_server_remote_coordinator_gpt_oss_matches_dense_baseline() {
-    let model_dir = repo_model_dir("gpt-oss-20b-mxfp4");
-    if !model_dir.exists() {
-        eprintln!(
-            "Skipping test: model directory not found at {}",
-            model_dir.display()
-        );
-        return;
-    }
+    assert_remote_coordinator_matches_dense_baseline("gpt-oss-20b-mxfp4", "Hello");
+}
 
-    let num_layers = resolve_in_process_pipeline_num_layers(&model_dir).unwrap();
-    let split = num_layers / 2;
-    let pp_layers = format!("0-{},{}-{}", split - 1, split, num_layers - 1);
-    let assignments =
-        resolve_in_process_stage_assignments(num_layers, None, Some(&pp_layers)).unwrap();
-
-    let coordinator_addr = format!("127.0.0.1:{}", reserve_port());
-    let stage0_addr = format!("127.0.0.1:{}", reserve_port());
-    let stage1_addr = format!("127.0.0.1:{}", reserve_port());
-
-    let stage1 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
-        model_dir: model_dir.clone(),
-        bind_address: stage1_addr.clone(),
-        transport_backend: TransportBackend::Tcp,
-        stage_assignment: assignments[1].clone(),
-        num_stages: 2,
-        upstream_peer: Some(stage0_addr.clone()),
-        downstream_peer: None,
-    })
-    .unwrap();
-    let stage0 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
-        model_dir: model_dir.clone(),
-        bind_address: stage0_addr.clone(),
-        transport_backend: TransportBackend::Tcp,
-        stage_assignment: assignments[0].clone(),
-        num_stages: 2,
-        upstream_peer: None,
-        downstream_peer: Some(stage1_addr.clone()),
-    })
-    .unwrap();
-
-    let dense_provider = ModelProvider::new_with_server_config(
-        model_dir.clone(),
-        None,
-        &ServerConfig::default(),
-        Arc::new(BatchMetrics::new()),
-        Arc::new(BatchObservability::new()),
-    )
-    .unwrap();
-    let remote_provider = ModelProvider::new_with_server_config(
-        model_dir.clone(),
-        None,
-        &ServerConfig {
-            pipeline_parallel_runtime: Some(PipelineParallelRuntimeConfig::RemoteCoordinator(
-                RemotePipelineRuntimeConfig {
-                    stage_peers: vec![stage0_addr.clone(), stage1_addr.clone()],
-                    transport_backend: TransportBackend::Tcp,
-                    bind_address: coordinator_addr,
-                    stage_timeout: Duration::from_secs(5),
-                },
-            )),
-            ..ServerConfig::default()
-        },
-        Arc::new(BatchMetrics::new()),
-        Arc::new(BatchObservability::new()),
-    )
-    .unwrap();
-
-    wait_for_loaded(&dense_provider);
-    wait_for_loaded(&remote_provider);
-
-    let options = ServerGenerateOptions {
-        max_tokens: 8,
-        sampling: SamplingConfig::greedy(),
-        stop_sequences: None,
-        priority: RequestPriority::Normal,
-        logprobs: Default::default(),
-    };
-
-    let dense = dense_provider
-        .generate("Hello".to_string(), options.clone())
-        .unwrap();
-    let remote = remote_provider
-        .generate("Hello".to_string(), options)
-        .unwrap();
-
-    drop(remote_provider);
-    drop(dense_provider);
-    stage0.shutdown().unwrap();
-    stage1.shutdown().unwrap();
-
-    assert_eq!(dense.text, remote.text);
-    assert_eq!(dense.completion_tokens, remote.completion_tokens);
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote stage services"]
+fn pipeline_server_remote_coordinator_gemma3_matches_dense_baseline() {
+    assert_remote_coordinator_matches_dense_baseline("gemma3-1b-4bit", "Hello");
 }

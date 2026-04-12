@@ -24,6 +24,9 @@
 //! - clip_residual_f16 for float16 safety
 //! - Embedding scaling: h *= sqrt(hidden_size)
 
+use crate::distributed::pipeline::LayerFilter;
+use crate::distributed::pipeline::StageExecutionOutput;
+use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::model_owned::{
     ModelOwnedSequenceState, dispatch_paged_decode_from_visible_caches,
 };
@@ -126,7 +129,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         cache: &mut dyn CacheInterface,
@@ -502,7 +505,7 @@ pub struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         cache: &mut dyn CacheInterface,
@@ -583,7 +586,7 @@ impl TransformerBlock {
 }
 
 // Cache Interface.
-pub trait CacheInterface {
+pub(crate) trait CacheInterface {
     fn offset(&self) -> i32;
     fn update_and_fetch(
         &mut self,
@@ -620,20 +623,20 @@ impl CacheInterface for RotatingKVCache {
     }
 }
 
-pub enum Cache {
+pub(crate) enum Cache {
     Standard(KVCache),
     Rotating(RotatingKVCache),
 }
 
 impl Cache {
-    fn as_interface(&mut self) -> &mut dyn CacheInterface {
+    pub(crate) fn as_interface(&mut self) -> &mut dyn CacheInterface {
         match self {
             Cache::Standard(c) => c,
             Cache::Rotating(c) => c,
         }
     }
 
-    fn offset(&self) -> i32 {
+    pub(crate) fn offset(&self) -> i32 {
         match self {
             Cache::Standard(c) => c.offset,
             Cache::Rotating(c) => c.offset,
@@ -714,7 +717,7 @@ impl Gemma3Model {
 
     /// Forward pass with pre-computed embeddings (for VLM)
     /// If input_embeddings is Some, skip embed_tokens and use provided embeddings
-    pub fn forward_with_caches_and_embeddings(
+    pub(crate) fn forward_with_caches_and_embeddings(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
@@ -799,7 +802,7 @@ impl Gemma3Model {
     }
 
     /// Forward pass through the entire model
-    pub fn forward_with_caches(
+    pub(crate) fn forward_with_caches(
         &self,
         input_ids: &MlxArray,
         caches: &mut [Cache],
@@ -808,7 +811,7 @@ impl Gemma3Model {
     }
 
     /// Create KV caches for all layers
-    pub fn make_caches(&self) -> Vec<Cache> {
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
         (0..self.layers.len())
             .map(|i| {
                 let is_global =
@@ -898,6 +901,216 @@ impl Gemma3Model {
             sliding_window_pattern: args.sliding_window_pattern,
             hidden_size: args.hidden_size,
         })
+    }
+}
+
+pub(crate) struct Gemma3StageModel {
+    filter: LayerFilter,
+    embed_tokens: Option<UnifiedEmbedding>,
+    layers: Vec<TransformerBlock>,
+    norm: Option<GemmaRMSNorm>,
+    lm_head: Option<UnifiedLinear>,
+    sliding_window: usize,
+    sliding_window_pattern: usize,
+    hidden_size: usize,
+}
+
+impl Gemma3StageModel {
+    pub(crate) fn load(
+        model_dir: &Path,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read {}: {}", config_path.display(), e))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: ModelArgs = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse {}: {}", config_path.display(), e))?;
+
+        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        filter_weight_map(&mut weights, filter);
+        Self::from_filtered_weights(&weights, &args, filter, stage_index)
+    }
+
+    fn from_filtered_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let group_size = args.group_size();
+        let bits = args.bits();
+        let embed_tokens = if filter.has_embedding {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                "model.embed_tokens",
+                group_size,
+                bits,
+            )?)
+        } else {
+            None
+        };
+
+        let mut layers = Vec::with_capacity(filter.num_layers());
+        for layer_idx in filter.layer_range.clone() {
+            layers.push(TransformerBlock::from_weights(weights, args, layer_idx)?);
+        }
+
+        if layers.is_empty() {
+            return Err(format!(
+                "stage {} did not load any layers from range {}..{}",
+                stage_index, filter.layer_range.start, filter.layer_range.end
+            ));
+        }
+
+        let (norm, lm_head) = if filter.has_lm_head {
+            let norm_weight = get_weight_copy(weights, "model.norm.weight")?;
+            let norm = GemmaRMSNorm::new(norm_weight, args.rms_norm_eps);
+            let lm_head = UnifiedLinear::from_weights(weights, "lm_head", group_size, bits)?;
+            (Some(norm), Some(lm_head))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            filter: filter.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            sliding_window: args.sliding_window,
+            sliding_window_pattern: args.sliding_window_pattern,
+            hidden_size: args.hidden_size,
+        })
+    }
+
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
+        (0..self.layers.len())
+            .map(|layer_idx| {
+                let global_idx = self.global_layer_index(layer_idx);
+                let is_global =
+                    (global_idx % self.sliding_window_pattern) == (self.sliding_window_pattern - 1);
+                if is_global {
+                    Cache::Standard(KVCache::new())
+                } else {
+                    Cache::Rotating(RotatingKVCache::new(self.sliding_window as i32))
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn execute_from_token_ids(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        let mut hidden = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| {
+                "stage does not host embeddings; hidden-state input required".to_string()
+            })?
+            .forward(input_ids);
+        hidden = mlxcel_core::multiply_scalar(&hidden, (self.hidden_size as f32).sqrt());
+        self.execute_hidden(hidden, caches)
+    }
+
+    pub(crate) fn execute_from_hidden_states(
+        &self,
+        hidden: UniquePtr<MlxArray>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if self.filter.has_embedding {
+            return Err("entry stage expects token IDs, not hidden states".to_string());
+        }
+        self.execute_hidden(hidden, caches)
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if caches.len() != self.layers.len() {
+            return Err(format!(
+                "stage cache count mismatch: expected {}, got {}",
+                self.layers.len(),
+                caches.len()
+            ));
+        }
+
+        let seq_len = mlxcel_core::array_shape(hidden.as_ref().unwrap())[1];
+        if seq_len > 1 {
+            let global_offset = self
+                .first_global_cache_index()
+                .map(|idx| caches[idx].offset())
+                .unwrap_or(0);
+            let global_mask = create_causal_mask(seq_len, global_offset);
+
+            let sliding_mask = if self.first_sliding_cache_index().is_some() {
+                let sliding_offset = caches[self.first_sliding_cache_index().unwrap()].offset();
+                let max_cache = self.sliding_window as i32;
+                let effective_offset = sliding_offset.min((max_cache - seq_len).max(0));
+                Some(create_causal_mask_with_window(
+                    seq_len,
+                    effective_offset,
+                    Some(max_cache),
+                ))
+            } else {
+                None
+            };
+
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let mask = if self.is_global_layer(layer_idx) {
+                    Some(global_mask.as_ref().unwrap() as &MlxArray)
+                } else {
+                    sliding_mask.as_deref()
+                };
+                hidden = layer.forward(
+                    hidden.as_ref().unwrap(),
+                    caches[layer_idx].as_interface(),
+                    mask,
+                );
+            }
+        } else {
+            for (layer_idx, layer) in self.layers.iter().enumerate() {
+                hidden = layer.forward(
+                    hidden.as_ref().unwrap(),
+                    caches[layer_idx].as_interface(),
+                    None,
+                );
+            }
+        }
+
+        match (&self.norm, &self.lm_head) {
+            (Some(norm), Some(lm_head)) => {
+                let hidden = norm.forward(hidden.as_ref().unwrap());
+                Ok(StageExecutionOutput::Logits(lm_head.forward(&hidden)))
+            }
+            _ => Ok(StageExecutionOutput::HiddenStates(hidden)),
+        }
+    }
+
+    fn global_layer_index(&self, local_idx: usize) -> usize {
+        self.filter.layer_range.start + local_idx
+    }
+
+    fn is_global_layer(&self, local_idx: usize) -> bool {
+        let global_idx = self.global_layer_index(local_idx);
+        (global_idx % self.sliding_window_pattern) == (self.sliding_window_pattern - 1)
+    }
+
+    fn first_global_cache_index(&self) -> Option<usize> {
+        (0..self.layers.len()).find(|&idx| self.is_global_layer(idx))
+    }
+
+    fn first_sliding_cache_index(&self) -> Option<usize> {
+        (0..self.layers.len()).find(|&idx| !self.is_global_layer(idx))
     }
 }
 

@@ -73,6 +73,60 @@ fn spawn_remote_runtime(
     (runtime, stage0, stage1)
 }
 
+fn assert_remote_runtime_matches_full_model(
+    model_name: &str,
+    prompt: &[i32],
+    decode_token: i32,
+    seq_raw: u64,
+) {
+    let model_dir = repo_model_dir(model_name);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let (model, _) = mlxcel::load_model(&model_dir).unwrap();
+    let (runtime, stage0, stage1) = spawn_remote_runtime(
+        &model_dir,
+        "127.0.0.1".parse().unwrap(),
+        TransportBackend::Tcp,
+    );
+
+    let prompt_ids = mlxcel_core::from_slice_i32(prompt, &[1, prompt.len() as i32]);
+    let decode_ids = mlxcel_core::from_slice_i32(&[decode_token], &[1, 1]);
+
+    let mut full_caches = model.make_caches();
+    let full_prefill = model.forward(&prompt_ids, &mut full_caches, None);
+    let full_decode = model.forward(&decode_ids, &mut full_caches, None);
+
+    let seq_id = SequenceId::from_raw(seq_raw);
+    runtime.prepare_sequence_state(seq_id);
+    let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
+    let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
+
+    let atol = 1e-4f64;
+    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
+        &full_prefill,
+        &remote_prefill,
+        atol,
+        atol
+    )));
+    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
+        &full_decode,
+        &remote_decode,
+        atol,
+        atol
+    )));
+
+    runtime.release_sequence_state_by_id(seq_id);
+    runtime.shutdown().unwrap();
+    stage0.shutdown().unwrap();
+    stage1.shutdown().unwrap();
+}
+
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
 fn pipeline_remote_runtime_llama_real_model_parity_and_cleanup() {
@@ -244,47 +298,11 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
 fn pipeline_remote_runtime_gpt_oss_real_model_parity_and_cleanup() {
-    let model_dir = repo_model_dir("gpt-oss-20b-mxfp4");
-    if !model_dir.exists() {
-        eprintln!(
-            "Skipping test: model directory not found at {}",
-            model_dir.display()
-        );
-        return;
-    }
+    assert_remote_runtime_matches_full_model("gpt-oss-20b-mxfp4", &[42, 43], 44, 420);
+}
 
-    let (model, _) = mlxcel::load_model(&model_dir).unwrap();
-    let (runtime, stage0, stage1) =
-        spawn_remote_runtime(&model_dir, "127.0.0.1".parse().unwrap(), TransportBackend::Tcp);
-
-    let prompt_ids = mlxcel_core::from_slice_i32(&[42, 43], &[1, 2]);
-    let decode_ids = mlxcel_core::from_slice_i32(&[44], &[1, 1]);
-
-    let mut full_caches = model.make_caches();
-    let full_prefill = model.forward(&prompt_ids, &mut full_caches, None);
-    let full_decode = model.forward(&decode_ids, &mut full_caches, None);
-
-    let seq_id = SequenceId::from_raw(420);
-    runtime.prepare_sequence_state(seq_id);
-    let remote_prefill = runtime.forward_sequence(seq_id, &prompt_ids, None).unwrap();
-    let remote_decode = runtime.forward_sequence(seq_id, &decode_ids, None).unwrap();
-
-    let atol = 1e-4f64;
-    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
-        &full_prefill,
-        &remote_prefill,
-        atol,
-        atol
-    )));
-    assert!(mlxcel_core::item_bool(&mlxcel_core::allclose(
-        &full_decode,
-        &remote_decode,
-        atol,
-        atol
-    )));
-
-    runtime.release_sequence_state_by_id(seq_id);
-    runtime.shutdown().unwrap();
-    stage0.shutdown().unwrap();
-    stage1.shutdown().unwrap();
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
+fn pipeline_remote_runtime_gemma3_real_model_parity_and_cleanup() {
+    assert_remote_runtime_matches_full_model("gemma3-1b-4bit", &[2, 3], 4, 430);
 }
