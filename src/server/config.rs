@@ -136,6 +136,10 @@ pub struct ServerConfig {
     pub max_batch_prefill: usize,
     /// Decode-time storage backend used by the batch scheduler.
     pub decode_storage_backend: DecodeStorageBackend,
+    /// Manual in-process pipeline stage partition for server startup.
+    pub pipeline_parallel_layers: Option<String>,
+    /// Micro-batch size for in-process pipeline execution.
+    pub pipeline_parallel_micro_batch_size: usize,
     /// Tensor-parallel loading/runtime options resolved at startup.
     pub tensor_parallel: ShardConfig,
 }
@@ -175,6 +179,8 @@ impl Default for ServerConfig {
             no_batch: false,
             max_batch_prefill: 1,
             decode_storage_backend: DecodeStorageBackend::Auto,
+            pipeline_parallel_layers: None,
+            pipeline_parallel_micro_batch_size: 1,
             tensor_parallel: ShardConfig::default(),
         }
     }

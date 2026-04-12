@@ -68,11 +68,13 @@
 pub mod activation_transfer;
 pub mod benchmark;
 pub mod cache_manager;
+pub mod local_runtime;
 pub mod metrics;
 pub mod micro_batch;
 pub mod partial_loading;
 pub mod partition;
 pub mod schedule;
+pub mod server_runtime;
 pub mod serving;
 pub mod stage_executor;
 pub mod stage_worker;
@@ -92,6 +94,10 @@ pub use cache_manager::{
     PreemptionSignal, RejectionReason, SequenceId, StageCacheAllocation, broadcast_eviction,
     check_pipeline_pressure, coordinated_admission, sync_metadata,
 };
+pub use local_runtime::{
+    load_in_process_stage_worker, resolve_in_process_pipeline_num_layers,
+    resolve_in_process_stage_assignments,
+};
 pub use metrics::{
     MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics, StageMetrics,
 };
@@ -110,6 +116,7 @@ pub use partition::{
 pub use schedule::{
     GPipeSchedule, PipelineConfig, PipelineSchedule, ScheduleAction, create_gpipe_schedule,
 };
+pub use server_runtime::InProcessPipelineModel;
 pub use serving::{
     ChunkedPrefillPipeline, FailedRequest, PipelineCoordinator, PipelineRequest, PipelineResponse,
     PipelineServingConfig, StageHealth, StageRole, detect_pipeline_config, should_use_pipeline,

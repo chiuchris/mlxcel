@@ -127,10 +127,11 @@ pub use pipeline::{
     WeightClass, activation_channel, activation_latency, auto_partition, build_manual_assignments,
     build_pipeline_links, classify_weight_key, create_gpipe_schedule, detect_pipeline_config,
     estimate_partial_memory, filter_weight_keys, filter_weight_map, format_benchmark_report,
-    identify_required_shards, parse_manual_partition, run_pipeline_benchmark,
-    run_scaling_benchmark, should_load_key, should_use_pipeline, split_into_micro_batches,
-    suggested_micro_batch_size, to_pipeline_schedule_config, validate_activation,
-    validate_memory_fit, validate_partial_memory, validate_partition,
+    identify_required_shards, load_in_process_stage_worker, parse_manual_partition,
+    resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
+    run_pipeline_benchmark, run_scaling_benchmark, should_load_key, should_use_pipeline,
+    split_into_micro_batches, suggested_micro_batch_size, to_pipeline_schedule_config,
+    validate_activation, validate_memory_fit, validate_partial_memory, validate_partition,
 };
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use request_tracker::{

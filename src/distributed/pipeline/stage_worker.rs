@@ -120,6 +120,10 @@ impl PipelineStageWorker {
         }
     }
 
+    fn release_request(&mut self, request_id: &RequestId) {
+        self.caches_by_request.remove(request_id.as_str());
+    }
+
     fn receive_forward(&mut self, micro_batch_id: u32) -> Result<()> {
         let receiver = self
             .incoming_forward
@@ -412,6 +416,12 @@ impl InProcessStageWorkerLoop {
             .collect();
 
         Ok(Self { config, workers })
+    }
+
+    pub fn release_request(&mut self, request_id: &RequestId) {
+        for worker in &mut self.workers {
+            worker.release_request(request_id);
+        }
     }
 
     /// Execute one GPipe step to completion.

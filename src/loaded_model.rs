@@ -42,6 +42,7 @@ use mlxcel_core::generate::LanguageModel;
 /// that manage their internal cache state since they require mixed cache types.
 pub enum LoadedModel {
     Llama(models::Llama3Model),
+    PipelineLlama(crate::distributed::pipeline::InProcessPipelineModel),
     TensorParallelLlama(crate::distributed::TensorParallelLlamaModel),
     TensorParallelQwen3(crate::distributed::TensorParallelQwen3Model),
     TensorParallelQwen35(crate::distributed::TensorParallelQwen35Model),
@@ -144,6 +145,7 @@ macro_rules! delegate_language_model {
     ($self:expr, $method:ident ( $($arg:expr),* $(,)? )) => {
         match $self {
             LoadedModel::Llama(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::PipelineLlama(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::TensorParallelLlama(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::TensorParallelQwen3(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::TensorParallelQwen35(inner) => LanguageModel::$method(inner, $($arg),*),
