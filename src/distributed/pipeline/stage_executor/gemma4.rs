@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::cell::{RefCell, RefMut};
-use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::Result;
@@ -22,11 +20,12 @@ use mlxcel_core::{MlxArray, copy};
 
 use crate::models::gemma4::{Cache as Gemma4Cache, Gemma4StageModel};
 
+use super::common::PointerOwnedCacheStore;
 use super::{FamilyStageExecutor, LayerFilter, StageExecutionInput, StageExecutionOutput};
 
 pub struct Gemma4StageExecutor {
     model: Gemma4StageModel,
-    cache_sets: RefCell<HashMap<usize, Vec<Gemma4Cache>>>,
+    cache_store: PointerOwnedCacheStore<Gemma4Cache>,
 }
 
 impl Gemma4StageExecutor {
@@ -34,45 +33,7 @@ impl Gemma4StageExecutor {
         Ok(Self {
             model: Gemma4StageModel::load(model_dir, filter, stage_index)
                 .map_err(anyhow::Error::msg)?,
-            cache_sets: RefCell::new(HashMap::new()),
-        })
-    }
-
-    fn cache_key(caches: &[KVCache]) -> usize {
-        caches.as_ptr() as usize
-    }
-
-    fn sequence_needs_reset(external_caches: &[KVCache], internal_caches: &[Gemma4Cache]) -> bool {
-        external_caches.iter().all(|cache| cache.offset == 0)
-            && internal_caches.iter().any(|cache| cache.offset() > 0)
-    }
-
-    fn sync_external_offsets(external_caches: &mut [KVCache], internal_caches: &[Gemma4Cache]) {
-        for (external, internal) in external_caches.iter_mut().zip(internal_caches.iter()) {
-            external.offset = internal.offset();
-        }
-    }
-
-    fn caches_for_key<'a>(
-        &'a self,
-        cache_key: usize,
-        external_caches: &[KVCache],
-    ) -> RefMut<'a, Vec<Gemma4Cache>> {
-        let needs_reset = {
-            let cache_sets = self.cache_sets.borrow();
-            cache_sets.get(&cache_key).is_some_and(|internal_caches| {
-                Self::sequence_needs_reset(external_caches, internal_caches)
-            })
-        };
-
-        let mut cache_sets = self.cache_sets.borrow_mut();
-        if needs_reset || !cache_sets.contains_key(&cache_key) {
-            cache_sets.insert(cache_key, self.model.make_caches());
-        }
-        RefMut::map(cache_sets, |cache_sets| {
-            cache_sets
-                .get_mut(&cache_key)
-                .expect("gemma4 sequence cache entry must exist")
+            cache_store: PointerOwnedCacheStore::default(),
         })
     }
 }
@@ -85,9 +46,7 @@ impl FamilyStageExecutor for Gemma4StageExecutor {
     }
 
     fn release_caches(&self, caches: &[KVCache]) {
-        self.cache_sets
-            .borrow_mut()
-            .remove(&Self::cache_key(caches));
+        self.cache_store.release_caches(caches);
     }
 
     fn execute(
@@ -96,8 +55,12 @@ impl FamilyStageExecutor for Gemma4StageExecutor {
         caches: &mut [KVCache],
         _mask: Option<&MlxArray>,
     ) -> Result<StageExecutionOutput> {
-        let cache_key = Self::cache_key(caches);
-        let mut internal_caches = self.caches_for_key(cache_key, caches);
+        let mut internal_caches = self.cache_store.caches_for_sequence(
+            caches,
+            || self.model.make_caches(),
+            Gemma4Cache::offset,
+            "gemma4 sequence cache entry must exist",
+        );
 
         let output = match input {
             StageExecutionInput::TokenIds(input_ids) => self
@@ -109,7 +72,11 @@ impl FamilyStageExecutor for Gemma4StageExecutor {
         }
         .map_err(anyhow::Error::msg)?;
 
-        Self::sync_external_offsets(caches, &internal_caches);
+        PointerOwnedCacheStore::sync_external_offsets(
+            caches,
+            &internal_caches,
+            Gemma4Cache::offset,
+        );
         Ok(output)
     }
 }

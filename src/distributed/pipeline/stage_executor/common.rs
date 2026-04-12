@@ -16,6 +16,9 @@
 //!
 //! Used by: Llama stage executor, future GPT-OSS/Gemma/Qwen/GLM stage executors
 
+use std::cell::{RefCell, RefMut};
+use std::collections::HashMap;
+
 use anyhow::{Result, anyhow, bail, ensure};
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::pipeline_hint;
@@ -24,6 +27,65 @@ use mlxcel_core::{MlxArray, UniquePtr, copy};
 use crate::distributed::pipeline::LayerFilter;
 
 use super::{StageExecutionInput, StageExecutionOutput};
+
+pub struct PointerOwnedCacheStore<C> {
+    cache_sets: RefCell<HashMap<usize, Vec<C>>>,
+}
+
+impl<C> Default for PointerOwnedCacheStore<C> {
+    fn default() -> Self {
+        Self {
+            cache_sets: RefCell::new(HashMap::new()),
+        }
+    }
+}
+
+impl<C> PointerOwnedCacheStore<C> {
+    pub fn cache_key(caches: &[KVCache]) -> usize {
+        caches.as_ptr() as usize
+    }
+
+    pub fn release_caches(&self, caches: &[KVCache]) {
+        self.cache_sets
+            .borrow_mut()
+            .remove(&Self::cache_key(caches));
+    }
+
+    pub fn sync_external_offsets(
+        external_caches: &mut [KVCache],
+        internal_caches: &[C],
+        cache_offset: impl Fn(&C) -> i32,
+    ) {
+        for (external, internal) in external_caches.iter_mut().zip(internal_caches.iter()) {
+            external.offset = cache_offset(internal);
+        }
+    }
+
+    pub fn caches_for_sequence<'a>(
+        &'a self,
+        external_caches: &[KVCache],
+        make_caches: impl FnOnce() -> Vec<C>,
+        cache_offset: impl Fn(&C) -> i32,
+        missing_message: &'static str,
+    ) -> RefMut<'a, Vec<C>> {
+        let cache_key = Self::cache_key(external_caches);
+        let needs_reset = {
+            let cache_sets = self.cache_sets.borrow();
+            cache_sets.get(&cache_key).is_some_and(|internal_caches| {
+                external_caches.iter().all(|cache| cache.offset == 0)
+                    && internal_caches.iter().any(|cache| cache_offset(cache) > 0)
+            })
+        };
+
+        let mut cache_sets = self.cache_sets.borrow_mut();
+        if needs_reset || !cache_sets.contains_key(&cache_key) {
+            cache_sets.insert(cache_key, make_caches());
+        }
+        RefMut::map(cache_sets, |cache_sets| {
+            cache_sets.get_mut(&cache_key).expect(missing_message)
+        })
+    }
+}
 
 pub trait TransformerStageLayer {
     fn forward(

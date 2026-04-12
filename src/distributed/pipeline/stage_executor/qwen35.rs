@@ -18,27 +18,28 @@ use anyhow::Result;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, copy};
 
-use crate::models::gemma3::{Cache as Gemma3Cache, Gemma3StageModel};
+use crate::models::qwen3_5::Qwen35StageModel;
+use crate::models::qwen3_next::Qwen3NextCache;
 
 use super::common::PointerOwnedCacheStore;
 use super::{FamilyStageExecutor, LayerFilter, StageExecutionInput, StageExecutionOutput};
 
-pub struct Gemma3StageExecutor {
-    model: Gemma3StageModel,
-    cache_store: PointerOwnedCacheStore<Gemma3Cache>,
+pub struct Qwen35StageExecutor {
+    model: Qwen35StageModel,
+    cache_store: PointerOwnedCacheStore<Qwen3NextCache>,
 }
 
-impl Gemma3StageExecutor {
+impl Qwen35StageExecutor {
     pub fn load(model_dir: &Path, filter: &LayerFilter, stage_index: usize) -> Result<Self> {
         Ok(Self {
-            model: Gemma3StageModel::load(model_dir, filter, stage_index)
+            model: Qwen35StageModel::load(model_dir, filter, stage_index)
                 .map_err(anyhow::Error::msg)?,
             cache_store: PointerOwnedCacheStore::default(),
         })
     }
 }
 
-impl FamilyStageExecutor for Gemma3StageExecutor {
+impl FamilyStageExecutor for Qwen35StageExecutor {
     fn make_caches(&self) -> Vec<KVCache> {
         (0..self.model.num_layers())
             .map(|_| KVCache::new())
@@ -58,8 +59,8 @@ impl FamilyStageExecutor for Gemma3StageExecutor {
         let mut internal_caches = self.cache_store.caches_for_sequence(
             caches,
             || self.model.make_caches(),
-            Gemma3Cache::offset,
-            "gemma3 sequence cache entry must exist",
+            Qwen3NextCache::offset,
+            "qwen3.5 sequence cache entry must exist",
         );
 
         let output = match input {
@@ -75,7 +76,7 @@ impl FamilyStageExecutor for Gemma3StageExecutor {
         PointerOwnedCacheStore::sync_external_offsets(
             caches,
             &internal_caches,
-            Gemma3Cache::offset,
+            Qwen3NextCache::offset,
         );
         Ok(output)
     }

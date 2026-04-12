@@ -32,6 +32,7 @@ mod gemma4;
 mod gpt_oss;
 mod llama;
 mod qwen3;
+mod qwen35;
 
 use std::path::Path;
 
@@ -48,6 +49,7 @@ use gemma4::Gemma4StageExecutor;
 use gpt_oss::GptOssStageExecutor;
 use llama::LlamaStageExecutor;
 use qwen3::Qwen3StageExecutor;
+use qwen35::Qwen35StageExecutor;
 
 /// Input payload for a single stage-local forward.
 pub enum StageExecutionInput<'a> {
@@ -193,6 +195,14 @@ fn load_family_backend(
             stage_index,
         )?)),
         ModelType::Qwen3 => Ok(Box::new(Qwen3StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::Qwen35
+        | ModelType::Qwen35VLM
+        | ModelType::Qwen35Moe
+        | ModelType::Qwen35MoeVLM => Ok(Box::new(Qwen35StageExecutor::load(
             model_dir,
             filter,
             stage_index,

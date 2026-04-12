@@ -25,6 +25,9 @@
 //!
 //! Reference: mlx-lm/mlx_lm/models/qwen3_5.py
 
+use crate::distributed::pipeline::LayerFilter;
+use crate::distributed::pipeline::StageExecutionOutput;
+use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::gated_delta::{GatedDeltaCache, RMSNormGated, gated_delta_update};
 use crate::models::model_owned::ModelOwnedSequenceState;
 use crate::models::qwen3_next::{
@@ -1133,6 +1136,224 @@ impl Qwen35Model {
                     mrope_section.clone(),
                 ));
             }
+        }
+    }
+}
+
+pub(crate) struct Qwen35StageModel {
+    filter: LayerFilter,
+    embed_tokens: Option<UnifiedEmbedding>,
+    layers: Vec<Qwen35DecoderLayer>,
+    norm: Option<RMSNorm>,
+    lm_head: Option<UnifiedLinear>,
+}
+
+impl Qwen35StageModel {
+    pub(crate) fn load(
+        model_dir: &Path,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.json: {}", e))?;
+        let v: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+
+        let mut text_config_val = if let Some(tc) = v.get("text_config") {
+            tc.clone()
+        } else {
+            v.clone()
+        };
+        if text_config_val.get("quantization").is_none() && v.get("quantization").is_some() {
+            text_config_val
+                .as_object_mut()
+                .expect("Qwen3.5 text config must be a JSON object")
+                .insert("quantization".to_string(), v["quantization"].clone());
+        }
+        let config: Qwen35Config = serde_json::from_value(text_config_val)
+            .map_err(|e| format!("Failed to parse config: {}", e))?;
+
+        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        weights = sanitize_moe_weights(weights, &config);
+        let mut effective_filter = filter.clone();
+        if config.tie_word_embeddings && filter.has_lm_head {
+            effective_filter.has_embedding = true;
+        }
+        filter_weight_map(&mut weights, &effective_filter);
+        Self::from_filtered_weights(&weights, &config, filter, stage_index)
+    }
+
+    fn from_filtered_weights(
+        weights: &WeightMap,
+        config: &Qwen35Config,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let group_size = config.group_size();
+        let bits = config.bits();
+        let qn_config = config.to_qwen3next_config();
+
+        let load_embeddings =
+            filter.has_embedding || (config.tie_word_embeddings && filter.has_lm_head);
+        let embed_tokens = if load_embeddings {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                "model.embed_tokens",
+                group_size,
+                bits,
+            )?)
+        } else {
+            None
+        };
+
+        let mut layers = Vec::with_capacity(filter.num_layers());
+        for layer_idx in filter.layer_range.clone() {
+            layers.push(Qwen35DecoderLayer::from_weights(
+                weights, config, &qn_config, layer_idx,
+            )?);
+        }
+
+        if layers.is_empty() {
+            return Err(format!(
+                "stage {} did not load any layers from range {}..{}",
+                stage_index, filter.layer_range.start, filter.layer_range.end
+            ));
+        }
+
+        let norm = if filter.has_lm_head {
+            Some(RMSNorm::new(
+                weights
+                    .get("model.norm.weight")
+                    .map(|w| mlxcel_core::copy(w))
+                    .ok_or_else(|| "Missing model.norm.weight".to_string())?,
+                config.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+
+        let lm_head = if filter.has_lm_head && !config.tie_word_embeddings {
+            Some(UnifiedLinear::from_weights(
+                weights, "lm_head", group_size, bits,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            filter: filter.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
+    }
+
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn make_caches(&self) -> Vec<Qwen3NextCache> {
+        self.layers
+            .iter()
+            .map(|layer| {
+                if layer.is_linear {
+                    Qwen3NextCache::Linear(GatedDeltaCache::new())
+                } else {
+                    Qwen3NextCache::Attention(KVCache::new())
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn execute_from_token_ids(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Qwen3NextCache],
+    ) -> Result<StageExecutionOutput, String> {
+        let hidden = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| {
+                "stage does not host embeddings; hidden-state input required".to_string()
+            })?
+            .forward(input_ids);
+        self.execute_hidden(hidden, caches)
+    }
+
+    pub(crate) fn execute_from_hidden_states(
+        &self,
+        hidden_states: UniquePtr<MlxArray>,
+        caches: &mut [Qwen3NextCache],
+    ) -> Result<StageExecutionOutput, String> {
+        if self.filter.has_embedding {
+            return Err("entry stage expects token IDs, not hidden states".to_string());
+        }
+        self.execute_hidden(hidden_states, caches)
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        caches: &mut [Qwen3NextCache],
+    ) -> Result<StageExecutionOutput, String> {
+        if caches.len() != self.layers.len() {
+            return Err(format!(
+                "stage cache count mismatch: expected {}, got {}",
+                self.layers.len(),
+                caches.len()
+            ));
+        }
+
+        let shape = mlxcel_core::array_shape(hidden.as_ref().unwrap());
+        let seq_len = shape[1];
+        let fa_mask = if seq_len > 1 {
+            let offset = self
+                .layers
+                .iter()
+                .zip(caches.iter())
+                .find_map(|(layer, cache)| {
+                    (!layer.is_linear).then_some(match cache {
+                        Qwen3NextCache::Attention(kv) => kv.offset,
+                        Qwen3NextCache::Linear(gd) => gd.offset,
+                    })
+                })
+                .unwrap_or(0);
+            Some(create_causal_mask(seq_len, offset))
+        } else {
+            None
+        };
+
+        for (layer, cache) in self.layers.iter().zip(caches.iter_mut()) {
+            let mask = if layer.is_linear {
+                None
+            } else {
+                fa_mask.as_deref()
+            };
+            hidden = layer.forward(hidden.as_ref().unwrap(), mask, cache, None);
+        }
+
+        let hidden = if let Some(norm) = &self.norm {
+            norm.forward(hidden.as_ref().unwrap())
+        } else {
+            hidden
+        };
+
+        if self.filter.has_lm_head {
+            let logits = if let Some(lm_head) = &self.lm_head {
+                lm_head.forward(&hidden)
+            } else {
+                self.embed_tokens
+                    .as_ref()
+                    .ok_or_else(|| {
+                        "final tied-word-embedding stage missing embeddings".to_string()
+                    })?
+                    .as_linear(&hidden)
+            };
+            Ok(StageExecutionOutput::Logits(logits))
+        } else {
+            Ok(StageExecutionOutput::HiddenStates(hidden))
         }
     }
 }
