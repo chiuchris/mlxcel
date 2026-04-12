@@ -18,7 +18,9 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use mlxcel_core::cache::SequenceId;
@@ -195,6 +197,7 @@ pub struct RemotePipelineRuntimeConfig {
     pub stage_peers: Vec<String>,
     pub transport_backend: TransportBackend,
     pub bind_address: String,
+    pub stage_timeout: Duration,
 }
 
 pub struct RemotePipelineRuntime {
@@ -202,6 +205,8 @@ pub struct RemotePipelineRuntime {
     transport: Arc<TcpTransport>,
     io_runtime: Mutex<tokio::runtime::Runtime>,
     request_ids: Mutex<HashMap<SequenceId, RequestId>>,
+    stage_timeout: Duration,
+    draining: AtomicBool,
 }
 
 impl RemotePipelineRuntime {
@@ -237,6 +242,8 @@ impl RemotePipelineRuntime {
             transport,
             io_runtime: Mutex::new(io_runtime),
             request_ids: Mutex::new(HashMap::new()),
+            stage_timeout: config.stage_timeout,
+            draining: AtomicBool::new(false),
         })
     }
 
@@ -253,6 +260,7 @@ impl RemotePipelineRuntime {
         let transport = Arc::clone(&self.transport);
         let peer = peer.to_string();
         let reply_addr = self.transport.local_addr()?;
+        let timeout = self.stage_timeout;
         self.io_runtime
             .lock()
             .expect("remote pipeline runtime poisoned")
@@ -272,7 +280,11 @@ impl RemotePipelineRuntime {
                     .await?;
 
                 loop {
-                    let (_from, msg) = transport.recv().await?;
+                    let (_from, msg) = tokio::time::timeout(timeout, transport.recv())
+                        .await
+                        .map_err(|_| {
+                            anyhow!("remote stage {} timed out after {:?}", peer, timeout)
+                        })??;
                     let TransportMessage::Control { operation, payload } = msg else {
                         continue;
                     };
@@ -317,10 +329,33 @@ impl RemotePipelineRuntime {
         }
         Ok(states)
     }
+
+    pub fn begin_drain(&self) -> Result<()> {
+        self.draining.store(true, Ordering::Release);
+        self.broadcast_ack(RemoteStageCommand::BeginDrain)
+    }
+
+    pub fn shutdown(&self) -> Result<()> {
+        self.draining.store(true, Ordering::Release);
+        self.broadcast_ack(RemoteStageCommand::Shutdown)
+    }
+
+    fn cleanup_request(&self, request_id: &RequestId) {
+        let _ = self.broadcast_ack(RemoteStageCommand::CancelRequest {
+            request_id: request_id.as_str().to_string(),
+        });
+        let _ = self.broadcast_ack(RemoteStageCommand::ReleaseSequence {
+            request_id: request_id.as_str().to_string(),
+        });
+    }
 }
 
 impl PipelineModelRuntime for RemotePipelineRuntime {
     fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        assert!(
+            !self.draining.load(Ordering::Acquire),
+            "remote pipeline runtime is draining; refusing to prepare new sequence state"
+        );
         let request_id = RequestId::from_string(format!("pp-seq-{}", seq_id.as_u64()))
             .expect("sequence-derived request id must be valid");
         self.request_ids
@@ -354,7 +389,7 @@ impl PipelineModelRuntime for RemotePipelineRuntime {
         mask: Option<&MlxArray>,
     ) -> Result<UniquePtr<MlxArray>> {
         let request_id = self.request_id_for(seq_id);
-        let response = self.exchange(
+        let response = match self.exchange(
             &self.stage_peers[0],
             RemoteStageCommand::RunEntry {
                 request_id: request_id.as_str().to_string(),
@@ -362,11 +397,23 @@ impl PipelineModelRuntime for RemotePipelineRuntime {
                 input_ids: serialize_mlx_array(input_ids)?,
                 attention_mask: mask.map(serialize_mlx_array).transpose()?,
             },
-        )?;
+        ) {
+            Ok(response) => response,
+            Err(err) => {
+                self.cleanup_request(&request_id);
+                return Err(err);
+            }
+        };
         match response {
             RemoteStageResponse::RunResult { logits, .. } => deserialize_wire_tensor(&logits),
-            RemoteStageResponse::Error { message, .. } => Err(anyhow!(message)),
-            other => Err(anyhow!("unexpected remote forward response: {:?}", other)),
+            RemoteStageResponse::Error { message, .. } => {
+                self.cleanup_request(&request_id);
+                Err(anyhow!(message))
+            }
+            other => {
+                self.cleanup_request(&request_id);
+                Err(anyhow!("unexpected remote forward response: {:?}", other))
+            }
         }
     }
 
@@ -410,7 +457,222 @@ impl PipelineModelRuntime for RemotePipelineRuntime {
 
 #[cfg(test)]
 mod tests {
+    use std::net::TcpListener;
+    use std::sync::{Arc, Mutex};
+    use std::thread;
+
+    use bytes::Bytes;
+    use tokio::sync::oneshot;
+
     use super::*;
+    use crate::distributed::StageHealth;
+
+    #[derive(Clone, Copy)]
+    enum StubRunBehavior {
+        Silent,
+        Error,
+    }
+
+    struct StubStageHandle {
+        addr: String,
+        commands: Arc<Mutex<Vec<String>>>,
+        shutdown_tx: Option<oneshot::Sender<()>>,
+        join_handle: Option<thread::JoinHandle<Result<()>>>,
+    }
+
+    impl StubStageHandle {
+        fn spawn(run_behavior: StubRunBehavior) -> Result<Self> {
+            let commands = Arc::new(Mutex::new(Vec::new()));
+            let commands_for_thread = Arc::clone(&commands);
+            let (startup_tx, startup_rx) = std::sync::mpsc::channel::<Result<String>>();
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            let join_handle = thread::spawn(move || -> Result<()> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|err| anyhow!("failed to build stub stage runtime: {err}"))?;
+                runtime.block_on(async move {
+                    let transport = Arc::new(
+                        TcpTransport::bind(TcpTransportConfig {
+                            bind_address: reserve_bind_address(),
+                            ..Default::default()
+                        })
+                        .await?,
+                    );
+                    let local_addr = transport.local_addr()?;
+                    startup_tx
+                        .send(Ok(local_addr.clone()))
+                        .map_err(|_| anyhow!("failed to publish stub stage address"))?;
+
+                    let mut lifecycle = super::super::activation_transfer::StageLifecycleState {
+                        health: StageHealth::Healthy,
+                        ..Default::default()
+                    };
+                    let mut shutdown_rx = shutdown_rx;
+                    loop {
+                        tokio::select! {
+                            _ = &mut shutdown_rx => break,
+                            recv = transport.recv() => {
+                                let (_from, msg) = recv?;
+                                let TransportMessage::Control { operation, payload } = msg else {
+                                    continue;
+                                };
+                                if operation != PIPELINE_STAGE_COMMAND_OPERATION {
+                                    continue;
+                                }
+                                let request: RemoteStageRequest = serde_json::from_slice(&payload)?;
+                                let command_name = match &request.command {
+                                    RemoteStageCommand::PrepareSequence { .. } => "prepare",
+                                    RemoteStageCommand::ReleaseSequence { .. } => "release",
+                                    RemoteStageCommand::BeginDrain => "begin_drain",
+                                    RemoteStageCommand::CancelRequest { .. } => "cancel",
+                                    RemoteStageCommand::Shutdown => "shutdown",
+                                    RemoteStageCommand::RunEntry { .. } => "run_entry",
+                                    RemoteStageCommand::ProbeState => "probe_state",
+                                };
+                                commands_for_thread
+                                    .lock()
+                                    .expect("stub command log poisoned")
+                                    .push(command_name.to_string());
+
+                                let reply = match request.command {
+                                    RemoteStageCommand::PrepareSequence { .. } => {
+                                        lifecycle.mark_request_started();
+                                        Some(RemoteStageResponse::Ack {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        })
+                                    }
+                                    RemoteStageCommand::ReleaseSequence { .. } => {
+                                        lifecycle.mark_request_finished();
+                                        Some(RemoteStageResponse::Ack {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        })
+                                    }
+                                    RemoteStageCommand::BeginDrain => {
+                                        lifecycle.draining = true;
+                                        Some(RemoteStageResponse::Ack {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        })
+                                    }
+                                    RemoteStageCommand::CancelRequest { request_id: _ } => {
+                                        lifecycle.mark_request_finished();
+                                        Some(RemoteStageResponse::Ack {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        })
+                                    }
+                                    RemoteStageCommand::Shutdown => {
+                                        lifecycle.draining = true;
+                                        lifecycle.shutdown = true;
+                                        lifecycle.health = StageHealth::Failed;
+                                        lifecycle.in_flight_requests = 0;
+                                        let response = RemoteStageResponse::Ack {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        };
+                                        send_stub_response(&transport, &request.reply_addr, response)
+                                            .await?;
+                                        break;
+                                    }
+                                    RemoteStageCommand::RunEntry {
+                                        request_id,
+                                        micro_batch_id: _,
+                                        input_ids: _,
+                                        attention_mask: _,
+                                    } => match run_behavior {
+                                        StubRunBehavior::Silent => None,
+                                        StubRunBehavior::Error => Some(RemoteStageResponse::Error {
+                                            stage_index: 0,
+                                            request_id: Some(request_id),
+                                            message: "stub stage forced error".to_string(),
+                                            state: Some(lifecycle.snapshot()),
+                                        }),
+                                    },
+                                    RemoteStageCommand::ProbeState => {
+                                        Some(RemoteStageResponse::State {
+                                            stage_index: 0,
+                                            state: lifecycle.snapshot(),
+                                            pending_entry_replies: 0,
+                                        })
+                                    }
+                                };
+
+                                if let Some(response) = reply {
+                                    send_stub_response(&transport, &request.reply_addr, response).await?;
+                                }
+                            }
+                        }
+                    }
+                    transport.shutdown().await?;
+                    Ok(())
+                })
+            });
+            let addr = startup_rx
+                .recv()
+                .map_err(|_| anyhow!("stub stage startup channel dropped"))??;
+            Ok(Self {
+                addr,
+                commands,
+                shutdown_tx: Some(shutdown_tx),
+                join_handle: Some(join_handle),
+            })
+        }
+
+        fn addr(&self) -> &str {
+            &self.addr
+        }
+
+        fn commands(&self) -> Vec<String> {
+            self.commands
+                .lock()
+                .expect("stub command log poisoned")
+                .clone()
+        }
+
+        fn shutdown(mut self) -> Result<()> {
+            if let Some(tx) = self.shutdown_tx.take() {
+                let _ = tx.send(());
+            }
+            if let Some(handle) = self.join_handle.take() {
+                handle
+                    .join()
+                    .map_err(|_| anyhow!("stub stage thread panicked"))??;
+            }
+            Ok(())
+        }
+    }
+
+    fn reserve_bind_address() -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+        let addr = listener.local_addr().expect("local addr");
+        drop(listener);
+        addr.to_string()
+    }
+
+    async fn send_stub_response(
+        transport: &Arc<TcpTransport>,
+        peer: &str,
+        response: RemoteStageResponse,
+    ) -> Result<()> {
+        let payload = serde_json::to_vec(&response)?;
+        transport
+            .send(
+                peer,
+                TransportMessage::Control {
+                    operation: PIPELINE_STAGE_RESPONSE_OPERATION.to_string(),
+                    payload: Bytes::from(payload),
+                },
+            )
+            .await
+    }
 
     #[test]
     fn remote_runtime_rejects_empty_peer_set() {
@@ -418,6 +680,7 @@ mod tests {
             stage_peers: Vec::new(),
             transport_backend: TransportBackend::Tcp,
             bind_address: "127.0.0.1:0".to_string(),
+            stage_timeout: Duration::from_secs(30),
         })
         .err()
         .expect("empty stage peer config must fail");
@@ -430,9 +693,68 @@ mod tests {
             stage_peers: vec!["127.0.0.1:20000".to_string()],
             transport_backend: TransportBackend::Thunderbolt,
             bind_address: "127.0.0.1:0".to_string(),
+            stage_timeout: Duration::from_secs(30),
         })
         .err()
         .expect("unsupported transport backend must fail");
         assert!(err.to_string().contains("supports only tcp backend"));
+    }
+
+    #[test]
+    fn remote_runtime_begin_drain_marks_stages_and_blocks_new_sequences() {
+        let stage = StubStageHandle::spawn(StubRunBehavior::Error).expect("spawn stub stage");
+        let runtime = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
+            stage_peers: vec![stage.addr().to_string()],
+            transport_backend: TransportBackend::Tcp,
+            bind_address: reserve_bind_address(),
+            stage_timeout: Duration::from_secs(1),
+        })
+        .expect("create runtime");
+
+        runtime.begin_drain().expect("begin drain");
+        let states = runtime.probe_stages().expect("probe stages");
+        assert!(matches!(
+            &states[0],
+            RemoteStageResponse::State { state, .. } if state.draining
+        ));
+
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            runtime.prepare_sequence_state(SequenceId::from_raw(7));
+        }));
+        assert!(panic.is_err(), "prepare should panic while draining");
+
+        runtime.shutdown().expect("shutdown runtime");
+        stage.shutdown().expect("shutdown stub stage");
+    }
+
+    #[test]
+    fn remote_runtime_timeout_cleans_up_sequence_state() {
+        let stage = StubStageHandle::spawn(StubRunBehavior::Silent).expect("spawn stub stage");
+        let runtime = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
+            stage_peers: vec![stage.addr().to_string()],
+            transport_backend: TransportBackend::Tcp,
+            bind_address: reserve_bind_address(),
+            stage_timeout: Duration::from_millis(100),
+        })
+        .expect("create runtime");
+
+        let seq_id = SequenceId::from_raw(11);
+        runtime.prepare_sequence_state(seq_id);
+        let input_ids = mlxcel_core::from_slice_i32(&[1], &[1, 1]);
+        let err = runtime
+            .forward_sequence(seq_id, &input_ids, None)
+            .err()
+            .expect("silent stage must time out");
+        assert!(err.to_string().contains("timed out"));
+
+        let commands = stage.commands();
+        assert_eq!(
+            commands,
+            vec!["prepare", "run_entry", "cancel", "release"],
+            "timeout path should cancel and release sequence state"
+        );
+
+        runtime.shutdown().expect("shutdown runtime");
+        stage.shutdown().expect("shutdown stub stage");
     }
 }

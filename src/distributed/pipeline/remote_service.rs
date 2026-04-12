@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
 
 use crate::distributed::pipeline::activation_transfer::{
-    ActivationMessage, PIPELINE_ACTIVATION_OPERATION,
+    ActivationMessage, PIPELINE_ACTIVATION_OPERATION, StageLifecycleSnapshot, StageLifecycleState,
 };
 use crate::distributed::request_tracker::RequestId;
 use crate::distributed::{TcpTransport, TcpTransportConfig, Transport, TransportMessage};
@@ -47,6 +47,11 @@ pub enum RemoteStageCommand {
     ReleaseSequence {
         request_id: String,
     },
+    BeginDrain,
+    CancelRequest {
+        request_id: String,
+    },
+    Shutdown,
     RunEntry {
         request_id: String,
         micro_batch_id: u32,
@@ -66,7 +71,8 @@ pub struct RemoteStageRequest {
 pub enum RemoteStageResponse {
     Ack {
         stage_index: u32,
-        active_requests: usize,
+        state: StageLifecycleSnapshot,
+        pending_entry_replies: usize,
     },
     RunResult {
         stage_index: u32,
@@ -76,12 +82,14 @@ pub enum RemoteStageResponse {
     },
     State {
         stage_index: u32,
-        active_requests: usize,
+        state: StageLifecycleSnapshot,
         pending_entry_replies: usize,
     },
     Error {
         stage_index: u32,
+        request_id: Option<String>,
         message: String,
+        state: Option<StageLifecycleSnapshot>,
     },
 }
 
@@ -111,6 +119,7 @@ struct RemoteStageService {
     pending_entry_replies: HashMap<(String, u32), PendingEntryReply>,
     upstream_peer: Option<String>,
     downstream_peer: Option<String>,
+    lifecycle: StageLifecycleState,
 }
 
 impl RemoteStageService {
@@ -148,6 +157,10 @@ impl RemoteStageService {
             pending_entry_replies: HashMap::new(),
             upstream_peer: config.upstream_peer,
             downstream_peer: config.downstream_peer,
+            lifecycle: StageLifecycleState {
+                health: crate::distributed::pipeline::StageHealth::Healthy,
+                ..Default::default()
+            },
         })
     }
 
@@ -157,7 +170,10 @@ impl RemoteStageService {
                 _ = &mut shutdown_rx => break,
                 recv = self.transport.recv() => {
                     let (from, msg) = recv?;
-                    self.handle_transport_message(&from, msg).await?;
+                    let should_shutdown = self.handle_transport_message(&from, msg).await?;
+                    if should_shutdown {
+                        break;
+                    }
                 }
             }
         }
@@ -165,7 +181,11 @@ impl RemoteStageService {
         Ok(())
     }
 
-    async fn handle_transport_message(&mut self, _from: &str, msg: TransportMessage) -> Result<()> {
+    async fn handle_transport_message(
+        &mut self,
+        _from: &str,
+        msg: TransportMessage,
+    ) -> Result<bool> {
         match msg {
             TransportMessage::Control { operation, payload } => {
                 if operation == PIPELINE_STAGE_COMMAND_OPERATION {
@@ -174,12 +194,13 @@ impl RemoteStageService {
                         .await
                 } else if operation == PIPELINE_ACTIVATION_OPERATION {
                     let activation: ActivationMessage = serde_json::from_slice(&payload)?;
-                    self.handle_activation(activation).await
+                    self.handle_activation(activation).await?;
+                    Ok(false)
                 } else {
-                    Ok(())
+                    Ok(false)
                 }
             }
-            TransportMessage::TensorData { .. } => Ok(()),
+            TransportMessage::TensorData { .. } => Ok(false),
         }
     }
 
@@ -187,35 +208,50 @@ impl RemoteStageService {
         &mut self,
         reply_addr: &str,
         request: RemoteStageCommand,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         match request {
             RemoteStageCommand::PrepareSequence { request_id } => {
-                self.active_requests.insert(request_id.clone());
+                if self.lifecycle.draining {
+                    self.send_request_error(
+                        reply_addr,
+                        Some(request_id),
+                        "pipeline stage is draining",
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                self.mark_request_started(&request_id);
                 self.caches_by_request
                     .entry(request_id)
                     .or_insert_with(|| self.executor.make_caches());
-                self.send_response(
-                    reply_addr,
-                    RemoteStageResponse::Ack {
-                        stage_index: self.stage_index,
-                        active_requests: self.active_requests.len(),
-                    },
-                )
-                .await
+                self.send_response(reply_addr, self.ack_response()).await?;
+                Ok(false)
             }
             RemoteStageCommand::ReleaseSequence { request_id } => {
-                self.active_requests.remove(&request_id);
-                self.caches_by_request.remove(&request_id);
-                self.pending_entry_replies
-                    .retain(|(pending_request_id, _), _| pending_request_id != &request_id);
-                self.send_response(
-                    reply_addr,
-                    RemoteStageResponse::Ack {
-                        stage_index: self.stage_index,
-                        active_requests: self.active_requests.len(),
-                    },
-                )
-                .await
+                self.finish_request(&request_id);
+                self.send_response(reply_addr, self.ack_response()).await?;
+                Ok(false)
+            }
+            RemoteStageCommand::BeginDrain => {
+                self.lifecycle.draining = true;
+                self.send_response(reply_addr, self.ack_response()).await?;
+                Ok(false)
+            }
+            RemoteStageCommand::CancelRequest { request_id } => {
+                self.finish_request(&request_id);
+                self.send_response(reply_addr, self.ack_response()).await?;
+                Ok(false)
+            }
+            RemoteStageCommand::Shutdown => {
+                self.lifecycle.draining = true;
+                self.lifecycle.shutdown = true;
+                self.lifecycle.health = crate::distributed::pipeline::StageHealth::Failed;
+                let active: Vec<String> = self.active_requests.iter().cloned().collect();
+                for request_id in active {
+                    self.finish_request(&request_id);
+                }
+                self.send_response(reply_addr, self.ack_response()).await?;
+                Ok(true)
             }
             RemoteStageCommand::RunEntry {
                 request_id,
@@ -224,38 +260,51 @@ impl RemoteStageService {
                 attention_mask,
             } => {
                 if self.stage_index != 0 {
-                    return self
-                        .send_response(
-                            reply_addr,
-                            RemoteStageResponse::Error {
-                                stage_index: self.stage_index,
-                                message: format!(
-                                    "stage {} cannot accept entry execution requests",
-                                    self.stage_index
-                                ),
-                            },
-                        )
-                        .await;
+                    self.send_request_error(
+                        reply_addr,
+                        Some(request_id),
+                        &format!(
+                            "stage {} cannot accept entry execution requests",
+                            self.stage_index
+                        ),
+                    )
+                    .await?;
+                    return Ok(false);
+                }
+                if self.lifecycle.draining && !self.active_requests.contains(&request_id) {
+                    self.send_request_error(
+                        reply_addr,
+                        Some(request_id),
+                        "pipeline stage is draining",
+                    )
+                    .await?;
+                    return Ok(false);
                 }
                 let input_ids = deserialize_wire_tensor(&input_ids)?;
                 let attention_mask = attention_mask
                     .as_deref()
                     .map(deserialize_wire_tensor)
                     .transpose()?;
+                self.mark_request_started(&request_id);
                 let output = {
                     let caches = self
                         .caches_by_request
                         .entry(request_id.clone())
                         .or_insert_with(|| self.executor.make_caches());
-                    self.active_requests.insert(request_id.clone());
                     self.executor.execute(
                         StageExecutionInput::TokenIds(input_ids.as_ref().unwrap()),
                         caches,
                         attention_mask.as_ref().and_then(|mask| mask.as_ref()),
-                    )?
+                    )
                 };
                 match output {
-                    StageExecutionOutput::Logits(logits) => {
+                    Err(err) => {
+                        self.finish_request(&request_id);
+                        self.send_request_error(reply_addr, Some(request_id), &err.to_string())
+                            .await?;
+                        Ok(false)
+                    }
+                    Ok(StageExecutionOutput::Logits(logits)) => {
                         self.send_response(
                             reply_addr,
                             RemoteStageResponse::RunResult {
@@ -265,9 +314,10 @@ impl RemoteStageService {
                                 logits: serialize_mlx_array(logits.as_ref().unwrap())?,
                             },
                         )
-                        .await
+                        .await?;
+                        Ok(false)
                     }
-                    StageExecutionOutput::HiddenStates(hidden_states) => {
+                    Ok(StageExecutionOutput::HiddenStates(hidden_states)) => {
                         let downstream = self.downstream_peer.clone().ok_or_else(|| {
                             anyhow!("entry stage {} has no downstream peer", self.stage_index)
                         })?;
@@ -281,7 +331,8 @@ impl RemoteStageService {
                                 micro_batch_id,
                             },
                         );
-                        self.send_activation(
+                        if let Err(err) = self
+                            .send_activation(
                             &downstream,
                             ActivationMessage::forward(
                                 RequestId::from_string(request_id.clone()).ok_or_else(|| {
@@ -303,6 +354,16 @@ impl RemoteStageService {
                             ),
                         )
                         .await
+                        {
+                            self.finish_request(&request_id);
+                            self.send_request_error(
+                                reply_addr,
+                                Some(request_id.clone()),
+                                &err.to_string(),
+                            )
+                                .await?;
+                        }
+                        Ok(false)
                     }
                 }
             }
@@ -311,11 +372,12 @@ impl RemoteStageService {
                     reply_addr,
                     RemoteStageResponse::State {
                         stage_index: self.stage_index,
-                        active_requests: self.active_requests.len(),
+                        state: self.lifecycle.snapshot(),
                         pending_entry_replies: self.pending_entry_replies.len(),
                     },
                 )
-                .await
+                .await?;
+                Ok(false)
             }
         }
     }
@@ -368,20 +430,36 @@ impl RemoteStageService {
             .as_deref()
             .map(deserialize_wire_tensor)
             .transpose()?;
+        self.mark_request_started(&request_key);
         let output = {
             let caches = self
                 .caches_by_request
                 .entry(request_key.clone())
                 .or_insert_with(|| self.executor.make_caches());
-            self.active_requests.insert(request_key.clone());
             self.executor.execute(
                 StageExecutionInput::HiddenStates(hidden_states.as_ref().unwrap()),
                 caches,
                 attention_mask.as_ref().and_then(|mask| mask.as_ref()),
-            )?
+            )
         };
         match output {
-            StageExecutionOutput::HiddenStates(hidden_states) => {
+            Err(err) => {
+                self.finish_request(&request_key);
+                if let Some(upstream) = self.upstream_peer.clone() {
+                    self.send_response(
+                        &upstream,
+                        RemoteStageResponse::Error {
+                            stage_index: self.stage_index,
+                            request_id: Some(request_key),
+                            message: err.to_string(),
+                            state: Some(self.lifecycle.snapshot()),
+                        },
+                    )
+                    .await?;
+                }
+                Ok(())
+            }
+            Ok(StageExecutionOutput::HiddenStates(hidden_states)) => {
                 let downstream = self
                     .downstream_peer
                     .clone()
@@ -408,7 +486,7 @@ impl RemoteStageService {
                 )
                 .await
             }
-            StageExecutionOutput::Logits(logits) => {
+            Ok(StageExecutionOutput::Logits(logits)) => {
                 let upstream = self.upstream_peer.clone().ok_or_else(|| {
                     anyhow!(
                         "stage {} produced logits without upstream peer",
@@ -458,6 +536,47 @@ impl RemoteStageService {
                 },
             )
             .await
+    }
+
+    fn ack_response(&self) -> RemoteStageResponse {
+        RemoteStageResponse::Ack {
+            stage_index: self.stage_index,
+            state: self.lifecycle.snapshot(),
+            pending_entry_replies: self.pending_entry_replies.len(),
+        }
+    }
+
+    fn mark_request_started(&mut self, request_id: &str) {
+        if self.active_requests.insert(request_id.to_string()) {
+            self.lifecycle.mark_request_started();
+        }
+    }
+
+    fn finish_request(&mut self, request_id: &str) {
+        if self.active_requests.remove(request_id) {
+            self.lifecycle.mark_request_finished();
+        }
+        self.caches_by_request.remove(request_id);
+        self.pending_entry_replies
+            .retain(|(pending_request_id, _), _| pending_request_id != request_id);
+    }
+
+    async fn send_request_error(
+        &self,
+        peer: &str,
+        request_id: Option<String>,
+        message: &str,
+    ) -> Result<()> {
+        self.send_response(
+            peer,
+            RemoteStageResponse::Error {
+                stage_index: self.stage_index,
+                request_id,
+                message: message.to_string(),
+                state: Some(self.lifecycle.snapshot()),
+            },
+        )
+        .await
     }
 }
 

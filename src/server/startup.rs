@@ -618,6 +618,7 @@ fn resolve_remote_pipeline_topology(
                 stage_peers,
                 transport_backend: cluster_config.cluster.transport_backend,
                 bind_address: local_node.address.to_string(),
+                stage_timeout: std::time::Duration::from_secs(30),
             },
         )),
         None,

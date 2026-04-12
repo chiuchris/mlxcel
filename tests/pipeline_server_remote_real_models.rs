@@ -90,6 +90,7 @@ fn pipeline_server_remote_coordinator_llama_matches_dense_baseline() {
                     stage_peers: vec![stage0_addr.clone(), stage1_addr.clone()],
                     transport_backend: TransportBackend::Tcp,
                     bind_address: coordinator_addr,
+                    stage_timeout: Duration::from_secs(5),
                 },
             )),
             ..ServerConfig::default()
