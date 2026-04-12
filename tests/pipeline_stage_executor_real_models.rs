@@ -12,32 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::{Path, PathBuf};
+mod common;
 
+use std::path::Path;
+
+use common::repo_model_dir;
 use mlxcel::distributed::RequestId;
 use mlxcel::distributed::pipeline::{
     ChannelConfig, InProcessStageWorkerLoop, LoadedStageExecutor, PipelineConfig,
     PipelineWorkerInput, StageAssignment, StageExecutionInput,
 };
 use mlxcel::{LanguageModel, distributed::pipeline::StageExecutor};
-
-fn repo_model_dir(name: &str) -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let primary = manifest_dir.join("models").join(name);
-    if primary.exists() {
-        return primary;
-    }
-
-    let shared_checkout = manifest_dir
-        .parent()
-        .map(|parent| parent.join("mlxcel-internal").join("models").join(name))
-        .unwrap_or(primary.clone());
-    if shared_checkout.exists() {
-        return shared_checkout;
-    }
-
-    primary
-}
 
 fn two_stage_assignments(total_layers: usize) -> [StageAssignment; 2] {
     let split = total_layers / 2;

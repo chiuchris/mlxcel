@@ -17,7 +17,7 @@
 //! This module keeps the user-facing `generate` flow readable by separating
 //! prompt preparation, generation-mode selection, and terminal output helpers.
 
-use anyhow::Result;
+use anyhow::{Context, Result, anyhow, ensure};
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -25,15 +25,26 @@ use std::time::{Duration, Instant};
 use mlxcel::{
     CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
     SpeculativeGenerator,
-    distributed::{resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime},
+    distributed::{
+        ChannelConfig, DeviceSpec, InProcessStageWorkerLoop, LoadedStageExecutor, ModelProfile,
+        PipelineConfig as DistributedPipelineConfig, PipelineWorkerInput, RequestId,
+        StageAssignment, auto_partition, build_manual_assignments, parse_manual_partition,
+        resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
+    },
     initialize_runtime, load_model, load_model_with_adapter, load_model_with_tensor_parallel,
+    models::{self, ModelType, get_model_type, sanitize_config_json},
     quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
+    tokenizer::load_tokenizer,
     vision::merge::InputEmbeddings,
     vlm_runtime::prepared_embedding_refs,
 };
 use mlxcel_core::cache::KVCacheMode;
+use mlxcel_core::generation_policy::{
+    initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
+};
+use mlxcel_core::sampling::sample_token_optimized;
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -108,6 +119,231 @@ fn load_generation_model(
     let load_elapsed = load_start.elapsed();
     println!("Model loaded in {:.3}s.", load_elapsed.as_secs_f64());
     Ok(result)
+}
+
+fn cli_pipeline_requested(args: &GenerateArgs) -> bool {
+    args.pipeline_parallel.pp_size > 1 || args.pipeline_parallel.pp_layers.is_some()
+}
+
+fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
+    let pp = &args.pipeline_parallel;
+    ensure!(
+        pp.pp_micro_batch_size > 0,
+        "--pp-micro-batch-size must be greater than 0"
+    );
+    if pp.pp_layers.is_none() && pp.pp_size <= 1 {
+        return Ok(());
+    }
+
+    ensure!(
+        args.tensor_parallel.tp_size == 1,
+        "CLI pipeline parallelism does not support tensor parallelism yet"
+    );
+    ensure!(
+        args.model.adapter.is_none(),
+        "CLI pipeline parallelism does not support adapter loading yet"
+    );
+    ensure!(
+        args.model.draft_model.is_none(),
+        "CLI pipeline parallelism does not support speculative decoding yet"
+    );
+    ensure!(
+        args.generation.image.is_empty() && args.generation.audio.is_none(),
+        "CLI pipeline parallelism currently supports text-only generation"
+    );
+    if let Some(spec) = pp.pp_layers.as_deref() {
+        ensure!(
+            !spec.trim().is_empty(),
+            "--pp-layers must not be empty when provided"
+        );
+    } else {
+        ensure!(
+            pp.pp_size >= 2,
+            "--pp-size must be at least 2 to enable pipeline parallelism"
+        );
+    }
+    Ok(())
+}
+
+fn equal_stage_model_profile(num_layers: usize) -> ModelProfile {
+    ModelProfile {
+        num_layers,
+        layer_param_bytes: 1024,
+        embedding_param_bytes: 1024,
+        lm_head_param_bytes: 1024,
+    }
+}
+
+fn equal_capacity_devices(num_stages: usize, model: &ModelProfile) -> Vec<DeviceSpec> {
+    let per_stage_layers = model.num_layers.div_ceil(num_stages) as u64;
+    let per_stage_budget = model
+        .embedding_param_bytes
+        .saturating_add(model.lm_head_param_bytes)
+        .saturating_add(model.layer_param_bytes.saturating_mul(per_stage_layers + 2));
+    (0..num_stages)
+        .map(|stage_index| DeviceSpec {
+            device_id: format!("cli-stage-{stage_index}"),
+            available_memory_bytes: per_stage_budget,
+            compute_units: 1,
+        })
+        .collect()
+}
+
+fn resolve_cli_pipeline_assignments(
+    num_layers: usize,
+    args: &GenerateArgs,
+) -> Result<Vec<StageAssignment>> {
+    let pp = &args.pipeline_parallel;
+    let profile = equal_stage_model_profile(num_layers);
+    if let Some(spec) = pp.pp_layers.as_deref() {
+        let ranges = parse_manual_partition(spec, num_layers)?;
+        if pp.pp_size > 1 {
+            ensure!(
+                pp.pp_size == ranges.len(),
+                "--pp-size ({}) does not match manual partition stage count ({})",
+                pp.pp_size,
+                ranges.len()
+            );
+        }
+        let devices = equal_capacity_devices(ranges.len(), &profile);
+        return build_manual_assignments(&ranges, &profile, &devices);
+    }
+
+    ensure!(
+        pp.pp_size >= 2,
+        "--pp-size must be at least 2 when --pp-layers is not provided"
+    );
+    let devices = equal_capacity_devices(pp.pp_size, &profile);
+    auto_partition(&profile, &devices)
+}
+
+fn resolve_cli_pipeline_num_layers(model_dir: &Path) -> Result<usize> {
+    match get_model_type(model_dir)? {
+        ModelType::Llama => {
+            let config_path = model_dir.join("config.json");
+            let config_str = std::fs::read_to_string(&config_path)
+                .with_context(|| format!("failed to read {}", config_path.display()))?;
+            let config_str = sanitize_config_json(&config_str);
+            let args: models::llama3::ModelArgs = serde_json::from_str(&config_str)
+                .with_context(|| format!("failed to parse {}", config_path.display()))?;
+            Ok(args.num_hidden_layers)
+        }
+        other => Err(anyhow!(
+            "CLI pipeline parallelism is currently implemented only for Llama-family text models, got {:?}",
+            other
+        )),
+    }
+}
+
+fn generate_pipeline_text(
+    model_dir: &Path,
+    num_layers: usize,
+    prompt_tokens: &[i32],
+    max_tokens: usize,
+    sampling_config: &SamplingConfig,
+    args: &GenerateArgs,
+) -> Result<(Vec<i32>, GenerationStats)> {
+    let assignments = resolve_cli_pipeline_assignments(num_layers, args)?;
+    ensure!(
+        assignments.len() >= 2,
+        "pipeline execution requires at least 2 stages"
+    );
+
+    let executors: Vec<Box<dyn mlxcel::distributed::StageExecutor>> = assignments
+        .iter()
+        .map(|assignment| {
+            LoadedStageExecutor::load(model_dir, assignment)
+                .map(|executor| Box::new(executor) as Box<dyn mlxcel::distributed::StageExecutor>)
+        })
+        .collect::<Result<_>>()
+        .with_context(|| {
+            format!(
+                "CLI pipeline execution is not available for model {}",
+                model_dir.display()
+            )
+        })?;
+
+    let mut worker_loop = InProcessStageWorkerLoop::new(
+        DistributedPipelineConfig::new(
+            assignments.len() as u32,
+            args.pipeline_parallel.pp_micro_batch_size,
+        )?,
+        executors,
+        ChannelConfig::default(),
+    )?;
+
+    let request_id = RequestId::new();
+    let prompt_ids = mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+
+    let prefill_start = Instant::now();
+    let mut current_logits = worker_loop
+        .run_to_completion(vec![PipelineWorkerInput::new(
+            request_id.clone(),
+            prompt_ids,
+        )])?
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("pipeline worker loop did not return a prefill output"))?
+        .logits;
+    let prefill_elapsed = prefill_start.elapsed();
+
+    seed_rng_if_needed(sampling_config);
+    let eos_token_ids = merged_eos_token_ids(
+        mlxcel::read_eos_token_ids(model_dir),
+        &sampling_config.stop_token_ids,
+    );
+    let mut token_history =
+        initial_token_history(prompt_tokens, sampling_config.needs_token_history());
+    let mut generated_tokens = Vec::with_capacity(max_tokens);
+    let decode_start = Instant::now();
+
+    for _ in 0..max_tokens {
+        let (token_arr, _processed_logits) = sample_token_optimized(
+            current_logits.as_ref().unwrap(),
+            sampling_config,
+            &token_history,
+        );
+        mlxcel_core::eval(&token_arr);
+        let token_id = mlxcel_core::item_i32(&token_arr);
+        generated_tokens.push(token_id);
+        if sampling_config.needs_token_history() {
+            token_history.push(token_id);
+        }
+        if eos_token_ids.contains(&token_id) {
+            break;
+        }
+
+        let next_input = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
+        current_logits = worker_loop
+            .run_to_completion(vec![PipelineWorkerInput::new(
+                request_id.clone(),
+                next_input,
+            )])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow!("pipeline worker loop did not return a decode output"))?
+            .logits;
+    }
+
+    let decode_elapsed = decode_start.elapsed();
+    let stats = GenerationStats {
+        prompt_tokens: prompt_tokens.len(),
+        generated_tokens: generated_tokens.len(),
+        prefill_time_ms: prefill_elapsed.as_secs_f64() * 1000.0,
+        decode_time_ms: decode_elapsed.as_secs_f64() * 1000.0,
+        prefill_tok_per_sec: if prefill_elapsed.as_secs_f64() > 0.0 {
+            prompt_tokens.len() as f64 / prefill_elapsed.as_secs_f64()
+        } else {
+            0.0
+        },
+        decode_tok_per_sec: if decode_elapsed.as_secs_f64() > 0.0 {
+            generated_tokens.len() as f64 / decode_elapsed.as_secs_f64()
+        } else {
+            0.0
+        },
+    };
+
+    Ok((generated_tokens, stats))
 }
 
 fn validate_tensor_parallel_args(args: &GenerateArgs) -> Result<()> {
@@ -435,6 +671,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
     print_runtime_setup(&runtime);
     validate_tensor_parallel_args(&args)?;
+    validate_pipeline_parallel_args(&args)?;
 
     // Quantization recommendation and BF16 warning (before loading the model).
     let hw = mlxcel_core::hardware::get_hardware();
@@ -456,7 +693,8 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         }
     }
 
-    let (model, tokenizer) = load_generation_model(&args)?;
+    let pipeline_requested = cli_pipeline_requested(&args);
+    let tokenizer = load_tokenizer(&args.model.model)?;
     let prompt = load_cli_prompt(
         &args.model.model,
         &args.generation.prompt,
@@ -465,20 +703,8 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     );
     let mut prompt_tokens = tokenize_prompt(&tokenizer, &prompt)?;
 
-    print_generation_preamble(&args.generation.prompt)?;
-
     let sampling_config =
         build_cli_sampling_config(&args, mlxcel::read_eos_token_ids(&args.model.model));
-
-    // Check for VLM image/audio mode
-    let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
-        &model,
-        &mut prompt_tokens,
-        &prompt,
-        &args.generation.image,
-        args.generation.audio.as_deref(),
-        &tokenizer,
-    )?;
 
     // Parse KV cache mode (validated early so errors surface before generation)
     let kv_cache_mode = args
@@ -490,14 +716,37 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         println!("KV cache mode: int8 (per-token absmax quantization)");
     }
 
-    let (generated_tokens, stats) = run_generation_mode(
-        &model,
-        &args,
-        &prompt_tokens,
-        &sampling_config,
-        vlm_embeddings.as_ref(),
-        kv_cache_mode,
-    )?;
+    let (generated_tokens, stats) = if pipeline_requested {
+        let num_layers = resolve_cli_pipeline_num_layers(&args.model.model)?;
+        print_generation_preamble(&args.generation.prompt)?;
+        generate_pipeline_text(
+            &args.model.model,
+            num_layers,
+            &prompt_tokens,
+            args.generation.max_tokens,
+            &sampling_config,
+            &args,
+        )?
+    } else {
+        let (model, _loaded_tokenizer) = load_generation_model(&args)?;
+        let vlm_embeddings = generate_vlm::compute_vlm_embeddings(
+            &model,
+            &mut prompt_tokens,
+            &prompt,
+            &args.generation.image,
+            args.generation.audio.as_deref(),
+            &tokenizer,
+        )?;
+        print_generation_preamble(&args.generation.prompt)?;
+        run_generation_mode(
+            &model,
+            &args,
+            &prompt_tokens,
+            &sampling_config,
+            vlm_embeddings.as_ref(),
+            kv_cache_mode,
+        )?
+    };
     let generated_text = decode_generated_text(&tokenizer, &prompt_tokens, &generated_tokens);
     print_generation_result(&generated_text, &stats, args.generation.profile)?;
 
