@@ -1,3 +1,20 @@
+mlxcel (0.0.21-1~jammy1) jammy; urgency=medium
+
+  * Feat: Paged KV cache substrate with batch scheduler integration
+  * Feat: Native paged decode kernel paths for rotating and chunked caches
+  * Feat: Paged compatibility for windowed caches
+  * Feat: Default paged decode for supported server workers
+  * Feat: Paged KV transfer observability
+  * Feat: NVFP4 load-time dequantization for Gemma 4 nvfp4 checkpoints
+  * Feat: F8_E4M3/F8_E5M2 safetensors loading for nvfp4 checkpoints
+  * Refactor: Unify model-owned sequence state with backend seam
+  * Refactor: Vectorize batched decode positional metadata
+  * Fix: Skip Teams notification when webhook URL secret is not configured
+  * CI: Auto-promote pre-release to full release after successful builds
+  * Docs: Paged decode rollout benchmark matrix and eligibility tracking
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 12 Apr 2026 12:00:00 +0900
+
 mlxcel (0.0.20-1~jammy1) jammy; urgency=medium
 
   * Feat: In-process tensor parallel runtime for Llama, Qwen2/3/3.5, Gemma 3/4, ERNIE, Hunyuan
