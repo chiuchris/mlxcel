@@ -81,8 +81,9 @@ pub mod stage_worker;
 
 pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
-    StageEndpoint, StageLink, activation_channel, activation_latency, build_pipeline_links,
-    validate_activation,
+    StageEndpoint, StageLifecycleRequest, StageLifecycleResponse, StageLifecycleSnapshot,
+    StageLifecycleState, StageLink, TransportStageEndpoint, TransportStageLink, activation_channel,
+    activation_latency, build_pipeline_links, install_stage_control_service, validate_activation,
 };
 pub use benchmark::{
     PipelineBenchmarkConfig, PipelineBenchmarkResult, ScalingResult, format_benchmark_report,
