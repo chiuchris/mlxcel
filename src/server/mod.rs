@@ -33,7 +33,10 @@ pub mod types;
 pub use app::create_app;
 pub use chat_template::ChatTemplateProcessor;
 pub use cli_input::ServerStartupInput;
-pub use config::{DecodeStorageBackend, PreemptionPolicy, ServerConfig, ServerGenerateOptions};
+pub use config::{
+    DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
+    RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
+};
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use startup::{ServerStartupConfig, start_server};
 pub use state::{AppState, BatchMetrics, Metrics};

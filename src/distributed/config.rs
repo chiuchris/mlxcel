@@ -24,6 +24,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use super::TransportBackend;
+
 /// Maximum allowed length for node IDs and cluster names to prevent abuse
 /// from untrusted TOML configuration files.
 const MAX_ID_LENGTH: usize = 128;
@@ -155,6 +157,9 @@ pub struct ClusterMeta {
     /// Pipeline-parallel depth (number of PP stages).
     #[serde(default = "default_one")]
     pub pipeline_parallel_size: u32,
+    /// Inter-node transport backend used for remote pipeline traffic.
+    #[serde(default)]
+    pub transport_backend: TransportBackend,
 }
 
 fn default_cluster_name() -> String {
@@ -171,6 +176,7 @@ impl Default for ClusterMeta {
             name: default_cluster_name(),
             tensor_parallel_size: 1,
             pipeline_parallel_size: 1,
+            transport_backend: TransportBackend::Tcp,
         }
     }
 }
@@ -274,12 +280,88 @@ impl ClusterConfig {
             }
         }
 
+        let pipeline_stage_nodes: Vec<&NodeConfig> = self
+            .nodes
+            .iter()
+            .filter(|node| node.role == NodeRole::PipelineStage)
+            .collect();
+        if !pipeline_stage_nodes.is_empty() || self.cluster.pipeline_parallel_size > 1 {
+            anyhow::ensure!(
+                self.cluster.pipeline_parallel_size > 0,
+                "pipeline_parallel_size must be greater than 0 when pipeline stages are configured"
+            );
+            anyhow::ensure!(
+                pipeline_stage_nodes.len() == self.cluster.pipeline_parallel_size as usize,
+                "cluster config declares pipeline_parallel_size={} but defines {} pipeline_stage nodes",
+                self.cluster.pipeline_parallel_size,
+                pipeline_stage_nodes.len()
+            );
+
+            let mut seen_stages = std::collections::HashSet::new();
+            for node in pipeline_stage_nodes {
+                let stage = node.stage.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pipeline stage node '{}' is missing required 'stage' index",
+                        node.id
+                    )
+                })?;
+                anyhow::ensure!(
+                    stage < self.cluster.pipeline_parallel_size,
+                    "pipeline stage node '{}' has out-of-range stage index {} for pipeline_parallel_size={}",
+                    node.id,
+                    stage,
+                    self.cluster.pipeline_parallel_size
+                );
+                anyhow::ensure!(
+                    seen_stages.insert(stage),
+                    "duplicate pipeline stage index {} in cluster config",
+                    stage
+                );
+            }
+            for expected_stage in 0..self.cluster.pipeline_parallel_size {
+                anyhow::ensure!(
+                    seen_stages.contains(&expected_stage),
+                    "missing pipeline stage index {} in cluster config",
+                    expected_stage
+                );
+            }
+        }
+
+        for node in &self.nodes {
+            if node.role != NodeRole::PipelineStage && node.stage.is_some() {
+                anyhow::bail!(
+                    "node '{}' sets stage={} but role is {}; only pipeline_stage nodes may set stage",
+                    node.id,
+                    node.stage.unwrap(),
+                    node.role
+                );
+            }
+        }
+
         Ok(())
     }
 
     /// Return the node config for the given node ID, if present.
     pub fn find_node(&self, id: &str) -> Option<&NodeConfig> {
         self.nodes.iter().find(|n| n.id == id)
+    }
+
+    /// Return pipeline-stage nodes sorted by stage index.
+    pub fn pipeline_stage_nodes(&self) -> Vec<&NodeConfig> {
+        let mut nodes: Vec<&NodeConfig> = self
+            .nodes
+            .iter()
+            .filter(|node| node.role == NodeRole::PipelineStage)
+            .collect();
+        nodes.sort_by_key(|node| node.stage.unwrap_or(u32::MAX));
+        nodes
+    }
+
+    /// Return the pipeline-stage node for the given stage index, if present.
+    pub fn pipeline_stage_node(&self, stage: u32) -> Option<&NodeConfig> {
+        self.nodes
+            .iter()
+            .find(|node| node.role == NodeRole::PipelineStage && node.stage == Some(stage))
     }
 
     /// Pretty-print a summary of the cluster topology.

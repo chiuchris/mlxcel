@@ -24,15 +24,18 @@
 use std::fmt;
 use std::pin::Pin;
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncRead;
 
 /// Backend discriminator for transport implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum TransportBackend {
     /// Standard TCP/IP networking.
+    #[default]
     Tcp,
     /// Thunderbolt (IP-over-Thunderbolt Bridge) for local clusters.
     Thunderbolt,
@@ -43,6 +46,20 @@ impl fmt::Display for TransportBackend {
         match self {
             Self::Tcp => write!(f, "tcp"),
             Self::Thunderbolt => write!(f, "thunderbolt"),
+        }
+    }
+}
+
+impl std::str::FromStr for TransportBackend {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self> {
+        match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+            "tcp" => Ok(Self::Tcp),
+            "thunderbolt" => Ok(Self::Thunderbolt),
+            other => {
+                bail!("unknown transport backend '{other}'; expected one of: tcp, thunderbolt")
+            }
         }
     }
 }

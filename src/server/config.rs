@@ -22,6 +22,8 @@ use std::path::PathBuf;
 
 use crate::SamplingConfig;
 use crate::distributed::ShardConfig;
+use crate::distributed::TransportBackend;
+use crate::distributed::pipeline::RemotePipelineRuntimeConfig;
 use crate::server::batch::RequestPriority;
 use mlxcel_core::sampling::LogprobsConfig;
 
@@ -73,6 +75,48 @@ pub enum PreemptionPolicy {
     LongestFirst,
     /// Evict the lowest-priority sequence; break ties by longest running.
     LowestPriority,
+}
+
+/// Normalized pipeline-parallel runtime mode for the server worker.
+#[derive(Debug, Clone)]
+pub enum PipelineParallelRuntimeConfig {
+    /// Existing single-process stage-partitioned runtime.
+    InProcess {
+        layers: String,
+        micro_batch_size: usize,
+    },
+    /// Coordinator runtime that dispatches requests to remote stages.
+    RemoteCoordinator(RemotePipelineRuntimeConfig),
+}
+
+impl PipelineParallelRuntimeConfig {
+    pub fn describe(&self) -> String {
+        match self {
+            Self::InProcess {
+                layers,
+                micro_batch_size,
+            } => {
+                format!("in_process(pp_layers={layers}, pp_micro_batch_size={micro_batch_size})")
+            }
+            Self::RemoteCoordinator(config) => format!(
+                "remote_coordinator(stages={}, transport={}, bind_address={})",
+                config.stage_peers.len(),
+                config.transport_backend,
+                config.bind_address
+            ),
+        }
+    }
+}
+
+/// Startup-only config for launching this process as a remote pipeline stage.
+#[derive(Debug, Clone)]
+pub struct RemotePipelineStageConfig {
+    pub bind_address: String,
+    pub stage_index: u32,
+    pub num_stages: u32,
+    pub upstream_peer: Option<String>,
+    pub downstream_peer: Option<String>,
+    pub transport_backend: TransportBackend,
 }
 
 /// Server configuration derived from CLI-compatible startup arguments.
@@ -136,10 +180,11 @@ pub struct ServerConfig {
     pub max_batch_prefill: usize,
     /// Decode-time storage backend used by the batch scheduler.
     pub decode_storage_backend: DecodeStorageBackend,
-    /// Manual in-process pipeline stage partition for server startup.
-    pub pipeline_parallel_layers: Option<String>,
-    /// Micro-batch size for in-process pipeline execution.
-    pub pipeline_parallel_micro_batch_size: usize,
+    /// Normalized pipeline-parallel runtime mode for the server worker.
+    pub pipeline_parallel_runtime: Option<PipelineParallelRuntimeConfig>,
+    /// When present, launch this process as a remote pipeline stage instead of
+    /// the HTTP API server.
+    pub remote_pipeline_stage: Option<RemotePipelineStageConfig>,
     /// Tensor-parallel loading/runtime options resolved at startup.
     pub tensor_parallel: ShardConfig,
 }
@@ -179,8 +224,8 @@ impl Default for ServerConfig {
             no_batch: false,
             max_batch_prefill: 1,
             decode_storage_backend: DecodeStorageBackend::Auto,
-            pipeline_parallel_layers: None,
-            pipeline_parallel_micro_batch_size: 1,
+            pipeline_parallel_runtime: None,
+            remote_pipeline_stage: None,
             tensor_parallel: ShardConfig::default(),
         }
     }

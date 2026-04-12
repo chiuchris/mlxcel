@@ -26,15 +26,26 @@ use anyhow::{Context, Result};
 use tower::Service;
 
 use crate::SamplingConfig;
+use crate::distributed::pipeline::{
+    RemoteStageServiceConfig, RemoteStageServiceHandle, resolve_in_process_pipeline_num_layers,
+    resolve_in_process_stage_assignments,
+};
 use crate::distributed::{
-    resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
+    ClusterConfig, NodeRegistry, NodeRole, TransportBackend, resolve_model_shard_plan,
+    shard_config_from_cli, validate_supported_runtime,
 };
 
 use super::batch::BatchObservability;
 use super::{
-    AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, ServerConfig,
-    ServerGenerateOptions, create_app,
+    AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, PipelineParallelRuntimeConfig,
+    ServerConfig, ServerGenerateOptions, create_app,
 };
+
+struct ResolvedDistributedStartup {
+    _node_registry: Option<NodeRegistry>,
+    pipeline_runtime: Option<PipelineParallelRuntimeConfig>,
+    remote_stage_service: Option<RemoteStageServiceConfig>,
+}
 
 /// Startup configuration for the server (shared between `mlxcel serve` and `mlxcel-server`).
 #[derive(Debug)]
@@ -320,8 +331,13 @@ pub(super) fn build_server_config(
         no_batch: startup.no_batch,
         max_batch_prefill: startup.max_batch_prefill.max(1),
         decode_storage_backend: resolve_decode_storage_backend(),
-        pipeline_parallel_layers: startup.pp_layers.clone(),
-        pipeline_parallel_micro_batch_size: startup.pp_micro_batch_size.max(1),
+        pipeline_parallel_runtime: startup.pp_layers.as_ref().map(|layers| {
+            PipelineParallelRuntimeConfig::InProcess {
+                layers: layers.clone(),
+                micro_batch_size: startup.pp_micro_batch_size.max(1),
+            }
+        }),
+        remote_pipeline_stage: None,
         tensor_parallel,
     }
 }
@@ -484,15 +500,134 @@ async fn serve_tcp(startup: &ServerStartupConfig, app: axum::Router) -> Result<(
     Ok(())
 }
 
-/// Resolve distributed cluster configuration from CLI arguments.
-///
-/// Returns `Some(NodeRegistry)` when distributed mode is active, `None` for
-/// standalone operation.
-async fn resolve_distributed_config(
-    startup: &ServerStartupConfig,
-) -> Result<Option<crate::distributed::NodeRegistry>> {
-    use crate::distributed::{ClusterConfig, NodeRole};
+fn parse_startup_listen_addr(startup: &ServerStartupConfig) -> Result<SocketAddr> {
+    format!("{}:{}", startup.host, startup.port)
+        .parse()
+        .context("failed to parse local listen address for distributed config")
+}
 
+fn resolve_remote_pipeline_topology(
+    startup: &ServerStartupConfig,
+    cluster_config: &ClusterConfig,
+    local_id: &str,
+) -> Result<(
+    Option<PipelineParallelRuntimeConfig>,
+    Option<RemoteStageServiceConfig>,
+)> {
+    let pipeline_depth = cluster_config.cluster.pipeline_parallel_size;
+    if pipeline_depth <= 1 {
+        return Ok((None, None));
+    }
+    anyhow::ensure!(
+        startup.pp_layers.is_none(),
+        "remote pipeline startup is configured via cluster topology; remove --pp-layers"
+    );
+    anyhow::ensure!(
+        startup.adapter_path.is_none(),
+        "remote pipeline startup does not support adapter loading yet"
+    );
+    anyhow::ensure!(
+        startup.draft_model_path.is_none(),
+        "remote pipeline startup does not support speculative decoding yet"
+    );
+    anyhow::ensure!(
+        startup.tp_size == 1,
+        "remote pipeline startup does not support tensor parallelism yet"
+    );
+    anyhow::ensure!(
+        !startup.no_batch,
+        "remote pipeline startup requires the batch scheduler; remove --no-batch"
+    );
+    anyhow::ensure!(
+        startup.node_id.is_some(),
+        "remote pipeline startup requires --node-id so the local cluster node can be identified"
+    );
+
+    let local_node = cluster_config.find_node(local_id).ok_or_else(|| {
+        anyhow::anyhow!("local node '{local_id}' was not found in cluster config")
+    })?;
+    let pipeline_nodes = cluster_config.pipeline_stage_nodes();
+    anyhow::ensure!(
+        !pipeline_nodes.is_empty(),
+        "cluster config must define pipeline_stage nodes when pipeline_parallel_size > 1"
+    );
+
+    if local_node.role == NodeRole::PipelineStage {
+        anyhow::ensure!(
+            cluster_config.cluster.transport_backend == TransportBackend::Tcp,
+            "remote pipeline stage startup currently supports only tcp transport, got {}",
+            cluster_config.cluster.transport_backend
+        );
+        let stage_index = local_node.stage.ok_or_else(|| {
+            anyhow::anyhow!(
+                "pipeline stage node '{}' is missing required 'stage' index",
+                local_node.id
+            )
+        })?;
+        let num_layers = resolve_in_process_pipeline_num_layers(&startup.model_path)?;
+        let assignments =
+            resolve_in_process_stage_assignments(num_layers, Some(pipeline_depth as usize), None)?;
+        let stage_assignment = assignments
+            .into_iter()
+            .find(|assignment| assignment.stage_index == stage_index as usize)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "failed to resolve stage assignment for stage {} of {}",
+                    stage_index,
+                    pipeline_depth
+                )
+            })?;
+        let upstream_peer = stage_index
+            .checked_sub(1)
+            .and_then(|idx| cluster_config.pipeline_stage_node(idx))
+            .map(|node| node.address.to_string());
+        let downstream_peer = cluster_config
+            .pipeline_stage_node(stage_index + 1)
+            .map(|node| node.address.to_string());
+        return Ok((
+            None,
+            Some(RemoteStageServiceConfig {
+                model_dir: startup.model_path.clone(),
+                bind_address: local_node.address.to_string(),
+                stage_assignment,
+                num_stages: pipeline_depth,
+                upstream_peer,
+                downstream_peer,
+            }),
+        ));
+    }
+
+    anyhow::ensure!(
+        cluster_config.cluster.transport_backend == TransportBackend::Tcp,
+        "remote pipeline coordinator currently supports only tcp transport, got {}",
+        cluster_config.cluster.transport_backend
+    );
+    anyhow::ensure!(
+        local_node.address != parse_startup_listen_addr(startup)?,
+        "remote pipeline coordinator control address {} conflicts with HTTP listen address {}; assign a distinct cluster node address/port for control traffic",
+        local_node.address,
+        parse_startup_listen_addr(startup)?
+    );
+    let stage_peers = pipeline_nodes
+        .into_iter()
+        .map(|node| node.address.to_string())
+        .collect::<Vec<_>>();
+    Ok((
+        Some(PipelineParallelRuntimeConfig::RemoteCoordinator(
+            crate::distributed::pipeline::RemotePipelineRuntimeConfig {
+                stage_peers,
+                transport_backend: cluster_config.cluster.transport_backend,
+                bind_address: local_node.address.to_string(),
+            },
+        )),
+        None,
+    ))
+}
+
+/// Resolve distributed cluster configuration and any remote pipeline startup mode.
+async fn resolve_distributed_startup(
+    startup: &ServerStartupConfig,
+) -> Result<ResolvedDistributedStartup> {
     if let Some(ref config_path) = startup.distributed_config {
         let cluster_config = ClusterConfig::from_file(config_path)?;
         let local_id = startup
@@ -500,25 +635,29 @@ async fn resolve_distributed_config(
             .as_deref()
             .or_else(|| cluster_config.nodes.first().map(|n| n.id.as_str()))
             .unwrap_or("node-0");
+        let (pipeline_runtime, remote_stage_service) =
+            resolve_remote_pipeline_topology(startup, &cluster_config, local_id)?;
         let registry = crate::distributed::initialize_distributed(
             &cluster_config,
             local_id,
             std::time::Duration::from_secs(5),
         )
         .await?;
-        return Ok(Some(registry));
+        return Ok(ResolvedDistributedStartup {
+            _node_registry: Some(registry),
+            pipeline_runtime,
+            remote_stage_service,
+        });
     }
 
-    // CLI shorthand: --node-role + optional --node-id / --peers
+    // CLI shorthand remains non-PP-only; remote PP requires an explicit cluster config.
     if let Some(ref role_str) = startup.node_role {
         let role: NodeRole = role_str.parse()?;
         let node_id = startup
             .node_id
             .clone()
             .unwrap_or_else(|| "node-0".to_string());
-        let listen_addr: std::net::SocketAddr = format!("{}:{}", startup.host, startup.port)
-            .parse()
-            .context("failed to parse local listen address for distributed config")?;
+        let listen_addr = parse_startup_listen_addr(startup)?;
         let cluster_config =
             ClusterConfig::from_cli(node_id.clone(), listen_addr, role, startup.peers.clone());
         let registry = crate::distributed::initialize_distributed(
@@ -527,10 +666,43 @@ async fn resolve_distributed_config(
             std::time::Duration::from_secs(5),
         )
         .await?;
-        return Ok(Some(registry));
+        return Ok(ResolvedDistributedStartup {
+            _node_registry: Some(registry),
+            pipeline_runtime: None,
+            remote_stage_service: None,
+        });
     }
 
-    Ok(None)
+    Ok(ResolvedDistributedStartup {
+        _node_registry: None,
+        pipeline_runtime: None,
+        remote_stage_service: None,
+    })
+}
+
+async fn serve_remote_pipeline_stage(service_config: RemoteStageServiceConfig) -> Result<()> {
+    let bind_address = service_config.bind_address.clone();
+    let stage_index = service_config.stage_assignment.stage_index;
+    let num_stages = service_config.num_stages;
+    let upstream = service_config.upstream_peer.clone();
+    let downstream = service_config.downstream_peer.clone();
+    let handle = RemoteStageServiceHandle::spawn(service_config)?;
+    tracing::info!(
+        "Starting remote pipeline stage service on {} (stage={}/{}, upstream={:?}, downstream={:?})",
+        bind_address,
+        stage_index,
+        num_stages,
+        upstream,
+        downstream
+    );
+    tokio::signal::ctrl_c()
+        .await
+        .context("failed to wait for shutdown signal")?;
+    tracing::info!(
+        "Shutting down remote pipeline stage service on {}",
+        handle.local_addr()
+    );
+    handle.shutdown()
 }
 
 /// Start the server with the given startup configuration.
@@ -588,10 +760,18 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     }
 
     // -- Distributed mode initialization --
-    let _node_registry = resolve_distributed_config(&startup).await?;
+    let distributed = resolve_distributed_startup(&startup).await?;
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
     let mut config = build_server_config(&startup, api_key);
+    if config.pipeline_parallel_runtime.is_some() && distributed.pipeline_runtime.is_some() {
+        anyhow::bail!(
+            "server startup resolved both in-process and remote pipeline runtimes; remove either --pp-layers or the remote pipeline cluster topology"
+        );
+    }
+    config.pipeline_parallel_runtime = distributed
+        .pipeline_runtime
+        .or(config.pipeline_parallel_runtime.take());
     config.no_batch |= tp_support.force_no_batch;
     if config.tensor_parallel.tp_size > 1 {
         if config.no_batch {
@@ -602,12 +782,14 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
             tracing::info!("Tensor parallel runtime enabled; batch scheduler remains active");
         }
     }
-    if let Some(ref pp_layers) = config.pipeline_parallel_layers {
+    if let Some(ref pipeline_runtime) = config.pipeline_parallel_runtime {
         tracing::info!(
-            "Server pipeline runtime enabled (pp_layers={}, pp_micro_batch_size={})",
-            pp_layers,
-            config.pipeline_parallel_micro_batch_size
+            "Server pipeline runtime enabled ({})",
+            pipeline_runtime.describe()
         );
+    }
+    if let Some(service_config) = distributed.remote_stage_service {
+        return serve_remote_pipeline_stage(service_config).await;
     }
     let chat_template = resolve_chat_template(
         startup.chat_template.as_deref(),

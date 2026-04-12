@@ -21,7 +21,10 @@ use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-use super::runtime::{InProcessPipelineRuntime, PipelineModelRuntime};
+use super::runtime::{
+    InProcessPipelineRuntime, PipelineModelRuntime, RemotePipelineRuntime,
+    RemotePipelineRuntimeConfig,
+};
 
 pub struct PipelineServerModel {
     num_layers: usize,
@@ -49,6 +52,16 @@ impl PipelineServerModel {
     ) -> anyhow::Result<Self> {
         let (num_layers, eos_token_ids, runtime) =
             InProcessPipelineRuntime::load(model_dir, pp_layers, pp_micro_batch_size)?;
+        Ok(Self::new(num_layers, eos_token_ids, Box::new(runtime)))
+    }
+
+    pub fn load_remote(
+        model_dir: &std::path::Path,
+        config: RemotePipelineRuntimeConfig,
+    ) -> anyhow::Result<Self> {
+        let num_layers = super::resolve_in_process_pipeline_num_layers(model_dir)?;
+        let eos_token_ids = crate::read_eos_token_ids(model_dir);
+        let runtime = RemotePipelineRuntime::new(config)?;
         Ok(Self::new(num_layers, eos_token_ids, Box::new(runtime)))
     }
 }

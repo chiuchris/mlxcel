@@ -143,8 +143,7 @@ impl ModelProvider {
                 config.preemption_policy,
                 config.max_batch_prefill,
                 config.decode_storage_backend,
-                config.pipeline_parallel_layers.clone(),
-                config.pipeline_parallel_micro_batch_size,
+                config.pipeline_parallel_runtime.clone(),
                 batch_metrics,
                 batch_observability,
             )
@@ -223,7 +222,6 @@ impl ModelProvider {
             1,
             crate::server::DecodeStorageBackend::Dense,
             None,
-            1,
             batch_metrics,
             batch_observability,
         )
@@ -242,8 +240,7 @@ impl ModelProvider {
         preemption_policy: crate::server::config::PreemptionPolicy,
         max_batch_prefill: usize,
         decode_storage_backend: crate::server::DecodeStorageBackend,
-        pipeline_parallel_layers: Option<String>,
-        pipeline_parallel_micro_batch_size: usize,
+        pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -268,8 +265,7 @@ impl ModelProvider {
             preemption_policy,
             max_batch_prefill: max_batch_prefill.max(1),
             decode_storage_backend,
-            pipeline_parallel_layers,
-            pipeline_parallel_micro_batch_size: pipeline_parallel_micro_batch_size.max(1),
+            pipeline_parallel_runtime,
             tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 
@@ -331,8 +327,7 @@ impl ModelProvider {
             preemption_policy: crate::server::config::PreemptionPolicy::default(),
             max_batch_prefill: 1,
             decode_storage_backend: crate::server::DecodeStorageBackend::Dense,
-            pipeline_parallel_layers: None,
-            pipeline_parallel_micro_batch_size: 1,
+            pipeline_parallel_runtime: None,
             tensor_parallel: crate::distributed::ShardConfig::default(),
         };
 

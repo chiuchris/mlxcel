@@ -17,11 +17,12 @@ use std::path::PathBuf;
 use super::{
     ServerStartupConfig, build_server_config, resolve_api_key, resolve_chat_template,
     resolve_decode_storage_backend, resolve_default_max_tokens, resolve_dry_penalty_last_n,
-    resolve_tensor_parallel_runtime_support, validate_pipeline_parallel_startup,
-    validate_tensor_parallel_startup,
+    resolve_remote_pipeline_topology, resolve_tensor_parallel_runtime_support,
+    validate_pipeline_parallel_startup, validate_tensor_parallel_startup,
 };
-use crate::server::DecodeStorageBackend;
+use crate::distributed::ClusterConfig;
 use crate::server::chat_template::ChatMessage;
+use crate::server::{DecodeStorageBackend, PipelineParallelRuntimeConfig};
 
 fn temp_path(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mlxcel-{}-{}", name, uuid::Uuid::new_v4()));
@@ -188,8 +189,189 @@ fn build_server_config_propagates_pipeline_parallel_settings() {
         ..ServerStartupConfig::default()
     };
     let config = build_server_config(&startup, None);
-    assert_eq!(config.pipeline_parallel_layers.as_deref(), Some("0-7,8-15"));
-    assert_eq!(config.pipeline_parallel_micro_batch_size, 4);
+    match config.pipeline_parallel_runtime.as_ref() {
+        Some(PipelineParallelRuntimeConfig::InProcess {
+            layers,
+            micro_batch_size,
+        }) => {
+            assert_eq!(layers, "0-7,8-15");
+            assert_eq!(*micro_batch_size, 4);
+        }
+        other => panic!("unexpected pipeline runtime config: {other:?}"),
+    }
+}
+
+#[test]
+fn resolve_remote_pipeline_topology_builds_remote_coordinator_runtime() {
+    let dir = temp_path("pp-remote-coordinator");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        host: "127.0.0.1".to_string(),
+        port: 8080,
+        node_id: Some("coordinator".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(
+        r#"
+[cluster]
+name = "remote-pp"
+pipeline_parallel_size = 2
+transport_backend = "tcp"
+
+[[nodes]]
+id = "coordinator"
+address = "127.0.0.1:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "127.0.0.1:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "127.0.0.1:19002"
+role = "pipeline_stage"
+stage = 1
+"#,
+    )
+    .unwrap();
+
+    let (runtime, stage) =
+        resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap();
+    assert!(stage.is_none());
+    match runtime {
+        Some(PipelineParallelRuntimeConfig::RemoteCoordinator(config)) => {
+            assert_eq!(config.bind_address, "127.0.0.1:19000");
+            assert_eq!(
+                config.stage_peers,
+                vec!["127.0.0.1:19001", "127.0.0.1:19002"]
+            );
+        }
+        other => panic!("unexpected remote pipeline runtime: {other:?}"),
+    }
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolve_remote_pipeline_topology_builds_remote_stage_service() {
+    let dir = temp_path("pp-remote-stage");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        node_id: Some("stage-1".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(
+        r#"
+[cluster]
+name = "remote-pp"
+pipeline_parallel_size = 2
+transport_backend = "tcp"
+
+[[nodes]]
+id = "coordinator"
+address = "127.0.0.1:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "127.0.0.1:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "127.0.0.1:19002"
+role = "pipeline_stage"
+stage = 1
+"#,
+    )
+    .unwrap();
+
+    let (runtime, stage) = resolve_remote_pipeline_topology(&startup, &cluster, "stage-1").unwrap();
+    assert!(runtime.is_none());
+    let stage = stage.expect("stage service config");
+    assert_eq!(stage.bind_address, "127.0.0.1:19002");
+    assert_eq!(stage.stage_assignment.stage_index, 1);
+    assert_eq!(stage.upstream_peer.as_deref(), Some("127.0.0.1:19001"));
+    assert_eq!(stage.downstream_peer, None);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolve_remote_pipeline_topology_rejects_control_port_conflict() {
+    let dir = temp_path("pp-remote-conflict");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        host: "127.0.0.1".to_string(),
+        port: 19000,
+        node_id: Some("coordinator".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(
+        r#"
+[cluster]
+name = "remote-pp"
+pipeline_parallel_size = 2
+transport_backend = "tcp"
+
+[[nodes]]
+id = "coordinator"
+address = "127.0.0.1:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "127.0.0.1:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "127.0.0.1:19002"
+role = "pipeline_stage"
+stage = 1
+"#,
+    )
+    .unwrap();
+
+    let err = resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("conflicts with HTTP listen address")
+    );
+
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

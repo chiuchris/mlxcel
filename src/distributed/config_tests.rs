@@ -1,4 +1,5 @@
 use super::*;
+use crate::distributed::TransportBackend;
 
 #[test]
 fn parse_node_role_from_str() {
@@ -72,10 +73,92 @@ rank = 1
     let config = ClusterConfig::from_toml(toml_str).unwrap();
     assert_eq!(config.cluster.name, "test-cluster");
     assert_eq!(config.cluster.tensor_parallel_size, 2);
+    assert_eq!(config.cluster.transport_backend, TransportBackend::Tcp);
     assert_eq!(config.nodes.len(), 2);
     assert_eq!(config.nodes[0].role, NodeRole::TensorParallelRank);
     assert_eq!(config.nodes[0].rank, Some(0));
     assert_eq!(config.nodes[1].rank, Some(1));
+}
+
+#[test]
+fn parse_pipeline_stage_cluster_with_transport_backend() {
+    let toml_str = r#"
+[cluster]
+name = "pipeline"
+pipeline_parallel_size = 2
+transport_backend = "thunderbolt"
+
+[[nodes]]
+id = "coordinator"
+address = "10.0.0.10:9000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "10.0.0.11:9000"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "10.0.0.12:9000"
+role = "pipeline_stage"
+stage = 1
+"#;
+    let config = ClusterConfig::from_toml(toml_str).unwrap();
+    assert_eq!(
+        config.cluster.transport_backend,
+        TransportBackend::Thunderbolt
+    );
+    assert_eq!(
+        config
+            .pipeline_stage_nodes()
+            .into_iter()
+            .map(|node| node.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["stage-0", "stage-1"]
+    );
+}
+
+#[test]
+fn reject_pipeline_config_with_missing_stage_index() {
+    let toml_str = r#"
+[cluster]
+name = "pipeline"
+pipeline_parallel_size = 2
+
+[[nodes]]
+id = "stage-0"
+address = "10.0.0.11:9000"
+role = "pipeline_stage"
+
+[[nodes]]
+id = "stage-1"
+address = "10.0.0.12:9000"
+role = "pipeline_stage"
+stage = 1
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(err.to_string().contains("missing required 'stage' index"));
+}
+
+#[test]
+fn reject_pipeline_config_with_non_stage_node_stage_field() {
+    let toml_str = r#"
+[cluster]
+name = "pipeline"
+
+[[nodes]]
+id = "coord"
+address = "10.0.0.10:9000"
+role = "hybrid"
+stage = 0
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("only pipeline_stage nodes may set stage")
+    );
 }
 
 #[test]
