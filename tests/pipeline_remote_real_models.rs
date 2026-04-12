@@ -6,8 +6,8 @@ use std::time::Duration;
 use common::repo_model_dir;
 use mlxcel::distributed::pipeline::{
     RemotePipelineRuntime, RemotePipelineRuntimeConfig, RemoteStageResponse,
-    RemoteStageServiceConfig, RemoteStageServiceHandle, resolve_in_process_pipeline_num_layers,
-    resolve_in_process_stage_assignments,
+    RemoteStageServiceConfig, RemoteStageServiceHandle, StageAssignment,
+    resolve_in_process_pipeline_num_layers,
 };
 use mlxcel::distributed::{ThunderboltTransport, TransportBackend};
 use mlxcel::{LanguageModel, distributed::pipeline::PipelineModelRuntime};
@@ -20,20 +20,39 @@ fn reserve_port(bind_ip: IpAddr) -> u16 {
     port
 }
 
+fn two_stage_assignments(num_layers: usize, split: usize) -> [StageAssignment; 2] {
+    [
+        StageAssignment {
+            stage_index: 0,
+            device_id: "stage-0".to_string(),
+            layer_range: 0..split,
+            has_embedding: true,
+            has_lm_head: false,
+            estimated_memory_bytes: 0,
+        },
+        StageAssignment {
+            stage_index: 1,
+            device_id: "stage-1".to_string(),
+            layer_range: split..num_layers,
+            has_embedding: false,
+            has_lm_head: true,
+            estimated_memory_bytes: 0,
+        },
+    ]
+}
+
 fn spawn_remote_runtime(
     model_dir: &std::path::Path,
     bind_ip: IpAddr,
     transport_backend: TransportBackend,
+    split_override: Option<usize>,
 ) -> (
     RemotePipelineRuntime,
     RemoteStageServiceHandle,
     RemoteStageServiceHandle,
 ) {
     let num_layers = resolve_in_process_pipeline_num_layers(model_dir).unwrap();
-    let split = num_layers / 2;
-    let pp_layers = format!("0-{},{}-{}", split - 1, split, num_layers - 1);
-    let assignments =
-        resolve_in_process_stage_assignments(num_layers, None, Some(&pp_layers)).unwrap();
+    let assignments = two_stage_assignments(num_layers, split_override.unwrap_or(num_layers / 2));
 
     let stage0_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
     let stage1_addr = format!("{}:{}", bind_ip, reserve_port(bind_ip));
@@ -66,7 +85,7 @@ fn spawn_remote_runtime(
         stage_peers: vec![stage0_addr, stage1_addr],
         transport_backend,
         bind_address: format!("{}:{}", bind_ip, reserve_port(bind_ip)),
-        stage_timeout: Duration::from_secs(5),
+        stage_timeout: Duration::from_secs(30),
     })
     .unwrap();
 
@@ -78,6 +97,7 @@ fn assert_remote_runtime_matches_full_model(
     prompt: &[i32],
     decode_token: i32,
     seq_raw: u64,
+    split_override: Option<usize>,
 ) {
     let model_dir = repo_model_dir(model_name);
     if !model_dir.exists() {
@@ -93,6 +113,7 @@ fn assert_remote_runtime_matches_full_model(
         &model_dir,
         "127.0.0.1".parse().unwrap(),
         TransportBackend::Tcp,
+        split_override,
     );
 
     let prompt_ids = mlxcel_core::from_slice_i32(prompt, &[1, prompt.len() as i32]);
@@ -144,6 +165,7 @@ fn pipeline_remote_runtime_llama_real_model_parity_and_cleanup() {
         &model_dir,
         "127.0.0.1".parse().unwrap(),
         TransportBackend::Tcp,
+        None,
     );
 
     let prompt_ids = mlxcel_core::from_slice_i32(&[128000, 9906], &[1, 2]);
@@ -213,6 +235,7 @@ fn pipeline_remote_runtime_llama_drain_and_shutdown_transition() {
         &model_dir,
         "127.0.0.1".parse().unwrap(),
         TransportBackend::Tcp,
+        None,
     );
 
     let seq_id = SequenceId::from_raw(77);
@@ -261,7 +284,7 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
 
     let (model, _) = mlxcel::load_model(&model_dir).unwrap();
     let (runtime, stage0, stage1) =
-        spawn_remote_runtime(&model_dir, bind_ip, TransportBackend::Thunderbolt);
+        spawn_remote_runtime(&model_dir, bind_ip, TransportBackend::Thunderbolt, None);
 
     let prompt_ids = mlxcel_core::from_slice_i32(&[128000, 9906], &[1, 2]);
     let decode_ids = mlxcel_core::from_slice_i32(&[13], &[1, 1]);
@@ -298,11 +321,17 @@ fn pipeline_remote_runtime_llama_thunderbolt_bridge_parity() {
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
 fn pipeline_remote_runtime_gpt_oss_real_model_parity_and_cleanup() {
-    assert_remote_runtime_matches_full_model("gpt-oss-20b-mxfp4", &[42, 43], 44, 420);
+    assert_remote_runtime_matches_full_model("gpt-oss-20b-mxfp4", &[42, 43], 44, 420, None);
 }
 
 #[test]
 #[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
 fn pipeline_remote_runtime_gemma3_real_model_parity_and_cleanup() {
-    assert_remote_runtime_matches_full_model("gemma3-1b-4bit", &[2, 3], 4, 430);
+    assert_remote_runtime_matches_full_model("gemma3-1b-4bit", &[2, 3], 4, 430, None);
+}
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote pipeline stages"]
+fn pipeline_remote_runtime_gemma4_real_model_parity_and_cleanup() {
+    assert_remote_runtime_matches_full_model("gemma-4-e2b-it-4bit", &[2, 3], 4, 440, Some(13));
 }

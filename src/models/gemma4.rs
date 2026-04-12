@@ -24,6 +24,9 @@
 //! - Dense + MoE feed-forward paths
 //! - Final logit softcapping
 
+use crate::distributed::pipeline::LayerFilter;
+use crate::distributed::pipeline::StageExecutionOutput;
+use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::switch_layers::{SwitchLinear, gather_sort};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{
@@ -482,7 +485,7 @@ pub struct Experts {
 }
 
 impl Experts {
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         top_k_indices: &MlxArray,
@@ -529,7 +532,7 @@ enum AttentionProjection {
     },
 }
 
-pub trait CacheInterface {
+pub(crate) trait CacheInterface {
     fn offset(&self) -> i32;
     fn set_offset(&mut self, offset: i32);
     fn update_and_fetch(
@@ -581,6 +584,13 @@ pub enum Cache {
 }
 
 impl Cache {
+    pub(crate) fn offset(&self) -> i32 {
+        match self {
+            Self::Standard(cache) => cache.offset,
+            Self::Rotating(cache) => cache.offset,
+        }
+    }
+
     pub(crate) fn as_interface(&mut self) -> &mut dyn CacheInterface {
         match self {
             Self::Standard(cache) => cache,
@@ -609,7 +619,7 @@ pub struct Attention {
 }
 
 impl Attention {
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         mask: Option<&MlxArray>,
@@ -901,7 +911,7 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         mask: Option<&MlxArray>,
@@ -1463,6 +1473,503 @@ impl Gemma4Model {
 
     pub(crate) fn make_caches(&self) -> Vec<Cache> {
         self.text_model.make_caches()
+    }
+}
+
+pub(crate) struct Gemma4StageModel {
+    filter: LayerFilter,
+    embed_tokens: Option<UnifiedEmbedding>,
+    embed_tokens_per_layer: Option<UnifiedEmbedding>,
+    per_layer_model_projection: Option<ScaledLinear>,
+    per_layer_projection_norm: Option<RMSNorm>,
+    layers: Vec<(usize, DecoderLayer)>,
+    norm: Option<RMSNorm>,
+    config: TextConfig,
+    final_logit_softcapping: Option<f32>,
+    _weight_backing: super::sanitize::Gemma4WeightBacking,
+}
+
+impl Gemma4StageModel {
+    pub(crate) fn load(
+        model_dir: &Path,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.json: {}", e))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: ModelArgs = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+        let config_value: serde_json::Value = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse sanitized config.json: {}", e))?;
+
+        let is_quantized = config_value.get("quantization").is_some()
+            || config_value
+                .get("text_config")
+                .and_then(|text| text.get("quantization"))
+                .is_some();
+        let (mut weights, weight_backing) = if is_quantized {
+            super::sanitize::load_gemma4_text_weights_with_backing(model_dir)?
+        } else {
+            (
+                crate::models::load_and_sanitize_weights(model_dir)?,
+                super::sanitize::Gemma4WeightBacking::default(),
+            )
+        };
+        crate::models::sanitize_tied_embeddings(&mut weights, &config_value);
+        let mut effective_filter = filter.clone();
+        if filter.has_lm_head {
+            effective_filter.has_embedding = true;
+        }
+        filter_weight_map(&mut weights, &effective_filter);
+        Self::from_filtered_weights(&weights, &args, filter, stage_index, weight_backing)
+    }
+
+    fn from_filtered_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        filter: &LayerFilter,
+        stage_index: usize,
+        weight_backing: super::sanitize::Gemma4WeightBacking,
+    ) -> Result<Self, String> {
+        let config = args.text_args();
+        let prefix = "language_model.model";
+
+        let embed_tokens = if filter.has_embedding || filter.has_lm_head {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                &format!("{}.embed_tokens", prefix),
+                config.group_size(),
+                config.bits(),
+            )?)
+        } else {
+            None
+        };
+
+        let embed_tokens_per_layer =
+            if filter.has_embedding && config.hidden_size_per_layer_input > 0 {
+                Some(UnifiedEmbedding::from_weights(
+                    weights,
+                    &format!("{}.embed_tokens_per_layer", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?)
+            } else {
+                None
+            };
+
+        let per_layer_model_projection =
+            if filter.has_embedding && config.hidden_size_per_layer_input > 0 {
+                Some(ScaledLinear::from_weights(
+                    weights,
+                    &format!("{}.per_layer_model_projection", prefix),
+                    config.group_size(),
+                    config.bits(),
+                    (config.hidden_size as f32).powf(-0.5),
+                )?)
+            } else {
+                None
+            };
+
+        let per_layer_projection_norm =
+            if filter.has_embedding && config.hidden_size_per_layer_input > 0 {
+                Some(RMSNorm::new(
+                    get_weight_copy(
+                        weights,
+                        &format!("{}.per_layer_projection_norm.weight", prefix),
+                    )?,
+                    config.rms_norm_eps,
+                ))
+            } else {
+                None
+            };
+
+        let mut layers = Vec::with_capacity(filter.num_layers());
+        for layer_idx in filter.layer_range.clone() {
+            let layer = DecoderLayer::from_weights(
+                weights,
+                &config,
+                layer_idx,
+                &format!("{}.layers.{}", prefix, layer_idx),
+            )?;
+            if layer.self_attn.is_kv_shared_layer
+                && let Some(shared_idx) = layer.self_attn.kv_shared_layer_index
+                && !filter.layer_range.contains(&shared_idx)
+            {
+                return Err(format!(
+                    "stage {} cannot host Gemma4 layer {} because it shares KV with layer {} outside range {}..{}",
+                    stage_index,
+                    layer_idx,
+                    shared_idx,
+                    filter.layer_range.start,
+                    filter.layer_range.end
+                ));
+            }
+            layers.push((layer_idx, layer));
+        }
+
+        if layers.is_empty() {
+            return Err(format!(
+                "stage {} did not load any layers from range {}..{}",
+                stage_index, filter.layer_range.start, filter.layer_range.end
+            ));
+        }
+
+        let norm = if filter.has_lm_head {
+            Some(RMSNorm::new(
+                get_weight_copy(weights, &format!("{}.norm.weight", prefix))?,
+                config.rms_norm_eps,
+            ))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            filter: filter.clone(),
+            embed_tokens,
+            embed_tokens_per_layer,
+            per_layer_model_projection,
+            per_layer_projection_norm,
+            layers,
+            norm,
+            final_logit_softcapping: config.final_logit_softcapping,
+            config,
+            _weight_backing: weight_backing,
+        })
+    }
+
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
+        self.layers
+            .iter()
+            .map(|(layer_idx, _)| {
+                if self.config.layer_type(*layer_idx) == "full_attention" {
+                    Cache::Standard(KVCache::new())
+                } else {
+                    Cache::Rotating(RotatingKVCache::new(self.config.sliding_window as i32))
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn execute_from_token_ids(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        let mut hidden = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| {
+                "stage does not host embeddings; hidden-state input required".to_string()
+            })?
+            .forward(input_ids);
+        hidden = mlxcel_core::multiply_scalar(&hidden, (self.config.hidden_size as f32).sqrt());
+
+        let stage_inputs = if self.config.hidden_size_per_layer_input > 0 {
+            let raw_inputs = self.get_per_layer_inputs(input_ids)?;
+            let projected = self.project_per_layer_inputs(
+                hidden.as_ref().unwrap(),
+                Some(raw_inputs.as_ref().unwrap()),
+            )?;
+            Some(projected)
+        } else {
+            None
+        };
+        let local_inputs = stage_inputs.as_ref().map(|inputs| {
+            self.slice_layer_input_range(inputs.as_ref().unwrap(), self.filter.layer_range.clone())
+        });
+        let downstream_inputs = stage_inputs.as_ref().and_then(|inputs| {
+            if self.filter.layer_range.end >= self.config.num_hidden_layers {
+                None
+            } else {
+                Some(self.slice_layer_input_range(
+                    inputs.as_ref().unwrap(),
+                    self.filter.layer_range.end..self.config.num_hidden_layers,
+                ))
+            }
+        });
+
+        self.execute_hidden(hidden, local_inputs.as_ref(), downstream_inputs, caches)
+    }
+
+    pub(crate) fn execute_from_hidden_states(
+        &self,
+        packed_hidden: UniquePtr<MlxArray>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if self.filter.has_embedding {
+            return Err("entry stage expects token IDs, not hidden states".to_string());
+        }
+
+        let (hidden, local_inputs, downstream_inputs) =
+            self.unpack_stage_hidden(packed_hidden.as_ref().unwrap())?;
+        self.execute_hidden(hidden, local_inputs.as_ref(), downstream_inputs, caches)
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        local_per_layer_inputs: Option<&UniquePtr<MlxArray>>,
+        downstream_inputs: Option<UniquePtr<MlxArray>>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if caches.len() != self.layers.len() {
+            return Err(format!(
+                "stage cache count mismatch: expected {}, got {}",
+                self.layers.len(),
+                caches.len()
+            ));
+        }
+
+        let shape = mlxcel_core::array_shape(hidden.as_ref().unwrap());
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        let (global_mask, sliding_mask) = if seq_len > 1 {
+            let global_offset = self.first_cache_offset(caches, "full_attention");
+            let sliding_offset = self.first_cache_offset(caches, "sliding_attention");
+            let sliding_effective_offset =
+                sliding_offset.min((self.config.sliding_window as i32 - seq_len).max(0));
+            (
+                Some(create_causal_mask(seq_len, global_offset)),
+                Some(create_causal_mask_with_window(
+                    seq_len,
+                    sliding_effective_offset,
+                    Some(self.config.sliding_window as i32),
+                )),
+            )
+        } else {
+            (None, None)
+        };
+
+        let mut shared_kv_store: HashMap<usize, (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32)> =
+            HashMap::new();
+        let n_layers = self.layers.len();
+
+        for (local_idx, (global_idx, layer)) in self.layers.iter().enumerate() {
+            let cache = caches[local_idx].as_interface();
+            let mut shared_kv = None;
+
+            if layer.self_attn.is_kv_shared_layer
+                && let Some(ref_idx) = layer.self_attn.kv_shared_layer_index
+            {
+                let (keys, values, ref_offset) =
+                    shared_kv_store.get(&ref_idx).ok_or_else(|| {
+                        format!(
+                            "stage missing shared KV source layer {} for Gemma4 layer {}",
+                            ref_idx, global_idx
+                        )
+                    })?;
+                cache.set_offset(*ref_offset);
+                shared_kv = Some((keys.as_ref().unwrap(), values.as_ref().unwrap()));
+            }
+
+            let local_mask = match layer.layer_type.as_str() {
+                "full_attention" => global_mask.as_ref().map(|m| m.as_ref().unwrap()),
+                _ => sliding_mask.as_ref().map(|m| m.as_ref().unwrap()),
+            };
+
+            let layer_input = local_per_layer_inputs.as_ref().map(|inputs| {
+                slice_layer_input(
+                    inputs.as_ref().unwrap(),
+                    local_idx as i32,
+                    batch,
+                    seq_len,
+                    self.config.hidden_size_per_layer_input as i32,
+                )
+            });
+
+            let pre_offset = cache.offset();
+            let (next_hidden, stored_kv) = layer.forward(
+                hidden.as_ref().unwrap(),
+                local_mask,
+                cache,
+                layer_input.as_ref().map(|arr| arr.as_ref().unwrap()),
+                shared_kv,
+            );
+            hidden = next_hidden;
+
+            if let Some((keys, values)) = stored_kv {
+                shared_kv_store.insert(*global_idx, (keys, values, pre_offset));
+            }
+
+            pipeline_hint(&hidden, local_idx, n_layers);
+        }
+
+        if let Some(norm) = &self.norm {
+            let hidden = norm.forward(hidden.as_ref().unwrap());
+            let mut logits = self
+                .embed_tokens
+                .as_ref()
+                .ok_or_else(|| "final Gemma4 stage missing embeddings".to_string())?
+                .as_linear(&hidden);
+            if let Some(cap) = self.final_logit_softcapping {
+                logits = mlxcel_core::compiled_softcap(&logits, cap);
+            }
+            return Ok(StageExecutionOutput::Logits(logits));
+        }
+
+        Ok(StageExecutionOutput::HiddenStates(
+            self.pack_hidden_for_downstream(hidden.as_ref().unwrap(), downstream_inputs.as_ref())?,
+        ))
+    }
+
+    fn get_per_layer_inputs(&self, input_ids: &MlxArray) -> Result<UniquePtr<MlxArray>, String> {
+        let embedded = self
+            .embed_tokens_per_layer
+            .as_ref()
+            .ok_or_else(|| "Gemma4 per-layer embeddings missing".to_string())?
+            .forward(input_ids);
+        let embedded = mlxcel_core::multiply_scalar(
+            &embedded,
+            (self.config.hidden_size_per_layer_input as f32).sqrt(),
+        );
+        let shape = mlxcel_core::array_shape(input_ids);
+        Ok(mlxcel_core::reshape(
+            &embedded,
+            &[
+                shape[0],
+                shape[1],
+                self.config.num_hidden_layers as i32,
+                self.config.hidden_size_per_layer_input as i32,
+            ],
+        ))
+    }
+
+    fn project_per_layer_inputs(
+        &self,
+        inputs_embeds: &MlxArray,
+        per_layer_inputs: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let projected = self
+            .per_layer_model_projection
+            .as_ref()
+            .ok_or_else(|| "Gemma4 per_layer_model_projection missing".to_string())?
+            .forward(inputs_embeds);
+        let shape = mlxcel_core::array_shape(inputs_embeds);
+        let projected = mlxcel_core::reshape(
+            &projected,
+            &[
+                shape[0],
+                shape[1],
+                self.config.num_hidden_layers as i32,
+                self.config.hidden_size_per_layer_input as i32,
+            ],
+        );
+        let projected = self
+            .per_layer_projection_norm
+            .as_ref()
+            .ok_or_else(|| "Gemma4 per_layer_projection_norm missing".to_string())?
+            .forward(&projected);
+
+        Ok(if let Some(per_layer_inputs) = per_layer_inputs {
+            let sum = mlxcel_core::add(&projected, per_layer_inputs);
+            mlxcel_core::multiply_scalar(&sum, std::f32::consts::FRAC_1_SQRT_2)
+        } else {
+            projected
+        })
+    }
+
+    fn pack_hidden_for_downstream(
+        &self,
+        hidden: &MlxArray,
+        downstream_inputs: Option<&UniquePtr<MlxArray>>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let Some(downstream_inputs) = downstream_inputs else {
+            return Ok(mlxcel_core::copy(hidden));
+        };
+
+        let aux_shape = mlxcel_core::array_shape(downstream_inputs.as_ref().unwrap());
+        let flat_aux = mlxcel_core::reshape(
+            downstream_inputs.as_ref().unwrap(),
+            &[aux_shape[0], aux_shape[1], aux_shape[2] * aux_shape[3]],
+        );
+        Ok(mlxcel_core::concatenate(hidden, &flat_aux, -1))
+    }
+
+    fn unpack_stage_hidden(
+        &self,
+        packed_hidden: &MlxArray,
+    ) -> Result<
+        (
+            UniquePtr<MlxArray>,
+            Option<UniquePtr<MlxArray>>,
+            Option<UniquePtr<MlxArray>>,
+        ),
+        String,
+    > {
+        if self.config.hidden_size_per_layer_input == 0 {
+            return Ok((mlxcel_core::copy(packed_hidden), None, None));
+        }
+
+        let shape = mlxcel_core::array_shape(packed_hidden);
+        let batch = shape[0];
+        let seq_len = shape[1];
+        let hidden_size = self.config.hidden_size as i32;
+        let remaining_layers =
+            (self.config.num_hidden_layers - self.filter.layer_range.start) as i32;
+        let hidden = slice_axis(packed_hidden, -1, 0, hidden_size);
+        let flat_aux = slice_axis(
+            packed_hidden,
+            -1,
+            hidden_size,
+            hidden_size + remaining_layers * self.config.hidden_size_per_layer_input as i32,
+        );
+        let aux = mlxcel_core::reshape(
+            &flat_aux,
+            &[
+                batch,
+                seq_len,
+                remaining_layers,
+                self.config.hidden_size_per_layer_input as i32,
+            ],
+        );
+        let local_layers = self.filter.num_layers() as i32;
+        let local_inputs = self.slice_layer_input_range(&aux, 0..local_layers as usize);
+        let downstream_inputs =
+            if local_layers < remaining_layers {
+                Some(self.slice_layer_input_range(
+                    &aux,
+                    local_layers as usize..remaining_layers as usize,
+                ))
+            } else {
+                None
+            };
+        Ok((hidden, Some(local_inputs), downstream_inputs))
+    }
+
+    fn slice_layer_input_range(
+        &self,
+        inputs: &MlxArray,
+        range: std::ops::Range<usize>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(inputs);
+        mlxcel_core::slice(
+            inputs,
+            &[0, 0, range.start as i32, 0],
+            &[
+                shape[0],
+                shape[1],
+                range.end as i32,
+                self.config.hidden_size_per_layer_input as i32,
+            ],
+        )
+    }
+
+    fn first_cache_offset(&self, caches: &[Cache], layer_type: &str) -> i32 {
+        for cache in caches {
+            match (layer_type, cache) {
+                ("full_attention", Cache::Standard(cache)) => return cache.offset,
+                ("sliding_attention", Cache::Rotating(cache)) => return cache.offset,
+                _ => {}
+            }
+        }
+        0
     }
 }
 

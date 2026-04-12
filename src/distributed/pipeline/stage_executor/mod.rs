@@ -28,6 +28,7 @@
 
 mod common;
 mod gemma3;
+mod gemma4;
 mod gpt_oss;
 mod llama;
 
@@ -42,6 +43,7 @@ use crate::models::{ModelType, get_model_type};
 use super::partial_loading::LayerFilter;
 use super::partition::StageAssignment;
 use gemma3::Gemma3StageExecutor;
+use gemma4::Gemma4StageExecutor;
 use gpt_oss::GptOssStageExecutor;
 use llama::LlamaStageExecutor;
 
@@ -179,6 +181,11 @@ fn load_family_backend(
             stage_index,
         )?)),
         ModelType::Gemma3 => Ok(Box::new(Gemma3StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::Gemma4 | ModelType::Gemma4VLM => Ok(Box::new(Gemma4StageExecutor::load(
             model_dir,
             filter,
             stage_index,
