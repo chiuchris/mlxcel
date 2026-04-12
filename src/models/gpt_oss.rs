@@ -34,6 +34,10 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
+use crate::distributed::pipeline::LayerFilter;
+use crate::distributed::pipeline::StageExecutionOutput;
+use crate::distributed::pipeline::partial_loading::filter_weight_map;
+
 // Configuration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ModelArgs {
@@ -182,7 +186,7 @@ impl ModelArgs {
     }
 
     /// Compute YarnRoPE frequencies
-    fn compute_yarn_freqs(&self) -> Option<(UniquePtr<MlxArray>, f32)> {
+    pub(crate) fn compute_yarn_freqs(&self) -> Option<(UniquePtr<MlxArray>, f32)> {
         let rope_scaling = self.rope_scaling.as_ref()?;
         let rope_type = rope_scaling
             .get("rope_type")
@@ -734,7 +738,7 @@ impl Attention {
 }
 
 // Transformer Block.
-struct TransformerBlock {
+pub(crate) struct TransformerBlock {
     self_attn: Attention,
     mlp: MLPBlock,
     input_layernorm: RMSNorm,
@@ -742,7 +746,7 @@ struct TransformerBlock {
 }
 
 impl TransformerBlock {
-    fn forward(
+    pub(crate) fn forward(
         &self,
         x: &MlxArray,
         cache: &mut dyn CacheInterface,
@@ -759,7 +763,7 @@ impl TransformerBlock {
         mlxcel_core::add(&residual, &moe_out)
     }
 
-    fn from_weights(
+    pub(crate) fn from_weights(
         weights: &WeightMap,
         args: &ModelArgs,
         layer_idx: usize,
@@ -798,7 +802,7 @@ impl TransformerBlock {
 
 // Cache Interface (same pattern as Gemma3).
 // Used by: GptOss
-trait CacheInterface {
+pub(crate) trait CacheInterface {
     fn offset(&self) -> i32;
     fn update_and_fetch(
         &mut self,
@@ -833,17 +837,24 @@ impl CacheInterface for RotatingKVCache {
     }
 }
 
-enum Cache {
+pub(crate) enum Cache {
     Standard(KVCache),
     Rotating(RotatingKVCache),
 }
 
 impl Cache {
-    fn as_interface(&mut self) -> &mut dyn CacheInterface {
+    pub(crate) fn as_interface(&mut self) -> &mut dyn CacheInterface {
         match self {
             Cache::Standard(c) => c,
             Cache::Rotating(c) => c,
         }
+    }
+}
+
+pub(crate) fn gpt_oss_cache_offset(cache: &Cache) -> i32 {
+    match cache {
+        Cache::Standard(cache) => cache.offset,
+        Cache::Rotating(cache) => cache.offset,
     }
 }
 
@@ -1048,4 +1059,211 @@ fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray
         .get(name)
         .map(|w| mlxcel_core::copy(w))
         .ok_or_else(|| format!("Weight not found: {}", name))
+}
+
+pub(crate) struct GptOssStageModel {
+    filter: LayerFilter,
+    embed_tokens: Option<UnifiedEmbedding>,
+    layers: Vec<TransformerBlock>,
+    norm: Option<RMSNorm>,
+    lm_head: Option<UnifiedLinear>,
+    layer_types: Vec<String>,
+    sliding_window: usize,
+}
+
+impl GptOssStageModel {
+    pub(crate) fn load(
+        model_dir: &Path,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read {}: {}", config_path.display(), e))?;
+        let config_str = crate::models::sanitize_config_json(&config_str);
+        let args: ModelArgs = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse {}: {}", config_path.display(), e))?;
+
+        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut effective_filter = filter.clone();
+        if args.tie_word_embeddings && filter.has_lm_head {
+            effective_filter.has_embedding = true;
+        }
+        filter_weight_map(&mut weights, &effective_filter);
+        Self::from_filtered_weights(&weights, &args, filter, stage_index)
+    }
+
+    fn from_filtered_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        filter: &LayerFilter,
+        stage_index: usize,
+    ) -> Result<Self, String> {
+        let (embed_gs, embed_bits, _embed_mode) = args.quant_for("model.embed_tokens");
+        let embed_tokens = if filter.has_embedding {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                "model.embed_tokens",
+                embed_gs,
+                embed_bits,
+            )?)
+        } else {
+            None
+        };
+
+        let yarn_result = args.compute_yarn_freqs();
+        let (yarn_freqs_ref, rope_mscale) = match &yarn_result {
+            Some((freqs, mscale)) => (Some(freqs.as_ref().unwrap() as &MlxArray), *mscale),
+            None => (None, 1.0),
+        };
+
+        let layer_types = args.layer_types_list()[filter.layer_range.clone()].to_vec();
+
+        let mut layers = Vec::with_capacity(filter.num_layers());
+        for layer_idx in filter.layer_range.clone() {
+            let layer =
+                TransformerBlock::from_weights(weights, args, layer_idx, yarn_freqs_ref, rope_mscale)?;
+            layers.push(layer);
+        }
+
+        if layers.is_empty() {
+            return Err(format!(
+                "stage {} did not load any layers from range {}..{}",
+                stage_index, filter.layer_range.start, filter.layer_range.end
+            ));
+        }
+
+        let (norm, lm_head) = if filter.has_lm_head {
+            let norm_weight = get_weight_copy(weights, "model.norm.weight")?;
+            let norm = RMSNorm::new(norm_weight, args.rms_norm_eps);
+            let lm_head = if !args.tie_word_embeddings {
+                let (lm_gs, lm_bits, lm_mode) = args.quant_for("lm_head");
+                Some(UnifiedLinear::from_weights_with_mode(
+                    weights, "lm_head", lm_gs, lm_bits, &lm_mode,
+                )?)
+            } else {
+                None
+            };
+            (Some(norm), lm_head)
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            filter: filter.clone(),
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            layer_types,
+            sliding_window: args.sliding_window,
+        })
+    }
+
+    pub(crate) fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    pub(crate) fn make_caches(&self) -> Vec<Cache> {
+        self.layer_types
+            .iter()
+            .map(|lt| {
+                if lt == "full_attention" {
+                    Cache::Standard(KVCache::new())
+                } else {
+                    Cache::Rotating(RotatingKVCache::new(self.sliding_window as i32))
+                }
+            })
+            .collect()
+    }
+
+    pub(crate) fn execute_from_token_ids(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        let hidden = self
+            .embed_tokens
+            .as_ref()
+            .ok_or_else(|| {
+                "stage does not host embeddings; hidden-state input required".to_string()
+            })?
+            .forward(input_ids);
+        self.execute_hidden(hidden, caches)
+    }
+
+    pub(crate) fn execute_from_hidden_states(
+        &self,
+        hidden: UniquePtr<MlxArray>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if self.filter.has_embedding {
+            return Err("entry stage expects token IDs, not hidden states".to_string());
+        }
+        self.execute_hidden(hidden, caches)
+    }
+
+    fn execute_hidden(
+        &self,
+        mut hidden: UniquePtr<MlxArray>,
+        caches: &mut [Cache],
+    ) -> Result<StageExecutionOutput, String> {
+        if caches.len() != self.layers.len() {
+            return Err(format!(
+                "stage cache count mismatch: expected {}, got {}",
+                self.layers.len(),
+                caches.len()
+            ));
+        }
+
+        let seq_len = mlxcel_core::array_shape(hidden.as_ref().unwrap())[1];
+        let full_mask = if seq_len > 1 {
+            self.first_layer_offset(caches, "full_attention")
+                .map(|offset| create_causal_mask(seq_len, offset))
+        } else {
+            None
+        };
+        let sliding_mask = if seq_len > 1 {
+            self.first_layer_offset(caches, "sliding_attention")
+                .map(|offset| {
+                    let max_cache = self.sliding_window as i32;
+                    let effective_offset = offset.min((max_cache - seq_len).max(0));
+                    create_causal_mask_with_window(seq_len, effective_offset, Some(max_cache))
+                })
+        } else {
+            None
+        };
+
+        for (idx, layer) in self.layers.iter().enumerate() {
+            let mask = match self.layer_types[idx].as_str() {
+                "full_attention" => full_mask.as_deref(),
+                "sliding_attention" => sliding_mask.as_deref(),
+                _ => None,
+            };
+            hidden = layer.forward(hidden.as_ref().unwrap(), caches[idx].as_interface(), mask);
+        }
+
+        match (&self.norm, &self.lm_head) {
+            (Some(norm), Some(lm_head)) => {
+                let hidden = norm.forward(hidden.as_ref().unwrap());
+                Ok(StageExecutionOutput::Logits(lm_head.forward(&hidden)))
+            }
+            (Some(norm), None) if self.filter.has_lm_head => {
+                let hidden = norm.forward(hidden.as_ref().unwrap());
+                let embed_tokens = self
+                    .embed_tokens
+                    .as_ref()
+                    .ok_or_else(|| "tied-word-embedding stage missing embeddings".to_string())?;
+                Ok(StageExecutionOutput::Logits(embed_tokens.as_linear(&hidden)))
+            }
+            _ => Ok(StageExecutionOutput::HiddenStates(hidden)),
+        }
+    }
+
+    fn first_layer_offset(&self, caches: &mut [Cache], layer_type: &str) -> Option<i32> {
+        self.layer_types
+            .iter()
+            .position(|kind| kind == layer_type)
+            .map(|idx| caches[idx].as_interface().offset())
+    }
 }

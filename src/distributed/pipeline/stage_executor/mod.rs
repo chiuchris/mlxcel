@@ -27,6 +27,7 @@
 //! Used by: pipeline worker loop, CLI pipeline runtime, server pipeline runtime
 
 mod common;
+mod gpt_oss;
 mod llama;
 
 use std::path::Path;
@@ -39,6 +40,7 @@ use crate::models::{ModelType, get_model_type};
 
 use super::partial_loading::LayerFilter;
 use super::partition::StageAssignment;
+use gpt_oss::GptOssStageExecutor;
 use llama::LlamaStageExecutor;
 
 /// Input payload for a single stage-local forward.
@@ -78,6 +80,7 @@ pub trait StageExecutor {
     fn stage_assignment(&self) -> &StageAssignment;
     fn layer_filter(&self) -> &LayerFilter;
     fn make_caches(&self) -> Vec<KVCache>;
+    fn release_caches(&self, caches: &[KVCache]);
     fn execute(
         &self,
         input: StageExecutionInput<'_>,
@@ -88,6 +91,7 @@ pub trait StageExecutor {
 
 pub trait FamilyStageExecutor {
     fn make_caches(&self) -> Vec<KVCache>;
+    fn release_caches(&self, _caches: &[KVCache]) {}
     fn execute(
         &self,
         input: StageExecutionInput<'_>,
@@ -141,6 +145,10 @@ impl StageExecutor for LoadedStageExecutor {
         self.backend.make_caches()
     }
 
+    fn release_caches(&self, caches: &[KVCache]) {
+        self.backend.release_caches(caches);
+    }
+
     fn execute(
         &self,
         input: StageExecutionInput<'_>,
@@ -159,6 +167,11 @@ fn load_family_backend(
 ) -> Result<Box<dyn FamilyStageExecutor>> {
     match model_type {
         ModelType::Llama => Ok(Box::new(LlamaStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        ModelType::GptOss => Ok(Box::new(GptOssStageExecutor::load(
             model_dir,
             filter,
             stage_index,

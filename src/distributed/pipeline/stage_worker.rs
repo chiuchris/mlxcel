@@ -120,7 +120,9 @@ impl PipelineStageWorker {
     }
 
     fn release_request(&mut self, request_id: &RequestId) {
-        self.caches_by_request.remove(request_id.as_str());
+        if let Some(caches) = self.caches_by_request.remove(request_id.as_str()) {
+            self.executor.release_caches(&caches);
+        }
     }
 
     fn receive_forward(&mut self, micro_batch_id: u32) -> Result<()> {

@@ -25,7 +25,7 @@ use crate::distributed::pipeline::{
     PipelineConfig, StageAssignment, StageExecutor, auto_partition, build_manual_assignments,
     parse_manual_partition,
 };
-use crate::models::{ModelType, get_model_type, sanitize_config_json};
+use crate::models::sanitize_config_json;
 
 fn equal_stage_model_profile(num_layers: usize) -> ModelProfile {
     ModelProfile {
@@ -52,30 +52,22 @@ fn equal_capacity_devices(num_stages: usize, model: &ModelProfile) -> Vec<Device
 }
 
 pub fn resolve_in_process_pipeline_num_layers(model_dir: &Path) -> Result<usize> {
-    match get_model_type(model_dir)? {
-        ModelType::Llama => {
-            let config_path = model_dir.join("config.json");
-            let config_str = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("failed to read {}", config_path.display()))?;
-            let config_str = sanitize_config_json(&config_str);
-            let config: serde_json::Value = serde_json::from_str(&config_str)
-                .with_context(|| format!("failed to parse {}", config_path.display()))?;
-            let num_layers = config
-                .get("num_hidden_layers")
-                .and_then(|value| value.as_u64())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "config {} is missing an integer num_hidden_layers field",
-                        config_path.display()
-                    )
-                })?;
-            Ok(num_layers as usize)
-        }
-        other => Err(anyhow!(
-            "in-process pipeline execution is currently implemented only for Llama-family text models, got {:?}",
-            other
-        )),
-    }
+    let config_path = model_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read {}", config_path.display()))?;
+    let config_str = sanitize_config_json(&config_str);
+    let config: serde_json::Value = serde_json::from_str(&config_str)
+        .with_context(|| format!("failed to parse {}", config_path.display()))?;
+    let num_layers = config
+        .get("num_hidden_layers")
+        .and_then(|value| value.as_u64())
+        .ok_or_else(|| {
+            anyhow!(
+                "config {} is missing an integer num_hidden_layers field",
+                config_path.display()
+            )
+        })?;
+    Ok(num_layers as usize)
 }
 
 pub fn resolve_in_process_stage_assignments(

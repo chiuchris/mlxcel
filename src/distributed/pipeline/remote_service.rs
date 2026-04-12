@@ -558,7 +558,9 @@ impl RemoteStageService {
         if self.active_requests.remove(request_id) {
             self.lifecycle.mark_request_finished();
         }
-        self.caches_by_request.remove(request_id);
+        if let Some(caches) = self.caches_by_request.remove(request_id) {
+            self.executor.release_caches(&caches);
+        }
         self.pending_entry_replies
             .retain(|(pending_request_id, _), _| pending_request_id != request_id);
     }

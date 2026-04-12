@@ -54,6 +54,8 @@ impl StageExecutor for FakeStageExecutor {
         }
     }
 
+    fn release_caches(&self, _caches: &[KVCache]) {}
+
     fn execute(
         &self,
         input: StageExecutionInput<'_>,
