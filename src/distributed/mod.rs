@@ -116,11 +116,12 @@ pub use metrics::{
 };
 pub use pipeline::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, ChunkedPrefillPipeline,
-    DeviceSpec, FailedRequest, GPipeSchedule, LayerFilter, LoadedStageExecutor,
-    MetricsSummary as PipelineMetricsSummary, MicroBatch, MicroBatchSpec, ModelProfile,
-    PartitionConfig, PipelineBenchmarkConfig, PipelineBenchmarkResult, PipelineChannel,
-    PipelineConfig, PipelineCoordinator, PipelineMetrics, PipelineMetricsCollector,
-    PipelineRequest, PipelineResponse, PipelineSchedule, PipelineServingConfig, SafeTensorsIndex,
+    DeviceSpec, FailedRequest, GPipeSchedule, InProcessStageWorkerLoop, LayerFilter,
+    LoadedStageExecutor, MetricsSummary as PipelineMetricsSummary, MicroBatch, MicroBatchSpec,
+    ModelProfile, PartitionConfig, PipelineBenchmarkConfig, PipelineBenchmarkResult,
+    PipelineChannel, PipelineConfig, PipelineCoordinator, PipelineMetrics,
+    PipelineMetricsCollector, PipelineRequest, PipelineResponse, PipelineSchedule,
+    PipelineServingConfig, PipelineWorkerInput, PipelineWorkerOutput, SafeTensorsIndex,
     ScalingResult, ScheduleAction, StageAssignment, StageEndpoint, StageExecutionInput,
     StageExecutionOutput, StageExecutor, StageHealth, StageLink, StageMetrics, StageRole,
     WeightClass, activation_channel, activation_latency, auto_partition, build_manual_assignments,
