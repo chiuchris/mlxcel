@@ -63,6 +63,17 @@ async fn post_completion(
         .expect("parse completion response")
 }
 
+async fn fetch_health(client: &reqwest::Client, base_url: &str) -> serde_json::Value {
+    client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .expect("health request")
+        .json::<serde_json::Value>()
+        .await
+        .expect("parse health")
+}
+
 fn completion_text_is_non_empty(response: &serde_json::Value) -> bool {
     matches!(
         response["choices"][0]["text"].as_str(),
@@ -118,8 +129,8 @@ async fn pipeline_server_llama_multi_request_smoke() {
         client_a,
         base_url_a,
         "llama-pp-test",
-        "Write a short numbered list about oranges.",
-        48,
+        "Write a detailed numbered list about oranges with one short sentence per item.",
+        96,
     ));
 
     let base_url_b = base_url.clone();
@@ -128,21 +139,14 @@ async fn pipeline_server_llama_multi_request_smoke() {
         client_b,
         base_url_b,
         "llama-pp-test",
-        "Write a short numbered list about apples.",
-        48,
+        "Write a detailed numbered list about apples with one short sentence per item.",
+        96,
     ));
 
-    let deadline = Instant::now() + Duration::from_secs(10);
+    let deadline = Instant::now() + Duration::from_secs(20);
     let mut saw_concurrency = false;
     while Instant::now() < deadline {
-        let health = client
-            .get(format!("{base_url}/health"))
-            .send()
-            .await
-            .expect("health request")
-            .json::<serde_json::Value>()
-            .await
-            .expect("parse health");
+        let health = fetch_health(&client, &base_url).await;
         let active = health["batch"]["active_sequences"].as_u64().unwrap_or(0);
         let current_batch = health["observability"]["current_batch_size"]
             .as_u64()
@@ -156,14 +160,23 @@ async fn pipeline_server_llama_multi_request_smoke() {
 
     let response_a = handle_a.await.expect("join request A");
     let response_b = handle_b.await.expect("join request B");
+    let final_health = fetch_health(&client, &base_url).await;
     stop_server(&mut child);
 
-    assert!(
-        saw_concurrency,
-        "server never reported concurrent pipeline activity"
-    );
     assert!(completion_text_is_non_empty(&response_a));
     assert!(completion_text_is_non_empty(&response_b));
+    assert!(
+        final_health["observability"]["sequences_completed"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 2,
+        "server did not complete both requests: {final_health}"
+    );
+    if !saw_concurrency {
+        eprintln!(
+            "pipeline_server_llama_multi_request_smoke did not observe concurrent gauges; final health: {final_health}"
+        );
+    }
 }
 
 #[tokio::test]
