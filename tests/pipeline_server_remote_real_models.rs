@@ -174,3 +174,9 @@ fn pipeline_server_remote_coordinator_gemma3_matches_dense_baseline() {
 fn pipeline_server_remote_coordinator_gemma4_matches_dense_baseline() {
     assert_remote_coordinator_matches_dense_baseline("gemma-4-e2b-it-4bit", "Hello", Some(13));
 }
+
+#[test]
+#[ignore = "requires local model weights and TCP-bound remote stage services"]
+fn pipeline_server_remote_coordinator_qwen3_matches_dense_baseline() {
+    assert_remote_coordinator_matches_dense_baseline("qwen3-0.6b-4bit", "Hello", None);
+}
