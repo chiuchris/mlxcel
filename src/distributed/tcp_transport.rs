@@ -235,7 +235,6 @@ impl Transport for TcpTransport {
                 match self.pool.acquire(peer).await {
                     Ok(stream) => {
                         self.pool.release(peer, stream).await;
-                        tracing::info!("Connected to peer {peer}");
                     }
                     Err(e) => {
                         tracing::warn!("Failed to pre-connect to peer {peer}: {e}");

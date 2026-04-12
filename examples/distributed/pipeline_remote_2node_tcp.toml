@@ -1,0 +1,21 @@
+[cluster]
+name = "remote-pp-tcp"
+pipeline_parallel_size = 2
+transport_backend = "tcp"
+
+[[nodes]]
+id = "coordinator"
+address = "10.0.0.10:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "10.0.0.10:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "10.0.0.11:19001"
+role = "pipeline_stage"
+stage = 1
