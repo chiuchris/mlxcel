@@ -150,10 +150,7 @@ impl ConnectionPool {
                     if attempt == 0 {
                         tracing::info!("Connected to peer {peer}");
                     } else {
-                        tracing::info!(
-                            "Reconnected to peer {peer} after {} attempts",
-                            attempt + 1
-                        );
+                        tracing::info!("Reconnected to peer {peer} after {} attempts", attempt + 1);
                     }
                     return Ok(stream);
                 }

@@ -316,3 +316,20 @@ fn pipeline_stage_worker_loop_qwen35_real_model_parity() {
         None,
     );
 }
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_glm4_real_model_parity() {
+    assert_two_stage_model_matches_full_model(&repo_model_dir("glm4-flash-4bit"), &[2, 3], 4, None);
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_glm4_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("glm4-flash-4bit"),
+        &[2, 3],
+        4,
+        None,
+    );
+}

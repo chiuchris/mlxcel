@@ -262,8 +262,7 @@ pub(crate) struct PipelineParallelOptions {
 
 /// Server options
 #[derive(Args, Debug)]
-#[command(
-    after_help = "\
+#[command(after_help = "\
 Remote Pipeline Parallel Example (TCP):
   1. Generate a shared cluster config:
        CLUSTER_NAME=studio-pp \\
@@ -296,8 +295,7 @@ Thunderbolt mode:
   Thunderbolt Bridge IP (for example 169.254.x.x). The current Thunderbolt
   path uses the shared TCP transport core over the Bridge network.
 
-See also: docs/PIPELINE_PARALLELISM.md"
-)]
+See also: docs/PIPELINE_PARALLELISM.md")]
 pub(crate) struct ServeArgs {
     /// Path to the model directory
     #[arg(short, long, env = "LLAMA_ARG_MODEL", value_name = "PATH")]
