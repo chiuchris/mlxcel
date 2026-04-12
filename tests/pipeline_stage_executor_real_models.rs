@@ -14,7 +14,11 @@
 
 use std::path::{Path, PathBuf};
 
-use mlxcel::distributed::pipeline::{LoadedStageExecutor, StageAssignment, StageExecutionInput};
+use mlxcel::distributed::RequestId;
+use mlxcel::distributed::pipeline::{
+    ChannelConfig, InProcessStageWorkerLoop, LoadedStageExecutor, PipelineConfig,
+    PipelineWorkerInput, StageAssignment, StageExecutionInput,
+};
 use mlxcel::{LanguageModel, distributed::pipeline::StageExecutor};
 
 fn repo_model_dir(name: &str) -> PathBuf {
@@ -133,10 +137,86 @@ fn assert_two_stage_llama_matches_full_model(model_dir: &Path, prompt: &[i32], d
     );
 }
 
+fn assert_two_stage_llama_worker_loop_matches_full_model(
+    model_dir: &Path,
+    prompt: &[i32],
+    decode_token: i32,
+) {
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping test: model directory not found at {}",
+            model_dir.display()
+        );
+        return;
+    }
+
+    let (model, _) = mlxcel::load_model(model_dir).unwrap();
+    let total_layers = model.num_layers();
+    let assignments = two_stage_assignments(total_layers);
+    let executors: Vec<Box<dyn StageExecutor>> = vec![
+        Box::new(LoadedStageExecutor::load(model_dir, &assignments[0]).unwrap()),
+        Box::new(LoadedStageExecutor::load(model_dir, &assignments[1]).unwrap()),
+    ];
+    let mut worker_loop = InProcessStageWorkerLoop::new(
+        PipelineConfig::new(2, 1).unwrap(),
+        executors,
+        ChannelConfig::default(),
+    )
+    .unwrap();
+
+    let prompt_ids = mlxcel_core::from_slice_i32(prompt, &[1, prompt.len() as i32]);
+    let decode_ids = mlxcel_core::from_slice_i32(&[decode_token], &[1, 1]);
+    let request_id = RequestId::from_string("llama-worker-loop".to_string()).unwrap();
+
+    let mut full_caches = model.make_caches();
+    let full_prefill = model.forward(&prompt_ids, &mut full_caches, None);
+    let full_decode = model.forward(&decode_ids, &mut full_caches, None);
+
+    let prefill = worker_loop
+        .run_to_completion(vec![PipelineWorkerInput::new(
+            request_id.clone(),
+            prompt_ids,
+        )])
+        .unwrap();
+    let decode = worker_loop
+        .run_to_completion(vec![PipelineWorkerInput::new(request_id, decode_ids)])
+        .unwrap();
+
+    let atol = 1e-4f64;
+    let prefill_close = mlxcel_core::allclose(
+        &full_prefill,
+        prefill[0].logits.as_ref().unwrap(),
+        atol,
+        atol,
+    );
+    let decode_close =
+        mlxcel_core::allclose(&full_decode, decode[0].logits.as_ref().unwrap(), atol, atol);
+    assert!(
+        mlxcel_core::item_bool(&prefill_close),
+        "prefill worker loop logits mismatch for {}",
+        model_dir.display()
+    );
+    assert!(
+        mlxcel_core::item_bool(&decode_close),
+        "decode worker loop logits mismatch for {}",
+        model_dir.display()
+    );
+}
+
 #[test]
 #[ignore = "requires local model weights and extended real-model generation"]
 fn pipeline_stage_executor_llama_real_model_parity() {
     assert_two_stage_llama_matches_full_model(
+        &repo_model_dir("llama-3.2-1b-4bit"),
+        &[128000, 9906],
+        13,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_llama_real_model_parity() {
+    assert_two_stage_llama_worker_loop_matches_full_model(
         &repo_model_dir("llama-3.2-1b-4bit"),
         &[128000, 9906],
         13,

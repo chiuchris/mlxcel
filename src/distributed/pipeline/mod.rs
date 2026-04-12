@@ -75,6 +75,7 @@ pub mod partition;
 pub mod schedule;
 pub mod serving;
 pub mod stage_executor;
+pub mod stage_worker;
 
 pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
@@ -117,3 +118,4 @@ pub use serving::{
 pub use stage_executor::{
     LoadedStageExecutor, StageExecutionInput, StageExecutionOutput, StageExecutor,
 };
+pub use stage_worker::{InProcessStageWorkerLoop, PipelineWorkerInput, PipelineWorkerOutput};
