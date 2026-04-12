@@ -61,9 +61,15 @@ pub fn resolve_in_process_pipeline_num_layers(model_dir: &Path) -> Result<usize>
     let num_layers = config
         .get("num_hidden_layers")
         .and_then(|value| value.as_u64())
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|text| text.get("num_hidden_layers"))
+                .and_then(|value| value.as_u64())
+        })
         .ok_or_else(|| {
             anyhow!(
-                "config {} is missing an integer num_hidden_layers field",
+                "config {} is missing an integer num_hidden_layers field (top-level or text_config.num_hidden_layers)",
                 config_path.display()
             )
         })?;
