@@ -18,15 +18,23 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::concatenate;
 use mlxcel_core::{MlxArray, UniquePtr, copy, slice};
 
 use crate::distributed::RequestId;
+use crate::distributed::{
+    TcpTransport, TcpTransportConfig, Transport, TransportBackend, TransportMessage,
+};
 
+use super::remote_service::{
+    PIPELINE_STAGE_COMMAND_OPERATION, PIPELINE_STAGE_RESPONSE_OPERATION, RemoteStageCommand,
+    RemoteStageRequest, RemoteStageResponse,
+};
+use super::wire_tensor::{deserialize_wire_tensor, serialize_mlx_array};
 use super::{
     InProcessStageWorkerLoop, PipelineWorkerInput, load_in_process_stage_worker,
     resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
@@ -185,47 +193,246 @@ impl PipelineModelRuntime for InProcessPipelineRuntime {
 #[derive(Debug, Clone)]
 pub struct RemotePipelineRuntimeConfig {
     pub stage_peers: Vec<String>,
-    pub transport_backend: crate::distributed::TransportBackend,
+    pub transport_backend: TransportBackend,
+    pub bind_address: String,
 }
 
-/// Remote runtime placeholder used to prove the server seam is now transport-capable.
 pub struct RemotePipelineRuntime {
-    config: RemotePipelineRuntimeConfig,
+    stage_peers: Vec<String>,
+    transport: Arc<TcpTransport>,
+    io_runtime: Mutex<tokio::runtime::Runtime>,
+    request_ids: Mutex<HashMap<SequenceId, RequestId>>,
 }
 
 impl RemotePipelineRuntime {
-    pub fn new(config: RemotePipelineRuntimeConfig) -> Self {
-        Self { config }
+    pub fn new(config: RemotePipelineRuntimeConfig) -> Result<Self> {
+        if config.transport_backend != TransportBackend::Tcp {
+            return Err(anyhow!(
+                "remote pipeline runtime currently supports only tcp backend, got {}",
+                config.transport_backend
+            ));
+        }
+        if config.stage_peers.is_empty() {
+            return Err(anyhow!(
+                "remote pipeline runtime requires at least one stage peer"
+            ));
+        }
+        let io_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| anyhow!("failed to build remote pipeline runtime: {err}"))?;
+        let transport = io_runtime.block_on(async {
+            let transport = Arc::new(
+                TcpTransport::bind(TcpTransportConfig {
+                    bind_address: config.bind_address.clone(),
+                    ..Default::default()
+                })
+                .await?,
+            );
+            transport.connect(&config.stage_peers).await?;
+            Ok::<_, anyhow::Error>(transport)
+        })?;
+        Ok(Self {
+            stage_peers: config.stage_peers,
+            transport,
+            io_runtime: Mutex::new(io_runtime),
+            request_ids: Mutex::new(HashMap::new()),
+        })
     }
 
-    fn unavailable(&self) -> anyhow::Error {
-        anyhow!(
-            "remote pipeline runtime is not implemented yet (backend={}, peers={})",
-            self.config.transport_backend,
-            self.config.stage_peers.join(",")
-        )
+    fn request_id_for(&self, seq_id: SequenceId) -> RequestId {
+        self.request_ids
+            .lock()
+            .expect("pipeline request map poisoned")
+            .get(&seq_id)
+            .cloned()
+            .unwrap_or_else(|| panic!("pipeline request id missing for sequence {seq_id}"))
+    }
+
+    fn exchange(&self, peer: &str, request: RemoteStageCommand) -> Result<RemoteStageResponse> {
+        let transport = Arc::clone(&self.transport);
+        let peer = peer.to_string();
+        let reply_addr = self.transport.local_addr()?;
+        self.io_runtime
+            .lock()
+            .expect("remote pipeline runtime poisoned")
+            .block_on(async move {
+                let payload = serde_json::to_vec(&RemoteStageRequest {
+                    reply_addr,
+                    command: request,
+                })?;
+                transport
+                    .send(
+                        &peer,
+                        TransportMessage::Control {
+                            operation: PIPELINE_STAGE_COMMAND_OPERATION.to_string(),
+                            payload: payload.into(),
+                        },
+                    )
+                    .await?;
+
+                loop {
+                    let (_from, msg) = transport.recv().await?;
+                    let TransportMessage::Control { operation, payload } = msg else {
+                        continue;
+                    };
+                    if operation != PIPELINE_STAGE_RESPONSE_OPERATION {
+                        continue;
+                    }
+                    return serde_json::from_slice::<RemoteStageResponse>(&payload)
+                        .map_err(Into::into);
+                }
+            })
+    }
+
+    fn broadcast_ack(&self, request: RemoteStageCommand) -> Result<()> {
+        for peer in &self.stage_peers {
+            match self.exchange(peer, request.clone())? {
+                RemoteStageResponse::Ack { .. } => {}
+                RemoteStageResponse::Error { message, .. } => {
+                    bail!("remote stage {} failed request: {}", peer, message);
+                }
+                other => {
+                    bail!(
+                        "unexpected remote stage response from {}: {:?}",
+                        peer,
+                        other
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn probe_stages(&self) -> Result<Vec<RemoteStageResponse>> {
+        let mut states = Vec::with_capacity(self.stage_peers.len());
+        for peer in &self.stage_peers {
+            match self.exchange(peer, RemoteStageCommand::ProbeState)? {
+                state @ RemoteStageResponse::State { .. } => states.push(state),
+                RemoteStageResponse::Error { message, .. } => {
+                    bail!("remote stage {} failed probe: {}", peer, message);
+                }
+                other => bail!("unexpected remote stage probe response: {:?}", other),
+            }
+        }
+        Ok(states)
     }
 }
 
 impl PipelineModelRuntime for RemotePipelineRuntime {
-    fn prepare_sequence_state(&self, _seq_id: SequenceId) {}
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        let request_id = RequestId::from_string(format!("pp-seq-{}", seq_id.as_u64()))
+            .expect("sequence-derived request id must be valid");
+        self.request_ids
+            .lock()
+            .expect("pipeline request map poisoned")
+            .insert(seq_id, request_id.clone());
+        self.broadcast_ack(RemoteStageCommand::PrepareSequence {
+            request_id: request_id.as_str().to_string(),
+        })
+        .expect("failed to prepare remote pipeline sequence state");
+    }
 
-    fn release_sequence_state_by_id(&self, _seq_id: SequenceId) {}
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        let Some(request_id) = self
+            .request_ids
+            .lock()
+            .expect("pipeline request map poisoned")
+            .remove(&seq_id)
+        else {
+            return;
+        };
+        let _ = self.broadcast_ack(RemoteStageCommand::ReleaseSequence {
+            request_id: request_id.as_str().to_string(),
+        });
+    }
 
     fn forward_sequence(
         &self,
-        _seq_id: SequenceId,
-        _input_ids: &MlxArray,
-        _mask: Option<&MlxArray>,
+        seq_id: SequenceId,
+        input_ids: &MlxArray,
+        mask: Option<&MlxArray>,
     ) -> Result<UniquePtr<MlxArray>> {
-        Err(self.unavailable())
+        let request_id = self.request_id_for(seq_id);
+        let response = self.exchange(
+            &self.stage_peers[0],
+            RemoteStageCommand::RunEntry {
+                request_id: request_id.as_str().to_string(),
+                micro_batch_id: 0,
+                input_ids: serialize_mlx_array(input_ids)?,
+                attention_mask: mask.map(serialize_mlx_array).transpose()?,
+            },
+        )?;
+        match response {
+            RemoteStageResponse::RunResult { logits, .. } => deserialize_wire_tensor(&logits),
+            RemoteStageResponse::Error { message, .. } => Err(anyhow!(message)),
+            other => Err(anyhow!("unexpected remote forward response: {:?}", other)),
+        }
     }
 
     fn forward_batched(
         &self,
-        _seq_ids: &[SequenceId],
-        _input_ids: &MlxArray,
+        seq_ids: &[SequenceId],
+        input_ids: &MlxArray,
     ) -> Result<UniquePtr<MlxArray>> {
-        Err(self.unavailable())
+        let shape = mlxcel_core::array_shape(input_ids);
+        let seq_len = shape.get(1).copied().unwrap_or(1);
+        let mut ordered = seq_ids.iter().enumerate();
+        let Some((first_idx, first_seq_id)) = ordered.next() else {
+            return Err(anyhow!(
+                "pipeline batched decode received an empty request set"
+            ));
+        };
+        let mut merged = self.forward_sequence(
+            *first_seq_id,
+            slice(
+                input_ids,
+                &[first_idx as i32, 0],
+                &[first_idx as i32 + 1, seq_len],
+            )
+            .as_ref()
+            .unwrap(),
+            None,
+        )?;
+        for (idx, seq_id) in ordered {
+            let logits = self.forward_sequence(
+                *seq_id,
+                slice(input_ids, &[idx as i32, 0], &[idx as i32 + 1, seq_len])
+                    .as_ref()
+                    .unwrap(),
+                None,
+            )?;
+            merged = concatenate(&merged, &logits, 0);
+        }
+        Ok(merged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_runtime_rejects_empty_peer_set() {
+        let err = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
+            stage_peers: Vec::new(),
+            transport_backend: TransportBackend::Tcp,
+            bind_address: "127.0.0.1:0".to_string(),
+        })
+        .err()
+        .expect("empty stage peer config must fail");
+        assert!(err.to_string().contains("at least one stage peer"));
+    }
+
+    #[test]
+    fn remote_runtime_rejects_unsupported_backend() {
+        let err = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
+            stage_peers: vec!["127.0.0.1:20000".to_string()],
+            transport_backend: TransportBackend::Thunderbolt,
+            bind_address: "127.0.0.1:0".to_string(),
+        })
+        .err()
+        .expect("unsupported transport backend must fail");
+        assert!(err.to_string().contains("supports only tcp backend"));
     }
 }

@@ -170,7 +170,7 @@ pub struct ChannelConfig {
     pub recv_timeout: Option<Duration>,
 }
 
-const PIPELINE_ACTIVATION_OPERATION: &str = "pipeline_activation";
+pub(crate) const PIPELINE_ACTIVATION_OPERATION: &str = "pipeline_activation";
 
 impl Default for ChannelConfig {
     fn default() -> Self {

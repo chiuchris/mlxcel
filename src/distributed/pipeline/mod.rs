@@ -73,12 +73,14 @@ pub mod metrics;
 pub mod micro_batch;
 pub mod partial_loading;
 pub mod partition;
+pub mod remote_service;
 pub mod runtime;
 pub mod schedule;
 pub mod server_runtime;
 pub mod serving;
 pub mod stage_executor;
 pub mod stage_worker;
+pub mod wire_tensor;
 
 pub use activation_transfer::{
     ActivationMessage, ActivationReceiver, ActivationSender, ChannelConfig, PipelineChannel,
@@ -114,6 +116,9 @@ pub use partial_loading::{
 pub use partition::{
     DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
     build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,
+};
+pub use remote_service::{
+    RemoteStageCommand, RemoteStageResponse, RemoteStageServiceConfig, RemoteStageServiceHandle,
 };
 pub use runtime::{
     InProcessPipelineRuntime, PipelineModelRuntime, RemotePipelineRuntime,
