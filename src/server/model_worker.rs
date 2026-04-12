@@ -71,7 +71,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
 
         let load_start = Instant::now();
         let result = if let Some(ref pp_layers) = sched_config.pipeline_parallel_layers {
-            crate::distributed::pipeline::InProcessPipelineModel::load(
+            crate::distributed::pipeline::PipelineServerModel::load_in_process(
                 &model_path,
                 Some(pp_layers.as_str()),
                 sched_config.pipeline_parallel_micro_batch_size,

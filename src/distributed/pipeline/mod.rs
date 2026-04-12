@@ -73,6 +73,7 @@ pub mod metrics;
 pub mod micro_batch;
 pub mod partial_loading;
 pub mod partition;
+pub mod runtime;
 pub mod schedule;
 pub mod server_runtime;
 pub mod serving;
@@ -114,10 +115,14 @@ pub use partition::{
     DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
     build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,
 };
+pub use runtime::{
+    InProcessPipelineRuntime, PipelineModelRuntime, RemotePipelineRuntime,
+    RemotePipelineRuntimeConfig,
+};
 pub use schedule::{
     GPipeSchedule, PipelineConfig, PipelineSchedule, ScheduleAction, create_gpipe_schedule,
 };
-pub use server_runtime::InProcessPipelineModel;
+pub use server_runtime::PipelineServerModel;
 pub use serving::{
     ChunkedPrefillPipeline, FailedRequest, PipelineCoordinator, PipelineRequest, PipelineResponse,
     PipelineServingConfig, StageHealth, StageRole, detect_pipeline_config, should_use_pipeline,
