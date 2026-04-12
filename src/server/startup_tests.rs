@@ -20,7 +20,7 @@ use super::{
     resolve_remote_pipeline_topology, resolve_tensor_parallel_runtime_support,
     validate_pipeline_parallel_startup, validate_tensor_parallel_startup,
 };
-use crate::distributed::ClusterConfig;
+use crate::distributed::{ClusterConfig, TransportBackend};
 use crate::server::chat_template::ChatMessage;
 use crate::server::{DecodeStorageBackend, PipelineParallelRuntimeConfig};
 
@@ -253,6 +253,7 @@ stage = 1
     match runtime {
         Some(PipelineParallelRuntimeConfig::RemoteCoordinator(config)) => {
             assert_eq!(config.bind_address, "127.0.0.1:19000");
+            assert_eq!(config.transport_backend, TransportBackend::Tcp);
             assert_eq!(
                 config.stage_peers,
                 vec!["127.0.0.1:19001", "127.0.0.1:19002"]
@@ -312,9 +313,70 @@ stage = 1
     assert!(runtime.is_none());
     let stage = stage.expect("stage service config");
     assert_eq!(stage.bind_address, "127.0.0.1:19002");
+    assert_eq!(stage.transport_backend, TransportBackend::Tcp);
     assert_eq!(stage.stage_assignment.stage_index, 1);
     assert_eq!(stage.upstream_peer.as_deref(), Some("127.0.0.1:19001"));
     assert_eq!(stage.downstream_peer, None);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn resolve_remote_pipeline_topology_preserves_thunderbolt_backend() {
+    let dir = temp_path("pp-remote-thunderbolt");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        host: "127.0.0.1".to_string(),
+        port: 8080,
+        node_id: Some("coordinator".to_string()),
+        ..ServerStartupConfig::default()
+    };
+    let cluster = ClusterConfig::from_toml(
+        r#"
+[cluster]
+name = "remote-pp"
+pipeline_parallel_size = 2
+transport_backend = "thunderbolt"
+
+[[nodes]]
+id = "coordinator"
+address = "169.254.91.10:19000"
+role = "hybrid"
+
+[[nodes]]
+id = "stage-0"
+address = "169.254.91.11:19001"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "169.254.91.12:19002"
+role = "pipeline_stage"
+stage = 1
+"#,
+    )
+    .unwrap();
+
+    let (runtime, stage) =
+        resolve_remote_pipeline_topology(&startup, &cluster, "coordinator").unwrap();
+    assert!(stage.is_none());
+    match runtime {
+        Some(PipelineParallelRuntimeConfig::RemoteCoordinator(config)) => {
+            assert_eq!(config.transport_backend, TransportBackend::Thunderbolt);
+            assert_eq!(config.bind_address, "169.254.91.10:19000");
+        }
+        other => panic!("unexpected remote pipeline runtime: {other:?}"),
+    }
 
     std::fs::remove_dir_all(dir).unwrap();
 }

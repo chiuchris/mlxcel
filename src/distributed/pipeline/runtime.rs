@@ -28,9 +28,8 @@ use mlxcel_core::concatenate;
 use mlxcel_core::{MlxArray, UniquePtr, copy, slice};
 
 use crate::distributed::RequestId;
-use crate::distributed::{
-    TcpTransport, TcpTransportConfig, Transport, TransportBackend, TransportMessage,
-};
+use crate::distributed::transport_factory::bind_transport;
+use crate::distributed::{Transport, TransportBackend, TransportMessage};
 
 use super::remote_service::{
     PIPELINE_STAGE_COMMAND_OPERATION, PIPELINE_STAGE_RESPONSE_OPERATION, RemoteStageCommand,
@@ -202,7 +201,7 @@ pub struct RemotePipelineRuntimeConfig {
 
 pub struct RemotePipelineRuntime {
     stage_peers: Vec<String>,
-    transport: Arc<TcpTransport>,
+    transport: Arc<dyn Transport>,
     io_runtime: Mutex<tokio::runtime::Runtime>,
     request_ids: Mutex<HashMap<SequenceId, RequestId>>,
     stage_timeout: Duration,
@@ -211,12 +210,6 @@ pub struct RemotePipelineRuntime {
 
 impl RemotePipelineRuntime {
     pub fn new(config: RemotePipelineRuntimeConfig) -> Result<Self> {
-        if config.transport_backend != TransportBackend::Tcp {
-            return Err(anyhow!(
-                "remote pipeline runtime currently supports only tcp backend, got {}",
-                config.transport_backend
-            ));
-        }
         if config.stage_peers.is_empty() {
             return Err(anyhow!(
                 "remote pipeline runtime requires at least one stage peer"
@@ -227,13 +220,7 @@ impl RemotePipelineRuntime {
             .build()
             .map_err(|err| anyhow!("failed to build remote pipeline runtime: {err}"))?;
         let transport = io_runtime.block_on(async {
-            let transport = Arc::new(
-                TcpTransport::bind(TcpTransportConfig {
-                    bind_address: config.bind_address.clone(),
-                    ..Default::default()
-                })
-                .await?,
-            );
+            let transport = bind_transport(config.transport_backend, &config.bind_address).await?;
             transport.connect(&config.stage_peers).await?;
             Ok::<_, anyhow::Error>(transport)
         })?;
@@ -465,7 +452,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::distributed::StageHealth;
+    use crate::distributed::{StageHealth, TcpTransport, TcpTransportConfig};
 
     #[derive(Clone, Copy)]
     enum StubRunBehavior {
@@ -688,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_runtime_rejects_unsupported_backend() {
+    fn remote_runtime_rejects_non_thunderbolt_bind_address() {
         let err = RemotePipelineRuntime::new(RemotePipelineRuntimeConfig {
             stage_peers: vec!["127.0.0.1:20000".to_string()],
             transport_backend: TransportBackend::Thunderbolt,
@@ -696,8 +683,14 @@ mod tests {
             stage_timeout: Duration::from_secs(30),
         })
         .err()
-        .expect("unsupported transport backend must fail");
-        assert!(err.to_string().contains("supports only tcp backend"));
+        .expect("invalid thunderbolt bind address must fail");
+        assert!(
+            err.to_string()
+                .contains("does not belong to a Thunderbolt Bridge interface")
+                || err
+                    .to_string()
+                    .contains("no Thunderbolt Bridge interface with an IP address was detected")
+        );
     }
 
     #[test]

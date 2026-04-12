@@ -31,8 +31,8 @@ use crate::distributed::pipeline::{
     resolve_in_process_stage_assignments,
 };
 use crate::distributed::{
-    ClusterConfig, NodeRegistry, NodeRole, TransportBackend, resolve_model_shard_plan,
-    shard_config_from_cli, validate_supported_runtime,
+    ClusterConfig, NodeRegistry, NodeRole, resolve_model_shard_plan, shard_config_from_cli,
+    validate_supported_runtime,
 };
 
 use super::batch::BatchObservability;
@@ -553,11 +553,6 @@ fn resolve_remote_pipeline_topology(
     );
 
     if local_node.role == NodeRole::PipelineStage {
-        anyhow::ensure!(
-            cluster_config.cluster.transport_backend == TransportBackend::Tcp,
-            "remote pipeline stage startup currently supports only tcp transport, got {}",
-            cluster_config.cluster.transport_backend
-        );
         let stage_index = local_node.stage.ok_or_else(|| {
             anyhow::anyhow!(
                 "pipeline stage node '{}' is missing required 'stage' index",
@@ -589,6 +584,7 @@ fn resolve_remote_pipeline_topology(
             Some(RemoteStageServiceConfig {
                 model_dir: startup.model_path.clone(),
                 bind_address: local_node.address.to_string(),
+                transport_backend: cluster_config.cluster.transport_backend,
                 stage_assignment,
                 num_stages: pipeline_depth,
                 upstream_peer,
@@ -597,11 +593,6 @@ fn resolve_remote_pipeline_topology(
         ));
     }
 
-    anyhow::ensure!(
-        cluster_config.cluster.transport_backend == TransportBackend::Tcp,
-        "remote pipeline coordinator currently supports only tcp transport, got {}",
-        cluster_config.cluster.transport_backend
-    );
     anyhow::ensure!(
         local_node.address != parse_startup_listen_addr(startup)?,
         "remote pipeline coordinator control address {} conflicts with HTTP listen address {}; assign a distinct cluster node address/port for control traffic",

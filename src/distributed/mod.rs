@@ -22,7 +22,7 @@
 //! - [`discovery`] — static peer discovery and health probing
 //! - [`transport`] — abstract transport trait with streaming and RPC modes
 //! - [`tcp_transport`] — TCP backend with connection pooling
-//! - [`thunderbolt_transport`] — Thunderbolt backend (stubbed)
+//! - [`thunderbolt_transport`] — Thunderbolt Bridge backend built on the shared TCP transport core
 //! - [`connection_pool`] — connection pooling with reconnection logic
 //! - [`heartbeat`] — heartbeat protocol with configurable interval and failure threshold
 //! - [`failure_detector`] — threshold-based failure detection integrated with node registry
@@ -70,6 +70,7 @@ pub mod tensor_serialize;
 pub mod test_harness;
 pub mod thunderbolt_transport;
 pub mod transport;
+pub mod transport_factory;
 
 pub use backpressure::{
     BackpressureConfig, BackpressureMonitor, BackpressurePolicy, BackpressureSignal, LoadLevel,

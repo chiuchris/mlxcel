@@ -57,6 +57,7 @@ fn pipeline_server_remote_coordinator_llama_matches_dense_baseline() {
     let stage1 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
         model_dir: model_dir.clone(),
         bind_address: stage1_addr.clone(),
+        transport_backend: TransportBackend::Tcp,
         stage_assignment: assignments[1].clone(),
         num_stages: 2,
         upstream_peer: Some(stage0_addr.clone()),
@@ -66,6 +67,7 @@ fn pipeline_server_remote_coordinator_llama_matches_dense_baseline() {
     let stage0 = RemoteStageServiceHandle::spawn(RemoteStageServiceConfig {
         model_dir: model_dir.clone(),
         bind_address: stage0_addr.clone(),
+        transport_backend: TransportBackend::Tcp,
         stage_assignment: assignments[0].clone(),
         num_stages: 2,
         upstream_peer: None,

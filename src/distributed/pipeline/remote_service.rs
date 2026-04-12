@@ -30,7 +30,8 @@ use crate::distributed::pipeline::activation_transfer::{
     ActivationMessage, PIPELINE_ACTIVATION_OPERATION, StageLifecycleSnapshot, StageLifecycleState,
 };
 use crate::distributed::request_tracker::RequestId;
-use crate::distributed::{TcpTransport, TcpTransportConfig, Transport, TransportMessage};
+use crate::distributed::transport_factory::bind_transport;
+use crate::distributed::{Transport, TransportBackend, TransportMessage};
 
 use super::stage_executor::{LoadedStageExecutor, StageExecutionInput, StageExecutionOutput};
 use super::wire_tensor::{deserialize_wire_tensor, sequence_length, serialize_mlx_array};
@@ -97,6 +98,7 @@ pub enum RemoteStageResponse {
 pub struct RemoteStageServiceConfig {
     pub model_dir: PathBuf,
     pub bind_address: String,
+    pub transport_backend: TransportBackend,
     pub stage_assignment: StageAssignment,
     pub num_stages: u32,
     pub upstream_peer: Option<String>,
@@ -112,7 +114,7 @@ struct PendingEntryReply {
 struct RemoteStageService {
     stage_index: u32,
     num_stages: u32,
-    transport: Arc<TcpTransport>,
+    transport: Arc<dyn Transport>,
     executor: LoadedStageExecutor,
     caches_by_request: HashMap<String, Vec<KVCache>>,
     active_requests: HashSet<String>,
@@ -123,7 +125,7 @@ struct RemoteStageService {
 }
 
 impl RemoteStageService {
-    async fn load(config: RemoteStageServiceConfig, transport: Arc<TcpTransport>) -> Result<Self> {
+    async fn load(config: RemoteStageServiceConfig, transport: Arc<dyn Transport>) -> Result<Self> {
         ensure!(
             config.stage_assignment.stage_index < config.num_stages as usize,
             "stage assignment index {} exceeds configured stage count {}",
@@ -596,13 +598,8 @@ impl RemoteStageServiceHandle {
                 .build()
                 .context("failed to build remote stage runtime")?;
             runtime.block_on(async move {
-                let transport = Arc::new(
-                    TcpTransport::bind(TcpTransportConfig {
-                        bind_address: config.bind_address.clone(),
-                        ..Default::default()
-                    })
-                    .await?,
-                );
+                let transport =
+                    bind_transport(config.transport_backend, &config.bind_address).await?;
                 let local_addr = transport.local_addr()?;
                 startup_tx
                     .send(Ok(local_addr))
