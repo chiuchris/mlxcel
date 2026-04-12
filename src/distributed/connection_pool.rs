@@ -147,6 +147,14 @@ impl ConnectionPool {
                     if self.config.tcp_nodelay {
                         let _ = stream.set_nodelay(true);
                     }
+                    if attempt == 0 {
+                        tracing::info!("Connected to peer {peer}");
+                    } else {
+                        tracing::info!(
+                            "Reconnected to peer {peer} after {} attempts",
+                            attempt + 1
+                        );
+                    }
                     return Ok(stream);
                 }
                 Ok(Err(e)) => {
