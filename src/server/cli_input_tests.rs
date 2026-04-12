@@ -70,6 +70,7 @@ fn sample_input() -> ServerStartupInput {
         node_id: None,
         peers: Vec::new(),
         pp_layers: None,
+        pp_micro_batch_size: 1,
         tp_size: 1,
         tp_moe_mode: "expert_parallel".to_string(),
         tp_embedding_mode: "replicated".to_string(),
@@ -194,4 +195,12 @@ fn into_startup_config_propagates_pp_layers() {
 fn into_startup_config_pp_layers_none_by_default() {
     let startup = sample_input().into_startup_config();
     assert_eq!(startup.pp_layers, None);
+}
+
+#[test]
+fn into_startup_config_propagates_pp_micro_batch_size() {
+    let mut input = sample_input();
+    input.pp_micro_batch_size = 4;
+    let startup = input.into_startup_config();
+    assert_eq!(startup.pp_micro_batch_size, 4);
 }

@@ -17,7 +17,8 @@ use std::path::PathBuf;
 use super::{
     ServerStartupConfig, build_server_config, resolve_api_key, resolve_chat_template,
     resolve_decode_storage_backend, resolve_default_max_tokens, resolve_dry_penalty_last_n,
-    resolve_tensor_parallel_runtime_support, validate_tensor_parallel_startup,
+    resolve_tensor_parallel_runtime_support, validate_pipeline_parallel_startup,
+    validate_tensor_parallel_startup,
 };
 use crate::server::DecodeStorageBackend;
 use crate::server::chat_template::ChatMessage;
@@ -180,6 +181,18 @@ fn build_server_config_preserves_batch_scheduler_for_tensor_parallel() {
 }
 
 #[test]
+fn build_server_config_propagates_pipeline_parallel_settings() {
+    let startup = ServerStartupConfig {
+        pp_layers: Some("0-7,8-15".to_string()),
+        pp_micro_batch_size: 4,
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert_eq!(config.pipeline_parallel_layers.as_deref(), Some("0-7,8-15"));
+    assert_eq!(config.pipeline_parallel_micro_batch_size, 4);
+}
+
+#[test]
 fn decode_storage_backend_parses_auto_dense_and_paged() {
     assert_eq!(
         "auto".parse::<DecodeStorageBackend>().unwrap(),
@@ -254,6 +267,53 @@ fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_gemma3() {
     };
     let support = resolve_tensor_parallel_runtime_support(&startup).unwrap();
     assert!(!support.force_no_batch);
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_startup_accepts_supported_llama_config() {
+    let dir = temp_path("pp-llama-startup");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        pp_layers: Some("0-7,8-15".to_string()),
+        pp_micro_batch_size: 2,
+        ..ServerStartupConfig::default()
+    };
+    validate_pipeline_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_startup_rejects_no_batch_mode() {
+    let dir = temp_path("pp-no-batch");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        pp_layers: Some("0-7,8-15".to_string()),
+        no_batch: true,
+        ..ServerStartupConfig::default()
+    };
+    let err = validate_pipeline_parallel_startup(&startup).unwrap_err();
+    assert!(err.to_string().contains("requires the batch scheduler"));
 
     std::fs::remove_dir_all(dir).unwrap();
 }

@@ -17,7 +17,7 @@
 //! This module keeps the user-facing `generate` flow readable by separating
 //! prompt preparation, generation-mode selection, and terminal output helpers.
 
-use anyhow::{Context, Result, anyhow, ensure};
+use anyhow::{Result, anyhow, ensure};
 use std::io::{self, Write as IoWrite};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -26,13 +26,14 @@ use mlxcel::{
     CxxGenerator, GenerationStats, LanguageModel, RuntimeSetup, SamplingConfig,
     SpeculativeGenerator,
     distributed::{
-        ChannelConfig, DeviceSpec, InProcessStageWorkerLoop, LoadedStageExecutor, ModelProfile,
-        PipelineConfig as DistributedPipelineConfig, PipelineWorkerInput, RequestId,
-        StageAssignment, auto_partition, build_manual_assignments, parse_manual_partition,
+        PipelineWorkerInput, RequestId,
+        pipeline::{
+            load_in_process_stage_worker, resolve_in_process_pipeline_num_layers,
+            resolve_in_process_stage_assignments,
+        },
         resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
     },
     initialize_runtime, load_model, load_model_with_adapter, load_model_with_tensor_parallel,
-    models::{self, ModelType, get_model_type, sanitize_config_json},
     quant_advisor::{advise_quantization, print_quant_advice},
     sampling::{ResolvedSamplingParams, build_sampling_config},
     server::chat_template::{ChatMessage, ChatTemplateProcessor},
@@ -165,74 +166,19 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
     Ok(())
 }
 
-fn equal_stage_model_profile(num_layers: usize) -> ModelProfile {
-    ModelProfile {
-        num_layers,
-        layer_param_bytes: 1024,
-        embedding_param_bytes: 1024,
-        lm_head_param_bytes: 1024,
-    }
-}
-
-fn equal_capacity_devices(num_stages: usize, model: &ModelProfile) -> Vec<DeviceSpec> {
-    let per_stage_layers = model.num_layers.div_ceil(num_stages) as u64;
-    let per_stage_budget = model
-        .embedding_param_bytes
-        .saturating_add(model.lm_head_param_bytes)
-        .saturating_add(model.layer_param_bytes.saturating_mul(per_stage_layers + 2));
-    (0..num_stages)
-        .map(|stage_index| DeviceSpec {
-            device_id: format!("cli-stage-{stage_index}"),
-            available_memory_bytes: per_stage_budget,
-            compute_units: 1,
-        })
-        .collect()
-}
-
 fn resolve_cli_pipeline_assignments(
     num_layers: usize,
     args: &GenerateArgs,
-) -> Result<Vec<StageAssignment>> {
-    let pp = &args.pipeline_parallel;
-    let profile = equal_stage_model_profile(num_layers);
-    if let Some(spec) = pp.pp_layers.as_deref() {
-        let ranges = parse_manual_partition(spec, num_layers)?;
-        if pp.pp_size > 1 {
-            ensure!(
-                pp.pp_size == ranges.len(),
-                "--pp-size ({}) does not match manual partition stage count ({})",
-                pp.pp_size,
-                ranges.len()
-            );
-        }
-        let devices = equal_capacity_devices(ranges.len(), &profile);
-        return build_manual_assignments(&ranges, &profile, &devices);
-    }
-
-    ensure!(
-        pp.pp_size >= 2,
-        "--pp-size must be at least 2 when --pp-layers is not provided"
-    );
-    let devices = equal_capacity_devices(pp.pp_size, &profile);
-    auto_partition(&profile, &devices)
+) -> Result<Vec<mlxcel::distributed::StageAssignment>> {
+    resolve_in_process_stage_assignments(
+        num_layers,
+        Some(args.pipeline_parallel.pp_size),
+        args.pipeline_parallel.pp_layers.as_deref(),
+    )
 }
 
 fn resolve_cli_pipeline_num_layers(model_dir: &Path) -> Result<usize> {
-    match get_model_type(model_dir)? {
-        ModelType::Llama => {
-            let config_path = model_dir.join("config.json");
-            let config_str = std::fs::read_to_string(&config_path)
-                .with_context(|| format!("failed to read {}", config_path.display()))?;
-            let config_str = sanitize_config_json(&config_str);
-            let args: models::llama3::ModelArgs = serde_json::from_str(&config_str)
-                .with_context(|| format!("failed to parse {}", config_path.display()))?;
-            Ok(args.num_hidden_layers)
-        }
-        other => Err(anyhow!(
-            "CLI pipeline parallelism is currently implemented only for Llama-family text models, got {:?}",
-            other
-        )),
-    }
+    resolve_in_process_pipeline_num_layers(model_dir).map_err(|err| anyhow!("{err}"))
 }
 
 fn generate_pipeline_text(
@@ -249,27 +195,10 @@ fn generate_pipeline_text(
         "pipeline execution requires at least 2 stages"
     );
 
-    let executors: Vec<Box<dyn mlxcel::distributed::StageExecutor>> = assignments
-        .iter()
-        .map(|assignment| {
-            LoadedStageExecutor::load(model_dir, assignment)
-                .map(|executor| Box::new(executor) as Box<dyn mlxcel::distributed::StageExecutor>)
-        })
-        .collect::<Result<_>>()
-        .with_context(|| {
-            format!(
-                "CLI pipeline execution is not available for model {}",
-                model_dir.display()
-            )
-        })?;
-
-    let mut worker_loop = InProcessStageWorkerLoop::new(
-        DistributedPipelineConfig::new(
-            assignments.len() as u32,
-            args.pipeline_parallel.pp_micro_batch_size,
-        )?,
-        executors,
-        ChannelConfig::default(),
+    let mut worker_loop = load_in_process_stage_worker(
+        model_dir,
+        &assignments,
+        args.pipeline_parallel.pp_micro_batch_size,
     )?;
 
     let request_id = RequestId::new();

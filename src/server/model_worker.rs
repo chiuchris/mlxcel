@@ -48,6 +48,10 @@ pub(crate) struct WorkerSchedulerConfig {
     pub max_batch_prefill: usize,
     /// Decode-time storage backend for server sequence state.
     pub decode_storage_backend: crate::server::DecodeStorageBackend,
+    /// Manual in-process pipeline stage partition for server runtime.
+    pub pipeline_parallel_layers: Option<String>,
+    /// Micro-batch size for in-process pipeline execution.
+    pub pipeline_parallel_micro_batch_size: usize,
     /// Tensor-parallel runtime configuration.
     pub tensor_parallel: crate::distributed::ShardConfig,
 }
@@ -66,7 +70,18 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         tracing::info!("Model worker thread starting, loading model...");
 
         let load_start = Instant::now();
-        let result = if sched_config.tensor_parallel.tp_size > 1 {
+        let result = if let Some(ref pp_layers) = sched_config.pipeline_parallel_layers {
+            crate::distributed::pipeline::InProcessPipelineModel::load(
+                &model_path,
+                Some(pp_layers.as_str()),
+                sched_config.pipeline_parallel_micro_batch_size,
+            )
+            .map(|model| {
+                let tokenizer = crate::tokenizer::load_tokenizer(&model_path)?;
+                Ok((crate::LoadedModel::PipelineLlama(model), tokenizer))
+            })
+            .and_then(|pair| pair)
+        } else if sched_config.tensor_parallel.tp_size > 1 {
             crate::load_model_with_tensor_parallel(
                 &model_path,
                 adapter_path.as_deref(),

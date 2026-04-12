@@ -97,6 +97,8 @@ pub struct ServerStartupInput {
     pub peers: Vec<SocketAddr>,
     /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
     pub pp_layers: Option<String>,
+    /// Micro-batch size for in-process pipeline execution.
+    pub pp_micro_batch_size: usize,
     /// Number of tensor-parallel ranks.
     pub tp_size: usize,
     /// MoE expert sharding mode string (parsed at startup).
@@ -163,6 +165,7 @@ impl ServerStartupInput {
             node_id: self.node_id,
             peers: self.peers,
             pp_layers: self.pp_layers,
+            pp_micro_batch_size: self.pp_micro_batch_size,
             tp_size: self.tp_size,
             tp_moe_mode: self.tp_moe_mode,
             tp_embedding_mode: self.tp_embedding_mode,

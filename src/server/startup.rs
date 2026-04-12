@@ -127,6 +127,8 @@ pub struct ServerStartupConfig {
     /// Manual pipeline-parallel layer partition spec (e.g. "0-15,16-31").
     /// When `None`, auto-partition mode is used.
     pub pp_layers: Option<String>,
+    /// Micro-batch size for in-process pipeline execution.
+    pub pp_micro_batch_size: usize,
     /// Number of tensor-parallel ranks (1 = disabled).
     pub tp_size: usize,
     /// MoE expert sharding mode string (parsed into `MoeShardMode` at plan generation).
@@ -190,6 +192,7 @@ impl Default for ServerStartupConfig {
             node_id: None,
             peers: Vec::new(),
             pp_layers: None,
+            pp_micro_batch_size: 1,
             tp_size: 1,
             tp_moe_mode: "expert_parallel".to_string(),
             tp_embedding_mode: "replicated".to_string(),
@@ -317,6 +320,8 @@ pub(super) fn build_server_config(
         no_batch: startup.no_batch,
         max_batch_prefill: startup.max_batch_prefill.max(1),
         decode_storage_backend: resolve_decode_storage_backend(),
+        pipeline_parallel_layers: startup.pp_layers.clone(),
+        pipeline_parallel_micro_batch_size: startup.pp_micro_batch_size.max(1),
         tensor_parallel,
     }
 }
@@ -384,6 +389,39 @@ fn resolve_tensor_parallel_runtime_support(
         summary.shard_config.clone(),
         startup.adapter_path.as_deref(),
     )
+}
+
+fn validate_pipeline_parallel_startup(startup: &ServerStartupConfig) -> Result<()> {
+    anyhow::ensure!(
+        startup.pp_micro_batch_size > 0,
+        "--pp-micro-batch-size must be greater than 0"
+    );
+    let Some(pp_layers) = startup.pp_layers.as_deref() else {
+        return Ok(());
+    };
+
+    anyhow::ensure!(
+        !pp_layers.trim().is_empty(),
+        "--pp-layers must not be empty when provided"
+    );
+    anyhow::ensure!(
+        startup.adapter_path.is_none(),
+        "Server pipeline parallelism does not support adapter loading yet"
+    );
+    anyhow::ensure!(
+        startup.draft_model_path.is_none(),
+        "Server pipeline parallelism does not support speculative decoding yet"
+    );
+    anyhow::ensure!(
+        startup.tp_size == 1,
+        "Server pipeline parallelism does not support tensor parallelism yet"
+    );
+    anyhow::ensure!(
+        !startup.no_batch,
+        "Server pipeline parallelism requires the batch scheduler; remove --no-batch"
+    );
+    crate::distributed::pipeline::resolve_in_process_pipeline_num_layers(&startup.model_path)
+        .map(|_| ())
 }
 
 fn log_endpoints(startup: &ServerStartupConfig, addr: &str) {
@@ -500,6 +538,7 @@ async fn resolve_distributed_config(
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+    validate_pipeline_parallel_startup(&startup)?;
     let tp_support = resolve_tensor_parallel_runtime_support(&startup)?;
 
     if startup.ubatch_size_provided {
@@ -562,6 +601,13 @@ pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
         } else {
             tracing::info!("Tensor parallel runtime enabled; batch scheduler remains active");
         }
+    }
+    if let Some(ref pp_layers) = config.pipeline_parallel_layers {
+        tracing::info!(
+            "Server pipeline runtime enabled (pp_layers={}, pp_micro_batch_size={})",
+            pp_layers,
+            config.pipeline_parallel_micro_batch_size
+        );
     }
     let chat_template = resolve_chat_template(
         startup.chat_template.as_deref(),
