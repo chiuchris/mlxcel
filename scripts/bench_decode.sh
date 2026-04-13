@@ -21,9 +21,14 @@
 #   date, hardware, mlx_version, build_type, max_tokens, prompt
 #
 # Filename convention:
-#   {backend}_{hardware}_{YYYY-MM-DD}.csv        (text)
-#   {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv    (VLM)
-#   Optional suffix: {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv
+#   {backend}_{hardware}_{YYYY-MM-DD}.csv                (text suite, 'all')
+#   {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv            (VLM suite, 'all --vlm')
+#   {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv       (with --suffix)
+#   {backend}_{hardware}_{YYYY-MM-DD}_single_{model}.csv (single-model run)
+#
+# The `_single_{model}` form exists so that ad-hoc sanity runs against a
+# specific model cannot silently truncate the day's full-suite CSV. Pass
+# --output PATH to override the default for either mode.
 
 set -euo pipefail
 
@@ -196,15 +201,33 @@ Options:
   --help              Show this help
 
 Filename convention:
-  {backend}_{hardware}_{YYYY-MM-DD}.csv           text benchmarks
-  {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv       VLM benchmarks
-  {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv  with --suffix
+  {backend}_{hardware}_{YYYY-MM-DD}.csv                text suite ('all')
+  {backend}_{hardware}_vlm_{YYYY-MM-DD}.csv            VLM suite ('all --vlm')
+  {backend}_{hardware}_{YYYY-MM-DD}_{suffix}.csv       with --suffix
+  {backend}_{hardware}_{YYYY-MM-DD}_single_{model}.csv single-model run
+                                                       (separate file so sanity
+                                                       runs do not truncate the
+                                                       full-suite CSV)
 EOF
 }
 
 # ---------------------------------------------------------------------------
 # Generate default output filename
 # ---------------------------------------------------------------------------
+# Composes orthogonal segments in this order:
+#   {backend}_{hardware}[_vlm]_{date}[_{suffix}][_single_{model}].csv
+#
+# Rationale for `_single_{model}` after `_{suffix}`: this groups all output
+# from one --suffix run together in lexical directory listings, so e.g.
+# `ls metal_m5max_2026-04-13_probe_*` shows the full-suite probe CSV right
+# next to its per-model probe CSVs. Reversing the order would group runs
+# of the same model across unrelated suffixes instead, which is rarely
+# what the human comparing two benchmark runs wants.
+#
+# Single-model invocations get their own auto-named CSV so that ad-hoc
+# sanity runs cannot truncate the day's full-suite CSV (#313). The full-
+# suite path is reserved exclusively for `all` runs and for any caller
+# that explicitly passes --output.
 default_output_path() {
   local name="${BACKEND}_${HARDWARE_SHORT}"
   if [[ "$VLM_MODE" -eq 1 ]]; then
@@ -213,6 +236,11 @@ default_output_path() {
   name="${name}_${DATE}"
   if [[ -n "$SUFFIX" ]]; then
     name="${name}_${SUFFIX}"
+  fi
+  if [[ "$MODEL_ARG" != "all" && -n "$MODEL_ARG" ]]; then
+    local model_basename
+    model_basename=$(basename "${MODEL_ARG%/}")
+    name="${name}_single_${model_basename}"
   fi
   echo "${BENCHMARKS_DIR}/${name}.csv"
 }
@@ -366,6 +394,15 @@ if [[ ! -x "$MLXCEL" ]]; then
   exit 1
 fi
 
+# Validate single-model paths before generating the output filename so a
+# typo in `models/foo` exits cleanly without leaving a header-only orphan
+# CSV behind in benchmarks/. The `all` mode is allowed to proceed without
+# this check because it iterates the existing entries of $MODELS_DIR.
+if [[ "$MODEL_ARG" != "all" && ! -d "$MODEL_ARG" ]]; then
+  echo "Error: model directory '$MODEL_ARG' not found" >&2
+  exit 1
+fi
+
 # Auto-generate output path if not specified
 if [[ -z "$OUTPUT" ]]; then
   OUTPUT=$(default_output_path)
@@ -450,10 +487,7 @@ if [[ "$MODEL_ARG" == "all" ]]; then
     cooldown_after "$dir"
   done
 else
-  if [[ ! -d "$MODEL_ARG" ]]; then
-    echo "Error: model directory '$MODEL_ARG' not found" >&2
-    exit 1
-  fi
+  # Path validation already happened before $OUTPUT was generated.
   result=$(bench_one "$MODEL_ARG")
   emit "$result"
   cooldown_after "$MODEL_ARG"
