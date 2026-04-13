@@ -82,12 +82,27 @@ pub fn resolve_model_shard_plan(
     let config = read_model_config(model_dir)?;
     let model_type = get_model_type(model_dir)?;
     let architecture = detect_plan_architecture(&config, model_type);
-    let num_layers = detect_num_layers(&config).with_context(|| {
-        format!(
-            "failed to determine layer count for tensor-parallel planning in {}",
-            model_dir.display()
-        )
-    })?;
+    // Single-rank execution never consumes the layer count downstream
+    // (`generate_shard_plan` returns a replicated plan immediately for
+    // `tp_size == 1`, and `validate_supported_runtime` returns its default
+    // support struct without inspecting the summary). VLM wrappers like
+    // LLaVA ship a partial `text_config` that omits `num_hidden_layers` and
+    // defers to a referenced base model, so strict detection would block
+    // the entire single-rank generate path for those models. Tolerate a
+    // missing layer count here and only fail when a real shard plan is
+    // actually needed.
+    let num_layers = match detect_num_layers(&config) {
+        Ok(n) => n,
+        Err(_) if shard_config.tp_size == 1 => 0,
+        Err(err) => {
+            return Err(err).with_context(|| {
+                format!(
+                    "failed to determine layer count for tensor-parallel planning in {}",
+                    model_dir.display()
+                )
+            });
+        }
+    };
     let plan = generate_shard_plan(&architecture, num_layers, &shard_config)?;
 
     Ok(TensorParallelPlanSummary {
