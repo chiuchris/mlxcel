@@ -27,6 +27,10 @@
 
 set -euo pipefail
 
+# Forward SIGINT/SIGTERM through cooldown sleeps so Ctrl-C aborts immediately
+# instead of waiting out the current sleep.
+trap 'echo "Interrupted (signal received)" >&2; exit 130' INT TERM
+
 MLXCEL="./target/release/mlxcel"
 MODELS_DIR="./models"
 BENCHMARKS_DIR="./benchmarks"
@@ -43,6 +47,16 @@ SUFFIX=""
 DATE=$(date '+%Y-%m-%d')
 MLX_VERSION="0.31.1"
 BUILD_TYPE="release"
+
+# Thermal cooldown between models. Defaults to 0 to preserve existing
+# behaviour for CI and desktop hardware. Laptops (e.g. MacBook Pro M5 Max)
+# should pass --cooldown / --big-cooldown explicitly to avoid throttling
+# during long all-model runs.
+COOLDOWN_SECS=0
+BIG_MODEL_COOLDOWN_SECS=0
+# Models whose total weight bytes exceed this threshold get an additional
+# BIG_MODEL_COOLDOWN_SECS pause after running.
+BIG_MODEL_THRESHOLD_BYTES=$((10 * 1024 * 1024 * 1024))
 
 # ---------------------------------------------------------------------------
 # Hardware detection
@@ -168,6 +182,17 @@ Options:
   --jit-preheat-timeout N  Timeout for CUDA JIT warmup in seconds (default: 600)
   --output PATH       Write CSV to specific file (overrides auto-naming)
   --suffix TAG        Append suffix to auto-generated filename (e.g. --suffix baseline)
+  --cooldown N        Sleep N seconds after every model to let the GPU cool
+                      down (default: 0). Use on thermally constrained
+                      hardware such as the MacBook Pro M5 Max where back-to-
+                      back large models cause Metal to throttle.
+  --big-cooldown N    Additional sleep after a model whose weight bytes
+                      exceed --big-threshold-gb (default: 0). The total pause
+                      after a "big" model is COOLDOWN + BIG_COOLDOWN.
+  --big-threshold-gb N  Size in GB that triggers --big-cooldown
+                        (default: 10).
+  --no-cooldown       Force --cooldown=0 and --big-cooldown=0, overriding
+                      any earlier values on the same command line.
   --help              Show this help
 
 Filename convention:
@@ -280,6 +305,29 @@ bench_one() {
 }
 
 # ---------------------------------------------------------------------------
+# Thermal cooldown
+# ---------------------------------------------------------------------------
+# Pause after a model finishes so the GPU can cool down before the next run.
+# The pause is COOLDOWN_SECS, plus BIG_MODEL_COOLDOWN_SECS if the model's
+# total safetensors size exceeds BIG_MODEL_THRESHOLD_BYTES. With the default
+# values (both 0) this function is a no-op, so existing callers see no change.
+cooldown_after() {
+  local model_path="$1"
+  local sleep_secs="$COOLDOWN_SECS"
+  if [[ "$BIG_MODEL_COOLDOWN_SECS" -gt 0 ]]; then
+    local model_bytes
+    model_bytes=$(estimate_model_size "$model_path")
+    if [[ "$model_bytes" -gt "$BIG_MODEL_THRESHOLD_BYTES" ]]; then
+      sleep_secs=$(( sleep_secs + BIG_MODEL_COOLDOWN_SECS ))
+    fi
+  fi
+  if [[ "$sleep_secs" -gt 0 ]]; then
+    >&2 printf '    cooldown: %ds\n' "$sleep_secs"
+    sleep "$sleep_secs"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 MODEL_ARG=""
@@ -295,6 +343,12 @@ while [[ $# -gt 0 ]]; do
     --jit-preheat-timeout) JIT_PREHEAT_TIMEOUT="$2"; shift 2 ;;
     --output)         OUTPUT="$2"; shift 2 ;;
     --suffix)         SUFFIX="$2"; shift 2 ;;
+    --cooldown)       COOLDOWN_SECS="$2"; shift 2 ;;
+    --big-cooldown)   BIG_MODEL_COOLDOWN_SECS="$2"; shift 2 ;;
+    --big-threshold-gb)
+                      BIG_MODEL_THRESHOLD_BYTES=$(( $2 * 1024 * 1024 * 1024 ))
+                      shift 2 ;;
+    --no-cooldown)    COOLDOWN_SECS=0; BIG_MODEL_COOLDOWN_SECS=0; shift ;;
     --help)           usage; exit 0 ;;
     -*)               echo "Unknown option: $1" >&2; usage >&2; exit 1 ;;
     *)                MODEL_ARG="$1"; shift ;;
@@ -385,6 +439,7 @@ if [[ "$MODEL_ARG" == "all" ]]; then
     is_gpu_crash_model "$dir" && continue
     result=$(bench_one "$dir")
     emit "$result"
+    cooldown_after "$dir"
   done
   # Second pass: run known GPU-crash models last
   for dir in "$MODELS_DIR"/*/; do
@@ -392,6 +447,7 @@ if [[ "$MODEL_ARG" == "all" ]]; then
     is_gpu_crash_model "$dir" || continue
     result=$(bench_one "$dir")
     emit "$result"
+    cooldown_after "$dir"
   done
 else
   if [[ ! -d "$MODEL_ARG" ]]; then
@@ -400,6 +456,7 @@ else
   fi
   result=$(bench_one "$MODEL_ARG")
   emit "$result"
+  cooldown_after "$MODEL_ARG"
 fi
 
 >&2 echo ""
