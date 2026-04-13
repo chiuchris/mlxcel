@@ -145,16 +145,45 @@ pub fn load_weights_from_dir<P: AsRef<Path>>(dir: P) -> Result<WeightMap, String
 ///
 /// Uses the index JSON when present; otherwise globs all `*.safetensors` files.
 /// Broken symlinks are skipped with a warning message. Returns an error if all
-/// candidate files are broken symlinks or if the index references missing shards.
+/// candidate files are broken symlinks or if the directory has no loadable
+/// safetensors files at all.
+///
+/// Stale-index tolerance: mlx-community frequently ships repackaged quantized
+/// variants of upstream models with the original full-precision
+/// `model.safetensors.index.json` left untouched, so the index's shard names
+/// no longer match the on-disk files. When the index validation fails but the
+/// directory still contains usable `*.safetensors` files, fall back to globbing
+/// and emit a warning instead of erroring out — preserving the actionable
+/// missing-shard error only for genuinely empty directories.
 fn collect_shard_paths(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     // Try to parse the index file first
     let index_shards = parse_shard_index(dir)?;
 
     let candidates: Vec<std::path::PathBuf> = if let Some(shard_names) = index_shards {
-        // Use the shard list from the index — deterministic and validated
-        validate_index_shards(dir, &shard_names)?
+        match validate_index_shards(dir, &shard_names) {
+            Ok(paths) => paths,
+            Err(index_err) => {
+                // Index references files that aren't on disk. Try the glob
+                // fallback so repackaged mlx-community models keep working.
+                match glob_safetensors(dir) {
+                    Ok(globbed) if !globbed.is_empty() => {
+                        eprintln!(
+                            "Warning: model.safetensors.index.json in {} references \
+                             shards that don't match the on-disk files \
+                             (likely a repackaged mlx-community quant). \
+                             Falling back to all *.safetensors files in the directory.",
+                            dir.display()
+                        );
+                        globbed
+                    }
+                    // Glob also failed or returned nothing — surface the
+                    // original, more actionable, missing-shard error.
+                    _ => return Err(index_err),
+                }
+            }
+        }
     } else {
-        // Fallback: glob all *.safetensors in the directory
+        // No index file at all: glob everything
         glob_safetensors(dir)?
     };
 
@@ -482,5 +511,87 @@ mod tests {
         let result = validate_index_shards(dir.path(), &shards);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("Invalid shard filename"));
+    }
+
+    /// Helper: write a stub `model.safetensors.index.json` referencing the given
+    /// shard names. Bytes are intentionally garbage — this helper exists only to
+    /// exercise the path-collection logic, not the actual safetensors loader.
+    fn write_stub_index(dir: &Path, shards: &[&str]) {
+        use std::io::Write;
+        let mut entries = Vec::new();
+        for (i, name) in shards.iter().enumerate() {
+            entries.push(format!(r#""w{i}.weight": "{name}""#));
+        }
+        let json = format!(
+            r#"{{"metadata": {{"total_size": 0}}, "weight_map": {{{}}}}}"#,
+            entries.join(",")
+        );
+        let mut f = std::fs::File::create(dir.join("model.safetensors.index.json")).unwrap();
+        f.write_all(json.as_bytes()).unwrap();
+    }
+
+    fn touch_safetensors(dir: &Path, name: &str) {
+        use std::io::Write;
+        let mut f = std::fs::File::create(dir.join(name)).unwrap();
+        f.write_all(b"").unwrap();
+    }
+
+    #[test]
+    fn test_collect_shard_paths_uses_index_when_valid() {
+        // Happy path: index lists shards that all exist on disk.
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_index(
+            dir.path(),
+            &[
+                "model-00001-of-00002.safetensors",
+                "model-00002-of-00002.safetensors",
+            ],
+        );
+        touch_safetensors(dir.path(), "model-00001-of-00002.safetensors");
+        touch_safetensors(dir.path(), "model-00002-of-00002.safetensors");
+
+        let paths = collect_shard_paths(dir.path()).expect("should succeed");
+        assert_eq!(paths.len(), 2);
+        assert!(paths
+            .iter()
+            .any(|p| p.file_name().unwrap() == "model-00001-of-00002.safetensors"));
+        assert!(paths
+            .iter()
+            .any(|p| p.file_name().unwrap() == "model-00002-of-00002.safetensors"));
+    }
+
+    #[test]
+    fn test_collect_shard_paths_falls_back_when_index_stale() {
+        // Regression test: mlx-community frequently ships repackaged quants with
+        // an outdated index.json that points at the original full-precision shard
+        // layout. The collector should fall back to globbing the directory.
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_index(
+            dir.path(),
+            &[
+                "model-00001-of-00050.safetensors",
+                "model-00002-of-00050.safetensors",
+            ],
+        );
+        // Real on-disk file uses a different sharding (single file in this case).
+        touch_safetensors(dir.path(), "model.safetensors");
+
+        let paths = collect_shard_paths(dir.path()).expect("should fall back to glob");
+        assert_eq!(paths.len(), 1);
+        assert_eq!(paths[0].file_name().unwrap(), "model.safetensors");
+    }
+
+    #[test]
+    fn test_collect_shard_paths_returns_index_error_when_dir_empty() {
+        // If the index is broken AND there are no actual safetensors files,
+        // surface the original missing-shard error so the user can fix it.
+        let dir = tempfile::tempdir().unwrap();
+        write_stub_index(dir.path(), &["model-00001-of-00002.safetensors"]);
+
+        let err = collect_shard_paths(dir.path()).expect_err("should surface error");
+        assert!(
+            err.contains("Missing shard file"),
+            "expected missing-shard error, got: {err}"
+        );
     }
 }
