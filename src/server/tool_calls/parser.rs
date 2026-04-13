@@ -23,26 +23,48 @@ use super::formats;
 use super::types::{ParsedToolCall, ToolCallParseResult};
 use crate::server::types::request::Tool;
 
-/// Strip `<think>...</think>` blocks from model output before parsing.
+/// Strip thinking/reasoning blocks from model output before parsing.
 ///
-/// Many reasoning models (DeepSeek R1, Granite 3.3, etc.) wrap their
-/// thought process in `<think>` tags.  We need to remove these to get at
-/// the actual tool call output.
+/// Handles two formats:
+/// - `<think>...</think>` — DeepSeek R1, Granite 3.3, etc.
+/// - `<|channel>...<channel|>` — Gemma 4 thinking channels
+///
+/// Used by: tool_calls::parser
 fn strip_thinking(text: &str) -> String {
-    let mut result = String::with_capacity(text.len());
-    let mut remaining = text;
+    let pairs: &[(&str, &str)] = &[("<think>", "</think>"), ("<|channel>", "<channel|>")];
 
-    while let Some(start) = remaining.find("<think>") {
-        result.push_str(&remaining[..start]);
-        if let Some(end) = remaining[start..].find("</think>") {
-            remaining = &remaining[start + end + "</think>".len()..];
-        } else {
-            // Unclosed <think> tag -- strip everything after it
-            remaining = "";
+    let mut result = text.to_string();
+    for &(open, close) in pairs {
+        let mut new_result = String::with_capacity(result.len());
+        let mut remaining = result.as_str();
+        while let Some(start) = remaining.find(open) {
+            new_result.push_str(&remaining[..start]);
+            if let Some(end) = remaining[start..].find(close) {
+                remaining = &remaining[start + end + close.len()..];
+            } else {
+                // Unclosed tag -- strip everything after it
+                remaining = "";
+            }
         }
+        new_result.push_str(remaining);
+        result = new_result;
     }
-    result.push_str(remaining);
     result
+}
+
+/// Remove model-specific structural markers from content text.
+///
+/// Called when tool-call parsing was attempted but no tool calls were found,
+/// or when cleaning content extracted alongside tool calls.  Strips markers
+/// that would otherwise leak into the response content.
+///
+/// Used by: tool_calls::parser
+fn clean_content_markers(text: &str) -> String {
+    text.replace("<turn|>", "")
+        .replace("<|turn>", "")
+        .replace("<|think|>", "")
+        .trim()
+        .to_string()
 }
 
 /// Parse model output for tool calls, trying each known format in order.
@@ -87,7 +109,10 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
         }
     }
 
-    ToolCallParseResult::none(raw_output.to_string())
+    // No tool calls found: return cleaned content (thinking blocks and
+    // model-specific markers stripped) so callers never see raw control tokens.
+    let content = clean_content_markers(text);
+    ToolCallParseResult::none(content)
 }
 
 /// Filter parsed tool calls to only include functions that exist in the
@@ -296,5 +321,108 @@ mod tests {
         let input = "no thinking tags here";
         let result = strip_thinking(input);
         assert_eq!(result, input);
+    }
+
+    // -- Gemma 4 channel/thinking block stripping --
+
+    #[test]
+    fn strip_thinking_removes_gemma4_channel() {
+        let input = "<|channel>thought\nI should search.<channel|>actual content";
+        let result = strip_thinking(input);
+        assert_eq!(result, "actual content");
+    }
+
+    #[test]
+    fn strip_thinking_handles_unclosed_channel() {
+        let input = "<|channel>thought\nunclosed channel";
+        let result = strip_thinking(input);
+        assert_eq!(result, "");
+    }
+
+    #[test]
+    fn strip_thinking_handles_both_think_and_channel() {
+        let input = "<think>think block</think><|channel>thought\nchannel block<channel|>final";
+        let result = strip_thinking(input);
+        assert_eq!(result, "final");
+    }
+
+    // -- Gemma 4 full-path parse tests (issue #311) --
+
+    #[test]
+    fn gemma4_thinking_only() {
+        let output = "<|channel>thought\nI should search.<channel|><turn|>";
+        let result = parse_tool_calls(output, None);
+        assert!(!result.has_tool_calls());
+        assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn gemma4_thinking_then_content() {
+        let output = "<|channel>thought\nPlanning.<channel|>Here is the answer.<turn|>";
+        let result = parse_tool_calls(output, None);
+        assert!(!result.has_tool_calls());
+        assert_eq!(result.content, "Here is the answer.");
+    }
+
+    #[test]
+    fn gemma4_thinking_then_tool_call() {
+        let output = "<|channel>thought\nI need to search.<channel|>\
+                       <|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|><turn|>";
+        let tools = vec![make_tool("web_search")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "web_search");
+        assert_eq!(result.content, "");
+    }
+
+    #[test]
+    fn gemma4_content_then_tool_call() {
+        let output = "Let me search.\
+                       <|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|><turn|>";
+        let tools = vec![make_tool("web_search")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.content, "Let me search.");
+    }
+
+    #[test]
+    fn gemma4_multiple_tool_calls() {
+        let output = "<|tool_call>call:search{query:<|\"|>rust<|\"|>}<tool_call|>\
+                       <|tool_call>call:calc{expr:<|\"|>2+2<|\"|>}<tool_call|><turn|>";
+        let tools = vec![make_tool("search"), make_tool("calc")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "search");
+        assert_eq!(result.tool_calls[1].name, "calc");
+    }
+
+    #[test]
+    fn gemma4_strips_trailing_turn() {
+        // Content followed by <turn|> with no tool calls
+        let output = "Here is the answer.<turn|>";
+        let result = parse_tool_calls(output, None);
+        assert!(!result.content.contains("<turn|>"));
+        assert_eq!(result.content, "Here is the answer.");
+    }
+
+    #[test]
+    fn gemma4_strips_trailing_turn_with_tools() {
+        // Content + tool call + <turn|> — content must not contain <turn|>
+        let output = "Content<|tool_call>call:fn{key:<|\"|>v<|\"|>}<tool_call|><turn|>";
+        let tools = vec![make_tool("fn")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert!(!result.content.contains("<turn|>"));
+        assert_eq!(result.content, "Content");
+    }
+
+    #[test]
+    fn clean_content_markers_strips_all() {
+        let input = "<|turn>content<turn|><|think|>";
+        let result = clean_content_markers(input);
+        assert_eq!(result, "content");
     }
 }

@@ -472,6 +472,13 @@ pub fn try_gemma4(text: &str) -> Option<ToolCallParseResult> {
         return None;
     }
 
+    // Strip Gemma 4 structural markers from content (e.g. trailing <turn|>)
+    let content = content
+        .replace("<turn|>", "")
+        .replace("<|turn>", "")
+        .replace("<|think|>", "");
+    let content = content.trim().to_string();
+
     Some(ToolCallParseResult {
         format: Some(ToolCallFormat::Gemma4),
         tool_calls: calls,

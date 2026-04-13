@@ -32,6 +32,7 @@ use crate::server::chat_request::prepare_chat_request;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
 use crate::server::tool_calls;
+use crate::server::tool_calls::stream_filter::StreamFilter;
 use crate::server::types::response::{ChatLogprobs, TokenLogprob, TopLogprob};
 use crate::server::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, ErrorResponse,
@@ -255,6 +256,19 @@ async fn non_stream_chat_completion(
                 )));
             }
         }
+
+        // No tool calls found, but tool parsing was enabled — use the cleaned
+        // content from the parser (thinking blocks and structural markers
+        // stripped) instead of the raw generation output.
+        return Ok(Json(ChatCompletionResponse::new_with_logprobs(
+            request_id,
+            model_id,
+            parsed.content,
+            result.prompt_tokens,
+            result.completion_tokens,
+            Some(result.finish_reason),
+            logprobs,
+        )));
     }
 
     Ok(Json(ChatCompletionResponse::new_with_logprobs(
@@ -333,6 +347,18 @@ async fn stream_chat_completion(
         let accumulated = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let acc_clone = accumulated.clone();
 
+        // Stream filter: strips Gemma 4 (and similar) structural tokens from
+        // content deltas so clients never see <|channel>, <|tool_call>, etc.
+        // Active only when tool-call parsing is enabled.
+        let stream_filter = if parse_tools {
+            Some(std::sync::Arc::new(std::sync::Mutex::new(
+                StreamFilter::new(),
+            )))
+        } else {
+            None
+        };
+        let filter_for_callback = stream_filter.clone();
+
         let result = state
             .model_provider
             .generate_streaming_with_logprobs_cancellable(
@@ -342,27 +368,53 @@ async fn stream_chat_completion(
                 prepared.audio_data,
                 cancelled,
                 |token, lp_data| {
-                    // Accumulate for later tool call parsing
+                    // Always accumulate raw text for tool call parsing
                     if parse_tools && let Ok(mut acc) = acc_clone.lock() {
                         acc.push_str(&token);
                     }
 
-                    let logprobs = if logprobs_enabled {
-                        lp_data
-                            .as_ref()
-                            .map(|lp| build_single_token_chat_logprobs(&tokenizer, lp, top_k))
+                    // Apply stream filter to strip structural tokens
+                    let emit_text = if let Some(ref filter) = filter_for_callback {
+                        filter.lock().ok().and_then(|mut f| f.feed(&token))
                     } else {
-                        None
+                        Some(token)
                     };
-                    let chunk = ChatCompletionChunk::content_with_logprobs(
-                        request_id_inner.clone(),
-                        model_id_inner.clone(),
-                        token,
-                        logprobs,
-                    );
-                    let _ = token_events.json(&chunk);
+
+                    if let Some(text) = emit_text {
+                        if text.is_empty() {
+                            return;
+                        }
+                        let logprobs = if logprobs_enabled {
+                            lp_data
+                                .as_ref()
+                                .map(|lp| build_single_token_chat_logprobs(&tokenizer, lp, top_k))
+                        } else {
+                            None
+                        };
+                        let chunk = ChatCompletionChunk::content_with_logprobs(
+                            request_id_inner.clone(),
+                            model_id_inner.clone(),
+                            text,
+                            logprobs,
+                        );
+                        let _ = token_events.json(&chunk);
+                    }
                 },
             );
+
+        // Flush any remaining buffered content from the stream filter
+        if let Some(ref filter) = stream_filter
+            && let Some(remaining) = filter.lock().ok().and_then(|mut f| f.flush())
+            && !remaining.is_empty()
+        {
+            let chunk = ChatCompletionChunk::content_with_logprobs(
+                request_id_clone.clone(),
+                model_id_clone.clone(),
+                remaining,
+                None,
+            );
+            let _ = finish_events.json(&chunk);
+        }
 
         // Check for tool calls in accumulated output
         let mut finish_reason = match &result {

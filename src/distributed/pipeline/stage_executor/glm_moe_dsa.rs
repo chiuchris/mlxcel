@@ -15,8 +15,8 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow};
-use mlxcel_core::layers::KVCache;
 use mlxcel_core::MlxArray;
+use mlxcel_core::layers::KVCache;
 
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::deepseek_v32::DeepSeekV32StageModel;
@@ -38,7 +38,8 @@ impl GlmMoeDsaStageExecutor {
             .map_err(|err| anyhow!("failed to parse {}: {}", config_path.display(), err))?;
 
         let dsv32_args = args.to_dsv32_args();
-        let mut weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let mut weights =
+            models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
         weights = DeepSeekV32Model::sanitize_weights_with_args(weights, &dsv32_args);
 
         let mut effective_filter = filter.clone();

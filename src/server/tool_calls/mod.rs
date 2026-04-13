@@ -22,6 +22,7 @@
 
 mod formats;
 pub mod parser;
+pub mod stream_filter;
 pub mod types;
 
 pub use parser::{generate_tool_call_id, parse_tool_calls};
