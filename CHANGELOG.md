@@ -4,6 +4,69 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.22] - 2026-04-13
+
+### Added
+- Pipeline stage executor framework with per-family executors (#272)
+- Gemma 3 pipeline stage executor (#304)
+- Gemma 4 pipeline stage executor (#305)
+- Qwen3 pipeline stage executor (#306)
+- Qwen3.5 pipeline stage executor (#307)
+- GLM4-family pipeline stage executors (#308)
+- GLM MoE DSA pipeline stage executor (#310)
+- gpt-oss pipeline stage executor (#303)
+- In-process pipeline stage worker loop (#273)
+- CLI pipeline generate path (#274)
+- Server pipeline runtime integration (#275)
+- Pipeline transport lifecycle controls (#276)
+- TCP-backed remote pipeline stages (#288)
+- Thunderbolt transport backend for remote pipeline parallelism (#291)
+- Multi-machine validation for remote pipeline parallelism (#301)
+- bench_decode `--cooldown` and `--big-cooldown` for M5 Max thermal management
+- M5 Max benchmark refresh for 2026-04-13 (97 models, 88 pass; 8 multimodal models restored)
+
+### Fixed
+- Tolerate stale `model.safetensors.index.json` in mlx-community repackaged quants (gemma3-4b, gemma3n-e2b/e4b, llama-4-scout-17b, mistral-small-3.1, molmo2)
+- Tolerate partial `text_config` (no `num_hidden_layers`) in single-rank tensor-parallel planning (LLaVA-1.5, LLaVA-Next-Mistral)
+- Prevent Gemma 4 special tokens from leaking into streaming content deltas (#312)
+- Complete remote pipeline lifecycle recovery (#290)
+- bench_decode single-model runs no longer truncate the day's full-suite CSV (#314, closes #313)
+- Log lazy pipeline peer reconnects
+
+### Changed
+- Generalize stage executor backends and remove legacy stage executor file (#302)
+- Transport-capable pipeline runtime seam (#287)
+
+### Tests
+- Pipeline server smoke validation (#278)
+- Pipeline rollout real-model coverage (#277)
+
+### Docs
+- Remote pipeline usage examples
+- Remote pipeline rollout workflow
+- Refreshed M5 Max benchmark documentation with measurement-variance analysis
+- Recorded issue execution workflow
+
+## [v0.0.21] - 2026-04-12
+
+### Added
+- Paged KV cache substrate with batch scheduler integration
+- Native paged decode kernel paths for rotating and chunked caches (#260)
+- Paged compatibility for windowed caches (#256)
+- Default paged decode for supported server workers (#246)
+- Paged KV transfer observability (#258)
+- NVFP4 load-time dequantization for Gemma 4 nvfp4 checkpoints
+- F8_E4M3 / F8_E5M2 safetensors loading for nvfp4 checkpoints
+- Paged decode rollout benchmark matrix and eligibility tracking (#262)
+
+### Changed
+- Unify model-owned sequence state with backend seam (#244)
+- Vectorize batched decode positional metadata
+- CI: auto-promote pre-release to full release after successful builds
+
+### Fixed
+- Skip Teams notification when webhook URL secret is not configured
+
 ## [v0.0.20] - 2026-04-10
 
 ### Added
@@ -392,6 +455,8 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.22]: https://github.com/lablup/mlxcel/compare/v0.0.21...v0.0.22
+[v0.0.21]: https://github.com/lablup/mlxcel/compare/v0.0.20...v0.0.21
 [v0.0.20]: https://github.com/lablup/mlxcel/compare/v0.0.19...v0.0.20
 [v0.0.19]: https://github.com/lablup/mlxcel/compare/v0.0.18...v0.0.19
 [v0.0.18]: https://github.com/lablup/mlxcel/compare/v0.0.17...v0.0.18

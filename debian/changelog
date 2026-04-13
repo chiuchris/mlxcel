@@ -1,3 +1,30 @@
+mlxcel (0.0.22-1~jammy1) jammy; urgency=medium
+
+  * Feat: Pipeline stage executor framework with per-family executors
+  * Feat: Stage executors for Gemma 3, Gemma 4, Qwen3, Qwen3.5, GLM4, GLM MoE DSA, gpt-oss
+  * Feat: Generic Llama-family pipeline stage executor seam
+  * Feat: In-process pipeline stage worker loop
+  * Feat: CLI pipeline generate path
+  * Feat: Server pipeline runtime integration
+  * Feat: Pipeline transport lifecycle controls
+  * Feat: TCP-backed remote pipeline stages
+  * Feat: Thunderbolt transport backend for remote pipeline parallelism
+  * Feat: Multi-machine validation for remote pipeline parallelism
+  * Feat: bench_decode --cooldown / --big-cooldown for M5 Max thermal management
+  * Refactor: Generalize stage executor backends
+  * Refactor: Transport-capable pipeline runtime seam
+  * Fix: Tolerate stale model.safetensors.index.json in mlx-community repackaged quants
+  * Fix: Tolerate partial text_config (no num_hidden_layers) in single-rank TP planning
+  * Fix: Prevent Gemma 4 special tokens from leaking into streaming content deltas
+  * Fix: Complete remote pipeline lifecycle recovery
+  * Fix: bench_decode single-model runs no longer truncate the full-suite CSV
+  * Fix: Log lazy pipeline peer reconnects
+  * Test: Pipeline server smoke validation and pipeline rollout real-model coverage
+  * Docs: M5 Max benchmark refresh for 2026-04-13 (97 models, 88 pass; 8 multimodal models restored)
+  * Docs: Remote pipeline usage examples and rollout workflow
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Mon, 13 Apr 2026 15:30:00 +0900
+
 mlxcel (0.0.21-1~jammy1) jammy; urgency=medium
 
   * Feat: Paged KV cache substrate with batch scheduler integration
