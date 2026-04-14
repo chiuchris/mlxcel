@@ -1,3 +1,29 @@
+mlxcel (0.0.23-1~jammy1) jammy; urgency=medium
+
+  * Fix: Render chat templates that use Python-style dict/string methods
+    (.get, .items, .keys, .values, .strip, .lstrip, .rstrip, .startswith,
+    .endswith, .split, .rsplit, .replace, .join, .upper, .lower, .title,
+    .capitalize, .casefold, .swapcase, .find, .count, .is{digit,alpha,
+    alnum,space,upper,lower}) via extended minijinja unknown-method callback
+  * Fix: Pass tools as empty iterable so `tools is iterable and | length > 0`
+    guards work under minijinja (Qwen 3 Next, Nemotron-H/NAS)
+  * Fix: Strip HuggingFace transformers `{% generation %}`/`{% endgeneration %}`
+    extension markers during template preprocessing (SmolLM 3)
+  * Fix: Resolve Gemma 4 "Assistant:" echo loop on gemma-4-e4b-it-4bit caused
+    by chat template silently falling back to `User: ... Assistant:` format
+  * Fix: Apply Gemma 4 structural-token stream filter and non-streaming
+    cleanup unconditionally, not only when tool parsing is enabled
+  * Test: Add cross-model chat template render audit covering 85 locally
+    available models across simple / system+user / multi-turn-with-think
+    scenarios (249/249 scenarios pass)
+  * Chore: Clean up pre-existing clippy warnings in distributed config, TP
+    llama_runtime, thunderbolt_transport, qwen3_5 linear attention, and
+    NVFP4 sanitize
+  * Chore: Clean up webpage ESLint/TypeScript errors in motion-wrapper,
+    downloads, footer, and use-os hook (no production impact)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Wed, 15 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.22-1~jammy1) jammy; urgency=medium
 
   * Feat: Pipeline stage executor framework with per-family executors
