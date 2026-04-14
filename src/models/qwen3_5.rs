@@ -261,9 +261,9 @@ impl Qwen35GatedDeltaNet {
         &self,
         inputs: &MlxArray,
         mask: Option<&MlxArray>,
-        mut cache: Option<&mut GatedDeltaCache>,
+        cache: Option<&mut GatedDeltaCache>,
     ) -> UniquePtr<MlxArray> {
-        let out = self.forward_hidden_internal(inputs, mask, cache.as_deref_mut(), true);
+        let out = self.forward_hidden_internal(inputs, mask, cache, true);
         self.out_proj.forward(&out)
     }
 

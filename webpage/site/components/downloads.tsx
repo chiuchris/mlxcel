@@ -112,7 +112,7 @@ export function Downloads({ dict, release }: DownloadsProps) {
   const getFriendlyName = (filename: string) => {
     const lower = filename.toLowerCase();
 
-    let os = "macOS";
+    const os = "macOS";
     let arch = "Apple Silicon";
 
     if (lower.includes("arm64") || lower.includes("aarch64")) {

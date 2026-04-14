@@ -1024,7 +1024,9 @@ impl TensorParallelGemma4Model {
             h = mlxcel_core::add(&residual, &post_attn);
 
             let residual = mlxcel_core::copy(&h);
-            let ff = if layer0.router.is_some() && layer0.experts.is_some() {
+            let ff = if let Some(router) = layer0.router.as_ref()
+                && layer0.experts.is_some()
+            {
                 let dense_norm = layer0.pre_feedforward_layernorm.forward(&h);
                 let dense_parts: Vec<_> = self
                     .ranks
@@ -1038,11 +1040,7 @@ impl TensorParallelGemma4Model {
                     .expect("Gemma4 TP missing post_feedforward_layernorm_1")
                     .forward(&dense);
 
-                let (top_k_indices, top_k_weights) = layer0
-                    .router
-                    .as_ref()
-                    .expect("Gemma4 TP missing router")
-                    .forward(&h);
+                let (top_k_indices, top_k_weights) = router.forward(&h);
                 let routed_norm = layer0
                     .pre_feedforward_layernorm_2
                     .as_ref()
@@ -2245,11 +2243,11 @@ fn gemma4_requires_loaded_model_fallback(
         && config.num_kv_shared_layers > 0
 }
 
-fn split_rank_caches<'a>(
-    caches: &'a mut [KVCache],
+fn split_rank_caches(
+    caches: &mut [KVCache],
     num_layers_per_rank: usize,
     num_ranks: usize,
-) -> Result<Vec<&'a mut [KVCache]>> {
+) -> Result<Vec<&mut [KVCache]>> {
     let expected = num_layers_per_rank * num_ranks;
     ensure!(
         caches.len() == expected,
@@ -2572,17 +2570,9 @@ fn shard_qwen35_weight_map(
             .map(|dim| usize::try_from(dim).context("negative tensor dimension"))
             .collect::<Result<_>>()?;
 
-        let sharded_tensor = if logical_name.ends_with(".linear_attn.in_proj_qkv.weight") {
-            shard_qwen35_linear_qkv_tensor(
-                tensor,
-                rank,
-                plan.tp_size,
-                args.linear_num_key_heads,
-                args.linear_key_head_dim,
-                args.linear_num_value_heads,
-                args.linear_value_head_dim,
-            )?
-        } else if logical_name.ends_with(".linear_attn.conv1d.weight") {
+        let sharded_tensor = if logical_name.ends_with(".linear_attn.in_proj_qkv.weight")
+            || logical_name.ends_with(".linear_attn.conv1d.weight")
+        {
             shard_qwen35_linear_qkv_tensor(
                 tensor,
                 rank,

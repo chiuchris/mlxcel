@@ -311,7 +311,7 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
         let group_size: usize = 16;
 
         // in_dim must be a multiple of group_size for scale indexing to be valid.
-        if in_dim % group_size != 0 {
+        if !in_dim.is_multiple_of(group_size) {
             eprintln!(
                 "Skipping NVFP4 dequant for {prefix}: in_dim {in_dim} is not a multiple of group_size {group_size}"
             );

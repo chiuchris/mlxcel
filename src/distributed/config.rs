@@ -328,11 +328,13 @@ impl ClusterConfig {
         }
 
         for node in &self.nodes {
-            if node.role != NodeRole::PipelineStage && node.stage.is_some() {
+            if node.role != NodeRole::PipelineStage
+                && let Some(stage) = node.stage
+            {
                 anyhow::bail!(
                     "node '{}' sets stage={} but role is {}; only pipeline_stage nodes may set stage",
                     node.id,
-                    node.stage.unwrap(),
+                    stage,
                     node.role
                 );
             }

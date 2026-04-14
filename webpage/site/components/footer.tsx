@@ -1,3 +1,4 @@
+import Image from "next/image";
 import { Github, Linkedin, Youtube } from "lucide-react";
 import type { Dictionary } from "@/dictionaries/en";
 import type { Locale } from "@/lib/dictionary";
@@ -48,11 +49,12 @@ export function Footer({ dict, lang }: FooterProps) {
             rel="noopener noreferrer"
             className="inline-flex items-center"
           >
-            <img
+            <Image
               src={LABLUP_LOGO_URL}
               alt="Lablup"
+              width={120}
+              height={32}
               className="h-7 w-auto sm:h-8"
-              loading="lazy"
             />
           </a>
           <address className="mt-5 not-italic text-slate-400">

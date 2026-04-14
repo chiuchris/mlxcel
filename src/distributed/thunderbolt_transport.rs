@@ -402,13 +402,12 @@ fn parse_networksetup_hardware_ports(output: &str) -> Vec<String> {
             current_port = Some(port.trim().to_string());
             continue;
         }
-        if let Some(device) = trimmed.strip_prefix("Device:") {
-            if current_port
+        if let Some(device) = trimmed.strip_prefix("Device:")
+            && current_port
                 .as_deref()
                 .is_some_and(|port| port.contains("Thunderbolt"))
-            {
-                interfaces.push(device.trim().to_string());
-            }
+        {
+            interfaces.push(device.trim().to_string());
         }
     }
     interfaces
