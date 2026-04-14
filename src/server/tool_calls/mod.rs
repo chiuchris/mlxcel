@@ -25,7 +25,7 @@ pub mod parser;
 pub mod stream_filter;
 pub mod types;
 
-pub use parser::{generate_tool_call_id, parse_tool_calls};
+pub use parser::{clean_structural_tokens, generate_tool_call_id, parse_tool_calls};
 pub use types::{ParsedToolCall, ToolCallFormat, ToolCallParseResult};
 
 use super::types::request::ChatCompletionRequest;

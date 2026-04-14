@@ -88,7 +88,7 @@ impl ChatTemplateProcessor {
             .unwrap_or_default();
 
         Ok(Some(Self {
-            template,
+            template: preprocess_template(template),
             bos_token,
             eos_token,
             add_generation_prompt: true,
@@ -99,7 +99,7 @@ impl ChatTemplateProcessor {
     /// Create a processor with a custom template string
     pub fn with_template(template: String) -> Self {
         Self {
-            template,
+            template: preprocess_template(template),
             bos_token: String::new(),
             eos_token: String::new(),
             add_generation_prompt: true,
@@ -195,7 +195,14 @@ impl ChatTemplateProcessor {
         // Convert serde_json::Value to minijinja::Value
         let messages_val = minijinja::Value::from_serialize(messages);
 
-        let tools_val = tools.map(minijinja::Value::from_serialize);
+        // Always pass `tools` as an iterable (possibly empty) rather than
+        // `None` so that `{% if tools is iterable and tools | length > 0 %}`
+        // works under minijinja — its short-circuit evaluation still tries
+        // to compute `| length` of `none`, which raises an error.
+        let tools_val = match tools {
+            Some(t) => minijinja::Value::from_serialize(t),
+            None => minijinja::Value::from_serialize(Vec::<Tool>::new()),
+        };
         let context = minijinja::context! {
             messages => messages_val,
             bos_token => &self.bos_token,
@@ -226,9 +233,16 @@ impl ChatTemplateProcessor {
 
         let tmpl = env.get_template("chat")?;
 
-        // Many templates conditionally check variables like `tools`, `enable_thinking`, etc.
-        // We must provide them as None/false to avoid undefined variable errors.
-        let tools_val = tools.map(minijinja::Value::from_serialize);
+        // Many templates conditionally check variables like `tools`,
+        // `enable_thinking`, etc. We must provide them with the right
+        // concrete type to avoid undefined/None errors — in particular,
+        // `tools` must be an iterable (even when empty) so that the common
+        // `{% if tools is iterable and tools | length > 0 %}` guard used by
+        // Qwen/Nemotron templates works correctly under minijinja.
+        let tools_val = match tools {
+            Some(t) => minijinja::Value::from_serialize(t),
+            None => minijinja::Value::from_serialize(Vec::<Tool>::new()),
+        };
         let context = minijinja::context! {
             messages => messages,
             bos_token => &self.bos_token,
@@ -244,6 +258,36 @@ impl ChatTemplateProcessor {
 
         Ok(result)
     }
+}
+
+/// Strip HuggingFace `transformers` Jinja2 extensions that minijinja does not
+/// implement.
+///
+/// `{% generation %}...{% endgeneration %}` is a transformers extension used
+/// to mark assistant-generation regions for token-level masking. It has no
+/// effect on the rendered prompt, so we simply drop both delimiters so the
+/// template parses cleanly under minijinja. Affected models: SmolLM3, and
+/// any other HF template that adopts this marker.
+fn preprocess_template(template: String) -> String {
+    // Handle all whitespace-control variants of the two delimiters. Using
+    // explicit replaces keeps this allocation-light and regex-free.
+    let variants: &[&str] = &[
+        "{% generation %}",
+        "{%- generation %}",
+        "{% generation -%}",
+        "{%- generation -%}",
+        "{% endgeneration %}",
+        "{%- endgeneration %}",
+        "{% endgeneration -%}",
+        "{%- endgeneration -%}",
+    ];
+    let mut out = template;
+    for v in variants {
+        if out.contains(v) {
+            out = out.replace(v, "");
+        }
+    }
+    out
 }
 
 /// Configure a minijinja environment with common settings and Python-compat methods.
@@ -266,17 +310,271 @@ fn configure_environment(env: &mut Environment<'_>) {
         chrono::Utc::now().format("%d %b %Y").to_string()
     });
 
-    // Handle Python string methods not natively supported by minijinja.
-    // Many HuggingFace chat templates (e.g. Gemma 4) use `.split()` which
-    // is standard Python/Jinja2 but not a built-in minijinja string method.
-    env.set_unknown_method_callback(|_state, value, method, args| match (value.kind(), method) {
-        (minijinja::value::ValueKind::String, "split") => {
+    // Handle Python methods not natively supported by minijinja.
+    //
+    // Many HuggingFace chat templates use Python-style string and dict
+    // methods (`.split()`, `.strip()`, `.startswith()`, `.get()`, `.items()`
+    // …) that are standard in Python/Jinja2 but not built into minijinja's
+    // value types. Without these shims, rendering silently falls back to
+    // the `to_prompt()` "User: ... Assistant:" format, and the model echoes
+    // those labels instead of producing a real response.
+    //
+    // Scope: cover every method encountered in the chat templates we ship
+    // against (Gemma 4, Qwen 3, GLM 4/5, Jamba, Exaone 4, olmo 3, …).
+    env.set_unknown_method_callback(|_state, value, method, args| {
+        use minijinja::value::ValueKind;
+
+        // --- String methods ---------------------------------------------
+        if value.kind() == ValueKind::String {
             let s = value.as_str().unwrap_or_default();
-            let sep = args.first().and_then(|a| a.as_str()).unwrap_or_default();
-            let parts: Vec<Value> = s.split(sep).map(|p| Value::from(p.to_string())).collect();
-            Ok(Value::from(parts))
+            let arg_str = || args.first().and_then(|a| a.as_str()).unwrap_or_default();
+
+            // `chars` argument for strip/lstrip/rstrip. `None` → whitespace.
+            let strip_chars = args.first().and_then(|a| a.as_str());
+            let strip_matches = |s: &str| -> String {
+                match strip_chars {
+                    None => s.trim().to_string(),
+                    Some(chars) => s.trim_matches(|c: char| chars.contains(c)).to_string(),
+                }
+            };
+            let lstrip_matches = |s: &str| -> String {
+                match strip_chars {
+                    None => s.trim_start().to_string(),
+                    Some(chars) => s
+                        .trim_start_matches(|c: char| chars.contains(c))
+                        .to_string(),
+                }
+            };
+            let rstrip_matches = |s: &str| -> String {
+                match strip_chars {
+                    None => s.trim_end().to_string(),
+                    Some(chars) => s.trim_end_matches(|c: char| chars.contains(c)).to_string(),
+                }
+            };
+
+            match method {
+                "split" => {
+                    let sep = arg_str();
+                    // Python `s.split()` with no arg splits on any whitespace
+                    // and drops empty strings; `s.split(sep)` splits on sep.
+                    let parts: Vec<Value> = if sep.is_empty() {
+                        s.split_whitespace()
+                            .map(|p| Value::from(p.to_string()))
+                            .collect()
+                    } else {
+                        s.split(sep).map(|p| Value::from(p.to_string())).collect()
+                    };
+                    return Ok(Value::from(parts));
+                }
+                "rsplit" => {
+                    let sep = arg_str();
+                    let parts: Vec<Value> = if sep.is_empty() {
+                        s.split_whitespace()
+                            .map(|p| Value::from(p.to_string()))
+                            .collect()
+                    } else {
+                        s.rsplit(sep).map(|p| Value::from(p.to_string())).collect()
+                    };
+                    return Ok(Value::from(parts));
+                }
+                "strip" => return Ok(Value::from(strip_matches(s))),
+                "lstrip" => return Ok(Value::from(lstrip_matches(s))),
+                "rstrip" => return Ok(Value::from(rstrip_matches(s))),
+                "startswith" => {
+                    let prefix = arg_str();
+                    return Ok(Value::from(s.starts_with(prefix)));
+                }
+                "endswith" => {
+                    let suffix = arg_str();
+                    return Ok(Value::from(s.ends_with(suffix)));
+                }
+                "replace" => {
+                    let old = args.first().and_then(|a| a.as_str()).unwrap_or_default();
+                    let new = args.get(1).and_then(|a| a.as_str()).unwrap_or_default();
+                    return Ok(Value::from(s.replace(old, new)));
+                }
+                "upper" => return Ok(Value::from(s.to_uppercase())),
+                "lower" => return Ok(Value::from(s.to_lowercase())),
+                "title" => {
+                    // Simple title-case: uppercase first letter of each word.
+                    let mut result = String::with_capacity(s.len());
+                    let mut prev_alphabetic = false;
+                    for ch in s.chars() {
+                        if ch.is_alphabetic() {
+                            if prev_alphabetic {
+                                result.extend(ch.to_lowercase());
+                            } else {
+                                result.extend(ch.to_uppercase());
+                            }
+                            prev_alphabetic = true;
+                        } else {
+                            result.push(ch);
+                            prev_alphabetic = false;
+                        }
+                    }
+                    return Ok(Value::from(result));
+                }
+                "capitalize" => {
+                    // Python `s.capitalize()` — uppercase first char, lowercase the rest.
+                    let mut chars = s.chars();
+                    let result = match chars.next() {
+                        Some(first) => {
+                            let mut out = String::with_capacity(s.len());
+                            out.extend(first.to_uppercase());
+                            out.extend(chars.flat_map(|c| c.to_lowercase()));
+                            out
+                        }
+                        None => String::new(),
+                    };
+                    return Ok(Value::from(result));
+                }
+                "casefold" => {
+                    // Python `s.casefold()` — approximation via lowercase.
+                    return Ok(Value::from(s.to_lowercase()));
+                }
+                "swapcase" => {
+                    let result: String = s
+                        .chars()
+                        .flat_map(|c| {
+                            if c.is_uppercase() {
+                                c.to_lowercase().collect::<Vec<_>>()
+                            } else if c.is_lowercase() {
+                                c.to_uppercase().collect::<Vec<_>>()
+                            } else {
+                                vec![c]
+                            }
+                        })
+                        .collect();
+                    return Ok(Value::from(result));
+                }
+                "join" => {
+                    // Python `sep.join(iterable)` — called as method on the
+                    // separator string, with the iterable as the argument.
+                    let Some(iter_arg) = args.first() else {
+                        return Err(minijinja::Error::new(
+                            ErrorKind::InvalidOperation,
+                            "str.join() requires an iterable argument",
+                        ));
+                    };
+                    let iter = iter_arg.try_iter().map_err(|_| {
+                        minijinja::Error::new(
+                            ErrorKind::InvalidOperation,
+                            "str.join() argument is not iterable",
+                        )
+                    })?;
+                    let parts: Vec<String> = iter
+                        .map(|v| {
+                            v.as_str()
+                                .map(String::from)
+                                .unwrap_or_else(|| v.to_string())
+                        })
+                        .collect();
+                    return Ok(Value::from(parts.join(s)));
+                }
+                "isdigit" => {
+                    return Ok(Value::from(
+                        !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()),
+                    ));
+                }
+                "isalpha" => {
+                    return Ok(Value::from(
+                        !s.is_empty() && s.chars().all(|c| c.is_alphabetic()),
+                    ));
+                }
+                "isalnum" => {
+                    return Ok(Value::from(
+                        !s.is_empty() && s.chars().all(|c| c.is_alphanumeric()),
+                    ));
+                }
+                "isspace" => {
+                    return Ok(Value::from(
+                        !s.is_empty() && s.chars().all(|c| c.is_whitespace()),
+                    ));
+                }
+                "isupper" => {
+                    return Ok(Value::from(
+                        s.chars().any(|c| c.is_uppercase()) && !s.chars().any(|c| c.is_lowercase()),
+                    ));
+                }
+                "islower" => {
+                    return Ok(Value::from(
+                        s.chars().any(|c| c.is_lowercase()) && !s.chars().any(|c| c.is_uppercase()),
+                    ));
+                }
+                "find" => {
+                    let needle = arg_str();
+                    let idx = s.find(needle).map(|i| i as i64).unwrap_or(-1);
+                    return Ok(Value::from(idx));
+                }
+                "count" => {
+                    let needle = arg_str();
+                    if needle.is_empty() {
+                        return Ok(Value::from(0_i64));
+                    }
+                    return Ok(Value::from(s.matches(needle).count() as i64));
+                }
+                _ => {}
+            }
         }
-        _ => Err(minijinja::Error::from(ErrorKind::UnknownMethod)),
+
+        // --- Map (dict) methods -----------------------------------------
+        if value.kind() == ValueKind::Map {
+            match method {
+                // Python-style `dict.get(key[, default])`: returns the
+                // value at `key` or `default` (or Undefined) when absent.
+                // Jinja2 treats Undefined as falsy, matching Python's
+                // `None` semantics in `m.get('a') or m.get('b')` chains.
+                "get" => {
+                    let Some(key) = args.first() else {
+                        return Err(minijinja::Error::new(
+                            ErrorKind::InvalidOperation,
+                            "dict.get() requires at least one argument",
+                        ));
+                    };
+                    let default = args.get(1).cloned().unwrap_or(Value::UNDEFINED);
+                    return match value.get_item(key) {
+                        Ok(v) if v.is_undefined() => Ok(default),
+                        Ok(v) => Ok(v),
+                        Err(_) => Ok(default),
+                    };
+                }
+                // Python-style `dict.items()` / `keys()` / `values()` —
+                // return flat sequences usable directly in `{% for %}`.
+                "items" => {
+                    let mut pairs: Vec<Value> = Vec::new();
+                    if let Ok(iter) = value.try_iter() {
+                        for k in iter {
+                            let v = value.get_item(&k).unwrap_or(Value::UNDEFINED);
+                            pairs.push(Value::from(vec![k, v]));
+                        }
+                    }
+                    return Ok(Value::from(pairs));
+                }
+                "keys" => {
+                    let mut keys: Vec<Value> = Vec::new();
+                    if let Ok(iter) = value.try_iter() {
+                        for k in iter {
+                            keys.push(k);
+                        }
+                    }
+                    return Ok(Value::from(keys));
+                }
+                "values" => {
+                    let mut vals: Vec<Value> = Vec::new();
+                    if let Ok(iter) = value.try_iter() {
+                        for k in iter {
+                            if let Ok(v) = value.get_item(&k) {
+                                vals.push(v);
+                            }
+                        }
+                    }
+                    return Ok(Value::from(vals));
+                }
+                _ => {}
+            }
+        }
+
+        Err(minijinja::Error::from(ErrorKind::UnknownMethod))
     });
 }
 
@@ -420,6 +718,351 @@ mod tests {
         let _ = processor.supports_tools();
         // Now cached
         assert!(processor.supports_tools_cached.is_some());
+    }
+
+    #[test]
+    fn test_dict_get_method_present_key() {
+        // Python-style dict.get('key') should return the value when present.
+        let template = r#"{{ messages[0].get('content') }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello world".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "hello world");
+    }
+
+    #[test]
+    fn test_dict_get_method_missing_key_is_falsy() {
+        // Missing key should be falsy so `get('a') or get('b')` works.
+        let template = r#"{% if messages[0].get('missing_field') %}HAS{% else %}NONE{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "NONE");
+    }
+
+    #[test]
+    fn test_dict_get_method_or_chain() {
+        // `m.get('a') or m.get('b')` — the Gemma 4 idiom.
+        let template = r#"{{ messages[0].get('reasoning') or messages[0].get('content') }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "fallback value".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "fallback value");
+    }
+
+    #[test]
+    fn test_dict_get_method_with_default() {
+        // `m.get('missing', 'default')` — two-arg form.
+        let template = r#"{{ messages[0].get('missing', 'fallback') }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "fallback");
+    }
+
+    #[test]
+    fn test_string_strip_default_whitespace() {
+        let template = r#"{{ messages[0].content.strip() }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "  hello  ".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "hello");
+    }
+
+    #[test]
+    fn test_string_strip_with_chars() {
+        // Python: `"\n\nhello\n".strip('\n')` → `"hello"`
+        let template = r#"{{ messages[0].content.strip('\n') }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "\n\nhello\n".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "hello");
+    }
+
+    #[test]
+    fn test_string_lstrip_rstrip() {
+        // Pad the output so we can assert on exact leading/trailing content
+        // without being confused by minijinja's whitespace-control modes.
+        let template_l = r#"[{{ messages[0].content.lstrip('\n') }}]"#;
+        let template_r = r#"[{{ messages[0].content.rstrip('\n') }}]"#;
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "\n\nhello\n\n".to_string(),
+        }];
+        let pl = ChatTemplateProcessor::with_template(template_l.to_string());
+        assert_eq!(pl.apply(&messages, None).unwrap().trim(), "[hello\n\n]");
+        let pr = ChatTemplateProcessor::with_template(template_r.to_string());
+        assert_eq!(pr.apply(&messages, None).unwrap().trim(), "[\n\nhello]");
+    }
+
+    #[test]
+    fn test_string_startswith_endswith() {
+        let template = r#"{% if messages[0].content.startswith('<tool>') %}T{% else %}F{% endif %}{% if messages[0].content.endswith('</tool>') %}T{% else %}F{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "<tool>call</tool>".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "TT");
+    }
+
+    #[test]
+    fn test_string_replace() {
+        let template = r#"{{ messages[0].content.replace('foo', 'bar') }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "foo and foo".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        assert_eq!(result.trim(), "bar and bar");
+    }
+
+    #[test]
+    fn test_map_items_iteration() {
+        // `{% for k, v in d.items() %}` — destructuring iteration.
+        let template = r#"{% for k, v in messages[0].items() %}{{ k }}={{ v }};{% endfor %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let result = processor.apply(&messages, None).unwrap();
+        // Order is stable for struct-derived maps (serde preserves field order).
+        assert!(result.contains("role=user"));
+        assert!(result.contains("content=hi"));
+    }
+
+    #[test]
+    fn test_qwen3_template_thinking_chain_renders() {
+        // Representative fragment from Qwen 3 / Jamba templates — uses
+        // `.strip('\n')`, `.split()`, `.lstrip()`, `.startswith()`,
+        // `.endswith()` all in the same expression.
+        let template = r#"{%- set content = messages[0].content.split('</think>')[-1].lstrip('\n') -%}
+{%- if messages[0].content.startswith('<tool_response>') and messages[0].content.endswith('</tool_response>') -%}
+TOOL
+{%- else -%}
+{{ content.strip('\n') }}
+{%- endif -%}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "<think>\nplanning\n</think>\n\nthe answer\n".to_string(),
+        }];
+        let result = processor
+            .apply(&messages, None)
+            .expect("Qwen 3 style template must render");
+        assert_eq!(result.trim(), "the answer");
+    }
+
+    #[test]
+    fn test_gemma4_template_renders() {
+        // Regression guard for the Gemma 4 chat template, which uses
+        // `message.get('reasoning')` idioms that require unknown_method_callback
+        // support for dict.get().
+        let template = r#"{{- bos_token -}}
+{%- for message in messages -%}
+    {%- set thinking_text = message.get('reasoning') or message.get('reasoning_content') -%}
+    {%- if thinking_text -%}
+        <|channel>thought
+{{ thinking_text }}
+<channel|>
+    {%- endif -%}
+    <|turn>{{ message['role'] }}
+{{ message['content'] }}<turn|>
+{%- endfor -%}
+{%- if add_generation_prompt -%}<|turn>model
+{%- endif -%}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "containerization question".to_string(),
+        }];
+        let result = processor
+            .apply(&messages, None)
+            .expect("Gemma 4 template must render successfully");
+        assert!(result.contains("<|turn>user"));
+        assert!(result.contains("containerization question"));
+        assert!(result.contains("<|turn>model"));
+    }
+
+    /// Renders every locally-available model's chat template with a few
+    /// representative message patterns and reports all failures at the end.
+    ///
+    /// Marked `#[ignore]` because it requires the developer's `models/`
+    /// directory, which is not present in CI. Run with:
+    ///
+    /// ```text
+    /// cargo test --release --lib -p mlxcel test_all_local_model_templates_render -- --ignored --nocapture
+    /// ```
+    #[test]
+    #[ignore = "requires local models/ directory; run with --ignored"]
+    fn test_all_local_model_templates_render() {
+        let models_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("models");
+        if !models_dir.exists() {
+            eprintln!("skip: {} not found", models_dir.display());
+            return;
+        }
+
+        // Three canonical scenarios exercising different template branches:
+        //   simple          — single user turn (default path)
+        //   system          — system + user (system-message branch)
+        //   multi_turn_think — multi-turn with `<think>...</think>`,
+        //                       exercising `.split('</think>')` + friends
+        let scenarios: Vec<(&str, Vec<ChatMessage>)> = vec![
+            (
+                "simple",
+                vec![ChatMessage {
+                    role: "user".into(),
+                    content: "Hello, what is 2+2?".into(),
+                }],
+            ),
+            (
+                "system",
+                vec![
+                    ChatMessage {
+                        role: "system".into(),
+                        content: "You are a helpful assistant.".into(),
+                    },
+                    ChatMessage {
+                        role: "user".into(),
+                        content: "Hi".into(),
+                    },
+                ],
+            ),
+            (
+                "multi_turn_think",
+                vec![
+                    ChatMessage {
+                        role: "user".into(),
+                        content: "What is 2+2?".into(),
+                    },
+                    ChatMessage {
+                        role: "assistant".into(),
+                        content: "<think>\nLet me calculate.\n</think>\n\n2+2 equals 4.".into(),
+                    },
+                    ChatMessage {
+                        role: "user".into(),
+                        content: "And 3+3?".into(),
+                    },
+                ],
+            ),
+        ];
+
+        // Errors raised by the template itself via `raise_exception(...)`
+        // are intentional rejections (e.g. "system role not supported",
+        // "roles must alternate"). They indicate the template is WORKING,
+        // just for a scenario it explicitly refuses. We want the audit to
+        // flag only genuine engine/unknown-method failures.
+        let is_intentional_reject = |err: &str| -> bool {
+            const INTENTIONAL_PHRASES: &[&str] = &[
+                "System role not supported",
+                "System messages not supported",
+                "must alternate",
+                "Only user and assistant roles",
+                "does not support tool",
+            ];
+            INTENTIONAL_PHRASES.iter().any(|p| err.contains(p))
+        };
+
+        let mut failures: Vec<(String, String, String)> = Vec::new();
+        let mut intentional: Vec<(String, String, String)> = Vec::new();
+        let mut passed = 0usize;
+        let mut skipped = 0usize;
+        let mut models_checked = 0usize;
+
+        let mut entries: Vec<_> = std::fs::read_dir(&models_dir)
+            .expect("read models/")
+            .flatten()
+            .filter(|e| e.file_type().map(|ft| ft.is_dir()).unwrap_or(false))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        for entry in entries {
+            let path = entry.path();
+            let model_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+            let processor = match ChatTemplateProcessor::from_model_path(&path) {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    skipped += 1;
+                    continue; // no chat template shipped
+                }
+                Err(e) => {
+                    failures.push((model_name.clone(), "load".into(), format!("{e:#}")));
+                    continue;
+                }
+            };
+
+            models_checked += 1;
+
+            for (scenario_name, messages) in &scenarios {
+                match processor.apply(messages, None) {
+                    Ok(_) => passed += 1,
+                    Err(e) => {
+                        let msg = format!("{e:#}");
+                        if is_intentional_reject(&msg) {
+                            intentional.push((
+                                model_name.clone(),
+                                (*scenario_name).to_string(),
+                                msg,
+                            ));
+                        } else {
+                            failures.push((model_name.clone(), (*scenario_name).to_string(), msg));
+                        }
+                    }
+                }
+            }
+        }
+
+        eprintln!();
+        eprintln!("=== chat template render audit ===");
+        eprintln!("models checked:          {models_checked}");
+        eprintln!("scenarios passed:        {passed}");
+        eprintln!("intentional rejections:  {}", intentional.len());
+        eprintln!("skipped (no template):   {skipped}");
+        eprintln!("failures:                {}", failures.len());
+
+        if !intentional.is_empty() {
+            eprintln!();
+            eprintln!("--- intentional template rejections (expected) ---");
+            for (model, scenario, err) in &intentional {
+                let first_line = err.lines().next().unwrap_or("");
+                eprintln!("  {model}::{scenario} — {first_line}");
+            }
+        }
+
+        if !failures.is_empty() {
+            eprintln!();
+            eprintln!("--- failures ---");
+            for (model, scenario, err) in &failures {
+                let first_line = err.lines().next().unwrap_or("");
+                eprintln!("  {model}::{scenario} — {first_line}");
+            }
+            panic!(
+                "{} model/scenario combinations failed to render",
+                failures.len()
+            );
+        }
     }
 
     #[test]

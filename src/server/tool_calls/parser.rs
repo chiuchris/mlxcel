@@ -58,13 +58,36 @@ fn strip_thinking(text: &str) -> String {
 /// or when cleaning content extracted alongside tool calls.  Strips markers
 /// that would otherwise leak into the response content.
 ///
+/// Note that matched `<|channel>...<channel|>` blocks are removed earlier
+/// by [`strip_thinking`]; this function only cleans *stray* markers (e.g.
+/// a dangling `<channel|>` the model emits without a matching open tag,
+/// which happens with Gemma 4 non-thinking mode).
+///
 /// Used by: tool_calls::parser
 fn clean_content_markers(text: &str) -> String {
     text.replace("<turn|>", "")
         .replace("<|turn>", "")
         .replace("<|think|>", "")
+        .replace("<channel|>", "")
+        .replace("<|channel>", "")
+        .replace("<|tool_call>", "")
+        .replace("<tool_call|>", "")
         .trim()
         .to_string()
+}
+
+/// Strip all known structural tokens (thinking blocks and stray turn/think
+/// markers) from a raw model output.
+///
+/// This is the non-streaming counterpart to
+/// [`StreamFilter`](super::stream_filter::StreamFilter) and should be applied
+/// to any chat response text before it is returned to the client, regardless
+/// of whether tool-call parsing is enabled.  Without this pass, Gemma 4 leaks
+/// `<channel|>`, `<turn|>`, and related markers into plain chat content when
+/// no tools are present in the request.
+// Used by: routes/chat (non-streaming path)
+pub fn clean_structural_tokens(raw: &str) -> String {
+    clean_content_markers(&strip_thinking(raw))
 }
 
 /// Parse model output for tool calls, trying each known format in order.

@@ -271,10 +271,15 @@ async fn non_stream_chat_completion(
         )));
     }
 
+    // Even without tool-call parsing, strip structural tokens so Gemma 4
+    // (and similar) markers like `<channel|>` / `<turn|>` never leak into
+    // plain chat responses.
+    let cleaned_text = tool_calls::clean_structural_tokens(&result.text);
+
     Ok(Json(ChatCompletionResponse::new_with_logprobs(
         request_id,
         model_id,
-        result.text,
+        cleaned_text,
         result.prompt_tokens,
         result.completion_tokens,
         Some(result.finish_reason),
@@ -349,14 +354,10 @@ async fn stream_chat_completion(
 
         // Stream filter: strips Gemma 4 (and similar) structural tokens from
         // content deltas so clients never see <|channel>, <|tool_call>, etc.
-        // Active only when tool-call parsing is enabled.
-        let stream_filter = if parse_tools {
-            Some(std::sync::Arc::new(std::sync::Mutex::new(
-                StreamFilter::new(),
-            )))
-        } else {
-            None
-        };
+        // Always on — for non-tool chat requests we still need to suppress
+        // the thinking-channel markers and stray turn tokens that Gemma 4
+        // models occasionally emit.
+        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(StreamFilter::new()));
         let filter_for_callback = stream_filter.clone();
 
         let result = state
@@ -374,11 +375,10 @@ async fn stream_chat_completion(
                     }
 
                     // Apply stream filter to strip structural tokens
-                    let emit_text = if let Some(ref filter) = filter_for_callback {
-                        filter.lock().ok().and_then(|mut f| f.feed(&token))
-                    } else {
-                        Some(token)
-                    };
+                    let emit_text = filter_for_callback
+                        .lock()
+                        .ok()
+                        .and_then(|mut f| f.feed(&token));
 
                     if let Some(text) = emit_text {
                         if text.is_empty() {
@@ -403,8 +403,7 @@ async fn stream_chat_completion(
             );
 
         // Flush any remaining buffered content from the stream filter
-        if let Some(ref filter) = stream_filter
-            && let Some(remaining) = filter.lock().ok().and_then(|mut f| f.flush())
+        if let Some(remaining) = stream_filter.lock().ok().and_then(|mut f| f.flush())
             && !remaining.is_empty()
         {
             let chunk = ChatCompletionChunk::content_with_logprobs(
