@@ -257,30 +257,6 @@ impl RMSNormNoScale {
     }
 }
 
-pub struct ScaledLinear {
-    linear: UnifiedLinear,
-    scalar: f32,
-}
-
-impl ScaledLinear {
-    pub fn from_weights(
-        weights: &WeightMap,
-        prefix: &str,
-        group_size: i32,
-        bits: i32,
-        scalar: f32,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            linear: UnifiedLinear::from_weights(weights, prefix, group_size, bits)?,
-            scalar,
-        })
-    }
-
-    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
-        mlxcel_core::multiply_scalar(&self.linear.forward(x), self.scalar)
-    }
-}
-
 struct SwitchGeGLU {
     gate_proj: SwitchLinear,
     up_proj: SwitchLinear,
@@ -1113,7 +1089,8 @@ impl DecoderLayer {
 pub struct Gemma4TextModel {
     pub(crate) embed_tokens: UnifiedEmbedding,
     pub(crate) embed_tokens_per_layer: Option<UnifiedEmbedding>,
-    pub(crate) per_layer_model_projection: Option<ScaledLinear>,
+    pub(crate) per_layer_model_projection: Option<UnifiedLinear>,
+    pub(crate) per_layer_projection_scale: f32,
     pub(crate) per_layer_projection_norm: Option<RMSNorm>,
     pub(crate) layers: Vec<DecoderLayer>,
     pub(crate) norm: RMSNorm,
@@ -1255,6 +1232,8 @@ impl Gemma4TextModel {
             .as_ref()
             .expect("Gemma4 per_layer_model_projection missing")
             .forward(inputs_embeds);
+        let projected =
+            mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
         let shape = mlxcel_core::array_shape(inputs_embeds);
         let projected = mlxcel_core::reshape(
             &projected,
@@ -1302,13 +1281,13 @@ impl Gemma4TextModel {
             None
         };
 
+        let per_layer_projection_scale = (config.hidden_size as f32).powf(-0.5);
         let per_layer_model_projection = if config.hidden_size_per_layer_input > 0 {
-            Some(ScaledLinear::from_weights(
+            Some(UnifiedLinear::from_weights(
                 weights,
                 &format!("{}.per_layer_model_projection", prefix),
                 config.group_size(),
                 config.bits(),
-                (config.hidden_size as f32).powf(-0.5),
             )?)
         } else {
             None
@@ -1345,6 +1324,7 @@ impl Gemma4TextModel {
             embed_tokens,
             embed_tokens_per_layer,
             per_layer_model_projection,
+            per_layer_projection_scale,
             per_layer_projection_norm,
             layers,
             norm,
@@ -1480,7 +1460,8 @@ pub(crate) struct Gemma4StageModel {
     filter: LayerFilter,
     embed_tokens: Option<UnifiedEmbedding>,
     embed_tokens_per_layer: Option<UnifiedEmbedding>,
-    per_layer_model_projection: Option<ScaledLinear>,
+    per_layer_model_projection: Option<UnifiedLinear>,
+    per_layer_projection_scale: f32,
     per_layer_projection_norm: Option<RMSNorm>,
     layers: Vec<(usize, DecoderLayer)>,
     norm: Option<RMSNorm>,
@@ -1559,14 +1540,14 @@ impl Gemma4StageModel {
                 None
             };
 
+        let per_layer_projection_scale = (config.hidden_size as f32).powf(-0.5);
         let per_layer_model_projection =
             if filter.has_embedding && config.hidden_size_per_layer_input > 0 {
-                Some(ScaledLinear::from_weights(
+                Some(UnifiedLinear::from_weights(
                     weights,
                     &format!("{}.per_layer_model_projection", prefix),
                     config.group_size(),
                     config.bits(),
-                    (config.hidden_size as f32).powf(-0.5),
                 )?)
             } else {
                 None
@@ -1630,6 +1611,7 @@ impl Gemma4StageModel {
             embed_tokens,
             embed_tokens_per_layer,
             per_layer_model_projection,
+            per_layer_projection_scale,
             per_layer_projection_norm,
             layers,
             norm,
@@ -1851,6 +1833,8 @@ impl Gemma4StageModel {
             .as_ref()
             .ok_or_else(|| "Gemma4 per_layer_model_projection missing".to_string())?
             .forward(inputs_embeds);
+        let projected =
+            mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
         let shape = mlxcel_core::array_shape(inputs_embeds);
         let projected = mlxcel_core::reshape(
             &projected,
