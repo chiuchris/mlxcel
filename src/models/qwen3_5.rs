@@ -348,16 +348,21 @@ impl Qwen35GatedDeltaNet {
         // Concatenate with conv state
         let conv_input = concatenate(&conv_state, &qkv, 1);
 
-        // Update cache with new conv state
+        // Update cache with new conv state.
+        // Wrap slice in contiguous() to force MLX to materialize a fresh,
+        // independent buffer. Without this, the slice is a lazy view that
+        // retains a reference to the full conv_input allocation, causing a
+        // memory leak proportional to the sequence length. (issue #323)
         if let Some(c) = cache.as_deref_mut() {
             let n_keep = (self.conv_kernel_size - 1) as i32;
             let conv_shape = mlxcel_core::array_shape(&conv_input);
             let conv_len = conv_shape[1];
-            c.conv_state = Some(mlxcel_core::slice(
+            let tail = mlxcel_core::slice(
                 &conv_input,
                 &[0, conv_len - n_keep, 0],
                 &[b, conv_len, self.conv_dim as i32],
-            ));
+            );
+            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
         }
 
         // Apply conv1d with SiLU activation

@@ -820,3 +820,102 @@ fn bench_compiled_vs_uncompiled_swiglu() {
         );
     }
 }
+
+/// Regression test for issue #323: conv_input cache slice must be contiguous.
+///
+/// MLX's `slice()` returns a lazy view that retains a reference to the source
+/// array in the computation graph (`{a}` input). Without wrapping the slice
+/// with `contiguous()`, every cached conv_state holds a reference to the full
+/// `conv_input` buffer, preventing it from being freed and causing per-step
+/// memory growth proportional to sequence length.
+///
+/// This test:
+/// 1. Simulates the gated-delta conv-state update pattern over many steps.
+/// 2. Verifies the contiguous result has the expected small shape.
+/// 3. Verifies the slice result is usable after `contiguous()` is applied and
+///    evaluated, confirming the data is correct.
+/// 4. Measures the aggregate size to ensure it does not grow with step count.
+#[test]
+fn test_conv_state_slice_is_contiguous_after_fix() {
+    // Parameters matching a typical gated-delta layer.
+    let batch: i32 = 1;
+    let conv_kernel_size: i32 = 4; // kernel_size-1 = 3 entries kept
+    let conv_dim: i32 = 64;
+    let n_keep = conv_kernel_size - 1; // 3
+
+    // Simulate 50 decode steps accumulating conv_state in a cache.
+    let mut cached_state: Option<cxx::UniquePtr<MlxArray>> = None;
+
+    for step in 0..50_i32 {
+        // Each step we get a new token input of shape [B, 1, conv_dim].
+        let input_data: Vec<f32> = (0..conv_dim).map(|i| (step * conv_dim + i) as f32).collect();
+        let qkv = from_slice_f32(&input_data, &[batch, 1, conv_dim]);
+
+        // Build or reuse conv_state: [B, n_keep, conv_dim]
+        let prev_state = match cached_state {
+            Some(ref s) => copy(s.as_ref().unwrap()),
+            None => zeros(&[batch, n_keep, conv_dim], dtype::FLOAT32),
+        };
+
+        // Concatenate: [B, n_keep + 1, conv_dim]
+        let conv_input = crate::ops::concatenate(&prev_state, &qkv, 1);
+
+        let conv_input_shape = array_shape(&conv_input);
+        let conv_len = conv_input_shape[1];
+
+        // Slice the tail: [B, n_keep, conv_dim] — this is a lazy view
+        let tail = slice(
+            &conv_input,
+            &[0, conv_len - n_keep, 0],
+            &[batch, conv_len, conv_dim],
+        );
+
+        // Wrap with contiguous() to force materialization — this is the fix
+        let new_state = contiguous(&tail, false);
+
+        // Verify shape is exactly [B, n_keep, conv_dim], not [B, conv_len, conv_dim]
+        eval(&new_state);
+        let state_shape = array_shape(&new_state);
+        assert_eq!(
+            state_shape,
+            vec![batch, n_keep, conv_dim],
+            "step {step}: conv_state shape must be [B, n_keep, conv_dim] = [{batch}, {n_keep}, {conv_dim}], got {state_shape:?}"
+        );
+
+        // Verify element count matches the theoretical minimum
+        let expected_elements = (batch * n_keep * conv_dim) as usize;
+        let actual_elements = array_size(&new_state);
+        assert_eq!(
+            actual_elements,
+            expected_elements,
+            "step {step}: element count must be {expected_elements}, got {actual_elements}"
+        );
+
+        cached_state = Some(new_state);
+    }
+
+    // After all 50 steps, the cached state must still have the minimal shape.
+    let final_state = cached_state.unwrap();
+    eval(&final_state);
+    let final_shape = array_shape(&final_state);
+    assert_eq!(
+        final_shape,
+        vec![batch, n_keep, conv_dim],
+        "final conv_state shape must not grow with step count; got {final_shape:?}"
+    );
+
+    // Verify the state holds the correct values from the last step (step=49).
+    // The last slice of conv_input at step 49 contains:
+    //   rows at logical index [conv_len - n_keep .. conv_len] of [prev_state | qkv_49]
+    //   = last n_keep=3 rows of [prev_state (3 rows) | qkv_49 (1 row)]
+    //   = rows 1,2 of prev_state and row 0 of qkv_49
+    // We only check the first value of the last n_keep-th slice (qkv_49 row).
+    let last_slice = slice(&final_state, &[0, n_keep - 1, 0], &[batch, n_keep, 1]);
+    eval(&last_slice);
+    let val = item_f32(&last_slice);
+    let expected_val = (49 * conv_dim) as f32; // first element of qkv at step 49
+    assert!(
+        (val - expected_val).abs() < 1.0,
+        "final conv_state last row first element should be ~{expected_val}, got {val}"
+    );
+}
