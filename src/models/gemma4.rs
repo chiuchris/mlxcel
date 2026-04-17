@@ -1166,12 +1166,19 @@ impl Gemma4TextModel {
         mask: Option<&MlxArray>,
         per_layer_inputs: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        // When `input_embeddings` is supplied (e.g. from the VLM path where
+        // vision/audio features have already been merged into the embedding
+        // stream), the caller is responsible for applying the
+        // `sqrt(hidden_size)` embed scale to the text portion *before*
+        // merging. Scaling here would double-scale the text tokens and
+        // incorrectly scale image/audio features that are already in the
+        // language-model embedding space. See issue #317.
         let mut h = if let Some(embeddings) = input_embeddings {
             mlxcel_core::copy(embeddings)
         } else {
-            self.embed_tokens.forward(input_ids)
+            let embeds = self.embed_tokens.forward(input_ids);
+            mlxcel_core::multiply_scalar(&embeds, (self.config.hidden_size as f32).sqrt())
         };
-        h = mlxcel_core::multiply_scalar(&h, (self.config.hidden_size as f32).sqrt());
 
         let shape = mlxcel_core::array_shape(&h);
         let b = shape[0];
@@ -2086,6 +2093,17 @@ impl Gemma4Wrapper {
 
     pub(crate) fn eos_token_ids_value(&self) -> Vec<i32> {
         self.model.eos_token_ids.clone()
+    }
+
+    /// Returns the text model's hidden size (embedding dimension).
+    ///
+    /// Used by: `Gemma4VLModel::get_input_embeddings_with_audio` to apply the
+    /// `sqrt(hidden_size)` embed scale to text embeddings before merging in
+    /// vision / audio features. Vision and audio features must NOT be scaled
+    /// again since they are already in the language-model embedding space
+    /// (see issue #317).
+    pub fn hidden_size(&self) -> usize {
+        self.model.config.hidden_size
     }
 }
 

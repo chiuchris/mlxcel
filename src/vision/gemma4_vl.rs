@@ -131,7 +131,18 @@ impl Gemma4VLModel {
         audio_features: Option<&MlxArray>,
         audio_mask: Option<&MlxArray>,
     ) -> merge::InputEmbeddings {
+        // Apply the `sqrt(hidden_size)` embed scale to the text embeddings
+        // once, up front. Vision features (produced by `self.embed_vision`)
+        // and audio features (produced by `self.embed_audio`) are already in
+        // the language-model embedding space, so they must NOT be scaled
+        // again. `Gemma4TextModel::forward` detects that we are passing
+        // `input_embeddings` and skips its own embed scale to avoid
+        // double-scaling the text tokens. See issue #317.
         let inputs_embeds = self.text_model.input_embeddings(input_ids);
+        let inputs_embeds = mlxcel_core::multiply_scalar(
+            &inputs_embeds,
+            (self.text_model.hidden_size() as f32).sqrt(),
+        );
 
         // Build per-layer inputs, masking out both image and audio tokens
         let image_token = mlxcel_core::from_slice_i32(&[self.image_token_id], &[1]);
