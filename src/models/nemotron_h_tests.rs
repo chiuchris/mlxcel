@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{NemotronLayerCache, NemotronMambaCache};
+use super::{NemotronHConfig, NemotronLayerCache, NemotronMambaCache};
 use mlxcel_core::layers::KVCache;
 
 // ---------------------------------------------------------------------------
@@ -210,5 +210,115 @@ fn state_contrib_old_shape_was_rank5() {
         old_last_exp_shape.len(),
         next_state_rank,
         "pre-fix shape rank 5 must differ from next_state rank 4"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// time_step_limit defaulting (NemotronHConfig::post_init)
+// ---------------------------------------------------------------------------
+
+/// Minimal config JSON with required fields only (no time_step_limit, no
+/// time_step_min, no time_step_max). After post_init the field must be (0.0, +inf).
+fn minimal_config_json(extra: &str) -> String {
+    format!(
+        r#"{{
+            "model_type": "nemotron_h",
+            "vocab_size": 256,
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "mamba_num_heads": 4,
+            "mamba_head_dim": 16,
+            "ssm_state_size": 16,
+            "conv_kernel": 4,
+            "n_groups": 1,
+            "hybrid_override_pattern": "MM"
+            {extra}
+        }}"#
+    )
+}
+
+/// Config with no time_step_limit, no time_step_min, and no time_step_max.
+/// After post_init, time_step_limit must be (0.0, +inf).
+#[test]
+fn post_init_no_time_step_fields_defaults_to_zero_inf() {
+    let json = minimal_config_json("");
+    let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
+    assert!(
+        cfg.time_step_limit.is_none(),
+        "time_step_limit must be None before post_init when absent from JSON"
+    );
+    cfg.post_init().expect("post_init");
+    let (lo, hi) = cfg
+        .time_step_limit
+        .expect("time_step_limit must be Some after post_init");
+    assert_eq!(lo, 0.0, "lower bound must be 0.0");
+    assert!(
+        hi.is_infinite() && hi.is_sign_positive(),
+        "upper bound must be +inf"
+    );
+}
+
+/// Config with only time_step_min: 0.001 (no time_step_limit, no time_step_max).
+/// After post_init, time_step_limit must be (0.001, +inf).
+#[test]
+fn post_init_only_time_step_min_uses_min_and_inf() {
+    let json = minimal_config_json(r#", "time_step_min": 0.001"#);
+    let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
+    cfg.post_init().expect("post_init");
+    let (lo, hi) = cfg
+        .time_step_limit
+        .expect("time_step_limit must be Some after post_init");
+    assert!(
+        (lo - 0.001_f32).abs() < 1e-7,
+        "lower bound must be 0.001, got {lo}"
+    );
+    assert!(
+        hi.is_infinite() && hi.is_sign_positive(),
+        "upper bound must be +inf"
+    );
+}
+
+/// Config with only time_step_max: 0.1 (no time_step_limit, no time_step_min).
+/// After post_init, time_step_limit must be (0.0, 0.1).
+/// This was the primary broken case from issue #319.
+#[test]
+fn post_init_only_time_step_max_uses_zero_and_max() {
+    let json = minimal_config_json(r#", "time_step_max": 0.1"#);
+    let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
+    cfg.post_init().expect("post_init");
+    let (lo, hi) = cfg
+        .time_step_limit
+        .expect("time_step_limit must be Some after post_init");
+    assert_eq!(lo, 0.0, "lower bound must be 0.0 when time_step_min absent");
+    assert!(
+        (hi - 0.1_f32).abs() < 1e-6,
+        "upper bound must be 0.1, got {hi}"
+    );
+}
+
+/// Config with explicit time_step_limit: [0.05, 1.5].
+/// After post_init, time_step_limit must be (0.05, 1.5) unchanged.
+#[test]
+fn post_init_explicit_time_step_limit_is_preserved() {
+    let json = minimal_config_json(r#", "time_step_limit": [0.05, 1.5]"#);
+    let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
+    assert!(
+        cfg.time_step_limit.is_some(),
+        "explicit time_step_limit must be Some before post_init"
+    );
+    cfg.post_init().expect("post_init");
+    let (lo, hi) = cfg
+        .time_step_limit
+        .expect("time_step_limit must be Some after post_init");
+    assert!(
+        (lo - 0.05_f32).abs() < 1e-6,
+        "lower bound must be 0.05, got {lo}"
+    );
+    assert!(
+        (hi - 1.5_f32).abs() < 1e-6,
+        "upper bound must be 1.5, got {hi}"
     );
 }

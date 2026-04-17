@@ -87,19 +87,33 @@ where
     deserializer.deserialize_any(PatternVisitor)
 }
 
-fn deserialize_time_step_limit<'de, D>(deserializer: D) -> Result<(f32, f32), D::Error>
+fn deserialize_time_step_limit_opt<'de, D>(deserializer: D) -> Result<Option<(f32, f32)>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     use serde::de::{SeqAccess, Visitor};
 
-    struct TimeStepLimitVisitor;
+    struct TimeStepLimitOptVisitor;
 
-    impl<'de> Visitor<'de> for TimeStepLimitVisitor {
-        type Value = (f32, f32);
+    impl<'de> Visitor<'de> for TimeStepLimitOptVisitor {
+        type Value = Option<(f32, f32)>;
 
         fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
-            formatter.write_str("a tuple of two numbers")
+            formatter.write_str("a tuple of two numbers, or null/absent")
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(None)
         }
 
         fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
@@ -114,11 +128,11 @@ where
                     _ => f32::INFINITY,
                 })
                 .unwrap_or(f32::INFINITY);
-            Ok((first, second))
+            Ok(Some((first, second)))
         }
     }
 
-    deserializer.deserialize_seq(TimeStepLimitVisitor)
+    deserializer.deserialize_any(TimeStepLimitOptVisitor)
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -153,11 +167,8 @@ pub struct NemotronHConfig {
     pub conv_kernel: usize,
     pub n_groups: usize,
 
-    #[serde(
-        default = "default_time_step_limit",
-        deserialize_with = "deserialize_time_step_limit"
-    )]
-    pub time_step_limit: (f32, f32),
+    #[serde(default, deserialize_with = "deserialize_time_step_limit_opt")]
+    pub time_step_limit: Option<(f32, f32)>,
 
     #[serde(default)]
     pub mlp_bias: bool,
@@ -220,8 +231,8 @@ pub struct NemotronHConfig {
     pub quantization: Option<Quantization>,
 
     /// Fallback fields for time_step_limit construction.
-    /// When time_step_limit is absent but time_step_min is present,
-    /// we construct (time_step_min, time_step_max or +inf).
+    /// When time_step_limit is absent, defaults to
+    /// (time_step_min.unwrap_or(0.0), time_step_max.unwrap_or(+inf)).
     #[serde(default)]
     pub time_step_min: Option<f32>,
 
@@ -246,12 +257,13 @@ impl NemotronHConfig {
     /// - Normalizes layers_block_type word names to single-char hybrid_override_pattern.
     /// - Sets num_hidden_layers from pattern length.
     pub fn post_init(&mut self) -> Result<(), String> {
-        // Build time_step_limit from min/max when the tuple field is at default
-        if self.time_step_limit == default_time_step_limit()
-            && let Some(ts_min) = self.time_step_min
-        {
+        // When time_step_limit is absent from the config, default to
+        // (time_step_min.unwrap_or(0.0), time_step_max.unwrap_or(+inf)).
+        // This matches upstream mlx-lm: `if time_step_limit is None: time_step_limit = (0.0, inf)`.
+        if self.time_step_limit.is_none() {
+            let ts_min = self.time_step_min.unwrap_or(0.0);
             let ts_max = self.time_step_max.unwrap_or(f32::INFINITY);
-            self.time_step_limit = (ts_min, ts_max);
+            self.time_step_limit = Some((ts_min, ts_max));
         }
 
         // Normalize layers_block_type word names to single-char codes
@@ -283,10 +295,6 @@ impl NemotronHConfig {
     }
 }
 
-fn default_time_step_limit() -> (f32, f32) {
-    (0.0, f32::INFINITY)
-}
-
 fn default_layer_norm_epsilon() -> f32 {
     1e-5
 }
@@ -296,6 +304,12 @@ fn default_true() -> bool {
 }
 
 impl NemotronHConfig {
+    /// Returns the effective time_step_limit, falling back to (0.0, +inf) if post_init
+    /// was not called (should not happen in normal usage).
+    pub fn effective_time_step_limit(&self) -> (f32, f32) {
+        self.time_step_limit.unwrap_or((0.0, f32::INFINITY))
+    }
+
     pub fn get_mamba_intermediate_size(&self) -> usize {
         self.mamba_num_heads * self.mamba_head_dim
     }
@@ -1997,7 +2011,7 @@ impl NemotronHModel {
                         intermediate_size,
                         n_groups: config.n_groups,
                         head_dim: config.mamba_head_dim,
-                        time_step_limit: config.time_step_limit,
+                        time_step_limit: config.effective_time_step_limit(),
                         conv_dim,
                         conv_weight,
                         conv_bias,
@@ -2482,8 +2496,8 @@ impl NemotronHModel {
                 self.config.mamba_head_dim as i32,
                 self.config.n_groups as i32,
                 self.config.ssm_state_size as i32,
-                self.config.time_step_limit.0,
-                self.config.time_step_limit.1,
+                self.config.effective_time_step_limit().0,
+                self.config.effective_time_step_limit().1,
                 self.config.layer_norm_epsilon,
                 // MoE config
                 moe_top_k,
