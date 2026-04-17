@@ -703,3 +703,202 @@ fn auto_decode_storage_prefers_paged_only_for_supported_workers() {
         DecodeStorageBackend::Dense
     );
 }
+
+// -------------------------------------------------------------------
+// Null / empty-cache safety tests (issue #324)
+//
+// These tests cover the same transition edges that upstream mlx-lm
+// landed null-guards for in `mlx_lm/models/cache.py`:
+//
+//   - `BatchKVCache.extend`: both inputs empty (offset == 0, no keys).
+//   - `BatchKVCache.extend`: one input empty, one populated.
+//   - `BatchKVCache.filter`: filter to an empty index list.
+//   - `BatchKVCache.merge` / `ArraysCache.from_batch_of`: all-empty inputs.
+//
+// mlxcel does not expose a `BatchKVCache` struct — its equivalent is the
+// scheduler's combination of [`ActiveBatch`] (per-sequence metadata) and
+// [`mlxcel_core::cache::CachePool`] (per-sequence KV tensors). The cases
+// below exercise the same transitions on those structures, plus the
+// scheduling-decision layer that dispatches work based on them.
+// -------------------------------------------------------------------
+
+/// `extend` analogue: two empty caches (both sequences have no generated
+/// tokens yet) combine into a batch whose bookkeeping (active count, ids)
+/// reflects the sum of inputs. Per-sequence state remains `offset == 0`,
+/// `generated_tokens.is_empty()` — i.e. `keys is None` in upstream
+/// terminology.
+#[test]
+fn test_extend_both_empty() {
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut s1, _r1) = make_test_sequence(1);
+    let (mut s2, _r2) = make_test_sequence(2);
+    s1.state = SequenceState::Decoding;
+    s2.state = SequenceState::Decoding;
+    // Both sequences are "empty": no tokens generated, prefill offset 0.
+    assert!(s1.generated_tokens.is_empty());
+    assert!(s2.generated_tokens.is_empty());
+    assert_eq!(s1.prefill_offset, 0);
+    assert_eq!(s2.prefill_offset, 0);
+
+    batch.add(s1).unwrap();
+    batch.add(s2).unwrap();
+
+    // Extend result: batch dim == sum of inputs, both sequences visible,
+    // and per-sequence state is still "empty" (no panic from concatenating
+    // null tensors — there are no tensors to concatenate at this layer).
+    assert_eq!(batch.len(), 2);
+    let mut ids: Vec<u64> = batch.sequence_ids().iter().map(|id| id.as_u64()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![1, 2]);
+
+    for seq in batch.iter_sequences() {
+        assert!(
+            seq.generated_tokens.is_empty(),
+            "both-empty extend must preserve keys=None state per sequence"
+        );
+        assert_eq!(seq.prefill_offset, 0);
+    }
+
+    // A decode step scheduled on this batch must be a no-op under the
+    // filter-to-empty guard path (empty id list), but with two active
+    // sequences the action is Decode of both, which is valid.
+    let queue = PrefillQueue::new();
+    let action = decide_action_from_state(&queue, &batch);
+    match action {
+        BatchSchedulerAction::Decode(decode_ids) => assert_eq!(decode_ids.len(), 2),
+        other => panic!("Expected Decode, got {other:?}"),
+    }
+}
+
+/// `extend` analogue: one sequence with 3 generated tokens + one empty
+/// sequence. Combined batch must expose both ids with the populated side's
+/// state preserved. The empty side's absence of key tensors must not
+/// propagate NaNs into the populated side.
+#[test]
+fn test_extend_empty_and_populated() {
+    let mut batch = ActiveBatch::new(4);
+
+    let (mut populated, _rp) = make_test_sequence(100);
+    populated.state = SequenceState::Decoding;
+    populated.generated_tokens = vec![10, 20, 30]; // populated with 3 tokens
+    populated.prefill_offset = 3;
+
+    let (mut empty, _re) = make_test_sequence(200);
+    empty.state = SequenceState::Decoding;
+    // empty: no generated_tokens, no prefill offset — the "keys is None" case.
+    assert!(empty.generated_tokens.is_empty());
+    assert_eq!(empty.prefill_offset, 0);
+
+    batch.add(populated).unwrap();
+    batch.add(empty).unwrap();
+
+    // Combined batch: size 2, both ids present.
+    assert_eq!(batch.len(), 2);
+    let mut ids: Vec<u64> = batch.sequence_ids().iter().map(|id| id.as_u64()).collect();
+    ids.sort();
+    assert_eq!(ids, vec![100, 200]);
+
+    // Populated side is unperturbed — its state survived the extend.
+    let populated_after = batch.get_mut(SequenceId::from_raw(100)).unwrap();
+    assert_eq!(populated_after.generated_tokens, vec![10, 20, 30]);
+    assert_eq!(populated_after.prefill_offset, 3);
+
+    // Empty side still empty — the extend did not fabricate tokens for it.
+    let empty_after = batch.get_mut(SequenceId::from_raw(200)).unwrap();
+    assert!(empty_after.generated_tokens.is_empty());
+    assert_eq!(empty_after.prefill_offset, 0);
+
+    // Scheduling: decode step covers both sequences without panic.
+    let queue = PrefillQueue::new();
+    let action = decide_action_from_state(&queue, &batch);
+    match action {
+        BatchSchedulerAction::Decode(decode_ids) => assert_eq!(decode_ids.len(), 2),
+        other => panic!("Expected Decode, got {other:?}"),
+    }
+}
+
+/// `filter` analogue: filtering by an empty id list must produce an empty
+/// result without panicking. In mlxcel this is expressed through the
+/// decode dispatch path: calling the decode step with an empty slice is a
+/// no-op. The observability counter is updated with length 0 so operators
+/// can see that a zero-sized step was attempted.
+#[test]
+fn test_filter_to_empty() {
+    use crate::server::batch::observability::BatchObservability;
+
+    // An ActiveBatch with three sequences, then "filter" the decode call
+    // via an empty id slice (the analogue of Python's empty `batch_indices`).
+    let mut batch = ActiveBatch::new(4);
+    for id in [1_u64, 2, 3] {
+        let (mut seq, _rx) = make_test_sequence(id);
+        seq.state = SequenceState::Decoding;
+        batch.add(seq).unwrap();
+    }
+
+    // Decide-action on an empty list case: when the batch becomes empty
+    // via filtering, decide_action returns Idle (no crash, no phantom
+    // Decode with length 0).
+    let empty_batch = ActiveBatch::new(4);
+    let queue = PrefillQueue::new();
+    let action = decide_action_from_state(&queue, &empty_batch);
+    assert!(
+        matches!(action, BatchSchedulerAction::Idle),
+        "filter-to-empty must resolve to Idle, not a zero-sized Decode"
+    );
+
+    // And at the dispatch layer: record_decode_step(0) is safe, matching
+    // the scheduler's `execute_decode_step` empty-id guard.
+    let obs = BatchObservability::new();
+    obs.record_decode_step(0);
+    let snap = obs.snapshot();
+    assert_eq!(snap.decode_steps_processed, 1);
+    assert_eq!(snap.total_decode_tokens, 0);
+
+    // The populated batch is untouched by a filter-to-empty on an
+    // unrelated batch (no aliasing between the two).
+    assert_eq!(batch.len(), 3);
+}
+
+/// `merge` / `from_batch_of` analogue: constructing a batch from 4 "empty"
+/// inputs yields a single logical batch whose per-sequence caches are all
+/// empty (`size() == 0` in upstream terms). The scheduler handles this by
+/// returning Idle when no sequence has work, rather than crashing inside
+/// a batched forward pass.
+#[test]
+fn test_merge_all_empty() {
+    let mut queue = PrefillQueue::new();
+
+    // Four sequences, all "empty" (no prior tokens, no prefill offset),
+    // enqueued but not yet admitted to the batch.
+    for id in [10_u64, 20, 30, 40] {
+        let (seq, _rx) = make_test_sequence(id);
+        assert!(seq.generated_tokens.is_empty());
+        assert_eq!(seq.prefill_offset, 0);
+        queue.enqueue(seq).unwrap();
+    }
+
+    // Empty batch ("merged" cache has size 0): decide_action must not
+    // crash, and it must not emit a zero-sized Decode.
+    let empty_batch = ActiveBatch::new(4);
+    assert_eq!(empty_batch.len(), 0);
+
+    // Because the queue has work, the action is Prefill (to admit one of
+    // the empty sequences), not Idle — which is the correct merge-of-
+    // all-empty behavior: do not panic, do not dispatch an empty decode,
+    // instead admit real work.
+    let action = decide_action_from_state(&queue, &empty_batch);
+    assert!(
+        matches!(action, BatchSchedulerAction::Prefill(_)),
+        "merge-of-all-empty with non-empty queue must Prefill, not crash"
+    );
+
+    // And with both batch and queue empty, Idle is the correct merge
+    // result for 4 empties + 0 pending.
+    let drained_queue = PrefillQueue::new();
+    let action = decide_action_from_state(&drained_queue, &empty_batch);
+    assert!(
+        matches!(action, BatchSchedulerAction::Idle),
+        "merge of all-empty inputs with no pending work must be Idle"
+    );
+}

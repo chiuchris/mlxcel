@@ -415,6 +415,27 @@ impl BatchScheduler {
             }
         };
         let mut prompt_tokens: Vec<i32> = token_ids.iter().map(|&x| x as i32).collect();
+
+        // Empty-prompt guard (null/empty-cache safety):
+        //
+        // A zero-token prompt cannot be prefilled — the forward pass would
+        // run with a `[1, 0]` input and the per-sequence KV cache would
+        // remain in the `keys is None, offset == 0` state. Admitting such a
+        // request into the batch could later crash the scheduler when the
+        // cache is used alongside populated caches in `execute_batched_*`.
+        // Mirrors the upstream `mlx-lm` `BatchKVCache.extend` null-guard
+        // that refuses to pad/concatenate a cache with no tensors. VLM
+        // requests may legitimately start with an empty token list (image
+        // tokens are injected later by `prepare_request_vlm_embeddings`),
+        // so this guard only applies to pure-text requests without images
+        // or audio.
+        if prompt_tokens.is_empty() && images.is_empty() && audio.is_empty() {
+            let _ = response_tx.send(GenerateEvent::Error(
+                "Empty prompt: request has no input tokens to process".to_string(),
+            ));
+            return;
+        }
+
         let sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
 
         let seq_id = match self.allocate_sequence_state() {
@@ -1335,6 +1356,17 @@ impl BatchScheduler {
 
     /// Run one decode step for the active sequences.
     fn execute_decode_step(&mut self, seq_ids: &[SequenceId]) {
+        // Filter-to-empty guard: a zero-sized decode step is a no-op, not a
+        // failure. The observability counter already reflects length 0 for
+        // caller-side traceability, so we still record it, then skip the
+        // dispatch entirely. This matches the null-guard pattern upstream
+        // `mlx-lm` added to `BatchKVCache.filter` when the filtered index
+        // list is empty.
+        if seq_ids.is_empty() {
+            self.batch_observability.record_decode_step(0);
+            return;
+        }
+
         let _span = tracing::info_span!("decode_step", batch_size = seq_ids.len(),).entered();
         self.batch_observability.record_decode_step(seq_ids.len());
 
@@ -1349,7 +1381,28 @@ impl BatchScheduler {
     }
 
     /// Batched decode: one forward_batched() call for all active sequences.
+    ///
+    /// # Null/empty-cache safety
+    ///
+    /// Early-exits on `seq_ids.is_empty()`. Though the scheduler's current
+    /// [`Self::decide_action`] never produces a `Decode(ids)` action with an
+    /// empty list (it returns [`BatchSchedulerAction::Idle`] first), this
+    /// guard makes the method robust against future policy changes and any
+    /// direct caller. Dispatching a zero-batch forward pass would otherwise
+    /// materialize an empty `[0, 1]` input tensor and invoke the model
+    /// kernel with no work to do, which is both wasteful and potentially
+    /// undefined behavior in downstream MLX kernels.
+    ///
+    /// This mirrors the upstream `mlx-lm` `BatchKVCache.filter` / `extend`
+    /// null-guards that prevent cache operations from crashing when all
+    /// sequences have been filtered out of the batch.
     fn execute_batched_decode(&mut self, seq_ids: &[SequenceId]) {
+        if seq_ids.is_empty() {
+            // Filter-to-empty case: nothing to do. Bookkeeping is handled by
+            // the caller (`execute_decode_step`) via its own length guard.
+            return;
+        }
+
         let b = seq_ids.len();
 
         let mut last_tokens: Vec<i32> = Vec::with_capacity(b);
