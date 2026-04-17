@@ -55,6 +55,13 @@ pub struct RopeParameters {
     pub rope_theta: f32,
     #[serde(default = "default_partial_rotary_factor")]
     pub partial_rotary_factor: f32,
+    /// Upstream Gemma 4 (post-commit bb91e23 on mlx-vlm main) marks
+    /// full-attention layers with `rope_type: "proportional"`, whose exponents
+    /// are normalized by the FULL head dimension (`head_dim`) rather than the
+    /// rotated-only slice. `"default"` means the usual
+    /// `nn.RoPE(dims = head_dim * partial_rotary_factor)` path.
+    #[serde(default = "default_rope_type")]
+    pub rope_type: String,
 }
 
 fn default_rope_theta() -> f32 {
@@ -63,6 +70,10 @@ fn default_rope_theta() -> f32 {
 
 fn default_partial_rotary_factor() -> f32 {
     1.0
+}
+
+fn default_rope_type() -> String {
+    "default".to_string()
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -173,6 +184,7 @@ impl TextConfig {
             .unwrap_or(RopeParameters {
                 rope_theta: default_rope_theta(),
                 partial_rotary_factor: default_partial_rotary_factor(),
+                rope_type: default_rope_type(),
             })
     }
 
@@ -584,8 +596,22 @@ pub struct Attention {
     pub(crate) n_heads: i32,
     pub(crate) n_kv_heads: i32,
     pub(crate) head_dim: i32,
+    /// For `rope_type == "default"`, this is `head_dim * partial_rotary_factor`
+    /// (the historical mlxcel / pre-bb91e23 mlx-vlm behavior).
+    /// For `rope_type == "proportional"`, this is unused — proportional RoPE
+    /// is driven by the precomputed `proportional_rope_freqs` table below and
+    /// always rotates on the full `head_dim`.
     pub(crate) rope_dims: i32,
     pub(crate) rope_theta: f32,
+    /// If `Some`, the layer uses proportional RoPE (Gemma 4 full-attention
+    /// layers). Holds the length-`rotated_dims / 2` frequency table consumed
+    /// by `mlxcel_core::rope_proportional::apply_proportional_rope`.
+    pub(crate) proportional_rope_freqs: Option<UniquePtr<MlxArray>>,
+    /// Only meaningful when `proportional_rope_freqs.is_some()`. Matches the
+    /// `partial_rotary_factor` passed in to
+    /// `compute_proportional_rope_freqs`, so `apply_proportional_rope` can
+    /// recompute `rotated_dims` without serializing it as a separate field.
+    pub(crate) proportional_partial_rotary_factor: f32,
     pub(crate) scale: f32,
     pub(crate) is_kv_shared_layer: bool,
     pub(crate) kv_shared_layer_index: Option<usize>,
@@ -595,6 +621,30 @@ pub struct Attention {
 }
 
 impl Attention {
+    /// Apply the layer's configured RoPE variant.
+    ///
+    /// * Proportional RoPE (Gemma 4 full-attention layers, `rope_type ==
+    ///   "proportional"`): slice the first `rotated_dims` entries of the
+    ///   head, call `mx.fast.rope` with exponents normalized by the FULL
+    ///   `head_dim`, and splice the rotated slice back. This matches
+    ///   `mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE` numerically.
+    /// * Default RoPE (sliding-attention layers and legacy configs): rotate
+    ///   only the first `rope_dims = head_dim * partial_rotary_factor` slots
+    ///   with the standard `fast_rope` kernel.
+    fn apply_rope(&self, x: &MlxArray, offset: i32) -> UniquePtr<MlxArray> {
+        if let Some(ref freqs) = self.proportional_rope_freqs {
+            mlxcel_core::rope_proportional::apply_proportional_rope(
+                x,
+                self.head_dim,
+                self.proportional_partial_rotary_factor,
+                offset,
+                Some(freqs),
+            )
+        } else {
+            mlxcel_core::fast_rope(x, self.rope_dims, false, self.rope_theta, 1.0, offset)
+        }
+    }
+
     pub(crate) fn forward(
         &self,
         x: &MlxArray,
@@ -620,14 +670,7 @@ impl Attention {
         let queries = mlxcel_core::reshape(&queries, &[b, l, self.n_heads, self.head_dim]);
         let queries = self.q_norm.forward(&queries);
         let queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
-        let queries = mlxcel_core::fast_rope(
-            &queries,
-            self.rope_dims,
-            false,
-            self.rope_theta,
-            1.0,
-            offset,
-        );
+        let queries = self.apply_rope(&queries, offset);
 
         if self.is_kv_shared_layer
             && let Some((keys, values)) = shared_kv
@@ -728,8 +771,7 @@ impl Attention {
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
         let keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
-        let keys =
-            mlxcel_core::fast_rope(&keys, self.rope_dims, false, self.rope_theta, 1.0, offset);
+        let keys = self.apply_rope(&keys, offset);
 
         cache.update_and_fetch(keys, values)
     }
@@ -745,6 +787,22 @@ impl Attention {
         let n_kv_heads = config.num_kv_heads_for_layer(layer_idx);
         let rope_params = config.rope_params_for_layer(layer_idx);
         let rope_dims = (head_dim as f32 * rope_params.partial_rotary_factor) as i32;
+        // For `rope_type == "proportional"`, precompute the proportional
+        // frequency table once per layer. The exponents are normalized by the
+        // FULL head_dim, matching upstream `ProportionalRoPE` semantics.
+        // Other rope_types fall through to the historical partial-dim
+        // `fast_rope` path (no precomputed freqs).
+        let proportional_rope_freqs = if rope_params.rope_type == "proportional" {
+            mlxcel_core::rope_proportional::compute_proportional_rope_freqs(
+                head_dim,
+                rope_params.partial_rotary_factor,
+                rope_params.rope_theta,
+                1.0,
+            )
+        } else {
+            None
+        };
+        let proportional_partial_rotary_factor = rope_params.partial_rotary_factor;
         let use_k_eq_v = config.attention_k_eq_v && !config.is_sliding_layer(layer_idx);
         let first_kv_shared_idx = config.first_kv_shared_layer_idx();
         let is_kv_shared_layer = config.is_kv_shared_layer(layer_idx);
@@ -827,6 +885,8 @@ impl Attention {
             head_dim,
             rope_dims,
             rope_theta: rope_params.rope_theta,
+            proportional_rope_freqs,
+            proportional_partial_rotary_factor,
             scale: 1.0,
             is_kv_shared_layer,
             kv_shared_layer_index,

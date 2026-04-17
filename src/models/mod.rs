@@ -307,6 +307,10 @@ mod detection_tests;
 mod gemma3n_helpers_tests;
 
 #[cfg(test)]
+#[path = "gemma4_tests.rs"]
+mod gemma4_tests;
+
+#[cfg(test)]
 #[path = "llama4_helpers_tests.rs"]
 mod llama4_helpers_tests;
 

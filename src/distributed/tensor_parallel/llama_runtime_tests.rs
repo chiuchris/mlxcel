@@ -174,6 +174,7 @@ fn make_test_gemma4_args() -> Gemma4ModelArgs {
         Gemma4RopeParameters {
             rope_theta: 10_000.0,
             partial_rotary_factor: 1.0,
+            rope_type: "default".to_string(),
         },
     );
     rope_parameters.insert(
@@ -181,6 +182,7 @@ fn make_test_gemma4_args() -> Gemma4ModelArgs {
         Gemma4RopeParameters {
             rope_theta: 10_000.0,
             partial_rotary_factor: 1.0,
+            rope_type: "default".to_string(),
         },
     );
 

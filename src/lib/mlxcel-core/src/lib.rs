@@ -2041,6 +2041,10 @@ pub mod dtype;
 // Public so that mlxcel (the main crate) can log hardware info at startup.
 pub mod hardware;
 
+// RoPE variants that are not exposed directly by `mlx::core::fast::rope`.
+// Currently: proportional RoPE used by Gemma 4 full-attention layers.
+pub mod rope_proportional;
+
 #[cfg(test)]
 #[path = "ffi_tests.rs"]
 mod ffi_tests;
