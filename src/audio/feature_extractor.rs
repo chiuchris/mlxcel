@@ -133,11 +133,13 @@ impl AudioFeatureExtractor {
             fft_length *= 2;
         }
 
-        // Hanning window (non-zero at endpoints)
+        // Periodic Hann window: w(i) = 0.5 - 0.5*cos(2π·i/N)
+        // Uses the periodic form (no +0.5 phase shift) to match the HuggingFace
+        // Gemma 4 audio reference implementation.
         let window: Vec<f32> = (0..frame_length)
             .map(|i| {
                 let arg = 2.0 * PI / frame_length as f64;
-                (0.5 - 0.5 * (arg * (i as f64 + 0.5)).cos()) as f32
+                (0.5 - 0.5 * (arg * i as f64).cos()) as f32
             })
             .collect();
 
@@ -174,7 +176,12 @@ impl AudioFeatureExtractor {
         let max_len = max_length.unwrap_or(480_000);
         let effective_len = waveform.len().min(max_len);
 
-        // Pad to multiple of 128 if needed
+        // Semicausal left-pad: prepend frame_length/2 zeros so the first frame
+        // is centered at t=0, matching the HuggingFace Gemma 4 reference.
+        let left_pad = self.frame_length / 2;
+
+        // Pad to multiple of 128 if needed (computed on the signal length, not
+        // including the left-pad which is always frame_length/2 zeros).
         let pad_multiple = 128;
         let padded_len = if !effective_len.is_multiple_of(pad_multiple) {
             ((effective_len / pad_multiple) + 1) * pad_multiple
@@ -182,13 +189,17 @@ impl AudioFeatureExtractor {
             effective_len
         };
 
-        let mut padded = vec![self.padding_value; padded_len];
-        padded[..effective_len].copy_from_slice(&waveform[..effective_len]);
+        let total_len = left_pad + padded_len;
+        let mut padded = vec![self.padding_value; total_len];
+        padded[left_pad..left_pad + effective_len].copy_from_slice(&waveform[..effective_len]);
 
-        // Attention mask: 1 = valid, 0 = padding
-        let mut attn_mask = vec![1i32; padded_len];
-        for m in attn_mask[effective_len..].iter_mut() {
-            *m = 0;
+        // Attention mask: 1 = valid sample, 0 = left-pad or right-pad.
+        // Left-pad region [0..left_pad] is structural zero-padding (mask = 0).
+        // Real waveform region [left_pad..left_pad + effective_len] is mask = 1.
+        // Right-pad region [left_pad + effective_len..total_len] is mask = 0.
+        let mut attn_mask = vec![0i32; total_len];
+        for m in attn_mask[left_pad..left_pad + effective_len].iter_mut() {
+            *m = 1;
         }
 
         // Apply input scale
@@ -198,10 +209,16 @@ impl AudioFeatureExtractor {
             }
         }
 
-        // Frame extraction with preemphasis
-        let frame_size_for_unfold = self.frame_length + 1;
-        let num_frames = if padded_len >= frame_size_for_unfold {
-            (padded_len - frame_size_for_unfold) / self.hop_length + 1
+        // Frame extraction with preemphasis.
+        // Non-HTK preemphasis reads frame_data[i+1], so needs frame_length+1
+        // samples per window. HTK flavor and no-preemphasis only need frame_length.
+        let frame_size_for_unfold = if self.preemphasis > 0.0 && !self.preemphasis_htk_flavor {
+            self.frame_length + 1
+        } else {
+            self.frame_length
+        };
+        let num_frames = if total_len >= frame_size_for_unfold {
+            (total_len - frame_size_for_unfold) / self.hop_length + 1
         } else {
             0
         };
@@ -453,4 +470,75 @@ fn parse_wav<R: std::io::Read>(mut reader: R) -> Result<(Vec<f32>, u32), String>
     };
 
     Ok((mono, sample_rate))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Generate a pure tone at `freq_hz` for `duration_s` seconds sampled at
+    /// `sample_rate` Hz, with unit amplitude.
+    fn generate_tone(freq_hz: f64, duration_s: f64, sample_rate: u32) -> Vec<f32> {
+        let num_samples = (duration_s * sample_rate as f64).round() as usize;
+        (0..num_samples)
+            .map(|i| (2.0 * PI * freq_hz * i as f64 / sample_rate as f64).sin() as f32)
+            .collect()
+    }
+
+    /// Test that the semicausal left-pad produces the correct frame count.
+    ///
+    /// A 1-second 440 Hz tone at 16 kHz should produce exactly 100 frames with
+    /// a 10 ms hop and 20 ms frame (frame_length=320, hop_length=160, left_pad=160):
+    ///   total_len = 160 + 16000 = 16160
+    ///   num_frames = (16160 - 320) / 160 + 1 = 100
+    #[test]
+    fn test_semicausal_left_pad_frame_count() {
+        let tone = generate_tone(440.0, 1.0, 16_000);
+        let extractor = AudioFeatureExtractor::new(AudioFeatureExtractorConfig::default());
+        let (features, mask) = extractor.extract(&tone, None);
+        let num_frames = features.len() / extractor.feature_size();
+        assert_eq!(
+            num_frames, 100,
+            "expected 100 frames for 1s audio with left-pad, got {num_frames}"
+        );
+        assert_eq!(mask.len(), 100, "mask length must equal num_frames");
+    }
+
+    /// Test that the periodic Hann window places the 440 Hz energy peak in the
+    /// correct mel bin range (roughly bins 20-35 out of 128 for 440 Hz on a
+    /// 0-8000 Hz mel scale at 16 kHz).
+    ///
+    /// The non-periodic window (with +0.5 phase shift) subtly distorts spectral
+    /// magnitudes; the periodic form matches the HuggingFace reference.
+    #[test]
+    fn test_periodic_hann_window_mel_peak() {
+        let tone = generate_tone(440.0, 1.0, 16_000);
+        let extractor = AudioFeatureExtractor::new(AudioFeatureExtractorConfig::default());
+        let (features, _mask) = extractor.extract(&tone, None);
+        let num_frames = features.len() / extractor.feature_size();
+        let feature_size = extractor.feature_size();
+
+        // Average mel energy across all non-padding frames
+        let mut mel_energy = vec![0.0f64; feature_size];
+        for frame in 0..num_frames {
+            for mel in 0..feature_size {
+                mel_energy[mel] += features[frame * feature_size + mel] as f64;
+            }
+        }
+
+        // Find the mel bin with maximum average energy
+        let peak_bin = mel_energy
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i)
+            .unwrap();
+
+        // 440 Hz maps to ~25th mel bin (out of 128) on a 0-8000 Hz scale.
+        // Allow a range of ±10 bins to account for filterbank overlap.
+        assert!(
+            (15..=40).contains(&peak_bin),
+            "440 Hz mel energy peak at bin {peak_bin}, expected in range 15-40"
+        );
+    }
 }
