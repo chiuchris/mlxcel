@@ -24,14 +24,22 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 pub struct Gemma4MultimodalEmbedder {
     embedding_projection: UnifiedLinear,
-    post_projection_norm: crate::models::gemma4::RMSNormNoScale,
+    pre_projection_norm: crate::models::gemma4::RMSNormNoScale,
 }
 
 impl Gemma4MultimodalEmbedder {
+    /// Construct the Gemma 4 multimodal embedder.
+    ///
+    /// `embedding_dim` is the input feature dimension (the vision or audio
+    /// encoder output size) — i.e. the column count of the projection weight
+    /// `embedding_projection.weight`. The RMS norm is applied on this dim
+    /// BEFORE the projection, matching upstream mlx-vlm after the reordering
+    /// that renamed `embedding_post_projection_norm` to
+    /// `embedding_pre_projection_norm`.
     pub fn from_weights(
         weights: &mlxcel_core::weights::WeightMap,
         prefix: &str,
-        hidden_size: usize,
+        embedding_dim: usize,
         eps: f32,
         group_size: i32,
         bits: i32,
@@ -43,16 +51,16 @@ impl Gemma4MultimodalEmbedder {
                 group_size,
                 bits,
             )?,
-            post_projection_norm: crate::models::gemma4::RMSNormNoScale::new(
-                hidden_size as i32,
+            pre_projection_norm: crate::models::gemma4::RMSNormNoScale::new(
+                embedding_dim as i32,
                 eps,
             ),
         })
     }
 
     pub fn forward(&self, inputs_embeds: &MlxArray) -> UniquePtr<MlxArray> {
-        let proj = self.embedding_projection.forward(inputs_embeds);
-        self.post_projection_norm.forward(&proj)
+        let normed = self.pre_projection_norm.forward(inputs_embeds);
+        self.embedding_projection.forward(&normed)
     }
 }
 

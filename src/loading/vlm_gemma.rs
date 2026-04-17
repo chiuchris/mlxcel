@@ -331,10 +331,15 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     )
     .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 vision tower: {}", e))?;
 
+    // The RMS norm is applied BEFORE the projection on the vision encoder's
+    // output dim (`vision_config.hidden_size`), matching upstream mlx-vlm
+    // after the `embedding_post_projection_norm` -> `embedding_pre_projection_norm`
+    // rename. This is a BREAKING change for pre-rename Gemma 4 VLM checkpoints;
+    // users must re-download `mlx-community/gemma-4-*-it-4bit` or equivalent.
     let embed_vision = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
         &weights,
         "embed_vision",
-        args.text_args().hidden_size,
+        vision_config.hidden_size,
         vision_config.rms_norm_eps(),
         group_size,
         bits,
@@ -403,10 +408,14 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
             )
             .map_err(|e| anyhow::anyhow!("Failed to load audio tower: {}", e))?;
 
+            // Audio embedder: RMS norm on the audio encoder's output dim
+            // (`audio_config.hidden_size`) BEFORE projection, matching the
+            // reordered upstream Gemma 4 multimodal embedder. See the note on
+            // `embed_vision` above for migration guidance.
             let embed_audio = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
                 &weights,
                 "embed_audio",
-                args.text_args().hidden_size,
+                audio_config.hidden_size,
                 audio_config.rms_norm_eps,
                 group_size,
                 bits,
