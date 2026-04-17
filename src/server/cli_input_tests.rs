@@ -75,6 +75,7 @@ fn sample_input() -> ServerStartupInput {
         tp_moe_mode: "expert_parallel".to_string(),
         tp_embedding_mode: "replicated".to_string(),
         tp_lm_head_mode: "replicated".to_string(),
+        vision_cache_size: 20,
     }
 }
 

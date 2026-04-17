@@ -16,6 +16,7 @@
 //!
 //! Used by: Gemma4 VLM
 
+use super::feature_cache::{CacheKey, SingleArrayFeatures, VisionFeatureCache};
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
 use crate::audio;
@@ -128,7 +129,7 @@ impl Gemma4VLModel {
         input_ids: &MlxArray,
         images: &[processors::gemma4::Gemma4ImageInput],
     ) -> merge::InputEmbeddings {
-        self.get_input_embeddings_with_audio(input_ids, images, None, None)
+        self.get_input_embeddings_with_audio_and_cache(input_ids, images, None, None, None, None)
     }
 
     /// Compute input embeddings with both vision and audio features.
@@ -138,6 +139,38 @@ impl Gemma4VLModel {
         images: &[processors::gemma4::Gemma4ImageInput],
         audio_features: Option<&MlxArray>,
         audio_mask: Option<&MlxArray>,
+    ) -> merge::InputEmbeddings {
+        self.get_input_embeddings_with_audio_and_cache(
+            input_ids,
+            images,
+            audio_features,
+            audio_mask,
+            None,
+            None,
+        )
+    }
+
+    /// Compute input embeddings with an optional per-image vision feature cache.
+    ///
+    /// `image_keys` — when `Some(..)`, must have the same length as `images`.
+    /// Each entry is the [`CacheKey`] to look up for that image. `None` entries
+    /// skip the cache and always run the vision tower.
+    ///
+    /// `vision_cache` — when `Some(..)`, provides shared storage for post-
+    /// projection image features. The cache is a no-op when disabled (its
+    /// `max_size == 0`); see [`VisionFeatureCache`] for LRU semantics.
+    ///
+    /// Cache hits short-circuit both `self.vision_tower.forward(...)` and
+    /// `self.embed_vision.forward(...)`. On miss, the freshly-computed features
+    /// are inserted before merging.
+    pub fn get_input_embeddings_with_audio_and_cache(
+        &self,
+        input_ids: &MlxArray,
+        images: &[processors::gemma4::Gemma4ImageInput],
+        audio_features: Option<&MlxArray>,
+        audio_mask: Option<&MlxArray>,
+        image_keys: Option<&[Option<CacheKey>]>,
+        vision_cache: Option<&std::sync::Mutex<VisionFeatureCache<SingleArrayFeatures>>>,
     ) -> merge::InputEmbeddings {
         // Apply the `sqrt(hidden_size)` embed scale to the text embeddings
         // once, up front. Vision features (produced by `self.embed_vision`)
@@ -175,13 +208,44 @@ impl Gemma4VLModel {
                     .expect("Gemma4 projected per-layer inputs")
             });
 
-        // Vision features
+        // Vision features — consult the per-image cache first when enabled.
+        //
+        // Cache semantics: `image_keys[i] == Some(key)` plus a non-None
+        // `vision_cache` triggers a lookup; on hit we skip the vision tower
+        // and the multimodal embedder. On miss we run both, then insert the
+        // result so the next turn that ships the same image can reuse it.
         let mut image_features = Vec::with_capacity(images.len());
-        for image in images {
+        for (idx, image) in images.iter().enumerate() {
+            let cache_key = image_keys
+                .and_then(|keys| keys.get(idx))
+                .and_then(|k| k.as_ref());
+
+            // Try cache hit when both a key and a cache were provided.
+            if let (Some(key), Some(cache)) = (cache_key, vision_cache)
+                && let Ok(mut guard) = cache.lock()
+                && let Some(cached) = guard.get(key)
+            {
+                image_features.push(cached.features);
+                continue;
+            }
+
             let features = self
                 .vision_tower
                 .forward(image.pixel_values.as_ref().unwrap(), image.patch_grid);
             let features = self.embed_vision.forward(&features);
+
+            // Populate the cache on miss. We store a deep copy so the
+            // returned `features` remains free for the merge path below.
+            if let (Some(key), Some(cache)) = (cache_key, vision_cache) {
+                // Materialize before hashing/storing; the cache must hold a
+                // stable tensor rather than a deferred graph node.
+                mlxcel_core::eval(&features);
+                let snapshot = SingleArrayFeatures::new(mlxcel_core::copy(features.as_ref().unwrap()));
+                if let Ok(mut guard) = cache.lock() {
+                    guard.put(key.clone(), &snapshot);
+                }
+            }
+
             image_features.push(features);
         }
 

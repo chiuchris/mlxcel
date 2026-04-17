@@ -26,6 +26,7 @@
 //! starved during prefill of large prompts.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -55,6 +56,7 @@ use crate::server::model_provider::model_worker::{
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
 use crate::server::state::BatchMetrics;
 use crate::tokenizer::MlxcelTokenizer;
+use crate::vision::feature_cache::ModelVisionCaches;
 use crate::vlm_runtime::prepared_embedding_refs;
 
 use super::active::ActiveBatch;
@@ -144,6 +146,16 @@ pub struct BatchScheduler {
     max_batch_prefill: usize,
     /// Decode-time sequence-state backend used by this scheduler.
     decode_storage_backend: DecodeStorageBackend,
+
+    // -- Vision feature cache --
+    /// Per-model vision feature cache bundle. Contains LRU caches for
+    /// post-projection image features so multi-turn VLM conversations can
+    /// skip the vision tower when the same image is referenced across turns.
+    ///
+    /// Stored as `Rc<..>` because the scheduler is single-threaded (all MLX
+    /// work runs on the worker thread). The cache is cleared automatically
+    /// when the scheduler (and thus this loaded model) is dropped.
+    vision_caches: Rc<ModelVisionCaches>,
 }
 
 impl BatchScheduler {
@@ -245,7 +257,22 @@ impl BatchScheduler {
             shutdown_requested: false,
             max_batch_prefill: max_batch_prefill.max(1),
             decode_storage_backend: effective_decode_storage,
+            vision_caches: Rc::new(ModelVisionCaches::new(
+                crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
+            )),
         }
+    }
+
+    /// Replace the default vision feature cache with one sized per the server
+    /// configuration.
+    ///
+    /// `max_size == 0` disables the cache entirely; non-zero values mirror
+    /// the `--vision-cache-size` CLI flag. Callers that do not invoke this
+    /// method get the default size from
+    /// [`crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE`].
+    pub fn with_vision_cache_size(mut self, max_size: usize) -> Self {
+        self.vision_caches = Rc::new(ModelVisionCaches::new(max_size));
+        self
     }
 
     /// Run the scheduler loop until shutdown or channel close.
@@ -454,6 +481,7 @@ impl BatchScheduler {
             &mut prompt_tokens,
             &images,
             &audio,
+            Some(self.vision_caches.as_ref()),
         ) {
             Ok(emb) => emb,
             Err(err) => {

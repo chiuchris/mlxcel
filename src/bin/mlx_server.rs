@@ -401,6 +401,14 @@ struct Args {
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel handles batching internally)
     #[arg(long, hide = true)]
     _cont_batching: bool,
+
+    /// Maximum number of cached post-projection image features per loaded VLM.
+    ///
+    /// Multi-turn conversations that revisit the same image reuse cached
+    /// vision features and skip the vision tower + multimodal embedder on
+    /// subsequent turns. `0` disables caching. Default: 20.
+    #[arg(long = "vision-cache-size", default_value_t = 20, value_name = "N")]
+    vision_cache_size: usize,
 }
 
 #[tokio::main]
@@ -468,5 +476,6 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         tp_moe_mode: args.tp_moe_mode,
         tp_embedding_mode: args.tp_embedding_mode,
         tp_lm_head_mode: args.tp_lm_head_mode,
+        vision_cache_size: args.vision_cache_size,
     }
 }

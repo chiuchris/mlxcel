@@ -31,8 +31,11 @@ use crate::SamplingConfig;
 use crate::server::batch::BatchObservability;
 use crate::server::state::BatchMetrics;
 use crate::tokenizer::MlxcelTokenizer;
+use crate::vision::feature_cache::ModelVisionCaches;
 use crate::vision::merge::InputEmbeddings;
-use crate::vlm_runtime::prepare_and_compute_vlm_embeddings;
+use crate::vlm_runtime::{
+    prepare_and_compute_vlm_embeddings, prepare_and_compute_vlm_embeddings_with_cache,
+};
 
 use super::{GenerationResult, ModelRequest};
 
@@ -52,6 +55,9 @@ pub(crate) struct WorkerSchedulerConfig {
     pub pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
     /// Tensor-parallel runtime configuration.
     pub tensor_parallel: crate::distributed::ShardConfig,
+    /// Maximum number of cached post-projection image features per loaded
+    /// VLM. `0` disables caching.
+    pub vision_cache_size: usize,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -159,7 +165,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.preemption_policy,
             sched_config.max_batch_prefill,
             sched_config.decode_storage_backend,
-        );
+        )
+        .with_vision_cache_size(sched_config.vision_cache_size);
         scheduler.run();
     })
 }
@@ -235,6 +242,11 @@ pub(crate) fn spawn_legacy_model_worker(
         // Reuse BatchScheduler with max_batch_size=1 and chunking disabled.
         // Per the scheduler docs, size-1 behavior is identical to the old
         // sequential recv() loop, with no extra overhead.
+        //
+        // The legacy worker uses the default vision cache size because it
+        // currently does not receive the normalized server config; users who
+        // need to tune `--vision-cache-size` should use the default batched
+        // worker which wires the flag through `WorkerSchedulerConfig`.
         let mut scheduler = super::super::batch::BatchScheduler::with_config(
             model,
             tokenizer,
@@ -293,6 +305,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
     audio: &[Vec<u8>],
+    vision_caches: Option<&ModelVisionCaches>,
 ) -> Result<Option<InputEmbeddings>> {
     let has_media = !images.is_empty() || !audio.is_empty();
 
@@ -329,23 +342,54 @@ pub(crate) fn prepare_request_vlm_embeddings(
         }
     }
 
-    // Standard image-only path
+    // Standard image-only path. When a per-model vision cache is available and
+    // enabled, the cache-aware variant is used so repeated images across
+    // multi-turn conversations skip the vision tower. The hashing identity is
+    // derived from the request-supplied image bytes so path-less (inline)
+    // payloads still benefit from de-duplication.
     if !images.is_empty() {
         let decoded_images = decode_request_images(images)?;
-        let prepared = prepare_and_compute_vlm_embeddings(
-            model,
-            prompt_tokens,
-            prompt,
-            &decoded_images,
-            |text, add_special| {
-                tokenizer
-                    .encode(text, add_special)
-                    .unwrap_or_default()
-                    .iter()
-                    .map(|&t| t as i32)
-                    .collect()
-            },
-        )?;
+        let prepared = if let Some(caches) = vision_caches.filter(|c| c.enabled()) {
+            let image_cache_keys: Vec<Option<crate::vision::feature_cache::CacheKey>> = images
+                .iter()
+                .map(|bytes| {
+                    Some(crate::vision::feature_cache::CacheKey::from_hash(
+                        crate::vision::feature_cache::image_hash_from_bytes(bytes),
+                    ))
+                })
+                .collect();
+            prepare_and_compute_vlm_embeddings_with_cache(
+                model,
+                prompt_tokens,
+                prompt,
+                &decoded_images,
+                Some(&image_cache_keys),
+                Some(caches),
+                |text, add_special| {
+                    tokenizer
+                        .encode(text, add_special)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&t| t as i32)
+                        .collect()
+                },
+            )?
+        } else {
+            prepare_and_compute_vlm_embeddings(
+                model,
+                prompt_tokens,
+                prompt,
+                &decoded_images,
+                |text, add_special| {
+                    tokenizer
+                        .encode(text, add_special)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|&t| t as i32)
+                        .collect()
+                },
+            )?
+        };
         return Ok(prepared.map(|prepared| prepared.embeddings));
     }
 

@@ -148,6 +148,13 @@ pub struct ServerStartupConfig {
     pub tp_embedding_mode: String,
     /// LM head sharding mode string (parsed into `EmbeddingMode` at plan generation).
     pub tp_lm_head_mode: String,
+
+    // Vision feature cache.
+    /// Maximum number of cached post-projection image features per loaded model.
+    ///
+    /// `0` disables the cache. Default matches
+    /// [`DEFAULT_VISION_CACHE_SIZE`](crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE).
+    pub vision_cache_size: usize,
 }
 
 impl Default for ServerStartupConfig {
@@ -208,6 +215,7 @@ impl Default for ServerStartupConfig {
             tp_moe_mode: "expert_parallel".to_string(),
             tp_embedding_mode: "replicated".to_string(),
             tp_lm_head_mode: "replicated".to_string(),
+            vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
         }
     }
 }
@@ -339,6 +347,7 @@ pub(super) fn build_server_config(
         }),
         remote_pipeline_stage: None,
         tensor_parallel,
+        vision_cache_size: startup.vision_cache_size,
     }
 }
 

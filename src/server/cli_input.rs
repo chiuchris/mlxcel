@@ -107,6 +107,10 @@ pub struct ServerStartupInput {
     pub tp_embedding_mode: String,
     /// LM head sharding mode string (parsed at startup).
     pub tp_lm_head_mode: String,
+
+    /// Maximum number of cached post-projection image features per loaded model.
+    /// `0` disables the cache entirely.
+    pub vision_cache_size: usize,
 }
 
 impl ServerStartupInput {
@@ -170,6 +174,7 @@ impl ServerStartupInput {
             tp_moe_mode: self.tp_moe_mode,
             tp_embedding_mode: self.tp_embedding_mode,
             tp_lm_head_mode: self.tp_lm_head_mode,
+            vision_cache_size: self.vision_cache_size,
         }
     }
 }

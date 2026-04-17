@@ -16,6 +16,7 @@
 //!
 //! Vision encoder with DeepStack + Qwen3 language model with interleaved MRoPE
 
+use super::feature_cache::{CacheKey, DeepStackFeatures, VisionFeatureCache};
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
 use mlxcel_core::layers::KVCache;
@@ -47,18 +48,70 @@ impl Qwen3VLModel {
         pixel_values: &MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> merge::InputEmbeddings {
+        self.get_input_embeddings_with_cache(input_ids, pixel_values, grid_thw, None, None)
+    }
+
+    /// Get input embeddings with optional vision feature caching.
+    ///
+    /// Caches both the post-merger hidden states and the DeepStack side-branch
+    /// features, since Qwen3-VL injects DeepStack outputs at selected language
+    /// model layers. The cache key covers the concatenated pixel tensor for
+    /// all images in the request (see [`Qwen25VLModel::get_input_embeddings_with_cache`]).
+    ///
+    /// MRoPE state and the visual position mask are recomputed on every call
+    /// because they depend on the current `input_ids`.
+    pub fn get_input_embeddings_with_cache(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+        cache_key: Option<&CacheKey>,
+        vision_cache: Option<&std::sync::Mutex<VisionFeatureCache<DeepStackFeatures>>>,
+    ) -> merge::InputEmbeddings {
         let inputs_embeds = self.text_model.get_embed_tokens(input_ids);
 
-        // Encode images through vision tower (returns hidden_states + deepstack features)
-        let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
-        let pv = mlxcel_core::astype(pixel_values, embed_dtype);
-        let vision_output = self.vision_encoder.forward_with_grid(&pv, grid_thw);
-        let image_features = &vision_output.hidden_states;
+        // Cache lookup: reuse post-merger hidden states + DeepStack branch
+        // outputs when the same pixel tensor has already been encoded.
+        let cached: Option<DeepStackFeatures> = match (cache_key, vision_cache) {
+            (Some(key), Some(cache)) => cache.lock().ok().and_then(|mut guard| guard.get(key)),
+            _ => None,
+        };
+
+        let (image_features, deepstack_features): (UniquePtr<MlxArray>, Vec<UniquePtr<MlxArray>>) =
+            if let Some(cached) = cached {
+                (cached.hidden_states, cached.deepstack)
+            } else {
+                let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
+                let pv = mlxcel_core::astype(pixel_values, embed_dtype);
+                let vision_output = self.vision_encoder.forward_with_grid(&pv, grid_thw);
+
+                // Populate the cache on miss. We eval and deep-copy each
+                // tensor to decouple the cached snapshot from the graph.
+                if let (Some(key), Some(cache)) = (cache_key, vision_cache) {
+                    mlxcel_core::eval(&vision_output.hidden_states);
+                    for feat in &vision_output.deepstack_features {
+                        mlxcel_core::eval(feat);
+                    }
+                    let hs_copy =
+                        mlxcel_core::copy(vision_output.hidden_states.as_ref().unwrap());
+                    let ds_copy: Vec<UniquePtr<MlxArray>> = vision_output
+                        .deepstack_features
+                        .iter()
+                        .map(|feat| mlxcel_core::copy(feat.as_ref().unwrap()))
+                        .collect();
+                    let snapshot = DeepStackFeatures::new(hs_copy, ds_copy);
+                    if let Ok(mut guard) = cache.lock() {
+                        guard.put(key.clone(), &snapshot);
+                    }
+                }
+
+                (vision_output.hidden_states, vision_output.deepstack_features)
+            };
 
         // Merge vision features at image token positions (LLaVA-style)
         let merged = merge::merge_llava(
             self.image_token_id,
-            image_features,
+            image_features.as_ref().unwrap(),
             &inputs_embeds,
             input_ids,
         );
@@ -68,14 +121,14 @@ impl Qwen3VLModel {
         mlxcel_core::eval(&visual_pos_masks);
 
         // Eval deepstack features before storing
-        for feat in &vision_output.deepstack_features {
+        for feat in &deepstack_features {
             mlxcel_core::eval(feat);
         }
 
         // Store deepstack state in language model
-        if !vision_output.deepstack_features.is_empty() {
+        if !deepstack_features.is_empty() {
             self.text_model
-                .set_deepstack_state(visual_pos_masks, vision_output.deepstack_features);
+                .set_deepstack_state(visual_pos_masks, deepstack_features);
         }
 
         // Compute MRoPE position IDs (same algorithm as Qwen2-VL)

@@ -48,6 +48,9 @@ lz4_flex = "0.11"
 anyhow = "1.0.100"
 thiserror = "2.0.11"
 
+# Cryptographic hashing (for vision feature cache keys)
+sha2 = "0.10"
+
 # CLI
 clap = { version = "4.5.31", features = ["derive", "env"] }
 

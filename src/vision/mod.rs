@@ -30,6 +30,7 @@ use anyhow::Result;
 pub mod config;
 pub mod connectors;
 pub mod encoders;
+pub mod feature_cache;
 pub mod merge;
 pub mod processors;
 

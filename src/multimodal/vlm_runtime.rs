@@ -31,6 +31,9 @@ use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
 use crate::phi4mm_prompt::prepare_phi4mm_prompt_tokens;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
+use crate::vision::feature_cache::{
+    CacheKey, ModelVisionCaches, image_hash_from_pixels,
+};
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::processors::ImageProcessor;
 use crate::vlm_prompt::{ImageTokenBlockStats, apply_image_token_blocks};
@@ -117,11 +120,77 @@ fn prompt_ids_array(prompt_tokens: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core
     mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32])
 }
 
+/// Pick the first explicit (non-None) cache key from a caller-supplied slice.
+///
+/// Used by Qwen-VL families which pack every image into a single pixel tensor
+/// per request: a request-scoped cache key is sufficient and we prefer the
+/// caller's key when they provided one (e.g. a filesystem path).
+fn first_explicit_key(keys: Option<&[Option<CacheKey>]>) -> Option<CacheKey> {
+    keys.and_then(|slice| slice.iter().find_map(|k| k.clone()))
+}
+
+/// Build a per-image cache key list, preferring explicit caller-supplied keys
+/// and falling back to pixel-byte hashing for entries the caller left `None`.
+///
+/// This is used by Gemma 4 VLM which runs the vision tower once per image and
+/// therefore benefits from per-image cache lookup.
+fn resolve_per_image_keys<F>(
+    explicit: Option<&[Option<CacheKey>]>,
+    count: usize,
+    mut fallback: F,
+) -> Vec<Option<CacheKey>>
+where
+    F: FnMut(usize) -> Option<[u8; 32]>,
+{
+    (0..count)
+        .map(|idx| {
+            if let Some(key) = explicit.and_then(|slice| slice.get(idx).cloned()).flatten() {
+                Some(key)
+            } else {
+                fallback(idx).map(CacheKey::from_hash)
+            }
+        })
+        .collect()
+}
+
 pub fn prepare_and_compute_vlm_embeddings<E>(
     model: &LoadedModel,
     prompt_tokens: &mut Vec<i32>,
     prompt: &str,
     images: &[DynamicImage],
+    encode: E,
+) -> Result<Option<PreparedVlmEmbeddings>>
+where
+    E: FnMut(&str, bool) -> Vec<i32>,
+{
+    prepare_and_compute_vlm_embeddings_with_cache(
+        model,
+        prompt_tokens,
+        prompt,
+        images,
+        None,
+        None,
+        encode,
+    )
+}
+
+/// Cache-aware wrapper for [`prepare_and_compute_vlm_embeddings`].
+///
+/// When `caches` is `Some`, the VLM runtime is invoked through its
+/// cache-aware variant. Cache keys (one per image for per-image VLM families
+/// like Gemma 4, or a single request-scoped key for batch-style VLM families
+/// like Qwen2.5/3-VL) are supplied via `image_cache_keys`. When no keys are
+/// provided, keys are derived on the fly from the pixel tensor bytes.
+///
+/// Passing `caches == None` or `caches.enabled() == false` falls through to
+/// the un-cached path with zero additional cost.
+pub fn prepare_and_compute_vlm_embeddings_with_cache<E>(
+    model: &LoadedModel,
+    prompt_tokens: &mut Vec<i32>,
+    prompt: &str,
+    images: &[DynamicImage],
+    image_cache_keys: Option<&[Option<CacheKey>]>,
+    caches: Option<&ModelVisionCaches>,
     mut encode: E,
 ) -> Result<Option<PreparedVlmEmbeddings>>
 where
@@ -134,6 +203,9 @@ where
     let runtime = model
         .vlm_runtime()
         .ok_or_else(|| anyhow::anyhow!("Images provided but model has no VLM runtime"))?;
+
+    // Only activate the cache when both the caches are present AND enabled.
+    let active_caches = caches.filter(|c| c.enabled());
 
     match runtime {
         VlmRuntimeRef::Qwen(qwen) => {
@@ -151,8 +223,24 @@ where
                 total_image_tokens: stats.total_image_tokens,
             });
 
+            // Qwen-VL families take one concatenated pixel tensor per request.
+            // Use the first explicit cache key when provided; otherwise derive
+            // one from the pixel bytes when caching is enabled.
+            let qwen_cache_key = if active_caches.is_some() {
+                first_explicit_key(image_cache_keys)
+                    .or_else(|| Some(CacheKey::from_hash(image_hash_from_pixels(&pixel_values))))
+            } else {
+                None
+            };
+
             let input_ids_arr = prompt_ids_array(prompt_tokens);
-            let embeddings = qwen.input_embeddings(&input_ids_arr, &pixel_values, &grid_thw);
+            let embeddings = qwen.input_embeddings_with_cache(
+                &input_ids_arr,
+                &pixel_values,
+                &grid_thw,
+                qwen_cache_key.as_ref(),
+                active_caches,
+            );
 
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
@@ -232,8 +320,26 @@ where
                 &num_soft_tokens,
             )?;
 
+            // Build per-image cache keys when caching is enabled. Explicit
+            // keys supplied by the caller take precedence over hashing the
+            // pixel tensor, which matches the "path > hash" policy.
+            let gemma4_keys: Option<Vec<Option<CacheKey>>> = if active_caches.is_some() {
+                Some(resolve_per_image_keys(image_cache_keys, processed_images.len(), |i| {
+                    processed_images[i].pixel_values.as_ref().map(image_hash_from_pixels)
+                }))
+            } else {
+                None
+            };
+
             let input_ids_arr = prompt_ids_array(prompt_tokens);
-            let embeddings = gemma4_vl.get_input_embeddings(&input_ids_arr, &processed_images);
+            let embeddings = gemma4_vl.get_input_embeddings_with_audio_and_cache(
+                &input_ids_arr,
+                &processed_images,
+                None,
+                None,
+                gemma4_keys.as_deref(),
+                active_caches.map(|c| &c.single),
+            );
 
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,

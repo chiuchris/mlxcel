@@ -187,6 +187,13 @@ pub struct ServerConfig {
     pub remote_pipeline_stage: Option<RemotePipelineStageConfig>,
     /// Tensor-parallel loading/runtime options resolved at startup.
     pub tensor_parallel: ShardConfig,
+    /// Maximum number of cached post-projection image features per loaded model.
+    ///
+    /// `0` disables the cache entirely. When enabled, multi-turn VLM
+    /// conversations that revisit the same image can skip the vision tower and
+    /// multimodal embedder on subsequent turns. Default is
+    /// [`DEFAULT_VISION_CACHE_SIZE`](crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE).
+    pub vision_cache_size: usize,
 }
 
 impl Default for ServerConfig {
@@ -227,6 +234,7 @@ impl Default for ServerConfig {
             pipeline_parallel_runtime: None,
             remote_pipeline_stage: None,
             tensor_parallel: ShardConfig::default(),
+            vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
         }
     }
 }

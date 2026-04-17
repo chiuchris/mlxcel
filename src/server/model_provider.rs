@@ -144,6 +144,7 @@ impl ModelProvider {
                 config.max_batch_prefill,
                 config.decode_storage_backend,
                 config.pipeline_parallel_runtime.clone(),
+                config.vision_cache_size,
                 batch_metrics,
                 batch_observability,
             )
@@ -222,6 +223,7 @@ impl ModelProvider {
             1,
             crate::server::DecodeStorageBackend::Dense,
             None,
+            crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             batch_metrics,
             batch_observability,
         )
@@ -229,6 +231,9 @@ impl ModelProvider {
 
     /// Create and start a new model provider with full scheduler config,
     /// shared batch metrics, and batched prefill support.
+    ///
+    /// `vision_cache_size` maps directly to the `--vision-cache-size` CLI
+    /// flag. `0` disables per-image vision feature caching entirely.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_full_config_and_batch_prefill(
         model_path: PathBuf,
@@ -241,6 +246,7 @@ impl ModelProvider {
         max_batch_prefill: usize,
         decode_storage_backend: crate::server::DecodeStorageBackend,
         pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
+        vision_cache_size: usize,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -267,6 +273,7 @@ impl ModelProvider {
             decode_storage_backend,
             pipeline_parallel_runtime,
             tensor_parallel: crate::distributed::ShardConfig::default(),
+            vision_cache_size,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -329,6 +336,7 @@ impl ModelProvider {
             decode_storage_backend: crate::server::DecodeStorageBackend::Dense,
             pipeline_parallel_runtime: None,
             tensor_parallel: crate::distributed::ShardConfig::default(),
+            vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

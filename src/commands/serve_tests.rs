@@ -84,6 +84,7 @@ fn sample_args() -> crate::ServeArgs {
         _no_mmap: false,
         _cont_batching: false,
         kv_cache_mode: "fp16".to_string(),
+        vision_cache_size: 20,
     }
 }
 

@@ -625,6 +625,14 @@ pub(crate) struct ServeArgs {
     ///           by ~50% at the cost of small quantization error per token.
     #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     kv_cache_mode: String,
+
+    /// Maximum number of cached post-projection image features per loaded VLM.
+    ///
+    /// Multi-turn conversations that revisit the same image can reuse cached
+    /// vision features and skip the vision tower + multimodal embedder on
+    /// subsequent turns. `0` disables caching. Default: 20.
+    #[arg(long = "vision-cache-size", default_value_t = 20, value_name = "N")]
+    vision_cache_size: usize,
 }
 
 fn main() -> anyhow::Result<()> {

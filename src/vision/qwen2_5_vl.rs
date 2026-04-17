@@ -16,6 +16,7 @@
 //!
 //! Qwen2.5-VL vision encoder + Qwen2 language model with MRoPE
 
+use super::feature_cache::{CacheKey, SingleArrayFeatures, VisionFeatureCache};
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
 use mlxcel_core::layers::KVCache;
@@ -45,16 +46,67 @@ impl Qwen25VLModel {
         pixel_values: &MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> merge::InputEmbeddings {
+        self.get_input_embeddings_with_cache(input_ids, pixel_values, grid_thw, None, None)
+    }
+
+    /// Get input embeddings with optional vision feature caching.
+    ///
+    /// Qwen2.5-VL's vision tower takes a single concatenated `pixel_values`
+    /// tensor covering every image in the prompt together with a matching
+    /// `grid_thw` layout, so the cache key is derived per-request rather than
+    /// per-image. In a multi-turn conversation where the same image-set is
+    /// reused across turns, this still short-circuits the vision tower +
+    /// merger on subsequent turns.
+    ///
+    /// MRoPE state depends on `input_ids` and therefore must be recomputed on
+    /// every call — only the post-merger hidden states are cached.
+    pub fn get_input_embeddings_with_cache(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+        cache_key: Option<&CacheKey>,
+        vision_cache: Option<&std::sync::Mutex<VisionFeatureCache<SingleArrayFeatures>>>,
+    ) -> merge::InputEmbeddings {
         let inputs_embeds = self.text_model.get_embed_tokens(input_ids);
 
-        let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
-        let pv = mlxcel_core::astype(pixel_values, embed_dtype);
-        let vision_output = self.vision_encoder.forward_with_grid(&pv, grid_thw);
-        let image_features = &vision_output.hidden_states;
+        // Cache lookup: reuse the post-merger hidden states when the same
+        // pixel tensor (keyed by path or SHA-256) has already been encoded.
+        let cached_features = match (cache_key, vision_cache) {
+            (Some(key), Some(cache)) => cache
+                .lock()
+                .ok()
+                .and_then(|mut guard| guard.get(key))
+                .map(|c| c.features),
+            _ => None,
+        };
+
+        let image_features: UniquePtr<MlxArray> = if let Some(cached) = cached_features {
+            cached
+        } else {
+            let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
+            let pv = mlxcel_core::astype(pixel_values, embed_dtype);
+            let vision_output = self.vision_encoder.forward_with_grid(&pv, grid_thw);
+
+            // Populate the cache on miss so subsequent turns can skip the
+            // vision tower. Materialize before copying so we cache a concrete
+            // array rather than a deferred graph node.
+            if let (Some(key), Some(cache)) = (cache_key, vision_cache) {
+                mlxcel_core::eval(&vision_output.hidden_states);
+                let snapshot = SingleArrayFeatures::new(mlxcel_core::copy(
+                    vision_output.hidden_states.as_ref().unwrap(),
+                ));
+                if let Ok(mut guard) = cache.lock() {
+                    guard.put(key.clone(), &snapshot);
+                }
+            }
+
+            vision_output.hidden_states
+        };
 
         let merged = merge::merge_llava(
             self.image_token_id,
-            image_features,
+            image_features.as_ref().unwrap(),
             &inputs_embeds,
             input_ids,
         );

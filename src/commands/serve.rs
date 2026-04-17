@@ -86,6 +86,7 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         tp_moe_mode: args.tp_moe_mode,
         tp_embedding_mode: args.tp_embedding_mode,
         tp_lm_head_mode: args.tp_lm_head_mode,
+        vision_cache_size: args.vision_cache_size,
     }
 }
 

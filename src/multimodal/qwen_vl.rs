@@ -19,6 +19,7 @@
 //! CLI/server callers so Qwen-VL prompt preparation stays consistent.
 
 use crate::vision;
+use crate::vision::feature_cache::{CacheKey, ModelVisionCaches};
 use mlxcel_core::MlxArray;
 
 #[derive(Clone, Copy)]
@@ -43,6 +44,26 @@ pub trait QwenVlRuntime {
         pixel_values: &MlxArray,
         grid_thw: &[(i32, i32, i32)],
     ) -> vision::merge::InputEmbeddings;
+
+    /// Variant of [`input_embeddings`] that consults a shared vision feature
+    /// cache. Implementors that do not support caching (e.g. older Qwen-VL
+    /// variants not yet wired for the cache) should fall through to the plain
+    /// [`input_embeddings`] path. The default implementation here matches that
+    /// pass-through behavior so trait users always get *something* compiled.
+    ///
+    /// `caches` is shared per model instance. Runtimes whose vision output
+    /// shape matches [`super::feature_cache::SingleArrayFeatures`] use
+    /// `caches.single`; Qwen3-VL uses `caches.deepstack`.
+    fn input_embeddings_with_cache(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+        _cache_key: Option<&CacheKey>,
+        _caches: Option<&ModelVisionCaches>,
+    ) -> vision::merge::InputEmbeddings {
+        self.input_embeddings(input_ids, pixel_values, grid_thw)
+    }
 }
 
 macro_rules! impl_qwen_vl_runtime {
@@ -69,11 +90,87 @@ macro_rules! impl_qwen_vl_runtime {
     };
 }
 
+// Runtimes without cache wiring (yet) — they fall back to the default
+// trait method which just routes through `input_embeddings`.
 impl_qwen_vl_runtime!(vision::Qwen2VLModel);
-impl_qwen_vl_runtime!(vision::Qwen25VLModel);
-impl_qwen_vl_runtime!(vision::Qwen3VLModel);
 impl_qwen_vl_runtime!(vision::Qwen3VLMoeModel);
 impl_qwen_vl_runtime!(vision::Qwen35VLModel);
+
+// Qwen2.5-VL: single-array cache path.
+impl QwenVlRuntime for vision::Qwen25VLModel {
+    fn prompt_info(&self) -> QwenVlmPromptInfo<'_> {
+        QwenVlmPromptInfo {
+            processor: &self.processor,
+            spatial_merge_size: self.spatial_merge_size,
+            vision_start_token_id: self.vision_start_token_id,
+            image_token_id: self.image_token_id,
+        }
+    }
+
+    fn input_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+    ) -> vision::merge::InputEmbeddings {
+        self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+    }
+
+    fn input_embeddings_with_cache(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+        cache_key: Option<&CacheKey>,
+        caches: Option<&ModelVisionCaches>,
+    ) -> vision::merge::InputEmbeddings {
+        self.get_input_embeddings_with_cache(
+            input_ids,
+            pixel_values,
+            grid_thw,
+            cache_key,
+            caches.map(|c| &c.single),
+        )
+    }
+}
+
+// Qwen3-VL: DeepStack-shaped cache path.
+impl QwenVlRuntime for vision::Qwen3VLModel {
+    fn prompt_info(&self) -> QwenVlmPromptInfo<'_> {
+        QwenVlmPromptInfo {
+            processor: &self.processor,
+            spatial_merge_size: self.spatial_merge_size,
+            vision_start_token_id: self.vision_start_token_id,
+            image_token_id: self.image_token_id,
+        }
+    }
+
+    fn input_embeddings(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+    ) -> vision::merge::InputEmbeddings {
+        self.get_input_embeddings(input_ids, pixel_values, grid_thw)
+    }
+
+    fn input_embeddings_with_cache(
+        &self,
+        input_ids: &MlxArray,
+        pixel_values: &MlxArray,
+        grid_thw: &[(i32, i32, i32)],
+        cache_key: Option<&CacheKey>,
+        caches: Option<&ModelVisionCaches>,
+    ) -> vision::merge::InputEmbeddings {
+        self.get_input_embeddings_with_cache(
+            input_ids,
+            pixel_values,
+            grid_thw,
+            cache_key,
+            caches.map(|c| &c.deepstack),
+        )
+    }
+}
 
 pub fn insert_qwen_vl_image_tokens(
     prompt_tokens: &mut Vec<i32>,
