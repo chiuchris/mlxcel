@@ -78,7 +78,28 @@ pub fn fuse_lora_weights(
         .iter()
         .map(|(k, v)| (k.clone(), mlxcel_core::copy(v)))
         .collect();
+    fuse_lora_weights_into(&mut fused_weights, adapter_weights, scale)?;
+    Ok(fused_weights)
+}
 
+/// Fuse LoRA adapter weights into an existing base [`WeightMap`] in place.
+///
+/// This is the composition primitive shared by both the non-PP adapter path
+/// (which first clones the base weight map and then calls this helper on the
+/// clone) and the pipeline-parallel stage-local adapter path (which operates
+/// directly on the stage's in-memory base weight map to avoid the extra
+/// allocation of a second weight map).
+///
+/// If the adapter weight map is stage-filtered, only the layers covered by
+/// the filter will produce fusion updates — `base_weights` entries that are
+/// not referenced by any `lora_a` / `lora_b` pair are left untouched.
+///
+/// Used by: [`fuse_lora_weights`], `apply_lora_adapters_in_place`
+pub fn fuse_lora_weights_into(
+    base_weights: &mut WeightMap,
+    adapter_weights: &WeightMap,
+    scale: f32,
+) -> Result<()> {
     // Group adapter weights by their base layer name
     // LoRA weights are typically named like:
     // - layers.0.self_attn.q_proj.lora_a (rank, in_features)
@@ -112,7 +133,7 @@ pub fn fuse_lora_weights(
         // Find the corresponding base weight
         let base_weight_name = find_base_weight_name(&base_name, base_weights)?;
 
-        let Some(base_weight) = fused_weights.get(&base_weight_name) else {
+        let Some(base_weight) = base_weights.get(&base_weight_name) else {
             tracing::warn!(
                 "Base weight not found for LoRA layer {}: tried {}",
                 base_name,
@@ -127,10 +148,10 @@ pub fn fuse_lora_weights(
         // Fuse: W_fused = W_base + delta
         let fused = mlxcel_core::add(base_weight, &delta);
 
-        fused_weights.insert(base_weight_name, fused);
+        base_weights.insert(base_weight_name, fused);
     }
 
-    Ok(fused_weights)
+    Ok(())
 }
 
 /// Find the base weight name that corresponds to a LoRA layer name
@@ -258,6 +279,66 @@ pub fn apply_lora_adapters(base_weights: &WeightMap, adapter_path: &Path) -> Res
     tracing::info!("Fused LoRA adapters into {} layers", modified_count);
 
     Ok(fused)
+}
+
+/// Apply a stage-local LoRA adapter to a pipeline stage's base weight map
+/// in place.
+///
+/// This is the pipeline-parallel counterpart of [`apply_lora_adapters`]:
+/// it reuses the same adapter directory layout (`adapter_config.json` plus
+/// `adapters.safetensors` / `adapter_model.safetensors`) and the same rank
+/// / scaling semantics, but loads only the adapter tensors that belong to
+/// the stage's layer range, fuses them into the stage's base weights in
+/// place, and never materializes per-layer deltas for other stages.
+///
+/// The caller is expected to pass the stage's [`LayerFilter`]. The
+/// adapter configuration is validated exactly as in the non-PP path.
+///
+/// Used by: pipeline stage initialization (family stage executors)
+pub fn apply_stage_lora_adapter(
+    base_weights: &mut WeightMap,
+    adapter_path: &Path,
+    filter: &crate::distributed::pipeline::LayerFilter,
+) -> Result<()> {
+    let config = AdapterConfig::load(adapter_path)?;
+
+    tracing::info!(
+        "Loading stage-local LoRA adapter: rank={}, scale={:.2}, type={:?}, stage_layers={}..{}",
+        config.rank(),
+        config.effective_scale(),
+        config.fine_tune_type,
+        filter.layer_range.start,
+        filter.layer_range.end,
+    );
+
+    if !config.is_lora() {
+        anyhow::bail!(
+            "Adapter is not LoRA type: {:?}. Full fine-tuning adapters should be loaded directly.",
+            config.fine_tune_type
+        );
+    }
+
+    let adapter_weights =
+        crate::distributed::pipeline::load_stage_adapter_weights(adapter_path, filter)?;
+
+    let modified_count = adapter_weights
+        .keys()
+        .filter(|k| k.ends_with(".lora_a"))
+        .count();
+
+    tracing::info!(
+        "Loaded {} adapter tensors for stage (skipped out-of-range adapter layers)",
+        adapter_weights.len(),
+    );
+
+    fuse_lora_weights_into(base_weights, &adapter_weights, config.effective_scale())?;
+
+    tracing::info!(
+        "Fused stage-local LoRA adapters into {} layers",
+        modified_count,
+    );
+
+    Ok(())
 }
 
 #[cfg(test)]

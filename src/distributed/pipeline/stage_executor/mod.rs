@@ -142,6 +142,24 @@ impl LoadedStageExecutor {
     /// filter so later phases can replace the "load then filter" path with
     /// shard-selective I/O without changing the runtime API.
     pub fn load(model_dir: &Path, stage: &StageAssignment) -> Result<Self> {
+        Self::load_with_adapter(model_dir, stage, None)
+    }
+
+    /// Load a stage-local executor optionally composing a LoRA adapter.
+    ///
+    /// When `adapter_path` is `Some`, the family stage executor loads its
+    /// base weights, applies only the adapter tensors inside the stage's
+    /// layer range, and then constructs the stage model from the fused
+    /// weights. This is the pipeline-parallel counterpart of the non-PP
+    /// `load_model_with_adapter` entry point — both paths share the same
+    /// adapter file format (`adapter_config.json` plus
+    /// `adapters.safetensors` / `adapter_model.safetensors`) and the same
+    /// rank/scaling semantics.
+    pub fn load_with_adapter(
+        model_dir: &Path,
+        stage: &StageAssignment,
+        adapter_path: Option<&Path>,
+    ) -> Result<Self> {
         ensure!(
             stage.layer_range.end > stage.layer_range.start,
             "stage {} has an empty layer range",
@@ -150,7 +168,13 @@ impl LoadedStageExecutor {
 
         let filter = LayerFilter::from_stage(stage);
         let family = resolve_stage_family(model_dir)?;
-        let backend = load_family_backend(model_dir, &filter, stage.stage_index, family)?;
+        let backend = load_family_backend(
+            model_dir,
+            &filter,
+            stage.stage_index,
+            family,
+            adapter_path,
+        )?;
 
         Ok(Self {
             stage: stage.clone(),
@@ -359,90 +383,162 @@ fn load_family_backend(
     filter: &LayerFilter,
     stage_index: usize,
     family: StageFamily,
+    adapter_path: Option<&Path>,
 ) -> Result<Box<dyn FamilyStageExecutor>> {
     match family {
         StageFamily::Llama => Ok(Box::new(LlamaStageExecutor::load(
             model_dir,
             filter,
             stage_index,
+            adapter_path,
         )?)),
-        StageFamily::Mistral => Ok(Box::new(MistralStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Mixtral => Ok(Box::new(MixtralStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::DeepSeekV3 => Ok(Box::new(DeepSeekV3StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Llama4 => Ok(Box::new(Llama4StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::GptOss => Ok(Box::new(GptOssStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Gemma3 => Ok(Box::new(Gemma3StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Gemma4 | StageFamily::Gemma4Vlm => Ok(Box::new(Gemma4StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Glm4 => Ok(Box::new(Glm4StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Glm4Moe => Ok(Box::new(Glm4MoeStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Glm4MoeLite => Ok(Box::new(Glm4MoeLiteStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::GlmMoeDsa => Ok(Box::new(GlmMoeDsaStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Qwen3 => Ok(Box::new(Qwen3StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
+        StageFamily::Mistral => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(MistralStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Mixtral => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(MixtralStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::DeepSeekV3 => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(DeepSeekV3StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Llama4 => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Llama4StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::GptOss => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(GptOssStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Gemma3 => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Gemma3StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Gemma4 | StageFamily::Gemma4Vlm => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Gemma4StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Glm4 => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Glm4StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Glm4Moe => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Glm4MoeStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Glm4MoeLite => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Glm4MoeLiteStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::GlmMoeDsa => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(GlmMoeDsaStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Qwen3 => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Qwen3StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
         StageFamily::Qwen35
         | StageFamily::Qwen35Vlm
         | StageFamily::Qwen35Moe
-        | StageFamily::Qwen35MoeVlm => Ok(Box::new(Qwen35StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::Jamba => Ok(Box::new(JambaStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        StageFamily::NemotronH => Ok(Box::new(NemotronHStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
+        | StageFamily::Qwen35MoeVlm => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(Qwen35StageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::Jamba => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(JambaStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
+        StageFamily::NemotronH => {
+            ensure_no_adapter(adapter_path, family)?;
+            Ok(Box::new(NemotronHStageExecutor::load(
+                model_dir,
+                filter,
+                stage_index,
+            )?))
+        }
     }
+}
+
+/// Guard that rejects an adapter path for stage families whose PP stage
+/// executors have not yet been wired for LoRA composition.
+///
+/// Families opt into PP+LoRA by:
+///   1. Accepting `adapter_path: Option<&Path>` in their `load` signature.
+///   2. Calling `crate::lora::apply_stage_lora_adapter` between the weight
+///      load and the `filter_weight_map` call.
+///   3. Being removed from this guard.
+///
+/// Keeping this guard explicit means that adding a new family without
+/// implementing the adapter path surfaces a loud error instead of silently
+/// producing base-only outputs.
+fn ensure_no_adapter(adapter_path: Option<&Path>, family: StageFamily) -> Result<()> {
+    if let Some(path) = adapter_path {
+        bail!(
+            "pipeline-parallel LoRA composition is not yet implemented for stage family \
+             '{}'; adapter path {} was provided but only the Llama family currently \
+             supports PP+LoRA composition (v1 scope)",
+            family.name(),
+            path.display(),
+        );
+    }
+    Ok(())
 }

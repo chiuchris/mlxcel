@@ -79,11 +79,14 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 crate::server::PipelineParallelRuntimeConfig::InProcess {
                     layers,
                     micro_batch_size,
-                } => crate::distributed::pipeline::PipelineServerModel::load_in_process(
-                    &model_path,
-                    Some(layers.as_str()),
-                    *micro_batch_size,
-                ),
+                } => {
+                    crate::distributed::pipeline::PipelineServerModel::load_in_process_with_adapter(
+                        &model_path,
+                        Some(layers.as_str()),
+                        *micro_batch_size,
+                        adapter_path.as_deref(),
+                    )
+                }
                 crate::server::PipelineParallelRuntimeConfig::RemoteCoordinator(config) => {
                     crate::distributed::pipeline::PipelineServerModel::load_remote(
                         &model_path,

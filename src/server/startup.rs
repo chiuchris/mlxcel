@@ -460,10 +460,9 @@ fn validate_pipeline_parallel_startup(startup: &ServerStartupConfig) -> Result<(
         !pp_layers.trim().is_empty(),
         "--pp-layers must not be empty when provided"
     );
-    anyhow::ensure!(
-        startup.adapter_path.is_none(),
-        "Server pipeline parallelism does not support adapter loading yet"
-    );
+    // LoRA adapter composition with PP is supported for in-process stages.
+    // Single-adapter only; multi-adapter stacking and runtime hot-swap are
+    // out of scope for v1.
     anyhow::ensure!(
         startup.draft_model_path.is_none(),
         "Server pipeline parallelism does not support speculative decoding yet"

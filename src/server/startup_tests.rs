@@ -539,6 +539,36 @@ fn validate_pipeline_parallel_startup_accepts_supported_llama_config() {
 }
 
 #[test]
+fn validate_pipeline_parallel_startup_accepts_adapter_config() {
+    // LoRA + PP composition is supported for the in-process server runtime:
+    // the adapter path is threaded through
+    // PipelineServerModel::load_in_process_with_adapter at model worker
+    // bring-up, so the startup validator must no longer reject the
+    // combination. v1 covers the Llama family; other families still bail
+    // at stage_executor::load_family_backend.
+    let dir = temp_path("pp-with-adapter");
+    std::fs::write(
+        dir.join("config.json"),
+        r#"{
+            "model_type": "llama",
+            "num_hidden_layers": 16
+        }"#,
+    )
+    .unwrap();
+
+    let startup = ServerStartupConfig {
+        model_path: dir.clone(),
+        pp_layers: Some("0-7,8-15".to_string()),
+        pp_micro_batch_size: 2,
+        adapter_path: Some(dir.join("adapters").clone()),
+        ..ServerStartupConfig::default()
+    };
+    validate_pipeline_parallel_startup(&startup).unwrap();
+
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
 fn validate_pipeline_parallel_startup_rejects_no_batch_mode() {
     let dir = temp_path("pp-no-batch");
     std::fs::write(

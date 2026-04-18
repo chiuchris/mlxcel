@@ -302,6 +302,25 @@ fn glob_safetensors(dir: &Path) -> Result<Vec<std::path::PathBuf>, String> {
 /// Uses MLX's native `load_safetensors()` which returns lazy arrays with
 /// MLX-managed mmap. No synchronization barrier is needed.
 pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<WeightMap, String> {
+    load_safetensors_filtered(path, |_| true)
+}
+
+/// Load a filtered subset of tensors from a single safetensors file.
+///
+/// Iterates the tensor table via the MLX FFI and only takes tensors whose
+/// name satisfies the `keep` predicate — the rest are left on the MLX-side
+/// loader handle and released when that handle is dropped. This lets callers
+/// (for example, pipeline-parallel stage initialization) skip tensors that
+/// belong to other stages without ever materializing them in the Rust
+/// [`WeightMap`], which is cheaper than loading everything and filtering
+/// afterwards.
+///
+/// Used by: `distributed::pipeline::partial_loading::load_stage_adapter_weights`
+pub fn load_safetensors_filtered<P, F>(path: P, mut keep: F) -> Result<WeightMap, String>
+where
+    P: AsRef<Path>,
+    F: FnMut(&str) -> bool,
+{
     let path = path.as_ref();
     let path_str = path
         .to_str()
@@ -312,6 +331,9 @@ pub fn load_safetensors<P: AsRef<Path>>(path: P) -> Result<WeightMap, String> {
     let mut weights = HashMap::with_capacity(len);
     for i in 0..len {
         let name = ffi::loaded_weights_name(&loaded, i);
+        if !keep(&name) {
+            continue;
+        }
         let array = ffi::loaded_weights_take(loaded.pin_mut(), i);
         weights.insert(name, array);
     }

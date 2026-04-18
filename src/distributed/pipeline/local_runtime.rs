@@ -133,6 +133,19 @@ pub fn load_in_process_stage_worker(
     assignments: &[StageAssignment],
     micro_batch_size: usize,
 ) -> Result<InProcessStageWorkerLoop> {
+    load_in_process_stage_worker_with_adapter(model_dir, assignments, micro_batch_size, None)
+}
+
+/// Worktree-aware variant that also plumbs a single-adapter LoRA path into
+/// every stage's loader. Passing `None` reproduces the base-only path.
+///
+/// Used by: CLI pipeline generate, server pipeline runtime, tests
+pub fn load_in_process_stage_worker_with_adapter(
+    model_dir: &Path,
+    assignments: &[StageAssignment],
+    micro_batch_size: usize,
+    adapter_path: Option<&Path>,
+) -> Result<InProcessStageWorkerLoop> {
     ensure!(
         assignments.len() >= 2,
         "in-process pipeline execution requires at least 2 stages"
@@ -140,7 +153,7 @@ pub fn load_in_process_stage_worker(
     let executors: Vec<Box<dyn StageExecutor>> = assignments
         .iter()
         .map(|assignment| {
-            LoadedStageExecutor::load(model_dir, assignment)
+            LoadedStageExecutor::load_with_adapter(model_dir, assignment, adapter_path)
                 .map(|executor| Box::new(executor) as Box<dyn StageExecutor>)
         })
         .collect::<Result<_>>()

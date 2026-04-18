@@ -37,7 +37,7 @@ use super::remote_service::{
 };
 use super::wire_tensor::{deserialize_wire_tensor, serialize_mlx_array};
 use super::{
-    InProcessStageWorkerLoop, PipelineWorkerInput, load_in_process_stage_worker,
+    InProcessStageWorkerLoop, PipelineWorkerInput, load_in_process_stage_worker_with_adapter,
     resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
 };
 
@@ -74,10 +74,23 @@ impl InProcessPipelineRuntime {
         pp_layers: Option<&str>,
         pp_micro_batch_size: usize,
     ) -> Result<(usize, Vec<i32>, Self)> {
+        Self::load_with_adapter(model_dir, pp_layers, pp_micro_batch_size, None)
+    }
+
+    pub fn load_with_adapter(
+        model_dir: &Path,
+        pp_layers: Option<&str>,
+        pp_micro_batch_size: usize,
+        adapter_path: Option<&Path>,
+    ) -> Result<(usize, Vec<i32>, Self)> {
         let num_layers = resolve_in_process_pipeline_num_layers(model_dir)?;
         let assignments = resolve_in_process_stage_assignments(num_layers, None, pp_layers)?;
-        let worker_loop =
-            load_in_process_stage_worker(model_dir, &assignments, pp_micro_batch_size)?;
+        let worker_loop = load_in_process_stage_worker_with_adapter(
+            model_dir,
+            &assignments,
+            pp_micro_batch_size,
+            adapter_path,
+        )?;
         Ok((
             num_layers,
             crate::read_eos_token_ids(model_dir),

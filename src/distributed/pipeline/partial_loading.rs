@@ -26,6 +26,10 @@
 //!    ([`filter_weight_map`]).
 //! 5. Estimate memory for a partial load and validate against device capacity.
 //!
+//! Stage-local LoRA adapter loading lives in
+//! [`super::partial_loading_adapter`] and is re-exported from this module
+//! so callers can import a single namespace.
+//!
 //! Used by: pipeline startup, distributed model loading
 
 use std::collections::HashSet;

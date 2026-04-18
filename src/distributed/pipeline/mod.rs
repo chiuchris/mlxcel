@@ -72,6 +72,7 @@ pub mod local_runtime;
 pub mod metrics;
 pub mod micro_batch;
 pub mod partial_loading;
+pub mod partial_loading_adapter;
 pub mod partition;
 pub mod remote_service;
 pub mod runtime;
@@ -100,8 +101,8 @@ pub use cache_manager::{
     coordinated_admission, sync_metadata,
 };
 pub use local_runtime::{
-    load_in_process_stage_worker, resolve_in_process_pipeline_num_layers,
-    resolve_in_process_stage_assignments,
+    load_in_process_stage_worker, load_in_process_stage_worker_with_adapter,
+    resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
 };
 pub use metrics::{
     MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics, StageMetrics,
@@ -113,6 +114,10 @@ pub use partial_loading::{
     LayerFilter, SafeTensorsIndex, WeightClass, classify_weight_key, estimate_partial_memory,
     filter_weight_keys, filter_weight_map, identify_required_shards, should_load_key,
     validate_partial_memory,
+};
+pub use partial_loading_adapter::{
+    filter_adapter_weights, load_stage_adapter_weights, resolve_adapter_weights_path,
+    should_load_adapter_key,
 };
 pub use partition::{
     DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,

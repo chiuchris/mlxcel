@@ -31,7 +31,12 @@ pub struct LlamaStageExecutor {
 }
 
 impl LlamaStageExecutor {
-    pub fn load(model_dir: &Path, filter: &LayerFilter, stage_index: usize) -> Result<Self> {
+    pub fn load(
+        model_dir: &Path,
+        filter: &LayerFilter,
+        stage_index: usize,
+        adapter_path: Option<&Path>,
+    ) -> Result<Self> {
         let config_path = model_dir.join("config.json");
         let config_str = std::fs::read_to_string(&config_path)
             .map_err(|err| anyhow!("failed to read {}: {}", config_path.display(), err))?;
@@ -45,6 +50,17 @@ impl LlamaStageExecutor {
         if args.tie_word_embeddings && filter.has_lm_head {
             effective_filter.has_embedding = true;
         }
+
+        // Compose LoRA adapter deltas into the base weights (stage-local).
+        // This must run BEFORE filter_weight_map so that the adapter can
+        // address the same base keys the filter will later trim. The
+        // adapter loader itself only pulls in tensors whose layer index
+        // falls inside this stage's range, avoiding wasteful reads of
+        // adapter tensors owned by other stages.
+        if let Some(path) = adapter_path {
+            crate::lora::apply_stage_lora_adapter(&mut weights, path, &effective_filter)?;
+        }
+
         filter_weight_map(&mut weights, &effective_filter);
 
         let group_size = args.group_size();

@@ -339,9 +339,29 @@ fn validate_pipeline_parallel_args_requires_two_stages_without_manual_ranges() {
 #[test]
 fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
     let mut args = sample_generate_args(temp_model_dir("pp-incompatible"));
+    // Speculative decoding + PP is still rejected (separate epic).
+    args.pipeline_parallel.pp_size = 2;
+    args.model.draft_model = Some(PathBuf::from("draft"));
+    assert!(validate_pipeline_parallel_args(&args).is_err());
+    args.model.draft_model = None;
+
+    // Tensor parallelism + PP is now accepted (2D PP × TP composition landed
+    // via #346). Positive coverage for the 2D path lives in
+    // `validate_pipeline_parallel_args_accepts_2d_pp_tp` below.
+
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_args_accepts_adapter() {
+    // LoRA + PP composition is supported: stage-local adapter loading is
+    // wired through load_in_process_stage_worker_with_adapter. The CLI
+    // validator must accept the combination so the runtime path can take
+    // over. (v1 single-adapter composition.)
+    let mut args = sample_generate_args(temp_model_dir("pp-with-adapter"));
     args.pipeline_parallel.pp_size = 2;
     args.model.adapter = Some(PathBuf::from("adapter"));
-    assert!(validate_pipeline_parallel_args(&args).is_err());
+    assert!(validate_pipeline_parallel_args(&args).is_ok());
     fs::remove_dir_all(args.model.model).unwrap();
 }
 

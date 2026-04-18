@@ -28,7 +28,7 @@ use mlxcel::{
     distributed::{
         PipelineWorkerInput, RequestId,
         pipeline::{
-            load_in_process_stage_worker, resolve_in_process_pipeline_num_layers,
+            load_in_process_stage_worker_with_adapter, resolve_in_process_pipeline_num_layers,
             resolve_in_process_stage_assignments,
         },
         resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
@@ -159,10 +159,10 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
             tp_size
         );
     }
-    ensure!(
-        args.model.adapter.is_none(),
-        "CLI pipeline parallelism does not support adapter loading yet"
-    );
+    // LoRA adapter composition with PP is supported — adapters are loaded at
+    // stage initialization via `load_in_process_stage_worker_with_adapter`.
+    // Single-adapter only; multi-adapter stacking and runtime hot-swap
+    // remain out of scope for v1.
     ensure!(
         args.model.draft_model.is_none(),
         "CLI pipeline parallelism does not support speculative decoding yet"
@@ -214,10 +214,18 @@ fn generate_pipeline_text(
         "pipeline execution requires at least 2 stages"
     );
 
-    let mut worker_loop = load_in_process_stage_worker(
+    if let Some(ref adapter_path) = args.model.adapter {
+        println!(
+            "Loading LoRA adapter from {:?} across {} pipeline stages...",
+            adapter_path,
+            assignments.len(),
+        );
+    }
+    let mut worker_loop = load_in_process_stage_worker_with_adapter(
         model_dir,
         &assignments,
         args.pipeline_parallel.pp_micro_batch_size,
+        args.model.adapter.as_deref(),
     )?;
 
     let request_id = RequestId::new();

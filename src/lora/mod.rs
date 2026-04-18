@@ -24,4 +24,6 @@ mod config;
 mod loader;
 
 pub use config::{AdapterConfig, LoRAParameters};
-pub use loader::{apply_lora_adapters, fuse_lora_weights};
+pub use loader::{
+    apply_lora_adapters, apply_stage_lora_adapter, fuse_lora_weights, fuse_lora_weights_into,
+};

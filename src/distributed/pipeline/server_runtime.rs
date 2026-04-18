@@ -50,8 +50,28 @@ impl PipelineServerModel {
         pp_layers: Option<&str>,
         pp_micro_batch_size: usize,
     ) -> anyhow::Result<Self> {
-        let (num_layers, eos_token_ids, runtime) =
-            InProcessPipelineRuntime::load(model_dir, pp_layers, pp_micro_batch_size)?;
+        Self::load_in_process_with_adapter(model_dir, pp_layers, pp_micro_batch_size, None)
+    }
+
+    /// Load an in-process pipeline server model, optionally composing a LoRA
+    /// adapter into each stage.
+    ///
+    /// This mirrors [`crate::load_model_with_adapter`] for non-PP inference:
+    /// the adapter directory format, the `--adapter` CLI flag, and the
+    /// rank/scaling semantics are identical. The adapter is loaded once at
+    /// stage initialization — runtime hot-swap is out of scope (v1).
+    pub fn load_in_process_with_adapter(
+        model_dir: &std::path::Path,
+        pp_layers: Option<&str>,
+        pp_micro_batch_size: usize,
+        adapter_path: Option<&std::path::Path>,
+    ) -> anyhow::Result<Self> {
+        let (num_layers, eos_token_ids, runtime) = InProcessPipelineRuntime::load_with_adapter(
+            model_dir,
+            pp_layers,
+            pp_micro_batch_size,
+            adapter_path,
+        )?;
         Ok(Self::new(num_layers, eos_token_ids, Box::new(runtime)))
     }
 
