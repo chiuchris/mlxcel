@@ -31,8 +31,9 @@ use crate::distributed::pipeline::{
     resolve_in_process_stage_assignments,
 };
 use crate::distributed::{
-    ClusterConfig, NodeRegistry, NodeRole, resolve_model_shard_plan, shard_config_from_cli,
-    validate_supported_runtime,
+    ClusterConfig, ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, NodeRegistry,
+    NodeRole, TransportBackend, plan_cluster, resolve_model_shard_plan, shard_config_from_cli,
+    validate_supported_runtime, write_plan_toml,
 };
 
 use super::batch::BatchObservability;
@@ -140,6 +141,27 @@ pub struct ServerStartupConfig {
     pub pp_layers: Option<String>,
     /// Micro-batch size for in-process pipeline execution.
     pub pp_micro_batch_size: usize,
+
+    // Zero-config multi-machine pipeline bring-up (issue #342).
+    /// Zero-config coordinator intent: pipeline depth for `mlxcel-server --pp-auto N`.
+    pub pp_auto: Option<u32>,
+    /// Zero-config peer intent: `mlxcel-server --pp-peer` joins a running cluster.
+    pub pp_peer: bool,
+    /// Cluster discovery mode string (parsed into `ClusterDiscoveryMode` at startup).
+    pub cluster_discovery: String,
+    /// Optional override for the zero-config cluster name.
+    pub cluster_name: Option<String>,
+    /// Static seed peers for the zero-config bring-up.
+    pub cluster_peers: Vec<SocketAddr>,
+    /// Optional UDP port for the discovery beacon.
+    pub cluster_discovery_port: Option<u16>,
+    /// Optional coordinator control-plane bind address.
+    pub cluster_control_addr: Option<SocketAddr>,
+    /// Optional output path for the emitted cluster TOML.
+    pub cluster_config_out: Option<PathBuf>,
+    /// When `true`, plan the cluster and exit before starting workers.
+    pub dry_run: bool,
+
     /// Number of tensor-parallel ranks (1 = disabled).
     pub tp_size: usize,
     /// MoE expert sharding mode string (parsed into `MoeShardMode` at plan generation).
@@ -211,6 +233,15 @@ impl Default for ServerStartupConfig {
             peers: Vec::new(),
             pp_layers: None,
             pp_micro_batch_size: 1,
+            pp_auto: None,
+            pp_peer: false,
+            cluster_discovery: "static".to_string(),
+            cluster_name: None,
+            cluster_peers: Vec::new(),
+            cluster_discovery_port: None,
+            cluster_control_addr: None,
+            cluster_config_out: None,
+            dry_run: false,
             tp_size: 1,
             tp_moe_mode: "expert_parallel".to_string(),
             tp_embedding_mode: "replicated".to_string(),
@@ -625,6 +656,140 @@ fn resolve_remote_pipeline_topology(
     ))
 }
 
+/// Parse the discovery mode string, falling back to an actionable error so the
+/// operator sees what was accepted.
+fn parse_discovery_mode(raw: &str) -> Result<ClusterDiscoveryMode> {
+    raw.parse::<ClusterDiscoveryMode>()
+        .with_context(|| format!("failed to parse --cluster-discovery={raw}"))
+}
+
+/// Derive the default output path for the emitted cluster TOML.
+fn default_cluster_config_path() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".mlxcel")
+        .join("cluster.toml")
+}
+
+/// Build a [`ClusterInitRequest`] from the coordinator-side CLI inputs.
+fn build_cluster_init_request(startup: &ServerStartupConfig) -> Result<ClusterInitRequest> {
+    let pp_stages = startup.pp_auto.ok_or_else(|| {
+        anyhow::anyhow!("internal: build_cluster_init_request called without --pp-auto")
+    })?;
+    anyhow::ensure!(
+        pp_stages >= 2,
+        "--pp-auto requires N >= 2; pass N={pp_stages} instead of a single-node run"
+    );
+    anyhow::ensure!(
+        startup.distributed_config.is_none(),
+        "--pp-auto and --distributed-config are mutually exclusive; remove one or the other"
+    );
+    anyhow::ensure!(
+        startup.pp_layers.is_none(),
+        "--pp-auto replaces --pp-layers; remove --pp-layers when using --pp-auto"
+    );
+    anyhow::ensure!(
+        !startup.pp_peer,
+        "--pp-auto (coordinator) and --pp-peer are mutually exclusive"
+    );
+
+    let discovery = parse_discovery_mode(&startup.cluster_discovery)?;
+    let http_addr = parse_startup_listen_addr(startup)?;
+    let control_addr = startup.cluster_control_addr.unwrap_or_else(|| {
+        SocketAddr::new(
+            http_addr.ip(),
+            crate::distributed::DEFAULT_CONTROL_BASE_PORT,
+        )
+    });
+    let discovery_port = startup
+        .cluster_discovery_port
+        .unwrap_or(crate::distributed::DEFAULT_DISCOVERY_PORT);
+    let data_port_base = control_addr.port().saturating_add(1).max(1);
+    let cluster_name = startup
+        .cluster_name
+        .clone()
+        .unwrap_or_else(|| "mlxcel-cluster".to_string());
+
+    Ok(ClusterInitRequest {
+        pp_stages,
+        cluster_name,
+        transport_backend: TransportBackend::Tcp,
+        discovery,
+        discovery_timeout: None,
+        discovery_port,
+        coordinator_http_addr: http_addr,
+        coordinator_control_addr: control_addr,
+        static_peers: startup.cluster_peers.clone(),
+        data_port_base,
+        output_toml_path: startup.cluster_config_out.clone(),
+    })
+}
+
+/// Run the zero-config bring-up path (issue #342): resolve peers (static or
+/// mDNS broadcast), emit a deterministic cluster TOML, and rewrite the
+/// startup config so the downstream distributed resolution path sees a
+/// normal `distributed_config` + `node_id` tuple.
+///
+/// Returns `Some(plan)` when the path was taken so the caller can honour
+/// `--dry-run`. Returns `None` for a no-op when neither `--pp-auto` nor
+/// `--pp-peer` is set.
+async fn run_zero_config_bring_up(
+    startup: &mut ServerStartupConfig,
+) -> Result<Option<ClusterInitPlan>> {
+    if startup.pp_auto.is_some() {
+        let request = build_cluster_init_request(startup)?;
+        let resolved_peers = crate::distributed::discover_peers(
+            request.discovery,
+            &request.cluster_name,
+            request.coordinator_control_addr.ip(),
+            request.discovery_port,
+            &request.static_peers,
+            request.pp_stages as usize,
+            request
+                .discovery_timeout
+                .unwrap_or(crate::distributed::DEFAULT_DISCOVERY_TIMEOUT),
+        )
+        .await?;
+        let mut planned_request = request;
+        planned_request.static_peers = resolved_peers;
+        let plan = plan_cluster(&planned_request)?;
+
+        let output_path = startup
+            .cluster_config_out
+            .clone()
+            .unwrap_or_else(default_cluster_config_path);
+        write_plan_toml(&plan, &output_path)?;
+        tracing::info!(
+            "Zero-config pipeline cluster ready: wrote {} ({} stage(s))",
+            output_path.display(),
+            plan.cluster.cluster.pipeline_parallel_size,
+        );
+        for line in plan.summary.lines() {
+            tracing::info!("cluster> {line}");
+        }
+
+        startup.distributed_config = Some(output_path);
+        if startup.node_id.is_none() {
+            startup.node_id = Some("coordinator".to_string());
+        }
+        return Ok(Some(plan));
+    }
+
+    if startup.pp_peer {
+        anyhow::ensure!(
+            startup.distributed_config.is_some(),
+            "--pp-peer currently requires --distributed-config pointing at the coordinator-emitted cluster TOML. \
+             Future work will remove this once the coordinator push-assigns stages (issue #342 follow-up)."
+        );
+        anyhow::ensure!(
+            startup.node_id.is_some(),
+            "--pp-peer requires --node-id so the coordinator can map this host to a pipeline stage"
+        );
+    }
+
+    Ok(None)
+}
+
 /// Resolve distributed cluster configuration and any remote pipeline startup mode.
 async fn resolve_distributed_startup(
     startup: &ServerStartupConfig,
@@ -709,8 +874,31 @@ async fn serve_remote_pipeline_stage(service_config: RemoteStageServiceConfig) -
 /// Start the server with the given startup configuration.
 ///
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
-pub async fn start_server(startup: ServerStartupConfig) -> Result<()> {
+pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+
+    // Zero-config multi-machine pipeline bring-up (issue #342). Runs before
+    // the tensor-parallel / pipeline-parallel validators so the emitted TOML
+    // passes through the existing distributed resolution path unchanged.
+    let zero_config_plan = run_zero_config_bring_up(&mut startup).await?;
+    if startup.dry_run {
+        if let Some(plan) = zero_config_plan.as_ref() {
+            // Print the topology summary to stdout so CI gates and operators
+            // can consume it without scraping logs.
+            println!("{}", plan.summary);
+            println!(
+                "Emitted cluster TOML at: {}",
+                startup
+                    .distributed_config
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "<not persisted>".to_string())
+            );
+            return Ok(());
+        }
+        anyhow::bail!("--dry-run was requested but --pp-auto was not provided; nothing to plan");
+    }
+
     validate_pipeline_parallel_startup(&startup)?;
     let tp_support = resolve_tensor_parallel_runtime_support(&startup)?;
 

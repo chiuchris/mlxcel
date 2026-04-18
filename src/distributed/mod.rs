@@ -18,6 +18,7 @@
 //! This module provides the building blocks for multi-node inference:
 //!
 //! - [`config`] — `NodeRole`, `ClusterConfig`, and TOML parsing
+//! - [`cluster_init`] — zero-config multi-machine pipeline bring-up (LAN discovery, port allocation, deterministic TOML emission)
 //! - [`registry`] — thread-safe runtime node registry
 //! - [`discovery`] — static peer discovery and health probing
 //! - [`transport`] — abstract transport trait with streaming and RPC modes
@@ -41,6 +42,7 @@
 
 pub mod backpressure;
 pub mod bench;
+pub mod cluster_init;
 pub mod config;
 pub mod connection_pool;
 pub mod correlation;
@@ -74,6 +76,12 @@ pub mod transport_factory;
 
 pub use backpressure::{
     BackpressureConfig, BackpressureMonitor, BackpressurePolicy, BackpressureSignal, LoadLevel,
+};
+pub use cluster_init::{
+    ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, DEFAULT_CONTROL_BASE_PORT,
+    DEFAULT_DISCOVERY_PORT, DEFAULT_DISCOVERY_TIMEOUT, DiscoveryBeacon, allocate_data_ports,
+    broadcast_beacon_loop, discover_peers, is_port_available, plan_cluster,
+    render_deterministic_toml, write_plan_toml,
 };
 pub use config::{ClusterConfig, ClusterMeta, NodeConfig, NodeResources, NodeRole};
 pub use connection_pool::{ConnectionPool, PoolConfig, PoolStats};

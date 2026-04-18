@@ -333,6 +333,81 @@ struct Args {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
+    /// Zero-config pipeline-parallel bring-up: declare the desired number of stages.
+    ///
+    /// When set (N >= 2), `mlxcel-server` acts as the coordinator and resolves
+    /// peers either from `--cluster-peers` or via `--cluster-discovery=mdns`,
+    /// allocates ports for the coordinator control plane and stage data ports
+    /// if they are not explicitly provided, and emits a deterministic cluster
+    /// TOML to `--cluster-config-out` before starting the server. The flag is
+    /// mutually exclusive with `--distributed-config`.
+    #[arg(long = "pp-auto", value_name = "N")]
+    pp_auto: Option<u32>,
+
+    /// Peer role for zero-config pipeline bring-up: register with the coordinator
+    /// instead of starting a server of our own.
+    ///
+    /// When set, `mlxcel-server` announces its availability (either statically
+    /// by registering against a known coordinator address, or via broadcast
+    /// when `--cluster-discovery=mdns`) and then starts a pipeline stage
+    /// service using the stage assignment the coordinator returns.
+    #[arg(long = "pp-peer")]
+    pp_peer: bool,
+
+    /// Cluster discovery mechanism: "static" (default) or "mdns" for UDP broadcast.
+    ///
+    /// "static" consumes `--cluster-peers` verbatim. "mdns" enables opt-in
+    /// LAN peer discovery via UDP broadcast. The name is retained for future
+    /// zeroconf compatibility; today the implementation uses plain UDP so no
+    /// extra dependency is required.
+    #[arg(
+        long = "cluster-discovery",
+        default_value = "static",
+        value_name = "MODE"
+    )]
+    cluster_discovery: String,
+
+    /// Human-readable cluster name used to scope discovery and as the TOML header.
+    ///
+    /// Defaults to the value embedded in the generated TOML when `--pp-auto`
+    /// runs (currently `mlxcel-cluster`). Peers with a mismatching name are
+    /// ignored by the coordinator during mDNS discovery.
+    #[arg(long = "cluster-name", value_name = "NAME")]
+    cluster_name: Option<String>,
+
+    /// Static peer addresses for zero-config bring-up (host:port, comma-separated).
+    ///
+    /// Each peer address should point at the control+data socket that the
+    /// corresponding `mlxcel-server --pp-peer` exposes. Ignored when
+    /// `--cluster-discovery=mdns` fully resolves the expected peer count.
+    #[arg(long = "cluster-peers", value_delimiter = ',', value_name = "ADDR")]
+    cluster_peers: Vec<std::net::SocketAddr>,
+
+    /// UDP port for the discovery beacon when `--cluster-discovery=mdns` is used.
+    #[arg(long = "cluster-discovery-port", value_name = "PORT")]
+    cluster_discovery_port: Option<u16>,
+
+    /// Coordinator control-plane bind address for zero-config bring-up (host:port).
+    ///
+    /// Kept deliberately distinct from the HTTP listen address so operators do
+    /// not have to co-schedule two services on a single port.
+    #[arg(long = "cluster-control-addr", value_name = "ADDR")]
+    cluster_control_addr: Option<std::net::SocketAddr>,
+
+    /// Output path for the emitted cluster TOML.
+    ///
+    /// Defaults to `<current directory>/.mlxcel/cluster.toml` when
+    /// `--pp-auto` is used and this flag is omitted.
+    #[arg(long = "cluster-config-out", value_name = "PATH")]
+    cluster_config_out: Option<PathBuf>,
+
+    /// Plan the cluster topology and emit the TOML without starting workers.
+    ///
+    /// Exits with non-zero status when port, version, or peer-count conflicts
+    /// cannot be resolved. Only meaningful in combination with `--pp-auto`.
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
+
     /// Number of tensor-parallel ranks (must be a power of 2).
     ///
     /// Current multi-rank runtime support is limited to dense Llama, Qwen2/2.5,
@@ -472,6 +547,15 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         peers: args.peers,
         pp_layers: args.pp_layers,
         pp_micro_batch_size: args.pp_micro_batch_size,
+        pp_auto: args.pp_auto,
+        pp_peer: args.pp_peer,
+        cluster_discovery: args.cluster_discovery,
+        cluster_name: args.cluster_name,
+        cluster_peers: args.cluster_peers,
+        cluster_discovery_port: args.cluster_discovery_port,
+        cluster_control_addr: args.cluster_control_addr,
+        cluster_config_out: args.cluster_config_out,
+        dry_run: args.dry_run,
         tp_size: args.tp_size,
         tp_moe_mode: args.tp_moe_mode,
         tp_embedding_mode: args.tp_embedding_mode,

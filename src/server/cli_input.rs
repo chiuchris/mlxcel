@@ -99,6 +99,28 @@ pub struct ServerStartupInput {
     pub pp_layers: Option<String>,
     /// Micro-batch size for in-process pipeline execution.
     pub pp_micro_batch_size: usize,
+
+    // Zero-config multi-machine pipeline bring-up (issue #342).
+    /// When set (>= 2), run the zero-config coordinator bring-up and populate
+    /// `distributed_config` with a freshly emitted TOML.
+    pub pp_auto: Option<u32>,
+    /// When `true`, run as a pipeline-stage peer for zero-config bring-up.
+    pub pp_peer: bool,
+    /// Discovery mode string (parsed into `ClusterDiscoveryMode` at startup).
+    pub cluster_discovery: String,
+    /// Optional override for the zero-config cluster name.
+    pub cluster_name: Option<String>,
+    /// Static seed peers for the zero-config bring-up.
+    pub cluster_peers: Vec<SocketAddr>,
+    /// Optional UDP port for the discovery beacon.
+    pub cluster_discovery_port: Option<u16>,
+    /// Optional coordinator control-plane bind address.
+    pub cluster_control_addr: Option<SocketAddr>,
+    /// Optional output path for the emitted cluster TOML.
+    pub cluster_config_out: Option<PathBuf>,
+    /// When `true`, plan the cluster and exit without starting workers.
+    pub dry_run: bool,
+
     /// Number of tensor-parallel ranks.
     pub tp_size: usize,
     /// MoE expert sharding mode string (parsed at startup).
@@ -170,6 +192,15 @@ impl ServerStartupInput {
             peers: self.peers,
             pp_layers: self.pp_layers,
             pp_micro_batch_size: self.pp_micro_batch_size,
+            pp_auto: self.pp_auto,
+            pp_peer: self.pp_peer,
+            cluster_discovery: self.cluster_discovery,
+            cluster_name: self.cluster_name,
+            cluster_peers: self.cluster_peers,
+            cluster_discovery_port: self.cluster_discovery_port,
+            cluster_control_addr: self.cluster_control_addr,
+            cluster_config_out: self.cluster_config_out,
+            dry_run: self.dry_run,
             tp_size: self.tp_size,
             tp_moe_mode: self.tp_moe_mode,
             tp_embedding_mode: self.tp_embedding_mode,

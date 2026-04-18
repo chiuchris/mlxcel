@@ -548,6 +548,50 @@ pub(crate) struct ServeArgs {
     #[arg(long = "pp-micro-batch-size", default_value_t = 1, value_name = "N")]
     pp_micro_batch_size: usize,
 
+    /// Zero-config pipeline bring-up: coordinator declares N stages.
+    ///
+    /// See `docs/en/distributed/pipeline-parallelism.md` "Zero-config startup"
+    /// for the full operator workflow. Mutually exclusive with
+    /// `--distributed-config`.
+    #[arg(long = "pp-auto", value_name = "N")]
+    pp_auto: Option<u32>,
+
+    /// Zero-config pipeline bring-up: run as a peer that joins a coordinator.
+    #[arg(long = "pp-peer")]
+    pp_peer: bool,
+
+    /// Cluster discovery mechanism: "static" (default) or "mdns" for UDP broadcast.
+    #[arg(
+        long = "cluster-discovery",
+        default_value = "static",
+        value_name = "MODE"
+    )]
+    cluster_discovery: String,
+
+    /// Human-readable cluster name for discovery and TOML header.
+    #[arg(long = "cluster-name", value_name = "NAME")]
+    cluster_name: Option<String>,
+
+    /// Static peer addresses for zero-config bring-up (host:port, comma-separated).
+    #[arg(long = "cluster-peers", value_delimiter = ',', value_name = "ADDR")]
+    cluster_peers: Vec<std::net::SocketAddr>,
+
+    /// UDP port for the discovery beacon when `--cluster-discovery=mdns`.
+    #[arg(long = "cluster-discovery-port", value_name = "PORT")]
+    cluster_discovery_port: Option<u16>,
+
+    /// Coordinator control-plane bind address for zero-config bring-up (host:port).
+    #[arg(long = "cluster-control-addr", value_name = "ADDR")]
+    cluster_control_addr: Option<std::net::SocketAddr>,
+
+    /// Output path for the emitted cluster TOML (default: `.mlxcel/cluster.toml`).
+    #[arg(long = "cluster-config-out", value_name = "PATH")]
+    cluster_config_out: Option<PathBuf>,
+
+    /// Plan the cluster topology and emit the TOML without starting workers.
+    #[arg(long = "dry-run", default_value_t = false)]
+    dry_run: bool,
+
     /// Number of tensor-parallel ranks (must be a power of 2).
     ///
     /// When set to N > 1, model weights are sharded across N in-process ranks.
