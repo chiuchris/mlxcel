@@ -935,12 +935,27 @@ impl TensorParallelGemma4Model {
         let cache_key = Self::cache_key(caches);
         let mut rank_caches = self.rank_caches_for_key(cache_key, caches);
 
+        // Invariant: callers that supply `input_embeddings` (e.g. a future
+        // TP-capable Gemma4 VLM path) are responsible for applying
+        // `sqrt(hidden_size)` to the text portion of the embeddings *before*
+        // merging vision/audio features. Applying the scale here would
+        // double-scale text tokens and incorrectly scale image/audio features
+        // that are already in the language-model embedding space.
+        // See `Gemma4VLModel::get_input_embeddings_with_audio` in
+        // `src/vision/gemma4_vl.rs` and issue #317 / PR #326 for the non-TP
+        // equivalent fix.
         let text_config = &self.ranks[0].text_model.config;
         let mut h = match input_embeddings {
-            Some(embeddings) => mlxcel_core::copy(embeddings),
-            None => self.ranks[0].text_model.embed_tokens.forward(input_ids),
+            Some(embeddings) => {
+                // Caller has already applied embed_scale to text portion of
+                // the embeddings; image/audio features must NOT be scaled again.
+                mlxcel_core::copy(embeddings)
+            }
+            None => {
+                let h = self.ranks[0].text_model.embed_tokens.forward(input_ids);
+                mlxcel_core::multiply_scalar(&h, (text_config.hidden_size as f32).sqrt())
+            }
         };
-        h = mlxcel_core::multiply_scalar(&h, (text_config.hidden_size as f32).sqrt());
         let shape = mlxcel_core::array_shape(&h);
         let batch = shape[0];
         let seq_len = shape[1];

@@ -1554,3 +1554,75 @@ fn tensor_parallel_gemma4_matches_full_model_logits() {
     let close = mlxcel_core::allclose(&full_logits, &tp_logits, 1e-5, 1e-5);
     assert!(mlxcel_core::item_bool(&close));
 }
+
+/// Regression test for issue #335: TP Gemma4 must not double-apply embed_scale
+/// when `input_embeddings` is supplied.
+///
+/// The non-TP path was fixed in PR #326 (issue #317). This test verifies that
+/// `TensorParallelGemma4Model::forward_impl` applies the same conditional:
+/// `sqrt(hidden_size)` scale only for the `input_ids` path, not for the
+/// pre-merged `input_embeddings` path.
+///
+/// Strategy: run both non-TP (already fixed) and TP with identical synthetic
+/// embeddings. If TP still double-scales, the two outputs diverge.
+/// Additionally, verify the text-only (input_ids) path still scales correctly
+/// by comparing it to the full model.
+#[test]
+fn tensor_parallel_gemma4_embed_scale_not_doubled_for_input_embeddings() {
+    let args = make_test_gemma4_args();
+    let weights = make_test_gemma4_weight_map();
+    // hidden_size = 4, so sqrt(hidden_size) = 2.0
+    let hidden_size = args.text_args().hidden_size;
+    assert_eq!(hidden_size, 4, "test relies on hidden_size == 4");
+
+    let full =
+        Gemma4Wrapper::new(crate::models::Gemma4Model::from_weights(&weights, &args).unwrap());
+    let plan = generate_shard_plan(
+        "gemma4",
+        args.text_args().num_hidden_layers,
+        &ShardConfig::with_tp_size(2),
+    )
+    .unwrap();
+    let tp = TensorParallelGemma4Model::from_full_weights(&args, &weights, &plan).unwrap();
+
+    let input_ids = mlxcel_core::from_slice_i32(&[1, 2], &[1, 2]);
+
+    // Build synthetic embeddings: shape [1, 2, 4], all elements 1.0.
+    // With hidden_size=4, sqrt(4)=2.0.  A double-scale would yield 2.0; a
+    // correct single-skip yields the original 1.0 feeding through the layers.
+    let embeddings = mlxcel_core::from_slice_f32(&[1.0_f32; 8], &[1, 2, 4]);
+
+    // --- input_embeddings path: TP must match non-TP (no double-scale) ---
+    let mut full_caches_emb = full.make_caches();
+    let mut tp_caches_emb = tp.make_caches();
+    let full_logits_emb = LanguageModel::forward_with_embeddings(
+        &full,
+        &input_ids,
+        Some(&embeddings),
+        &mut full_caches_emb,
+        None,
+    );
+    let tp_logits_emb = LanguageModel::forward_with_embeddings(
+        &tp,
+        &input_ids,
+        Some(&embeddings),
+        &mut tp_caches_emb,
+        None,
+    );
+    let close_emb = mlxcel_core::allclose(&full_logits_emb, &tp_logits_emb, 1e-5, 1e-5);
+    assert!(
+        mlxcel_core::item_bool(&close_emb),
+        "TP Gemma4 logits with input_embeddings must match non-TP (embed_scale must not be applied twice)"
+    );
+
+    // --- input_ids path: TP must still match non-TP (text-only scale intact) ---
+    let mut full_caches_ids = full.make_caches();
+    let mut tp_caches_ids = tp.make_caches();
+    let full_logits_ids = full.forward(&input_ids, &mut full_caches_ids, None);
+    let tp_logits_ids = tp.forward(&input_ids, &mut tp_caches_ids, None);
+    let close_ids = mlxcel_core::allclose(&full_logits_ids, &tp_logits_ids, 1e-5, 1e-5);
+    assert!(
+        mlxcel_core::item_bool(&close_ids),
+        "TP Gemma4 logits with input_ids must match non-TP (text-only embed_scale must still be applied)"
+    );
+}
