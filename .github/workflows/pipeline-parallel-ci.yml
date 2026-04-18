@@ -1,0 +1,209 @@
+name: Pipeline Parallel CI
+
+# Multi-host pipeline-parallel (PP) regression harness.
+#
+# The workflow has two jobs:
+#
+#   - `two-host-logical`: simulates two PP stages as two processes on a
+#     single GitHub-hosted Linux runner. Exercises the full production
+#     code path under `src/distributed/pipeline/` — coordinator, remote
+#     stage service, transport, and the heterogeneous-memory partition
+#     + admission-control regressions. Runs on every PR that touches
+#     PP-related paths.
+#
+#   - `three-host-real-model`: targets a self-hosted runner lab with
+#     three real machines. Gated by the `ci:pp-three-host` label so it
+#     only runs on demand (manual trigger) for PRs that need a full
+#     3-stage real-model parity sweep. The model checkout and the
+#     runner lab are expected to be available on hosts tagged with
+#     `pp-three-host`.
+#
+# Out of scope (see issue #344):
+#   - running the 3-host job on every PR
+#   - cross-OS matrices on the self-hosted path
+#
+# The workflow intentionally drives the same scripts that operators run
+# locally (`scripts/ci/run-pp-*.sh`) so the CI result and the local
+# developer experience never drift.
+
+on:
+  pull_request:
+    paths:
+      - "src/distributed/pipeline/**"
+      - "src/distributed/tcp_transport.rs"
+      - "src/distributed/thunderbolt_transport.rs"
+      - "src/distributed/rdma_transport.rs"
+      - "src/distributed/rdma_capabilities.rs"
+      - "src/distributed/transport.rs"
+      - "src/distributed/transport_factory.rs"
+      - "src/distributed/cluster_init.rs"
+      - "src/distributed/mod.rs"
+      - "tests/pipeline_ci_multi_stage_real_models.rs"
+      - "tests/pipeline_cli_real_models.rs"
+      - "tests/pipeline_server_real_models.rs"
+      - "tests/pipeline_server_remote_real_models.rs"
+      - "tests/pipeline_remote_real_models.rs"
+      - "tests/pipeline_stage_executor_real_models.rs"
+      - "tests/zero_config_cluster_init.rs"
+      - "tests/rdma_transport_bench.rs"
+      - "scripts/ci/**"
+      - ".github/workflows/pipeline-parallel-ci.yml"
+  # Manual dispatch for ad-hoc runs of the 3-host job on a PR that did
+  # not yet carry the `ci:pp-three-host` label at PR-open time.
+  workflow_dispatch:
+    inputs:
+      run_three_host:
+        description: "Also run the 3-host real-model parity job (requires self-hosted runner)"
+        required: false
+        default: "false"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pp-ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The Linux-hosted logical job compiles without CUDA / Metal because
+  # it runs in a fully CPU-bound transport + scheduler regression mode.
+  # Model weights are not present on GitHub-hosted runners, so the
+  # ignored multi-stage smoke self-skips — this is expected and the
+  # script exits 0 in that case.
+  RUST_BACKTRACE: short
+
+jobs:
+  two-host-logical:
+    name: 2-host logical (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: cargo-pp-ci-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-pp-ci-${{ runner.os }}-
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            ninja-build \
+            libopenblas-dev \
+            liblapack-dev \
+            pkg-config
+
+      - name: Validate workflow YAML
+        run: |
+          python3 -c "import yaml; yaml.safe_load(open('.github/workflows/pipeline-parallel-ci.yml'))"
+
+      - name: Run heterogeneous-memory partition regressions
+        env:
+          CARGO_PROFILE: debug
+        run: ./scripts/ci/run-pp-heterogeneous-memory.sh
+
+      - name: Run 2-host logical pipeline-parallel job
+        env:
+          CARGO_PROFILE: debug
+          # Model weights are not present on GitHub-hosted runners, so
+          # the ignored multi-stage test self-skips. The unit and
+          # heterogeneous-memory sections still run and gate the merge.
+          TEST_MODEL: llama-3.2-1b-4bit
+        run: ./scripts/ci/run-pp-two-host-logical.sh
+
+      - name: Clippy on PP modules
+        run: |
+          cargo clippy \
+            -p mlxcel \
+            --lib \
+            --tests \
+            -- -D warnings
+
+  three-host-real-model:
+    name: 3-host real-model parity (self-hosted)
+    # Runs on either:
+    #   1. PRs that explicitly carry the `ci:pp-three-host` label; or
+    #   2. Manual `workflow_dispatch` with `run_three_host=true`.
+    #
+    # The job targets a self-hosted runner group labelled `pp-three-host`
+    # that owns the 3-machine lab. The runner group is expected to have
+    # model weights mounted at `$MODEL_ROOT` so the ignored
+    # `pipeline_multi_stage_three_host_real_model_parity` test can
+    # exercise the full 3-stage path. If the lab is offline, the job
+    # stays queued until the runner becomes available or the PR is
+    # updated — it does not auto-fail.
+    if: |
+      (github.event_name == 'pull_request' &&
+        contains(github.event.pull_request.labels.*.name, 'ci:pp-three-host')) ||
+      (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.run_three_host == 'true')
+    runs-on:
+      - self-hosted
+      - pp-three-host
+    timeout-minutes: 120
+    needs: two-host-logical
+
+    env:
+      CARGO_PROFILE: release
+      PP_THREE_HOST_MODEL: llama-3.2-1b-4bit
+      PP_THREE_HOST_TOKENS: "16"
+      PP_THREE_HOST_PROMPT: "Hello from the 3-host pipeline-parallel CI validation."
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Resolve model root
+        id: model
+        run: |
+          # The self-hosted runner group is expected to mount model
+          # weights at either $MODEL_ROOT or the repo-local models/
+          # path. The 3-host script fails loudly when STRICT_MODEL=1
+          # but weights are absent, so pass that through.
+          if [[ -z "${MODEL_ROOT:-}" && -d "$HOME/mlxcel-models" ]]; then
+            echo "MODEL_ROOT=$HOME/mlxcel-models" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run 5 rollout-checklist tests
+        run: ./scripts/ci/run-pp-rollout-tests.sh
+
+      - name: Run 3-host real-model parity sweep
+        env:
+          STRICT_MODEL: "1"
+          REPORT_PATH: "${{ github.workspace }}/docs_internal/performance/pipeline_parallel_3stage_ci_runs.md"
+        run: ./scripts/ci/run-pp-three-host.sh
+
+      - name: Upload captured rollout CSV
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pp-3host-benchmarks-${{ github.run_id }}
+          path: |
+            benchmarks/pipeline_parallel_*.csv
+            docs_internal/performance/pipeline_parallel_3stage_ci_runs.md
+          if-no-files-found: ignore
+          retention-days: 30
