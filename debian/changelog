@@ -1,3 +1,54 @@
+mlxcel (0.0.24-1~jammy1) jammy; urgency=medium
+
+  * Feat: Zero-config multi-machine pipeline-parallel bring-up via
+    --pp-auto N with --cluster-peers seeds or opt-in mDNS discovery
+  * Feat: RDMA-aware transport backend with transparent TCP fallback
+    (io_uring on Linux, kqueue batched send on macOS)
+  * Feat: Compose pipeline parallelism with tensor parallelism as a 2D
+    (pp_stage, tp_rank) mesh for Llama-70B-class topologies
+  * Feat: Byte-accurate pipeline auto-partition with adjacency
+    constraints for MoE and Gemma 4 KV-shared pairs (drops manual
+    --pp-layers for MoE and gemma-4-e2b-it-4bit)
+  * Feat: Elastic pipeline-parallel repartitioning behind
+    --enable-elastic-pp (drain/rebalance/resume without cluster restart)
+  * Feat: LoRA adapter composition across pipeline stages via existing
+    --adapter flag (Llama family; parity with single-process run)
+  * Feat: Pipeline stage-executor coverage for Mistral, Mixtral,
+    DeepSeek V3, Llama 4, Jamba, Nemotron-H
+  * Feat: Pipeline /metrics endpoint (per-stage utilization, bubble
+    ratio, transfer latency, KV admission rejections), --metrics-port,
+    --debug-pp-trace chrome-tracing output, and Grafana dashboard
+  * Feat: Multi-host pipeline-parallel regression CI harness
+    (2-host logical + 3-host real-model gated by ci:pp-three-host)
+  * Feat: VisionFeatureCache LRU for multi-turn VLM image reuse
+    (--vision-cache-size N, default 20) on Gemma 4, Qwen2.5-VL, Qwen3-VL
+  * Feat: Batch scheduler null/empty-cache safety guards for empty
+    prompt, filter-to-empty, and merge-of-all-empty transitions
+  * Fix: Auto-detect per-layer quantization bit overrides in
+    UnifiedLinear loader (enables qwen3.6-35b-a3b-4bit)
+  * Fix: Use additive f32 attention mask in
+    prepare_inputs_for_multimodal (prevents padding leakage through
+    scaled_dot_product_attention)
+  * Fix: Apply embed_scale conditionally in the tensor-parallel Gemma 4
+    runtime, matching the single-GPU model
+  * Fix: Wrap conv_state slice in contiguous() across mamba / mamba2 /
+    nemotron-h / jamba / qwen3.5 / kimi-linear / qwen3-next to prevent
+    per-step graph retention and memory growth
+  * Fix (BREAKING): Apply RMS norm before projection in Gemma 4
+    multimodal embedder (re-download Gemma 4 VLM checkpoints)
+  * Fix: Apply sqrt(hidden_size) embed_scale to text embeddings before
+    merging vision/audio features in Gemma 4 VLM
+  * Fix: Implement proportional RoPE for Gemma 4 full-attention layers
+    (rope_type="proportional" normalizes exponents by full head_dim)
+  * Fix: Gemma 4 audio feature extractor — periodic Hann window and
+    semicausal left-pad (restores correct 100-frame count for 1s audio)
+  * Fix: Default NemotronH time_step_limit to (0.0, +inf) unconditionally
+    when absent, matching upstream mlx-lm
+  * Refactor: Replace Gemma 4 ScaledLinear with UnifiedLinear + external
+    per_layer_projection_scale (bit-identical math)
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 18 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.23-1~jammy1) jammy; urgency=medium
 
   * Fix: Render chat templates that use Python-style dict/string methods
