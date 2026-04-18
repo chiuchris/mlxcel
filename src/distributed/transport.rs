@@ -39,6 +39,14 @@ pub enum TransportBackend {
     Tcp,
     /// Thunderbolt (IP-over-Thunderbolt Bridge) for local clusters.
     Thunderbolt,
+    /// RDMA-aware zero-copy transport.
+    ///
+    /// Uses `io_uring` registered buffers on Linux, `kqueue` batched send with
+    /// registered memory regions on macOS, and falls back transparently to TCP
+    /// when the zero-copy primitive is unavailable or negotiation fails. A
+    /// single-line log entry at coordinator startup names the reason when the
+    /// fallback is taken (OS, driver, peer version, or capability mismatch).
+    Rdma,
 }
 
 impl fmt::Display for TransportBackend {
@@ -46,6 +54,7 @@ impl fmt::Display for TransportBackend {
         match self {
             Self::Tcp => write!(f, "tcp"),
             Self::Thunderbolt => write!(f, "thunderbolt"),
+            Self::Rdma => write!(f, "rdma"),
         }
     }
 }
@@ -57,8 +66,12 @@ impl std::str::FromStr for TransportBackend {
         match s.trim().to_ascii_lowercase().replace('-', "_").as_str() {
             "tcp" => Ok(Self::Tcp),
             "thunderbolt" => Ok(Self::Thunderbolt),
+            "rdma" => Ok(Self::Rdma),
             other => {
-                bail!("unknown transport backend '{other}'; expected one of: tcp, thunderbolt")
+                bail!(
+                    "unknown transport backend '{other}'; \
+                     expected one of: tcp, thunderbolt, rdma"
+                )
             }
         }
     }

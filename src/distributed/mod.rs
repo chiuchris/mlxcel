@@ -24,6 +24,8 @@
 //! - [`transport`] — abstract transport trait with streaming and RPC modes
 //! - [`tcp_transport`] — TCP backend with connection pooling
 //! - [`thunderbolt_transport`] — Thunderbolt Bridge backend built on the shared TCP transport core
+//! - [`rdma_transport`] — RDMA-aware backend that negotiates OS-level zero-copy primitives (`io_uring` on Linux, `kqueue`/`writev` registered regions on macOS) and falls back transparently to TCP with a single logged reason
+//! - [`rdma_capabilities`] — OS-specific capability probe and protocol-version negotiation for the RDMA-aware transport
 //! - [`connection_pool`] — connection pooling with reconnection logic
 //! - [`heartbeat`] — heartbeat protocol with configurable interval and failure threshold
 //! - [`failure_detector`] — threshold-based failure detection integrated with node registry
@@ -42,6 +44,7 @@
 
 pub mod backpressure;
 pub mod bench;
+pub mod bench_activation;
 pub mod cluster_init;
 pub mod config;
 pub mod connection_pool;
@@ -57,6 +60,8 @@ pub mod metrics;
 #[cfg(any(test, feature = "test-utils"))]
 pub mod mock_transport;
 pub mod pipeline;
+pub mod rdma_capabilities;
+pub mod rdma_transport;
 pub mod registry;
 pub mod request_tracker;
 pub mod routing;
@@ -76,6 +81,10 @@ pub mod transport_factory;
 
 pub use backpressure::{
     BackpressureConfig, BackpressureMonitor, BackpressurePolicy, BackpressureSignal, LoadLevel,
+};
+pub use bench_activation::{
+    ActivationBenchConfig, ActivationTransferReport, DrainHandle, measure_activation_transfer,
+    render_markdown_report, spawn_drain_task,
 };
 pub use cluster_init::{
     ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, DEFAULT_CONTROL_BASE_PORT,
@@ -177,5 +186,10 @@ pub use tensor_serialize::{
     DeserializedTensor, SerializeOptions, deserialize_tensor, serialize_tensor,
     serialize_tensor_to_bytes,
 };
+pub use rdma_capabilities::{
+    RDMA_PROTOCOL_VERSION, RdmaAcceleration, RdmaCapabilities, negotiate_protocol_version,
+    probe_capabilities,
+};
+pub use rdma_transport::{RdmaTransport, RdmaTransportConfig};
 pub use thunderbolt_transport::{ThunderboltTransport, ThunderboltTransportConfig};
 pub use transport::{Transport, TransportBackend, TransportMessage};

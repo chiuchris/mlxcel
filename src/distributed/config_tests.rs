@@ -121,6 +121,30 @@ stage = 1
 }
 
 #[test]
+fn parse_pipeline_stage_cluster_with_rdma_backend() {
+    let toml_str = r#"
+[cluster]
+name = "pipeline"
+pipeline_parallel_size = 2
+transport_backend = "rdma"
+
+[[nodes]]
+id = "stage-0"
+address = "10.0.0.11:9000"
+role = "pipeline_stage"
+stage = 0
+
+[[nodes]]
+id = "stage-1"
+address = "10.0.0.12:9000"
+role = "pipeline_stage"
+stage = 1
+"#;
+    let config = ClusterConfig::from_toml(toml_str).unwrap();
+    assert_eq!(config.cluster.transport_backend, TransportBackend::Rdma);
+}
+
+#[test]
 fn reject_pipeline_config_with_missing_stage_index() {
     let toml_str = r#"
 [cluster]

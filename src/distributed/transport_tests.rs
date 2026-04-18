@@ -41,4 +41,28 @@ fn message_kind_rejects_unknown() {
 fn transport_backend_display() {
     assert_eq!(TransportBackend::Tcp.to_string(), "tcp");
     assert_eq!(TransportBackend::Thunderbolt.to_string(), "thunderbolt");
+    assert_eq!(TransportBackend::Rdma.to_string(), "rdma");
+}
+
+#[test]
+fn transport_backend_from_str_accepts_rdma() {
+    use std::str::FromStr;
+    assert_eq!(
+        TransportBackend::from_str("rdma").unwrap(),
+        TransportBackend::Rdma
+    );
+    assert_eq!(
+        TransportBackend::from_str("  RDMA  ").unwrap(),
+        TransportBackend::Rdma
+    );
+}
+
+#[test]
+fn transport_backend_from_str_reports_valid_set_in_error() {
+    use std::str::FromStr;
+    let err = TransportBackend::from_str("infiniband").unwrap_err();
+    let rendered = format!("{err}");
+    assert!(rendered.contains("tcp"));
+    assert!(rendered.contains("thunderbolt"));
+    assert!(rendered.contains("rdma"));
 }

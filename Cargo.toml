@@ -84,6 +84,12 @@ async-stream = "0.3"
 fancy-regex = "0.17.0"
 toml = "0.8"
 
+[target.'cfg(unix)'.dependencies]
+# Used for the RDMA-aware transport backend capability probe (io_uring on
+# Linux, kqueue / writev batched sends on macOS). Unix-only: this does not
+# affect Windows builds of the library today.
+libc = "0.2"
+
 [profile.release]
 strip = true              # Strip all symbols for smaller binary
 lto = true                # Full (fat) LTO for best size and performance
