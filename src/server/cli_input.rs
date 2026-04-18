@@ -133,6 +133,16 @@ pub struct ServerStartupInput {
     /// Maximum number of cached post-projection image features per loaded model.
     /// `0` disables the cache entirely.
     pub vision_cache_size: usize,
+
+    // Elastic pipeline-parallel repartitioning (issue #349).
+    /// Enable `--enable-elastic-pp`. Off by default.
+    pub enable_elastic_pp: bool,
+    /// Drain timeout seconds for elastic repartitioning.
+    pub elastic_pp_drain_timeout: u64,
+    /// Memory-pressure trigger fraction for elastic repartitioning.
+    pub elastic_pp_pressure_fraction: f64,
+    /// Cool-down seconds between memory-pressure triggers.
+    pub elastic_pp_cool_down: u64,
 }
 
 impl ServerStartupInput {
@@ -206,6 +216,10 @@ impl ServerStartupInput {
             tp_embedding_mode: self.tp_embedding_mode,
             tp_lm_head_mode: self.tp_lm_head_mode,
             vision_cache_size: self.vision_cache_size,
+            enable_elastic_pp: self.enable_elastic_pp,
+            elastic_pp_drain_timeout: self.elastic_pp_drain_timeout,
+            elastic_pp_pressure_fraction: self.elastic_pp_pressure_fraction,
+            elastic_pp_cool_down: self.elastic_pp_cool_down,
         }
     }
 }

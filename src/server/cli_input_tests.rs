@@ -85,6 +85,10 @@ fn sample_input() -> ServerStartupInput {
         tp_embedding_mode: "replicated".to_string(),
         tp_lm_head_mode: "replicated".to_string(),
         vision_cache_size: 20,
+        enable_elastic_pp: false,
+        elastic_pp_drain_timeout: 120,
+        elastic_pp_pressure_fraction: 0.92,
+        elastic_pp_cool_down: 30,
     }
 }
 

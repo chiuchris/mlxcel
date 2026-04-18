@@ -94,6 +94,10 @@ fn sample_args() -> crate::ServeArgs {
         _cont_batching: false,
         kv_cache_mode: "fp16".to_string(),
         vision_cache_size: 20,
+        enable_elastic_pp: false,
+        elastic_pp_drain_timeout: 120,
+        elastic_pp_pressure_fraction: 0.92,
+        elastic_pp_cool_down: 30,
     }
 }
 

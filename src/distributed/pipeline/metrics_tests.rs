@@ -145,3 +145,107 @@ fn metrics_summary_display() {
     let display = format!("{summary}");
     assert!(display.contains("stages=4"));
 }
+
+// -----------------------------------------------------------------------------
+// Elastic repartition counters (issue #349 emission path, #350 read path).
+// -----------------------------------------------------------------------------
+
+mod repartition {
+    use super::super::RepartitionMetrics;
+    use crate::distributed::pipeline::elastic::{
+        RepartitionEvent, RepartitionEventSink, RepartitionOutcome, RepartitionState,
+        RepartitionTrigger,
+    };
+    use std::time::Duration;
+
+    fn completed_event(trigger: RepartitionTrigger) -> RepartitionEvent {
+        RepartitionEvent {
+            trigger,
+            to_state: RepartitionState::Idle,
+            drain_duration: Duration::from_millis(200),
+            total_duration: Duration::from_millis(500),
+            outcome: Some(RepartitionOutcome::Completed),
+            ranges_before: vec![0..8, 8..16],
+            ranges_after: vec![0..10, 10..16],
+        }
+    }
+
+    fn failed_event(trigger: RepartitionTrigger) -> RepartitionEvent {
+        RepartitionEvent {
+            trigger,
+            to_state: RepartitionState::Failed,
+            drain_duration: Duration::from_millis(50),
+            total_duration: Duration::from_millis(120),
+            outcome: Some(RepartitionOutcome::Failed),
+            ranges_before: vec![0..8, 8..16],
+            ranges_after: Vec::new(),
+        }
+    }
+
+    fn progress_event(trigger: RepartitionTrigger) -> RepartitionEvent {
+        RepartitionEvent {
+            trigger,
+            to_state: RepartitionState::Draining,
+            drain_duration: Duration::ZERO,
+            total_duration: Duration::from_millis(10),
+            outcome: None,
+            ranges_before: vec![0..8, 8..16],
+            ranges_after: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn sink_counts_events_by_trigger_and_outcome() {
+        let metrics = RepartitionMetrics::new();
+
+        metrics.record_event(&completed_event(RepartitionTrigger::Explicit));
+        metrics.record_event(&failed_event(RepartitionTrigger::MemoryPressure {
+            stage_index: 1,
+            fraction: 0.97,
+        }));
+        metrics.record_event(&progress_event(RepartitionTrigger::Explicit));
+
+        let snap = metrics.snapshot();
+        assert_eq!(snap.counters.get("explicit:completed"), Some(&1));
+        assert_eq!(snap.counters.get("memory_pressure:failed"), Some(&1));
+        assert_eq!(snap.counters.get("explicit:progress"), Some(&1));
+        assert_eq!(snap.total_events(), 3);
+    }
+
+    #[test]
+    fn completed_events_drive_drain_histogram_totals() {
+        let metrics = RepartitionMetrics::new();
+        metrics.record_event(&completed_event(RepartitionTrigger::Explicit));
+        metrics.record_event(&completed_event(RepartitionTrigger::Explicit));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.drain_count, 2);
+        // Two 200ms drains -> 400_000us total, mean = 200_000us.
+        assert_eq!(snap.drain_us_total, 400_000);
+        assert_eq!(snap.mean_drain_us(), 200_000);
+        assert_eq!(snap.drain_us_max, 200_000);
+    }
+
+    #[test]
+    fn failed_events_are_counted_but_not_in_drain_histogram() {
+        let metrics = RepartitionMetrics::new();
+        metrics.record_event(&failed_event(RepartitionTrigger::Explicit));
+        let snap = metrics.snapshot();
+        assert_eq!(
+            snap.drain_count, 0,
+            "failed events must not pollute drain p50"
+        );
+        // Failed events still count toward total repartition observations.
+        assert_eq!(snap.total_count, 1);
+        assert!(snap.total_us_total >= 120_000);
+    }
+
+    #[test]
+    fn progress_events_do_not_affect_terminal_totals() {
+        let metrics = RepartitionMetrics::new();
+        metrics.record_event(&progress_event(RepartitionTrigger::Explicit));
+        let snap = metrics.snapshot();
+        assert_eq!(snap.total_count, 0, "progress events are not terminal");
+        assert_eq!(snap.drain_count, 0);
+        assert_eq!(snap.mean_drain_us(), 0);
+    }
+}

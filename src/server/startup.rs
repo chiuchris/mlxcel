@@ -27,7 +27,8 @@ use tower::Service;
 
 use crate::SamplingConfig;
 use crate::distributed::pipeline::{
-    RemoteStageServiceConfig, RemoteStageServiceHandle, resolve_in_process_pipeline_num_layers,
+    ElasticPpConfig, RemoteStageServiceConfig, RemoteStageServiceHandle,
+    resolve_in_process_pipeline_num_layers,
 };
 use crate::distributed::{
     ClusterConfig, ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, NodeRegistry,
@@ -176,6 +177,20 @@ pub struct ServerStartupConfig {
     /// `0` disables the cache. Default matches
     /// [`DEFAULT_VISION_CACHE_SIZE`](crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE).
     pub vision_cache_size: usize,
+
+    // Elastic pipeline-parallel repartitioning (issue #349).
+    /// When `true`, the runtime constructs the elastic repartition coordinator
+    /// described in `docs_internal/architecture/elastic-pipeline-repartition-
+    /// 20260418.md`. Off by default so existing deployments are unaffected.
+    pub enable_elastic_pp: bool,
+    /// Drain timeout (seconds). Only consulted when `enable_elastic_pp` is set.
+    pub elastic_pp_drain_timeout: u64,
+    /// Memory-pressure trigger fraction. Clamped to `(0.0, 1.0]` at consumption
+    /// time.
+    pub elastic_pp_pressure_fraction: f64,
+    /// Cool-down (seconds) between successive memory-pressure triggers on the
+    /// same stage.
+    pub elastic_pp_cool_down: u64,
 }
 
 impl Default for ServerStartupConfig {
@@ -246,8 +261,31 @@ impl Default for ServerStartupConfig {
             tp_embedding_mode: "replicated".to_string(),
             tp_lm_head_mode: "replicated".to_string(),
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
+            enable_elastic_pp: false,
+            elastic_pp_drain_timeout: 120,
+            elastic_pp_pressure_fraction: 0.92,
+            elastic_pp_cool_down: 30,
         }
     }
+}
+
+/// Resolve the elastic repartition configuration from CLI flags.
+///
+/// Returns `None` when `--enable-elastic-pp` is not set, which is the
+/// default. Callers that construct a
+/// [`super::super::distributed::pipeline::RepartitionCoordinator`] should
+/// skip construction when this helper returns `None`.
+pub(super) fn resolve_elastic_pp_config(startup: &ServerStartupConfig) -> Option<ElasticPpConfig> {
+    if !startup.enable_elastic_pp {
+        return None;
+    }
+    let cfg = ElasticPpConfig::enabled()
+        .with_drain_timeout(std::time::Duration::from_secs(
+            startup.elastic_pp_drain_timeout,
+        ))
+        .with_cool_down(std::time::Duration::from_secs(startup.elastic_pp_cool_down))
+        .with_trigger_memory_fraction(startup.elastic_pp_pressure_fraction);
+    Some(cfg)
 }
 
 pub(super) fn resolve_default_max_tokens(n_predict: i32) -> usize {
@@ -993,6 +1031,22 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             "Server pipeline runtime enabled ({})",
             pipeline_runtime.describe()
         );
+    }
+    if let Some(elastic_cfg) = resolve_elastic_pp_config(&startup) {
+        if config.pipeline_parallel_runtime.is_none() {
+            tracing::warn!(
+                "--enable-elastic-pp was set but no pipeline-parallel runtime is active; \
+                 elastic repartitioning requires PP (ignore if launching as a peer)"
+            );
+        } else {
+            tracing::info!(
+                drain_timeout_s = elastic_cfg.drain_timeout.as_secs(),
+                cool_down_s = elastic_cfg.cool_down.as_secs(),
+                pressure_fraction = elastic_cfg.trigger_memory_fraction,
+                "Elastic pipeline repartitioning enabled (experimental, see \
+                 docs_internal/architecture/elastic-pipeline-repartition-20260418.md)"
+            );
+        }
     }
     if let Some(service_config) = distributed.remote_stage_service {
         return serve_remote_pipeline_stage(service_config).await;

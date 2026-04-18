@@ -484,6 +484,45 @@ struct Args {
     /// subsequent turns. `0` disables caching. Default: 20.
     #[arg(long = "vision-cache-size", default_value_t = 20, value_name = "N")]
     vision_cache_size: usize,
+
+    /// Enable experimental elastic pipeline-parallel repartitioning.
+    ///
+    /// When set, `mlxcel-server` constructs a repartition coordinator (see
+    /// `docs_internal/architecture/elastic-pipeline-repartition-20260418.md`)
+    /// that can drain in-flight requests, recompute the partition plan, and
+    /// reload layer weights without a full cluster restart. Off by default —
+    /// v1 is explicitly opt-in.
+    #[arg(long = "enable-elastic-pp", default_value_t = false)]
+    enable_elastic_pp: bool,
+
+    /// Maximum wait (seconds) for in-flight requests to drain during an
+    /// elastic repartition. Only meaningful with `--enable-elastic-pp`.
+    #[arg(
+        long = "elastic-pp-drain-timeout",
+        default_value_t = 120,
+        value_name = "SECONDS"
+    )]
+    elastic_pp_drain_timeout: u64,
+
+    /// Memory usage fraction above which a memory-pressure trigger fires.
+    /// Values outside (0.0, 1.0] are clamped. Default: 0.92. Only meaningful
+    /// with `--enable-elastic-pp`.
+    #[arg(
+        long = "elastic-pp-pressure-fraction",
+        default_value_t = 0.92,
+        value_name = "FRACTION"
+    )]
+    elastic_pp_pressure_fraction: f64,
+
+    /// Cool-down (seconds) between successive memory-pressure repartition
+    /// triggers on the same stage. Explicit operator triggers bypass this
+    /// debounce. Default: 30. Only meaningful with `--enable-elastic-pp`.
+    #[arg(
+        long = "elastic-pp-cool-down",
+        default_value_t = 30,
+        value_name = "SECONDS"
+    )]
+    elastic_pp_cool_down: u64,
 }
 
 #[tokio::main]
@@ -561,5 +600,9 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         tp_embedding_mode: args.tp_embedding_mode,
         tp_lm_head_mode: args.tp_lm_head_mode,
         vision_cache_size: args.vision_cache_size,
+        enable_elastic_pp: args.enable_elastic_pp,
+        elastic_pp_drain_timeout: args.elastic_pp_drain_timeout,
+        elastic_pp_pressure_fraction: args.elastic_pp_pressure_fraction,
+        elastic_pp_cool_down: args.elastic_pp_cool_down,
     }
 }

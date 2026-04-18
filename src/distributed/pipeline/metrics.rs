@@ -18,11 +18,20 @@
 //! the pipeline schedule. Metrics are collected per-step and can be
 //! aggregated for reporting.
 //!
+//! Also exposes counters/histograms for elastic repartition events (issue
+//! #349). The sink API is intentionally transport-agnostic — the Prometheus
+//! endpoint (#350) reads from [`RepartitionMetricsSnapshot`] while unit tests
+//! inspect the raw [`RepartitionMetrics`] struct.
+//!
 //! Used by: pipeline schedule, pipeline execution loop, server metrics endpoint
 
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use super::elastic::{RepartitionEvent, RepartitionEventSink, RepartitionOutcome};
 
 /// Per-stage timing breakdown for a single pipeline step.
 #[derive(Debug, Clone)]
@@ -313,6 +322,147 @@ impl fmt::Display for MetricsSummary {
             self.average_bubble_ratio * 100.0,
             self.average_utilization * 100.0,
         )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Elastic repartition counters (consumed by #350's /metrics endpoint)
+// ---------------------------------------------------------------------------
+
+/// Atomic counters + histogram totals for elastic repartition events.
+///
+/// This is the low-level container the coordinator writes to; the
+/// Prometheus endpoint reads a [`RepartitionMetricsSnapshot`] to render
+/// stable text output. Used by: #349 elastic coordinator (writer),
+/// #350 Prometheus endpoint (reader).
+#[derive(Debug, Default)]
+pub struct RepartitionMetrics {
+    /// Total repartition events, partitioned by trigger kind + outcome.
+    ///
+    /// Key format: `(trigger_kind, outcome_label)`.
+    ///
+    /// `trigger_kind` is one of: "explicit", "memory_pressure".
+    /// `outcome_label` is one of: "completed", "aborted", "failed", "progress"
+    /// (the latter is emitted for intermediate state transitions).
+    counters: Mutex<HashMap<(&'static str, &'static str), u64>>,
+    /// Sum of drain durations observed on `completed` outcomes, in
+    /// microseconds.
+    drain_us_total: AtomicU64,
+    /// Number of completed drains (the histogram count).
+    drain_count: AtomicU64,
+    /// Sum of total durations observed across *all* terminal events, in
+    /// microseconds. Useful for computing average repartition wall time.
+    total_us_total: AtomicU64,
+    /// Number of terminal events observed across all outcomes.
+    total_count: AtomicU64,
+    /// Maximum drain duration observed, microseconds. Simple O(1) proxy for
+    /// a p99 until the full histogram lands.
+    drain_us_max: AtomicU64,
+}
+
+impl RepartitionMetrics {
+    /// Create a fresh metrics container.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Snapshot for the Prometheus endpoint.
+    pub fn snapshot(&self) -> RepartitionMetricsSnapshot {
+        let counters: HashMap<String, u64> = self
+            .counters
+            .lock()
+            .expect("repartition metrics poisoned")
+            .iter()
+            .map(|((k, v), count)| (format!("{k}:{v}"), *count))
+            .collect();
+        RepartitionMetricsSnapshot {
+            counters,
+            drain_us_total: self.drain_us_total.load(Ordering::Relaxed),
+            drain_count: self.drain_count.load(Ordering::Relaxed),
+            total_us_total: self.total_us_total.load(Ordering::Relaxed),
+            total_count: self.total_count.load(Ordering::Relaxed),
+            drain_us_max: self.drain_us_max.load(Ordering::Relaxed),
+        }
+    }
+
+    fn bump(&self, key: (&'static str, &'static str)) {
+        let mut map = self.counters.lock().expect("repartition metrics poisoned");
+        *map.entry(key).or_insert(0) += 1;
+    }
+
+    fn record_drain(&self, drain_us: u64) {
+        self.drain_us_total.fetch_add(drain_us, Ordering::Relaxed);
+        self.drain_count.fetch_add(1, Ordering::Relaxed);
+        let mut current = self.drain_us_max.load(Ordering::Relaxed);
+        while drain_us > current {
+            match self.drain_us_max.compare_exchange_weak(
+                current,
+                drain_us,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+impl RepartitionEventSink for RepartitionMetrics {
+    fn record_event(&self, event: &RepartitionEvent) {
+        let trigger_kind = event.trigger.kind_label();
+        let outcome_label = match event.outcome {
+            Some(RepartitionOutcome::Completed) => "completed",
+            Some(RepartitionOutcome::Aborted) => "aborted",
+            Some(RepartitionOutcome::Failed) => "failed",
+            None => "progress",
+        };
+        self.bump((trigger_kind, outcome_label));
+        if event.outcome.is_some() {
+            self.total_us_total.fetch_add(
+                event.total_duration.as_micros().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            self.total_count.fetch_add(1, Ordering::Relaxed);
+        }
+        if matches!(event.outcome, Some(RepartitionOutcome::Completed)) {
+            self.record_drain(event.drain_duration.as_micros().min(u128::from(u64::MAX)) as u64);
+        }
+    }
+}
+
+/// Snapshot returned by [`RepartitionMetrics::snapshot`] for rendering.
+#[derive(Debug, Clone, Default)]
+pub struct RepartitionMetricsSnapshot {
+    /// Counter values keyed by "trigger_kind:outcome".
+    pub counters: HashMap<String, u64>,
+    /// Sum of drain durations across completed events, microseconds.
+    pub drain_us_total: u64,
+    /// Number of completed drain observations.
+    pub drain_count: u64,
+    /// Sum of total repartition durations across terminal events, microseconds.
+    pub total_us_total: u64,
+    /// Number of terminal events observed.
+    pub total_count: u64,
+    /// Largest drain duration observed so far, microseconds.
+    pub drain_us_max: u64,
+}
+
+impl RepartitionMetricsSnapshot {
+    /// Total events counted, regardless of outcome.
+    pub fn total_events(&self) -> u64 {
+        self.counters.values().copied().sum()
+    }
+
+    /// Mean drain duration (microseconds) across completed events, or zero
+    /// when no completed drain has been observed yet.
+    pub fn mean_drain_us(&self) -> u64 {
+        if self.drain_count == 0 {
+            0
+        } else {
+            self.drain_us_total / self.drain_count
+        }
     }
 }
 

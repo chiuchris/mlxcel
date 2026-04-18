@@ -96,6 +96,10 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         tp_embedding_mode: args.tp_embedding_mode,
         tp_lm_head_mode: args.tp_lm_head_mode,
         vision_cache_size: args.vision_cache_size,
+        enable_elastic_pp: args.enable_elastic_pp,
+        elastic_pp_drain_timeout: args.elastic_pp_drain_timeout,
+        elastic_pp_pressure_fraction: args.elastic_pp_pressure_fraction,
+        elastic_pp_cool_down: args.elastic_pp_cool_down,
     }
 }
 

@@ -677,6 +677,34 @@ pub(crate) struct ServeArgs {
     /// subsequent turns. `0` disables caching. Default: 20.
     #[arg(long = "vision-cache-size", default_value_t = 20, value_name = "N")]
     vision_cache_size: usize,
+
+    /// Enable experimental elastic pipeline-parallel repartitioning.
+    #[arg(long = "enable-elastic-pp", default_value_t = false)]
+    enable_elastic_pp: bool,
+
+    /// Drain timeout (seconds) for elastic repartitioning.
+    #[arg(
+        long = "elastic-pp-drain-timeout",
+        default_value_t = 120,
+        value_name = "SECONDS"
+    )]
+    elastic_pp_drain_timeout: u64,
+
+    /// Memory-pressure trigger fraction for elastic repartitioning.
+    #[arg(
+        long = "elastic-pp-pressure-fraction",
+        default_value_t = 0.92,
+        value_name = "FRACTION"
+    )]
+    elastic_pp_pressure_fraction: f64,
+
+    /// Cool-down (seconds) between memory-pressure repartition triggers.
+    #[arg(
+        long = "elastic-pp-cool-down",
+        default_value_t = 30,
+        value_name = "SECONDS"
+    )]
+    elastic_pp_cool_down: u64,
 }
 
 fn main() -> anyhow::Result<()> {

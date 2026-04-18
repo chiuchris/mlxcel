@@ -64,10 +64,19 @@
 //! - [`StageMetrics`] — per-stage timing breakdown
 //! - [`PipelineMetrics`] — bubble ratio, utilization, latency breakdown
 //! - [`MetricsCollector`] — accumulates metrics across pipeline steps
+//!
+//! Elastic repartitioning (issue #349):
+//!
+//! - [`ElasticPpConfig`] — runtime configuration for `--enable-elastic-pp`
+//! - [`RepartitionCoordinator`] — drain → rebalance → resume state machine
+//! - [`RepartitionTrigger`] / [`RepartitionState`] / [`RepartitionOutcome`]
+//! - [`RepartitionEvent`] / [`RepartitionEventSink`] — observability hooks
+//!   consumed by the metrics endpoint
 
 pub mod activation_transfer;
 pub mod benchmark;
 pub mod cache_manager;
+pub mod elastic;
 pub mod local_runtime;
 pub mod metrics;
 pub mod micro_batch;
@@ -105,13 +114,19 @@ pub use cache_manager::{
     broadcast_2d_eviction, broadcast_eviction, check_pipeline_pressure, coordinated_2d_admission,
     coordinated_admission, sync_metadata,
 };
+pub use elastic::{
+    ElasticPpConfig, ElasticRuntimeDriver, NoopEventSink, RecordingEventSink,
+    RepartitionCoordinator, RepartitionEvent, RepartitionEventSink, RepartitionOutcome,
+    RepartitionState, RepartitionTrigger,
+};
 pub use local_runtime::{
     load_in_process_stage_worker, load_in_process_stage_worker_with_adapter, log_partition_quality,
     resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
     resolve_in_process_stage_assignments_for_model,
 };
 pub use metrics::{
-    MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics, StageMetrics,
+    MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics,
+    RepartitionMetrics, RepartitionMetricsSnapshot, StageMetrics,
 };
 pub use micro_batch::{
     MicroBatch, MicroBatchSpec, split_into_micro_batches, suggested_micro_batch_size,
