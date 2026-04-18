@@ -179,9 +179,12 @@ role = "hybrid"
 stage = 0
 "#;
     let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    let msg = err.to_string();
     assert!(
-        err.to_string()
-            .contains("only pipeline_stage nodes may set stage")
+        msg.contains("only pipeline_stage")
+            && msg.contains("pipeline_tensor_parallel")
+            && msg.contains("may set stage"),
+        "unexpected error: {msg}"
     );
 }
 
@@ -350,4 +353,261 @@ fn from_cli_deduplicates_local_address_in_peers() {
         config.nodes[1].address,
         "192.168.1.2:9000".parse::<std::net::SocketAddr>().unwrap()
     );
+}
+
+// -- 2D (PP x TP) parallelism ------------------------------------------------
+
+#[test]
+fn parse_pp_tp_role_variants() {
+    for alias in ["pipeline_tensor_parallel", "pp_tp", "pptp", "PP-TP", "2d"] {
+        assert_eq!(
+            alias.parse::<NodeRole>().unwrap(),
+            NodeRole::PipelineTensorParallel,
+            "alias {alias} did not parse"
+        );
+    }
+}
+
+#[test]
+fn pp_tp_role_predicates() {
+    assert!(NodeRole::PipelineTensorParallel.is_pipeline());
+    assert!(NodeRole::PipelineTensorParallel.is_tensor_parallel());
+    assert!(NodeRole::PipelineTensorParallel.is_pp_tp());
+    assert!(NodeRole::PipelineStage.is_pipeline());
+    assert!(!NodeRole::PipelineStage.is_pp_tp());
+    assert!(!NodeRole::TensorParallelRank.is_pipeline());
+    assert!(NodeRole::TensorParallelRank.is_tensor_parallel());
+}
+
+fn build_2x2_cluster_toml() -> &'static str {
+    r#"
+[cluster]
+name = "pp-tp-2x2"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "s0-r0"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "s0-r1"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 1
+
+[[nodes]]
+id = "s1-r0"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "s1-r1"
+address = "10.0.0.21:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#
+}
+
+#[test]
+fn parse_pp_tp_2x2_cluster_config() {
+    let config = ClusterConfig::from_toml(build_2x2_cluster_toml()).unwrap();
+    assert_eq!(config.cluster.pipeline_parallel_size, 2);
+    assert_eq!(config.cluster.tensor_parallel_size, 2);
+    assert!(config.is_pp_tp_2d());
+    assert_eq!(config.pp_tp_nodes().len(), 4);
+    assert_eq!(config.pp_tp_nodes_at_stage(0).len(), 2);
+    assert_eq!(config.pp_tp_nodes_at_stage(1).len(), 2);
+    assert_eq!(config.pp_tp_nodes_at_rank(0).len(), 2);
+    assert_eq!(config.pp_tp_nodes_at_rank(1).len(), 2);
+    assert_eq!(config.pp_tp_node(0, 0).unwrap().id, "s0-r0");
+    assert_eq!(config.pp_tp_node(1, 1).unwrap().id, "s1-r1");
+    // Sort order should be (stage, rank).
+    let ordered = config.pp_tp_nodes();
+    assert_eq!(ordered[0].id, "s0-r0");
+    assert_eq!(ordered[1].id, "s0-r1");
+    assert_eq!(ordered[2].id, "s1-r0");
+    assert_eq!(ordered[3].id, "s1-r1");
+}
+
+#[test]
+fn pp_tp_missing_pair_fails_validation() {
+    let toml_str = r#"
+[cluster]
+name = "bad"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "s0-r0"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "s0-r1"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 1
+
+[[nodes]]
+id = "s1-r0"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    let msg = err.to_string();
+    // Message should clearly identify the 2D grid size mismatch.
+    assert!(
+        msg.contains("2x2") || msg.contains("2x2") || msg.contains("requires 4"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn pp_tp_duplicate_pair_fails_validation() {
+    let toml_str = r#"
+[cluster]
+name = "bad"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "a"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "b"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "c"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "d"
+address = "10.0.0.21:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("duplicate") && msg.contains("stage=0") && msg.contains("rank=0"),
+        "unexpected error: {msg}"
+    );
+}
+
+#[test]
+fn pp_tp_out_of_range_rank_fails_validation() {
+    let toml_str = r#"
+[cluster]
+name = "bad"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "s0-r0"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "s0-r1"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 5
+
+[[nodes]]
+id = "s1-r0"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "s1-r1"
+address = "10.0.0.21:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(
+        err.to_string().contains("out-of-range rank"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn pp_tp_missing_stage_fails_validation() {
+    let toml_str = r#"
+[cluster]
+name = "bad"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "a"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+rank = 0
+
+[[nodes]]
+id = "b"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 1
+
+[[nodes]]
+id = "c"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "d"
+address = "10.0.0.21:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#;
+    let err = ClusterConfig::from_toml(toml_str).unwrap_err();
+    assert!(
+        err.to_string().contains("missing required 'stage'"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
+fn topology_summary_shows_stage_and_rank() {
+    let config = ClusterConfig::from_toml(build_2x2_cluster_toml()).unwrap();
+    let summary = config.topology_summary();
+    assert!(summary.contains("(stage=0, rank=0)"));
+    assert!(summary.contains("(stage=1, rank=1)"));
 }

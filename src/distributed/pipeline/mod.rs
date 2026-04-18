@@ -94,9 +94,10 @@ pub use benchmark::{
 };
 pub use cache_manager::{
     AdmissionDecision, CacheAdmissionRequest, CacheMetadataSync, EvictionEvent, EvictionReason,
-    PipelineCacheConfig, PipelineCacheManager, PreemptionPolicy, PreemptionReason,
-    PreemptionSignal, RejectionReason, SequenceId, StageCacheAllocation, broadcast_eviction,
-    check_pipeline_pressure, coordinated_admission, sync_metadata,
+    PipelineCacheConfig, PipelineCacheManager, PpTpAdmissionOutcome, PpTpCoord, PreemptionPolicy,
+    PreemptionReason, PreemptionSignal, RejectionReason, SequenceId, StageCacheAllocation,
+    broadcast_2d_eviction, broadcast_eviction, check_pipeline_pressure, coordinated_2d_admission,
+    coordinated_admission, sync_metadata,
 };
 pub use local_runtime::{
     load_in_process_stage_worker, resolve_in_process_pipeline_num_layers,

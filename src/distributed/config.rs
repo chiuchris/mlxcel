@@ -35,6 +35,12 @@ const MAX_ID_LENGTH: usize = 128;
 /// A single node may serve one of several purposes depending on the
 /// parallelism strategy (pipeline parallel, tensor parallel, disaggregated
 /// inference, or a hybrid combination).
+///
+/// # 2D parallelism (PP × TP)
+///
+/// When PP and TP are composed, each node owns a specific `(pp_stage, tp_rank)`
+/// intersection of the 2D mesh. Such nodes carry the [`Self::PipelineTensorParallel`]
+/// role and populate both `stage` and `rank` on their [`NodeConfig`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
@@ -43,12 +49,38 @@ pub enum NodeRole {
     Prefill,
     /// Handles autoregressive decode only (disaggregated inference).
     Decode,
-    /// Owns one stage of a pipeline-parallel topology.
+    /// Owns one stage of a pipeline-parallel topology (1D PP, `tp_size == 1`).
     PipelineStage,
-    /// Participates as a rank in tensor-parallel execution.
+    /// Participates as a rank in tensor-parallel execution (1D TP, `pp_size == 1`).
     TensorParallelRank,
+    /// Owns one `(pp_stage, tp_rank)` intersection of a 2D parallelism mesh.
+    ///
+    /// Used when `pipeline_parallel_size > 1 && tensor_parallel_size > 1`. Every
+    /// node with this role must set both `stage` and `rank` on its
+    /// [`NodeConfig`].
+    PipelineTensorParallel,
     /// General-purpose node that can perform any function.
     Hybrid,
+}
+
+impl NodeRole {
+    /// Whether this role contributes to pipeline parallelism.
+    pub fn is_pipeline(&self) -> bool {
+        matches!(self, Self::PipelineStage | Self::PipelineTensorParallel)
+    }
+
+    /// Whether this role contributes to tensor parallelism.
+    pub fn is_tensor_parallel(&self) -> bool {
+        matches!(
+            self,
+            Self::TensorParallelRank | Self::PipelineTensorParallel
+        )
+    }
+
+    /// Whether this role is a 2D `(pp_stage, tp_rank)` role.
+    pub fn is_pp_tp(&self) -> bool {
+        matches!(self, Self::PipelineTensorParallel)
+    }
 }
 
 impl std::fmt::Display for NodeRole {
@@ -58,6 +90,7 @@ impl std::fmt::Display for NodeRole {
             Self::Decode => write!(f, "decode"),
             Self::PipelineStage => write!(f, "pipeline_stage"),
             Self::TensorParallelRank => write!(f, "tensor_parallel_rank"),
+            Self::PipelineTensorParallel => write!(f, "pipeline_tensor_parallel"),
             Self::Hybrid => write!(f, "hybrid"),
         }
     }
@@ -72,10 +105,13 @@ impl std::str::FromStr for NodeRole {
             "decode" => Ok(Self::Decode),
             "pipeline_stage" | "pipeline" => Ok(Self::PipelineStage),
             "tensor_parallel_rank" | "tensor_parallel" | "tp" => Ok(Self::TensorParallelRank),
+            "pipeline_tensor_parallel" | "pp_tp" | "pptp" | "2d" => {
+                Ok(Self::PipelineTensorParallel)
+            }
             "hybrid" => Ok(Self::Hybrid),
             other => anyhow::bail!(
                 "unknown node role '{other}'; expected one of: prefill, decode, \
-                 pipeline_stage, tensor_parallel_rank, hybrid"
+                 pipeline_stage, tensor_parallel_rank, pipeline_tensor_parallel, hybrid"
             ),
         }
     }
@@ -280,63 +316,196 @@ impl ClusterConfig {
             }
         }
 
-        let pipeline_stage_nodes: Vec<&NodeConfig> = self
-            .nodes
-            .iter()
-            .filter(|node| node.role == NodeRole::PipelineStage)
-            .collect();
-        if !pipeline_stage_nodes.is_empty() || self.cluster.pipeline_parallel_size > 1 {
-            anyhow::ensure!(
-                self.cluster.pipeline_parallel_size > 0,
-                "pipeline_parallel_size must be greater than 0 when pipeline stages are configured"
-            );
-            anyhow::ensure!(
-                pipeline_stage_nodes.len() == self.cluster.pipeline_parallel_size as usize,
-                "cluster config declares pipeline_parallel_size={} but defines {} pipeline_stage nodes",
-                self.cluster.pipeline_parallel_size,
-                pipeline_stage_nodes.len()
-            );
+        // Detect whether any 2D (PP×TP) role is present in the config.
+        let has_pp_tp_role = self.nodes.iter().any(|n| n.role.is_pp_tp());
+        let pp_size = self.cluster.pipeline_parallel_size;
+        let tp_size = self.cluster.tensor_parallel_size;
 
-            let mut seen_stages = std::collections::HashSet::new();
-            for node in pipeline_stage_nodes {
-                let stage = node.stage.ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "pipeline stage node '{}' is missing required 'stage' index",
-                        node.id
-                    )
-                })?;
+        if has_pp_tp_role || (pp_size > 1 && tp_size > 1) {
+            // 2D parallelism path.
+            self.validate_pp_tp_topology(pp_size, tp_size)?;
+        } else {
+            // Legacy 1D PP-only path.
+            let pipeline_stage_nodes: Vec<&NodeConfig> = self
+                .nodes
+                .iter()
+                .filter(|node| node.role == NodeRole::PipelineStage)
+                .collect();
+            if !pipeline_stage_nodes.is_empty() || pp_size > 1 {
                 anyhow::ensure!(
-                    stage < self.cluster.pipeline_parallel_size,
-                    "pipeline stage node '{}' has out-of-range stage index {} for pipeline_parallel_size={}",
-                    node.id,
-                    stage,
-                    self.cluster.pipeline_parallel_size
+                    pp_size > 0,
+                    "pipeline_parallel_size must be greater than 0 when pipeline stages are configured"
                 );
                 anyhow::ensure!(
-                    seen_stages.insert(stage),
-                    "duplicate pipeline stage index {} in cluster config",
-                    stage
+                    pipeline_stage_nodes.len() == pp_size as usize,
+                    "cluster config declares pipeline_parallel_size={} but defines {} pipeline_stage nodes",
+                    pp_size,
+                    pipeline_stage_nodes.len()
                 );
+
+                let mut seen_stages = std::collections::HashSet::new();
+                for node in pipeline_stage_nodes {
+                    let stage = node.stage.ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "pipeline stage node '{}' is missing required 'stage' index",
+                            node.id
+                        )
+                    })?;
+                    anyhow::ensure!(
+                        stage < pp_size,
+                        "pipeline stage node '{}' has out-of-range stage index {} for pipeline_parallel_size={}",
+                        node.id,
+                        stage,
+                        pp_size
+                    );
+                    anyhow::ensure!(
+                        seen_stages.insert(stage),
+                        "duplicate pipeline stage index {} in cluster config",
+                        stage
+                    );
+                }
+                for expected_stage in 0..pp_size {
+                    anyhow::ensure!(
+                        seen_stages.contains(&expected_stage),
+                        "missing pipeline stage index {} in cluster config",
+                        expected_stage
+                    );
+                }
             }
-            for expected_stage in 0..self.cluster.pipeline_parallel_size {
+
+            for node in &self.nodes {
+                if node.role != NodeRole::PipelineStage
+                    && let Some(stage) = node.stage
+                {
+                    anyhow::bail!(
+                        "node '{}' sets stage={} but role is {}; only pipeline_stage or \
+                         pipeline_tensor_parallel nodes may set stage",
+                        node.id,
+                        stage,
+                        node.role
+                    );
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Validate a 2D (PP × TP) cluster topology.
+    ///
+    /// Guarantees:
+    ///   * `pp_size >= 1 && tp_size >= 1`
+    ///   * exactly `pp_size * tp_size` nodes carry the `PipelineTensorParallel` role
+    ///   * every `(stage, rank)` pair in the grid is present exactly once
+    ///   * each PPTP node has both `stage` and `rank` set, within range
+    ///   * no node outside the 2D role sets `stage` or `rank`
+    fn validate_pp_tp_topology(&self, pp_size: u32, tp_size: u32) -> Result<()> {
+        anyhow::ensure!(
+            pp_size > 0,
+            "pipeline_parallel_size must be greater than 0 for 2D parallelism"
+        );
+        anyhow::ensure!(
+            tp_size > 0,
+            "tensor_parallel_size must be greater than 0 for 2D parallelism"
+        );
+        let expected = (pp_size as usize)
+            .checked_mul(tp_size as usize)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pipeline_parallel_size * tensor_parallel_size overflows: pp={} tp={}",
+                    pp_size,
+                    tp_size
+                )
+            })?;
+
+        let pptp_nodes: Vec<&NodeConfig> =
+            self.nodes.iter().filter(|n| n.role.is_pp_tp()).collect();
+        anyhow::ensure!(
+            pptp_nodes.len() == expected,
+            "cluster config declares a {}x{} (PP x TP) 2D mesh that requires {} \
+             pipeline_tensor_parallel nodes, but {} were defined",
+            pp_size,
+            tp_size,
+            expected,
+            pptp_nodes.len()
+        );
+
+        let mut seen_pairs: std::collections::HashSet<(u32, u32)> =
+            std::collections::HashSet::with_capacity(expected);
+        for node in &pptp_nodes {
+            let stage = node.stage.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pipeline_tensor_parallel node '{}' is missing required 'stage' index",
+                    node.id
+                )
+            })?;
+            let rank = node.rank.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pipeline_tensor_parallel node '{}' is missing required 'rank' index",
+                    node.id
+                )
+            })?;
+            anyhow::ensure!(
+                stage < pp_size,
+                "pipeline_tensor_parallel node '{}' has out-of-range stage {} for \
+                 pipeline_parallel_size={}",
+                node.id,
+                stage,
+                pp_size
+            );
+            anyhow::ensure!(
+                rank < tp_size,
+                "pipeline_tensor_parallel node '{}' has out-of-range rank {} for \
+                 tensor_parallel_size={}",
+                node.id,
+                rank,
+                tp_size
+            );
+            anyhow::ensure!(
+                seen_pairs.insert((stage, rank)),
+                "duplicate (stage={}, rank={}) in 2D parallelism cluster config",
+                stage,
+                rank
+            );
+        }
+
+        // Full coverage: every pair in the grid must be present.
+        for s in 0..pp_size {
+            for r in 0..tp_size {
                 anyhow::ensure!(
-                    seen_stages.contains(&expected_stage),
-                    "missing pipeline stage index {} in cluster config",
-                    expected_stage
+                    seen_pairs.contains(&(s, r)),
+                    "missing (stage={}, rank={}) node in 2D parallelism cluster config",
+                    s,
+                    r
                 );
             }
         }
 
+        // Non-PPTP nodes must not set stage/rank.
         for node in &self.nodes {
-            if node.role != NodeRole::PipelineStage
-                && let Some(stage) = node.stage
-            {
-                anyhow::bail!(
-                    "node '{}' sets stage={} but role is {}; only pipeline_stage nodes may set stage",
-                    node.id,
-                    stage,
-                    node.role
-                );
+            if !node.role.is_pp_tp() {
+                if let Some(stage) = node.stage
+                    && node.role != NodeRole::PipelineStage
+                {
+                    anyhow::bail!(
+                        "node '{}' sets stage={} but role is {}; only pipeline_stage or \
+                         pipeline_tensor_parallel nodes may set stage",
+                        node.id,
+                        stage,
+                        node.role
+                    );
+                }
+                if let Some(rank) = node.rank
+                    && node.role != NodeRole::TensorParallelRank
+                {
+                    anyhow::bail!(
+                        "node '{}' sets rank={} but role is {}; only tensor_parallel_rank or \
+                         pipeline_tensor_parallel nodes may set rank",
+                        node.id,
+                        rank,
+                        node.role
+                    );
+                }
             }
         }
 
@@ -366,6 +535,49 @@ impl ClusterConfig {
             .find(|node| node.role == NodeRole::PipelineStage && node.stage == Some(stage))
     }
 
+    /// Return whether this cluster uses 2D (PP × TP) parallelism.
+    pub fn is_pp_tp_2d(&self) -> bool {
+        self.cluster.pipeline_parallel_size > 1
+            && self.cluster.tensor_parallel_size > 1
+            && self.nodes.iter().any(|n| n.role.is_pp_tp())
+    }
+
+    /// Return PPTP nodes sorted by (stage, rank).
+    pub fn pp_tp_nodes(&self) -> Vec<&NodeConfig> {
+        let mut nodes: Vec<&NodeConfig> = self.nodes.iter().filter(|n| n.role.is_pp_tp()).collect();
+        nodes.sort_by_key(|n| (n.stage.unwrap_or(u32::MAX), n.rank.unwrap_or(u32::MAX)));
+        nodes
+    }
+
+    /// Return the PPTP node for the given `(stage, rank)`, if present.
+    pub fn pp_tp_node(&self, stage: u32, rank: u32) -> Option<&NodeConfig> {
+        self.nodes.iter().find(|node| {
+            node.role.is_pp_tp() && node.stage == Some(stage) && node.rank == Some(rank)
+        })
+    }
+
+    /// Return all PPTP nodes on a given pipeline stage (one per TP rank).
+    pub fn pp_tp_nodes_at_stage(&self, stage: u32) -> Vec<&NodeConfig> {
+        let mut nodes: Vec<&NodeConfig> = self
+            .nodes
+            .iter()
+            .filter(|n| n.role.is_pp_tp() && n.stage == Some(stage))
+            .collect();
+        nodes.sort_by_key(|n| n.rank.unwrap_or(u32::MAX));
+        nodes
+    }
+
+    /// Return all PPTP nodes at a given TP rank (one per pipeline stage).
+    pub fn pp_tp_nodes_at_rank(&self, rank: u32) -> Vec<&NodeConfig> {
+        let mut nodes: Vec<&NodeConfig> = self
+            .nodes
+            .iter()
+            .filter(|n| n.role.is_pp_tp() && n.rank == Some(rank))
+            .collect();
+        nodes.sort_by_key(|n| n.stage.unwrap_or(u32::MAX));
+        nodes
+    }
+
     /// Pretty-print a summary of the cluster topology.
     pub fn topology_summary(&self) -> String {
         use std::fmt::Write;
@@ -378,7 +590,17 @@ impl ClusterConfig {
         );
         let _ = writeln!(out, "  Nodes ({}):", self.nodes.len());
         for node in &self.nodes {
-            let _ = writeln!(out, "    - {} @ {} [{}]", node.id, node.address, node.role);
+            let coords = match (node.stage, node.rank) {
+                (Some(s), Some(r)) => format!(" (stage={s}, rank={r})"),
+                (Some(s), None) => format!(" (stage={s})"),
+                (None, Some(r)) => format!(" (rank={r})"),
+                (None, None) => String::new(),
+            };
+            let _ = writeln!(
+                out,
+                "    - {} @ {} [{}]{coords}",
+                node.id, node.address, node.role
+            );
         }
         out
     }

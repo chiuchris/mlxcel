@@ -54,8 +54,63 @@ pub struct RoutingRequest {
     pub preferred_role: Option<NodeRole>,
     /// Preferred pipeline stage (for PP routing).
     pub preferred_stage: Option<u32>,
+    /// Preferred tensor-parallel rank (for 2D PP×TP routing).
+    pub preferred_rank: Option<u32>,
+    /// Traffic class for 2D routing: intra-stage TP collective vs inter-stage
+    /// PP activation transfer. Ignored for 1D topologies.
+    pub traffic_class: TrafficClass,
     /// Optional hint for sticky routing (route to same node as before).
     pub affinity_node: Option<String>,
+}
+
+/// Traffic classification used by 2D (PP × TP) transport routing.
+///
+/// The connection pool is shared across classes, but the routing layer picks a
+/// different peer set for each class:
+///
+/// - [`Self::TpCollective`] — intra-stage all-reduce / reduce-scatter /
+///   all-gather traffic; peer set is all PPTP nodes on the same pipeline
+///   stage.
+/// - [`Self::PpActivation`] — inter-stage activation / boundary tensor
+///   handoff; peer set is the adjacent-stage node at the same TP rank.
+/// - [`Self::Any`] — legacy 1D topologies that do not need the distinction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TrafficClass {
+    /// Unspecified (legacy / 1D topologies).
+    #[default]
+    Any,
+    /// Intra-stage TP collective traffic (all-reduce family).
+    TpCollective,
+    /// Inter-stage PP activation handoff traffic.
+    PpActivation,
+}
+
+impl std::fmt::Display for TrafficClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Any => write!(f, "any"),
+            Self::TpCollective => write!(f, "tp_collective"),
+            Self::PpActivation => write!(f, "pp_activation"),
+        }
+    }
+}
+
+impl RoutingRequest {
+    /// Build a routing request with only the required fields populated.
+    ///
+    /// All 2D-specific fields default to their neutral values, preserving the
+    /// existing 1D routing behavior for legacy callers.
+    pub fn new(request_id: impl Into<String>) -> Self {
+        Self {
+            request_id: request_id.into(),
+            preferred_role: None,
+            preferred_stage: None,
+            preferred_rank: None,
+            traffic_class: TrafficClass::Any,
+            affinity_node: None,
+        }
+    }
 }
 
 /// Result of a routing decision.
@@ -337,6 +392,61 @@ impl RoutingStrategy for PipelineStageRouter {
 
     fn strategy_name(&self) -> &str {
         "pipeline-stage"
+    }
+}
+
+/// Routes requests on the 2D `(pp_stage, tp_rank)` mesh.
+///
+/// The strategy requires both `preferred_stage` and `preferred_rank` on the
+/// routing request. The [`TrafficClass`] on the request disambiguates which
+/// transport handler a caller is targeting, but does not change the selected
+/// peer — it is purely advisory so the connection pool user can pick the
+/// appropriate downstream callback. Callers that need a different peer set
+/// (e.g., broadcast to every rank on a stage for all-reduce) should use the
+/// registry's `nodes_at_stage` / `nodes_at_rank` helpers directly.
+///
+/// Used by: 2D PP × TP request routing.
+pub struct PipelineTensorParallelRouter;
+
+impl RoutingStrategy for PipelineTensorParallelRouter {
+    fn select_node(
+        &self,
+        request: &RoutingRequest,
+        candidates: &[NodeCandidate],
+    ) -> Result<RoutingDecision> {
+        let target_stage = request
+            .preferred_stage
+            .ok_or_else(|| anyhow::anyhow!("2D router requires preferred_stage"))?;
+        let target_rank = request
+            .preferred_rank
+            .ok_or_else(|| anyhow::anyhow!("2D router requires preferred_rank"))?;
+
+        let selected = candidates
+            .iter()
+            .find(|c| {
+                c.status == NodeStatus::Online
+                    && c.role.is_pp_tp()
+                    && c.stage == Some(target_stage)
+                    && c.rank == Some(target_rank)
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no online 2D node found for (stage={target_stage}, rank={target_rank})"
+                )
+            })?;
+
+        Ok(RoutingDecision {
+            target_node: selected.node_id.clone(),
+            strategy: self.strategy_name().to_string(),
+            reason: Some(format!(
+                "pp-tp stage={target_stage} rank={target_rank} class={}",
+                request.traffic_class
+            )),
+        })
+    }
+
+    fn strategy_name(&self) -> &str {
+        "pipeline-tensor-parallel"
     }
 }
 

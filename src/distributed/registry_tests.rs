@@ -155,3 +155,91 @@ fn concurrent_access() {
     // Registry should still be consistent
     assert_eq!(registry.node_count(), 2);
 }
+
+// -- 2D (PP x TP) parallelism ------------------------------------------------
+
+fn pp_tp_2x2_config() -> ClusterConfig {
+    let toml_str = r#"
+[cluster]
+name = "pptp"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "s0-r0"
+address = "10.0.0.10:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "s0-r1"
+address = "10.0.0.11:8080"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 1
+
+[[nodes]]
+id = "s1-r0"
+address = "10.0.0.20:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "s1-r1"
+address = "10.0.0.21:8080"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#;
+    ClusterConfig::from_toml(toml_str).unwrap()
+}
+
+#[test]
+fn find_pp_tp_node_returns_exact_intersection() {
+    let config = pp_tp_2x2_config();
+    let registry = NodeRegistry::from_config(&config, "s0-r0");
+    assert_eq!(registry.find_pp_tp_node(0, 0).unwrap().config.id, "s0-r0");
+    assert_eq!(registry.find_pp_tp_node(1, 1).unwrap().config.id, "s1-r1");
+    assert!(registry.find_pp_tp_node(2, 0).is_none());
+    assert!(registry.find_pp_tp_node(0, 5).is_none());
+}
+
+#[test]
+fn nodes_at_stage_returns_all_ranks() {
+    let config = pp_tp_2x2_config();
+    let registry = NodeRegistry::from_config(&config, "s0-r0");
+    let stage0 = registry.nodes_at_stage(0);
+    assert_eq!(stage0.len(), 2);
+    assert_eq!(stage0[0].config.id, "s0-r0");
+    assert_eq!(stage0[1].config.id, "s0-r1");
+    let stage1 = registry.nodes_at_stage(1);
+    assert_eq!(stage1.len(), 2);
+    assert_eq!(stage1[0].config.id, "s1-r0");
+    assert_eq!(stage1[1].config.id, "s1-r1");
+}
+
+#[test]
+fn nodes_at_rank_returns_all_stages() {
+    let config = pp_tp_2x2_config();
+    let registry = NodeRegistry::from_config(&config, "s0-r0");
+    let rank0 = registry.nodes_at_rank(0);
+    assert_eq!(rank0.len(), 2);
+    assert_eq!(rank0[0].config.id, "s0-r0");
+    assert_eq!(rank0[1].config.id, "s1-r0");
+}
+
+#[test]
+fn local_pp_tp_coords_reflect_local_node() {
+    let config = pp_tp_2x2_config();
+    let registry = NodeRegistry::from_config(&config, "s1-r0");
+    assert_eq!(registry.local_pp_tp_coords(), Some((1, 0)));
+}
+
+#[test]
+fn local_pp_tp_coords_none_for_legacy_topology() {
+    let config = sample_config();
+    let registry = NodeRegistry::from_config(&config, "local");
+    assert!(registry.local_pp_tp_coords().is_none());
+}

@@ -526,3 +526,129 @@ fn display_rejection_reason() {
     assert!(display.contains("1000"));
     assert!(display.contains("500"));
 }
+
+// --- 2D (PP x TP) coordinated admission tests ---
+
+fn pp_tp_config(stage: u32, _rank: u32, layer_range: Range<usize>) -> PipelineCacheConfig {
+    // 2 stages, each sharded across 2 TP ranks. The config itself does not
+    // carry the TP rank — the rank is tracked by the 2D grid key passed to
+    // `coordinated_2d_admission`. Each TP rank holds half the KV shard, so
+    // the per-rank budget and bytes-per-layer figures are halved relative to
+    // the 1D configuration.
+    PipelineCacheConfig {
+        stage_index: stage,
+        num_stages: 2,
+        layer_range,
+        max_sequences: 4,
+        memory_budget_bytes: 500_000,
+        bytes_per_layer_per_token: 512,
+        pressure_threshold: 0.8,
+    }
+}
+
+#[test]
+fn pp_tp_coord_display_and_order() {
+    let a = PpTpCoord::new(0, 0);
+    let b = PpTpCoord::new(1, 0);
+    let c = PpTpCoord::new(0, 1);
+    assert!(a < c && c < b);
+    assert_eq!(a.to_string(), "(stage=0, rank=0)");
+}
+
+#[test]
+fn coordinated_2d_admission_accepts_when_every_slot_fits() {
+    let mut m00 = PipelineCacheManager::new(pp_tp_config(0, 0, 0..8)).unwrap();
+    let mut m01 = PipelineCacheManager::new(pp_tp_config(0, 1, 0..8)).unwrap();
+    let mut m10 = PipelineCacheManager::new(pp_tp_config(1, 0, 8..16)).unwrap();
+    let mut m11 = PipelineCacheManager::new(pp_tp_config(1, 1, 8..16)).unwrap();
+
+    let mut grid: Vec<(PpTpCoord, &mut PipelineCacheManager)> = vec![
+        (PpTpCoord::new(0, 0), &mut m00),
+        (PpTpCoord::new(0, 1), &mut m01),
+        (PpTpCoord::new(1, 0), &mut m10),
+        (PpTpCoord::new(1, 1), &mut m11),
+    ];
+
+    let req = CacheAdmissionRequest::new(42, 32).with_estimated_max_tokens(32);
+    let outcome = coordinated_2d_admission(&mut grid, &req).unwrap();
+    assert_eq!(outcome, PpTpAdmissionOutcome::Admitted);
+    // Every slot now holds the allocation.
+    assert!(m00.get_allocation(42).is_some());
+    assert!(m01.get_allocation(42).is_some());
+    assert!(m10.get_allocation(42).is_some());
+    assert!(m11.get_allocation(42).is_some());
+}
+
+#[test]
+fn coordinated_2d_admission_rejects_when_any_slot_is_full_and_keeps_grid_empty() {
+    let mut m00 = PipelineCacheManager::new(pp_tp_config(0, 0, 0..8)).unwrap();
+    // m01 is saturated: its memory budget is 500_000 but we admit a giant
+    // sequence to exhaust it.
+    let mut full_cfg = pp_tp_config(0, 1, 0..8);
+    full_cfg.max_sequences = 1;
+    let mut m01 = PipelineCacheManager::new(full_cfg).unwrap();
+    m01.request_admission(&CacheAdmissionRequest::new(1, 8));
+
+    let mut m10 = PipelineCacheManager::new(pp_tp_config(1, 0, 8..16)).unwrap();
+    let mut m11 = PipelineCacheManager::new(pp_tp_config(1, 1, 8..16)).unwrap();
+
+    let mut grid: Vec<(PpTpCoord, &mut PipelineCacheManager)> = vec![
+        (PpTpCoord::new(0, 0), &mut m00),
+        (PpTpCoord::new(0, 1), &mut m01),
+        (PpTpCoord::new(1, 0), &mut m10),
+        (PpTpCoord::new(1, 1), &mut m11),
+    ];
+
+    let req = CacheAdmissionRequest::new(42, 32);
+    let outcome = coordinated_2d_admission(&mut grid, &req).unwrap();
+    match outcome {
+        PpTpAdmissionOutcome::Rejected { at, reason } => {
+            assert_eq!(at, PpTpCoord::new(0, 1));
+            assert_eq!(reason, RejectionReason::MaxSequencesReached);
+        }
+        _ => panic!("expected Rejected"),
+    }
+    // Crucially: no other slot was mutated.
+    assert!(m00.get_allocation(42).is_none());
+    assert!(m10.get_allocation(42).is_none());
+    assert!(m11.get_allocation(42).is_none());
+}
+
+#[test]
+fn broadcast_2d_eviction_clears_all_slots() {
+    let mut m00 = PipelineCacheManager::new(pp_tp_config(0, 0, 0..8)).unwrap();
+    let mut m01 = PipelineCacheManager::new(pp_tp_config(0, 1, 0..8)).unwrap();
+    let mut m10 = PipelineCacheManager::new(pp_tp_config(1, 0, 8..16)).unwrap();
+    let mut m11 = PipelineCacheManager::new(pp_tp_config(1, 1, 8..16)).unwrap();
+
+    {
+        let mut grid: Vec<(PpTpCoord, &mut PipelineCacheManager)> = vec![
+            (PpTpCoord::new(0, 0), &mut m00),
+            (PpTpCoord::new(0, 1), &mut m01),
+            (PpTpCoord::new(1, 0), &mut m10),
+            (PpTpCoord::new(1, 1), &mut m11),
+        ];
+        let req = CacheAdmissionRequest::new(7, 16);
+        coordinated_2d_admission(&mut grid, &req).unwrap();
+    }
+
+    let mut grid: Vec<(PpTpCoord, &mut PipelineCacheManager)> = vec![
+        (PpTpCoord::new(0, 0), &mut m00),
+        (PpTpCoord::new(0, 1), &mut m01),
+        (PpTpCoord::new(1, 0), &mut m10),
+        (PpTpCoord::new(1, 1), &mut m11),
+    ];
+    let event = broadcast_2d_eviction(
+        &mut grid,
+        7,
+        PpTpCoord::new(0, 0),
+        EvictionReason::ExplicitRequest,
+    )
+    .unwrap();
+    assert_eq!(event.sequence_id, 7);
+    assert_eq!(event.initiating_stage, 0);
+    assert!(m00.get_allocation(7).is_none());
+    assert!(m01.get_allocation(7).is_none());
+    assert!(m10.get_allocation(7).is_none());
+    assert!(m11.get_allocation(7).is_none());
+}

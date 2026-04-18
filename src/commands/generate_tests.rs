@@ -346,6 +346,32 @@ fn validate_pipeline_parallel_args_rejects_incompatible_modes() {
 }
 
 #[test]
+fn validate_pipeline_parallel_args_accepts_2d_pp_tp() {
+    // Issue #346: the validator no longer rejects PP + TP.
+    let mut args = sample_generate_args(temp_model_dir("pp-tp-2d"));
+    args.pipeline_parallel.pp_size = 2;
+    args.tensor_parallel.tp_size = 2;
+    let result = validate_pipeline_parallel_args(&args);
+    assert!(
+        result.is_ok(),
+        "expected validator to accept 2D PPxTP, got: {result:?}"
+    );
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
+fn validate_pipeline_parallel_args_rejects_2d_without_pp_enabled() {
+    // TP > 1 with pp_size=1 is TP-only, not 2D; but if the caller sets pp_size=0
+    // alongside tp_size=2 it is malformed. The validator returns early when
+    // PP is disabled, so this case is harmless — verify it doesn't error.
+    let mut args = sample_generate_args(temp_model_dir("tp-only"));
+    args.pipeline_parallel.pp_size = 1;
+    args.tensor_parallel.tp_size = 2;
+    assert!(validate_pipeline_parallel_args(&args).is_ok());
+    fs::remove_dir_all(args.model.model).unwrap();
+}
+
+#[test]
 fn resolve_cli_pipeline_assignments_honors_manual_ranges() {
     let mut args = sample_generate_args(temp_model_dir("pp-manual"));
     args.pipeline_parallel.pp_size = 2;

@@ -154,6 +154,74 @@ impl NodeRegistry {
             .collect()
     }
 
+    /// Return the registered node that owns the 2D `(pp_stage, tp_rank)`
+    /// intersection, if any.
+    ///
+    /// Used by: 2D parallelism transport routing (intra-stage TP collectives
+    /// and inter-stage PP activation handoff both look up peers through this
+    /// method).
+    pub fn find_pp_tp_node(&self, stage: u32, rank: u32) -> Option<RegisteredNode> {
+        self.inner
+            .read()
+            .expect("registry lock poisoned")
+            .nodes
+            .values()
+            .find(|n| {
+                n.config.role.is_pp_tp()
+                    && n.config.stage == Some(stage)
+                    && n.config.rank == Some(rank)
+            })
+            .cloned()
+    }
+
+    /// Return all PPTP peers on the same pipeline stage, sorted by rank.
+    ///
+    /// These are the peers that participate in intra-stage all-reduce / TP
+    /// collective communication.
+    ///
+    /// Used by: 2D parallelism transport routing (TP collective path).
+    pub fn nodes_at_stage(&self, stage: u32) -> Vec<RegisteredNode> {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        let mut nodes: Vec<RegisteredNode> = inner
+            .nodes
+            .values()
+            .filter(|n| n.config.role.is_pp_tp() && n.config.stage == Some(stage))
+            .cloned()
+            .collect();
+        nodes.sort_by_key(|n| n.config.rank.unwrap_or(u32::MAX));
+        nodes
+    }
+
+    /// Return all PPTP peers at the same TP rank, sorted by stage.
+    ///
+    /// These are the peers that participate in inter-stage PP activation
+    /// handoff between corresponding ranks.
+    ///
+    /// Used by: 2D parallelism transport routing (PP activation path).
+    pub fn nodes_at_rank(&self, rank: u32) -> Vec<RegisteredNode> {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        let mut nodes: Vec<RegisteredNode> = inner
+            .nodes
+            .values()
+            .filter(|n| n.config.role.is_pp_tp() && n.config.rank == Some(rank))
+            .cloned()
+            .collect();
+        nodes.sort_by_key(|n| n.config.stage.unwrap_or(u32::MAX));
+        nodes
+    }
+
+    /// Return the `(stage, rank)` of the local node, if this cluster uses
+    /// 2D parallelism and the local node carries the PPTP role.
+    pub fn local_pp_tp_coords(&self) -> Option<(u32, u32)> {
+        let inner = self.inner.read().expect("registry lock poisoned");
+        let local = inner.nodes.get(&inner.local_node_id)?;
+        if local.config.role.is_pp_tp() {
+            Some((local.config.stage?, local.config.rank?))
+        } else {
+            None
+        }
+    }
+
     /// Return the cluster metadata.
     pub fn cluster_meta(&self) -> ClusterMeta {
         self.inner
@@ -218,9 +286,15 @@ impl NodeRegistry {
             } else {
                 ""
             };
+            let coords = match (node.config.stage, node.config.rank) {
+                (Some(s), Some(r)) => format!(" (stage={s}, rank={r})"),
+                (Some(s), None) => format!(" (stage={s})"),
+                (None, Some(r)) => format!(" (rank={r})"),
+                (None, None) => String::new(),
+            };
             let _ = writeln!(
                 out,
-                "    - {} @ {} [{}] status={}{local_tag}",
+                "    - {} @ {} [{}]{coords} status={}{local_tag}",
                 node.config.id, node.config.address, node.config.role, node.status
             );
         }

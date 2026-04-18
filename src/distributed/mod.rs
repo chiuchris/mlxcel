@@ -153,13 +153,19 @@ pub use pipeline::{
     split_into_micro_batches, suggested_micro_batch_size, to_pipeline_schedule_config,
     validate_activation, validate_memory_fit, validate_partial_memory, validate_partition,
 };
+pub use rdma_capabilities::{
+    RDMA_PROTOCOL_VERSION, RdmaAcceleration, RdmaCapabilities, negotiate_protocol_version,
+    probe_capabilities,
+};
+pub use rdma_transport::{RdmaTransport, RdmaTransportConfig};
 pub use registry::{NodeRegistry, NodeStatus, RegisteredNode};
 pub use request_tracker::{
     RequestId, RequestLifecycle, RequestState, RequestTracker, RequestTrackerConfig,
 };
 pub use routing::{
-    LoadBalancedRouter, NodeCandidate, PipelineStageRouter, RoleBasedRouter, RoundRobinRouter,
-    RoutingDecision, RoutingRequest, RoutingStrategy,
+    LoadBalancedRouter, NodeCandidate, PipelineStageRouter, PipelineTensorParallelRouter,
+    RoleBasedRouter, RoundRobinRouter, RoutingDecision, RoutingRequest, RoutingStrategy,
+    TrafficClass,
 };
 pub use scheduler::{CoordinationMode, Scheduler, SchedulerConfig};
 pub use tcp_transport::{TcpTransport, TcpTransportConfig};
@@ -186,10 +192,5 @@ pub use tensor_serialize::{
     DeserializedTensor, SerializeOptions, deserialize_tensor, serialize_tensor,
     serialize_tensor_to_bytes,
 };
-pub use rdma_capabilities::{
-    RDMA_PROTOCOL_VERSION, RdmaAcceleration, RdmaCapabilities, negotiate_protocol_version,
-    probe_capabilities,
-};
-pub use rdma_transport::{RdmaTransport, RdmaTransportConfig};
 pub use thunderbolt_transport::{ThunderboltTransport, ThunderboltTransportConfig};
 pub use transport::{Transport, TransportBackend, TransportMessage};

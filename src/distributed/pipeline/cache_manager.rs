@@ -822,6 +822,132 @@ pub fn check_pipeline_pressure(managers: &[&PipelineCacheManager]) -> Option<Pre
         })
 }
 
+// ---------------------------------------------------------------------------
+// 2D (PP x TP) cache coordination
+// ---------------------------------------------------------------------------
+
+/// Identifier for a 2D cache slot — one per `(pp_stage, tp_rank)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct PpTpCoord {
+    /// Pipeline stage index.
+    pub stage: u32,
+    /// Tensor-parallel rank within the stage.
+    pub rank: u32,
+}
+
+impl PpTpCoord {
+    /// Create a new 2D coordinate.
+    pub fn new(stage: u32, rank: u32) -> Self {
+        Self { stage, rank }
+    }
+}
+
+impl fmt::Display for PpTpCoord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(stage={}, rank={})", self.stage, self.rank)
+    }
+}
+
+/// Result of a 2D admission attempt across the full `(stage, rank)` grid.
+///
+/// When a sequence is submitted to the 2D mesh, every `(stage, rank)` cache
+/// manager must accept. If any rank rejects, the entire submission is rolled
+/// back — otherwise the stage would run an un-cached sharded forward pass and
+/// silently diverge.
+///
+/// Used by: 2D PP × TP admission controller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PpTpAdmissionOutcome {
+    /// Every `(stage, rank)` slot admitted the sequence.
+    Admitted,
+    /// At least one slot rejected; nothing was committed anywhere.
+    Rejected {
+        /// Coordinate of the first slot that rejected.
+        at: PpTpCoord,
+        /// Reason reported by that slot.
+        reason: RejectionReason,
+    },
+}
+
+/// Check admission across a 2D `(pp_stage, tp_rank)` grid of cache managers.
+///
+/// `managers[(stage, rank)]` must reference the cache manager that owns the
+/// KV shard for that intersection. The function performs a two-phase check:
+///
+/// 1. Dry-run admission on every slot (no mutation). If any slot rejects,
+///    return the first rejection without touching any manager's state.
+/// 2. If every slot accepts, finalize the admission on each manager.
+///
+/// This preserves the invariant that a 2D stage is coherent: either every
+/// rank in the grid holds the KV shard for the sequence, or none does.
+///
+/// Used by: 2D PP × TP cache admission controller.
+pub fn coordinated_2d_admission(
+    managers: &mut [(PpTpCoord, &mut PipelineCacheManager)],
+    req: &CacheAdmissionRequest,
+) -> Result<PpTpAdmissionOutcome> {
+    ensure!(!managers.is_empty(), "at least one 2D manager is required");
+
+    // Phase 1: dry-run check (do not mutate state).
+    for (coord, mgr) in managers.iter() {
+        if mgr.allocations.contains_key(&req.sequence_id) {
+            return Ok(PpTpAdmissionOutcome::Rejected {
+                at: *coord,
+                reason: RejectionReason::AlreadyCached,
+            });
+        }
+        if mgr.allocations.len() >= mgr.config.max_sequences {
+            return Ok(PpTpAdmissionOutcome::Rejected {
+                at: *coord,
+                reason: RejectionReason::MaxSequencesReached,
+            });
+        }
+        let required = mgr.config.estimate_memory(req.effective_tokens());
+        let available = mgr.available_memory();
+        if required > available {
+            return Ok(PpTpAdmissionOutcome::Rejected {
+                at: *coord,
+                reason: RejectionReason::InsufficientMemory {
+                    required_bytes: required,
+                    available_bytes: available,
+                },
+            });
+        }
+    }
+
+    // Phase 2: commit on every slot.
+    for (_, mgr) in managers.iter_mut() {
+        let decision = mgr.request_admission(req);
+        debug_assert_eq!(decision, AdmissionDecision::Admitted);
+    }
+
+    Ok(PpTpAdmissionOutcome::Admitted)
+}
+
+/// Broadcast an eviction across every `(stage, rank)` slot in a 2D grid.
+///
+/// Returns the eviction event produced by the initiating slot.
+///
+/// Used by: 2D PP × TP cache admission controller.
+pub fn broadcast_2d_eviction(
+    managers: &mut [(PpTpCoord, &mut PipelineCacheManager)],
+    sequence_id: SequenceId,
+    initiating: PpTpCoord,
+    reason: EvictionReason,
+) -> Result<EvictionEvent> {
+    let event = EvictionEvent {
+        sequence_id,
+        initiating_stage: initiating.stage,
+        reason,
+    };
+
+    for (_, mgr) in managers.iter_mut() {
+        mgr.apply_eviction_broadcast(&event)?;
+    }
+    Ok(event)
+}
+
 #[cfg(test)]
 #[path = "cache_manager_tests.rs"]
 mod tests;

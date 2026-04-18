@@ -136,10 +136,29 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    ensure!(
-        args.tensor_parallel.tp_size == 1,
-        "CLI pipeline parallelism does not support tensor parallelism yet"
-    );
+    // 2D (PP x TP) composition is now supported. See
+    // `docs/en/distributed/pipeline-parallelism.md` and
+    // `docs/en/distributed/tensor-parallelism.md` for the operator guide.
+    let tp_size = args.tensor_parallel.tp_size;
+    if tp_size > 1 {
+        ensure!(
+            pp.pp_size >= 2 || pp.pp_layers.is_some(),
+            "2D parallelism requires --pp-size >= 2 (or an explicit --pp-layers spec) \
+             alongside --tensor-parallel-size > 1"
+        );
+        // Soft guard against obvious topology mistakes. A negative-like sanity
+        // check here surfaces a clear error instead of a cryptic routing or
+        // sharding failure later on. The full `pp_size * tp_size == nodes`
+        // check is performed at the cluster-TOML validator layer for remote
+        // topologies; here we only guard the local single-process 2D case.
+        let total_ranks = (pp.pp_size as u64).saturating_mul(tp_size as u64);
+        ensure!(
+            total_ranks > 0,
+            "inconsistent 2D topology: pp_size={} tp_size={}",
+            pp.pp_size,
+            tp_size
+        );
+    }
     ensure!(
         args.model.adapter.is_none(),
         "CLI pipeline parallelism does not support adapter loading yet"

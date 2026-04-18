@@ -30,6 +30,8 @@ fn make_request(preferred_role: Option<NodeRole>) -> RoutingRequest {
         request_id: "req-1".to_string(),
         preferred_role,
         preferred_stage: None,
+        preferred_rank: None,
+        traffic_class: TrafficClass::Any,
         affinity_node: None,
     }
 }
@@ -110,6 +112,8 @@ fn role_based_respects_affinity() {
         request_id: "req-1".to_string(),
         preferred_role: Some(NodeRole::Prefill),
         preferred_stage: None,
+        preferred_rank: None,
+        traffic_class: TrafficClass::Any,
         affinity_node: Some("node-1".to_string()),
     };
     let decision = router.select_node(&request, &candidates).unwrap();
@@ -190,6 +194,8 @@ fn pipeline_stage_selects_correct_stage() {
         request_id: "req-1".to_string(),
         preferred_role: None,
         preferred_stage: Some(1),
+        preferred_rank: None,
+        traffic_class: TrafficClass::Any,
         affinity_node: None,
     };
     let decision = router.select_node(&request, &[c0, c1]).unwrap();
@@ -218,6 +224,8 @@ fn pipeline_stage_errors_when_no_matching_stage() {
         request_id: "req-1".to_string(),
         preferred_role: None,
         preferred_stage: Some(5),
+        preferred_rank: None,
+        traffic_class: TrafficClass::Any,
         affinity_node: None,
     };
     assert!(router.select_node(&request, &[c0]).is_err());
@@ -233,4 +241,106 @@ fn routing_decision_display_fields() {
     assert_eq!(decision.target_node, "node-0");
     assert_eq!(decision.strategy, "test");
     assert_eq!(decision.reason.as_deref(), Some("test reason"));
+}
+
+// -- PipelineTensorParallelRouter (2D routing) --
+
+fn pp_tp_candidate(id: &str, stage: u32, rank: u32, status: NodeStatus) -> NodeCandidate {
+    NodeCandidate {
+        node_id: id.to_string(),
+        role: NodeRole::PipelineTensorParallel,
+        status,
+        metrics: None,
+        stage: Some(stage),
+        rank: Some(rank),
+    }
+}
+
+fn pp_tp_request(stage: Option<u32>, rank: Option<u32>, class: TrafficClass) -> RoutingRequest {
+    RoutingRequest {
+        request_id: "r".to_string(),
+        preferred_role: None,
+        preferred_stage: stage,
+        preferred_rank: rank,
+        traffic_class: class,
+        affinity_node: None,
+    }
+}
+
+#[test]
+fn pp_tp_router_selects_exact_intersection() {
+    let router = PipelineTensorParallelRouter;
+    let candidates = vec![
+        pp_tp_candidate("s0-r0", 0, 0, NodeStatus::Online),
+        pp_tp_candidate("s0-r1", 0, 1, NodeStatus::Online),
+        pp_tp_candidate("s1-r0", 1, 0, NodeStatus::Online),
+        pp_tp_candidate("s1-r1", 1, 1, NodeStatus::Online),
+    ];
+    let decision = router
+        .select_node(
+            &pp_tp_request(Some(1), Some(0), TrafficClass::PpActivation),
+            &candidates,
+        )
+        .unwrap();
+    assert_eq!(decision.target_node, "s1-r0");
+    assert_eq!(decision.strategy, "pipeline-tensor-parallel");
+    let reason = decision.reason.unwrap();
+    assert!(reason.contains("stage=1"));
+    assert!(reason.contains("rank=0"));
+    assert!(reason.contains("pp_activation"));
+}
+
+#[test]
+fn pp_tp_router_requires_preferred_stage_and_rank() {
+    let router = PipelineTensorParallelRouter;
+    let candidates = vec![pp_tp_candidate("s0-r0", 0, 0, NodeStatus::Online)];
+    let err_no_stage = router
+        .select_node(
+            &pp_tp_request(None, Some(0), TrafficClass::Any),
+            &candidates,
+        )
+        .unwrap_err();
+    assert!(err_no_stage.to_string().contains("preferred_stage"));
+
+    let err_no_rank = router
+        .select_node(
+            &pp_tp_request(Some(0), None, TrafficClass::Any),
+            &candidates,
+        )
+        .unwrap_err();
+    assert!(err_no_rank.to_string().contains("preferred_rank"));
+}
+
+#[test]
+fn pp_tp_router_skips_offline_intersection() {
+    let router = PipelineTensorParallelRouter;
+    let candidates = vec![
+        pp_tp_candidate("s0-r0", 0, 0, NodeStatus::Unreachable),
+        pp_tp_candidate("s0-r1", 0, 1, NodeStatus::Online),
+    ];
+    let err = router
+        .select_node(
+            &pp_tp_request(Some(0), Some(0), TrafficClass::TpCollective),
+            &candidates,
+        )
+        .unwrap_err();
+    assert!(err.to_string().contains("no online 2D node"));
+}
+
+#[test]
+fn traffic_class_display() {
+    assert_eq!(TrafficClass::Any.to_string(), "any");
+    assert_eq!(TrafficClass::TpCollective.to_string(), "tp_collective");
+    assert_eq!(TrafficClass::PpActivation.to_string(), "pp_activation");
+}
+
+#[test]
+fn routing_request_new_defaults_are_neutral() {
+    let req = RoutingRequest::new("test-id");
+    assert_eq!(req.request_id, "test-id");
+    assert!(req.preferred_role.is_none());
+    assert!(req.preferred_stage.is_none());
+    assert!(req.preferred_rank.is_none());
+    assert_eq!(req.traffic_class, TrafficClass::Any);
+    assert!(req.affinity_node.is_none());
 }

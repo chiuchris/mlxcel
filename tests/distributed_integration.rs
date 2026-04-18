@@ -565,3 +565,176 @@ async fn ci_concurrent_operations() {
 
     cluster.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// 2D (PP x TP) parallelism plumbing
+// ---------------------------------------------------------------------------
+//
+// These tests verify that the runtime plumbing for the 2D parallelism
+// introduced by issue #346 is wired end-to-end: config parsing, registry
+// lookups, 2D-aware routing, and the cache-manager admission grid.
+
+use mlxcel::distributed::config::ClusterConfig;
+use mlxcel::distributed::pipeline::{
+    CacheAdmissionRequest, PipelineCacheConfig, PipelineCacheManager, PpTpAdmissionOutcome,
+    PpTpCoord, coordinated_2d_admission,
+};
+use mlxcel::distributed::registry::NodeRegistry;
+use mlxcel::distributed::routing::{
+    NodeCandidate, PipelineTensorParallelRouter, RoutingRequest, RoutingStrategy, TrafficClass,
+};
+
+fn pp_tp_2x2_toml() -> &'static str {
+    r#"
+[cluster]
+name = "pp-tp-2x2-test"
+pipeline_parallel_size = 2
+tensor_parallel_size = 2
+
+[[nodes]]
+id = "s0-r0"
+address = "127.0.0.1:18100"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 0
+
+[[nodes]]
+id = "s0-r1"
+address = "127.0.0.1:18101"
+role = "pipeline_tensor_parallel"
+stage = 0
+rank = 1
+
+[[nodes]]
+id = "s1-r0"
+address = "127.0.0.1:18102"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 0
+
+[[nodes]]
+id = "s1-r1"
+address = "127.0.0.1:18103"
+role = "pipeline_tensor_parallel"
+stage = 1
+rank = 1
+"#
+}
+
+#[test]
+fn pp_tp_2x2_cluster_registers_every_intersection() {
+    let config = ClusterConfig::from_toml(pp_tp_2x2_toml()).unwrap();
+    assert!(config.is_pp_tp_2d());
+    let registry = NodeRegistry::from_config(&config, "s0-r0");
+    // Each (stage, rank) pair is reachable via the registry.
+    for stage in 0..2 {
+        for rank in 0..2 {
+            let node = registry.find_pp_tp_node(stage, rank).unwrap_or_else(|| {
+                panic!("missing node for (stage={stage}, rank={rank})");
+            });
+            assert_eq!(node.config.stage, Some(stage));
+            assert_eq!(node.config.rank, Some(rank));
+        }
+    }
+    assert_eq!(registry.local_pp_tp_coords(), Some((0, 0)));
+    assert_eq!(registry.nodes_at_stage(0).len(), 2); // TP collective peers.
+    assert_eq!(registry.nodes_at_rank(0).len(), 2); // PP activation peers.
+}
+
+#[test]
+fn pp_tp_router_handles_tp_collective_and_pp_activation_classes() {
+    let router = PipelineTensorParallelRouter;
+    let candidates: Vec<NodeCandidate> = [
+        ("s0-r0", 0, 0),
+        ("s0-r1", 0, 1),
+        ("s1-r0", 1, 0),
+        ("s1-r1", 1, 1),
+    ]
+    .iter()
+    .map(|(id, stage, rank)| NodeCandidate {
+        node_id: id.to_string(),
+        role: NodeRole::PipelineTensorParallel,
+        status: NodeStatus::Online,
+        metrics: None,
+        stage: Some(*stage),
+        rank: Some(*rank),
+    })
+    .collect();
+
+    // TP collective: stage 0, rank 0 wants to communicate with rank 1 on the
+    // same stage.
+    let tp_collective = RoutingRequest {
+        request_id: "tp".to_string(),
+        preferred_role: None,
+        preferred_stage: Some(0),
+        preferred_rank: Some(1),
+        traffic_class: TrafficClass::TpCollective,
+        affinity_node: None,
+    };
+    let tp_decision = router.select_node(&tp_collective, &candidates).unwrap();
+    assert_eq!(tp_decision.target_node, "s0-r1");
+    assert!(
+        tp_decision
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("tp_collective")
+    );
+
+    // PP activation: stage 0, rank 0 hands activations to stage 1 at the
+    // same TP rank.
+    let pp_activation = RoutingRequest {
+        request_id: "pp".to_string(),
+        preferred_role: None,
+        preferred_stage: Some(1),
+        preferred_rank: Some(0),
+        traffic_class: TrafficClass::PpActivation,
+        affinity_node: None,
+    };
+    let pp_decision = router.select_node(&pp_activation, &candidates).unwrap();
+    assert_eq!(pp_decision.target_node, "s1-r0");
+    assert!(
+        pp_decision
+            .reason
+            .as_deref()
+            .unwrap()
+            .contains("pp_activation")
+    );
+}
+
+#[test]
+fn pp_tp_cache_admission_rolls_back_on_any_rank_rejection() {
+    // Build a 2x2 grid with one slot that cannot hold the sequence.
+    let mk = |stage, _rank, layer_range, cap| {
+        PipelineCacheManager::new(PipelineCacheConfig {
+            stage_index: stage,
+            num_stages: 2,
+            layer_range,
+            max_sequences: cap,
+            memory_budget_bytes: 500_000,
+            bytes_per_layer_per_token: 256,
+            pressure_threshold: 0.9,
+        })
+        .unwrap()
+    };
+
+    let mut m00 = mk(0, 0, 0..8, 4);
+    let mut m01 = mk(0, 1, 0..8, 1); // Saturate this slot first.
+    m01.request_admission(&CacheAdmissionRequest::new(100, 16));
+    let mut m10 = mk(1, 0, 8..16, 4);
+    let mut m11 = mk(1, 1, 8..16, 4);
+
+    let mut grid: Vec<(PpTpCoord, &mut PipelineCacheManager)> = vec![
+        (PpTpCoord::new(0, 0), &mut m00),
+        (PpTpCoord::new(0, 1), &mut m01),
+        (PpTpCoord::new(1, 0), &mut m10),
+        (PpTpCoord::new(1, 1), &mut m11),
+    ];
+    let outcome = coordinated_2d_admission(&mut grid, &CacheAdmissionRequest::new(7, 16)).unwrap();
+    assert!(matches!(outcome, PpTpAdmissionOutcome::Rejected { .. }));
+
+    // Other slots must stay clean so the 2D stage remains coherent.
+    assert!(m00.get_allocation(7).is_none());
+    assert!(m10.get_allocation(7).is_none());
+    assert!(m11.get_allocation(7).is_none());
+}

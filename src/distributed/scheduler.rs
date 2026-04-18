@@ -206,6 +206,8 @@ impl Scheduler {
             request_id: request_id.as_str().to_string(),
             preferred_role,
             preferred_stage,
+            preferred_rank: None,
+            traffic_class: super::routing::TrafficClass::Any,
             affinity_node,
         };
 
@@ -458,12 +460,7 @@ impl Scheduler {
 
         // Use a simple role-based fallback for the alternative.
         let fallback = RoleBasedRouter;
-        let dummy_request = RoutingRequest {
-            request_id: String::new(),
-            preferred_role: None,
-            preferred_stage: None,
-            affinity_node: None,
-        };
+        let dummy_request = RoutingRequest::new(String::new());
 
         fallback.select_node(&dummy_request, &filtered).ok()
     }
