@@ -100,6 +100,8 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         elastic_pp_drain_timeout: args.elastic_pp_drain_timeout,
         elastic_pp_pressure_fraction: args.elastic_pp_pressure_fraction,
         elastic_pp_cool_down: args.elastic_pp_cool_down,
+        metrics_port: args.metrics_port,
+        debug_pp_trace: args.debug_pp_trace,
     }
 }
 

@@ -705,6 +705,14 @@ pub(crate) struct ServeArgs {
         value_name = "SECONDS"
     )]
     elastic_pp_cool_down: u64,
+
+    /// Enable `/metrics` and advertise this port as the scrape target.
+    #[arg(long = "metrics-port", value_name = "PORT")]
+    metrics_port: Option<u16>,
+
+    /// Write chrome-tracing JSON for pipeline scheduler actions.
+    #[arg(long = "debug-pp-trace", value_name = "PATH")]
+    debug_pp_trace: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {

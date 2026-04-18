@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
+use crate::distributed::pipeline::{PipelineObservability, PpTracer};
 use crate::tokenizer::MlxcelTokenizer;
 
 use super::batch::BatchObservability;
@@ -152,6 +153,12 @@ pub struct AppState {
     pub batch_observability: Arc<BatchObservability>,
     /// Server metrics (request counts, token throughput).
     pub metrics: Arc<Metrics>,
+    /// Pipeline-parallel observability aggregator (issue #350). Always
+    /// present even on non-PP deployments — counters stay at zero.
+    pub pp_observability: Arc<PipelineObservability>,
+    /// Optional chrome-tracing writer (issue #350, `--debug-pp-trace`).
+    /// `None` when tracing is disabled.
+    pub pp_tracer: Option<Arc<PpTracer>>,
 }
 
 impl AppState {
@@ -173,6 +180,8 @@ impl AppState {
             batch_metrics,
             batch_observability: Arc::new(BatchObservability::new()),
             metrics: Arc::new(Metrics::new()),
+            pp_observability: Arc::new(PipelineObservability::new()),
+            pp_tracer: None,
         }
     }
 
@@ -198,7 +207,25 @@ impl AppState {
             batch_metrics,
             batch_observability,
             metrics: Arc::new(Metrics::new()),
+            pp_observability: Arc::new(PipelineObservability::new()),
+            pp_tracer: None,
         }
+    }
+
+    /// Override the default no-op pipeline observability aggregator. Used
+    /// by the startup pipeline when the coordinator holds a shared `Arc`
+    /// so that scheduler writes are visible to HTTP handlers.
+    #[must_use]
+    pub fn with_pp_observability(mut self, pp: Arc<PipelineObservability>) -> Self {
+        self.pp_observability = pp;
+        self
+    }
+
+    /// Attach a chrome-tracing writer. Used by `--debug-pp-trace`.
+    #[must_use]
+    pub fn with_pp_tracer(mut self, tracer: Option<Arc<PpTracer>>) -> Self {
+        self.pp_tracer = tracer;
+        self
     }
 
     /// Get the display model ID (alias if set, otherwise model provider ID).

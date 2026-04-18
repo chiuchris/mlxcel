@@ -523,6 +523,22 @@ struct Args {
         value_name = "SECONDS"
     )]
     elastic_pp_cool_down: u64,
+
+    /// Enable `/metrics` and advertise the port operators should scrape.
+    ///
+    /// Currently the Prometheus endpoint is multiplexed onto the same HTTP
+    /// port as the OpenAI API. Passing this flag enables the endpoint.
+    /// A warning is logged when the requested port differs from `--port`
+    /// because a separate socket is deferred to a follow-up rollout.
+    #[arg(long = "metrics-port", value_name = "PORT")]
+    metrics_port: Option<u16>,
+
+    /// Write a chrome-tracing-compatible JSON trace of pipeline scheduler
+    /// actions (batch arrival, stage enter/exit, activation send/receive,
+    /// admission reject) to this file for offline analysis in
+    /// `chrome://tracing` or Perfetto.
+    #[arg(long = "debug-pp-trace", value_name = "PATH")]
+    debug_pp_trace: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -604,5 +620,7 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         elastic_pp_drain_timeout: args.elastic_pp_drain_timeout,
         elastic_pp_pressure_fraction: args.elastic_pp_pressure_fraction,
         elastic_pp_cool_down: args.elastic_pp_cool_down,
+        metrics_port: args.metrics_port,
+        debug_pp_trace: args.debug_pp_trace,
     }
 }

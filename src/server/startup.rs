@@ -191,6 +191,15 @@ pub struct ServerStartupConfig {
     /// Cool-down (seconds) between successive memory-pressure triggers on the
     /// same stage.
     pub elastic_pp_cool_down: u64,
+
+    // Observability (issue #350).
+    /// Port operators requested for `/metrics`. Currently informational —
+    /// the endpoint is multiplexed onto `port` because the server has a
+    /// single HTTP listener.
+    pub metrics_port: Option<u16>,
+    /// Optional chrome-tracing JSON output path for pipeline scheduler
+    /// actions. `Some(path)` constructs a `PpTracer`.
+    pub debug_pp_trace: Option<PathBuf>,
 }
 
 impl Default for ServerStartupConfig {
@@ -265,6 +274,8 @@ impl Default for ServerStartupConfig {
             elastic_pp_drain_timeout: 120,
             elastic_pp_pressure_fraction: 0.92,
             elastic_pp_cool_down: 30,
+            metrics_port: None,
+            debug_pp_trace: None,
         }
     }
 }
@@ -1079,6 +1090,28 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         }
     }
 
+    // Warn if operator requested a distinct /metrics port — not yet wired.
+    if let Some(requested) = startup.metrics_port
+        && requested != startup.port
+    {
+        tracing::warn!(
+            "--metrics-port {} requested, but the /metrics endpoint is \
+             multiplexed onto the main HTTP port ({}). A separate metrics \
+             listener is deferred to a follow-up rollout.",
+            requested,
+            startup.port
+        );
+    }
+
+    // Construct the chrome-tracing writer when --debug-pp-trace is set.
+    let pp_tracer = startup.debug_pp_trace.as_ref().map(|path| {
+        tracing::info!(
+            path = %path.display(),
+            "Enabling pipeline scheduler chrome-tracing (--debug-pp-trace)"
+        );
+        Arc::new(crate::distributed::pipeline::PpTracer::new(path.clone()))
+    });
+
     let state = AppState::with_observability(
         model_provider,
         config,
@@ -1087,7 +1120,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         startup.model_path.clone(),
         batch_metrics,
         batch_observability,
-    );
+    )
+    .with_pp_tracer(pp_tracer);
     let app = create_app(state);
 
     if startup.port == 0 {

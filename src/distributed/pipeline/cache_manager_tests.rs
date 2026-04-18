@@ -652,3 +652,90 @@ fn broadcast_2d_eviction_clears_all_slots() {
     assert!(m10.get_allocation(7).is_none());
     assert!(m11.get_allocation(7).is_none());
 }
+
+// -----------------------------------------------------------------------------
+// Issue #350: enriched OOM diagnostic via coordinated_admission_with_attribution.
+// -----------------------------------------------------------------------------
+
+mod attribution {
+    use super::*;
+
+    fn tight_config(stage_index: u32) -> PipelineCacheConfig {
+        PipelineCacheConfig {
+            stage_index,
+            num_stages: 2,
+            layer_range: 0..4,
+            max_sequences: 2,
+            memory_budget_bytes: 10_000,
+            bytes_per_layer_per_token: 1_000,
+            pressure_threshold: 0.9,
+        }
+    }
+
+    #[test]
+    fn admission_diagnostic_points_to_offending_stage() {
+        // Stage 0 has a generous budget; stage 1 is tight. A coordinated
+        // admission that overflows only on stage 1 must attribute to stage 1.
+        let fat_cfg = PipelineCacheConfig {
+            memory_budget_bytes: 1_000_000,
+            ..tight_config(0)
+        };
+        let mut s0 = PipelineCacheManager::new(fat_cfg).unwrap();
+        let mut s1 = PipelineCacheManager::new(tight_config(1)).unwrap();
+        // Fill stage 1 with a prior sequence to push it to high occupancy.
+        let filler = CacheAdmissionRequest::new(1, 2).with_estimated_max_tokens(0);
+        assert_eq!(
+            s1.request_admission(&filler),
+            AdmissionDecision::Admitted,
+            "filler must land on stage 1"
+        );
+
+        // Big sequence fits on stage 0 but overflows stage 1's budget.
+        let big_req = CacheAdmissionRequest::new(2, 8).with_estimated_max_tokens(0);
+        let mut mgrs: Vec<&mut PipelineCacheManager> = vec![&mut s0, &mut s1];
+        let outcome = coordinated_admission_with_attribution(&mut mgrs, &big_req).unwrap();
+        let diag = outcome.expect_err("admission must be rejected");
+        assert_eq!(diag.stage_index, 1, "rejection must attribute to stage 1");
+        assert!(
+            matches!(diag.reason, RejectionReason::InsufficientMemory { .. }),
+            "reason must be memory: {:?}",
+            diag.reason
+        );
+        assert!(
+            diag.used_memory_bytes > 0,
+            "stage 1 must report prior usage"
+        );
+        assert_eq!(diag.active_sequences, 1);
+        assert_eq!(diag.reason.metric_label(), "memory");
+    }
+
+    #[test]
+    fn sequence_cap_diagnostic_uses_short_metric_label() {
+        let cfg = PipelineCacheConfig {
+            max_sequences: 1,
+            ..tight_config(0)
+        };
+        let mut s0 = PipelineCacheManager::new(cfg).unwrap();
+        let first = CacheAdmissionRequest::new(1, 1);
+        assert_eq!(s0.request_admission(&first), AdmissionDecision::Admitted);
+
+        let second = CacheAdmissionRequest::new(2, 1);
+        let mut mgrs: Vec<&mut PipelineCacheManager> = vec![&mut s0];
+        let outcome = coordinated_admission_with_attribution(&mut mgrs, &second).unwrap();
+        let diag = outcome.expect_err("admission must be rejected");
+        assert_eq!(diag.reason.metric_label(), "sequence_cap");
+        assert_eq!(diag.active_sequences, 1);
+    }
+
+    #[test]
+    fn successful_coordinated_admission_returns_ok() {
+        let mut s0 = PipelineCacheManager::new(tight_config(0)).unwrap();
+        let mut s1 = PipelineCacheManager::new(tight_config(1)).unwrap();
+        let req = CacheAdmissionRequest::new(1, 1);
+        let mut mgrs: Vec<&mut PipelineCacheManager> = vec![&mut s0, &mut s1];
+        let outcome = coordinated_admission_with_attribution(&mut mgrs, &req).unwrap();
+        assert!(outcome.is_ok(), "admission must succeed");
+        assert_eq!(s0.active_sequences(), 1);
+        assert_eq!(s1.active_sequences(), 1);
+    }
+}

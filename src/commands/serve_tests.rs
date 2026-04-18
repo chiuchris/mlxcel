@@ -98,6 +98,8 @@ fn sample_args() -> crate::ServeArgs {
         elastic_pp_drain_timeout: 120,
         elastic_pp_pressure_fraction: 0.92,
         elastic_pp_cool_down: 30,
+        metrics_port: None,
+        debug_pp_trace: None,
     }
 }
 

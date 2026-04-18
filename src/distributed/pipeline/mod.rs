@@ -95,6 +95,7 @@ pub mod server_runtime;
 pub mod serving;
 pub mod stage_executor;
 pub mod stage_worker;
+pub mod trace;
 pub mod wire_tensor;
 
 pub use activation_transfer::{
@@ -108,11 +109,12 @@ pub use benchmark::{
     run_pipeline_benchmark, run_scaling_benchmark,
 };
 pub use cache_manager::{
-    AdmissionDecision, CacheAdmissionRequest, CacheMetadataSync, EvictionEvent, EvictionReason,
-    PipelineCacheConfig, PipelineCacheManager, PpTpAdmissionOutcome, PpTpCoord, PreemptionPolicy,
-    PreemptionReason, PreemptionSignal, RejectionReason, SequenceId, StageCacheAllocation,
-    broadcast_2d_eviction, broadcast_eviction, check_pipeline_pressure, coordinated_2d_admission,
-    coordinated_admission, sync_metadata,
+    AdmissionDecision, AdmissionDiagnostic, CacheAdmissionRequest, CacheMetadataSync,
+    EvictionEvent, EvictionReason, PipelineCacheConfig, PipelineCacheManager, PpTpAdmissionOutcome,
+    PpTpCoord, PreemptionPolicy, PreemptionReason, PreemptionSignal, RejectionReason, SequenceId,
+    StageCacheAllocation, broadcast_2d_eviction, broadcast_eviction, check_pipeline_pressure,
+    coordinated_2d_admission, coordinated_admission, coordinated_admission_with_attribution,
+    sync_metadata,
 };
 pub use elastic::{
     ElasticPpConfig, ElasticRuntimeDriver, NoopEventSink, RecordingEventSink,
@@ -125,8 +127,10 @@ pub use local_runtime::{
     resolve_in_process_stage_assignments_for_model,
 };
 pub use metrics::{
-    MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics,
-    RepartitionMetrics, RepartitionMetricsSnapshot, StageMetrics,
+    ActivationLatencyHistogram, ActivationLatencyPair, AdmissionRejectionCounters,
+    AdmissionRejectionEntry, MetricsCollector as PipelineMetricsCollector, MetricsSummary,
+    PipelineMetrics, PipelineObservability, PipelineObservabilitySnapshot, RepartitionMetrics,
+    RepartitionMetricsSnapshot, StageMetrics, StageUtilizationRegistry, StageUtilizationSnapshot,
 };
 pub use micro_batch::{
     MicroBatch, MicroBatchSpec, split_into_micro_batches, suggested_micro_batch_size,
@@ -171,3 +175,4 @@ pub use stage_executor::{
     supported_families,
 };
 pub use stage_worker::{InProcessStageWorkerLoop, PipelineWorkerInput, PipelineWorkerOutput};
+pub use trace::{PpTracer, StageSpan};

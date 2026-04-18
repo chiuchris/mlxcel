@@ -15,8 +15,16 @@
 //! Prometheus-compatible metrics endpoint.
 //!
 //! This route is read-only and should remain separate from generation policy.
-//! Includes both server-level request counters and batch observability gauges.
+//! Includes both server-level request counters and batch observability gauges,
+//! plus the pipeline-parallel families added by issue #350:
+//!
+//! - Per-stage utilization and bubble ratio.
+//! - Activation transfer latency histograms (p50/p95/p99 per stage pair).
+//! - KV cache admission rejection counters (labeled by stage + reason).
+//! - Elastic repartition event counters consumed from issue #349's emission
+//!   path.
 
+use std::fmt::Write;
 use std::sync::atomic::Ordering;
 
 use axum::{
@@ -25,6 +33,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::distributed::pipeline::PipelineObservabilitySnapshot;
 use crate::server::AppState;
 
 /// GET /metrics -- Prometheus text format
@@ -44,6 +53,7 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // Batch observability counters
     let obs = state.batch_observability.snapshot();
 
+    let pp_snapshot = state.pp_observability.snapshot();
     let body = format!(
         "# HELP mlxcel_requests_total Total number of generation requests\n\
          # TYPE mlxcel_requests_total counter\n\
@@ -129,6 +139,9 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         decode_storage_fallbacks = obs.decode_storage_fallbacks,
     );
 
+    let mut body = body;
+    append_pipeline_metrics(&mut body, &pp_snapshot);
+
     (
         [(
             header::CONTENT_TYPE,
@@ -137,4 +150,124 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         body,
     )
         .into_response()
+}
+
+/// Append the pipeline-parallel observability families in Prometheus text
+/// format. Safe to call on every scrape — the snapshot is an owned value
+/// that reads atomics / locked maps exactly once.
+fn append_pipeline_metrics(body: &mut String, snap: &PipelineObservabilitySnapshot) {
+    // --- Stage utilization ---
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_stage_busy_fraction Fraction of stage time spent on compute/transfer\n\
+         # TYPE mlxcel_pp_stage_busy_fraction gauge"
+    );
+    for s in &snap.stage_utilization {
+        let _ = writeln!(
+            body,
+            "mlxcel_pp_stage_busy_fraction{{stage=\"{}\"}} {:.6}",
+            s.stage_index,
+            s.busy_fraction()
+        );
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_stage_bubble_fraction Fraction of stage time spent idle (bubble)\n\
+         # TYPE mlxcel_pp_stage_bubble_fraction gauge"
+    );
+    for s in &snap.stage_utilization {
+        let _ = writeln!(
+            body,
+            "mlxcel_pp_stage_bubble_fraction{{stage=\"{}\"}} {:.6}",
+            s.stage_index,
+            s.bubble_fraction()
+        );
+    }
+
+    // --- Mean bubble ratio ---
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_mean_bubble_ratio Rolling mean bubble ratio across recorded steps\n\
+         # TYPE mlxcel_pp_mean_bubble_ratio gauge\n\
+         mlxcel_pp_mean_bubble_ratio {:.6}",
+        snap.mean_bubble_ratio
+    );
+
+    // --- Activation transfer latency ---
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_activation_latency_microseconds Activation transfer latency between adjacent stages\n\
+         # TYPE mlxcel_pp_activation_latency_microseconds summary"
+    );
+    for p in &snap.activation_latency {
+        let _ = writeln!(
+            body,
+            "mlxcel_pp_activation_latency_microseconds{{src_stage=\"{src}\",dst_stage=\"{dst}\",quantile=\"0.5\"}} {p50}\n\
+             mlxcel_pp_activation_latency_microseconds{{src_stage=\"{src}\",dst_stage=\"{dst}\",quantile=\"0.95\"}} {p95}\n\
+             mlxcel_pp_activation_latency_microseconds{{src_stage=\"{src}\",dst_stage=\"{dst}\",quantile=\"0.99\"}} {p99}\n\
+             mlxcel_pp_activation_latency_microseconds_count{{src_stage=\"{src}\",dst_stage=\"{dst}\"}} {count}\n\
+             mlxcel_pp_activation_latency_microseconds_max{{src_stage=\"{src}\",dst_stage=\"{dst}\"}} {max}",
+            src = p.src_stage,
+            dst = p.dst_stage,
+            p50 = p.p50_us,
+            p95 = p.p95_us,
+            p99 = p.p99_us,
+            count = p.count,
+            max = p.max_us,
+        );
+    }
+
+    // --- Admission rejection counters ---
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_admission_rejections_total Total KV cache admission rejections\n\
+         # TYPE mlxcel_pp_admission_rejections_total counter"
+    );
+    for e in &snap.admission_rejections {
+        let _ = writeln!(
+            body,
+            "mlxcel_pp_admission_rejections_total{{stage=\"{}\",reason=\"{}\"}} {}",
+            e.stage_index, e.reason, e.count
+        );
+    }
+
+    // --- Elastic repartition counters (issue #349 emission path) ---
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_repartition_events_total Total elastic pipeline repartition events\n\
+         # TYPE mlxcel_pp_repartition_events_total counter"
+    );
+    // Sort keys for deterministic output.
+    let mut keys: Vec<&String> = snap.repartition.counters.keys().collect();
+    keys.sort();
+    for key in keys {
+        let count = snap.repartition.counters.get(key).copied().unwrap_or(0);
+        // Key format is "<trigger>:<outcome>".
+        let (trigger, outcome) = key.split_once(':').unwrap_or((key.as_str(), "unknown"));
+        let _ = writeln!(
+            body,
+            "mlxcel_pp_repartition_events_total{{trigger=\"{trigger}\",outcome=\"{outcome}\"}} {count}"
+        );
+    }
+
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_repartition_drain_microseconds Drain duration histogram for completed repartitions\n\
+         # TYPE mlxcel_pp_repartition_drain_microseconds summary\n\
+         mlxcel_pp_repartition_drain_microseconds_sum {}\n\
+         mlxcel_pp_repartition_drain_microseconds_count {}\n\
+         mlxcel_pp_repartition_drain_microseconds_max {}",
+        snap.repartition.drain_us_total,
+        snap.repartition.drain_count,
+        snap.repartition.drain_us_max
+    );
+    let _ = writeln!(
+        body,
+        "# HELP mlxcel_pp_repartition_total_microseconds Total repartition wall time across outcomes\n\
+         # TYPE mlxcel_pp_repartition_total_microseconds summary\n\
+         mlxcel_pp_repartition_total_microseconds_sum {}\n\
+         mlxcel_pp_repartition_total_microseconds_count {}",
+        snap.repartition.total_us_total, snap.repartition.total_count
+    );
 }

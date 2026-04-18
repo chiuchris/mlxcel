@@ -326,6 +326,330 @@ impl fmt::Display for MetricsSummary {
 }
 
 // ---------------------------------------------------------------------------
+// Activation transfer latency histogram (#350)
+// ---------------------------------------------------------------------------
+
+/// Monotonic-merge histogram for activation transfer latency samples.
+///
+/// Samples are partitioned by `(src_stage, dst_stage)` so the Prometheus
+/// renderer can emit per-pair p50/p95/p99 quantile buckets. The histogram
+/// is approximate: we keep a fixed-size log-linear bucket layout rather
+/// than a full sample array so memory stays bounded under sustained traffic.
+///
+/// Used by: stage workers (sample producers), `/metrics` endpoint (renderer).
+#[derive(Debug, Default)]
+pub struct ActivationLatencyHistogram {
+    inner: Mutex<HashMap<(u32, u32), LatencyBuckets>>,
+}
+
+impl ActivationLatencyHistogram {
+    /// Construct an empty histogram.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a single observation.
+    pub fn observe(&self, src_stage: u32, dst_stage: u32, latency: Duration) {
+        let us = latency.as_micros().min(u128::from(u64::MAX)) as u64;
+        let mut map = self.inner.lock().expect("activation latency poisoned");
+        map.entry((src_stage, dst_stage)).or_default().record(us);
+    }
+
+    /// Snapshot for rendering. Emits one entry per stage pair ordered
+    /// `(src_stage, dst_stage)` ascending so output is stable.
+    pub fn snapshot(&self) -> Vec<ActivationLatencyPair> {
+        let map = self.inner.lock().expect("activation latency poisoned");
+        let mut pairs: Vec<_> = map
+            .iter()
+            .map(|(&(src, dst), buckets)| ActivationLatencyPair {
+                src_stage: src,
+                dst_stage: dst,
+                count: buckets.count,
+                p50_us: buckets.quantile(0.50),
+                p95_us: buckets.quantile(0.95),
+                p99_us: buckets.quantile(0.99),
+                max_us: buckets.max,
+            })
+            .collect();
+        pairs.sort_by(|a, b| (a.src_stage, a.dst_stage).cmp(&(b.src_stage, b.dst_stage)));
+        pairs
+    }
+}
+
+/// Rendered per-stage-pair latency summary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActivationLatencyPair {
+    pub src_stage: u32,
+    pub dst_stage: u32,
+    pub count: u64,
+    pub p50_us: u64,
+    pub p95_us: u64,
+    pub p99_us: u64,
+    pub max_us: u64,
+}
+
+/// Log-linear histogram buckets.
+///
+/// Covers 1 μs to ~1 s with 24 exponentially spaced bins; that is the
+/// working range for activation transfer (single-digit μs on a local link,
+/// hundreds of ms on a slow WAN link). Observations above the ceiling pin
+/// to the top bucket, which is what we want for the p99 tail indicator.
+#[derive(Debug, Clone, Default)]
+struct LatencyBuckets {
+    buckets: [u64; Self::BUCKET_COUNT],
+    count: u64,
+    max: u64,
+}
+
+impl LatencyBuckets {
+    const BUCKET_COUNT: usize = 24;
+
+    fn bucket_upper_bound(idx: usize) -> u64 {
+        // Powers of two, starting at 1 microsecond: 1, 2, 4, ..., 2^(N-1).
+        1u64 << idx.min(63)
+    }
+
+    fn record(&mut self, us: u64) {
+        self.count = self.count.saturating_add(1);
+        if us > self.max {
+            self.max = us;
+        }
+        let idx = Self::bucket_index(us);
+        self.buckets[idx] = self.buckets[idx].saturating_add(1);
+    }
+
+    fn bucket_index(us: u64) -> usize {
+        if us == 0 {
+            return 0;
+        }
+        let highest_bit = 63 - us.leading_zeros() as usize;
+        (highest_bit + 1).min(Self::BUCKET_COUNT - 1)
+    }
+
+    fn quantile(&self, q: f64) -> u64 {
+        if self.count == 0 {
+            return 0;
+        }
+        let target = ((self.count as f64) * q).ceil() as u64;
+        let mut seen = 0u64;
+        for (idx, &count) in self.buckets.iter().enumerate() {
+            seen += count;
+            if seen >= target {
+                return Self::bucket_upper_bound(idx);
+            }
+        }
+        self.max
+    }
+}
+
+// ---------------------------------------------------------------------------
+// KV cache admission rejection counters (#350)
+// ---------------------------------------------------------------------------
+
+/// Counters for KV cache admission rejections, keyed by
+/// `(stage_index, reason)`.
+///
+/// Used by: cache admission path (`cache_manager.rs`), `/metrics` endpoint.
+#[derive(Debug, Default)]
+pub struct AdmissionRejectionCounters {
+    inner: Mutex<HashMap<(u32, &'static str), u64>>,
+}
+
+impl AdmissionRejectionCounters {
+    /// Construct an empty counter set.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a rejection on `stage_index` with the given short reason label.
+    pub fn record(&self, stage_index: u32, reason: &'static str) {
+        let mut map = self.inner.lock().expect("admission counters poisoned");
+        *map.entry((stage_index, reason)).or_insert(0) += 1;
+    }
+
+    /// Snapshot sorted `(stage, reason)` ascending for stable output.
+    pub fn snapshot(&self) -> Vec<AdmissionRejectionEntry> {
+        let map = self.inner.lock().expect("admission counters poisoned");
+        let mut entries: Vec<_> = map
+            .iter()
+            .map(|(&(stage, reason), &count)| AdmissionRejectionEntry {
+                stage_index: stage,
+                reason,
+                count,
+            })
+            .collect();
+        entries.sort_by(|a, b| (a.stage_index, a.reason).cmp(&(b.stage_index, b.reason)));
+        entries
+    }
+}
+
+/// Rendered rejection counter entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdmissionRejectionEntry {
+    pub stage_index: u32,
+    pub reason: &'static str,
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------------------
+// Stage utilization snapshot (#350)
+// ---------------------------------------------------------------------------
+
+/// Compact per-stage utilization snapshot intended for Prometheus rendering.
+///
+/// The full [`MetricsCollector`] tracks rich per-step breakdowns; this
+/// container captures the fraction actually needed by operators watching
+/// dashboards (busy fraction, bubble contribution) without the serialization
+/// overhead of shipping an entire `PipelineMetrics` snapshot per scrape.
+#[derive(Debug, Default)]
+pub struct StageUtilizationRegistry {
+    inner: Mutex<HashMap<u32, StageUtilizationAccumulator>>,
+}
+
+impl StageUtilizationRegistry {
+    /// Construct an empty registry.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a sample for `stage_index`. `busy` is time spent on compute
+    /// plus transfer; `total` includes wait/bubble time.
+    pub fn record(&self, stage_index: u32, busy: Duration, total: Duration) {
+        let mut map = self.inner.lock().expect("stage utilization poisoned");
+        map.entry(stage_index).or_default().add(busy, total);
+    }
+
+    /// Snapshot ordered by stage index.
+    pub fn snapshot(&self) -> Vec<StageUtilizationSnapshot> {
+        let map = self.inner.lock().expect("stage utilization poisoned");
+        let mut entries: Vec<_> = map
+            .iter()
+            .map(|(&stage, acc)| StageUtilizationSnapshot {
+                stage_index: stage,
+                busy_us: acc.busy_us,
+                total_us: acc.total_us,
+            })
+            .collect();
+        entries.sort_by_key(|e| e.stage_index);
+        entries
+    }
+}
+
+/// Rendered per-stage utilization sample.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StageUtilizationSnapshot {
+    pub stage_index: u32,
+    pub busy_us: u64,
+    pub total_us: u64,
+}
+
+impl StageUtilizationSnapshot {
+    /// Busy fraction `[0.0, 1.0]`, or `0.0` if no samples have been recorded.
+    pub fn busy_fraction(&self) -> f64 {
+        if self.total_us == 0 {
+            0.0
+        } else {
+            self.busy_us as f64 / self.total_us as f64
+        }
+    }
+
+    /// Bubble contribution: `1.0 - busy_fraction`.
+    pub fn bubble_fraction(&self) -> f64 {
+        1.0 - self.busy_fraction()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StageUtilizationAccumulator {
+    busy_us: u64,
+    total_us: u64,
+}
+
+impl StageUtilizationAccumulator {
+    fn add(&mut self, busy: Duration, total: Duration) {
+        let b = busy.as_micros().min(u128::from(u64::MAX)) as u64;
+        let t = total.as_micros().min(u128::from(u64::MAX)) as u64;
+        self.busy_us = self.busy_us.saturating_add(b);
+        self.total_us = self.total_us.saturating_add(t);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline observability aggregator
+// ---------------------------------------------------------------------------
+
+/// Top-level container for every pipeline-parallel observability surface.
+///
+/// Held by the server's `AppState` so route handlers render metrics without
+/// knowing about the individual trackers.
+#[derive(Debug, Default)]
+pub struct PipelineObservability {
+    /// Per-stage utilization aggregator.
+    pub stage_utilization: StageUtilizationRegistry,
+    /// Per-stage-pair activation transfer latency histogram.
+    pub activation_latency: ActivationLatencyHistogram,
+    /// KV cache admission rejection counters.
+    pub admission_rejections: AdmissionRejectionCounters,
+    /// Elastic repartition event counters (issue #349 emission path).
+    pub repartition: RepartitionMetrics,
+    /// Rolling bubble ratio sample (best-effort; scheduler updates this when
+    /// it closes out a pipeline step).
+    bubble_ratio_bp: AtomicU64,
+    bubble_ratio_samples: AtomicU64,
+}
+
+impl PipelineObservability {
+    /// Construct an empty aggregator.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a bubble-ratio observation (fraction in `[0.0, 1.0]`). We
+    /// store as basis points (×10_000) to keep arithmetic integer-atomic.
+    pub fn record_bubble_ratio(&self, fraction: f64) {
+        let bp = (fraction.clamp(0.0, 1.0) * 10_000.0).round() as u64;
+        self.bubble_ratio_bp.fetch_add(bp, Ordering::Relaxed);
+        self.bubble_ratio_samples.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Mean bubble ratio across recorded samples. Zero when no samples.
+    pub fn mean_bubble_ratio(&self) -> f64 {
+        let samples = self.bubble_ratio_samples.load(Ordering::Relaxed);
+        if samples == 0 {
+            return 0.0;
+        }
+        let total = self.bubble_ratio_bp.load(Ordering::Relaxed);
+        (total as f64 / samples as f64) / 10_000.0
+    }
+
+    /// Render every sub-metric into a single snapshot struct suitable for
+    /// the Prometheus endpoint.
+    pub fn snapshot(&self) -> PipelineObservabilitySnapshot {
+        PipelineObservabilitySnapshot {
+            stage_utilization: self.stage_utilization.snapshot(),
+            activation_latency: self.activation_latency.snapshot(),
+            admission_rejections: self.admission_rejections.snapshot(),
+            repartition: self.repartition.snapshot(),
+            mean_bubble_ratio: self.mean_bubble_ratio(),
+        }
+    }
+}
+
+/// Rendered snapshot returned by [`PipelineObservability::snapshot`].
+#[derive(Debug, Clone, Default)]
+pub struct PipelineObservabilitySnapshot {
+    pub stage_utilization: Vec<StageUtilizationSnapshot>,
+    pub activation_latency: Vec<ActivationLatencyPair>,
+    pub admission_rejections: Vec<AdmissionRejectionEntry>,
+    pub repartition: RepartitionMetricsSnapshot,
+    pub mean_bubble_ratio: f64,
+}
+
+// ---------------------------------------------------------------------------
 // Elastic repartition counters (consumed by #350's /metrics endpoint)
 // ---------------------------------------------------------------------------
 

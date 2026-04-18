@@ -246,6 +246,62 @@ impl fmt::Display for RejectionReason {
     }
 }
 
+impl RejectionReason {
+    /// Short, low-cardinality label for metric dimensions and traces.
+    ///
+    /// Used by: `/metrics` admission rejection counters (#350),
+    /// chrome-tracing rejection events.
+    pub fn metric_label(&self) -> &'static str {
+        match self {
+            Self::MaxSequencesReached => "sequence_cap",
+            Self::InsufficientMemory { .. } => "memory",
+            Self::AlreadyCached => "already_cached",
+            Self::RejectedByStage { .. } => "rejected_by_stage",
+        }
+    }
+}
+
+/// Enriched OOM diagnostic produced by [`coordinated_admission_with_attribution`]
+/// (issue #350). Operators see which stage rejected, why, and where the
+/// offending stage's KV occupancy sits at the moment of rejection.
+///
+/// Used by: server HTTP error path, `/metrics` counters, chrome-tracing
+/// `admission_reject` events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionDiagnostic {
+    /// Stage that rejected the sequence.
+    pub stage_index: u32,
+    /// Underlying rejection reason.
+    pub reason: RejectionReason,
+    /// Byte occupancy currently held by the rejecting stage's KV cache.
+    pub used_memory_bytes: u64,
+    /// Byte budget configured on that stage.
+    pub budget_bytes: u64,
+    /// Active sequence count on the rejecting stage at the moment of the
+    /// rejection.
+    pub active_sequences: usize,
+}
+
+impl fmt::Display for AdmissionDiagnostic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let frac = if self.budget_bytes == 0 {
+            0.0
+        } else {
+            (self.used_memory_bytes as f64 / self.budget_bytes as f64) * 100.0
+        };
+        write!(
+            f,
+            "admission rejected on stage {} ({}): used {}B / {}B ({:.1}%), {} active sequences",
+            self.stage_index,
+            self.reason,
+            self.used_memory_bytes,
+            self.budget_bytes,
+            frac,
+            self.active_sequences
+        )
+    }
+}
+
 /// Event broadcast when a sequence is evicted from the cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvictionEvent {
@@ -946,6 +1002,69 @@ pub fn broadcast_2d_eviction(
         mgr.apply_eviction_broadcast(&event)?;
     }
     Ok(event)
+}
+
+/// Coordinated admission that returns an [`AdmissionDiagnostic`] on
+/// rejection, instead of just the enum. Used by the server HTTP error
+/// path so operators see the offending stage identity and KV occupancy.
+///
+/// On success the semantics are identical to [`coordinated_admission`] —
+/// every manager's allocation is committed atomically. On rejection no
+/// mutation is performed anywhere, mirroring the existing dry-run-then-
+/// commit contract.
+///
+/// Used by: `/metrics` admission rejection pipeline (#350).
+pub fn coordinated_admission_with_attribution(
+    managers: &mut [&mut PipelineCacheManager],
+    req: &CacheAdmissionRequest,
+) -> Result<std::result::Result<(), AdmissionDiagnostic>> {
+    ensure!(!managers.is_empty(), "at least one manager is required");
+
+    // Phase 1: dry-run check.
+    for mgr in managers.iter() {
+        let stage_index = mgr.config.stage_index;
+        let budget = mgr.config.memory_budget_bytes;
+        if mgr.allocations.contains_key(&req.sequence_id) {
+            return Ok(Err(AdmissionDiagnostic {
+                stage_index,
+                reason: RejectionReason::AlreadyCached,
+                used_memory_bytes: mgr.used_memory_bytes,
+                budget_bytes: budget,
+                active_sequences: mgr.allocations.len(),
+            }));
+        }
+        if mgr.allocations.len() >= mgr.config.max_sequences {
+            return Ok(Err(AdmissionDiagnostic {
+                stage_index,
+                reason: RejectionReason::MaxSequencesReached,
+                used_memory_bytes: mgr.used_memory_bytes,
+                budget_bytes: budget,
+                active_sequences: mgr.allocations.len(),
+            }));
+        }
+        let required = mgr.config.estimate_memory(req.effective_tokens());
+        let available = mgr.available_memory();
+        if required > available {
+            return Ok(Err(AdmissionDiagnostic {
+                stage_index,
+                reason: RejectionReason::InsufficientMemory {
+                    required_bytes: required,
+                    available_bytes: available,
+                },
+                used_memory_bytes: mgr.used_memory_bytes,
+                budget_bytes: budget,
+                active_sequences: mgr.allocations.len(),
+            }));
+        }
+    }
+
+    // Phase 2: commit.
+    for mgr in managers.iter_mut() {
+        let decision = mgr.request_admission(req);
+        debug_assert_eq!(decision, AdmissionDecision::Admitted);
+    }
+
+    Ok(Ok(()))
 }
 
 #[cfg(test)]

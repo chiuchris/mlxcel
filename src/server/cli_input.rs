@@ -143,6 +143,14 @@ pub struct ServerStartupInput {
     pub elastic_pp_pressure_fraction: f64,
     /// Cool-down seconds between memory-pressure triggers.
     pub elastic_pp_cool_down: u64,
+
+    // Observability (issue #350).
+    /// Requested port for the Prometheus `/metrics` endpoint. `Some(p)`
+    /// enables the endpoint; `p` is informational only in v1 because the
+    /// endpoint is multiplexed onto the main HTTP port.
+    pub metrics_port: Option<u16>,
+    /// Chrome-tracing JSON output path for the pipeline scheduler.
+    pub debug_pp_trace: Option<PathBuf>,
 }
 
 impl ServerStartupInput {
@@ -177,7 +185,7 @@ impl ServerStartupInput {
             chat_template_file: self.chat_template_file,
             enable_slots: resolve_compat_toggle(self.slots, self.no_slots),
             enable_props: self.props,
-            enable_metrics: self.metrics,
+            enable_metrics: self.metrics || self.metrics_port.is_some(),
             warmup: resolve_compat_toggle(self.warmup, self.no_warmup),
             temperature: self.temperature,
             top_k: self.top_k,
@@ -220,6 +228,8 @@ impl ServerStartupInput {
             elastic_pp_drain_timeout: self.elastic_pp_drain_timeout,
             elastic_pp_pressure_fraction: self.elastic_pp_pressure_fraction,
             elastic_pp_cool_down: self.elastic_pp_cool_down,
+            metrics_port: self.metrics_port,
+            debug_pp_trace: self.debug_pp_trace,
         }
     }
 }

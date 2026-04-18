@@ -249,3 +249,103 @@ mod repartition {
         assert_eq!(snap.mean_drain_us(), 0);
     }
 }
+
+// -----------------------------------------------------------------------------
+// Issue #350: activation latency histogram, admission rejection counters,
+// stage utilization registry, and the top-level PipelineObservability
+// aggregator.
+// -----------------------------------------------------------------------------
+
+mod observability {
+    use super::super::{
+        ActivationLatencyHistogram, AdmissionRejectionCounters, PipelineObservability,
+        StageUtilizationRegistry,
+    };
+    use std::time::Duration;
+
+    #[test]
+    fn latency_histogram_reports_stable_ordering() {
+        let hist = ActivationLatencyHistogram::new();
+        // Record a mix of pairs.
+        for _ in 0..10 {
+            hist.observe(0, 1, Duration::from_micros(50));
+        }
+        for _ in 0..10 {
+            hist.observe(1, 2, Duration::from_micros(200));
+        }
+        let snap = hist.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!((snap[0].src_stage, snap[0].dst_stage), (0, 1));
+        assert_eq!((snap[1].src_stage, snap[1].dst_stage), (1, 2));
+        // Every sample lived in the "0..=50us" bucket -> p95 for stage 0->1
+        // should be bounded by the 2^N boundary that covers 50us (64us).
+        assert!(snap[0].p95_us <= 64, "p95={}", snap[0].p95_us);
+        // 200us samples should land at or above 256us boundary.
+        assert!(snap[1].p95_us >= 128, "p95={}", snap[1].p95_us);
+        assert_eq!(snap[0].count, 10);
+        assert_eq!(snap[1].count, 10);
+    }
+
+    #[test]
+    fn latency_histogram_reports_max_regardless_of_bucket_ceiling() {
+        let hist = ActivationLatencyHistogram::new();
+        hist.observe(0, 1, Duration::from_millis(250));
+        let snap = hist.snapshot();
+        assert_eq!(snap.len(), 1);
+        // 250 ms = 250_000 us -> recorded verbatim in `max_us` even if
+        // the bucket layout saturates.
+        assert_eq!(snap[0].max_us, 250_000);
+    }
+
+    #[test]
+    fn admission_rejection_counters_aggregate_by_stage_and_reason() {
+        let counters = AdmissionRejectionCounters::new();
+        counters.record(0, "memory");
+        counters.record(0, "memory");
+        counters.record(1, "sequence_cap");
+        let snap = counters.snapshot();
+        assert_eq!(snap.len(), 2);
+        assert_eq!(
+            (snap[0].stage_index, snap[0].reason, snap[0].count),
+            (0, "memory", 2)
+        );
+        assert_eq!(
+            (snap[1].stage_index, snap[1].reason, snap[1].count),
+            (1, "sequence_cap", 1)
+        );
+    }
+
+    #[test]
+    fn stage_utilization_busy_fraction_rolls_up_samples() {
+        let reg = StageUtilizationRegistry::new();
+        reg.record(0, Duration::from_millis(80), Duration::from_millis(100));
+        reg.record(0, Duration::from_millis(100), Duration::from_millis(100));
+        let snap = reg.snapshot();
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].stage_index, 0);
+        // Combined busy 180 / 200 = 0.9.
+        assert!((snap[0].busy_fraction() - 0.9).abs() < 1e-6);
+        assert!((snap[0].bubble_fraction() - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn observability_snapshot_bundles_every_family() {
+        let obs = PipelineObservability::new();
+        obs.stage_utilization
+            .record(0, Duration::from_millis(10), Duration::from_millis(20));
+        obs.activation_latency
+            .observe(0, 1, Duration::from_micros(100));
+        obs.admission_rejections.record(0, "memory");
+        obs.record_bubble_ratio(0.4);
+        obs.record_bubble_ratio(0.6);
+        let snap = obs.snapshot();
+        assert_eq!(snap.stage_utilization.len(), 1);
+        assert_eq!(snap.activation_latency.len(), 1);
+        assert_eq!(snap.admission_rejections.len(), 1);
+        assert!(
+            (snap.mean_bubble_ratio - 0.5).abs() < 1e-6,
+            "mean = {}",
+            snap.mean_bubble_ratio
+        );
+    }
+}
