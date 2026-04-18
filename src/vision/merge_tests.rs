@@ -101,6 +101,45 @@ fn prepare_inputs_for_multimodal_builds_additive_mask_and_preserves_dtype() {
 }
 
 #[test]
+fn prepare_inputs_for_multimodal_all_ones_mask_is_all_zeros() {
+    ensure_cpu_device();
+
+    // Sanity check for the common case: when attention_mask is all ones,
+    // the additive 4D mask must be all zeros (attend everywhere).
+    let image_features = mlxcel_core::from_slice_f32(&[4.0, 6.0], &[1, 1, 2]);
+    let inputs_embeds =
+        mlxcel_core::from_slice_f32(&[1.0, 2.0, 10.0, 11.0, 20.0, 21.0], &[1, 3, 2]);
+    let inputs_embeds = mlxcel_core::astype(&inputs_embeds, dtype::FLOAT16);
+    let input_ids = mlxcel_core::from_slice_i32(&[10, 99, 42], &[1, 3]);
+    let attention_mask = mlxcel_core::from_slice_i32(&[1, 1, 1], &[1, 3]);
+
+    let merged = prepare_inputs_for_multimodal(
+        4,
+        0,
+        99,
+        &image_features,
+        &inputs_embeds,
+        &input_ids,
+        &attention_mask,
+    );
+
+    let expected_mask = mlxcel_core::from_slice_f32(
+        &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        &[1, 1, 3, 3],
+    );
+    let actual_mask = match merged
+        .attention_mask_4d
+        .as_ref()
+        .and_then(|mask| mask.as_ref())
+    {
+        Some(mask) => mask,
+        None => panic!("expected 4D attention mask"),
+    };
+    assert_eq!(mlxcel_core::array_dtype(actual_mask), dtype::FLOAT32);
+    assert_arrays_equal(actual_mask, &expected_mask);
+}
+
+#[test]
 fn merge_llava_flattens_projected_features_in_image_token_order() {
     ensure_cpu_device();
 

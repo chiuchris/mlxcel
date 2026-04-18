@@ -26,7 +26,8 @@
 //!
 //! Contract:
 //! - merge helpers keep output embeddings in the text-model dtype
-//! - Gemma-style merge returns an integer 4D mask (`0` or `1`)
+//! - Gemma-style merge returns an additive f32 4D mask
+//!   (`0.0` at attended positions, `f32::MIN` at masked positions)
 //! - LLaVA-style merge keeps standard causal masking and returns `None`
 //!
 //! Reference: references/mlx-vlm/mlx_vlm/models/gemma3/gemma3.py:121-168
@@ -52,6 +53,13 @@ pub struct InputEmbeddings {
 /// * `inputs_embeds` - Text token embeddings [batch, seq_len, embed_dim]
 /// * `input_ids` - Token IDs [batch, seq_len]
 /// * `attention_mask` - Attention mask [batch, seq_len]
+///
+/// # Returns
+/// * `inputs_embeds` - Merged embeddings in the text-model dtype
+/// * `attention_mask_4d` - Additive f32 4D mask of shape [batch, 1, seq_len, seq_len]
+///   with `0.0` at attended positions and `f32::MIN` at masked positions. This is
+///   consumable by `mx.fast.scaled_dot_product_attention`, which treats non-bool
+///   masks as additive bias on pre-softmax scores.
 ///
 /// Used by: Gemma3 VLM, PaliGemma
 pub fn prepare_inputs_for_multimodal(
@@ -119,18 +127,24 @@ pub fn prepare_inputs_for_multimodal(
         &scaled_image_features,
     );
 
-    // Build 4D attention mask as INT32 0/1, matching Python mlx-vlm exactly.
-    // Python's prepare_inputs_for_multimodal returns the mask directly as:
-    //   final_attention_mask_4d = (attention_mask[:, None] * attention_mask[:, :, None])[:, None]
-    // which is INT32 (1=attend, 0=mask). mx.fast.scaled_dot_product_attention
-    // treats non-bool masks as additive, so 0/1 adds 0 or 1 to scores.
-    // With all-ones attention_mask, this creates a uniform +1 offset that
-    // doesn't affect softmax (shift-invariant).
+    // Build additive 4D attention mask: f32 with 0.0 at attended positions
+    // and f32::MIN at masked positions. mx.fast.scaled_dot_product_attention
+    // treats non-bool masks as additive bias on pre-softmax scores, so
+    // masked positions collapse to ~0 after softmax while attended positions
+    // are unchanged. This is the correct semantics for padded sequences; a
+    // multiplicative 0/1 mask would silently leak padding tokens into the
+    // attention distribution.
     // Used by: PaliGemma (Gemma2 backbone), Gemma3 VLM
     let attn_mask_1 = mlxcel_core::expand_dims(attention_mask, 1); // [B, 1, S]
     let attn_mask_2 = mlxcel_core::expand_dims(attention_mask, 2); // [B, S, 1]
-    let attn_mask_4d = mlxcel_core::multiply(&attn_mask_1, &attn_mask_2); // [B, S, S]
-    let attn_mask_4d = mlxcel_core::expand_dims(&attn_mask_4d, 1); // [B, 1, S, S]
+    let attn_product = mlxcel_core::multiply(&attn_mask_1, &attn_mask_2); // [B, S, S] int32 0/1
+    let zero_i32 = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::INT32);
+    let zero_i32 = mlxcel_core::astype(&zero_i32, mlxcel_core::dtype::INT32);
+    let is_masked = mlxcel_core::equal(&attn_product, &zero_i32); // [B, S, S] bool
+    let zero_f32 = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::FLOAT32);
+    let neg_inf = mlxcel_core::full_f32(&[1], f32::MIN, mlxcel_core::dtype::FLOAT32);
+    let additive = mlxcel_core::where_cond(&is_masked, &neg_inf, &zero_f32);
+    let attn_mask_4d = mlxcel_core::expand_dims(&additive, 1); // [B, 1, S, S]
 
     // Cast final embedding to same dtype as inputs_embeds
     let dtype = mlxcel_core::array_dtype(inputs_embeds);
