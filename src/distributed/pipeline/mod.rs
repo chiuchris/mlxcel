@@ -74,6 +74,11 @@ pub mod micro_batch;
 pub mod partial_loading;
 pub mod partial_loading_adapter;
 pub mod partition;
+pub mod partition_assembly;
+pub mod partition_balance;
+pub mod partition_profile;
+pub mod partition_profile_heuristics;
+pub mod partition_quality;
 pub mod remote_service;
 pub mod runtime;
 pub mod schedule;
@@ -101,8 +106,9 @@ pub use cache_manager::{
     coordinated_admission, sync_metadata,
 };
 pub use local_runtime::{
-    load_in_process_stage_worker, load_in_process_stage_worker_with_adapter,
+    load_in_process_stage_worker, load_in_process_stage_worker_with_adapter, log_partition_quality,
     resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
+    resolve_in_process_stage_assignments_for_model,
 };
 pub use metrics::{
     MetricsCollector as PipelineMetricsCollector, MetricsSummary, PipelineMetrics, StageMetrics,
@@ -120,8 +126,14 @@ pub use partial_loading_adapter::{
     should_load_adapter_key,
 };
 pub use partition::{
-    DeviceSpec, ModelProfile, PartitionConfig, StageAssignment, auto_partition,
-    build_manual_assignments, parse_manual_partition, validate_memory_fit, validate_partition,
+    DeviceSpec, LayerAdjacencyGroup, ModelProfile, PartitionConfig, StageAssignment,
+    auto_partition, auto_partition_with_report, build_manual_assignments, parse_manual_partition,
+    validate_adjacency, validate_memory_fit, validate_partition,
+};
+pub use partition_profile::{build_model_profile, build_profile_from_json};
+pub use partition_quality::{
+    PartitionQualityReport, StageQuality, build_quality_report, build_quality_report_with_actuals,
+    format_quality_report, populate_actual_memory, summarize_quality_warnings,
 };
 pub use remote_service::{
     RemoteStageCommand, RemoteStageResponse, RemoteStageServiceConfig, RemoteStageServiceHandle,

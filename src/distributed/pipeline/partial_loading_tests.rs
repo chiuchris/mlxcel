@@ -416,12 +416,7 @@ fn safetensors_index_rejects_path_traversal_subdir() {
 // ---------------------------------------------------------------------------
 
 fn test_profile() -> ModelProfile {
-    ModelProfile {
-        num_layers: 32,
-        layer_param_bytes: 100_000_000,    // 100MB per layer
-        embedding_param_bytes: 50_000_000, // 50MB
-        lm_head_param_bytes: 50_000_000,   // 50MB
-    }
+    ModelProfile::uniform(32, 100_000_000, 50_000_000, 50_000_000)
 }
 
 #[test]

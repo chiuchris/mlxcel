@@ -310,12 +310,8 @@ fn pipeline_heterogeneous_memory_partition_is_stable() {
     // Synthetic model: 32 transformer layers, ~250 MiB per layer, ~300 MiB
     // embedding, ~300 MiB lm_head. Numbers are illustrative; the property
     // under test is the relative assignment shape, not the absolute sizes.
-    let profile = ModelProfile {
-        num_layers: 32,
-        layer_param_bytes: 250 * 1024 * 1024,
-        embedding_param_bytes: 300 * 1024 * 1024,
-        lm_head_param_bytes: 300 * 1024 * 1024,
-    };
+    let profile =
+        ModelProfile::uniform(32, 250 * 1024 * 1024, 300 * 1024 * 1024, 300 * 1024 * 1024);
     let devices = vec![
         DeviceSpec {
             device_id: "small-memory-stage-0".to_string(),

@@ -29,7 +29,6 @@ use mlxcel::{
         PipelineWorkerInput, RequestId,
         pipeline::{
             load_in_process_stage_worker_with_adapter, resolve_in_process_pipeline_num_layers,
-            resolve_in_process_stage_assignments,
         },
         resolve_model_shard_plan, shard_config_from_cli, validate_supported_runtime,
     },
@@ -186,14 +185,22 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
 }
 
 fn resolve_cli_pipeline_assignments(
+    model_dir: &Path,
     num_layers: usize,
     args: &GenerateArgs,
 ) -> Result<Vec<mlxcel::distributed::StageAssignment>> {
-    resolve_in_process_stage_assignments(
-        num_layers,
-        Some(args.pipeline_parallel.pp_size),
-        args.pipeline_parallel.pp_layers.as_deref(),
-    )
+    // Use the model-aware profile builder so MoE expert variation and
+    // Gemma 4 KV-shared adjacency are honoured by default. This drops the
+    // pre-#348 requirement for manual `--pp-layers` on those models.
+    let (assignments, report) =
+        mlxcel::distributed::pipeline::resolve_in_process_stage_assignments_for_model(
+            model_dir,
+            num_layers,
+            Some(args.pipeline_parallel.pp_size),
+            args.pipeline_parallel.pp_layers.as_deref(),
+        )?;
+    mlxcel::distributed::pipeline::log_partition_quality(&report);
+    Ok(assignments)
 }
 
 fn resolve_cli_pipeline_num_layers(model_dir: &Path) -> Result<usize> {
@@ -208,7 +215,7 @@ fn generate_pipeline_text(
     sampling_config: &SamplingConfig,
     args: &GenerateArgs,
 ) -> Result<(Vec<i32>, GenerationStats)> {
-    let assignments = resolve_cli_pipeline_assignments(num_layers, args)?;
+    let assignments = resolve_cli_pipeline_assignments(model_dir, num_layers, args)?;
     ensure!(
         assignments.len() >= 2,
         "pipeline execution requires at least 2 stages"

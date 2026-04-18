@@ -22,26 +22,32 @@ use anyhow::{Context, Result, anyhow, ensure};
 
 use crate::distributed::pipeline::{
     ChannelConfig, DeviceSpec, InProcessStageWorkerLoop, LoadedStageExecutor, ModelProfile,
-    PipelineConfig, StageAssignment, StageExecutor, auto_partition, build_manual_assignments,
-    parse_manual_partition,
+    PartitionQualityReport, PipelineConfig, StageAssignment, StageExecutor,
+    auto_partition_with_report, build_manual_assignments, build_model_profile,
+    format_quality_report, parse_manual_partition,
 };
 use crate::models::sanitize_config_json;
 
 fn equal_stage_model_profile(num_layers: usize) -> ModelProfile {
-    ModelProfile {
-        num_layers,
-        layer_param_bytes: 1024,
-        embedding_param_bytes: 1024,
-        lm_head_param_bytes: 1024,
-    }
+    ModelProfile::uniform(num_layers, 1024, 1024, 1024)
 }
 
 fn equal_capacity_devices(num_stages: usize, model: &ModelProfile) -> Vec<DeviceSpec> {
+    // Budget bound: sum of all layer bytes plus the heaviest stage's
+    // worst-case layer count (using the legacy uniform helper — the real
+    // model profile carries the vector and its own headroom). This keeps
+    // auto-partition happy for both the uniform test profile and the
+    // config-derived profile where `layer_bytes.is_some()`.
+    let per_layer_max = model
+        .layer_bytes
+        .as_ref()
+        .and_then(|v| v.iter().copied().max())
+        .unwrap_or(model.layer_param_bytes);
     let per_stage_layers = model.num_layers.div_ceil(num_stages) as u64;
     let per_stage_budget = model
         .embedding_param_bytes
         .saturating_add(model.lm_head_param_bytes)
-        .saturating_add(model.layer_param_bytes.saturating_mul(per_stage_layers + 2));
+        .saturating_add(per_layer_max.saturating_mul(per_stage_layers + 2));
     (0..num_stages)
         .map(|stage_index| DeviceSpec {
             device_id: format!("local-stage-{stage_index}"),
@@ -98,12 +104,64 @@ pub fn resolve_in_process_stage_assignments(
     manual_spec: Option<&str>,
 ) -> Result<Vec<StageAssignment>> {
     let profile = equal_stage_model_profile(num_layers);
+    resolve_stage_assignments_from_profile(&profile, num_stages, manual_spec).map(|(plan, _)| plan)
+}
+
+/// Resolve stage assignments for a concrete model directory. Unlike
+/// [`resolve_in_process_stage_assignments`], this variant loads a
+/// model-aware [`ModelProfile`] (real per-layer bytes for MoE, adjacency
+/// constraints for KV-shared layers) so the auto-partitioner no longer
+/// treats every layer as uniform. It also returns the partition quality
+/// report, which callers surface via `--log-level debug` logging.
+///
+/// Used by: CLI pipeline generate, `mlxcel-server` startup
+pub fn resolve_in_process_stage_assignments_for_model(
+    model_dir: &Path,
+    num_layers: usize,
+    num_stages: Option<usize>,
+    manual_spec: Option<&str>,
+) -> Result<(Vec<StageAssignment>, PartitionQualityReport)> {
+    let profile = build_model_profile(model_dir, num_layers).unwrap_or_else(|err| {
+        // Config read or parse failed — fall back to the uniform profile
+        // so we preserve the previous behaviour for callers that feed a
+        // bare layer count (e.g. synthetic tests).
+        tracing::debug!(
+            model_dir = %model_dir.display(),
+            error = %err,
+            "pipeline auto-partition: falling back to uniform profile"
+        );
+        equal_stage_model_profile(num_layers)
+    });
+    // Ensure the profile's layer count matches the caller-visible layer
+    // count (DeepSeek V3 stripping etc. may have reduced it).
+    let profile = if profile.num_layers == num_layers {
+        profile
+    } else {
+        let mut adjusted = profile.clone();
+        adjusted.num_layers = num_layers;
+        if let Some(v) = adjusted.layer_bytes.as_mut() {
+            v.truncate(num_layers);
+            while v.len() < num_layers {
+                v.push(adjusted.layer_param_bytes);
+            }
+        }
+        adjusted.adjacency.retain(|g| g.layers.end <= num_layers);
+        adjusted
+    };
+    resolve_stage_assignments_from_profile(&profile, num_stages, manual_spec)
+}
+
+fn resolve_stage_assignments_from_profile(
+    profile: &ModelProfile,
+    num_stages: Option<usize>,
+    manual_spec: Option<&str>,
+) -> Result<(Vec<StageAssignment>, PartitionQualityReport)> {
     if let Some(spec) = manual_spec {
         ensure!(
             !spec.trim().is_empty(),
             "--pp-layers must not be empty when provided"
         );
-        let ranges = parse_manual_partition(spec, num_layers)?;
+        let ranges = parse_manual_partition(spec, profile.num_layers)?;
         if let Some(expected) = num_stages
             && expected > 1
         {
@@ -113,8 +171,10 @@ pub fn resolve_in_process_stage_assignments(
                 ranges.len()
             );
         }
-        let devices = equal_capacity_devices(ranges.len(), &profile);
-        return build_manual_assignments(&ranges, &profile, &devices);
+        let devices = equal_capacity_devices(ranges.len(), profile);
+        let plan = build_manual_assignments(&ranges, profile, &devices)?;
+        let report = crate::distributed::pipeline::build_quality_report(profile, &plan);
+        return Ok((plan, report));
     }
 
     let num_stages = num_stages.ok_or_else(|| {
@@ -124,8 +184,18 @@ pub fn resolve_in_process_stage_assignments(
         num_stages >= 2,
         "in-process pipeline execution requires at least 2 stages"
     );
-    let devices = equal_capacity_devices(num_stages, &profile);
-    auto_partition(&profile, &devices)
+    let devices = equal_capacity_devices(num_stages, profile);
+    auto_partition_with_report(profile, &devices)
+}
+
+/// Log the partition quality report at debug level. Callers on the CLI
+/// generate and server startup paths should call this after resolving
+/// assignments so operators can see the estimated per-stage memory and
+/// any balancer warnings.
+///
+/// Used by: CLI pipeline generate, `mlxcel-server` startup
+pub fn log_partition_quality(report: &PartitionQualityReport) {
+    tracing::debug!("{}", format_quality_report(report));
 }
 
 pub fn load_in_process_stage_worker(

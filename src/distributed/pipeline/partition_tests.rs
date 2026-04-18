@@ -10,11 +10,41 @@ fn make_model(
     embed_bytes: u64,
     head_bytes: u64,
 ) -> ModelProfile {
+    ModelProfile::uniform(num_layers, layer_bytes, embed_bytes, head_bytes)
+}
+
+fn make_model_with_per_layer(
+    layer_bytes: Vec<u64>,
+    embed_bytes: u64,
+    head_bytes: u64,
+) -> ModelProfile {
+    let num_layers = layer_bytes.len();
+    let fallback = layer_bytes.iter().copied().max().unwrap_or(0);
     ModelProfile {
         num_layers,
-        layer_param_bytes: layer_bytes,
+        layer_param_bytes: fallback,
         embedding_param_bytes: embed_bytes,
         lm_head_param_bytes: head_bytes,
+        layer_bytes: Some(layer_bytes),
+        adjacency: Vec::new(),
+    }
+}
+
+fn make_model_with_adjacency(
+    layer_bytes: Vec<u64>,
+    embed_bytes: u64,
+    head_bytes: u64,
+    adjacency: Vec<LayerAdjacencyGroup>,
+) -> ModelProfile {
+    let num_layers = layer_bytes.len();
+    let fallback = layer_bytes.iter().copied().max().unwrap_or(0);
+    ModelProfile {
+        num_layers,
+        layer_param_bytes: fallback,
+        embedding_param_bytes: embed_bytes,
+        lm_head_param_bytes: head_bytes,
+        layer_bytes: Some(layer_bytes),
+        adjacency,
     }
 }
 
@@ -301,7 +331,7 @@ fn auto_partition_four_equal_devices() {
     assert!(result[3].has_lm_head);
     // Roughly 8 layers each.
     for a in &result {
-        assert!(a.layer_range.len() >= 1);
+        assert!(!a.layer_range.is_empty());
     }
 }
 
@@ -311,11 +341,15 @@ fn auto_partition_four_equal_devices() {
 
 #[test]
 fn auto_partition_non_uniform_two_devices() {
-    // 128GB device + 48GB device. The larger should get more layers.
+    // 32 layers × 1 GB = 32 GB. Stage 0 has 128 GB (plenty of room for
+    // every layer); stage 1 only has enough for 10 layers after the
+    // lm_head reservation. Byte-balance alone would split 16/16, but the
+    // small device's budget forces the partitioner to pack the bulk of
+    // the layers onto the big device.
     let model = make_model(32, 1_000_000_000, 500_000_000, 500_000_000);
     let devices = vec![
         make_device("big", 128_000_000_000),
-        make_device("small", 48_000_000_000),
+        make_device("small", 10_500_000_000),
     ];
     let result = auto_partition(&model, &devices).unwrap();
 
@@ -324,11 +358,30 @@ fn auto_partition_non_uniform_two_devices() {
 
     let big_layers = result[0].layer_range.len();
     let small_layers = result[1].layer_range.len();
-    // The big device (128GB) should get more layers than the small one (48GB).
     assert!(
         big_layers > small_layers,
-        "expected big device to get more layers ({big_layers} vs {small_layers})"
+        "tight budget on stage 1 must force more layers onto stage 0 \
+         ({big_layers} vs {small_layers})"
     );
+    // Stage 1 cannot exceed its budget after the lm_head reservation.
+    assert!(result[1].estimated_memory_bytes <= devices[1].available_memory_bytes);
+}
+
+#[test]
+fn auto_partition_balances_bytes_when_both_devices_roomy() {
+    // Same model, this time both devices have generous headroom. Byte
+    // balance should win: equal-sized stages.
+    let model = make_model(32, 1_000_000_000, 500_000_000, 500_000_000);
+    let devices = vec![
+        make_device("big", 128_000_000_000),
+        make_device("fat", 128_000_000_000),
+    ];
+    let result = auto_partition(&model, &devices).unwrap();
+    let diff = result[0]
+        .layer_range
+        .len()
+        .abs_diff(result[1].layer_range.len());
+    assert!(diff <= 1, "expected roughly even split, got {result:?}");
 }
 
 #[test]
@@ -530,4 +583,173 @@ fn device_spec_with_compute_units() {
     let d = make_device_with_compute("gpu0", 1_000_000, 128);
     assert_eq!(d.compute_units, 128);
     assert_eq!(d.available_memory_bytes, 1_000_000);
+}
+
+// ---------------------------------------------------------------------------
+// Per-layer byte accounting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn profile_reports_per_layer_bytes_when_override_set() {
+    let profile = make_model_with_per_layer(vec![10, 20, 30, 40], 5, 5);
+    assert_eq!(profile.layer_bytes_at(0), 10);
+    assert_eq!(profile.layer_bytes_at(3), 40);
+    assert_eq!(profile.total_param_bytes(), 10 + 20 + 30 + 40 + 5 + 5);
+}
+
+#[test]
+fn profile_falls_back_to_layer_param_bytes_without_override() {
+    let profile = make_model(4, 100, 5, 5);
+    assert_eq!(profile.layer_bytes_at(0), 100);
+    assert_eq!(profile.layer_bytes_at(3), 100);
+}
+
+#[test]
+fn auto_partition_honors_per_layer_bytes() {
+    // 8 layers: 0..3 are heavy (400 each), 3..8 are light (50 each).
+    // Heavy block = 1200 bytes, light block = 250 bytes. A balanced 2-way
+    // split should put the heavy block on one stage and light on the other.
+    let profile = make_model_with_per_layer(vec![400, 400, 400, 50, 50, 50, 50, 50], 100, 100);
+    let devices = vec![make_device("d0", 1_000_000), make_device("d1", 1_000_000)];
+    let plan = auto_partition(&profile, &devices).unwrap();
+    assert_eq!(plan.len(), 2);
+    // The first stage must stop after the heavy tail boundary.
+    assert!(plan[0].layer_range.end <= 3, "got plan {plan:?}");
+}
+
+#[test]
+fn auto_partition_respects_heterogeneous_budget_with_real_bytes() {
+    // Dense uniform layers but the second device's budget can only
+    // accommodate a handful of layers after the lm_head reservation. The
+    // partitioner must ship the bulk of the bytes to the big stage even
+    // though byte-balance alone would suggest an even split.
+    let profile = make_model_with_per_layer(vec![100; 16], 200, 200);
+    let devices = vec![make_device("big", 100_000), make_device("small", 700)];
+    let plan = auto_partition(&profile, &devices).unwrap();
+    assert!(
+        plan[0].layer_range.len() > plan[1].layer_range.len(),
+        "tight-budget stage 1 must hold fewer layers: {plan:?}"
+    );
+    assert!(plan[1].estimated_memory_bytes <= devices[1].available_memory_bytes);
+}
+
+// ---------------------------------------------------------------------------
+// Adjacency constraints
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_partition_refuses_to_split_adjacency_group() {
+    // 8 uniform layers, but layers 3..6 must stay together. The only
+    // valid split points are boundaries 1, 2, 3, and 6, 7.
+    let adjacency = vec![LayerAdjacencyGroup {
+        layers: 3..6,
+        reason: "synthetic adjacency".into(),
+    }];
+    let profile = make_model_with_adjacency(vec![100; 8], 100, 100, adjacency);
+    let devices = vec![make_device("d0", 1_000_000), make_device("d1", 1_000_000)];
+    let plan = auto_partition(&profile, &devices).unwrap();
+    assert_eq!(plan.len(), 2);
+    // The split must NOT fall inside 3..6 — that is, plan[0].end must be
+    // <= 3 or >= 6.
+    let split = plan[0].layer_range.end;
+    assert!(split <= 3 || split >= 6, "split={split} lands inside group");
+}
+
+#[test]
+fn auto_partition_merges_overlapping_adjacency_groups() {
+    let adjacency = vec![
+        LayerAdjacencyGroup {
+            layers: 1..4,
+            reason: "group-a".into(),
+        },
+        LayerAdjacencyGroup {
+            layers: 3..6,
+            reason: "group-b".into(),
+        },
+    ];
+    let profile = make_model_with_adjacency(vec![100; 8], 100, 100, adjacency);
+    // Forbidden boundaries are the union of interiors: (2, 3) ∪ (4, 5) with
+    // boundary 3 part of neither group's interior, so allowed.
+    let forbidden = profile.forbidden_boundaries();
+    assert!(forbidden.contains(&2));
+    assert!(forbidden.contains(&3));
+    assert!(forbidden.contains(&4));
+    assert!(forbidden.contains(&5));
+    assert!(!forbidden.contains(&6));
+}
+
+#[test]
+fn build_manual_assignments_rejects_adjacency_cut() {
+    let adjacency = vec![LayerAdjacencyGroup {
+        layers: 2..6,
+        reason: "synthetic forced-join".into(),
+    }];
+    let profile = make_model_with_adjacency(vec![100; 8], 50, 50, adjacency);
+    let devices = vec![make_device("d0", 100_000), make_device("d1", 100_000)];
+    // Manual plan that splits between layers 3 and 4 (inside 2..6) must fail.
+    let ranges = vec![0..4, 4..8];
+    let err = build_manual_assignments(&ranges, &profile, &devices).unwrap_err();
+    assert!(err.to_string().contains("adjacency"));
+}
+
+#[test]
+fn validate_adjacency_allows_split_on_boundary() {
+    // A manual split exactly on the group's start/end boundary is valid.
+    let adjacency = vec![LayerAdjacencyGroup {
+        layers: 2..6,
+        reason: "synthetic".into(),
+    }];
+    let ranges = vec![0..2, 2..8];
+    validate_adjacency(&ranges, &adjacency).unwrap();
+    let ranges2 = vec![0..6, 6..8];
+    validate_adjacency(&ranges2, &adjacency).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Warning path when adjacency forces imbalance
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_partition_with_report_emits_imbalance_warning() {
+    // Layers 0..7 must stay glued, with 8th layer alone on stage 1. The
+    // resulting 7:1 split triggers the imbalance warning.
+    let adjacency = vec![LayerAdjacencyGroup {
+        layers: 0..7,
+        reason: "synthetic forced-join".into(),
+    }];
+    let profile = make_model_with_adjacency(vec![100; 8], 50, 50, adjacency);
+    let devices = vec![make_device("d0", 10_000_000), make_device("d1", 10_000_000)];
+    let (plan, report) = auto_partition_with_report(&profile, &devices).unwrap();
+    assert_eq!(plan.len(), 2);
+    assert_eq!(plan[0].layer_range, 0..7);
+    assert!(!report.warnings.is_empty());
+    assert!(report.imbalance_pct > 100);
+}
+
+#[test]
+fn auto_partition_with_report_no_warnings_on_balanced_plan() {
+    let profile = make_model_with_per_layer(vec![100; 8], 50, 50);
+    let devices = vec![make_device("d0", 1_000_000), make_device("d1", 1_000_000)];
+    let (_, report) = auto_partition_with_report(&profile, &devices).unwrap();
+    assert!(
+        report.warnings.is_empty(),
+        "unexpected warnings: {report:?}"
+    );
+    assert_eq!(report.imbalance_pct, 100);
+}
+
+// ---------------------------------------------------------------------------
+// Memory-fit interplay with per-layer byte accounting
+// ---------------------------------------------------------------------------
+
+#[test]
+fn auto_partition_rejects_when_single_heavy_layer_exceeds_all_budgets() {
+    let profile = make_model_with_per_layer(vec![10_000, 10_000, 10_000, 10_000], 0, 0);
+    let devices = vec![make_device("d0", 100), make_device("d1", 100)];
+    let err = auto_partition(&profile, &devices).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("insufficient") || msg.contains("cannot balance"),
+        "unexpected error: {msg}"
+    );
 }

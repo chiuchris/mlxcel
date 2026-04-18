@@ -15,32 +15,80 @@
 //! Core layer partitioning algorithm for pipeline parallelism.
 //!
 //! Given a [`ModelProfile`] (layer count, per-layer parameter cost, embedding
-//! and lm_head sizes) and a set of [`DeviceSpec`]s (available memory, compute
-//! units), this module produces a vector of [`StageAssignment`]s that map
-//! contiguous layer ranges to devices.
+//! and lm_head sizes, optional per-layer byte weights, optional layer
+//! adjacency constraints) and a set of [`DeviceSpec`]s (available memory,
+//! compute units), this module produces a vector of [`StageAssignment`]s that
+//! map contiguous layer ranges to devices.
 //!
-//! The auto-partitioner distributes layers proportionally to each device's
-//! available memory after reserving space for the embedding (first stage) and
-//! lm_head (last stage). Manual partitions are parsed from the `--pp-layers`
-//! CLI flag and validated for correctness.
+//! The auto-partitioner minimises the maximum per-stage byte load across
+//! stages, subject to:
 //!
-//! Used by: server startup, model loading pipeline
+//! - Every device gets at least one layer.
+//! - Every device's assigned bytes fit inside its `available_memory_bytes`
+//!   budget (after embedding / lm_head reservations).
+//! - No constrained layer group (e.g. Gemma 4 KV-shared source/consumer
+//!   pairs) is split across a stage boundary.
+//!
+//! Manual partitions are parsed from the `--pp-layers` CLI flag and
+//! validated for correctness.
+//!
+//! Used by: server startup, model loading pipeline, CLI pipeline generate
 
 use std::ops::Range;
 
 use anyhow::{Result, bail, ensure};
 
+use super::partition_assembly::{assemble_auto_partition, assemble_manual_partition};
+use super::partition_quality::PartitionQualityReport;
+
+/// Describes a contiguous range of layers that must stay on the same pipeline
+/// stage.
+///
+/// The partitioner uses these to express layer-to-layer coupling that cannot
+/// be broken by a stage boundary. The canonical example is Gemma 4's KV
+/// sharing: the last `num_kv_shared_layers` decoder blocks read their keys
+/// and values from an earlier source layer, so a stage split between source
+/// and consumer would strand the cache on the wrong device.
+///
+/// Ranges are half-open (`start..end`, `end` exclusive) and must be
+/// non-empty. Multiple overlapping or adjacent groups are allowed and get
+/// merged internally.
+///
+/// Used by: `ModelProfile`, `auto_partition`
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LayerAdjacencyGroup {
+    /// Half-open range of layers that must land on the same stage.
+    pub layers: Range<usize>,
+    /// Human-readable reason, surfaced in warnings when the constraint
+    /// forces an imbalanced plan. Example:
+    /// `"gemma4 KV-shared layers 12..24 share keys with sources in 0..12"`.
+    pub reason: String,
+}
+
 /// Describes the memory footprint of a model for partitioning purposes.
 ///
 /// All sizes are in bytes. The partitioner uses these to estimate per-stage
 /// memory requirements and balance the assignment across devices.
+///
+/// Two knobs on top of the uniform-layer baseline make the partitioner
+/// accurate for MoE and KV-shared architectures:
+///
+/// - `layer_bytes`: per-layer parameter byte weight. When set, it overrides
+///   the uniform `layer_param_bytes` assumption. Use this for MoE models
+///   where expert layers are much heavier than dense layers, or Gemma 4
+///   where KV-shared consumer layers carry double-wide MLPs.
+/// - `adjacency`: groups of layers that must stay on the same stage. Use
+///   this for KV-shared layer pairs (source layer must live with its
+///   consumer), Jamba's Mamba+Transformer interleaving boundary invariants,
+///   or any other cross-layer state dependency that cannot be serialised
+///   over the activation channel.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ModelProfile {
     /// Total number of transformer/SSM layers in the model.
     pub num_layers: usize,
-    /// Estimated parameter memory per layer (bytes). For simplicity, all
-    /// layers are assumed equal; MoE models with variable expert counts
-    /// should use the average or worst-case layer size.
+    /// Fallback parameter memory per layer (bytes) used when `layer_bytes`
+    /// is `None`. For MoE models without an explicit per-layer vector,
+    /// callers should use the average or worst-case layer size.
     pub layer_param_bytes: u64,
     /// Memory consumed by the embedding table (bytes). Assigned to the
     /// first pipeline stage.
@@ -48,14 +96,93 @@ pub struct ModelProfile {
     /// Memory consumed by the lm_head / output projection (bytes). Assigned
     /// to the last pipeline stage.
     pub lm_head_param_bytes: u64,
+    /// Optional per-layer parameter byte weights. When `Some(v)`, `v.len()`
+    /// must equal `num_layers` and each entry is the layer's real byte cost
+    /// (experts included for MoE, double-wide MLP included for Gemma 4
+    /// KV-shared consumers). When `None`, the partitioner falls back to the
+    /// uniform `layer_param_bytes` assumption.
+    pub layer_bytes: Option<Vec<u64>>,
+    /// Layer-adjacency constraints that the partitioner must not cut
+    /// across. Empty means no constraints.
+    pub adjacency: Vec<LayerAdjacencyGroup>,
 }
 
 impl ModelProfile {
+    /// Construct a minimal profile that uses the uniform `layer_param_bytes`
+    /// assumption and carries no adjacency constraints.
+    ///
+    /// This is the legacy shape — prefer it only for smoke tests and
+    /// backward-compatible callers. Real model loading paths should go
+    /// through [`super::partition_profile::build_model_profile`].
+    pub fn uniform(
+        num_layers: usize,
+        layer_param_bytes: u64,
+        embedding_param_bytes: u64,
+        lm_head_param_bytes: u64,
+    ) -> Self {
+        Self {
+            num_layers,
+            layer_param_bytes,
+            embedding_param_bytes,
+            lm_head_param_bytes,
+            layer_bytes: None,
+            adjacency: Vec::new(),
+        }
+    }
+
+    /// Byte cost of layer `idx`, honouring the per-layer override if set.
+    pub fn layer_bytes_at(&self, idx: usize) -> u64 {
+        debug_assert!(idx < self.num_layers);
+        match self.layer_bytes.as_ref() {
+            Some(vec) if idx < vec.len() => vec[idx],
+            _ => self.layer_param_bytes,
+        }
+    }
+
+    /// Materialise the per-layer byte cost vector. Always returns a vector
+    /// of length `num_layers` — convenient for the DP partitioner without
+    /// forcing every caller to memoise the fallback path.
+    pub fn effective_layer_bytes(&self) -> Vec<u64> {
+        (0..self.num_layers)
+            .map(|i| self.layer_bytes_at(i))
+            .collect()
+    }
+
     /// Total model parameter memory (embedding + all layers + lm_head).
     pub fn total_param_bytes(&self) -> u64 {
+        let layer_total = self
+            .effective_layer_bytes()
+            .iter()
+            .copied()
+            .fold(0u64, |acc, b| acc.saturating_add(b));
         self.embedding_param_bytes
-            .saturating_add((self.num_layers as u64).saturating_mul(self.layer_param_bytes))
+            .saturating_add(layer_total)
             .saturating_add(self.lm_head_param_bytes)
+    }
+
+    /// Returns the sorted set of boundary indices `b` (meaning "split
+    /// before layer `b`") that are forbidden because they would separate
+    /// a [`LayerAdjacencyGroup`] across stages.
+    ///
+    /// A group covering `start..end` forbids boundaries at every
+    /// `start+1..end`. Boundary 0 and `num_layers` are structural, never
+    /// user-controlled, and are not returned here.
+    pub fn forbidden_boundaries(&self) -> Vec<usize> {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        for group in &self.adjacency {
+            if group.layers.start >= group.layers.end {
+                continue;
+            }
+            let interior_start = group.layers.start.saturating_add(1);
+            let interior_end = group.layers.end;
+            for b in interior_start..interior_end {
+                if b > 0 && b < self.num_layers {
+                    set.insert(b);
+                }
+            }
+        }
+        set.into_iter().collect()
     }
 }
 
@@ -243,226 +370,84 @@ pub fn validate_memory_fit(assignments: &[StageAssignment], devices: &[DeviceSpe
     Ok(())
 }
 
-/// Automatically partition model layers across devices proportionally to
-/// each device's available memory.
+/// Validate that a set of layer ranges does not cut any adjacency group.
 ///
-/// Algorithm:
-/// 1. Reserve embedding memory on the first device and lm_head on the last.
-/// 2. Compute effective memory per device (after reservations).
-/// 3. Distribute layers proportionally to effective memory.
-/// 4. Ensure every device gets at least one layer.
-/// 5. Build `StageAssignment` with memory estimates.
+/// Returns `Err` with a human-readable message naming the first violated
+/// group. The message includes the group's `reason` so operators can see
+/// which invariant they broke (e.g. `"gemma4 KV-shared layers 12..24 share
+/// keys with sources in 0..12"`).
+pub fn validate_adjacency(
+    ranges: &[Range<usize>],
+    adjacency: &[LayerAdjacencyGroup],
+) -> Result<()> {
+    for group in adjacency {
+        if group.layers.start >= group.layers.end {
+            continue;
+        }
+        for range in ranges {
+            let starts_inside = range.start > group.layers.start && range.start < group.layers.end;
+            if starts_inside {
+                bail!(
+                    "manual partition splits adjacency group {}..{} (reason: {})",
+                    group.layers.start,
+                    group.layers.end,
+                    group.reason
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Automatically partition model layers across devices.
+///
+/// The algorithm minimises the maximum per-stage byte load across stages,
+/// subject to:
+///
+/// 1. The embedding lives on stage 0 and the lm_head on the last stage.
+/// 2. Every device receives at least one layer.
+/// 3. Every device's assigned bytes fit inside its `available_memory_bytes`
+///    (after embedding / lm_head reservations).
+/// 4. No adjacency group is split across a stage boundary.
+///
+/// The per-layer byte cost is taken from `model.layer_bytes` when set, and
+/// otherwise falls back to the uniform `layer_param_bytes`.
 ///
 /// Returns an error if the model cannot fit in the combined device memory
-/// or if there are more devices than layers.
+/// or if the constraints are infeasible.
 pub fn auto_partition(
     model: &ModelProfile,
     devices: &[DeviceSpec],
 ) -> Result<Vec<StageAssignment>> {
-    let n_devices = devices.len();
-    let n_layers = model.num_layers;
+    auto_partition_with_report(model, devices).map(|(plan, _)| plan)
+}
 
-    ensure!(n_devices > 0, "at least one device is required");
-    ensure!(n_layers > 0, "model must have at least one layer");
-    ensure!(
-        n_devices <= n_layers,
-        "more devices ({n_devices}) than layers ({n_layers}); \
-         reduce the number of pipeline stages"
-    );
-
-    // Step 1: Compute effective memory per device after embedding/lm_head reservations.
-    let mut effective_memory: Vec<u64> = devices.iter().map(|d| d.available_memory_bytes).collect();
-
-    // Reserve embedding on first device.
-    if effective_memory[0] < model.embedding_param_bytes {
-        bail!(
-            "device '{}' has {} bytes but embedding alone requires {} bytes",
-            devices[0].device_id,
-            devices[0].available_memory_bytes,
-            model.embedding_param_bytes
-        );
-    }
-    effective_memory[0] -= model.embedding_param_bytes;
-
-    // Reserve lm_head on last device.
-    let last_idx = n_devices - 1;
-    if effective_memory[last_idx] < model.lm_head_param_bytes {
-        bail!(
-            "device '{}' has {} bytes but lm_head alone requires {} bytes",
-            devices[last_idx].device_id,
-            devices[last_idx].available_memory_bytes,
-            model.lm_head_param_bytes
-        );
-    }
-    effective_memory[last_idx] -= model.lm_head_param_bytes;
-
-    // Step 2: Check that each device can hold at least one layer.
-    for (i, &mem) in effective_memory.iter().enumerate() {
-        if mem < model.layer_param_bytes {
-            bail!(
-                "device '{}' has insufficient memory for even one layer \
-                 ({} bytes available after reservations, {} bytes per layer)",
-                devices[i].device_id,
-                mem,
-                model.layer_param_bytes
-            );
-        }
-    }
-
-    // Step 3: Distribute layers proportionally to effective memory.
-    let total_effective: u64 = effective_memory.iter().sum();
-    let total_layer_bytes = n_layers as u64 * model.layer_param_bytes;
-
-    if total_effective < total_layer_bytes {
-        bail!(
-            "combined device memory ({total_effective} bytes after reservations) \
-             is insufficient for {n_layers} layers ({total_layer_bytes} bytes)"
-        );
-    }
-
-    let mut layer_counts: Vec<usize> = effective_memory
-        .iter()
-        .map(|&mem| {
-            // Proportional share, floored.
-            let share = (mem as f64 / total_effective as f64) * n_layers as f64;
-            share.floor() as usize
-        })
-        .collect();
-
-    // Ensure every device gets at least 1 layer.
-    for count in &mut layer_counts {
-        if *count == 0 {
-            *count = 1;
-        }
-    }
-
-    // Distribute remaining layers to devices with the most headroom.
-    let assigned: usize = layer_counts.iter().sum();
-    if assigned < n_layers {
-        let mut remaining = n_layers - assigned;
-        // Sort device indices by remaining capacity (descending).
-        let mut indices: Vec<usize> = (0..n_devices).collect();
-        indices.sort_by(|&a, &b| {
-            let used_a = (layer_counts[a] as u64).saturating_mul(model.layer_param_bytes);
-            let used_b = (layer_counts[b] as u64).saturating_mul(model.layer_param_bytes);
-            let headroom_a = effective_memory[a].saturating_sub(used_a);
-            let headroom_b = effective_memory[b].saturating_sub(used_b);
-            headroom_b.cmp(&headroom_a)
-        });
-        for &idx in &indices {
-            if remaining == 0 {
-                break;
-            }
-            layer_counts[idx] += 1;
-            remaining -= 1;
-        }
-    } else if assigned > n_layers {
-        // Over-assigned due to minimum-1 enforcement; remove excess from
-        // the device with the fewest effective bytes (least capacity).
-        let mut excess = assigned - n_layers;
-        let mut indices: Vec<usize> = (0..n_devices).collect();
-        indices.sort_by_key(|&i| effective_memory[i]);
-        for &idx in &indices {
-            if excess == 0 {
-                break;
-            }
-            if layer_counts[idx] > 1 {
-                let can_remove = (layer_counts[idx] - 1).min(excess);
-                layer_counts[idx] -= can_remove;
-                excess -= can_remove;
-            }
-        }
-        if excess > 0 {
-            bail!(
-                "cannot distribute {n_layers} layers across {n_devices} devices \
-                 while giving each device at least one layer"
-            );
-        }
-    }
-
-    // Step 4: Build stage assignments.
-    let mut assignments = Vec::with_capacity(n_devices);
-    let mut layer_start = 0;
-
-    for (i, &count) in layer_counts.iter().enumerate() {
-        let layer_end = layer_start + count;
-        let is_first = i == 0;
-        let is_last = i == last_idx;
-
-        let mut mem = count as u64 * model.layer_param_bytes;
-        if is_first {
-            mem += model.embedding_param_bytes;
-        }
-        if is_last {
-            mem += model.lm_head_param_bytes;
-        }
-
-        assignments.push(StageAssignment {
-            stage_index: i,
-            device_id: devices[i].device_id.clone(),
-            layer_range: layer_start..layer_end,
-            has_embedding: is_first,
-            has_lm_head: is_last,
-            estimated_memory_bytes: mem,
-        });
-
-        layer_start = layer_end;
-    }
-
-    // Step 5: Validate the result.
-    validate_partition(&assignments, n_layers)?;
-    validate_memory_fit(&assignments, devices)?;
-
-    Ok(assignments)
+/// Variant of [`auto_partition`] that also returns a partition-quality
+/// report. The report surfaces per-stage estimated byte sums, the overall
+/// imbalance ratio, and any warnings produced while honouring the
+/// constraints.
+///
+/// Used by: CLI pipeline generate (debug logging), server startup (debug
+/// logging)
+pub fn auto_partition_with_report(
+    model: &ModelProfile,
+    devices: &[DeviceSpec],
+) -> Result<(Vec<StageAssignment>, PartitionQualityReport)> {
+    assemble_auto_partition(model, devices)
 }
 
 /// Build stage assignments from manually specified layer ranges.
 ///
 /// Pairs each range with the corresponding device (by index), sets embedding
 /// on the first stage and lm_head on the last, computes memory estimates,
-/// and validates the result.
+/// validates the result, and rejects any manual plan that splits an
+/// adjacency group.
 pub fn build_manual_assignments(
     ranges: &[Range<usize>],
     model: &ModelProfile,
     devices: &[DeviceSpec],
 ) -> Result<Vec<StageAssignment>> {
-    ensure!(
-        ranges.len() == devices.len(),
-        "manual partition has {} ranges but {} devices were provided",
-        ranges.len(),
-        devices.len()
-    );
-
-    let n_stages = ranges.len();
-    let mut assignments = Vec::with_capacity(n_stages);
-
-    for (i, range) in ranges.iter().enumerate() {
-        let is_first = i == 0;
-        let is_last = i == n_stages - 1;
-        let layer_count = range.end - range.start;
-
-        let mut mem = layer_count as u64 * model.layer_param_bytes;
-        if is_first {
-            mem += model.embedding_param_bytes;
-        }
-        if is_last {
-            mem += model.lm_head_param_bytes;
-        }
-
-        assignments.push(StageAssignment {
-            stage_index: i,
-            device_id: devices[i].device_id.clone(),
-            layer_range: range.clone(),
-            has_embedding: is_first,
-            has_lm_head: is_last,
-            estimated_memory_bytes: mem,
-        });
-    }
-
-    validate_partition(&assignments, model.num_layers)?;
-    validate_memory_fit(&assignments, devices)?;
-
-    Ok(assignments)
+    assemble_manual_partition(ranges, model, devices)
 }
 
 #[cfg(test)]

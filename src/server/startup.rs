@@ -28,7 +28,6 @@ use tower::Service;
 use crate::SamplingConfig;
 use crate::distributed::pipeline::{
     RemoteStageServiceConfig, RemoteStageServiceHandle, resolve_in_process_pipeline_num_layers,
-    resolve_in_process_stage_assignments,
 };
 use crate::distributed::{
     ClusterConfig, ClusterDiscoveryMode, ClusterInitPlan, ClusterInitRequest, NodeRegistry,
@@ -612,8 +611,14 @@ fn resolve_remote_pipeline_topology(
             )
         })?;
         let num_layers = resolve_in_process_pipeline_num_layers(&startup.model_path)?;
-        let assignments =
-            resolve_in_process_stage_assignments(num_layers, Some(pipeline_depth as usize), None)?;
+        let (assignments, report) =
+            crate::distributed::pipeline::resolve_in_process_stage_assignments_for_model(
+                &startup.model_path,
+                num_layers,
+                Some(pipeline_depth as usize),
+                None,
+            )?;
+        crate::distributed::pipeline::log_partition_quality(&report);
         let stage_assignment = assignments
             .into_iter()
             .find(|assignment| assignment.stage_index == stage_index as usize)

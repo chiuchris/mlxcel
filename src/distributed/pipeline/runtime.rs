@@ -38,7 +38,8 @@ use super::remote_service::{
 use super::wire_tensor::{deserialize_wire_tensor, serialize_mlx_array};
 use super::{
     InProcessStageWorkerLoop, PipelineWorkerInput, load_in_process_stage_worker_with_adapter,
-    resolve_in_process_pipeline_num_layers, resolve_in_process_stage_assignments,
+    log_partition_quality, resolve_in_process_pipeline_num_layers,
+    resolve_in_process_stage_assignments_for_model,
 };
 
 /// Server-side pipeline runtime abstraction.
@@ -84,7 +85,9 @@ impl InProcessPipelineRuntime {
         adapter_path: Option<&Path>,
     ) -> Result<(usize, Vec<i32>, Self)> {
         let num_layers = resolve_in_process_pipeline_num_layers(model_dir)?;
-        let assignments = resolve_in_process_stage_assignments(num_layers, None, pp_layers)?;
+        let (assignments, report) =
+            resolve_in_process_stage_assignments_for_model(model_dir, num_layers, None, pp_layers)?;
+        log_partition_quality(&report);
         let worker_loop = load_in_process_stage_worker_with_adapter(
             model_dir,
             &assignments,

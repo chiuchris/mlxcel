@@ -397,7 +397,8 @@ fn resolve_cli_pipeline_assignments_honors_manual_ranges() {
     args.pipeline_parallel.pp_size = 2;
     args.pipeline_parallel.pp_layers = Some("0-3,4-7".to_string());
 
-    let assignments = resolve_cli_pipeline_assignments(8, &args).unwrap();
+    let model_dir = args.model.model.clone();
+    let assignments = resolve_cli_pipeline_assignments(&model_dir, 8, &args).unwrap();
 
     assert_eq!(assignments.len(), 2);
     assert_eq!(assignments[0].layer_range, 0..4);
@@ -410,7 +411,8 @@ fn resolve_cli_pipeline_assignments_auto_splits_layers_across_stages() {
     let mut args = sample_generate_args(temp_model_dir("pp-auto"));
     args.pipeline_parallel.pp_size = 3;
 
-    let assignments = resolve_cli_pipeline_assignments(9, &args).unwrap();
+    let model_dir = args.model.model.clone();
+    let assignments = resolve_cli_pipeline_assignments(&model_dir, 9, &args).unwrap();
 
     assert_eq!(assignments.len(), 3);
     assert_eq!(assignments[0].layer_range.start, 0);
