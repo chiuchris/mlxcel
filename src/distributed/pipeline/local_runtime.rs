@@ -73,7 +73,23 @@ pub fn resolve_in_process_pipeline_num_layers(model_dir: &Path) -> Result<usize>
                 config_path.display()
             )
         })?;
-    Ok(num_layers as usize)
+
+    // DeepSeek V3 stores a trailing multi-token-prediction (MTP) layer at
+    // `model.layers.{num_hidden_layers - 1}` that is **not** part of the
+    // normal transformer stack. The Rust model implementation skips it, so
+    // the effective depth seen by the pipeline partitioner must also skip
+    // it, otherwise the last stage's auto-assigned range extends past the
+    // real decoder blocks and fails to load.
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let effective_layers = if model_type == "deepseek_v3" {
+        (num_layers as usize).saturating_sub(1).max(1)
+    } else {
+        num_layers as usize
+    };
+    Ok(effective_layers)
 }
 
 pub fn resolve_in_process_stage_assignments(
@@ -140,4 +156,68 @@ pub fn load_in_process_stage_worker(
         executors,
         ChannelConfig::default(),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::io::Write;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// Minimal temp-dir helper: avoids pulling `tempfile` into the main
+    /// crate's dependency tree for a two-test unit suite. The path is kept
+    /// unique per-process and removed on drop.
+    struct ScratchDir {
+        path: std::path::PathBuf,
+    }
+
+    impl ScratchDir {
+        fn new(tag: &str) -> Self {
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let pid = std::process::id();
+            let path = std::env::temp_dir().join(format!("mlxcel-pp-{tag}-{pid}-{nanos}"));
+            fs::create_dir_all(&path).unwrap();
+            Self { path }
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn write_config(model_dir: &Path, content: &str) {
+        let mut file = fs::File::create(model_dir.join("config.json")).unwrap();
+        file.write_all(content.as_bytes()).unwrap();
+    }
+
+    #[test]
+    fn num_layers_returns_raw_count_for_llama_family() {
+        let dir = ScratchDir::new("llama-count");
+        write_config(
+            &dir.path,
+            r#"{"model_type":"llama","num_hidden_layers":16,"hidden_size":128}"#,
+        );
+        let layers = resolve_in_process_pipeline_num_layers(&dir.path).unwrap();
+        assert_eq!(layers, 16);
+    }
+
+    #[test]
+    fn num_layers_strips_mtp_layer_for_deepseek_v3() {
+        // DeepSeek V3's MTP trailer is not part of the transformer stack,
+        // so the pipeline partitioner must see the number of decoder blocks,
+        // not the raw config count.
+        let dir = ScratchDir::new("deepseek_v3-count");
+        write_config(
+            &dir.path,
+            r#"{"model_type":"deepseek_v3","num_hidden_layers":61,"hidden_size":128}"#,
+        );
+        let layers = resolve_in_process_pipeline_num_layers(&dir.path).unwrap();
+        assert_eq!(layers, 60);
+    }
 }

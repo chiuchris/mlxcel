@@ -27,14 +27,24 @@
 //! Used by: pipeline worker loop, CLI pipeline runtime, server pipeline runtime
 
 mod common;
+mod deepseek_v3;
 mod gemma3;
 mod gemma4;
 mod glm4;
 mod glm_moe_dsa;
 mod gpt_oss;
+mod jamba;
 mod llama;
+mod llama4;
+mod mistral;
+mod mixtral;
+mod nemotron_h;
 mod qwen3;
 mod qwen35;
+
+#[cfg(test)]
+#[path = "family_registry_tests.rs"]
+mod family_registry_tests;
 
 use std::path::Path;
 
@@ -42,16 +52,22 @@ use anyhow::{Result, bail, ensure};
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
-use crate::models::{ModelType, get_model_type};
+use crate::models::{ModelType, get_model_type, sanitize_config_json};
 
 use super::partial_loading::LayerFilter;
 use super::partition::StageAssignment;
+use deepseek_v3::DeepSeekV3StageExecutor;
 use gemma3::Gemma3StageExecutor;
 use gemma4::Gemma4StageExecutor;
 use glm_moe_dsa::GlmMoeDsaStageExecutor;
 use glm4::{Glm4MoeLiteStageExecutor, Glm4MoeStageExecutor, Glm4StageExecutor};
 use gpt_oss::GptOssStageExecutor;
+use jamba::JambaStageExecutor;
 use llama::LlamaStageExecutor;
+use llama4::Llama4StageExecutor;
+use mistral::MistralStageExecutor;
+use mixtral::MixtralStageExecutor;
+use nemotron_h::NemotronHStageExecutor;
 use qwen3::Qwen3StageExecutor;
 use qwen35::Qwen35StageExecutor;
 
@@ -133,8 +149,8 @@ impl LoadedStageExecutor {
         );
 
         let filter = LayerFilter::from_stage(stage);
-        let model_type = get_model_type(model_dir)?;
-        let backend = load_family_backend(model_dir, &filter, stage.stage_index, model_type)?;
+        let family = resolve_stage_family(model_dir)?;
+        let backend = load_family_backend(model_dir, &filter, stage.stage_index, family)?;
 
         Ok(Self {
             stage: stage.clone(),
@@ -171,69 +187,262 @@ impl StageExecutor for LoadedStageExecutor {
     }
 }
 
-fn load_family_backend(
-    model_dir: &Path,
-    filter: &LayerFilter,
-    stage_index: usize,
-    model_type: ModelType,
-) -> Result<Box<dyn FamilyStageExecutor>> {
-    match model_type {
-        ModelType::Llama => Ok(Box::new(LlamaStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::GptOss => Ok(Box::new(GptOssStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Gemma3 => Ok(Box::new(Gemma3StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Gemma4 | ModelType::Gemma4VLM => Ok(Box::new(Gemma4StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Glm4 => Ok(Box::new(Glm4StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Glm4Moe => Ok(Box::new(Glm4MoeStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Glm4MoeLite => Ok(Box::new(Glm4MoeLiteStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::GlmMoeDsa => Ok(Box::new(GlmMoeDsaStageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Qwen3 => Ok(Box::new(Qwen3StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
-        ModelType::Qwen35
-        | ModelType::Qwen35VLM
-        | ModelType::Qwen35Moe
-        | ModelType::Qwen35MoeVLM => Ok(Box::new(Qwen35StageExecutor::load(
-            model_dir,
-            filter,
-            stage_index,
-        )?)),
+/// Pipeline-parallel family identifier used by the stage executor registry
+/// and by the server's capability negotiation.
+///
+/// A single [`ModelType`] may map to more than one [`StageFamily`] (today
+/// `ModelType::Llama` covers both the base Llama branch and the `mistral`
+/// config variant). The reverse is also allowed — a family may accept
+/// several model types if they share a stage loader.
+///
+/// Every family carries a stable textual [`Self::name`] that is the
+/// on-the-wire identifier during cross-version cluster handshakes.
+/// Operators will see mismatches as `pipeline capability mismatch` errors
+/// rather than silent activation corruption.
+///
+/// Used by: `LoadedStageExecutor`, server capability negotiation, CLI
+/// `mlxcel generate --pp-size N` runtime startup
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[non_exhaustive]
+pub enum StageFamily {
+    Llama,
+    Mistral,
+    Mixtral,
+    DeepSeekV3,
+    Llama4,
+    GptOss,
+    Gemma3,
+    Gemma4,
+    Gemma4Vlm,
+    Glm4,
+    Glm4Moe,
+    Glm4MoeLite,
+    GlmMoeDsa,
+    Qwen3,
+    Qwen35,
+    Qwen35Vlm,
+    Qwen35Moe,
+    Qwen35MoeVlm,
+    Jamba,
+    NemotronH,
+}
+
+impl StageFamily {
+    /// Stable textual name used for cluster-side capability negotiation.
+    /// Do not change these strings without bumping the pipeline capability
+    /// protocol version; clusters mix stages across mlxcel revisions and
+    /// rely on these strings staying byte-identical.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Llama => "llama",
+            Self::Mistral => "mistral",
+            Self::Mixtral => "mixtral",
+            Self::DeepSeekV3 => "deepseek_v3",
+            Self::Llama4 => "llama4",
+            Self::GptOss => "gpt_oss",
+            Self::Gemma3 => "gemma3",
+            Self::Gemma4 => "gemma4",
+            Self::Gemma4Vlm => "gemma4_vlm",
+            Self::Glm4 => "glm4",
+            Self::Glm4Moe => "glm4_moe",
+            Self::Glm4MoeLite => "glm4_moe_lite",
+            Self::GlmMoeDsa => "glm_moe_dsa",
+            Self::Qwen3 => "qwen3",
+            Self::Qwen35 => "qwen3_5",
+            Self::Qwen35Vlm => "qwen3_5_vlm",
+            Self::Qwen35Moe => "qwen3_5_moe",
+            Self::Qwen35MoeVlm => "qwen3_5_moe_vlm",
+            Self::Jamba => "jamba",
+            Self::NemotronH => "nemotron_h",
+        }
+    }
+}
+
+/// The full list of families supported by this binary's stage-executor
+/// registry.
+///
+/// `mlxcel-server` advertises this list during cluster handshake so a
+/// coordinator and its stage workers can detect version skew before
+/// serving traffic. Clusters whose union of family support is smaller
+/// than the coordinator's declared model family will refuse to start,
+/// rather than silently routing an unsupported model to a worker that
+/// would `bail!` at load time.
+///
+/// The returned slice is sorted by the textual [`StageFamily::name`] so
+/// handshake payloads are byte-identical across reruns with the same
+/// build.
+///
+/// Used by: `mlxcel-server` capability negotiation, integration tests
+pub fn supported_families() -> &'static [StageFamily] {
+    // Compile-time constant avoids heap allocations on every handshake.
+    // The list must stay sorted by `StageFamily::name` — verified by the
+    // `supported_families_is_sorted_by_name` test in
+    // `family_registry_tests.rs`.
+    const FAMILIES: &[StageFamily] = &[
+        StageFamily::DeepSeekV3,
+        StageFamily::Gemma3,
+        StageFamily::Gemma4,
+        StageFamily::Gemma4Vlm,
+        StageFamily::Glm4,
+        StageFamily::Glm4Moe,
+        StageFamily::Glm4MoeLite,
+        StageFamily::GlmMoeDsa,
+        StageFamily::GptOss,
+        StageFamily::Jamba,
+        StageFamily::Llama,
+        StageFamily::Llama4,
+        StageFamily::Mistral,
+        StageFamily::Mixtral,
+        StageFamily::NemotronH,
+        StageFamily::Qwen3,
+        StageFamily::Qwen35,
+        StageFamily::Qwen35Moe,
+        StageFamily::Qwen35MoeVlm,
+        StageFamily::Qwen35Vlm,
+    ];
+    FAMILIES
+}
+
+/// Decide which [`StageFamily`] should execute a given on-disk model. Most
+/// [`ModelType`] values map one-to-one; the exception is `ModelType::Llama`,
+/// which covers both the Llama stack and the base Mistral config — we peek
+/// at the raw `config.json` to disambiguate.
+fn resolve_stage_family(model_dir: &Path) -> Result<StageFamily> {
+    let model_type = get_model_type(model_dir)?;
+    let family = match model_type {
+        ModelType::Llama => {
+            if read_raw_config_model_type(model_dir)? == Some("mistral".to_string()) {
+                StageFamily::Mistral
+            } else {
+                StageFamily::Llama
+            }
+        }
+        ModelType::Mixtral => StageFamily::Mixtral,
+        ModelType::DeepSeekV3 => StageFamily::DeepSeekV3,
+        ModelType::Llama4 | ModelType::Llama4VLM => StageFamily::Llama4,
+        ModelType::GptOss => StageFamily::GptOss,
+        ModelType::Gemma3 => StageFamily::Gemma3,
+        ModelType::Gemma4 => StageFamily::Gemma4,
+        ModelType::Gemma4VLM => StageFamily::Gemma4Vlm,
+        ModelType::Glm4 => StageFamily::Glm4,
+        ModelType::Glm4Moe => StageFamily::Glm4Moe,
+        ModelType::Glm4MoeLite => StageFamily::Glm4MoeLite,
+        ModelType::GlmMoeDsa => StageFamily::GlmMoeDsa,
+        ModelType::Qwen3 => StageFamily::Qwen3,
+        ModelType::Qwen35 => StageFamily::Qwen35,
+        ModelType::Qwen35VLM => StageFamily::Qwen35Vlm,
+        ModelType::Qwen35Moe => StageFamily::Qwen35Moe,
+        ModelType::Qwen35MoeVLM => StageFamily::Qwen35MoeVlm,
+        ModelType::Jamba => StageFamily::Jamba,
+        ModelType::NemotronH => StageFamily::NemotronH,
         other => bail!(
             "pipeline stage executor is not implemented for model type {:?} yet",
             other
         ),
+    };
+    Ok(family)
+}
+
+fn read_raw_config_model_type(model_dir: &Path) -> Result<Option<String>> {
+    let config_path = model_dir.join("config.json");
+    let raw = std::fs::read_to_string(&config_path)?;
+    let raw = sanitize_config_json(&raw);
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(value
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string()))
+}
+
+fn load_family_backend(
+    model_dir: &Path,
+    filter: &LayerFilter,
+    stage_index: usize,
+    family: StageFamily,
+) -> Result<Box<dyn FamilyStageExecutor>> {
+    match family {
+        StageFamily::Llama => Ok(Box::new(LlamaStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Mistral => Ok(Box::new(MistralStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Mixtral => Ok(Box::new(MixtralStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::DeepSeekV3 => Ok(Box::new(DeepSeekV3StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Llama4 => Ok(Box::new(Llama4StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::GptOss => Ok(Box::new(GptOssStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Gemma3 => Ok(Box::new(Gemma3StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Gemma4 | StageFamily::Gemma4Vlm => Ok(Box::new(Gemma4StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Glm4 => Ok(Box::new(Glm4StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Glm4Moe => Ok(Box::new(Glm4MoeStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Glm4MoeLite => Ok(Box::new(Glm4MoeLiteStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::GlmMoeDsa => Ok(Box::new(GlmMoeDsaStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Qwen3 => Ok(Box::new(Qwen3StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Qwen35
+        | StageFamily::Qwen35Vlm
+        | StageFamily::Qwen35Moe
+        | StageFamily::Qwen35MoeVlm => Ok(Box::new(Qwen35StageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::Jamba => Ok(Box::new(JambaStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
+        StageFamily::NemotronH => Ok(Box::new(NemotronHStageExecutor::load(
+            model_dir,
+            filter,
+            stage_index,
+        )?)),
     }
 }

@@ -874,6 +874,88 @@ impl JambaModel {
         }
     }
 
+    /// Return the classification of every layer in the full Jamba stack, so
+    /// a pipeline stage can construct one [`JambaLayerCache`] per local
+    /// layer without importing `JambaModelBackbone` internals.
+    ///
+    /// Used by: Jamba pipeline stage executor
+    pub fn layer_block_types(&self) -> &[String] {
+        &self.model.layers_block_type
+    }
+
+    /// Run a pipeline-stage forward pass that only touches layers in
+    /// `layer_range`. `has_embedding` decides whether `inputs` is treated
+    /// as token IDs (and embedded on the fly) or as hidden states carried
+    /// in from the previous stage. `has_lm_head` decides whether the final
+    /// norm and LM head are applied on the way out.
+    ///
+    /// Because SSM state is carried across tokens inside each Mamba block,
+    /// the entire layer range (and therefore every SSM block within it)
+    /// must be evaluated on the same stage — callers must never split an
+    /// individual Mamba block across stages. See the module-level design
+    /// note on the Jamba pipeline stage executor for details.
+    ///
+    /// Used by: Jamba pipeline stage executor
+    pub fn forward_stage(
+        &self,
+        inputs: &MlxArray,
+        layer_range: std::ops::Range<usize>,
+        has_embedding: bool,
+        has_lm_head: bool,
+        caches: &mut [JambaLayerCache],
+    ) -> UniquePtr<MlxArray> {
+        assert_eq!(
+            caches.len(),
+            layer_range.end - layer_range.start,
+            "jamba forward_stage: cache count must match layer range length"
+        );
+
+        // Stage input: either embed tokens or accept hidden states as-is.
+        let mut h = if has_embedding {
+            self.model.embed_tokens.forward(inputs)
+        } else {
+            mlxcel_core::copy(inputs)
+        };
+
+        // Build a mask anchored on the first attention layer inside this
+        // stage. If the stage has no attention layers (pure Mamba slice),
+        // no mask is required.
+        let local_attn_idx = layer_range.clone().enumerate().find_map(|(local, abs)| {
+            if self.model.layers_block_type.get(abs).map(|s| s.as_str()) == Some("attention") {
+                Some(local)
+            } else {
+                None
+            }
+        });
+        let shape = mlxcel_core::array_shape(&h);
+        let seq_len = shape[1];
+        let mask = if let Some(idx) = local_attn_idx {
+            if seq_len > 1 {
+                let offset = caches[idx].offset();
+                Some(create_causal_mask(seq_len, offset))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        for (local, abs) in layer_range.clone().enumerate() {
+            h = self.model.layers[abs].forward(&h, mask.as_deref(), &mut caches[local]);
+        }
+
+        if has_lm_head {
+            let h = self.model.final_layernorm.forward(&h);
+            if let Some(ref head) = self.lm_head {
+                head.forward(&h)
+            } else {
+                self.model.embed_tokens.as_linear(&h)
+            }
+        } else {
+            h
+        }
+    }
+
     /// Load model from safetensors files
     pub fn load(model_path: &str) -> Result<(Self, JambaConfig), Box<dyn std::error::Error>> {
         let path = Path::new(model_path);

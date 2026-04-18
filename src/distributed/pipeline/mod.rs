@@ -134,6 +134,7 @@ pub use serving::{
     to_pipeline_schedule_config,
 };
 pub use stage_executor::{
-    LoadedStageExecutor, StageExecutionInput, StageExecutionOutput, StageExecutor,
+    LoadedStageExecutor, StageExecutionInput, StageExecutionOutput, StageExecutor, StageFamily,
+    supported_families,
 };
 pub use stage_worker::{InProcessStageWorkerLoop, PipelineWorkerInput, PipelineWorkerOutput};

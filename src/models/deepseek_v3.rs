@@ -868,6 +868,19 @@ impl DeepSeekV3Model {
         Ok((model, config))
     }
 
+    /// Public wrapper over [`Self::sanitize_weights`] for callers outside of
+    /// `src/models/deepseek_v3.rs` (e.g. the pipeline-parallel stage executor
+    /// that needs to sanitise the full weight map before partial-loading
+    /// filters out layers from other stages).
+    ///
+    /// Used by: DeepSeek V3 pipeline stage executor
+    pub fn sanitize_weights_with_args(
+        weights: WeightMap,
+        config: &DeepSeekV3Config,
+    ) -> WeightMap {
+        Self::sanitize_weights(weights, config)
+    }
+
     fn sanitize_weights(mut weights: WeightMap, config: &DeepSeekV3Config) -> WeightMap {
         // Remap pre-stacked weight names that omit the `.mlp.` segment.
         //

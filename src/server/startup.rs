@@ -476,6 +476,19 @@ fn validate_pipeline_parallel_startup(startup: &ServerStartupConfig) -> Result<(
         !startup.no_batch,
         "Server pipeline parallelism requires the batch scheduler; remove --no-batch"
     );
+    // Announce stage-executor family capabilities for operator visibility
+    // and to document the exact set a cluster handshake would advertise.
+    // Emitting this as a single comma-separated line keeps log parsers happy
+    // and makes cross-version mismatches trivially greppable.
+    let family_names: Vec<&'static str> = crate::distributed::pipeline::supported_families()
+        .iter()
+        .map(|f| f.name())
+        .collect();
+    tracing::info!(
+        "Pipeline-parallel stage-executor families advertised: {}",
+        family_names.join(",")
+    );
+
     crate::distributed::pipeline::resolve_in_process_pipeline_num_layers(&startup.model_path)
         .map(|_| ())
 }

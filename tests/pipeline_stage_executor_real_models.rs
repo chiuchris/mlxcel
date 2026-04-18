@@ -350,3 +350,153 @@ fn pipeline_stage_worker_loop_glm_moe_dsa_real_model_parity() {
         None,
     );
 }
+
+// Issue #345 families — stage executor parity against the non-PP reference
+// path on a short prompt. Each test is gated behind `#[ignore]` because it
+// requires real model weights to be present under `models/`; operators can
+// opt in by downloading the listed HuggingFace MLX Community checkpoint.
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_mistral_real_model_parity() {
+    // mlx-community/Mistral-7B-Instruct-v0.3-4bit (or any base mistral model)
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("mistral-7b-instruct-v0.3-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_mistral_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("mistral-7b-instruct-v0.3-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_mixtral_real_model_parity() {
+    // mlx-community/Mixtral-8x7B-Instruct-v0.1-4bit
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("mixtral-8x7b-instruct-v0.1-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_mixtral_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("mixtral-8x7b-instruct-v0.1-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_deepseek_v3_real_model_parity() {
+    // mlx-community/DeepSeek-V3-0324-4bit — note the 61-layer MTP trailer:
+    // the pipeline partitioner treats num_hidden_layers - 1 as the real
+    // transformer depth.
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("deepseek-v3-0324-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_deepseek_v3_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("deepseek-v3-0324-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_llama4_real_model_parity() {
+    // mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit — TEXT-only tower.
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("llama-4-scout-17b-16e-instruct-4bit"),
+        &[128000, 1],
+        2,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_llama4_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("llama-4-scout-17b-16e-instruct-4bit"),
+        &[128000, 1],
+        2,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_jamba_real_model_parity() {
+    // mlx-community/Jamba-v0.1-4bit — hybrid Mamba + Transformer. Every
+    // stage internally keeps the full model loaded (see the design note at
+    // the top of src/distributed/pipeline/stage_executor/jamba.rs); the
+    // parity check verifies that executing the stage-assigned layer range
+    // on each stage matches the non-PP model's logits end-to-end.
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("jamba-v0.1-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_jamba_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("jamba-v0.1-4bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_executor_nemotron_h_real_model_parity() {
+    // mlx-community/nvidia-Nemotron-H-8B-Base-8bit — hybrid Mamba2 +
+    // Transformer + MoE.
+    assert_two_stage_model_matches_full_model(
+        &repo_model_dir("nvidia-nemotron-h-8b-base-8bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}
+
+#[test]
+#[ignore = "requires local model weights and extended real-model generation"]
+fn pipeline_stage_worker_loop_nemotron_h_real_model_parity() {
+    assert_two_stage_model_worker_loop_matches_full_model(
+        &repo_model_dir("nvidia-nemotron-h-8b-base-8bit"),
+        &[1, 2],
+        3,
+        None,
+    );
+}

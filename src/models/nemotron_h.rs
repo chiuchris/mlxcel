@@ -1477,6 +1477,134 @@ impl NemotronHModel {
             .collect()
     }
 
+    /// Number of layers in the model that need a persistent per-token cache
+    /// (i.e. Mamba or Attention blocks). MLP blocks are stateless.
+    ///
+    /// Used by: Nemotron-H pipeline stage executor
+    pub fn num_cache_layers(&self) -> usize {
+        self.block_types.iter().filter(|bt| bt.needs_cache()).count()
+    }
+
+    /// Return whether the `i`-th layer in the model stack carries a
+    /// persistent cache (Mamba / Attention) or is stateless (MLP / MoE).
+    ///
+    /// Used by: Nemotron-H pipeline stage executor
+    pub fn layer_needs_cache(&self, layer_idx: usize) -> bool {
+        self.block_types
+            .get(layer_idx)
+            .is_some_and(|bt| bt.needs_cache())
+    }
+
+    /// Build a single [`NemotronLayerCache`] for the layer at `layer_idx`.
+    /// Callers that want caches for a pipeline stage's layer range can
+    /// invoke this once per stateful layer.
+    ///
+    /// Used by: Nemotron-H pipeline stage executor
+    pub fn make_layer_cache(&self, layer_idx: usize) -> Option<NemotronLayerCache> {
+        match self.block_types.get(layer_idx)? {
+            BlockType::Mamba => Some(NemotronLayerCache::Mamba(NemotronMambaCache::new())),
+            BlockType::Attention => Some(NemotronLayerCache::Attention(KVCache::new())),
+            _ => None,
+        }
+    }
+
+    /// Run a pipeline-stage forward pass that only touches layers in
+    /// `layer_range`. See `JambaModel::forward_stage` for the semantics of
+    /// `has_embedding` and `has_lm_head`.
+    ///
+    /// Caches: one entry per stateful layer inside `layer_range`, in layer
+    /// order. The caller is responsible for persisting these across
+    /// sequence-step boundaries (see the stage executor's
+    /// `PointerOwnedCacheStore`).
+    ///
+    /// SSM design note — Mamba / Attention / MLP / MoE blocks are executed
+    /// in full on the stage that owns them. Splitting a single Mamba block
+    /// across stages is not permitted: the conv and SSM state are
+    /// per-block and per-token, so the entire block must run on one
+    /// device.
+    ///
+    /// Used by: Nemotron-H pipeline stage executor
+    pub fn forward_stage(
+        &self,
+        inputs: &MlxArray,
+        layer_range: std::ops::Range<usize>,
+        has_embedding: bool,
+        has_lm_head: bool,
+        caches: &mut [NemotronLayerCache],
+    ) -> UniquePtr<MlxArray> {
+        let expected_caches: usize = layer_range
+            .clone()
+            .filter(|&abs| self.layer_needs_cache(abs))
+            .count();
+        assert_eq!(
+            caches.len(),
+            expected_caches,
+            "nemotron_h forward_stage: cache count mismatch (expected {}, got {})",
+            expected_caches,
+            caches.len()
+        );
+
+        let mut h = if has_embedding {
+            self.embeddings.forward(inputs)
+        } else {
+            mlxcel_core::copy(inputs)
+        };
+
+        // Anchor attention mask on the first attention layer in this stage.
+        let shape = mlxcel_core::array_shape(&h);
+        let seq_len = shape[1];
+        let first_attn_local_cache_idx = {
+            let mut local_cache_idx = 0usize;
+            let mut found = None;
+            for &abs in &layer_range.clone().collect::<Vec<_>>() {
+                if self.layer_needs_cache(abs) {
+                    if self.block_types.get(abs) == Some(&BlockType::Attention) {
+                        found = Some(local_cache_idx);
+                        break;
+                    }
+                    local_cache_idx += 1;
+                }
+            }
+            found
+        };
+        let attn_mask = if seq_len > 1 {
+            let offset = first_attn_local_cache_idx
+                .map(|idx| caches[idx].offset())
+                .unwrap_or(0);
+            Some(create_causal_mask(seq_len, offset))
+        } else {
+            None
+        };
+
+        let mut cache_idx = 0usize;
+        for abs in layer_range.clone() {
+            let layer = &self.layers[abs];
+            let block_type = self.block_types[abs];
+            if block_type.needs_cache() {
+                let cache_entry = &mut caches[cache_idx];
+                match (block_type, cache_entry) {
+                    (BlockType::Mamba, NemotronLayerCache::Mamba(mc)) => {
+                        h = layer.forward(&h, None, Some(mc), None);
+                    }
+                    (BlockType::Attention, NemotronLayerCache::Attention(kv)) => {
+                        h = layer.forward(&h, attn_mask.as_deref(), None, Some(kv));
+                    }
+                    _ => {}
+                }
+                cache_idx += 1;
+            } else {
+                h = layer.forward(&h, None, None, None);
+            }
+        }
+
+        if has_lm_head {
+            let h = self.norm_f.forward(&h);
+            self.lm_head.forward(&h)
+        } else {
+            h
+        }
+    }
+
     pub fn forward_with_caches(
         &self,
         inputs: &MlxArray,
