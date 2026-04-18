@@ -451,6 +451,73 @@ impl Linear {
     }
 }
 
+/// Infer actual per-tensor quantization bits from weight and scales shapes.
+///
+/// MLX stores affine-quantized linears as:
+/// - `weight`: u32 packed, shape `(..., out_features, packed_in_features)`
+/// - `scales`: float, shape `(..., out_features, num_groups)`
+///
+/// with the invariant `packed_in_features * 32 == bits * num_groups * group_size`.
+///
+/// When `caller_bits` is consistent with the observed shapes, it is returned
+/// unchanged. When it is not (e.g. per-layer override where a gate is stored
+/// at 8-bit while the rest of the model is 4-bit), this infers the actual bits
+/// by trusting `group_size` and solving the invariant.
+///
+/// This mirrors the upstream `nn.quantize(class_predicate=...)` pattern used
+/// by mlx-lm/mlx-vlm, which emits per-path bit overrides in `config.quantization`
+/// (e.g. Qwen3.5/3.6 MoE router gates).
+///
+/// Returns an error only when the inferred bits are not a valid MLX bit width
+/// `{2, 3, 4, 5, 6, 8}` — in that case `group_size` itself is likely wrong.
+fn infer_quantization_bits(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    group_size: i32,
+    caller_bits: i32,
+) -> Result<i32, String> {
+    if weight_shape.is_empty() || scales_shape.is_empty() || group_size <= 0 {
+        return Ok(caller_bits);
+    }
+    let packed_in = *weight_shape.last().unwrap();
+    let num_groups = *scales_shape.last().unwrap();
+    if packed_in <= 0 || num_groups <= 0 {
+        return Ok(caller_bits);
+    }
+
+    let numerator = packed_in.checked_mul(32).ok_or_else(|| {
+        format!(
+            "Quantized weight shape overflow: packed_in={}, weight.shape={:?}",
+            packed_in, weight_shape
+        )
+    })?;
+    let denominator = num_groups.checked_mul(group_size).ok_or_else(|| {
+        format!(
+            "Quantized scales shape overflow: num_groups={}, group_size={}",
+            num_groups, group_size
+        )
+    })?;
+    if denominator == 0 || numerator % denominator != 0 {
+        return Err(format!(
+            "Quantized weight shape inconsistency: weight.shape={:?}, scales.shape={:?}, \
+             group_size={}: cannot derive integer bits",
+            weight_shape, scales_shape, group_size
+        ));
+    }
+    let inferred_bits = numerator / denominator;
+    if inferred_bits == caller_bits {
+        return Ok(caller_bits);
+    }
+    if ![2, 3, 4, 5, 6, 8].contains(&inferred_bits) {
+        return Err(format!(
+            "Quantized weight shape inconsistency: inferred bits={} not in {{2,3,4,5,6,8}}; \
+             weight.shape={:?}, scales.shape={:?}, group_size={}, caller_bits={}",
+            inferred_bits, weight_shape, scales_shape, group_size, caller_bits
+        ));
+    }
+    Ok(inferred_bits)
+}
+
 /// Unified Linear layer that auto-detects quantization
 ///
 /// Checks for `.scales` key in weight map to determine whether to use
@@ -518,12 +585,24 @@ impl UnifiedLinear {
             // biases may not exist for mxfp4/nvfp4/mxfp8 modes
             let biases = weights.get(&biases_name).map(|w| ffi::copy(w));
 
+            // Reconcile caller-supplied bits with actual tensor shapes. Models
+            // with per-layer quantization overrides (Qwen3.5/3.6 MoE gates)
+            // store gates at a different bit width from the rest of the model.
+            let effective_bits = if mode == "affine" {
+                let w_shape = ffi::array_shape(&weight);
+                let s_shape = ffi::array_shape(&scales);
+                infer_quantization_bits(&w_shape, &s_shape, group_size, bits)
+                    .map_err(|e| format!("{} (prefix: {})", e, prefix))?
+            } else {
+                bits
+            };
+
             let qweight = QuantizedWeight {
                 weight,
                 scales,
                 biases,
                 group_size,
-                bits,
+                bits: effective_bits,
                 mode: mode.to_string(),
             };
 
@@ -691,6 +770,17 @@ impl FusedQKVLinear {
                 .get(&format!("{}.scales", v_prefix))
                 .ok_or_else(|| format!("Scales not found: {}.scales", v_prefix))?;
 
+            // Reconcile caller-supplied bits with actual tensor shapes (affine only).
+            // Fused QKV concatenates along axis 0, so q/k/v must share bits; infer from q.
+            let effective_bits = if mode == "affine" {
+                let w_shape = ffi::array_shape(q_w);
+                let s_shape = ffi::array_shape(q_s);
+                infer_quantization_bits(&w_shape, &s_shape, group_size, bits)
+                    .map_err(|e| format!("{} (prefix: {})", e, q_prefix))?
+            } else {
+                bits
+            };
+
             // Concatenate along axis 0 (output dimension)
             let qkv_weight = {
                 let ptrs: &[*const MlxArray] = &[
@@ -732,7 +822,7 @@ impl FusedQKVLinear {
                 scales: qkv_scales,
                 biases: qkv_biases,
                 group_size,
-                bits,
+                bits: effective_bits,
                 mode: mode.to_string(),
             };
             UnifiedLinear::Quantized {
@@ -2622,5 +2712,67 @@ mod tests {
         let v = ffi::zeros(&[1, 1, 1, 4], dtype::FLOAT16);
         let out = metal4_attention(&q, &k, &v, 0.5, None, 0.0, 0);
         assert_eq!(ffi::array_shape(&out).as_slice(), &[1, 1, 1, 4]);
+    }
+
+    /// Caller-supplied bits consistent with shapes → pass through unchanged.
+    /// Shapes taken from qwen3.5 out_proj: u32 weight (2048, 512), scales (2048, 64).
+    /// Invariant: `packed_in * 32 == bits * num_groups * group_size`
+    ///            `512 * 32 == 4 * 64 * 64`  (16384 == 16384)
+    #[test]
+    fn infer_bits_pass_through_when_consistent() {
+        let bits = infer_quantization_bits(&[2048, 512], &[2048, 64], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+    }
+
+    /// Qwen3.5/3.6 MoE gates store the router at 8-bit while the rest of the
+    /// model is 4-bit. The loader's caller_bits reflects the top-level config
+    /// (4), so we must detect the 8-bit override from the tensor shapes.
+    /// Shapes taken from real qwen3.6 tensors.
+    #[test]
+    fn infer_bits_detects_per_layer_8bit_override() {
+        // mlp.gate: u32 weight (256, 512), scales (256, 32), gs=64 → 8-bit
+        // 512 * 32 == 8 * 32 * 64  (16384 == 16384)
+        let bits = infer_quantization_bits(&[256, 512], &[256, 32], 64, 4).unwrap();
+        assert_eq!(bits, 8, "router gate is 8-bit under top-level 4-bit config");
+
+        // mlp.shared_expert_gate: u32 weight (1, 512), scales (1, 32) → 8-bit
+        let bits = infer_quantization_bits(&[1, 512], &[1, 32], 64, 4).unwrap();
+        assert_eq!(
+            bits, 8,
+            "shared_expert_gate is 8-bit under top-level 4-bit config"
+        );
+    }
+
+    /// 3D MoE expert weights (switch_mlp.*_proj) must use the last two axes.
+    #[test]
+    fn infer_bits_handles_3d_moe_experts() {
+        // down_proj: weight (256, 2048, 64) u32 / scales (256, 2048, 8)
+        // bits = 32 * 64 / (8 * 64) = 4
+        let bits = infer_quantization_bits(&[256, 2048, 64], &[256, 2048, 8], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+
+        // gate_proj: weight (256, 512, 256) / scales (256, 512, 32)
+        // bits = 32 * 256 / (32 * 64) = 4
+        let bits = infer_quantization_bits(&[256, 512, 256], &[256, 512, 32], 64, 4).unwrap();
+        assert_eq!(bits, 4);
+    }
+
+    /// Invalid inferred bits → error (prevents silently accepting a bogus
+    /// `group_size` that happens to satisfy the arithmetic).
+    #[test]
+    fn infer_bits_rejects_non_canonical_widths() {
+        // packed_in * 32 / (num_groups * group_size) = 32*4 / (32*2) = 2 is valid,
+        // so use a combination that yields 1 (invalid).
+        // packed_in=32, num_groups=32, group_size=32 → 32*32/(32*32) = 1.
+        let err = infer_quantization_bits(&[16, 32], &[16, 32], 32, 4);
+        assert!(err.is_err(), "bits=1 should be rejected");
+    }
+
+    /// Empty/zero shapes are treated as pass-through (defensive — real arrays
+    /// never have empty shape but we should not panic if called eagerly).
+    #[test]
+    fn infer_bits_pass_through_on_empty() {
+        assert_eq!(infer_quantization_bits(&[], &[], 64, 4).unwrap(), 4);
+        assert_eq!(infer_quantization_bits(&[0, 0], &[0, 0], 64, 4).unwrap(), 4);
     }
 }

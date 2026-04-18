@@ -848,7 +848,9 @@ fn test_conv_state_slice_is_contiguous_after_fix() {
 
     for step in 0..50_i32 {
         // Each step we get a new token input of shape [B, 1, conv_dim].
-        let input_data: Vec<f32> = (0..conv_dim).map(|i| (step * conv_dim + i) as f32).collect();
+        let input_data: Vec<f32> = (0..conv_dim)
+            .map(|i| (step * conv_dim + i) as f32)
+            .collect();
         let qkv = from_slice_f32(&input_data, &[batch, 1, conv_dim]);
 
         // Build or reuse conv_state: [B, n_keep, conv_dim]
@@ -886,8 +888,7 @@ fn test_conv_state_slice_is_contiguous_after_fix() {
         let expected_elements = (batch * n_keep * conv_dim) as usize;
         let actual_elements = array_size(&new_state);
         assert_eq!(
-            actual_elements,
-            expected_elements,
+            actual_elements, expected_elements,
             "step {step}: element count must be {expected_elements}, got {actual_elements}"
         );
 
