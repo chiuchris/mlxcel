@@ -322,3 +322,55 @@ fn post_init_explicit_time_step_limit_is_preserved() {
         "upper bound must be 1.5, got {hi}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// conv_state contiguous regression (issue #336)
+// ---------------------------------------------------------------------------
+
+/// Simulate 50 decode steps of conv-state update and assert the stored shape
+/// stays at [B=1, k-1=3, channels=8] regardless of how many steps we run.
+///
+/// This exercises the contiguous() fix for the NemotronH Mamba layer decode path
+/// (nemotron_h.rs line ~516).  Before the fix, each step stored a lazy slice
+/// aliasing the growing padded_input graph, leaking memory linearly with steps.
+#[test]
+#[ignore = "requires serial MLX execution"]
+fn nemotron_h_conv_state_shape_plateaus_after_50_steps() {
+    use mlxcel_core::utils::slice_axis;
+
+    let batch = 1i32;
+    let channels = 8i32;
+    let k = 4usize; // conv_kernel_size
+    let n_keep = (k - 1) as i32; // = 3
+    let expected_shape = vec![batch, n_keep, channels];
+
+    let mut conv_state =
+        mlxcel_core::zeros(&[batch, n_keep, channels], mlxcel_core::dtype::FLOAT32);
+
+    for _step in 0..50 {
+        let new_token = mlxcel_core::zeros(&[batch, 1, channels], mlxcel_core::dtype::FLOAT32);
+
+        // Build padded_input = concat(conv_state, new_token, axis=1) -> [1, k, channels]
+        let padded_input = mlxcel_core::concatenate(&conv_state, &new_token, 1);
+
+        let padded_shape = mlxcel_core::array_shape(&padded_input);
+        let len = padded_shape[1] as usize;
+
+        // Apply the fixed conv-state update: slice then contiguous
+        let tail = slice_axis(
+            &padded_input,
+            1,
+            (len - (k - 1)) as i32,
+            len as i32,
+        );
+        conv_state = mlxcel_core::contiguous(&tail, false);
+
+        mlxcel_core::eval(&conv_state);
+
+        let shape = mlxcel_core::array_shape(&conv_state);
+        assert_eq!(
+            shape, expected_shape,
+            "step {_step}: conv_state shape {shape:?} != expected {expected_shape:?}"
+        );
+    }
+}

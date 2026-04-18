@@ -509,16 +509,21 @@ impl NemotronHMamba2Mixer {
             concatenate(&pad_arr, &conv_input, 1)
         };
 
-        // Update conv cache
+        // Update conv cache.
+        // Wrap slice in contiguous() to force MLX to materialize a fresh,
+        // independent buffer. Without this, the slice is a lazy view that
+        // retains a reference to the full padded_input allocation, causing a
+        // memory leak proportional to the sequence length. (issue #336)
         if let Some(c) = cache.as_deref_mut() {
             let padded_shape = mlxcel_core::array_shape(&padded_input);
             let len = padded_shape[1] as usize;
-            c.conv_state = Some(slice_axis(
+            let tail = slice_axis(
                 &padded_input,
                 1,
                 (len - (k - 1)) as i32,
                 len as i32,
-            ));
+            );
+            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
         }
 
         // Depthwise conv1d
@@ -913,7 +918,10 @@ impl NemotronHMamba2Mixer {
             );
         }
 
-        cache.conv_state = Some(new_conv_state);
+        // The C++ fused kernel builds new_conv_state via slice(padded_input, ...)
+        // which is a lazy alias. Wrap with contiguous() to materialize a compact
+        // buffer and drop the upstream padded_input graph reference. (issue #336)
+        cache.conv_state = Some(mlxcel_core::contiguous(&new_conv_state, false));
         cache.ssm_state = Some(new_ssm_state);
 
         output
@@ -1678,14 +1686,19 @@ impl NemotronHModel {
             );
         }
 
-        // Update Mamba caches from C++ output
+        // Update Mamba caches from C++ output.
+        // The full-decode C++ kernel calls fused_mamba2_forward internally,
+        // which builds conv states via slice(padded_input, ...) — a lazy alias.
+        // Wrap each conv_state with contiguous() to materialize a compact buffer
+        // and drop the upstream padded_input graph reference. (issue #336)
         let mut mamba_idx = 0;
         for c in caches.iter_mut() {
             if let NemotronLayerCache::Mamba(mc) = c {
-                mc.conv_state = Some(std::mem::replace(
+                let raw_conv = std::mem::replace(
                     &mut mamba_conv_out[mamba_idx],
                     mlxcel_core::UniquePtr::null(),
-                ));
+                );
+                mc.conv_state = Some(mlxcel_core::contiguous(&raw_conv, false));
                 mc.ssm_state = Some(std::mem::replace(
                     &mut mamba_ssm_out[mamba_idx],
                     mlxcel_core::UniquePtr::null(),

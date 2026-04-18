@@ -688,16 +688,21 @@ impl JambaMambaMixer {
             conv_out
         };
 
-        // Update conv cache
+        // Update conv cache.
+        // Wrap slice in contiguous() to force MLX to materialize a fresh,
+        // independent buffer. Without this, the slice is a lazy view that
+        // retains a reference to the full padded_input allocation, causing a
+        // memory leak proportional to the sequence length. (issue #336)
         if let Some(c) = cache.as_deref_mut() {
             let padded_shape = mlxcel_core::array_shape(&padded_input);
             let len = padded_shape[1] as usize;
-            c.conv_state = Some(slice_axis(
+            let tail = slice_axis(
                 &padded_input,
                 1,
                 (len - (k - 1)) as i32,
                 len as i32,
-            ));
+            );
+            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
         }
 
         let x_conv = silu(&conv_out);
@@ -1263,3 +1268,7 @@ impl LanguageModel for JambaModel {
         vec![519] // Jamba EOS token: <|im_end|>
     }
 }
+
+#[cfg(test)]
+#[path = "jamba_tests.rs"]
+mod tests;
