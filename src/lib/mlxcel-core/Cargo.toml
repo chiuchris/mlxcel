@@ -23,6 +23,8 @@ smallvec = { version = "1.13", features = ["serde"] }
 sha2 = "0.10"
 thiserror = "2.0"
 tokenizers = "0.22.2"
+bincode = "1"
+dirs = "5"
 
 [dev-dependencies]
 tempfile = "3"

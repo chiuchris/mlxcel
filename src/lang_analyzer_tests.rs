@@ -16,13 +16,21 @@
 //!
 //! These tests verify the public API of the lang_analyzer module from the
 //! perspective of a downstream consumer (the main mlxcel crate). Unit-level
-//! tests live in `mlxcel-core/src/lang_analyzer.rs`; this file validates the
-//! same invariants via the public API surface.
+//! tests live in `mlxcel-core/src/lang_analyzer/mod.rs`; this file validates
+//! the same invariants via the public API surface.
 
 use mlxcel_core::lang_analyzer::{
-    CURRENT_VERSION, Script, TokenLanguageIndex, classify_token, is_numeric, is_punctuation,
+    cache, CURRENT_VERSION, Script, TokenLanguageIndex, classify_token, is_numeric, is_punctuation,
     is_whitespace,
 };
+
+// Serialize env-var-sensitive integration tests to avoid race conditions in
+// parallel test execution.
+static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ============================================================================
 // B2 — classify_token — §10.1 acceptance criteria strings
@@ -349,5 +357,137 @@ fn build_index_from_real_tokenizer_smoke() {
     eprintln!(
         "[ok] built index from {path}: vocab={vocab_size}, by_script entries={}",
         idx.by_script.len()
+    );
+}
+
+// ============================================================================
+// B4 — Disk cache integration tests
+// ============================================================================
+
+/// Integration test for B4 cache API exposed via the public `lang_analyzer`
+/// surface. Exercises `cache::cache_path`, `cache::load_or_build`, and
+/// `TokenLanguageIndex::compute_vocab_hash`.
+///
+/// Uses the mock tokenizer JSON to avoid requiring a downloaded model.
+#[test]
+fn b4_cache_integration_roundtrip() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let _guard = env_lock();
+    // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
+    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+
+    let json = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<unk>": 0, "integration_test_b4": 1, "hello": 2
+    },
+    "unk_token": "<unk>"
+  }
+}"#;
+
+    let json_bytes = json.as_bytes();
+    let tok = tokenizers::Tokenizer::from_bytes(json_bytes).expect("parse tokenizer");
+
+    // Verify compute_vocab_hash is consistent with the stored hash.
+    let hash = TokenLanguageIndex::compute_vocab_hash(json_bytes);
+    assert_eq!(hash.len(), 16, "vocab_hash must be 16 hex chars");
+
+    // cache_path must resolve under the overridden directory.
+    let expected_path = cache_path_relative(&tmp, &hash);
+    let resolved = cache::cache_path(&hash);
+    assert_eq!(resolved, expected_path);
+
+    // load_or_build: first call must build and persist.
+    let idx1 = cache::load_or_build(&tok, json_bytes, false)
+        .expect("first load_or_build should succeed");
+    assert_eq!(idx1.version, CURRENT_VERSION);
+    assert_eq!(idx1.vocab_hash, hash);
+    assert!(resolved.exists(), "cache file must exist after first load_or_build");
+
+    let mtime1 = std::fs::metadata(&resolved).unwrap().modified().unwrap();
+
+    // load_or_build: second call must load from disk (mtime unchanged).
+    let idx2 = cache::load_or_build(&tok, json_bytes, false)
+        .expect("second load_or_build should succeed");
+    let mtime2 = std::fs::metadata(&resolved).unwrap().modified().unwrap();
+
+    // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
+    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    drop(_guard);
+
+    assert_eq!(idx1.vocab_hash, idx2.vocab_hash);
+    assert_eq!(mtime1, mtime2, "second call must hit disk cache");
+
+    eprintln!("[ok] B4 cache integration: hash={hash}, path={}", resolved.display());
+}
+
+/// Helper to build the expected cache path relative to a tempdir.
+fn cache_path_relative(tmp: &tempfile::TempDir, hash: &str) -> std::path::PathBuf {
+    tmp.path()
+        .join("tokenizer-scripts")
+        .join(format!("{hash}.bin"))
+}
+
+/// Integration smoke test: exercises the B4 cache with a real tokenizer.json.
+/// Skipped when no model is available.
+#[test]
+fn b4_cache_real_tokenizer_integration_smoke() {
+    let candidates = [
+        "models/smollm-135m-4bit/tokenizer.json",
+        "models/Qwen2.5-7B-Instruct-4bit/tokenizer.json",
+        "models/Meta-Llama-3.1-8B-Instruct-4bit/tokenizer.json",
+    ];
+
+    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
+    let Some(tok_path) = found else {
+        eprintln!("[skip] no model tokenizer.json found; skipping B4 real-tokenizer integration smoke test");
+        return;
+    };
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let json_bytes = std::fs::read(tok_path).expect("read tokenizer.json");
+    let tok = tokenizers::Tokenizer::from_bytes(&json_bytes).expect("parse tokenizer");
+
+    let _guard = env_lock();
+    // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
+    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+
+    let hash = TokenLanguageIndex::compute_vocab_hash(&json_bytes);
+    let idx1 = cache::load_or_build(&tok, &json_bytes, false)
+        .expect("first load_or_build on real tokenizer");
+
+    assert_eq!(idx1.vocab_hash, hash);
+    assert_eq!(idx1.version, CURRENT_VERSION);
+
+    let path = cache::cache_path(&hash);
+    assert!(path.exists(), "cache file must exist");
+    let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    let idx2 = cache::load_or_build(&tok, &json_bytes, false)
+        .expect("second load_or_build on real tokenizer");
+    let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+    // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
+    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    drop(_guard);
+
+    assert_eq!(idx1.vocab_hash, idx2.vocab_hash);
+    assert_eq!(mtime1, mtime2, "real tokenizer: second call must hit disk cache");
+
+    eprintln!(
+        "[ok] B4 real-tokenizer integration smoke: vocab={}, hash={}",
+        idx1.tokens.len(),
+        hash
     );
 }

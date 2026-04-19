@@ -22,6 +22,10 @@
 //! The module is structured in sub-issues:
 //! - **B2 (this file, initial)**: `Script` enum, `classify_token`, helper predicates.
 //! - **B3** (added in the same file): `TokenScriptInfo`, `TokenLanguageIndex`, `build()`.
+//! - **B4** (`cache` submodule): disk cache for `TokenLanguageIndex` (vocab-hash keyed, bincode v1).
+
+pub mod cache;
+pub use cache::{cache_path, load_or_build, save, try_load};
 
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
@@ -259,9 +263,28 @@ pub enum LangAnalyzerError {
     Io(#[from] std::io::Error),
     #[error("tokenizer.json not found at path: {0}")]
     TokenizerJsonNotFound(String),
+    #[error("bincode serialization error: {0}")]
+    Bincode(#[from] bincode::Error),
 }
 
 impl TokenLanguageIndex {
+    /// Compute the vocabulary hash from raw `tokenizer.json` bytes without
+    /// building the full index.
+    ///
+    /// This is the cheap path used by B4's `load_or_build` to look up the
+    /// cache key before deciding whether to do the expensive vocab scan.
+    ///
+    /// Returns the first 16 hex characters of the SHA-256 digest of `bytes`.
+    pub fn compute_vocab_hash(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        let digest = hasher.finalize();
+        digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// Build the index by scanning the entire vocabulary.
     ///
     /// The caller should supply the `tokenizer_json_bytes` (raw contents of
@@ -319,15 +342,8 @@ impl TokenLanguageIndex {
             });
         }
 
-        // Compute vocab_hash = hex(sha256(tokenizer_json_bytes))[..16]
-        let mut hasher = Sha256::new();
-        hasher.update(tokenizer_json_bytes);
-        let digest = hasher.finalize();
-        // Format the first 8 bytes as lowercase hex (yields 16 hex chars).
-        let vocab_hash = digest[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>();
+        // Compute vocab_hash via the shared helper (first 16 hex chars of SHA-256).
+        let vocab_hash = Self::compute_vocab_hash(tokenizer_json_bytes);
 
         Ok(TokenLanguageIndex {
             vocab_hash,

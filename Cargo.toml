@@ -104,6 +104,9 @@ type_complexity = "allow"
 large_enum_variant = "allow"
 should_implement_trait = "allow"
 
+[dev-dependencies]
+tempfile = "3"
+
 [[test]]
 name = "distributed_integration"
 required-features = ["test-utils"]
