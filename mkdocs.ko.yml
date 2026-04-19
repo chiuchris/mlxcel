@@ -150,6 +150,7 @@ nav:
       - LoRA 어댑터: user-guide/lora.md
       - 추측적 디코딩: user-guide/speculative-decoding.md
       - 연속 배칭: user-guide/continuous-batching.md
+      - 언어 바이어스: user-guide/lang-bias.md
   - API 레퍼런스:
       - api-reference/index.md
       - REST API: api-reference/rest-api.md
