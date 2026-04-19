@@ -36,6 +36,10 @@ mod model_metadata;
 #[path = "model_metadata_tests.rs"]
 mod model_metadata_tests;
 
+#[cfg(test)]
+#[path = "lang_analyzer_tests.rs"]
+mod lang_analyzer_tests;
+
 // Re-export mlxcel-core generate module
 pub use execution::quant_advisor;
 pub use execution::runtime::{RuntimeDevice, RuntimeSetup, initialize_runtime};
