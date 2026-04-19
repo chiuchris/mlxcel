@@ -399,6 +399,33 @@ impl FromStr for LanguageCode {
     }
 }
 
+impl LanguageCode {
+    /// Returns the canonical lowercase BCP-47 code string for this language.
+    ///
+    /// Used by B9 observability to build the `languages` tracing field
+    /// (e.g. `"ja,zh"`) without requiring a `Display` format allocation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LanguageCode::Ja => "ja",
+            LanguageCode::Zh => "zh",
+            LanguageCode::Ko => "ko",
+            LanguageCode::En => "en",
+            LanguageCode::Ru => "ru",
+            LanguageCode::Ar => "ar",
+            LanguageCode::Th => "th",
+            LanguageCode::Hi => "hi",
+            LanguageCode::He => "he",
+            LanguageCode::El => "el",
+        }
+    }
+}
+
+impl std::fmt::Display for LanguageCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Token inclusion policy for language-script matching (§5.4).
 ///
 /// - **Conservative**: include any token whose script set *intersects* the

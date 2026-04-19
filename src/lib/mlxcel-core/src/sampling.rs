@@ -25,6 +25,45 @@ use crate::ffi::MlxArray;
 use crate::generate::SamplingConfig;
 use cxx::UniquePtr;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// ---------------------------------------------------------------------------
+// B9 — Observability: global Prometheus-compatible counters
+//
+// Process-wide atomics so the `/metrics` HTTP handler can read them from
+// `mlxcel_core::sampling` without threading an extra struct through every
+// call site.  All accesses use `Ordering::Relaxed`: exactness is not
+// required for monitoring — slight staleness is acceptable and avoids
+// unnecessary memory barriers on the hot decode path.
+// ---------------------------------------------------------------------------
+
+/// Total sampling calls where `token_bias` was non-empty.
+///
+/// Exposed via `/metrics` as `mlxcel_lang_bias_applied_total`.
+/// Incremented once per `sample_token_optimized` call with a non-empty
+/// `TokenBiasMap`; zero overhead when the map is empty (baseline path).
+pub static LANG_BIAS_APPLIED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Total sampling calls where the pre-bias top-1 token was `-inf`-suppressed.
+///
+/// Exposed via `/metrics` as `mlxcel_lang_bias_tokens_suppressed_total`.
+/// Incremented when the argmax of the original (pre-bias) logits is a token
+/// that has `f32::NEG_INFINITY` bias in the map — signalling the bias
+/// actively overrode the model's most probable token at that step.
+pub static LANG_BIAS_TOKENS_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
+
+/// Read the current value of `mlxcel_lang_bias_applied_total`.
+#[inline]
+pub fn lang_bias_applied_total() -> u64 {
+    LANG_BIAS_APPLIED_TOTAL.load(Ordering::Relaxed)
+}
+
+/// Read the current value of `mlxcel_lang_bias_tokens_suppressed_total`.
+#[inline]
+pub fn lang_bias_tokens_suppressed_total() -> u64 {
+    LANG_BIAS_TOKENS_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
+}
+
 
 /// Additive bias applied to specific token logits before any history-based penalty.
 ///
@@ -72,6 +111,14 @@ impl TokenBiasMap {
         self.entries.contains_key(&token_id)
     }
 
+    /// Returns the bias for `token_id`, or `None` if not present.
+    ///
+    /// Used by B9 observability to check whether the pre-bias argmax token
+    /// was `-inf`-suppressed.
+    pub fn get(&self, token_id: &i32) -> Option<&f32> {
+        self.entries.get(token_id)
+    }
+
     /// Iterate over `(&token_id, &bias)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&i32, &f32)> {
         self.entries.iter()
@@ -115,6 +162,12 @@ pub(crate) fn apply_token_bias(
 /// Uses fused C++ sampling (temperature + top-k + top-p + min-p + categorical
 /// in a single FFI call) to minimize round-trip overhead.
 ///
+/// **B9 observability**: when `config.token_bias` is non-empty this function
+/// increments `LANG_BIAS_APPLIED_TOTAL` and, when the pre-bias top-1 token
+/// was `-inf`-suppressed, `LANG_BIAS_TOKENS_SUPPRESSED_TOTAL`.  Both
+/// increments are skipped entirely when the map is empty, preserving the
+/// zero-overhead baseline path.
+///
 /// Used by: `CxxGenerator`, `SpeculativeGenerator`, `BatchScheduler`
 pub fn sample_token_optimized(
     logits: &MlxArray,
@@ -129,6 +182,23 @@ pub fn sample_token_optimized(
     // precedence. -inf composes correctly with downstream penalties:
     //   -inf × k == -inf,  -inf + f == -inf.
     let last_logits = if !config.token_bias.is_empty() {
+        // B9 — increment applied counter (zero overhead when bias is empty).
+        LANG_BIAS_APPLIED_TOTAL.fetch_add(1, Ordering::Relaxed);
+
+        // B9 — check if the pre-bias argmax token was `-inf`-suppressed.
+        // Evaluation is required to extract the integer id; the argmax is a
+        // lightweight reduction over the last logits slice already in memory.
+        let top_arr = ffi::argmax_last_axis(&last_logits);
+        ffi::eval(&top_arr);
+        let top_id = ffi::item_i32(&top_arr);
+        if config
+            .token_bias
+            .get(&top_id)
+            .is_some_and(|b| b.is_infinite() && b.is_sign_negative())
+        {
+            LANG_BIAS_TOKENS_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+        }
+
         apply_token_bias(&last_logits, &config.token_bias)
     } else {
         last_logits

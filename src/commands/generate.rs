@@ -749,6 +749,29 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             token_bias.len(),
             if token_bias.len() == 1 { "y" } else { "ies" }
         );
+        // B9 — emit structured debug trace once per generator construction.
+        let (languages_str, policy_str) = if let Some(cfg) = &lang_bias_config {
+            let langs: Vec<&str> = cfg
+                .bias_set
+                .ordered
+                .iter()
+                .map(|(code, _)| code.as_str())
+                .collect();
+            let langs_joined = langs.join(",");
+            let policy = match cfg.policy {
+                mlxcel_core::InclusionPolicy::Conservative => "conservative",
+                mlxcel_core::InclusionPolicy::Strict => "strict",
+            };
+            (langs_joined, policy)
+        } else {
+            (String::new(), "conservative")
+        };
+        tracing::debug!(
+            entries = token_bias.len(),
+            languages = %languages_str,
+            policy = %policy_str,
+            "lang_bias resolved"
+        );
     }
 
     // Parse KV cache mode (validated early so errors surface before generation)

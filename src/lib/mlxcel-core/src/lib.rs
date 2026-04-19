@@ -1851,6 +1851,9 @@ pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
 
 // Re-export sampling primitives needed by generation-loop wiring (B8) and server layers.
 pub use sampling::TokenBiasMap;
+// Re-export B9 observability counter accessors so the server `/metrics` handler
+// can read process-wide lang-bias counters without a struct dependency.
+pub use sampling::{lang_bias_applied_total, lang_bias_tokens_suppressed_total};
 
 // Re-export Axis B language-steering types so downstream consumers (CLI, server, B6–B8)
 // can use them without referencing the internal module path.

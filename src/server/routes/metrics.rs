@@ -45,6 +45,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let completion_tokens = m.completion_tokens_total.load(Ordering::Relaxed);
     let gen_time_ms = m.generation_time_ms_total.load(Ordering::Relaxed);
 
+    // B9 — read process-wide lang-bias observability counters.
+    let lang_bias_applied = mlxcel_core::lang_bias_applied_total();
+    let lang_bias_suppressed = mlxcel_core::lang_bias_tokens_suppressed_total();
+
     let slots_total = state.config.max_batch_size;
     let active = state.batch_metrics.active_count();
     let slots_available = slots_total.saturating_sub(active);
@@ -120,7 +124,13 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_cache_pool_paged_bytes_in_use {paged_bytes_in_use}\n\
          # HELP mlxcel_decode_storage_fallbacks_total Number of paged decode fallback events\n\
          # TYPE mlxcel_decode_storage_fallbacks_total counter\n\
-         mlxcel_decode_storage_fallbacks_total {decode_storage_fallbacks}\n",
+         mlxcel_decode_storage_fallbacks_total {decode_storage_fallbacks}\n\
+         # HELP mlxcel_lang_bias_applied_total Sampling steps where language token bias was applied\n\
+         # TYPE mlxcel_lang_bias_applied_total counter\n\
+         mlxcel_lang_bias_applied_total {lang_bias_applied}\n\
+         # HELP mlxcel_lang_bias_tokens_suppressed_total Sampling steps where the pre-bias top-1 token was neg-inf suppressed\n\
+         # TYPE mlxcel_lang_bias_tokens_suppressed_total counter\n\
+         mlxcel_lang_bias_tokens_suppressed_total {lang_bias_suppressed}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
         seq_started = obs.sequences_started,
         seq_completed = obs.sequences_completed,

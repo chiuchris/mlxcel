@@ -146,6 +146,29 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             &model_path,
         );
 
+        // B9 — emit structured debug trace once at generator construction time
+        // (after resolve, before the scheduler is started).
+        if let (true, Some(cfg)) = (!token_bias.is_empty(), sched_config.lang_bias_config.as_ref()) {
+            let langs: Vec<&str> = cfg
+                .bias_set
+                .ordered
+                .iter()
+                .map(|(code, _)| code.as_str())
+                .collect();
+            let languages_str = langs.join(",");
+            let policy_str = if cfg.policy == mlxcel_core::InclusionPolicy::Strict {
+                "strict"
+            } else {
+                "conservative"
+            };
+            tracing::debug!(
+                entries = token_bias.len(),
+                languages = %languages_str,
+                policy = %policy_str,
+                "lang_bias resolved"
+            );
+        }
+
         let chunk_info = if sched_config.prefill_chunk_size > 0 {
             format!(", prefill_chunk_size={}", sched_config.prefill_chunk_size)
         } else {
