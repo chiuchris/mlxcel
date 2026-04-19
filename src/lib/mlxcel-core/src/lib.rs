@@ -1849,6 +1849,9 @@ pub use ffi::*;
 pub use cxx::UniquePtr;
 pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
 
+// Re-export sampling primitives needed by generation-loop wiring (B8) and server layers.
+pub use sampling::TokenBiasMap;
+
 fn use_single_query_maskless_path() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {

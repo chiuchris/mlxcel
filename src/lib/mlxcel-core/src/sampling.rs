@@ -26,6 +26,79 @@ use crate::generate::SamplingConfig;
 use cxx::UniquePtr;
 use std::collections::HashMap;
 
+/// Additive bias applied to specific token logits before any history-based penalty.
+///
+/// A positive bias makes a token more likely; a negative bias makes it less likely.
+/// Use `f32::NEG_INFINITY` to permanently suppress a token (probability becomes 0).
+///
+/// When empty, `apply_token_bias` short-circuits without any array operations,
+/// preserving bit-exact baseline behavior.
+#[derive(Debug, Clone, Default)]
+pub struct TokenBiasMap {
+    entries: HashMap<i32, f32>,
+}
+
+impl TokenBiasMap {
+    /// Create an empty `TokenBiasMap`.
+    pub fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+        }
+    }
+
+    /// Insert or overwrite the bias for `token_id`.
+    ///
+    /// Negative token ids and ids outside the vocabulary range are accepted here
+    /// but silently ignored when the bias is applied (see `apply_token_bias`).
+    pub fn insert(&mut self, token_id: i32, bias: f32) {
+        self.entries.insert(token_id, bias);
+    }
+
+    /// Returns `true` when no bias entries are stored.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Number of bias entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Iterate over `(&token_id, &bias)` pairs.
+    pub fn iter(&self) -> impl Iterator<Item = (&i32, &f32)> {
+        self.entries.iter()
+    }
+}
+
+/// Apply additive bias to token logits before repetition/frequency/presence penalties.
+///
+/// Zero-overhead when `bias.is_empty()`: returns a copy of the input without
+/// any array arithmetic.
+///
+/// Invalid token ids (negative, or `>= vocab_size`) are silently ignored —
+/// no panic, no error.
+///
+/// Used by: standard generation, speculative decoding, batch scheduler
+pub(crate) fn apply_token_bias(
+    logits: &MlxArray,
+    bias: &TokenBiasMap,
+) -> UniquePtr<MlxArray> {
+    if bias.is_empty() {
+        return ffi::copy(logits);
+    }
+    let shape = ffi::array_shape(logits);
+    let vocab_size = *shape.last().unwrap() as usize;
+    let mut bias_vec = vec![0.0f32; vocab_size];
+    for (&tok, &b) in bias.iter() {
+        if tok >= 0 && (tok as usize) < vocab_size {
+            bias_vec[tok as usize] = b;
+        }
+    }
+    let bias_arr = ffi::from_slice_f32(&bias_vec, &[1, vocab_size as i32]);
+    let bias_broadcast = ffi::broadcast_to(&bias_arr, &shape);
+    ffi::add(logits, &bias_broadcast)
+}
+
 /// Optimized sampling that returns arrays for pipelining.
 ///
 /// Returns `(token_array, logits_array)` without forcing evaluation so the
@@ -42,6 +115,16 @@ pub fn sample_token_optimized(
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
     // Use optimized slice_last_logits: [batch, seq, vocab] -> [batch, vocab].
     let last_logits = ffi::slice_last_logits(logits);
+
+    // Apply token bias first (before history-based penalties).
+    // Language policy is an external decision, not history-based, so it takes
+    // precedence. -inf composes correctly with downstream penalties:
+    //   -inf × k == -inf,  -inf + f == -inf.
+    let last_logits = if !config.token_bias.is_empty() {
+        apply_token_bias(&last_logits, &config.token_bias)
+    } else {
+        last_logits
+    };
 
     let last_logits = if config.repetition_penalty != 1.0 && !token_history.is_empty() {
         apply_repetition_penalty(&last_logits, token_history, config.repetition_penalty)
@@ -568,5 +651,97 @@ mod tests {
         let result = compute_logprobs(&logits, 2, &config).expect("should return Some");
         // top_k is clamped to vocab size (3), so at most 3 alternatives
         assert_eq!(result.top_alternatives.len(), 3);
+    }
+
+    // -- TokenBiasMap and apply_token_bias --
+
+    #[test]
+    fn apply_token_bias_empty_noop() {
+        // Empty bias map must produce bit-exact equal output.
+        let data = [1.0f32, 2.0, 3.0, 4.0, 5.0];
+        let logits = ffi::from_slice_f32(&data, &[1, 5]);
+        let bias = TokenBiasMap::new();
+        let result = apply_token_bias(&logits, &bias);
+        ffi::eval(&result);
+        for i in 0..5i32 {
+            assert_eq!(
+                logit_at(&result, i),
+                data[i as usize],
+                "token {i} should be unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_token_bias_positive_adds() {
+        // {5: +2.0} -> logit[5] += 2.0, all others unchanged.
+        let logits = ffi::from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0], &[1, 6]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(5, 2.0);
+        let result = apply_token_bias(&logits, &bias);
+        ffi::eval(&result);
+        for i in 0..5i32 {
+            assert_eq!(logit_at(&result, i), i as f32, "token {i} should be unchanged");
+        }
+        assert_eq!(logit_at(&result, 5), 7.0, "token 5 should be 5.0 + 2.0 = 7.0");
+    }
+
+    #[test]
+    fn apply_token_bias_neg_inf_forces_zero_prob() {
+        // {3: -inf} -> after softmax, probability at index 3 must be 0.
+        let logits = ffi::from_slice_f32(&[1.0, 1.0, 1.0, 1.0, 1.0], &[1, 5]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(3, f32::NEG_INFINITY);
+        let biased = apply_token_bias(&logits, &bias);
+        ffi::eval(&biased);
+        let probs = ffi::softmax(&biased, -1);
+        ffi::eval(&probs);
+        let prob_at_3 = logit_at(&probs, 3);
+        assert_eq!(prob_at_3, 0.0, "probability at suppressed token must be 0.0");
+    }
+
+    #[test]
+    fn apply_token_bias_multiple_entries() {
+        // Multiple entries are applied independently and correctly.
+        let logits = ffi::from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 4]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(0, 1.0);
+        bias.insert(2, -3.0);
+        let result = apply_token_bias(&logits, &bias);
+        ffi::eval(&result);
+        assert_eq!(logit_at(&result, 0), 1.0, "token 0 should be 0.0 + 1.0");
+        assert_eq!(logit_at(&result, 1), 0.0, "token 1 should be unchanged");
+        assert_eq!(logit_at(&result, 2), -3.0, "token 2 should be 0.0 - 3.0");
+        assert_eq!(logit_at(&result, 3), 0.0, "token 3 should be unchanged");
+    }
+
+    #[test]
+    fn apply_token_bias_out_of_range_ignored() {
+        // Token id >= vocab_size must be silently ignored — no panic.
+        let logits = ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 3]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(100, 99.0); // way beyond vocab_size = 3
+        bias.insert(3, 5.0); // exactly vocab_size (off-by-one boundary)
+        let result = apply_token_bias(&logits, &bias);
+        ffi::eval(&result);
+        // Original values unchanged
+        assert_eq!(logit_at(&result, 0), 1.0);
+        assert_eq!(logit_at(&result, 1), 2.0);
+        assert_eq!(logit_at(&result, 2), 3.0);
+    }
+
+    #[test]
+    fn apply_token_bias_negative_index_ignored() {
+        // Negative token ids must be silently ignored — no panic.
+        let logits = ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 3]);
+        let mut bias = TokenBiasMap::new();
+        bias.insert(-1, 99.0);
+        bias.insert(-100, -50.0);
+        let result = apply_token_bias(&logits, &bias);
+        ffi::eval(&result);
+        // Original values unchanged
+        assert_eq!(logit_at(&result, 0), 1.0);
+        assert_eq!(logit_at(&result, 1), 2.0);
+        assert_eq!(logit_at(&result, 2), 3.0);
     }
 }

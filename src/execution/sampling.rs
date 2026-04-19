@@ -19,6 +19,7 @@
 //! control plane so every entry point applies the same defaults.
 
 use crate::SamplingConfig;
+use mlxcel_core::TokenBiasMap;
 
 #[derive(Debug, Clone, PartialEq)]
 /// Fully resolved sampling knobs before conversion into `SamplingConfig`.
@@ -74,6 +75,7 @@ pub fn build_sampling_config(params: ResolvedSamplingParams) -> SamplingConfig {
             frequency_penalty: params.frequency_penalty,
             presence_penalty: params.presence_penalty,
             stop_token_ids: params.stop_token_ids,
+            token_bias: TokenBiasMap::default(),
         }
     }
 }

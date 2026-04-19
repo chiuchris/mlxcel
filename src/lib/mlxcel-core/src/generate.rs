@@ -32,7 +32,7 @@ use crate::generation_policy::{
 };
 use crate::hardware;
 use crate::layers::KVCache;
-use crate::sampling::sample_token_optimized;
+use crate::sampling::{sample_token_optimized, TokenBiasMap};
 use crate::streams::{install_default_stream, new_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
@@ -475,6 +475,9 @@ pub struct SamplingConfig {
     /// Additional stop token IDs (from generation_config.json or API request)
     /// Merged with model's built-in eos_token_ids during generation
     pub stop_token_ids: Vec<i32>,
+    /// Per-token additive logit bias applied before all history-based penalties.
+    /// Empty (default) is a zero-overhead no-op that preserves bit-exact baseline.
+    pub token_bias: TokenBiasMap,
 }
 
 impl Default for SamplingConfig {
@@ -494,6 +497,7 @@ impl Default for SamplingConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             stop_token_ids: Vec::new(),
+            token_bias: TokenBiasMap::default(),
         }
     }
 }
@@ -516,6 +520,7 @@ impl SamplingConfig {
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
             stop_token_ids: Vec::new(),
+            token_bias: TokenBiasMap::default(),
         }
     }
 
