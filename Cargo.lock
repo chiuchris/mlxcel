@@ -1690,7 +1690,10 @@ dependencies = [
  "cxx-build",
  "serde",
  "serde_json",
+ "sha2",
  "smallvec",
+ "thiserror",
+ "tokenizers",
  "unicode-script",
 ]
 

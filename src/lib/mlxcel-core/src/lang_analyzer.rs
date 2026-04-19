@@ -207,6 +207,138 @@ fn is_punct_char(c: char) -> bool {
 }
 
 // ============================================================================
+// B3 — TokenScriptInfo, TokenLanguageIndex, build()
+// ============================================================================
+
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use tokenizers::Tokenizer;
+
+/// Cache-schema version. B4 compares the stored `version` field against this
+/// constant to decide whether to rebuild the index.
+pub const CURRENT_VERSION: u32 = 1;
+
+/// Per-token metadata produced by the vocabulary scan.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenScriptInfo {
+    pub token_id: i32,
+    pub scripts: SmallVec<[Script; 3]>,
+    pub is_special: bool,
+    pub is_numeric: bool,
+    pub is_punctuation: bool,
+    pub is_whitespace: bool,
+}
+
+/// Per-model, once-computed classification of every vocabulary token by script.
+///
+/// Built by `TokenLanguageIndex::build` and consumed by B4 (disk cache) and
+/// B5 (`LangBiasSet` → `TokenBiasMap` conversion).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenLanguageIndex {
+    /// First 16 hex chars of SHA-256 over the tokenizer.json bytes.
+    pub vocab_hash: String,
+    /// Cache schema version; compare against `CURRENT_VERSION` on load.
+    pub version: u32,
+    /// One entry per vocab token, indexed by token id.
+    pub tokens: Vec<TokenScriptInfo>,
+    /// Inverted index: script → list of token ids containing that script.
+    pub by_script: HashMap<Script, Vec<i32>>,
+}
+
+/// Errors that can occur during language-analyzer operations.
+#[derive(Debug, thiserror::Error)]
+pub enum LangAnalyzerError {
+    #[error("tokenizer returned no vocabulary")]
+    EmptyVocab,
+    #[error("tokenizer failed to decode token id {id}: {source}")]
+    TokenDecodeError {
+        id: u32,
+        source: Box<dyn std::error::Error + Send + Sync + 'static>,
+    },
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("tokenizer.json not found at path: {0}")]
+    TokenizerJsonNotFound(String),
+}
+
+impl TokenLanguageIndex {
+    /// Build the index by scanning the entire vocabulary.
+    ///
+    /// The caller should supply the `tokenizer_json_bytes` (raw contents of
+    /// `tokenizer.json`) so this function can compute the `vocab_hash` without
+    /// filesystem access. If the bytes are not available, pass an empty slice
+    /// and the hash will be computed over that empty slice.
+    ///
+    /// # Algorithm (§5.6)
+    /// 1. Determine vocab size via `tokenizer.get_vocab_size(with_added_tokens=true)`.
+    /// 2. For each id, decode via `tokenizer.id_to_token(id)`.
+    /// 3. Classify using B2 helpers.
+    /// 4. Set `is_special` from the tokenizer's added-tokens decoder.
+    /// 5. Invert into `by_script`.
+    pub fn build(tokenizer: &Tokenizer, tokenizer_json_bytes: &[u8]) -> Result<Self, LangAnalyzerError> {
+        let vocab_size = tokenizer.get_vocab_size(true);
+        if vocab_size == 0 {
+            return Err(LangAnalyzerError::EmptyVocab);
+        }
+
+        // Build a set of special token ids from the tokenizer's added-tokens decoder.
+        let added_tokens_decoder = tokenizer.get_added_tokens_decoder();
+        let special_ids: std::collections::HashSet<u32> = added_tokens_decoder
+            .iter()
+            .filter(|(_, tok)| tok.special)
+            .map(|(id, _)| *id)
+            .collect();
+
+        let mut tokens = Vec::with_capacity(vocab_size);
+        let mut by_script: HashMap<Script, Vec<i32>> = HashMap::new();
+
+        for id in 0..vocab_size as u32 {
+            let token_str = tokenizer
+                .id_to_token(id)
+                .unwrap_or_default();
+
+            let scripts = classify_token(&token_str);
+            let is_special = special_ids.contains(&id);
+            let is_num = is_numeric(&token_str);
+            let is_punct = is_punctuation(&token_str);
+            let is_ws = is_whitespace(&token_str);
+
+            // Populate the inverted index. Exception flags do NOT exclude from
+            // by_script here — that filtering happens in B5 via ExceptionConfig.
+            for &script in &scripts {
+                by_script.entry(script).or_default().push(id as i32);
+            }
+
+            tokens.push(TokenScriptInfo {
+                token_id: id as i32,
+                scripts,
+                is_special,
+                is_numeric: is_num,
+                is_punctuation: is_punct,
+                is_whitespace: is_ws,
+            });
+        }
+
+        // Compute vocab_hash = hex(sha256(tokenizer_json_bytes))[..16]
+        let mut hasher = Sha256::new();
+        hasher.update(tokenizer_json_bytes);
+        let digest = hasher.finalize();
+        // Format the first 8 bytes as lowercase hex (yields 16 hex chars).
+        let vocab_hash = digest[..8]
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+
+        Ok(TokenLanguageIndex {
+            vocab_hash,
+            version: CURRENT_VERSION,
+            tokens,
+            by_script,
+        })
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
