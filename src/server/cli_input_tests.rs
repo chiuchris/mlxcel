@@ -14,7 +14,10 @@
 
 use std::path::PathBuf;
 
-use super::{ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed};
+use super::{
+    ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed,
+};
+use crate::lang_bias::LangBiasCliArgs;
 
 fn sample_input() -> ServerStartupInput {
     ServerStartupInput {
@@ -220,4 +223,147 @@ fn into_startup_config_propagates_pp_micro_batch_size() {
     input.pp_micro_batch_size = 4;
     let startup = input.into_startup_config();
     assert_eq!(startup.pp_micro_batch_size, 4);
+}
+
+// -------------------------------------------------------------------------
+// B7 — LLAMA_ARG_LANG_BIAS env-var fallback tests (plan §6.4)
+//
+// Each test manages the env var explicitly (set + cleanup) and delegates to a
+// helper that calls `env_fallback_lang_bias` directly, keeping the env
+// mutation inside each test's stack frame for clarity.
+//
+// NOTE: Rust test threads share a process, so env-var mutations must be
+// cleaned up regardless of test outcome. These tests run in-process and are
+// intentionally structured to be self-contained.
+// -------------------------------------------------------------------------
+
+/// Helper that cleans up `LLAMA_ARG_LANG_BIAS` at drop time.
+struct EnvGuard(&'static str);
+
+impl EnvGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        // SAFETY: single-threaded access guaranteed by cargo test (or
+        // serial execution with env isolation if run under a test harness).
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        EnvGuard(key)
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        #[allow(unsafe_code)]
+        unsafe {
+            std::env::remove_var(self.0);
+        }
+    }
+}
+
+/// B7 acceptance test: only `LLAMA_ARG_LANG_BIAS` is set (no CLI flag) →
+/// the env value flows into `LangBiasCliArgs.lang_bias` and resolves to the
+/// expected `LangBiasConfig`.
+#[test]
+fn env_var_feeds_parser() {
+    use super::env_fallback_lang_bias;
+    use crate::lang_bias::parse_lang_bias_entries;
+
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ja=-inf,zh=-5");
+
+    let mut args = LangBiasCliArgs::default(); // lang_bias = None (no CLI flag)
+    env_fallback_lang_bias(&mut args);
+
+    // The env var value should now be in args.lang_bias.
+    assert_eq!(
+        args.lang_bias.as_deref(),
+        Some("ja=-inf,zh=-5"),
+        "env var value should be copied into lang_bias when CLI flag is absent"
+    );
+
+    // Resolve to a LangBiasConfig and verify the bias_set matches the expected pairs.
+    let config = args.resolve().unwrap().unwrap();
+    let expected = parse_lang_bias_entries("ja=-inf,zh=-5").unwrap();
+    assert_eq!(
+        config.bias_set.ordered.len(),
+        expected.ordered.len(),
+        "resolved bias_set should have the same number of entries as the env var"
+    );
+    for (i, ((got_lang, got_bias), (exp_lang, exp_bias))) in config
+        .bias_set
+        .ordered
+        .iter()
+        .zip(expected.ordered.iter())
+        .enumerate()
+    {
+        assert_eq!(
+            got_lang, exp_lang,
+            "entry {i}: language code mismatch (got {got_lang:?}, expected {exp_lang:?})"
+        );
+        // Use exact equality for f32 since both come from the same parse path.
+        assert_eq!(
+            got_bias, exp_bias,
+            "entry {i}: bias mismatch (got {got_bias}, expected {exp_bias})"
+        );
+    }
+}
+
+/// B7 acceptance test: `LLAMA_ARG_LANG_BIAS` is set without any CLI flag →
+/// resolves to the env-var config.
+#[test]
+fn env_without_cli_parses() {
+    use super::env_fallback_lang_bias;
+
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ko=+5");
+
+    let mut args = LangBiasCliArgs::default();
+    env_fallback_lang_bias(&mut args);
+
+    assert_eq!(
+        args.lang_bias.as_deref(),
+        Some("ko=+5"),
+        "env var value should be present when CLI flag is absent"
+    );
+
+    let config = args.resolve().unwrap().unwrap();
+    assert_eq!(config.bias_set.ordered.len(), 1);
+    use mlxcel_core::lang_analyzer::LanguageCode;
+    assert_eq!(config.bias_set.ordered[0].0, LanguageCode::Ko);
+    assert_eq!(config.bias_set.ordered[0].1, 5.0_f32);
+}
+
+/// B7 acceptance test: both CLI `--lang-bias ja=-inf` and env
+/// `LLAMA_ARG_LANG_BIAS=ko=+5` are set → CLI wins (env is ignored) and an
+/// INFO-level log message is emitted.
+///
+/// The log message is emitted via `tracing::info!` which writes to the
+/// subscriber registered for the current thread; we verify that the CLI value
+/// is kept without attempting to capture the log output (subscriber setup is
+/// out of scope for a unit test).
+#[test]
+fn cli_overrides_env() {
+    use super::env_fallback_lang_bias;
+
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ko=+5");
+
+    // Simulate CLI providing `--lang-bias ja=-inf`.
+    let mut args = LangBiasCliArgs {
+        lang_bias: Some("ja=-inf".to_owned()),
+        ..Default::default()
+    };
+
+    env_fallback_lang_bias(&mut args);
+
+    // CLI value must be preserved; env var must NOT overwrite it.
+    assert_eq!(
+        args.lang_bias.as_deref(),
+        Some("ja=-inf"),
+        "CLI --lang-bias should take precedence over LLAMA_ARG_LANG_BIAS env var"
+    );
+
+    let config = args.resolve().unwrap().unwrap();
+    assert_eq!(config.bias_set.ordered.len(), 1);
+    use mlxcel_core::lang_analyzer::LanguageCode;
+    assert_eq!(config.bias_set.ordered[0].0, LanguageCode::Ja);
+    assert_eq!(config.bias_set.ordered[0].1, f32::NEG_INFINITY);
 }

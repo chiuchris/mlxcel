@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::ServerStartupConfig;
+use crate::lang_bias::LangBiasCliArgs;
 
 /// Raw server startup input captured from CLI/front-end binaries.
 ///
@@ -160,8 +161,9 @@ pub struct ServerStartupInput {
     /// The binary's `serve` command calls `LangBiasCliArgs::resolve()` before
     /// constructing this input. `None` here means "no language steering",
     /// which preserves the bit-exact baseline generation path. B7
-    /// (`LLAMA_ARG_LANG_BIAS`) plugs into this same field so the env-var and
-    /// CLI paths share a single normalization point.
+    /// (`LLAMA_ARG_LANG_BIAS`) plugs into this same field by calling
+    /// [`env_fallback_lang_bias`] on the raw CLI args before `resolve()`, so
+    /// the env-var and CLI paths share a single normalization point.
     pub lang_bias_config: Option<LangBiasConfig>,
 }
 
@@ -244,6 +246,32 @@ impl ServerStartupInput {
             debug_pp_trace: self.debug_pp_trace,
             lang_bias_config: self.lang_bias_config,
         }
+    }
+}
+
+/// Apply `LLAMA_ARG_LANG_BIAS` env var fallback to the `lang_bias` field (plan §6.4).
+///
+/// Precedence rule: CLI flag beats env var.
+///
+/// - If `args.lang_bias` is `None` and `LLAMA_ARG_LANG_BIAS` is set → fill from env.
+/// - If `args.lang_bias` is `Some` (CLI was used) and `LLAMA_ARG_LANG_BIAS` is also set →
+///   keep CLI value and log an INFO-level message acknowledging the override.
+///
+/// Only `LLAMA_ARG_LANG_BIAS` is handled here. Companion env vars
+/// (`LLAMA_ARG_LANG_BIAS_POLICY`, `LLAMA_ARG_LANG_BIAS_CONFIG`, etc.) are NOT
+/// added because the repo does not yet use `LLAMA_ARG_*` for any of those
+/// sibling flags. They are reserved for a follow-up when the convention is
+/// established.
+pub fn env_fallback_lang_bias(args: &mut LangBiasCliArgs) {
+    if args.lang_bias.is_none() {
+        if let Ok(v) = std::env::var("LLAMA_ARG_LANG_BIAS") {
+            args.lang_bias = Some(v);
+        }
+    } else if std::env::var_os("LLAMA_ARG_LANG_BIAS").is_some() {
+        tracing::info!(
+            "LLAMA_ARG_LANG_BIAS env var is set but --lang-bias CLI flag takes precedence; \
+             ignoring LLAMA_ARG_LANG_BIAS"
+        );
     }
 }
 

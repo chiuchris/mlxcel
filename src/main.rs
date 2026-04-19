@@ -720,6 +720,9 @@ pub(crate) struct ServeArgs {
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. Mirrors the same flags exposed on the `generate` subcommand.
+    ///
+    /// The `--lang-bias` flag also reads from the `LLAMA_ARG_LANG_BIAS` env var
+    /// when running as a server (plan §6.4, B7). CLI flag takes precedence.
     #[command(flatten)]
     lang_bias: LangBiasCliArgs,
 }

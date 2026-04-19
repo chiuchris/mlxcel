@@ -16,7 +16,7 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use mlxcel::lang_bias::LangBiasCliArgs;
-use mlxcel::server::{ServerStartupInput, start_server};
+use mlxcel::server::{ServerStartupInput, env_fallback_lang_bias, start_server};
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
 ///
@@ -544,6 +544,9 @@ struct Args {
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. See `--lang-bias`, `--lang-bias-config`, `--lang-bias-policy`,
     /// and the `--lang-bias-include-*` family of flags.
+    ///
+    /// The `--lang-bias` flag also reads from the `LLAMA_ARG_LANG_BIAS` env var
+    /// (plan §6.4, B7). CLI flag takes precedence over the env var.
     #[command(flatten)]
     lang_bias: LangBiasCliArgs,
 }
@@ -554,7 +557,13 @@ async fn main() -> anyhow::Result<()> {
     start_server(build_startup_input(args)?.into_startup_config()).await
 }
 
-fn build_startup_input(args: Args) -> anyhow::Result<ServerStartupInput> {
+fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
+    // Axis B Epic #362 (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
+    // before resolving, so env-supplied values flow through the same
+    // validation and normalization as CLI flags. CLI flag wins on conflict
+    // (see `env_fallback_lang_bias` INFO log).
+    env_fallback_lang_bias(&mut args.lang_bias);
+
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
     let lang_bias_config = args

@@ -19,7 +19,7 @@
 //! rules live in `mlxcel::server::ServerStartupInput` so `main.rs` stays focused
 //! on schema and routing.
 
-use mlxcel::server::{ServerStartupInput, start_server};
+use mlxcel::server::{ServerStartupInput, env_fallback_lang_bias, start_server};
 
 /// Run the `mlxcel serve` subcommand.
 #[tokio::main]
@@ -27,11 +27,15 @@ pub(crate) async fn run_serve(args: crate::ServeArgs) -> anyhow::Result<()> {
     start_server(build_startup_input(args)?.into_startup_config()).await
 }
 
-fn build_startup_input(args: crate::ServeArgs) -> anyhow::Result<ServerStartupInput> {
+fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStartupInput> {
+    // Axis B Epic #362 (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
+    // before resolving, so env-supplied values flow through the same
+    // validation path as CLI flags. CLI flag wins on conflict.
+    env_fallback_lang_bias(&mut args.lang_bias);
+
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
-    // baseline bit-exact path (B7 `LLAMA_ARG_LANG_BIAS` landing alongside
-    // this plumbs into the same field in its own worktree).
+    // baseline bit-exact path.
     let lang_bias_config = args
         .lang_bias
         .resolve()

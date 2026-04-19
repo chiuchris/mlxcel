@@ -32,7 +32,7 @@ pub mod types;
 
 pub use app::create_app;
 pub use chat_template::ChatTemplateProcessor;
-pub use cli_input::ServerStartupInput;
+pub use cli_input::{ServerStartupInput, env_fallback_lang_bias};
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
     RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
