@@ -208,6 +208,8 @@ fn build_mlx() -> PathBuf {
     config.build()
 }
 
+// Used by the macOS configuration block above; dead on non-macOS targets.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn cmake_bool_from_env(name: &str) -> Option<&'static str> {
     let value = env::var(name).ok()?;
     match value.trim().to_ascii_lowercase().as_str() {

@@ -64,6 +64,14 @@ impl TokenBiasMap {
         self.entries.len()
     }
 
+    /// Returns `true` when a bias entry exists for `token_id`.
+    ///
+    /// Used by: `lang_analyzer::TokenLanguageIndex::to_token_bias` (B5) for
+    /// first-language-wins conflict resolution.
+    pub fn contains(&self, token_id: i32) -> bool {
+        self.entries.contains_key(&token_id)
+    }
+
     /// Iterate over `(&token_id, &bias)` pairs.
     pub fn iter(&self) -> impl Iterator<Item = (&i32, &f32)> {
         self.entries.iter()
