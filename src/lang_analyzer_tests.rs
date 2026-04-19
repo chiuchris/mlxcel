@@ -291,14 +291,16 @@ fn build_vocab_hash_differs_across_tokenizers() {
 }
 
 #[test]
-fn version_constant_is_one() {
-    assert_eq!(CURRENT_VERSION, 1, "CURRENT_VERSION must be 1");
+fn version_constant_is_two() {
+    // v1 → v2 bumped when classify switched from id_to_token to decode so
+    // byte-level BPE tokenizers produce correct script assignments.
+    assert_eq!(CURRENT_VERSION, 2, "CURRENT_VERSION must be 2");
 
     // Also verify the built index carries the correct version.
     let tok = make_tokenizer(MOCK_TOKENIZER_100_JSON);
     let idx = TokenLanguageIndex::build(&tok, MOCK_TOKENIZER_100_JSON.as_bytes())
         .expect("build failed");
-    assert_eq!(idx.version, 1);
+    assert_eq!(idx.version, 2);
 }
 
 // ============================================================================
@@ -357,6 +359,65 @@ fn build_index_from_real_tokenizer_smoke() {
     eprintln!(
         "[ok] built index from {path}: vocab={vocab_size}, by_script entries={}",
         idx.by_script.len()
+    );
+}
+
+/// Regression test: verifies the classifier correctly handles byte-level BPE.
+///
+/// Before v2, `build` called `id_to_token(id)` which returns the byte-mapped
+/// pre-image for byte-level tokenizers (Qwen, GPT-2, LLaMA). Non-ASCII bytes
+/// (0x80..0xFF) get mapped into Unicode Latin Extended-A codepoints, so every
+/// non-ASCII token was misclassified as `Latin` and `by_script[Hangul]` was
+/// empty for multilingual models. The feature silently did nothing.
+///
+/// v2 uses `decode(&[id], false)` which returns the logical UTF-8 string, so a
+/// multilingual tokenizer like Qwen populates Hangul/Han/Hiragana correctly.
+#[test]
+fn real_multilingual_tokenizer_populates_non_latin_scripts() {
+    let candidates = [
+        "models/qwen2.5-0.5b-bf16/tokenizer.json",
+        "models/qwen2.5-7b-4bit/tokenizer.json",
+        "models/qwen3-0.6b/tokenizer.json",
+        "models/Qwen2.5-7B-Instruct-4bit/tokenizer.json",
+    ];
+    let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
+    let Some(path) = found else {
+        eprintln!(
+            "[skip] no multilingual byte-level BPE tokenizer found; \
+             skipping classifier regression"
+        );
+        return;
+    };
+
+    let bytes = std::fs::read(path).expect("read tokenizer.json");
+    let tok = tokenizers::Tokenizer::from_bytes(&bytes).expect("parse tokenizer.json");
+    let idx = TokenLanguageIndex::build(&tok, &bytes).expect("build index");
+
+    let count = |s: mlxcel_core::lang_analyzer::Script| -> usize {
+        idx.by_script.get(&s).map(Vec::len).unwrap_or(0)
+    };
+    let hangul = count(mlxcel_core::lang_analyzer::Script::Hangul);
+    let han = count(mlxcel_core::lang_analyzer::Script::Han);
+    let latin = count(mlxcel_core::lang_analyzer::Script::Latin);
+
+    eprintln!(
+        "[{path}] by_script: Hangul={hangul}, Han={han}, Latin={latin}, \
+         total_tokens={}",
+        idx.tokens.len()
+    );
+
+    // Qwen has ~150k vocab; multilingual support demands at least hundreds of
+    // Hangul and Han tokens. If the classifier regresses to `id_to_token` we
+    // would see 0.
+    assert!(
+        hangul >= 100,
+        "expected ≥100 Hangul tokens on multilingual tokenizer; got {hangul} \
+         (byte-level BPE classifier regression?)"
+    );
+    assert!(
+        han >= 100,
+        "expected ≥100 Han tokens on multilingual tokenizer; got {han} \
+         (byte-level BPE classifier regression?)"
     );
 }
 

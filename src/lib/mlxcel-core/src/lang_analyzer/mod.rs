@@ -221,7 +221,12 @@ use tokenizers::Tokenizer;
 
 /// Cache-schema version. B4 compares the stored `version` field against this
 /// constant to decide whether to rebuild the index.
-pub const CURRENT_VERSION: u32 = 1;
+///
+/// - v1: initial B3 release — classified via `id_to_token` (broken for byte-level BPE).
+/// - v2: classify via `decode` so byte-level BPE tokenizers (Qwen, GPT-2, LLaMA)
+///   produce correct script assignments instead of defaulting every non-ASCII
+///   token to Latin.
+pub const CURRENT_VERSION: u32 = 2;
 
 /// Per-token metadata produced by the vocabulary scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -297,8 +302,15 @@ impl TokenLanguageIndex {
     ///
     /// # Algorithm (§5.6)
     /// 1. Determine vocab size via `tokenizer.get_vocab_size(with_added_tokens=true)`.
-    /// 2. For each id, decode via `tokenizer.id_to_token(id)`.
-    /// 3. Classify using B2 helpers.
+    /// 2. For each id, decode via `tokenizer.decode(&[id], false)` — this returns
+    ///    the logical UTF-8 string, which correctly handles byte-level BPE
+    ///    tokenizers (Qwen, GPT-2, LLaMA) where `id_to_token` returns the
+    ///    byte-mapped pre-image (0x80..0xFF bytes mapped into Latin Extended-A
+    ///    codepoints) rather than the actual text. Partial-UTF-8 byte tokens
+    ///    decode to a replacement character (U+FFFD) and classify as `Other`,
+    ///    which is the correct fallback since lone bytes aren't meaningful for
+    ///    language filtering.
+    /// 3. Classify using B2 helpers on the decoded string.
     /// 4. Set `is_special` from the tokenizer's added-tokens decoder.
     /// 5. Invert into `by_script`.
     pub fn build(tokenizer: &Tokenizer, tokenizer_json_bytes: &[u8]) -> Result<Self, LangAnalyzerError> {
@@ -319,12 +331,21 @@ impl TokenLanguageIndex {
         let mut by_script: HashMap<Script, Vec<i32>> = HashMap::new();
 
         for id in 0..vocab_size as u32 {
-            let token_str = tokenizer
-                .id_to_token(id)
-                .unwrap_or_default();
+            // Special tokens are reported as their literal form via decode only
+            // when skip_special_tokens = false. For classification we prefer the
+            // raw token string for specials (they don't have a meaningful decoded
+            // form for script purposes) and the decoded form for normal tokens.
+            let is_special = special_ids.contains(&id);
+            let token_str = if is_special {
+                tokenizer.id_to_token(id).unwrap_or_default()
+            } else {
+                // decode consumes a slice; returning the logical UTF-8 text.
+                tokenizer
+                    .decode(&[id], false)
+                    .unwrap_or_default()
+            };
 
             let scripts = classify_token(&token_str);
-            let is_special = special_ids.contains(&id);
             let is_num = is_numeric(&token_str);
             let is_punct = is_punctuation(&token_str);
             let is_ws = is_whitespace(&token_str);
