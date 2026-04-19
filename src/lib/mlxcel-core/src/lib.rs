@@ -1855,7 +1855,8 @@ pub use sampling::TokenBiasMap;
 // Re-export Axis B language-steering types so downstream consumers (CLI, server, B6–B8)
 // can use them without referencing the internal module path.
 pub use lang_analyzer::{
-    ExceptionConfig, InclusionPolicy, LangBiasSet, LangAnalyzerError, LanguageCode,
+    ExceptionConfig, InclusionPolicy, LangBiasConfig, LangBiasSet, LangAnalyzerError,
+    LanguageCode,
 };
 
 fn use_single_query_maskless_path() -> bool {

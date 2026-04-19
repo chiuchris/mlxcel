@@ -44,7 +44,8 @@ use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
-use mlxcel_core::sampling::sample_token_optimized;
+use mlxcel_core::lang_analyzer::LangBiasConfig;
+use mlxcel_core::sampling::{sample_token_optimized, TokenBiasMap};
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -435,6 +436,52 @@ fn tokenize_prompt(
     Ok(prompt_token_ids.iter().map(|&x| x as i32).collect())
 }
 
+/// Resolve the parsed `LangBiasConfig` into a concrete [`TokenBiasMap`] for
+/// the loaded tokenizer, or return an empty map when no language bias is
+/// active.
+///
+/// The empty-map path is the **baseline bit-exact** contract for Epic #362
+/// Axis B — no disk I/O, no vocab scan, no sampling-path changes.
+///
+/// # Errors
+/// Returns an error when the tokenizer is not HuggingFace-compatible but the
+/// user explicitly requested language bias. SentencePiece/Tiktoken tokenizers
+/// are not supported by the lang_analyzer vocabulary scanner in Phase 1.
+fn resolve_cli_token_bias(
+    lang_bias_config: Option<&LangBiasConfig>,
+    tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
+    model_path: &Path,
+) -> Result<TokenBiasMap> {
+    let Some(cfg) = lang_bias_config else {
+        return Ok(TokenBiasMap::default());
+    };
+    // Empty bias set is also a no-op — `resolve_token_bias` short-circuits,
+    // but we short-circuit earlier here too to avoid any tokenizer I/O.
+    if cfg.bias_set.ordered.is_empty() {
+        return Ok(TokenBiasMap::default());
+    }
+
+    let hf = tokenizer.hf_tokenizer().ok_or_else(|| {
+        anyhow::anyhow!(
+            "--lang-bias requires a HuggingFace tokenizer.json; this model uses \
+             a SentencePiece/Tiktoken tokenizer which is not supported by the \
+             Axis B Phase 1 language analyzer"
+        )
+    })?;
+
+    let json_path = model_path.join("tokenizer.json");
+    let json_bytes = std::fs::read(&json_path).map_err(|e| {
+        anyhow::anyhow!(
+            "--lang-bias: failed to read tokenizer.json at {:?} for vocab-hash \
+             cache key: {e}",
+            json_path
+        )
+    })?;
+
+    cfg.resolve_token_bias(hf, &json_bytes)
+        .map_err(|e| anyhow::anyhow!("--lang-bias: resolve failed: {e}"))
+}
+
 fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> SamplingConfig {
     build_sampling_config(ResolvedSamplingParams {
         temperature: args.sampling.temp,
@@ -518,8 +565,12 @@ fn generate_standard<M: LanguageModel>(
     sampling_config: &SamplingConfig,
     profile: bool,
     kv_cache_mode: KVCacheMode,
+    token_bias: TokenBiasMap,
 ) -> (Vec<i32>, GenerationStats) {
-    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
+    // Axis B (B8): thread the resolved token-bias into the CxxGenerator. Empty
+    // map preserves bit-exact baseline via `CxxGenerator::compose_sampling`.
+    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode)
+        .with_token_bias(token_bias);
 
     if profile {
         return generator.generate_with_stats(model, prompt_tokens, max_tokens, sampling_config);
@@ -547,8 +598,11 @@ fn generate_with_embeddings<M: LanguageModel>(
     sampling_config: &SamplingConfig,
     profile: bool,
     kv_cache_mode: KVCacheMode,
+    token_bias: TokenBiasMap,
 ) -> Result<(Vec<i32>, GenerationStats)> {
-    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode);
+    // Axis B (B8): same wiring as the text-only CxxGenerator path above.
+    let mut generator = CxxGenerator::new_with_kv_mode(model.num_layers(), kv_cache_mode)
+        .with_token_bias(token_bias);
     let (input_embeds, mask_ref) = prepared_embedding_refs(embeddings)?;
 
     if profile {
@@ -588,6 +642,7 @@ fn run_generation_mode<M: LanguageModel>(
     sampling_config: &SamplingConfig,
     vlm_embeddings: Option<&InputEmbeddings>,
     kv_cache_mode: KVCacheMode,
+    token_bias: TokenBiasMap,
 ) -> Result<(Vec<i32>, GenerationStats)> {
     let output = if let Some(ref draft_model_path) = args.model.draft_model {
         println!("Loading draft model from {:?}...", draft_model_path);
@@ -596,7 +651,11 @@ fn run_generation_mode<M: LanguageModel>(
 
         let draft_num_layers = draft_model.num_layers();
         let main_num_layers = model.num_layers();
-        let mut spec_generator = SpeculativeGenerator::new(main_num_layers, draft_num_layers);
+        // Axis B (B8): speculative decoding must apply the bias on the target
+        // (main) model only — see `SpeculativeGenerator::with_token_bias` and
+        // `draft_sampling` for the acceptance-rate rationale.
+        let mut spec_generator = SpeculativeGenerator::new(main_num_layers, draft_num_layers)
+            .with_token_bias(token_bias);
 
         spec_generator.generate(
             model,
@@ -615,6 +674,7 @@ fn run_generation_mode<M: LanguageModel>(
             sampling_config,
             args.generation.profile,
             kv_cache_mode,
+            token_bias,
         )?
     } else {
         generate_standard(
@@ -624,6 +684,7 @@ fn run_generation_mode<M: LanguageModel>(
             sampling_config,
             args.generation.profile,
             kv_cache_mode,
+            token_bias,
         )
     };
 
@@ -637,11 +698,9 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     validate_pipeline_parallel_args(&args)?;
 
     // Parse and validate language bias arguments early (before model load).
-    // The resolved config is stored for use by the generation pipeline (B8).
-    // When B8 is not yet merged, this block validates the CLI args and is a
-    // no-op for the generation path. When B8 lands, `_lang_bias_config` will
-    // be wired into `SamplingConfig::token_bias`.
-    let _lang_bias_config = args
+    // Empty/absent CLI flags resolve to `None`, which keeps the generation
+    // path bit-exact identical to the pre-B8 baseline (Epic #362 acceptance).
+    let lang_bias_config: Option<LangBiasConfig> = args
         .lang_bias
         .resolve()
         .map_err(|e| anyhow::anyhow!("--lang-bias: {e}"))?;
@@ -679,6 +738,19 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let sampling_config =
         build_cli_sampling_config(&args, mlxcel::read_eos_token_ids(&args.model.model));
 
+    // Axis B (B8): resolve the parsed LangBiasConfig into a concrete
+    // TokenBiasMap once per command invocation. Empty map = baseline bit-exact
+    // path (no tokenizer.json read, no vocab scan, no sampling-path changes).
+    let token_bias =
+        resolve_cli_token_bias(lang_bias_config.as_ref(), &tokenizer, &args.model.model)?;
+    if !token_bias.is_empty() {
+        println!(
+            "Language bias active: {} token entr{} biased",
+            token_bias.len(),
+            if token_bias.len() == 1 { "y" } else { "ies" }
+        );
+    }
+
     // Parse KV cache mode (validated early so errors surface before generation)
     let kv_cache_mode = args
         .generation
@@ -690,6 +762,14 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     }
 
     let (generated_tokens, stats) = if pipeline_requested {
+        // Axis B (B8): pipeline-parallel text generation samples via
+        // `sample_token_optimized` directly and does not go through the
+        // CxxGenerator/SpeculativeGenerator wrappers. We inject the token-bias
+        // on the composed `SamplingConfig` before the pipeline is started.
+        let mut pipeline_sampling = sampling_config.clone();
+        if !token_bias.is_empty() && pipeline_sampling.token_bias.is_empty() {
+            pipeline_sampling.token_bias = token_bias.clone();
+        }
         let num_layers = resolve_cli_pipeline_num_layers(&args.model.model)?;
         print_generation_preamble(&args.generation.prompt)?;
         generate_pipeline_text(
@@ -697,7 +777,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             num_layers,
             &prompt_tokens,
             args.generation.max_tokens,
-            &sampling_config,
+            &pipeline_sampling,
             &args,
         )?
     } else {
@@ -718,6 +798,7 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             &sampling_config,
             vlm_embeddings.as_ref(),
             kv_cache_mode,
+            token_bias,
         )?
     };
     let generated_text = decode_generated_text(&tokenizer, &prompt_tokens, &generated_tokens);

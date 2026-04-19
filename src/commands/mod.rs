@@ -19,7 +19,6 @@
 //! isolated modules.
 
 pub(crate) mod generate;
-pub(crate) mod lang_bias_args;
 mod generate_vlm;
 mod serve;
 

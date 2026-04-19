@@ -40,7 +40,7 @@ use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
 use mlxcel_core::hardware;
-use mlxcel_core::sampling::{compute_logprobs, sample_token_optimized};
+use mlxcel_core::sampling::{compute_logprobs, sample_token_optimized, TokenBiasMap};
 use mlxcel_core::streams::{install_default_stream, new_generation_stream};
 use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
 use mlxcel_core::{MlxStream, UniquePtr};
@@ -156,6 +156,23 @@ pub struct BatchScheduler {
     /// work runs on the worker thread). The cache is cleared automatically
     /// when the scheduler (and thus this loaded model) is dropped.
     vision_caches: Rc<ModelVisionCaches>,
+
+    // -- Axis B / Epic #362 — language-bias token map --
+    /// Cached per-scheduler `TokenBiasMap` resolved once from the server-level
+    /// `LangBiasConfig` at worker startup.
+    ///
+    /// **Phase 1 limitation — single policy per batch**: every sequence in
+    /// this scheduler's active batch receives the same bias, regardless of
+    /// per-request preferences. Per-sequence override via the
+    /// `/v1/chat/completions` request body is reserved for a follow-up
+    /// issue (B12) tracked outside this Epic. The bias is attached to each
+    /// queued sequence's [`SamplingConfig`] at `enqueue_request` time so
+    /// per-step sampling (`sample_token_optimized`) observes it with no
+    /// additional hot-path overhead beyond the existing
+    /// [`mlxcel_core::sampling::apply_token_bias`] fast path.
+    ///
+    /// Empty map = bit-exact baseline path (no sampling change, no alloc).
+    token_bias: TokenBiasMap,
 }
 
 impl BatchScheduler {
@@ -260,6 +277,7 @@ impl BatchScheduler {
             vision_caches: Rc::new(ModelVisionCaches::new(
                 crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             )),
+            token_bias: TokenBiasMap::default(),
         }
     }
 
@@ -273,6 +291,27 @@ impl BatchScheduler {
     pub fn with_vision_cache_size(mut self, max_size: usize) -> Self {
         self.vision_caches = Rc::new(ModelVisionCaches::new(max_size));
         self
+    }
+
+    /// Attach a pre-resolved Axis B `TokenBiasMap` to this scheduler (B8).
+    ///
+    /// The bias is cached for the scheduler's lifetime and applied to every
+    /// queued sequence's [`SamplingConfig`] at enqueue time (see the merge in
+    /// [`Self::enqueue_request`]). An empty map is a zero-overhead no-op on
+    /// the hot sampling path — [`sample_token_optimized`] still short-circuits
+    /// via the existing `config.token_bias.is_empty()` branch.
+    ///
+    /// **Phase 1 limitation**: one policy per batch (scheduler-wide).
+    /// Per-sequence overrides via request-body `lang_bias` are reserved for
+    /// the B12 follow-up outside this Epic.
+    pub fn with_token_bias(mut self, bias: TokenBiasMap) -> Self {
+        self.token_bias = bias;
+        self
+    }
+
+    /// Returns a reference to the cached token-bias map (for tests).
+    pub fn token_bias(&self) -> &TokenBiasMap {
+        &self.token_bias
     }
 
     /// Run the scheduler loop until shutdown or channel close.
@@ -463,7 +502,18 @@ impl BatchScheduler {
             return;
         }
 
-        let sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
+        let mut sampling = merge_config_stop_tokens(options.sampling.clone(), &self.config_eos);
+
+        // Axis B (B8): attach the scheduler-wide token bias to each sequence's
+        // sampling config when no per-request override is present. Empty
+        // cached bias = bit-exact baseline (the `is_empty()` short-circuit in
+        // `sample_token_optimized` keeps hot-path cost at zero).
+        //
+        // Phase 1 limitation: one policy per batch. Per-request overrides
+        // via `/v1/chat/completions` request body are deferred to B12.
+        if !self.token_bias.is_empty() && sampling.token_bias.is_empty() {
+            sampling.token_bias = self.token_bias.clone();
+        }
 
         let seq_id = match self.allocate_sequence_state() {
             Ok(id) => id,

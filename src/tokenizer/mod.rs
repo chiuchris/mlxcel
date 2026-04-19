@@ -77,6 +77,19 @@ impl MlxcelTokenizer {
             Self::Tiktoken(t) => t.decode(ids, skip_special_tokens),
         }
     }
+
+    /// Returns the underlying HuggingFace `tokenizers::Tokenizer` when this
+    /// instance was constructed from a `tokenizer.json` file.
+    ///
+    /// `None` for SentencePiece or Tiktoken tokenizers. Used by Axis B
+    /// (#362) language steering to feed the tokenizer vocabulary into the
+    /// [`mlxcel_core::lang_analyzer`] classifier.
+    pub fn hf_tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
+        match self {
+            Self::HuggingFace(t) => Some(t),
+            Self::SentencePiece(_) | Self::Tiktoken(_) => None,
+        }
+    }
 }
 
 impl SentencePieceTokenizer {

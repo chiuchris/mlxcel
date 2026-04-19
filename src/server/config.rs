@@ -25,6 +25,7 @@ use crate::distributed::ShardConfig;
 use crate::distributed::TransportBackend;
 use crate::distributed::pipeline::RemotePipelineRuntimeConfig;
 use crate::server::batch::RequestPriority;
+use mlxcel_core::lang_analyzer::LangBiasConfig;
 use mlxcel_core::sampling::LogprobsConfig;
 
 /// Storage backend used by the server batch scheduler for decode-time state.
@@ -194,6 +195,11 @@ pub struct ServerConfig {
     /// multimodal embedder on subsequent turns. Default is
     /// [`DEFAULT_VISION_CACHE_SIZE`](crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE).
     pub vision_cache_size: usize,
+    /// Axis B Epic #362 (B8): server-wide language bias configuration, if
+    /// resolved at startup from CLI flags or the `LLAMA_ARG_LANG_BIAS` env
+    /// var. Every batch sequence inherits this same policy (Phase 1 single
+    /// policy per batch; per-request overrides reserved for B12).
+    pub lang_bias_config: Option<LangBiasConfig>,
 }
 
 impl Default for ServerConfig {
@@ -235,6 +241,7 @@ impl Default for ServerConfig {
             remote_pipeline_stage: None,
             tensor_parallel: ShardConfig::default(),
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
+            lang_bias_config: None,
         }
     }
 }

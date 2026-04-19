@@ -20,6 +20,7 @@
 pub mod audio;
 pub mod distributed;
 pub mod execution;
+pub mod lang_bias;
 pub mod lora;
 pub mod models;
 pub mod multimodal;

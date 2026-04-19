@@ -571,6 +571,74 @@ impl TokenLanguageIndex {
 }
 
 // ============================================================================
+// B8 — Resolved language-bias configuration consumed by the generation loop
+// ============================================================================
+
+/// Resolved, validated language-bias configuration consumed by the generation
+/// loop (§8) to produce a [`TokenBiasMap`].
+///
+/// Produced by the CLI (`LangBiasCliArgs::resolve`) or the server environment
+/// adapter (B7). Consumed by each generator construction site (B8) to populate
+/// [`crate::sampling::SamplingConfig::token_bias`] via
+/// [`LangBiasConfig::resolve_token_bias`].
+///
+/// Kept in `mlxcel-core::lang_analyzer` rather than the binary crate so the
+/// server, CLI, and tests share a single core-level representation.
+#[derive(Debug, Clone, Default)]
+pub struct LangBiasConfig {
+    /// Ordered list of per-language bias values (earlier entries win on conflict).
+    pub bias_set: LangBiasSet,
+    /// Token inclusion policy (Conservative or Strict).
+    pub policy: InclusionPolicy,
+    /// Exception overrides for the auto-exclusion rules.
+    pub exceptions: ExceptionConfig,
+    /// If `true`, force a `TokenLanguageIndex` cache rebuild at resolve time.
+    pub rebuild_cache: bool,
+}
+
+impl LangBiasConfig {
+    /// Resolve this config into a concrete [`TokenBiasMap`] for the given
+    /// tokenizer.
+    ///
+    /// # Zero-overhead baseline
+    /// When `bias_set.ordered` is empty this short-circuits and returns
+    /// [`TokenBiasMap::default`] **without** touching the disk cache, preserving
+    /// bit-exact pre-B8 behavior for users who never enable language steering.
+    ///
+    /// # Cache path
+    /// When the bias set is non-empty, this calls
+    /// [`cache::load_or_build`](crate::lang_analyzer::cache::load_or_build) to
+    /// obtain (or rebuild) the [`TokenLanguageIndex`], then converts it via
+    /// [`TokenLanguageIndex::to_token_bias`].
+    ///
+    /// Callers should invoke this **once per generator lifetime** and cache the
+    /// result inside the generator — the per-call cost is dominated by the
+    /// one-time vocab scan on cache miss.
+    ///
+    /// # Arguments
+    /// * `tokenizer` — the HuggingFace tokenizer. Must have `get_vocab_size` and
+    ///   `id_to_token` available.
+    /// * `tokenizer_json_bytes` — raw bytes of the `tokenizer.json` file used to
+    ///   compute the cache key (`vocab_hash`). Pass an empty slice only when
+    ///   the bias set is empty (empty bias always returns early).
+    pub fn resolve_token_bias(
+        &self,
+        tokenizer: &Tokenizer,
+        tokenizer_json_bytes: &[u8],
+    ) -> Result<crate::sampling::TokenBiasMap, LangAnalyzerError> {
+        // Fast path: empty bias set produces an empty map without touching the
+        // disk cache or scanning the vocabulary. Required by the Epic B Phase 1
+        // baseline bit-exact acceptance criterion.
+        if self.bias_set.ordered.is_empty() {
+            return Ok(crate::sampling::TokenBiasMap::default());
+        }
+
+        let index = cache::load_or_build(tokenizer, tokenizer_json_bytes, self.rebuild_cache)?;
+        Ok(index.to_token_bias(&self.bias_set, self.policy, &self.exceptions))
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -1098,5 +1166,176 @@ mod tests {
 
         // The map is non-empty and has exactly 3 entries (ids 1, 2, 3).
         assert_eq!(map.len(), 3, "Expected 3 entries; got {}", map.len());
+    }
+
+    // =========================================================================
+    // B8 — LangBiasConfig::resolve_token_bias
+    // =========================================================================
+
+    /// Shared mutex serializing tests that mutate `MLXCEL_CACHE_DIR`. Duplicates
+    /// the guard used in `cache.rs` tests so both modules can cooperate.
+    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn resolve_mock_tokenizer_json(marker: &str) -> String {
+        format!(
+            r#"{{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}},
+    {{"id": 1, "content": "<s>",   "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null,
+  "model": {{
+    "type": "WordLevel",
+    "vocab": {{
+      "<unk>": 0, "<s>": 1,
+      "hello": 2, "world": 3, "한국어": 4, "中文": 5,
+      "{marker}": 6
+    }},
+    "unk_token": "<unk>"
+  }}
+}}"#
+        )
+    }
+
+    fn make_tokenizer(json: &str) -> Tokenizer {
+        Tokenizer::from_bytes(json.as_bytes()).expect("failed to parse mock tokenizer JSON")
+    }
+
+    /// Empty `bias_set.ordered` must return an empty `TokenBiasMap` and must
+    /// not touch the disk cache (verified by pointing `MLXCEL_CACHE_DIR` at a
+    /// temp dir and asserting nothing is written).
+    #[test]
+    fn resolve_token_bias_empty_returns_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json = resolve_mock_tokenizer_json("marker_resolve_empty");
+        let tok = make_tokenizer(&json);
+
+        let config = crate::lang_analyzer::LangBiasConfig::default();
+        assert!(
+            config.bias_set.ordered.is_empty(),
+            "default LangBiasConfig must have an empty bias_set"
+        );
+
+        let _guard = env_lock();
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+
+        // Call the resolver; it must NOT touch the cache for an empty bias set.
+        let map = config
+            .resolve_token_bias(&tok, json.as_bytes())
+            .expect("empty bias resolve should succeed without disk I/O");
+
+        // Inspect the cache directory before releasing the env override.
+        let cache_subdir = tmp.path().join(cache::CACHE_SUBDIR);
+        let cache_subdir_present = cache_subdir.exists();
+        let cache_entry_count = std::fs::read_dir(&cache_subdir)
+            .map(|rd| rd.count())
+            .unwrap_or(0);
+
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+        drop(_guard);
+
+        assert!(
+            map.is_empty(),
+            "empty bias_set must produce an empty TokenBiasMap"
+        );
+        assert!(
+            !cache_subdir_present,
+            "resolve with empty bias must NOT create the cache dir"
+        );
+        assert_eq!(
+            cache_entry_count, 0,
+            "resolve with empty bias must NOT write any cache entries"
+        );
+    }
+
+    /// Non-empty bias populates from the disk cache (building it first on a
+    /// cache miss). Second call hits the cache (mtime unchanged).
+    #[test]
+    fn resolve_token_bias_populates_from_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json = resolve_mock_tokenizer_json("marker_resolve_populate");
+        let tok = make_tokenizer(&json);
+
+        let config = crate::lang_analyzer::LangBiasConfig {
+            bias_set: LangBiasSet {
+                ordered: vec![
+                    (LanguageCode::Ja, f32::NEG_INFINITY),
+                    (LanguageCode::En, 1.5),
+                ],
+            },
+            policy: InclusionPolicy::Conservative,
+            exceptions: ExceptionConfig::default(),
+            rebuild_cache: false,
+        };
+
+        let _guard = env_lock();
+        unsafe {
+            std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+        }
+
+        // First resolve: cache miss → build + persist.
+        let map1 = config
+            .resolve_token_bias(&tok, json.as_bytes())
+            .expect("first resolve should build and succeed");
+
+        // Locate the written cache file via the vocab hash.
+        let hash = TokenLanguageIndex::compute_vocab_hash(json.as_bytes());
+        let cache_file = cache::cache_path(&hash);
+        let exists_after_first = cache_file.exists();
+        let mtime1 = std::fs::metadata(&cache_file)
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        // Second resolve: cache hit → no rebuild (mtime unchanged).
+        let map2 = config
+            .resolve_token_bias(&tok, json.as_bytes())
+            .expect("second resolve should succeed via cache hit");
+        let mtime2 = std::fs::metadata(&cache_file)
+            .ok()
+            .and_then(|m| m.modified().ok());
+
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+        drop(_guard);
+
+        assert!(exists_after_first, "first resolve must write the cache file");
+        // Both maps must be non-empty and equal in entry count.
+        assert!(
+            !map1.is_empty(),
+            "non-empty bias set must produce a non-empty map: {map1:?}"
+        );
+        assert_eq!(
+            map1.len(),
+            map2.len(),
+            "cached and fresh resolves must have the same entry count"
+        );
+        // ja=-inf: 한국어 is Hangul (not ja), 中文 is Han (in ja Conservative).
+        // The Han token must receive -inf.
+        assert!(
+            map1.iter().any(|(_id, &b)| b == f32::NEG_INFINITY),
+            "ja=-inf entry must populate at least one token: {map1:?}"
+        );
+        // en=+1.5: "hello"/"world" are Latin.
+        assert!(
+            map1.iter().any(|(_id, &b)| b == 1.5),
+            "en=+1.5 entry must populate at least one Latin token: {map1:?}"
+        );
+        // Cache file must not have been rewritten by the second resolve.
+        assert_eq!(
+            mtime1, mtime2,
+            "second resolve must not rewrite the cache file (disk hit expected)"
+        );
     }
 }

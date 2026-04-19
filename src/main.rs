@@ -17,7 +17,7 @@ use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
 mod commands;
-use commands::lang_bias_args::LangBiasCliArgs;
+use mlxcel::lang_bias::LangBiasCliArgs;
 
 /// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs
 ///
@@ -717,6 +717,11 @@ pub(crate) struct ServeArgs {
     /// Write chrome-tracing JSON for pipeline scheduler actions.
     #[arg(long = "debug-pp-trace", value_name = "PATH")]
     debug_pp_trace: Option<PathBuf>,
+
+    /// Axis B Epic #362 (B8): language-bias options for server-wide output
+    /// steering. Mirrors the same flags exposed on the `generate` subcommand.
+    #[command(flatten)]
+    lang_bias: LangBiasCliArgs,
 }
 
 fn main() -> anyhow::Result<()> {

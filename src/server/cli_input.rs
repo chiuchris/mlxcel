@@ -22,6 +22,8 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use mlxcel_core::lang_analyzer::LangBiasConfig;
+
 use super::ServerStartupConfig;
 
 /// Raw server startup input captured from CLI/front-end binaries.
@@ -151,6 +153,16 @@ pub struct ServerStartupInput {
     pub metrics_port: Option<u16>,
     /// Chrome-tracing JSON output path for the pipeline scheduler.
     pub debug_pp_trace: Option<PathBuf>,
+
+    /// Axis B Epic #362 (B8): already-resolved server-wide language-bias
+    /// configuration, if the CLI provided `--lang-bias` / `--lang-bias-config`.
+    ///
+    /// The binary's `serve` command calls `LangBiasCliArgs::resolve()` before
+    /// constructing this input. `None` here means "no language steering",
+    /// which preserves the bit-exact baseline generation path. B7
+    /// (`LLAMA_ARG_LANG_BIAS`) plugs into this same field so the env-var and
+    /// CLI paths share a single normalization point.
+    pub lang_bias_config: Option<LangBiasConfig>,
 }
 
 impl ServerStartupInput {
@@ -230,6 +242,7 @@ impl ServerStartupInput {
             elastic_pp_cool_down: self.elastic_pp_cool_down,
             metrics_port: self.metrics_port,
             debug_pp_trace: self.debug_pp_trace,
+            lang_bias_config: self.lang_bias_config,
         }
     }
 }

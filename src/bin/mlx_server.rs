@@ -15,6 +15,7 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{ServerStartupInput, start_server};
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -539,16 +540,29 @@ struct Args {
     /// `chrome://tracing` or Perfetto.
     #[arg(long = "debug-pp-trace", value_name = "PATH")]
     debug_pp_trace: Option<PathBuf>,
+
+    /// Axis B Epic #362 (B8): language-bias options for server-wide output
+    /// steering. See `--lang-bias`, `--lang-bias-config`, `--lang-bias-policy`,
+    /// and the `--lang-bias-include-*` family of flags.
+    #[command(flatten)]
+    lang_bias: LangBiasCliArgs,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    start_server(build_startup_input(args).into_startup_config()).await
+    start_server(build_startup_input(args)?.into_startup_config()).await
 }
 
-fn build_startup_input(args: Args) -> ServerStartupInput {
-    ServerStartupInput {
+fn build_startup_input(args: Args) -> anyhow::Result<ServerStartupInput> {
+    // Axis B (B8): resolve once up-front so CLI errors surface before the
+    // server starts listening. Baseline path returns `None` (bit-exact).
+    let lang_bias_config = args
+        .lang_bias
+        .resolve()
+        .map_err(|e| anyhow::anyhow!("--lang-bias: {e}"))?;
+
+    Ok(ServerStartupInput {
         model_path: args.model,
         adapter_path: args.lora,
         model_alias: args.alias,
@@ -622,5 +636,6 @@ fn build_startup_input(args: Args) -> ServerStartupInput {
         elastic_pp_cool_down: args.elastic_pp_cool_down,
         metrics_port: args.metrics_port,
         debug_pp_trace: args.debug_pp_trace,
-    }
+        lang_bias_config,
+    })
 }

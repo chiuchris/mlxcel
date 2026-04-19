@@ -24,11 +24,20 @@ use mlxcel::server::{ServerStartupInput, start_server};
 /// Run the `mlxcel serve` subcommand.
 #[tokio::main]
 pub(crate) async fn run_serve(args: crate::ServeArgs) -> anyhow::Result<()> {
-    start_server(build_startup_input(args).into_startup_config()).await
+    start_server(build_startup_input(args)?.into_startup_config()).await
 }
 
-fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
-    ServerStartupInput {
+fn build_startup_input(args: crate::ServeArgs) -> anyhow::Result<ServerStartupInput> {
+    // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
+    // errors surface before the server starts. Empty resolution = None =
+    // baseline bit-exact path (B7 `LLAMA_ARG_LANG_BIAS` landing alongside
+    // this plumbs into the same field in its own worktree).
+    let lang_bias_config = args
+        .lang_bias
+        .resolve()
+        .map_err(|e| anyhow::anyhow!("--lang-bias: {e}"))?;
+
+    Ok(ServerStartupInput {
         model_path: args.model,
         adapter_path: args.adapter,
         model_alias: args.alias,
@@ -102,7 +111,8 @@ fn build_startup_input(args: crate::ServeArgs) -> ServerStartupInput {
         elastic_pp_cool_down: args.elastic_pp_cool_down,
         metrics_port: args.metrics_port,
         debug_pp_trace: args.debug_pp_trace,
-    }
+        lang_bias_config,
+    })
 }
 
 #[cfg(test)]

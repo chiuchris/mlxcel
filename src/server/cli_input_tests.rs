@@ -91,6 +91,7 @@ fn sample_input() -> ServerStartupInput {
         elastic_pp_cool_down: 30,
         metrics_port: None,
         debug_pp_trace: None,
+        lang_bias_config: None,
     }
 }
 

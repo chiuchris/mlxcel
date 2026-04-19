@@ -34,10 +34,11 @@ use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
 use crate::generation_policy::{initial_token_history, merged_eos_token_ids};
 use crate::hardware;
 use crate::layers::KVCache;
-use crate::sampling::sample_token_optimized;
+use crate::sampling::{sample_token_optimized, TokenBiasMap};
 use crate::streams::{install_default_stream, new_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
+use std::borrow::Cow;
 use std::time::Instant;
 
 /// Returns true when the current hardware is M5+ with a Neural Accelerator
@@ -58,6 +59,16 @@ pub struct SpeculativeGenerator {
     draft_caches: Vec<KVCache>,
     generated_tokens: Vec<i32>,
     generation_stream: Option<UniquePtr<MlxStream>>,
+    /// Cached per-generator `TokenBiasMap` resolved from a `LangBiasConfig`.
+    ///
+    /// **Axis B invariant**: the bias is applied **only** to the target
+    /// (main) model's sampler. The draft model must keep seeing the
+    /// unmodified policy so its candidate distribution stays aligned with
+    /// its own weights; otherwise the accept/reject comparison becomes
+    /// biased on two different policies and speculative acceptance rate
+    /// collapses. See [`Self::compose_target_sampling`] and
+    /// [`Self::draft_sampling`] — only the former injects the cached bias.
+    token_bias: TokenBiasMap,
 }
 
 impl SpeculativeGenerator {
@@ -68,7 +79,55 @@ impl SpeculativeGenerator {
             draft_caches: (0..draft_num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
+            token_bias: TokenBiasMap::default(),
         }
+    }
+
+    /// Attach a pre-resolved `TokenBiasMap` to this speculative generator.
+    ///
+    /// The bias is cached for the generator's lifetime and applied **only** to
+    /// the target model's sampling during verification (and the first-token
+    /// prefill). The draft model's sampling is left untouched to preserve
+    /// speculative acceptance behavior.
+    pub fn with_token_bias(mut self, bias: TokenBiasMap) -> Self {
+        self.token_bias = bias;
+        self
+    }
+
+    /// Returns a reference to the cached target-only token-bias map.
+    ///
+    /// Used by tests to assert that the bias was wired in correctly and that
+    /// the draft model never observes it.
+    pub fn token_bias(&self) -> &TokenBiasMap {
+        &self.token_bias
+    }
+
+    /// Compose the effective **target-model** sampling config from the cached
+    /// `token_bias` and the caller's [`SamplingConfig`].
+    ///
+    /// Empty cached bias => borrowed unchanged (bit-exact baseline). Non-empty
+    /// bias but caller already set `sampling.token_bias` => caller wins.
+    /// Otherwise the caller's config is cloned and the cached bias is injected.
+    fn compose_target_sampling<'a>(&self, sampling: &'a SamplingConfig) -> Cow<'a, SamplingConfig> {
+        if self.token_bias.is_empty() || !sampling.token_bias.is_empty() {
+            Cow::Borrowed(sampling)
+        } else {
+            let mut cloned = sampling.clone();
+            cloned.token_bias = self.token_bias.clone();
+            Cow::Owned(cloned)
+        }
+    }
+
+    /// Returns the sampling config used by the **draft** model.
+    ///
+    /// **Axis B**: by design this ignores the generator's cached
+    /// `token_bias`. Biasing the draft sampler would skew candidate
+    /// distribution away from the draft model's trained distribution and
+    /// collapse speculative acceptance rates (the target's accept/reject
+    /// comparison already reflects the bias on the verification side).
+    #[inline]
+    fn draft_sampling<'a>(&self, sampling: &'a SamplingConfig) -> &'a SamplingConfig {
+        sampling
     }
 
     /// Reset generator state
@@ -107,10 +166,22 @@ impl SpeculativeGenerator {
     ) -> (Vec<i32>, GenerationStats) {
         self.reset();
 
+        // Axis B: compose target-only sampling once; draft sampling stays raw.
+        // `target_cow` owns the merged config when a bias is active, otherwise
+        // it borrows the caller's. `draft_sampling` always returns `sampling`
+        // unchanged — biasing the draft would collapse acceptance rate.
+        let target_cow = self.compose_target_sampling(sampling);
+        let target_sampling: &SamplingConfig = target_cow.as_ref();
+        let draft_sampling: &SamplingConfig = self.draft_sampling(sampling);
+
         // Set generation stream
         install_default_stream(self.generation_stream.as_ref());
 
-        let eos_tokens = merged_eos_token_ids(main_model.eos_token_ids(), &sampling.stop_token_ids);
+        // History + EOS handling inherit the caller's policy; history-based
+        // penalties apply to both models so we read flags from the caller's
+        // raw config (same shape as `target_sampling` except for `token_bias`).
+        let eos_tokens =
+            merged_eos_token_ids(main_model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
@@ -123,8 +194,9 @@ impl SpeculativeGenerator {
         let main_logits = main_model.forward(&input, &mut self.main_caches, None);
         let _draft_logits = draft_model.forward(&input, &mut self.draft_caches, None);
 
-        // Sample first token from main model
-        let (first_token_arr, _) = sample_token_optimized(&main_logits, sampling, &token_history);
+        // Sample first token from main model (target: bias applied).
+        let (first_token_arr, _) =
+            sample_token_optimized(&main_logits, target_sampling, &token_history);
         ffi::eval(&first_token_arr);
         let first_token = ffi::item_i32(&first_token_arr);
         let prefill_time = prefill_start.elapsed();
@@ -157,7 +229,10 @@ impl SpeculativeGenerator {
             for _ in 0..num_draft {
                 let draft_input = ffi::from_slice_i32(&[draft_token], &[1, 1]);
                 let draft_logits = draft_model.forward(&draft_input, &mut self.draft_caches, None);
-                let (tok_arr, _) = sample_token_optimized(&draft_logits, sampling, &token_history);
+                // Axis B: draft sampler MUST NOT see the bias. See
+                // `draft_sampling` for the rationale.
+                let (tok_arr, _) =
+                    sample_token_optimized(&draft_logits, draft_sampling, &token_history);
                 ffi::eval(&tok_arr);
                 draft_token = ffi::item_i32(&tok_arr);
                 draft_tokens.push(draft_token);
@@ -263,8 +338,9 @@ impl SpeculativeGenerator {
                 // Reshape to [1, 1, vocab] for sample_token_optimized
                 let pos_logits = ffi::reshape(&pos_logits, &[1, 1, main_shape[2]]);
 
+                // Axis B: target verification uses the bias-augmented sampling.
                 let (main_tok_arr, _) =
-                    sample_token_optimized(&pos_logits, sampling, &token_history);
+                    sample_token_optimized(&pos_logits, target_sampling, &token_history);
                 ffi::eval(&main_tok_arr);
                 let main_token = ffi::item_i32(&main_tok_arr);
 
@@ -310,8 +386,9 @@ impl SpeculativeGenerator {
                     &[1, last_pos + 1, main_shape[2]],
                 );
                 let last_logits = ffi::reshape(&last_logits, &[1, 1, main_shape[2]]);
+                // Axis B: bonus token comes from the main model → target bias.
                 let (bonus_tok_arr, _) =
-                    sample_token_optimized(&last_logits, sampling, &token_history);
+                    sample_token_optimized(&last_logits, target_sampling, &token_history);
                 ffi::eval(&bonus_tok_arr);
                 let bonus_token = ffi::item_i32(&bonus_tok_arr);
 
@@ -490,5 +567,89 @@ mod tests {
         for cache in &caches {
             assert_eq!(cache.offset, 3);
         }
+    }
+
+    // ------------------------------------------------------------------
+    // B8 — token-bias wiring (target-only)
+    // ------------------------------------------------------------------
+
+    fn make_bias(entries: &[(i32, f32)]) -> TokenBiasMap {
+        let mut m = TokenBiasMap::new();
+        for &(id, b) in entries {
+            m.insert(id, b);
+        }
+        m
+    }
+
+    /// Default construction yields an empty token-bias cache.
+    #[test]
+    fn speculative_generator_default_bias_is_empty() {
+        let g = SpeculativeGenerator::new(4, 2);
+        assert!(g.token_bias().is_empty());
+    }
+
+    /// `with_token_bias` caches the supplied map and exposes it via the
+    /// inspector — the target path sees this map, the draft path never does.
+    #[test]
+    fn speculative_generator_passes_bias_to_target_only() {
+        let bias = make_bias(&[(7, f32::NEG_INFINITY), (11, 2.0)]);
+        let g = SpeculativeGenerator::new(4, 2).with_token_bias(bias.clone());
+
+        // Target-side composition must inject the cached bias into a caller
+        // config that lacks one.
+        let caller = SamplingConfig::default();
+        let target = g.compose_target_sampling(&caller);
+        assert_eq!(
+            target.token_bias.len(),
+            2,
+            "target sampler must carry the cached bias"
+        );
+        assert!(
+            target.token_bias.contains(7),
+            "target bias must contain id=7"
+        );
+
+        // Draft-side composition MUST remain unbiased regardless of the cached
+        // map — this is the core speculative-acceptance invariant.
+        let draft = g.draft_sampling(&caller);
+        assert!(
+            draft.token_bias.is_empty(),
+            "draft sampler must NEVER carry the cached bias (got {} entries): \
+             speculative acceptance is computed by comparing draft candidates \
+             against target sampling, and biasing the draft collapses the \
+             accept ratio",
+            draft.token_bias.len()
+        );
+    }
+
+    /// Caller-supplied bias wins over the generator-cached bias (explicit
+    /// per-call override).
+    #[test]
+    fn speculative_generator_caller_bias_wins() {
+        let cached = make_bias(&[(1, 1.0)]);
+        let caller_bias = make_bias(&[(42, f32::NEG_INFINITY)]);
+        let g = SpeculativeGenerator::new(2, 1).with_token_bias(cached);
+
+        let mut caller = SamplingConfig::default();
+        caller.token_bias = caller_bias;
+        let target = g.compose_target_sampling(&caller);
+
+        assert_eq!(
+            target.token_bias.len(),
+            1,
+            "caller's explicit token_bias wins"
+        );
+        assert!(target.token_bias.contains(42));
+    }
+
+    /// Empty cached bias + empty caller bias yields the caller config
+    /// unchanged (bit-exact baseline — `Cow::Borrowed`).
+    #[test]
+    fn speculative_generator_empty_bias_is_bit_exact() {
+        let g = SpeculativeGenerator::new(2, 1);
+        let caller = SamplingConfig::default();
+        let target = g.compose_target_sampling(&caller);
+        assert!(matches!(target, Cow::Borrowed(_)));
+        assert!(target.token_bias.is_empty());
     }
 }

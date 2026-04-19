@@ -491,3 +491,190 @@ fn b4_cache_real_tokenizer_integration_smoke() {
         hash
     );
 }
+
+// ============================================================================
+// B8 — LangBiasConfig::resolve_token_bias (generation-loop entry point)
+// ============================================================================
+
+use mlxcel_core::lang_analyzer::{
+    ExceptionConfig, InclusionPolicy, LangBiasConfig, LangBiasSet, LanguageCode,
+};
+
+fn b8_mock_tokenizer_json(marker: &str) -> String {
+    format!(
+        r#"{{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [
+    {{"id": 0, "content": "<unk>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}},
+    {{"id": 1, "content": "<s>",   "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null,
+  "model": {{
+    "type": "WordLevel",
+    "vocab": {{
+      "<unk>": 0, "<s>": 1,
+      "hello": 2, "world": 3, "한국어": 4, "中文": 5,
+      "{marker}": 6
+    }},
+    "unk_token": "<unk>"
+  }}
+}}"#
+    )
+}
+
+/// Empty `LangBiasSet::ordered` must return an empty map and MUST NOT touch
+/// the disk cache. Proof: point `MLXCEL_CACHE_DIR` at an empty tempdir and
+/// assert the cache sub-directory is never created.
+#[test]
+fn b8_resolve_token_bias_empty_returns_empty() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let json = b8_mock_tokenizer_json("marker_b8_empty");
+    let tok = tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("parse tokenizer");
+
+    let config = LangBiasConfig::default();
+    assert!(config.bias_set.ordered.is_empty());
+
+    let _guard = env_lock();
+    // SAFETY: serialized via ENV_LOCK.
+    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+
+    let map = config
+        .resolve_token_bias(&tok, json.as_bytes())
+        .expect("empty resolve must succeed without disk I/O");
+
+    // Inspect the cache state before releasing the env override.
+    let cache_subdir = tmp.path().join("tokenizer-scripts");
+    let subdir_exists = cache_subdir.exists();
+    let entry_count = std::fs::read_dir(&cache_subdir).map(|rd| rd.count()).unwrap_or(0);
+
+    // SAFETY: serialized via ENV_LOCK.
+    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    drop(_guard);
+
+    assert!(map.is_empty(), "empty bias_set must yield empty TokenBiasMap");
+    assert!(
+        !subdir_exists,
+        "empty-bias resolve must NOT create the tokenizer-scripts cache dir"
+    );
+    assert_eq!(
+        entry_count, 0,
+        "empty-bias resolve must NOT write any cache files"
+    );
+}
+
+/// Non-empty bias resolves from (and populates) the on-disk cache. Second
+/// invocation hits the cache (mtime unchanged).
+#[test]
+fn b8_resolve_token_bias_populates_from_cache() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let json = b8_mock_tokenizer_json("marker_b8_populate");
+    let tok = tokenizers::Tokenizer::from_bytes(json.as_bytes()).expect("parse tokenizer");
+
+    let config = LangBiasConfig {
+        bias_set: LangBiasSet {
+            ordered: vec![
+                (LanguageCode::Ja, f32::NEG_INFINITY),
+                (LanguageCode::En, 1.5),
+            ],
+        },
+        policy: InclusionPolicy::Conservative,
+        exceptions: ExceptionConfig::default(),
+        rebuild_cache: false,
+    };
+
+    let _guard = env_lock();
+    // SAFETY: serialized via ENV_LOCK.
+    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+
+    // First call: cache miss -> build + persist.
+    let map1 = config
+        .resolve_token_bias(&tok, json.as_bytes())
+        .expect("first resolve must succeed");
+
+    let hash = TokenLanguageIndex::compute_vocab_hash(json.as_bytes());
+    let cache_file = cache_path_relative(&tmp, &hash);
+    let exists_after_first = cache_file.exists();
+    let mtime1 = std::fs::metadata(&cache_file).ok().and_then(|m| m.modified().ok());
+
+    // Second call: cache hit -> no rewrite.
+    let map2 = config
+        .resolve_token_bias(&tok, json.as_bytes())
+        .expect("second resolve must succeed");
+    let mtime2 = std::fs::metadata(&cache_file).ok().and_then(|m| m.modified().ok());
+
+    // SAFETY: serialized via ENV_LOCK.
+    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    drop(_guard);
+
+    assert!(exists_after_first, "first resolve must persist the cache file");
+    assert!(!map1.is_empty(), "non-empty bias must populate the map");
+    assert_eq!(map1.len(), map2.len(), "cache-hit map must match cache-build map");
+    assert!(
+        map1.iter().any(|(_id, &b)| b == f32::NEG_INFINITY),
+        "ja=-inf entry must populate at least one Japanese-script token"
+    );
+    assert!(
+        map1.iter().any(|(_id, &b)| b == 1.5),
+        "en=+1.5 entry must populate at least one Latin-script token"
+    );
+    assert_eq!(
+        mtime1, mtime2,
+        "second call must not rewrite the cache file (disk hit expected)"
+    );
+}
+
+// ============================================================================
+// B8 — SpeculativeGenerator::with_token_bias (target-only)
+// ============================================================================
+
+use crate::SpeculativeGenerator;
+use mlxcel_core::TokenBiasMap;
+
+/// Default `SpeculativeGenerator` has no cached bias.
+#[test]
+fn b8_speculative_generator_default_bias_is_empty() {
+    let g = SpeculativeGenerator::new(4, 2);
+    assert!(g.token_bias().is_empty());
+}
+
+/// `with_token_bias` caches a map that is exposed via the inspector and
+/// therefore reaches the target-only sampler path (see core unit tests in
+/// `speculative.rs::tests::speculative_generator_passes_bias_to_target_only`
+/// for the composition-level invariant).
+#[test]
+fn b8_speculative_generator_with_token_bias_caches_map() {
+    let mut bias = TokenBiasMap::new();
+    bias.insert(7, f32::NEG_INFINITY);
+    bias.insert(11, 2.0);
+
+    let g = SpeculativeGenerator::new(4, 2).with_token_bias(bias);
+    assert_eq!(g.token_bias().len(), 2);
+    assert!(g.token_bias().contains(7));
+    assert!(g.token_bias().contains(11));
+}
+
+// ============================================================================
+// B8 — CxxGenerator::with_token_bias
+// ============================================================================
+
+use crate::CxxGenerator;
+
+#[test]
+fn b8_cxx_generator_default_bias_is_empty() {
+    let g = CxxGenerator::new(4);
+    assert!(g.token_bias().is_empty());
+}
+
+#[test]
+fn b8_cxx_generator_with_token_bias_caches_map() {
+    let mut bias = TokenBiasMap::new();
+    bias.insert(3, -1.5);
+    let g = CxxGenerator::new(4).with_token_bias(bias);
+    assert_eq!(g.token_bias().len(), 1);
+    assert!(g.token_bias().contains(3));
+}

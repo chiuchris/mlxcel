@@ -58,6 +58,11 @@ pub(crate) struct WorkerSchedulerConfig {
     /// Maximum number of cached post-projection image features per loaded
     /// VLM. `0` disables caching.
     pub vision_cache_size: usize,
+    /// Axis B Epic #362 (B8): optional server-wide language-bias config.
+    /// Resolved once on the worker thread into a `TokenBiasMap` after the
+    /// tokenizer loads, and attached to the batch scheduler for the rest of
+    /// the worker's lifetime.
+    pub lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -132,6 +137,15 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             tracing::info!("EOS tokens from config: {:?}", config_eos);
         }
 
+        // Axis B Epic #362 (B8): resolve the server-wide LangBiasConfig once,
+        // after the tokenizer is available. Empty bias set or an HF-less
+        // tokenizer yields an empty map — bit-exact baseline preserved.
+        let token_bias = resolve_worker_token_bias(
+            sched_config.lang_bias_config.as_ref(),
+            &tokenizer,
+            &model_path,
+        );
+
         let chunk_info = if sched_config.prefill_chunk_size > 0 {
             format!(", prefill_chunk_size={}", sched_config.prefill_chunk_size)
         } else {
@@ -147,9 +161,14 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             crate::server::DecodeStorageBackend::Dense => String::new(),
             crate::server::DecodeStorageBackend::Paged => ", decode_storage=paged".to_string(),
         };
+        let lang_bias_info = if !token_bias.is_empty() {
+            format!(", lang_bias_tokens={}", token_bias.len())
+        } else {
+            String::new()
+        };
         tracing::info!(
             "Starting BatchScheduler (max_batch_size={}, \
-             max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info})",
+             max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info}{lang_bias_info})",
             sched_config.max_batch_size,
             sched_config.max_queue_depth,
         );
@@ -169,9 +188,62 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.max_batch_prefill,
             sched_config.decode_storage_backend,
         )
-        .with_vision_cache_size(sched_config.vision_cache_size);
+        .with_vision_cache_size(sched_config.vision_cache_size)
+        .with_token_bias(token_bias);
         scheduler.run();
     })
+}
+
+/// Resolve the worker-level Axis B `LangBiasConfig` into a concrete
+/// `TokenBiasMap` using the loaded tokenizer (B8).
+///
+/// Returns an empty map (baseline no-op) in the following cases:
+/// - No `lang_bias_config` was supplied.
+/// - The bias set is empty.
+/// - The tokenizer is not HuggingFace-backed (SentencePiece/Tiktoken are not
+///   supported by the Phase 1 vocabulary scanner).
+/// - `tokenizer.json` cannot be read from disk.
+/// - The resolver itself fails (logged; generation continues without bias).
+fn resolve_worker_token_bias(
+    config: Option<&mlxcel_core::lang_analyzer::LangBiasConfig>,
+    tokenizer: &crate::tokenizer::MlxcelTokenizer,
+    model_path: &std::path::Path,
+) -> mlxcel_core::sampling::TokenBiasMap {
+    let Some(cfg) = config else {
+        return mlxcel_core::sampling::TokenBiasMap::default();
+    };
+    if cfg.bias_set.ordered.is_empty() {
+        return mlxcel_core::sampling::TokenBiasMap::default();
+    }
+    let Some(hf) = tokenizer.hf_tokenizer() else {
+        tracing::warn!(
+            "--lang-bias/LLAMA_ARG_LANG_BIAS requested but this model uses a \
+             non-HuggingFace tokenizer (SentencePiece/Tiktoken); language \
+             steering is disabled for this session"
+        );
+        return mlxcel_core::sampling::TokenBiasMap::default();
+    };
+    let json_path = model_path.join("tokenizer.json");
+    let json_bytes = match std::fs::read(&json_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(
+                "failed to read {json_path:?} for lang-bias vocab-hash cache key: \
+                 {err}; language steering disabled for this session"
+            );
+            return mlxcel_core::sampling::TokenBiasMap::default();
+        }
+    };
+    match cfg.resolve_token_bias(hf, &json_bytes) {
+        Ok(map) => map,
+        Err(err) => {
+            tracing::warn!(
+                "failed to resolve language bias (vocab scan): {err}; language \
+                 steering disabled for this session"
+            );
+            mlxcel_core::sampling::TokenBiasMap::default()
+        }
+    }
 }
 
 /// Spawn the legacy sequential model worker.

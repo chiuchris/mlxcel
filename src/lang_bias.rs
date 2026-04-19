@@ -32,7 +32,8 @@ use clap::Args;
 use serde::Deserialize;
 
 use mlxcel_core::lang_analyzer::{
-    ExceptionConfig, InclusionPolicy, LangBiasSet, LanguageCode, LangAnalyzerError,
+    ExceptionConfig, InclusionPolicy, LangBiasConfig, LangBiasSet, LanguageCode,
+    LangAnalyzerError,
 };
 
 /// Error type for CLI argument parsing and YAML loading.
@@ -315,26 +316,6 @@ pub struct LangBiasCliArgs {
     /// Normally the cache is rebuilt only when the tokenizer vocab changes.
     /// Use this flag to force a rebuild regardless of cache state.
     #[arg(long = "lang-bias-rebuild-cache", default_value_t = false)]
-    pub rebuild_cache: bool,
-}
-
-/// Resolved, validated language bias configuration.
-///
-/// Produced by [`LangBiasCliArgs::resolve`]. Consumed by the generation
-/// pipeline (B8) to call `TokenLanguageIndex::to_token_bias`.
-///
-/// The fields are not yet consumed by the generation loop (pending B8).
-/// The `#[allow(dead_code)]` suppresses the warning until B8 wires it in.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub struct LangBiasConfig {
-    /// Ordered list of per-language bias values.
-    pub bias_set: LangBiasSet,
-    /// Token inclusion policy.
-    pub policy: InclusionPolicy,
-    /// Exception configuration.
-    pub exceptions: ExceptionConfig,
-    /// If `true`, force a `TokenLanguageIndex` cache rebuild.
     pub rebuild_cache: bool,
 }
 
@@ -735,7 +716,9 @@ unknown_field: value
         assert_eq!(parse_bias_f32("-inf").unwrap(), f32::NEG_INFINITY);
         assert_eq!(parse_bias_f32("+inf").unwrap(), f32::INFINITY);
         assert_eq!(parse_bias_f32("inf").unwrap(), f32::INFINITY);
-        assert_eq!(parse_bias_f32("3.14").unwrap(), 3.14_f32);
+        // Use a non-mathematical-constant literal so clippy's
+        // `approx_constant` lint does not mistakenly flag this for PI.
+        assert_eq!(parse_bias_f32("2.5").unwrap(), 2.5_f32);
         assert_eq!(parse_bias_f32("-5.0").unwrap(), -5.0_f32);
     }
 }

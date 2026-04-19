@@ -200,6 +200,11 @@ pub struct ServerStartupConfig {
     /// Optional chrome-tracing JSON output path for pipeline scheduler
     /// actions. `Some(path)` constructs a `PpTracer`.
     pub debug_pp_trace: Option<PathBuf>,
+
+    /// Axis B Epic #362 (B8): server-wide language-bias configuration
+    /// already resolved from CLI flags (B6) or the `LLAMA_ARG_LANG_BIAS`
+    /// env-var path (B7). `None` preserves the bit-exact baseline path.
+    pub lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
 }
 
 impl Default for ServerStartupConfig {
@@ -276,6 +281,7 @@ impl Default for ServerStartupConfig {
             elastic_pp_cool_down: 30,
             metrics_port: None,
             debug_pp_trace: None,
+            lang_bias_config: None,
         }
     }
 }
@@ -427,6 +433,7 @@ pub(super) fn build_server_config(
         remote_pipeline_stage: None,
         tensor_parallel,
         vision_cache_size: startup.vision_cache_size,
+        lang_bias_config: startup.lang_bias_config.clone(),
     }
 }
 

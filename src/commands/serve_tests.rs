@@ -100,12 +100,13 @@ fn sample_args() -> crate::ServeArgs {
         elastic_pp_cool_down: 30,
         metrics_port: None,
         debug_pp_trace: None,
+        lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
     }
 }
 
 #[test]
 fn build_startup_input_preserves_edge_flags_for_normalization() {
-    let input = build_startup_input(sample_args());
+    let input = build_startup_input(sample_args()).expect("resolve");
 
     assert_eq!(input.model_path, PathBuf::from("models/foo"));
     assert_eq!(input.adapter_path, Some(PathBuf::from("adapters/bar")));
@@ -125,12 +126,35 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
 fn build_startup_input_propagates_pp_layers() {
     let mut args = sample_args();
     args.pp_layers = Some("0-15,16-31".to_string());
-    let input = build_startup_input(args);
+    let input = build_startup_input(args).expect("resolve");
     assert_eq!(input.pp_layers, Some("0-15,16-31".to_string()));
 }
 
 #[test]
 fn build_startup_input_pp_layers_none_by_default() {
-    let input = build_startup_input(sample_args());
+    let input = build_startup_input(sample_args()).expect("resolve");
     assert_eq!(input.pp_layers, None);
+}
+
+// Axis B B8: default lang_bias args produce None config (baseline no-op).
+#[test]
+fn build_startup_input_lang_bias_defaults_to_none() {
+    let input = build_startup_input(sample_args()).expect("resolve");
+    assert!(
+        input.lang_bias_config.is_none(),
+        "no --lang-bias flag should yield None (baseline bit-exact)"
+    );
+}
+
+// Axis B B8: a populated --lang-bias is resolved and threaded through.
+#[test]
+fn build_startup_input_lang_bias_propagates_when_active() {
+    let mut args = sample_args();
+    args.lang_bias = mlxcel::lang_bias::LangBiasCliArgs {
+        lang_bias: Some("ja=-inf".to_string()),
+        ..Default::default()
+    };
+    let input = build_startup_input(args).expect("resolve");
+    let cfg = input.lang_bias_config.expect("resolved config");
+    assert_eq!(cfg.bias_set.ordered.len(), 1);
 }

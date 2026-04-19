@@ -24,6 +24,8 @@
 //! - Shared sampling policy delegated to `crate::sampling`
 //! - Shared decode setup delegated to `crate::generation_policy`
 
+use std::borrow::Cow;
+
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
 use crate::ffi::{MlxArray, MlxStream};
@@ -583,6 +585,19 @@ pub struct CxxGenerator {
     /// KV cache quantization mode applied to all layer caches.
     /// Default: `KVCacheMode::Fp16` (no quantization).
     kv_cache_mode: KVCacheMode,
+    /// Cached per-generator `TokenBiasMap` resolved from a `LangBiasConfig`.
+    ///
+    /// Populated at construction time via [`Self::with_token_bias`] (or a
+    /// `LangBiasConfig`-aware constructor) and re-applied to every
+    /// `SamplingConfig` used by the generator's public `generate_*` entry
+    /// points. Empty (`TokenBiasMap::default`) is a zero-overhead no-op that
+    /// preserves bit-exact baseline behavior, so callers that do not opt into
+    /// language steering pay no per-token or per-call cost (see
+    /// [`Self::compose_sampling`]).
+    ///
+    /// Axis B / Epic #362: populated by B8 wiring for the CLI `generate`
+    /// path; the server batch scheduler caches its own copy on `BatchScheduler`.
+    token_bias: TokenBiasMap,
 }
 
 impl CxxGenerator {
@@ -593,6 +608,7 @@ impl CxxGenerator {
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
             kv_cache_mode: KVCacheMode::Fp16,
+            token_bias: TokenBiasMap::default(),
         }
     }
 
@@ -608,6 +624,61 @@ impl CxxGenerator {
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
             kv_cache_mode,
+            token_bias: TokenBiasMap::default(),
+        }
+    }
+
+    /// Attach a pre-resolved `TokenBiasMap` to this generator.
+    ///
+    /// The bias is cached for the generator's lifetime and merged into every
+    /// `SamplingConfig` handed to `generate_*` unless the caller already
+    /// supplied a non-empty `token_bias` on the sampling config (caller wins).
+    ///
+    /// Callers that want to derive the map from a [`crate::LangBiasConfig`]
+    /// typically combine this with
+    /// [`crate::LangBiasConfig::resolve_token_bias`]:
+    ///
+    /// ```ignore
+    /// let bias = lang_bias_config.resolve_token_bias(tokenizer, bytes)?;
+    /// let generator = CxxGenerator::new(layers).with_token_bias(bias);
+    /// ```
+    ///
+    /// When `bias.is_empty()`, this method is a no-op on the sampling path —
+    /// the composed `SamplingConfig` is returned by reference and `sample_*`
+    /// goes through the existing zero-overhead branch.
+    pub fn with_token_bias(mut self, bias: TokenBiasMap) -> Self {
+        self.token_bias = bias;
+        self
+    }
+
+    /// Returns a reference to the cached token-bias map.
+    ///
+    /// Used by tests to assert that B8 wiring populated the correct map.
+    pub fn token_bias(&self) -> &TokenBiasMap {
+        &self.token_bias
+    }
+
+    /// Compose the effective sampling config from the cached `token_bias` and
+    /// the caller's [`SamplingConfig`].
+    ///
+    /// # Precedence and bit-exact baseline
+    /// - If the caller already set a non-empty `sampling.token_bias`, the
+    ///   caller's bias wins (returned borrow — zero allocation).
+    /// - If the cached `token_bias` is empty, we borrow the caller's config
+    ///   unchanged. This is the **baseline no-op path** and is bit-exact
+    ///   identical to pre-B8 behavior.
+    /// - Otherwise, clone the caller's config and inject the cached bias.
+    ///
+    /// Used by: `generate`, `generate_streaming`, `generate_with_stats`, and
+    /// VLM embedding-aware variants so every generation path observes the
+    /// cached bias without duplicating the merge logic.
+    fn compose_sampling<'a>(&self, sampling: &'a SamplingConfig) -> Cow<'a, SamplingConfig> {
+        if self.token_bias.is_empty() || !sampling.token_bias.is_empty() {
+            Cow::Borrowed(sampling)
+        } else {
+            let mut cloned = sampling.clone();
+            cloned.token_bias = self.token_bias.clone();
+            Cow::Owned(cloned)
         }
     }
 
@@ -674,6 +745,12 @@ impl CxxGenerator {
     ) -> Vec<i32> {
         // Reset state
         self.reset();
+
+        // Axis B: merge any generator-cached language-bias map into the
+        // sampling config before seeding/penalty evaluation. Empty cached
+        // bias => borrowed unchanged (bit-exact baseline; zero alloc).
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
 
         // Set random seed if specified (for reproducibility)
         seed_rng_if_needed(sampling);
@@ -885,6 +962,10 @@ impl CxxGenerator {
         // Reset state
         self.reset();
 
+        // Axis B: inject generator-cached language-bias into the sampling config.
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
+
         seed_rng_if_needed(sampling);
 
         ensure_model_caches(&mut self.caches, model);
@@ -1027,6 +1108,10 @@ impl CxxGenerator {
         use std::time::Instant;
 
         self.reset();
+
+        // Axis B: inject generator-cached language-bias into the sampling config.
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
 
         seed_rng_if_needed(sampling);
         ensure_model_caches(&mut self.caches, model);
@@ -1173,6 +1258,10 @@ impl CxxGenerator {
 
         // Reset state
         self.reset();
+
+        // Axis B: inject generator-cached language-bias into the sampling config.
+        let sampling_cow = self.compose_sampling(sampling);
+        let sampling = sampling_cow.as_ref();
 
         // Set random seed if specified (for reproducibility)
         seed_rng_if_needed(sampling);
@@ -1862,5 +1951,63 @@ mod tests {
         // responsibility to handle excess == 0 gracefully.
         assert_eq!(model.trim_call_count.get(), 1);
         assert_eq!(model.last_excess.get(), 0);
+    }
+
+    // ------------------------------------------------------------------
+    // B8 — CxxGenerator token-bias wiring
+    // ------------------------------------------------------------------
+
+    fn make_bias(entries: &[(i32, f32)]) -> TokenBiasMap {
+        let mut m = TokenBiasMap::new();
+        for &(id, b) in entries {
+            m.insert(id, b);
+        }
+        m
+    }
+
+    /// Default `CxxGenerator` carries an empty token-bias cache and produces
+    /// a bit-exact baseline (`Cow::Borrowed`) from `compose_sampling`.
+    #[test]
+    fn cxx_generator_empty_bias_is_baseline() {
+        let g = CxxGenerator::new(4);
+        assert!(g.token_bias().is_empty());
+        let caller = SamplingConfig::default();
+        let composed = g.compose_sampling(&caller);
+        assert!(matches!(composed, Cow::Borrowed(_)));
+        assert!(composed.token_bias.is_empty());
+    }
+
+    /// `with_token_bias` caches a map and injects it into sampling configs
+    /// that don't already carry a bias (fresh clone — `Cow::Owned`).
+    #[test]
+    fn cxx_generator_with_token_bias_injects_into_sampling() {
+        let bias = make_bias(&[(3, f32::NEG_INFINITY), (5, 1.5)]);
+        let g = CxxGenerator::new(4).with_token_bias(bias.clone());
+        assert_eq!(g.token_bias().len(), 2);
+
+        let caller = SamplingConfig::default();
+        let composed = g.compose_sampling(&caller);
+        assert!(matches!(composed, Cow::Owned(_)));
+        assert_eq!(composed.token_bias.len(), 2);
+        assert!(composed.token_bias.contains(3));
+        assert!(composed.token_bias.contains(5));
+    }
+
+    /// An explicit caller-side bias wins over the generator-cached one.
+    /// Preserves the "call-site override" contract for tests and API callers.
+    #[test]
+    fn cxx_generator_caller_bias_wins() {
+        let cached = make_bias(&[(1, 1.0)]);
+        let caller_bias = make_bias(&[(99, -3.0)]);
+        let g = CxxGenerator::new(2).with_token_bias(cached);
+
+        let mut caller = SamplingConfig::default();
+        caller.token_bias = caller_bias;
+        let composed = g.compose_sampling(&caller);
+
+        // Caller's explicit bias is preserved verbatim, cached bias is ignored.
+        assert_eq!(composed.token_bias.len(), 1);
+        assert!(composed.token_bias.contains(99));
+        assert!(!composed.token_bias.contains(1));
     }
 }
