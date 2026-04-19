@@ -17,6 +17,7 @@ use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
 mod commands;
+use commands::lang_bias_args::LangBiasCliArgs;
 
 /// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs
 ///
@@ -81,6 +82,9 @@ pub(crate) struct GenerateArgs {
 
     #[command(flatten)]
     pub(crate) tensor_parallel: TensorParallelOptions,
+
+    #[command(flatten)]
+    pub(crate) lang_bias: LangBiasCliArgs,
 }
 
 /// Model loading options

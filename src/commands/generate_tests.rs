@@ -128,6 +128,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             tp_embedding_mode: "replicated".to_string(),
             tp_lm_head_mode: "replicated".to_string(),
         },
+        lang_bias: crate::commands::lang_bias_args::LangBiasCliArgs::default(),
     }
 }
 

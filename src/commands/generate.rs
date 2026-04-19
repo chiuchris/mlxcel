@@ -636,6 +636,16 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     validate_tensor_parallel_args(&args)?;
     validate_pipeline_parallel_args(&args)?;
 
+    // Parse and validate language bias arguments early (before model load).
+    // The resolved config is stored for use by the generation pipeline (B8).
+    // When B8 is not yet merged, this block validates the CLI args and is a
+    // no-op for the generation path. When B8 lands, `_lang_bias_config` will
+    // be wired into `SamplingConfig::token_bias`.
+    let _lang_bias_config = args
+        .lang_bias
+        .resolve()
+        .map_err(|e| anyhow::anyhow!("--lang-bias: {e}"))?;
+
     // Quantization recommendation and BF16 warning (before loading the model).
     let hw = mlxcel_core::hardware::get_hardware();
     if args.generation.recommend_quant {
