@@ -47,6 +47,7 @@ use mlxcel_core::sampling::LogprobsConfig;
 
 use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
+use crate::server::thinking_budget::ThinkingState;
 use crate::vision::merge::InputEmbeddings;
 
 // ---------------------------------------------------------------------------
@@ -242,6 +243,14 @@ pub struct SequenceInfo {
     /// is complete. The scheduler advances this in increments of
     /// `prefill_chunk_size`.
     pub prefill_offset: usize,
+
+    // -- Issue #409: thinking-token budget --
+    /// Per-sequence thinking-budget state. Drives forced `</think>` injection
+    /// when the in-block token count reaches the configured cap. Set to
+    /// [`crate::server::thinking_budget::ThinkingState::disabled`] when the
+    /// model has no `<think>` / `</think>` tokens, when the request supplies
+    /// no budget, or when the server default is unbounded.
+    pub(crate) thinking: ThinkingState,
 
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.

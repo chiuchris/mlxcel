@@ -92,8 +92,7 @@ impl Qwen3VLModel {
                     for feat in &vision_output.deepstack_features {
                         mlxcel_core::eval(feat);
                     }
-                    let hs_copy =
-                        mlxcel_core::copy(vision_output.hidden_states.as_ref().unwrap());
+                    let hs_copy = mlxcel_core::copy(vision_output.hidden_states.as_ref().unwrap());
                     let ds_copy: Vec<UniquePtr<MlxArray>> = vision_output
                         .deepstack_features
                         .iter()
@@ -105,7 +104,10 @@ impl Qwen3VLModel {
                     }
                 }
 
-                (vision_output.hidden_states, vision_output.deepstack_features)
+                (
+                    vision_output.hidden_states,
+                    vision_output.deepstack_features,
+                )
             };
 
         // Merge vision features at image token positions (LLaVA-style)

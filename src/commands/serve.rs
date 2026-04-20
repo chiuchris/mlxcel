@@ -21,7 +21,7 @@
 
 use mlxcel::server::{
     ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
-    start_server,
+    env_fallback_reasoning_budget, start_server,
 };
 
 /// Run the `mlxcel serve` subcommand.
@@ -37,6 +37,8 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_lang_bias(&mut args.lang_bias);
     // Issue #405 — env-var fallback for the byte-fragment opt-in flag.
     env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
+    // Issue #409 — env-var fallback for the thinking-budget default.
+    env_fallback_reasoning_budget(&mut args.reasoning_budget);
 
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
@@ -121,6 +123,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         metrics_port: args.metrics_port,
         debug_pp_trace: args.debug_pp_trace,
         lang_bias_config,
+        reasoning_budget: args.reasoning_budget,
     })
 }
 

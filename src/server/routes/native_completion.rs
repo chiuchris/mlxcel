@@ -28,8 +28,10 @@ use axum::{
 };
 
 use crate::server::batch::RequestPriority;
+use crate::server::config::ReasoningBudgetOverride;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
+use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::types::{
     ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
 };
@@ -41,11 +43,36 @@ pub async fn native_completion(
     headers: HeaderMap,
     Json(request): Json<NativeCompletionRequest>,
 ) -> Response {
+    // Issue #409: validate thinking_budget_tokens early (semantics match
+    // /v1/chat/completions but the cap is checked against n_predict).
+    let effective_n_predict = request.n_predict.unwrap_or(state.config.default_max_tokens);
+    let raw_budget = pick_budget_alias(
+        request.thinking_budget_tokens,
+        request.thinking_token_budget,
+        request.thinking_budget,
+    );
+    let budget_override = match resolve_request_budget(
+        raw_budget,
+        state.config.reasoning_budget,
+        effective_n_predict,
+    ) {
+        Ok(effective) => {
+            if raw_budget.is_some() {
+                ReasoningBudgetOverride::Explicit(effective)
+            } else {
+                ReasoningBudgetOverride::InheritServerDefault
+            }
+        }
+        Err(err) => {
+            return ErrorResponse::new(err.to_string(), "invalid_request_error").into_response();
+        }
+    };
+
     let priority = parse_priority_header(&headers);
     if request.stream.unwrap_or(false) {
-        stream_native_completion(state, request, priority).await
+        stream_native_completion(state, request, priority, budget_override).await
     } else {
-        non_stream_native_completion(state, request, priority)
+        non_stream_native_completion(state, request, priority, budget_override)
             .await
             .into_response()
     }
@@ -62,6 +89,7 @@ async fn non_stream_native_completion(
     state: AppState,
     request: NativeCompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Result<Json<NativeCompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -72,6 +100,7 @@ async fn non_stream_native_completion(
 
     let mut options = build_native_options(&request, &state);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
 
     let result = state
         .model_provider
@@ -127,6 +156,7 @@ async fn stream_native_completion(
     state: AppState,
     request: NativeCompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
@@ -136,6 +166,7 @@ async fn stream_native_completion(
 
     let mut options = build_native_options(&request, &state);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
     let prompt = request.prompt.clone();
 
     let (events, stream, cancelled) = sse_channel(100);
@@ -203,6 +234,13 @@ fn build_native_generate_options(
             dry_sequence_breakers: request.dry_sequence_breakers.clone(),
             stop_sequences: request.stop.clone(),
             priority: RequestPriority::default(),
+            // Issue #409: the caller fills this from the validated request
+            // body + server default after `build_native_options` returns.
+            reasoning_budget: ReasoningBudgetOverride::default(),
+            // Issue #409: `/completion` takes a raw prompt; the caller is
+            // responsible for priming `<think>` in the prompt if they want
+            // in-block counting to start at the first decoded token.
+            thinking_enter_block_on_start: false,
         },
     )
 }

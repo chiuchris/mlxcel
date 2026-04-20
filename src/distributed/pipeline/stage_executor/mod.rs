@@ -168,13 +168,8 @@ impl LoadedStageExecutor {
 
         let filter = LayerFilter::from_stage(stage);
         let family = resolve_stage_family(model_dir)?;
-        let backend = load_family_backend(
-            model_dir,
-            &filter,
-            stage.stage_index,
-            family,
-            adapter_path,
-        )?;
+        let backend =
+            load_family_backend(model_dir, &filter, stage.stage_index, family, adapter_path)?;
 
         Ok(Self {
             stage: stage.clone(),

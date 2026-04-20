@@ -240,7 +240,8 @@ impl Gemma4VLModel {
                 // Materialize before hashing/storing; the cache must hold a
                 // stable tensor rather than a deferred graph node.
                 mlxcel_core::eval(&features);
-                let snapshot = SingleArrayFeatures::new(mlxcel_core::copy(features.as_ref().unwrap()));
+                let snapshot =
+                    SingleArrayFeatures::new(mlxcel_core::copy(features.as_ref().unwrap()));
                 if let Ok(mut guard) = cache.lock() {
                     guard.put(key.clone(), &snapshot);
                 }

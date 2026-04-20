@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
     ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
-    start_server,
+    env_fallback_reasoning_budget, start_server,
 };
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -552,6 +552,28 @@ struct Args {
     /// (plan §6.4, B7). CLI flag takes precedence over the env var.
     #[command(flatten)]
     lang_bias: LangBiasCliArgs,
+
+    /// Issue #409: default thinking-token budget for Qwen3-family models.
+    ///
+    /// Caps the number of tokens generated inside the `<think>...</think>`
+    /// reasoning block. Matches llama.cpp `--reasoning-budget` semantics:
+    ///   -1 = unrestricted (default)
+    ///    0 = immediate end of thinking (force </think> on first reasoning token)
+    ///    N > 0 = cap reasoning at N tokens
+    ///
+    /// Per-request `thinking_budget_tokens` (primary), `thinking_token_budget`
+    /// (vLLM alias), or `thinking_budget` (Qwen alias) on
+    /// `/v1/chat/completions` and `/completion` override this value. Also
+    /// reads from `LLAMA_ARG_REASONING_BUDGET` (applied via
+    /// `env_fallback_reasoning_budget`); CLI wins on conflict. Unparseable
+    /// env values are warn-logged and ignored. Silently ignored for models
+    /// that do not expose `<think>` / `</think>` tokens.
+    #[arg(
+        long = "reasoning-budget",
+        default_value_t = -1,
+        value_name = "N"
+    )]
+    reasoning_budget: i32,
 }
 
 #[tokio::main]
@@ -651,5 +673,16 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
         metrics_port: args.metrics_port,
         debug_pp_trace: args.debug_pp_trace,
         lang_bias_config,
+        // Issue #409: route through `env_fallback_reasoning_budget` so that
+        // CLI-vs-env precedence, unparseable-env handling, and the collision
+        // INFO log are handled consistently with `mlxcel serve` and with the
+        // other LLAMA_ARG_* env fallbacks. (Do NOT put `env = "..."` on the
+        // clap arg — that bypasses our warn-and-ignore policy for unparseable
+        // values and would emit a misleading collision warning.)
+        reasoning_budget: {
+            let mut v = args.reasoning_budget;
+            env_fallback_reasoning_budget(&mut v);
+            v
+        },
     })
 }

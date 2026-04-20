@@ -29,8 +29,10 @@ use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 
 use crate::server::batch::RequestPriority;
 use crate::server::chat_request::prepare_chat_request;
+use crate::server::config::ReasoningBudgetOverride;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
+use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::tool_calls;
 use crate::server::tool_calls::stream_filter::StreamFilter;
 use crate::server::types::response::{ChatLogprobs, TokenLogprob, TopLogprob};
@@ -164,11 +166,39 @@ pub async fn chat_completions(
         .into_response();
     }
 
+    // Issue #409: validate thinking_budget_tokens early so malformed values
+    // surface as 400 before any generation work begins.
+    let effective_max_tokens = request
+        .params
+        .max_tokens
+        .unwrap_or(state.config.default_max_tokens);
+    let raw_budget = pick_budget_alias(
+        request.params.thinking_budget_tokens,
+        request.params.thinking_token_budget,
+        request.params.thinking_budget,
+    );
+    let budget_override = match resolve_request_budget(
+        raw_budget,
+        state.config.reasoning_budget,
+        effective_max_tokens,
+    ) {
+        Ok(effective) => {
+            if raw_budget.is_some() {
+                ReasoningBudgetOverride::Explicit(effective)
+            } else {
+                ReasoningBudgetOverride::InheritServerDefault
+            }
+        }
+        Err(err) => {
+            return ErrorResponse::new(err.to_string(), "invalid_request_error").into_response();
+        }
+    };
+
     let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_chat_completion(state, request, priority).await
+        stream_chat_completion(state, request, priority, budget_override).await
     } else {
-        non_stream_chat_completion(state, request, priority)
+        non_stream_chat_completion(state, request, priority, budget_override)
             .await
             .into_response()
     }
@@ -187,6 +217,7 @@ async fn non_stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Result<Json<ChatCompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -201,6 +232,7 @@ async fn non_stream_chat_completion(
     let prepared = prepare_chat_request(&state.chat_template, &request).await;
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
 
     // Set logprobs configuration when requested
     let top_k = request.top_logprobs.unwrap_or(0) as usize;
@@ -291,6 +323,7 @@ async fn stream_chat_completion(
     state: AppState,
     request: ChatCompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
@@ -303,6 +336,7 @@ async fn stream_chat_completion(
     let prepared = prepare_chat_request(&state.chat_template, &request).await;
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request
@@ -521,6 +555,15 @@ pub(crate) fn build_generate_options(
             dry_sequence_breakers: params.dry_sequence_breakers.clone(),
             stop_sequences: params.stop.clone(),
             priority: RequestPriority::default(),
+            // Issue #409: the caller (non_stream_chat_completion /
+            // stream_chat_completion) sets `options.reasoning_budget`
+            // explicitly after `build_generate_options` returns, so the
+            // default here is just a placeholder.
+            reasoning_budget: ReasoningBudgetOverride::default(),
+            // Issue #409: chat templates prime `<think>\n` so the first
+            // decoded token is already inside the reasoning block for Qwen3
+            // family models.
+            thinking_enter_block_on_start: true,
         },
     )
 }

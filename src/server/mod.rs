@@ -27,6 +27,7 @@ pub mod routes;
 mod startup;
 mod state;
 mod streaming;
+pub mod thinking_budget;
 pub mod tool_calls;
 pub mod types;
 
@@ -34,6 +35,7 @@ pub use app::create_app;
 pub use chat_template::ChatTemplateProcessor;
 pub use cli_input::{
     ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    env_fallback_reasoning_budget,
 };
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,

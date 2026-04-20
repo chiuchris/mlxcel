@@ -40,7 +40,7 @@ use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
 use mlxcel_core::hardware;
-use mlxcel_core::sampling::{compute_logprobs, sample_token_optimized, TokenBiasMap};
+use mlxcel_core::sampling::{TokenBiasMap, compute_logprobs, sample_token_optimized};
 use mlxcel_core::streams::{install_default_stream, new_generation_stream};
 use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
 use mlxcel_core::{MlxStream, UniquePtr};
@@ -48,13 +48,16 @@ use mlxcel_core::{MlxStream, UniquePtr};
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::observability::BatchObservability;
-use crate::server::config::{DecodeStorageBackend, PreemptionPolicy};
+use crate::server::config::{DecodeStorageBackend, PreemptionPolicy, ReasoningBudgetOverride};
 use crate::server::model_provider::model_worker::{
     StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
     prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
 use crate::server::state::BatchMetrics;
+use crate::server::thinking_budget::{
+    ThinkingBudget, ThinkingDecision, ThinkingState, ThinkingTokenIds,
+};
 use crate::tokenizer::MlxcelTokenizer;
 use crate::vision::feature_cache::ModelVisionCaches;
 use crate::vlm_runtime::prepared_embedding_refs;
@@ -173,6 +176,16 @@ pub struct BatchScheduler {
     ///
     /// Empty map = bit-exact baseline path (no sampling change, no alloc).
     token_bias: TokenBiasMap,
+
+    // -- Issue #409 — thinking-token budget --
+    /// Server-wide default thinking-token budget. `None` means unrestricted.
+    /// Per-request `thinking_budget_tokens` overrides this at enqueue time.
+    reasoning_budget: Option<ThinkingBudget>,
+    /// Cached `<think>` / `</think>` token id pair resolved once from the
+    /// tokenizer at worker startup. `None` for non-thinking models; when
+    /// `None`, every sequence's [`ThinkingState`] is constructed as disabled
+    /// regardless of any budget configuration.
+    thinking_token_ids: Option<ThinkingTokenIds>,
 }
 
 impl BatchScheduler {
@@ -278,6 +291,8 @@ impl BatchScheduler {
                 crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             )),
             token_bias: TokenBiasMap::default(),
+            reasoning_budget: None,
+            thinking_token_ids: None,
         }
     }
 
@@ -312,6 +327,81 @@ impl BatchScheduler {
     /// Returns a reference to the cached token-bias map (for tests).
     pub fn token_bias(&self) -> &TokenBiasMap {
         &self.token_bias
+    }
+
+    /// Attach the server-wide thinking-token budget and resolved
+    /// `<think>` / `</think>` token ids (issue #409).
+    ///
+    /// `token_ids == None` means the model is non-thinking; the budget is
+    /// then silently ignored for every sequence. Callers resolve the token
+    /// ids once via
+    /// [`crate::server::thinking_budget::resolve_thinking_token_ids`] after
+    /// the tokenizer is loaded.
+    pub fn with_reasoning_budget(
+        mut self,
+        budget: Option<ThinkingBudget>,
+        token_ids: Option<ThinkingTokenIds>,
+    ) -> Self {
+        self.reasoning_budget = budget;
+        self.thinking_token_ids = token_ids;
+        self
+    }
+
+    /// Apply issue #409 thinking-budget enforcement to a freshly sampled
+    /// token for a single sequence.
+    ///
+    /// Returns the final token id to commit to the sequence (either the
+    /// sampled value, or the forced `</think>` id when the budget fires).
+    /// Caller is responsible for using the returned id for the remainder of
+    /// the decode step (EOS check, streaming emission, history update).
+    ///
+    /// The state advances with the final id so subsequent steps see the
+    /// post-close phase.
+    ///
+    /// # Notes on bypass of sampling knobs
+    ///
+    /// When the budget fires the forced id bypasses the sampler's logits
+    /// pipeline for that step. No retroactive re-penalization happens because
+    /// - `token_history` is only appended once per step (caller uses the
+    ///   returned id),
+    /// - `merged_eos` checks use the returned id,
+    /// - the next step samples fresh logits from the underlying model.
+    fn apply_thinking_budget(seq_thinking: &mut ThinkingState, sampled: i32) -> i32 {
+        if seq_thinking.is_disabled() {
+            return sampled;
+        }
+        let final_id = match seq_thinking.decide_override(sampled) {
+            ThinkingDecision::NoOverride => sampled,
+            ThinkingDecision::ForceClose(close_id) => close_id,
+        };
+        seq_thinking.observe(final_id);
+        final_id
+    }
+
+    /// Effective thinking-budget for a single sequence.
+    ///
+    /// Combines the server default with any per-request override attached to
+    /// the request's `ServerGenerateOptions`. Returns a [`ThinkingState`]
+    /// ready to be stored on `SequenceInfo`.
+    ///
+    /// `enter_block_on_start` is passed through to the [`ThinkingState`].
+    /// Chat endpoints set `true` (the Qwen3 chat template primes `<think>\n`);
+    /// raw text endpoints (`/v1/completions`, `/completion`) set `false` so
+    /// the model must emit `<think>` before any in-block counting begins.
+    fn build_thinking_state(
+        &self,
+        override_: ReasoningBudgetOverride,
+        enter_block_on_start: bool,
+    ) -> ThinkingState {
+        // No thinking tokens -> always disabled regardless of config.
+        let Some(token_ids) = self.thinking_token_ids else {
+            return ThinkingState::disabled();
+        };
+        let effective = match override_ {
+            ReasoningBudgetOverride::InheritServerDefault => self.reasoning_budget,
+            ReasoningBudgetOverride::Explicit(v) => v,
+        };
+        ThinkingState::new(Some(token_ids), effective, enter_block_on_start)
     }
 
     /// Run the scheduler loop until shutdown or channel close.
@@ -543,6 +633,16 @@ impl BatchScheduler {
 
         let decode_state = StreamingDecodeState::new(&self.tokenizer, &prompt_tokens);
 
+        // Issue #409: resolve the effective thinking-token budget for this
+        // sequence from the per-request override + server default. The route
+        // layer supplies `thinking_enter_block_on_start` as `true` when the
+        // rendered prompt primes `<think>` (chat endpoints) and `false` for
+        // raw text endpoints.
+        let thinking = self.build_thinking_state(
+            options.reasoning_budget,
+            options.thinking_enter_block_on_start,
+        );
+
         let seq = SequenceInfo {
             seq_id,
             state: SequenceState::Queued,
@@ -566,6 +666,7 @@ impl BatchScheduler {
             first_token_time: None,
             token_history: Vec::new(),
             merged_eos: Vec::new(),
+            thinking,
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
@@ -1246,9 +1347,19 @@ impl BatchScheduler {
         let (first_token_arr, adjusted_logits) =
             sample_token_optimized(&logits, &seq.sampling, &token_history);
         mlxcel_core::eval(&first_token_arr);
-        let first_token = mlxcel_core::item_i32(&first_token_arr);
+        let sampled_first_token = mlxcel_core::item_i32(&first_token_arr);
+
+        // Issue #409: thinking-budget override. Qwen3 chat templates prime
+        // `<think>\n`, so the first prefill-completion token is already
+        // inside the reasoning block when `enter_block_on_start == true`.
+        let first_token = Self::apply_thinking_budget(&mut seq.thinking, sampled_first_token);
 
         seq.first_token_time = Some(Instant::now());
+
+        // Issue #409: if the budget fired and substituted the first token,
+        // drop the logprob below (computed against the sampled token) so the
+        // streamed metadata stays consistent with the emitted token text.
+        let override_fired = first_token != sampled_first_token;
 
         // Check for immediate EOS
         if eos_tokens.contains(&first_token) {
@@ -1273,8 +1384,15 @@ impl BatchScheduler {
             return;
         }
 
-        // Optionally compute logprobs for the first token.
-        let token_lp = compute_logprobs(&adjusted_logits, first_token, &seq.logprobs_config);
+        // Optionally compute logprobs for the first token. When the override
+        // fired, the sampled token differs from the emitted `first_token`;
+        // suppress logprob emission in that case to keep token text and
+        // logprob metadata consistent (issue #409).
+        let token_lp = if override_fired {
+            None
+        } else {
+            compute_logprobs(&adjusted_logits, first_token, &seq.logprobs_config)
+        };
 
         seq.generated_tokens.push(first_token);
         if needs_history {
@@ -1556,9 +1674,22 @@ impl BatchScheduler {
                 let (token_arr, adjusted_logits) =
                     sample_token_optimized(&seq_logits, &seq.sampling, &seq.token_history);
                 mlxcel_core::eval(&token_arr);
-                let tok = mlxcel_core::item_i32(&token_arr);
-                let lp = compute_logprobs(&adjusted_logits, tok, &seq.logprobs_config);
-                (tok, lp)
+                let sampled = mlxcel_core::item_i32(&token_arr);
+                // Issue #409: apply the thinking-budget override first so that
+                // when the override fires (sampled != final_id) we can skip
+                // the log-softmax work entirely. The logprob metadata would
+                // be dropped anyway because the emitted `</think>` differs
+                // from the token the logits describe, so computing it first
+                // is wasted GPU work on the decode hot path.
+                let final_id = Self::apply_thinking_budget(&mut seq.thinking, sampled);
+                let lp = if final_id == sampled {
+                    compute_logprobs(&adjusted_logits, sampled, &seq.logprobs_config)
+                } else {
+                    // Override fired; token text and logprob metadata must
+                    // stay consistent, so drop the logprob for this step.
+                    None
+                };
+                (final_id, lp)
             };
 
             let seq = match self.active_batch.get_mut(seq_id) {
@@ -1651,9 +1782,19 @@ impl BatchScheduler {
             let (token_arr, adjusted_logits) =
                 sample_token_optimized(&logits, &seq.sampling, &seq.token_history);
             mlxcel_core::eval(&token_arr);
-            let tok = mlxcel_core::item_i32(&token_arr);
-            let lp = compute_logprobs(&adjusted_logits, tok, &seq.logprobs_config);
-            (tok, lp)
+            let sampled = mlxcel_core::item_i32(&token_arr);
+            // Issue #409: apply the thinking-budget override first so that
+            // when the override fires the log-softmax work is skipped — the
+            // logprob metadata for the sampled token would be dropped anyway
+            // (token text and logprob `token_id` must stay consistent), so
+            // computing it up-front wastes GPU time on every override step.
+            let final_id = Self::apply_thinking_budget(&mut seq.thinking, sampled);
+            let lp = if final_id == sampled {
+                compute_logprobs(&adjusted_logits, sampled, &seq.logprobs_config)
+            } else {
+                None
+            };
+            (final_id, lp)
         };
 
         let seq = match self.active_batch.get_mut(seq_id) {

@@ -874,10 +874,7 @@ impl DeepSeekV3Model {
     /// filters out layers from other stages).
     ///
     /// Used by: DeepSeek V3 pipeline stage executor
-    pub fn sanitize_weights_with_args(
-        weights: WeightMap,
-        config: &DeepSeekV3Config,
-    ) -> WeightMap {
+    pub fn sanitize_weights_with_args(weights: WeightMap, config: &DeepSeekV3Config) -> WeightMap {
         Self::sanitize_weights(weights, config)
     }
 

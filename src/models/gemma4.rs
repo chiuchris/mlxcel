@@ -1299,8 +1299,7 @@ impl Gemma4TextModel {
             .as_ref()
             .expect("Gemma4 per_layer_model_projection missing")
             .forward(inputs_embeds);
-        let projected =
-            mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
+        let projected = mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
         let shape = mlxcel_core::array_shape(inputs_embeds);
         let projected = mlxcel_core::reshape(
             &projected,
@@ -1900,8 +1899,7 @@ impl Gemma4StageModel {
             .as_ref()
             .ok_or_else(|| "Gemma4 per_layer_model_projection missing".to_string())?
             .forward(inputs_embeds);
-        let projected =
-            mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
+        let projected = mlxcel_core::multiply_scalar(&projected, self.per_layer_projection_scale);
         let shape = mlxcel_core::array_shape(inputs_embeds);
         let projected = mlxcel_core::reshape(
             &projected,

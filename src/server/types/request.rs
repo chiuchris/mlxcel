@@ -299,6 +299,19 @@ pub struct SamplingParams {
     pub frequency_penalty: Option<f32>,
     /// Presence penalty (0.0 = disabled) - penalizes based on presence
     pub presence_penalty: Option<f32>,
+
+    // Issue #409: thinking-token budget (Qwen3-family reasoning cap).
+    //
+    // Three aliases accepted, first non-None wins (see
+    // `thinking_budget::pick_budget_alias`). llama.cpp-compatible primary
+    // name, vLLM alias, and Qwen alias. Value semantics: -1 unrestricted,
+    // 0 immediate close, N > 0 cap at N tokens inside the `<think>` block.
+    /// Primary / llama.cpp-compatible name for the reasoning-token cap.
+    pub thinking_budget_tokens: Option<i32>,
+    /// vLLM-compatible alias for `thinking_budget_tokens`.
+    pub thinking_token_budget: Option<i32>,
+    /// Qwen-official alias for `thinking_budget_tokens`.
+    pub thinking_budget: Option<i32>,
 }
 
 /// Stream options for controlling streaming behavior
@@ -448,6 +461,14 @@ pub struct NativeCompletionRequest {
     pub dry_penalty_last_n: Option<usize>,
     /// DRY sequence breaker token IDs
     pub dry_sequence_breakers: Option<Vec<i32>>,
+
+    // Issue #409: thinking-token budget (Qwen3-family reasoning cap).
+    /// Primary / llama.cpp-compatible name for the reasoning-token cap.
+    pub thinking_budget_tokens: Option<i32>,
+    /// vLLM-compatible alias for `thinking_budget_tokens`.
+    pub thinking_token_budget: Option<i32>,
+    /// Qwen-official alias for `thinking_budget_tokens`.
+    pub thinking_budget: Option<i32>,
 }
 
 /// Tokenize request (POST /tokenize)

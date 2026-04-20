@@ -47,12 +47,7 @@ fn mamba_conv_state_shape_plateaus_after_50_steps() {
         let len = padded_shape[1] as usize;
 
         // Apply the fixed conv-state update: slice then contiguous
-        let tail = slice_axis(
-            &padded_input,
-            1,
-            (len - (k - 1)) as i32,
-            len as i32,
-        );
+        let tail = slice_axis(&padded_input, 1, (len - (k - 1)) as i32, len as i32);
         conv_state = mlxcel_core::contiguous(&tail, false);
 
         // Materialize so shape reflects the actual allocation

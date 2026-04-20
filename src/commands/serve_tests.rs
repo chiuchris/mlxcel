@@ -101,6 +101,7 @@ fn sample_args() -> crate::ServeArgs {
         metrics_port: None,
         debug_pp_trace: None,
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
+        reasoning_budget: -1,
     }
 }
 

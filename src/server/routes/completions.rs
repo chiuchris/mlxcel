@@ -30,7 +30,9 @@ use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 
 use crate::server::AppState;
 use crate::server::batch::RequestPriority;
+use crate::server::config::ReasoningBudgetOverride;
 use crate::server::streaming::sse_channel;
+use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::types::response::CompletionLogprobs;
 use crate::server::types::{CompletionChunk, CompletionRequest, CompletionResponse, ErrorResponse};
 use crate::tokenizer::MlxcelTokenizer;
@@ -118,11 +120,38 @@ pub async fn completions(
             .into_response();
     }
 
+    // Issue #409: validate thinking_budget_tokens early.
+    let effective_max_tokens = request
+        .params
+        .max_tokens
+        .unwrap_or(state.config.default_max_tokens);
+    let raw_budget = pick_budget_alias(
+        request.params.thinking_budget_tokens,
+        request.params.thinking_token_budget,
+        request.params.thinking_budget,
+    );
+    let budget_override = match resolve_request_budget(
+        raw_budget,
+        state.config.reasoning_budget,
+        effective_max_tokens,
+    ) {
+        Ok(effective) => {
+            if raw_budget.is_some() {
+                ReasoningBudgetOverride::Explicit(effective)
+            } else {
+                ReasoningBudgetOverride::InheritServerDefault
+            }
+        }
+        Err(err) => {
+            return ErrorResponse::new(err.to_string(), "invalid_request_error").into_response();
+        }
+    };
+
     let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_completion(state, request, priority).await
+        stream_completion(state, request, priority, budget_override).await
     } else {
-        non_stream_completion(state, request, priority)
+        non_stream_completion(state, request, priority, budget_override)
             .await
             .into_response()
     }
@@ -132,6 +161,7 @@ async fn non_stream_completion(
     state: AppState,
     request: CompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Result<Json<CompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -146,6 +176,13 @@ async fn non_stream_completion(
     let prompt = request.prompt.clone();
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
+    // Issue #409: `/v1/completions` takes a raw prompt just like `/completion`;
+    // the request body is not routed through the chat template so the prompt
+    // is not primed with `<think>\n`. Override the chat-oriented default from
+    // `build_generate_options` so the scheduler waits for the model to emit
+    // `<think>` itself before counting reasoning tokens.
+    options.thinking_enter_block_on_start = false;
 
     // In the legacy format, `logprobs` is a number (top-k); 0 means return only
     // the selected token's log-prob, None means don't return logprobs at all.
@@ -194,6 +231,7 @@ async fn stream_completion(
     state: AppState,
     request: CompletionRequest,
     priority: RequestPriority,
+    budget_override: ReasoningBudgetOverride,
 ) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
@@ -206,6 +244,11 @@ async fn stream_completion(
     let prompt = request.prompt.clone();
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
+    options.reasoning_budget = budget_override;
+    // Issue #409: see non_stream_completion — raw-text endpoint, no
+    // `<think>\n` priming, so the scheduler must wait for the model to
+    // emit `<think>` itself before counting reasoning tokens.
+    options.thinking_enter_block_on_start = false;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request

@@ -25,6 +25,9 @@ use std::path::PathBuf;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::ServerStartupConfig;
+use super::thinking_budget::{
+    ThinkingBudget, ThinkingBudgetError, resolve_server_default_reasoning_budget,
+};
 use crate::lang_bias::LangBiasCliArgs;
 
 /// Raw server startup input captured from CLI/front-end binaries.
@@ -165,6 +168,20 @@ pub struct ServerStartupInput {
     /// [`env_fallback_lang_bias`] on the raw CLI args before `resolve()`, so
     /// the env-var and CLI paths share a single normalization point.
     pub lang_bias_config: Option<LangBiasConfig>,
+
+    /// Issue #409: server-wide thinking-token budget for Qwen3-family models.
+    ///
+    /// Raw `i32` value preserving llama.cpp semantics:
+    /// - `-1` (default) — unrestricted reasoning (bit-exact baseline).
+    /// - `0` — immediate `</think>` on the first reasoning token.
+    /// - `N > 0` — cap reasoning at `N` tokens.
+    ///
+    /// Resolved at [`ServerStartupInput::into_startup_config`] time into a
+    /// typed `Option<ThinkingBudget>` on `ServerStartupConfig`. Per-request
+    /// overrides on `/v1/chat/completions` and `/completion` take precedence.
+    /// The env-var fallback `LLAMA_ARG_REASONING_BUDGET` is applied by
+    /// [`env_fallback_reasoning_budget`] before this struct is constructed.
+    pub reasoning_budget: i32,
 }
 
 impl ServerStartupInput {
@@ -172,6 +189,22 @@ impl ServerStartupInput {
     pub fn into_startup_config(self) -> ServerStartupConfig {
         let resolution =
             resolve_prefill_chunk_size(self.prefill_chunk_size, self.batch_size, self.ubatch_size);
+        // Issue #409: resolve the server-wide thinking budget once, up-front.
+        // Invalid values are logged and treated as unbounded so the server
+        // still starts (per-request errors are surfaced as 400s at the route).
+        let reasoning_budget = match ThinkingBudget::from_raw_i32(self.reasoning_budget) {
+            Ok(budget) => budget,
+            Err(ThinkingBudgetError::InvalidNegative(v)) => {
+                tracing::warn!(
+                    "--reasoning-budget {v} is invalid (must be >= -1); ignoring (treating as unbounded)"
+                );
+                None
+            }
+            Err(err) => {
+                tracing::warn!("--reasoning-budget validation error: {err}; treating as unbounded");
+                None
+            }
+        };
         ServerStartupConfig {
             model_path: self.model_path,
             adapter_path: self.adapter_path,
@@ -245,8 +278,26 @@ impl ServerStartupInput {
             metrics_port: self.metrics_port,
             debug_pp_trace: self.debug_pp_trace,
             lang_bias_config: self.lang_bias_config,
+            reasoning_budget,
         }
     }
+}
+
+/// Apply the `LLAMA_ARG_REASONING_BUDGET` env-var fallback to the raw CLI
+/// `--reasoning-budget` value (issue #409).
+///
+/// Precedence rule (matches existing `LLAMA_ARG_*` precedence helpers):
+/// - CLI flag wins over env var.
+/// - When CLI is left at the default (`-1`) and the env var is set to a parseable
+///   integer, the env value takes effect.
+/// - Unparseable env values are logged and ignored (default `-1` is kept).
+///
+/// This helper mutates the raw `i32` on `Args` / `ServeArgs` before
+/// `ServerStartupInput` is constructed so the CLI flag, env var, and
+/// request-body paths all converge on the same [`ThinkingBudget::from_raw_i32`]
+/// validation point.
+pub fn env_fallback_reasoning_budget(cli_value: &mut i32) {
+    *cli_value = resolve_server_default_reasoning_budget(*cli_value);
 }
 
 /// Apply `LLAMA_ARG_LANG_BIAS` env var fallback to the `lang_bias` field (plan §6.4).

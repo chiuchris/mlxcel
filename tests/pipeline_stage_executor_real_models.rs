@@ -458,12 +458,7 @@ fn pipeline_stage_executor_jamba_real_model_parity() {
     // the top of src/distributed/pipeline/stage_executor/jamba.rs); the
     // parity check verifies that executing the stage-assigned layer range
     // on each stage matches the non-PP model's logits end-to-end.
-    assert_two_stage_model_matches_full_model(
-        &repo_model_dir("jamba-v0.1-4bit"),
-        &[1, 2],
-        3,
-        None,
-    );
+    assert_two_stage_model_matches_full_model(&repo_model_dir("jamba-v0.1-4bit"), &[1, 2], 3, None);
 }
 
 #[test]

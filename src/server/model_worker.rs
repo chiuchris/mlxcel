@@ -63,6 +63,8 @@ pub(crate) struct WorkerSchedulerConfig {
     /// tokenizer loads, and attached to the batch scheduler for the rest of
     /// the worker's lifetime.
     pub lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
+    /// Issue #409: server-wide default thinking-token budget.
+    pub reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -212,6 +214,19 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.max_queue_depth,
         );
 
+        // Issue #409: resolve the thinking-token id pair once, after the
+        // tokenizer is loaded. For models without `<think>`/`</think>` tokens
+        // (non-thinking models) this returns `None` and the scheduler silently
+        // ignores any budget parameter (logging once per model load).
+        let thinking_ids = crate::server::thinking_budget::resolve_thinking_token_ids(&tokenizer);
+        if sched_config.reasoning_budget.is_some() && thinking_ids.is_none() {
+            tracing::warn!(
+                "--reasoning-budget / thinking_budget_tokens requested but this model's \
+                 tokenizer has no <think> / </think> tokens; thinking-budget enforcement \
+                 is disabled for this session"
+            );
+        }
+
         let mut scheduler = super::super::batch::BatchScheduler::with_config(
             model,
             tokenizer,
@@ -228,7 +243,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.decode_storage_backend,
         )
         .with_vision_cache_size(sched_config.vision_cache_size)
-        .with_token_bias(token_bias);
+        .with_token_bias(token_bias)
+        .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids);
         scheduler.run();
     })
 }
@@ -302,6 +318,7 @@ pub(crate) fn spawn_legacy_model_worker(
     model_path: PathBuf,
     adapter_path: Option<PathBuf>,
     tensor_parallel: crate::distributed::ShardConfig,
+    reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
     request_rx: mpsc::Receiver<ModelRequest>,
     loaded: Arc<AtomicBool>,
     worker_model_id: String,
@@ -353,6 +370,21 @@ pub(crate) fn spawn_legacy_model_worker(
              (max_batch_size=1, prefill_chunk_size=disabled)"
         );
 
+        // Issue #409: resolve the thinking-token id pair once, after the
+        // tokenizer is loaded. Mirrors the batched-worker path in
+        // `spawn_model_worker_with_batch_config`. For models without
+        // `<think>`/`</think>` tokens the helper returns `None` and the
+        // scheduler silently ignores any budget parameter (after the
+        // warn-once log below).
+        let thinking_ids = crate::server::thinking_budget::resolve_thinking_token_ids(&tokenizer);
+        if reasoning_budget.is_some() && thinking_ids.is_none() {
+            tracing::warn!(
+                "--reasoning-budget / thinking_budget_tokens requested but this model's \
+                 tokenizer has no <think> / </think> tokens; thinking-budget enforcement \
+                 is disabled for this session"
+            );
+        }
+
         // Reuse BatchScheduler with max_batch_size=1 and chunking disabled.
         // Per the scheduler docs, size-1 behavior is identical to the old
         // sequential recv() loop, with no extra overhead.
@@ -375,7 +407,8 @@ pub(crate) fn spawn_legacy_model_worker(
             crate::server::config::PreemptionPolicy::default(),
             1, // max_batch_prefill = 1 → sequential prefill
             crate::server::DecodeStorageBackend::Dense,
-        );
+        )
+        .with_reasoning_budget(reasoning_budget, thinking_ids);
         scheduler.run();
     })
 }

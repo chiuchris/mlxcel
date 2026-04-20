@@ -76,8 +76,7 @@ async fn capability_negotiation_yields_stable_state() {
 async fn record_peer_fallback_flips_state_and_logs_reason() {
     let transport = new_local_rdma().await;
     let before = transport.peer_fallbacks();
-    let was_accelerated =
-        transport.acceleration().await != RdmaAcceleration::TcpFallback;
+    let was_accelerated = transport.acceleration().await != RdmaAcceleration::TcpFallback;
 
     // Simulate a peer that replied with an incompatible protocol version.
     transport
@@ -111,11 +110,7 @@ async fn record_peer_fallback_flips_state_and_logs_reason() {
 #[tokio::test]
 async fn check_peer_protocol_rejects_mismatch() {
     let transport = new_local_rdma().await;
-    assert!(
-        transport
-            .check_peer_protocol(RDMA_PROTOCOL_VERSION)
-            .is_ok()
-    );
+    assert!(transport.check_peer_protocol(RDMA_PROTOCOL_VERSION).is_ok());
     let err = transport
         .check_peer_protocol(RDMA_PROTOCOL_VERSION.wrapping_add(1))
         .unwrap_err();

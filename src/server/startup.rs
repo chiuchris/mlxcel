@@ -205,6 +205,17 @@ pub struct ServerStartupConfig {
     /// already resolved from CLI flags (B6) or the `LLAMA_ARG_LANG_BIAS`
     /// env-var path (B7). `None` preserves the bit-exact baseline path.
     pub lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
+
+    /// Issue #409: server-wide default for the thinking-token budget.
+    ///
+    /// Normalized from the raw `i32` on [`super::ServerStartupInput`] via
+    /// [`super::thinking_budget::ThinkingBudget::from_raw_i32`]. `None` means
+    /// "unrestricted reasoning" (llama.cpp `-1` semantics); per-request body
+    /// fields may still impose or lift a cap on a per-request basis. Applies
+    /// only to Qwen3-family thinking models — for models that lack
+    /// `<think>` / `</think>` token IDs the scheduler resolves the token pair
+    /// to `None` and the budget is silently ignored.
+    pub reasoning_budget: Option<super::thinking_budget::ThinkingBudget>,
 }
 
 impl Default for ServerStartupConfig {
@@ -282,6 +293,7 @@ impl Default for ServerStartupConfig {
             metrics_port: None,
             debug_pp_trace: None,
             lang_bias_config: None,
+            reasoning_budget: None,
         }
     }
 }
@@ -434,6 +446,7 @@ pub(super) fn build_server_config(
         tensor_parallel,
         vision_cache_size: startup.vision_cache_size,
         lang_bias_config: startup.lang_bias_config.clone(),
+        reasoning_budget: startup.reasoning_budget,
     }
 }
 
@@ -472,6 +485,11 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
             stop_sequences: None,
             priority: crate::server::batch::RequestPriority::Normal,
             logprobs: Default::default(),
+            reasoning_budget: Default::default(),
+            // Issue #409: warmup prompt is the raw literal "Hello", not a
+            // chat-templated prompt with `<think>\n` priming, so treat the
+            // first token as not-yet-in-block.
+            thinking_enter_block_on_start: false,
         },
     )?;
     Ok(())

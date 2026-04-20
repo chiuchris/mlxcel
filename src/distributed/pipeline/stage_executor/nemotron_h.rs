@@ -46,8 +46,8 @@
 use std::path::Path;
 
 use anyhow::{Result, anyhow, bail, ensure};
-use mlxcel_core::layers::KVCache;
 use mlxcel_core::MlxArray;
+use mlxcel_core::layers::KVCache;
 
 use crate::models::{self, NemotronHModel, nemotron_h::NemotronLayerCache};
 

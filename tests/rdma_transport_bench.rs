@@ -57,10 +57,10 @@ async fn rdma_vs_tcp_activation_transfer() {
     // (per-stage hidden state). Keep the iteration count moderate so the
     // test still completes in seconds on CI-class hardware.
     let scenarios: &[(usize, usize)] = &[
-        (64 * 1024, 256),        // 64 KiB — RPC-sized handoff
-        (1 * 1024 * 1024, 128),  // 1 MiB  — decode-step activation
-        (8 * 1024 * 1024, 64),   // 8 MiB  — prefill-sized activation
-        (32 * 1024 * 1024, 16),  // 32 MiB — stage hand-off worst case
+        (64 * 1024, 256),       // 64 KiB — RPC-sized handoff
+        (1 * 1024 * 1024, 128), // 1 MiB  — decode-step activation
+        (8 * 1024 * 1024, 64),  // 8 MiB  — prefill-sized activation
+        (32 * 1024 * 1024, 16), // 32 MiB — stage hand-off worst case
     ];
 
     // ----- TCP baseline -----
@@ -78,7 +78,10 @@ async fn rdma_vs_tcp_activation_transfer() {
     })
     .await
     .unwrap();
-    tcp_client.connect(&[tcp_server_addr.clone()]).await.unwrap();
+    tcp_client
+        .connect(&[tcp_server_addr.clone()])
+        .await
+        .unwrap();
     let drain_tcp = spawn_drain_task(tcp_server.clone());
 
     let mut reports = Vec::new();
@@ -114,7 +117,10 @@ async fn rdma_vs_tcp_activation_transfer() {
     })
     .await
     .unwrap();
-    rdma_client.connect(&[rdma_server_addr.clone()]).await.unwrap();
+    rdma_client
+        .connect(&[rdma_server_addr.clone()])
+        .await
+        .unwrap();
     let drain_rdma = spawn_drain_task(rdma_server.clone());
 
     for (payload, iters) in scenarios.iter().copied() {

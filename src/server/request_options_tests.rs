@@ -59,6 +59,8 @@ fn build_server_generate_options_applies_request_overrides() {
             dry_sequence_breakers: Some(vec![1, 2]),
             stop_sequences: Some(vec!["stop".to_string()]),
             priority: crate::server::batch::RequestPriority::High,
+            reasoning_budget: crate::server::config::ReasoningBudgetOverride::default(),
+            thinking_enter_block_on_start: true,
         },
     );
 

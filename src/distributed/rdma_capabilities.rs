@@ -154,11 +154,9 @@ fn check_linux_io_uring_enabled() -> Result<(), String> {
             Ok(contents) => {
                 let trimmed = contents.trim();
                 if trimmed == "2" {
-                    return Err(
-                        "os=linux, driver=io_uring_disabled_sysctl: \
+                    return Err("os=linux, driver=io_uring_disabled_sysctl: \
                          /proc/sys/kernel/io_uring_disabled = 2 (forbidden)"
-                            .to_string(),
-                    );
+                        .to_string());
                 }
             }
             Err(err) => {

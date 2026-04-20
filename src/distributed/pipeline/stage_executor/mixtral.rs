@@ -67,7 +67,8 @@ impl MixtralStageExecutor {
         let group_size = args.group_size();
         let bits = args.bits();
 
-        let load_embeddings = filter.has_embedding || (args.tie_word_embeddings && filter.has_lm_head);
+        let load_embeddings =
+            filter.has_embedding || (args.tie_word_embeddings && filter.has_lm_head);
         let embed_tokens = if load_embeddings {
             Some(
                 UnifiedEmbedding::from_weights(&weights, "model.embed_tokens", group_size, bits)

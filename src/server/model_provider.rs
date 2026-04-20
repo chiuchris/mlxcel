@@ -129,6 +129,7 @@ impl ModelProvider {
                 model_path,
                 adapter_path,
                 config.tensor_parallel.clone(),
+                config.reasoning_budget,
                 batch_metrics,
                 batch_observability,
             )
@@ -146,6 +147,7 @@ impl ModelProvider {
                 config.pipeline_parallel_runtime.clone(),
                 config.vision_cache_size,
                 config.lang_bias_config.clone(),
+                config.reasoning_budget,
                 batch_metrics,
                 batch_observability,
             )
@@ -161,6 +163,7 @@ impl ModelProvider {
         model_path: PathBuf,
         adapter_path: Option<PathBuf>,
         tensor_parallel: crate::distributed::ShardConfig,
+        reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -181,6 +184,7 @@ impl ModelProvider {
             model_path,
             adapter_path,
             tensor_parallel,
+            reasoning_budget,
             request_rx,
             loaded_clone,
             worker_model_id,
@@ -226,6 +230,7 @@ impl ModelProvider {
             None,
             crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             None,
+            None,
             batch_metrics,
             batch_observability,
         )
@@ -240,6 +245,11 @@ impl ModelProvider {
     /// `lang_bias_config` is the Axis B / Epic #362 (B8) server-wide
     /// language-bias configuration. Pass `None` for the baseline bit-exact
     /// path (no sampling changes, no tokenizer-vocab scan).
+    ///
+    /// `reasoning_budget` (issue #409) is the server-wide default
+    /// thinking-token budget for Qwen3-family models. Pass `None` for
+    /// unrestricted reasoning (bit-exact baseline); per-request
+    /// `thinking_budget_tokens` still takes precedence.
     #[allow(clippy::too_many_arguments)]
     pub fn new_with_full_config_and_batch_prefill(
         model_path: PathBuf,
@@ -254,6 +264,7 @@ impl ModelProvider {
         pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
         vision_cache_size: usize,
         lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
+        reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -282,6 +293,7 @@ impl ModelProvider {
             tensor_parallel: crate::distributed::ShardConfig::default(),
             vision_cache_size,
             lang_bias_config,
+            reasoning_budget,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -346,6 +358,7 @@ impl ModelProvider {
             tensor_parallel: crate::distributed::ShardConfig::default(),
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             lang_bias_config: None,
+            reasoning_budget: None,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

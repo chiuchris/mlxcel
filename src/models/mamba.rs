@@ -234,12 +234,7 @@ impl MambaBlock {
             let n_keep = k - 1;
             let padded_shape = mlxcel_core::array_shape(&padded_input);
             let len = padded_shape[1] as usize;
-            let tail = slice_axis(
-                &padded_input,
-                1,
-                (len - n_keep) as i32,
-                len as i32,
-            );
+            let tail = slice_axis(&padded_input, 1, (len - n_keep) as i32, len as i32);
             c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
         }
 

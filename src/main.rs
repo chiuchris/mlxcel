@@ -725,6 +725,21 @@ pub(crate) struct ServeArgs {
     /// when running as a server (plan §6.4, B7). CLI flag takes precedence.
     #[command(flatten)]
     lang_bias: LangBiasCliArgs,
+
+    /// Issue #409: default thinking-token budget for Qwen3-family models.
+    ///
+    /// Caps the number of tokens generated inside the `<think>...</think>`
+    /// reasoning block. Matches llama.cpp `--reasoning-budget` semantics:
+    ///   -1 = unrestricted (default)
+    ///    0 = immediate end of thinking (force </think> on first reasoning token)
+    ///    N > 0 = cap reasoning at N tokens
+    ///
+    /// Also honors `LLAMA_ARG_REASONING_BUDGET`; CLI flag wins on conflict.
+    /// Per-request `thinking_budget_tokens` / `thinking_token_budget` /
+    /// `thinking_budget` on `/v1/chat/completions` or `/completion` overrides
+    /// this value.
+    #[arg(long = "reasoning-budget", default_value_t = -1, value_name = "N")]
+    reasoning_budget: i32,
 }
 
 fn main() -> anyhow::Result<()> {

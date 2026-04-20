@@ -31,9 +31,7 @@ use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
 use crate::phi4mm_prompt::prepare_phi4mm_prompt_tokens;
 use crate::qwen_vl::insert_qwen_vl_image_tokens;
-use crate::vision::feature_cache::{
-    CacheKey, ModelVisionCaches, image_hash_from_pixels,
-};
+use crate::vision::feature_cache::{CacheKey, ModelVisionCaches, image_hash_from_pixels};
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::processors::ImageProcessor;
 use crate::vlm_prompt::{ImageTokenBlockStats, apply_image_token_blocks};
@@ -324,9 +322,16 @@ where
             // keys supplied by the caller take precedence over hashing the
             // pixel tensor, which matches the "path > hash" policy.
             let gemma4_keys: Option<Vec<Option<CacheKey>>> = if active_caches.is_some() {
-                Some(resolve_per_image_keys(image_cache_keys, processed_images.len(), |i| {
-                    processed_images[i].pixel_values.as_ref().map(image_hash_from_pixels)
-                }))
+                Some(resolve_per_image_keys(
+                    image_cache_keys,
+                    processed_images.len(),
+                    |i| {
+                        processed_images[i]
+                            .pixel_values
+                            .as_ref()
+                            .map(image_hash_from_pixels)
+                    },
+                ))
             } else {
                 None
             };

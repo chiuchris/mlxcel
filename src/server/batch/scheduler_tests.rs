@@ -65,6 +65,7 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         first_token_time: None,
         token_history: Vec::new(),
         merged_eos: Vec::new(),
+        thinking: crate::server::thinking_budget::ThinkingState::disabled(),
     };
 
     (seq, rx)
@@ -250,6 +251,7 @@ fn make_test_sequence_with_priority(
         first_token_time: None,
         token_history: Vec::new(),
         merged_eos: Vec::new(),
+        thinking: crate::server::thinking_budget::ThinkingState::disabled(),
     };
 
     (seq, rx)

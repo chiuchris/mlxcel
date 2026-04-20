@@ -108,6 +108,7 @@ fn sample_input() -> ServerStartupInput {
         metrics_port: None,
         debug_pp_trace: None,
         lang_bias_config: None,
+        reasoning_budget: -1,
     }
 }
 

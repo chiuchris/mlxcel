@@ -21,6 +21,7 @@
 use super::{ServerConfig, ServerGenerateOptions};
 use crate::sampling::{ResolvedSamplingParams, build_sampling_config};
 use crate::server::batch::RequestPriority;
+use crate::server::config::ReasoningBudgetOverride;
 use mlxcel_core::sampling::LogprobsConfig;
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -41,6 +42,12 @@ pub(crate) struct RequestOptionOverrides {
     pub dry_sequence_breakers: Option<Vec<i32>>,
     pub stop_sequences: Option<Vec<String>>,
     pub priority: RequestPriority,
+    /// Issue #409: per-request thinking-token budget override.
+    pub reasoning_budget: ReasoningBudgetOverride,
+    /// Issue #409: whether the rendered prompt primes `<think>\n` (true for
+    /// chat endpoints) vs. takes a free-form prompt (false for raw text
+    /// completion endpoints).
+    pub thinking_enter_block_on_start: bool,
 }
 
 pub(crate) fn build_server_generate_options(
@@ -82,6 +89,8 @@ pub(crate) fn build_server_generate_options(
         stop_sequences: overrides.stop_sequences,
         priority: overrides.priority,
         logprobs: LogprobsConfig::default(),
+        reasoning_budget: overrides.reasoning_budget,
+        thinking_enter_block_on_start: overrides.thinking_enter_block_on_start,
     }
 }
 

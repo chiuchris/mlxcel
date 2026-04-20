@@ -97,8 +97,5 @@ fn acceleration_display_strings_are_stable() {
         format!("{}", RdmaAcceleration::MacosKqueueRegistered),
         "kqueue_registered"
     );
-    assert_eq!(
-        format!("{}", RdmaAcceleration::TcpFallback),
-        "tcp_fallback"
-    );
+    assert_eq!(format!("{}", RdmaAcceleration::TcpFallback), "tcp_fallback");
 }

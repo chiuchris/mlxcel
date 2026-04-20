@@ -696,12 +696,7 @@ impl JambaMambaMixer {
         if let Some(c) = cache.as_deref_mut() {
             let padded_shape = mlxcel_core::array_shape(&padded_input);
             let len = padded_shape[1] as usize;
-            let tail = slice_axis(
-                &padded_input,
-                1,
-                (len - (k - 1)) as i32,
-                len as i32,
-            );
+            let tail = slice_axis(&padded_input, 1, (len - (k - 1)) as i32, len as i32);
             c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
         }
 

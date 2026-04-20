@@ -65,6 +65,46 @@ pub struct ServerGenerateOptions {
     pub priority: RequestPriority,
     /// Log probability configuration; disabled by default (zero overhead).
     pub logprobs: LogprobsConfig,
+    /// Issue #409: per-request thinking-token budget. `None` means "inherit
+    /// whatever server default is configured"; `Some(budget)` explicitly sets
+    /// a value for this request (including reverting to unbounded via
+    /// the raw `-1` request value, which the routes translate to a sentinel
+    /// before reaching this field).
+    ///
+    /// Resolution precedence is performed in the route layer via
+    /// [`crate::server::thinking_budget::resolve_request_budget`] so the
+    /// scheduler sees a single effective value.
+    pub reasoning_budget: ReasoningBudgetOverride,
+
+    /// Issue #409: whether the first generated token should be treated as
+    /// "already inside the `<think>` block" because the prompt primed it.
+    ///
+    /// `true` for chat endpoints (`/v1/chat/completions`) whose chat template
+    /// renders a Qwen3-style `<think>\n` at the end of the prompt, so the
+    /// model's first decoded token is reasoning content. `false` for the raw
+    /// text endpoints (`/v1/completions`, `/completion`) where the prompt is
+    /// free-form and the model must emit `<think>` itself before any counting
+    /// begins. Without this distinction, a raw-text request with
+    /// `thinking_budget_tokens > 0` would miscount ordinary answer tokens as
+    /// reasoning tokens.
+    pub thinking_enter_block_on_start: bool,
+}
+
+/// Per-request reasoning-budget override.
+///
+/// Distinct from `Option<ThinkingBudget>` because the "per-request explicitly
+/// set to -1 (revert to unbounded)" case needs to be representable distinctly
+/// from "no per-request override; inherit server default". The route helpers
+/// normalize request bodies into this enum before the scheduler consumes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ReasoningBudgetOverride {
+    /// No per-request value supplied — the scheduler should use the
+    /// server-wide default from `ServerConfig::reasoning_budget`.
+    #[default]
+    InheritServerDefault,
+    /// Per-request override resolved to this effective budget (or `None` =
+    /// explicitly unrestricted).
+    Explicit(Option<crate::server::thinking_budget::ThinkingBudget>),
 }
 
 /// Policy for selecting which sequence to evict when preemption is enabled
@@ -200,6 +240,12 @@ pub struct ServerConfig {
     /// var. Every batch sequence inherits this same policy (Phase 1 single
     /// policy per batch; per-request overrides reserved for B12).
     pub lang_bias_config: Option<LangBiasConfig>,
+
+    /// Issue #409: server-wide default thinking-token budget for Qwen3-family
+    /// models. `None` = unrestricted reasoning (default, bit-exact baseline).
+    /// Per-request `thinking_budget_tokens` overrides this value (including
+    /// a per-request `-1` reverting to unbounded for that one request).
+    pub reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
 }
 
 impl Default for ServerConfig {
@@ -242,6 +288,7 @@ impl Default for ServerConfig {
             tensor_parallel: ShardConfig::default(),
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             lang_bias_config: None,
+            reasoning_budget: None,
         }
     }
 }

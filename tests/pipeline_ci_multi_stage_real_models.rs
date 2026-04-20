@@ -254,6 +254,8 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
         stop_sequences: None,
         priority: RequestPriority::Normal,
         logprobs: Default::default(),
+        reasoning_budget: Default::default(),
+        thinking_enter_block_on_start: false,
     };
 
     let dense = dense_provider
