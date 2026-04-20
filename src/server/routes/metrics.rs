@@ -48,6 +48,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     // B9 — read process-wide lang-bias observability counters.
     let lang_bias_applied = mlxcel_core::lang_bias_applied_total();
     let lang_bias_suppressed = mlxcel_core::lang_bias_tokens_suppressed_total();
+    // Issue #405 — byte-fragment suppression counter. Strict subset of
+    // `lang_bias_suppressed`; tracks suppressions that came from the opt-in
+    // byte-fragment classifier so operators can observe over-suppression.
+    let lang_bias_byte_fragment = mlxcel_core::lang_bias_byte_fragment_suppressions_total();
 
     let slots_total = state.config.max_batch_size;
     let active = state.batch_metrics.active_count();
@@ -130,7 +134,10 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_lang_bias_applied_total {lang_bias_applied}\n\
          # HELP mlxcel_lang_bias_tokens_suppressed_total Sampling steps where the pre-bias top-1 token was neg-inf suppressed\n\
          # TYPE mlxcel_lang_bias_tokens_suppressed_total counter\n\
-         mlxcel_lang_bias_tokens_suppressed_total {lang_bias_suppressed}\n",
+         mlxcel_lang_bias_tokens_suppressed_total {lang_bias_suppressed}\n\
+         # HELP mlxcel_lang_bias_byte_fragment_suppressions_total Suppressions where the neg-inf top-1 token was classified via UTF-8 start-byte (issue #405)\n\
+         # TYPE mlxcel_lang_bias_byte_fragment_suppressions_total counter\n\
+         mlxcel_lang_bias_byte_fragment_suppressions_total {lang_bias_byte_fragment}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
         seq_started = obs.sequences_started,
         seq_completed = obs.sequences_completed,

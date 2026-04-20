@@ -13,11 +13,24 @@
 // limitations under the License.
 
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
-use super::{
-    ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed,
-};
+use super::{ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed};
 use crate::lang_bias::LangBiasCliArgs;
+
+// Global mutex to serialize all tests that mutate env vars via `EnvGuard`.
+// `std::env::set_var` / `remove_var` are not thread-safe under cargo's default
+// parallel test runner.  Every test that calls `EnvGuard::set` must acquire
+// this lock *before* constructing the guard so the lock outlives the guard's
+// `Drop` (which calls `remove_var`).
+static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+    ENV_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
 
 fn sample_input() -> ServerStartupInput {
     ServerStartupInput {
@@ -269,6 +282,7 @@ fn env_var_feeds_parser() {
     use super::env_fallback_lang_bias;
     use crate::lang_bias::parse_lang_bias_entries;
 
+    let _env_guard = env_lock();
     let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ja=-inf,zh=-5");
 
     let mut args = LangBiasCliArgs::default(); // lang_bias = None (no CLI flag)
@@ -314,6 +328,7 @@ fn env_var_feeds_parser() {
 fn env_without_cli_parses() {
     use super::env_fallback_lang_bias;
 
+    let _env_guard = env_lock();
     let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ko=+5");
 
     let mut args = LangBiasCliArgs::default();
@@ -344,6 +359,7 @@ fn env_without_cli_parses() {
 fn cli_overrides_env() {
     use super::env_fallback_lang_bias;
 
+    let _env_guard = env_lock();
     let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS", "ko=+5");
 
     // Simulate CLI providing `--lang-bias ja=-inf`.
@@ -366,4 +382,93 @@ fn cli_overrides_env() {
     use mlxcel_core::lang_analyzer::LanguageCode;
     assert_eq!(config.bias_set.ordered[0].0, LanguageCode::Ja);
     assert_eq!(config.bias_set.ordered[0].1, f32::NEG_INFINITY);
+}
+
+// -------------------------------------------------------------------------
+// Issue #405 — LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS env-var fallback
+//
+// Mirrors the B7 tests above. The env-var fallback for the byte-fragment
+// opt-in is permissive about truthiness (accepts `true`/`false`/`1`/`0`) and
+// respects CLI precedence.
+// -------------------------------------------------------------------------
+
+/// Env var set without CLI flag → `include_byte_fragments` is flipped to `true`.
+#[test]
+fn byte_fragments_env_var_feeds_flag_true() {
+    use super::env_fallback_lang_bias_include_byte_fragments;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "true");
+
+    let mut args = LangBiasCliArgs::default();
+    assert!(
+        !args.include_byte_fragments,
+        "default must be false before fallback runs"
+    );
+    env_fallback_lang_bias_include_byte_fragments(&mut args);
+    assert!(
+        args.include_byte_fragments,
+        "truthy env var must flip include_byte_fragments to true"
+    );
+}
+
+/// Env var supports `1` / `0` forms too.
+#[test]
+fn byte_fragments_env_var_accepts_numeric_forms() {
+    use super::env_fallback_lang_bias_include_byte_fragments;
+
+    let _env_guard = env_lock();
+    // `1` → true
+    {
+        let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "1");
+        let mut args = LangBiasCliArgs::default();
+        env_fallback_lang_bias_include_byte_fragments(&mut args);
+        assert!(args.include_byte_fragments, "`1` must parse as true");
+    }
+    // `0` → false → no flip when CLI was already false.
+    {
+        let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "0");
+        let mut args = LangBiasCliArgs::default();
+        env_fallback_lang_bias_include_byte_fragments(&mut args);
+        assert!(
+            !args.include_byte_fragments,
+            "`0` must keep include_byte_fragments=false"
+        );
+    }
+}
+
+/// CLI `--lang-bias-include-byte-fragments` beats the env var.
+#[test]
+fn byte_fragments_cli_overrides_env() {
+    use super::env_fallback_lang_bias_include_byte_fragments;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "false");
+
+    // CLI already set include_byte_fragments=true.
+    let mut args = LangBiasCliArgs {
+        include_byte_fragments: true,
+        ..Default::default()
+    };
+    env_fallback_lang_bias_include_byte_fragments(&mut args);
+    assert!(
+        args.include_byte_fragments,
+        "CLI --lang-bias-include-byte-fragments must win against env 'false'"
+    );
+}
+
+/// Unparseable env var is ignored (warn-and-drop), leaving CLI default.
+#[test]
+fn byte_fragments_env_var_unparseable_is_ignored() {
+    use super::env_fallback_lang_bias_include_byte_fragments;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS", "maybe");
+
+    let mut args = LangBiasCliArgs::default();
+    env_fallback_lang_bias_include_byte_fragments(&mut args);
+    assert!(
+        !args.include_byte_fragments,
+        "unparseable env var must leave the CLI default (false) in place"
+    );
 }

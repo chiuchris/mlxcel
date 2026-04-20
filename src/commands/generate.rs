@@ -45,7 +45,7 @@ use mlxcel_core::generation_policy::{
     initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
 use mlxcel_core::lang_analyzer::LangBiasConfig;
-use mlxcel_core::sampling::{sample_token_optimized, TokenBiasMap};
+use mlxcel_core::sampling::{TokenBiasMap, sample_token_optimized};
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -766,12 +766,25 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         } else {
             (String::new(), "conservative")
         };
-        tracing::debug!(
-            entries = token_bias.len(),
-            languages = %languages_str,
-            policy = %policy_str,
-            "lang_bias resolved"
-        );
+        // Issue #405 — emit byte_fragment_entries only when non-zero so the
+        // existing B9 field shape is preserved for Phase 1 configs.
+        let byte_fragment_entries = token_bias.byte_fragment_len();
+        if byte_fragment_entries > 0 {
+            tracing::debug!(
+                entries = token_bias.len(),
+                byte_fragment_entries,
+                languages = %languages_str,
+                policy = %policy_str,
+                "lang_bias resolved"
+            );
+        } else {
+            tracing::debug!(
+                entries = token_bias.len(),
+                languages = %languages_str,
+                policy = %policy_str,
+                "lang_bias resolved"
+            );
+        }
     }
 
     // Parse KV cache mode (validated early so errors surface before generation)

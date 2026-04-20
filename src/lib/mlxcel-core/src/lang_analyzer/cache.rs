@@ -304,6 +304,50 @@ mod tests {
         );
     }
 
+    /// Issue #405 — a v2 cache file must auto-invalidate and rebuild to v3.
+    ///
+    /// Simulates a pre-#405 deployment: writes a cache file carrying the old
+    /// `version = 2` tag and exercises `load_or_build` with `rebuild=false`.
+    /// The old file must be discarded and a fresh v3 index written in its
+    /// place. This is the key backward-compatibility guarantee for Phase 1
+    /// users who upgrade to the byte-fragment-aware build.
+    #[test]
+    fn cache_v2_auto_rebuilds_to_v3() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let json = mock_json("marker_v2_to_v3");
+        let json_bytes = json.as_bytes().to_vec();
+        let tok = make_tokenizer(&json);
+
+        // Build a valid index, then stamp it as v2 and save.
+        let mut idx_v2 = build_test_index(&json);
+        idx_v2.version = 2;
+
+        let _guard = env_lock();
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+        save(&idx_v2).expect("save v2 cache");
+
+        // `try_load` must refuse the v2 cache.
+        let loaded = try_load(&idx_v2.vocab_hash);
+        assert!(
+            loaded.is_none(),
+            "try_load must reject v2 cache once CURRENT_VERSION advances"
+        );
+
+        // `load_or_build` must rebuild to the current version.
+        let rebuilt =
+            load_or_build(&tok, &json_bytes, false).expect("load_or_build should rebuild v2→v3");
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+        drop(_guard);
+
+        assert_eq!(
+            rebuilt.version, CURRENT_VERSION,
+            "rebuilt cache must carry CURRENT_VERSION (now 3): got {}",
+            rebuilt.version
+        );
+        // The on-disk file must have been rewritten (not carrying v2 anymore).
+        assert_eq!(rebuilt.vocab_hash, idx_v2.vocab_hash);
+    }
+
     // -------------------------------------------------------------------------
     // cache_corrupted_moves_aside_and_none
     // -------------------------------------------------------------------------

@@ -226,7 +226,14 @@ use tokenizers::Tokenizer;
 /// - v2: classify via `decode` so byte-level BPE tokenizers (Qwen, GPT-2, LLaMA)
 ///   produce correct script assignments instead of defaulting every non-ASCII
 ///   token to Latin.
-pub const CURRENT_VERSION: u32 = 2;
+/// - v3 (issue #405): adds optional byte-fragment classification for byte-level
+///   BPE tokenizers. Tokens that decode to `U+FFFD` (byte-fragment leaves) are
+///   tagged via UTF-8 start-byte analysis and flagged with
+///   [`TokenScriptInfo::is_byte_fragment`]. The index layout itself is
+///   backward-compatible with v2 at the wire level, but the new field is
+///   required for the opt-in `ExceptionConfig::include_byte_fragments` path,
+///   so v2 caches must be rebuilt to populate it.
+pub const CURRENT_VERSION: u32 = 3;
 
 /// Per-token metadata produced by the vocabulary scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -237,6 +244,14 @@ pub struct TokenScriptInfo {
     pub is_numeric: bool,
     pub is_punctuation: bool,
     pub is_whitespace: bool,
+    /// `true` when this token was classified via byte-fragment UTF-8 start-byte
+    /// analysis (issue #405), i.e. the decode path produced `U+FFFD` / empty
+    /// and the token is a byte-level BPE leaf. Always `false` for tokens that
+    /// classified via the Phase 1 decode path. Populated only when the vocab
+    /// scan ran with byte-fragment analysis enabled; older v2 cache files lack
+    /// this distinction and are rebuilt to v3 via the cache version check.
+    #[serde(default)]
+    pub is_byte_fragment: bool,
 }
 
 /// Per-model, once-computed classification of every vocabulary token by script.
@@ -312,7 +327,12 @@ impl TokenLanguageIndex {
     ///    language filtering.
     /// 3. Classify using B2 helpers on the decoded string.
     /// 4. Set `is_special` from the tokenizer's added-tokens decoder.
-    /// 5. Invert into `by_script`.
+    /// 5. (Issue #405) If the tokenizer has a `ByteLevel` pre-tokenizer in its
+    ///    chain, run a second pass: for tokens that decoded to `U+FFFD` /
+    ///    empty AND have no Phase 1 script, reverse-map the byte-level char
+    ///    back to its raw byte and classify by UTF-8 start-byte range. See
+    ///    [`classify_byte_start`] for the start-byte → Script table.
+    /// 6. Invert into `by_script`.
     pub fn build(tokenizer: &Tokenizer, tokenizer_json_bytes: &[u8]) -> Result<Self, LangAnalyzerError> {
         let vocab_size = tokenizer.get_vocab_size(true);
         if vocab_size == 0 {
@@ -326,6 +346,16 @@ impl TokenLanguageIndex {
             .filter(|(_, tok)| tok.special)
             .map(|(id, _)| *id)
             .collect();
+
+        // Build the byte-level char→byte reverse table once per vocab scan. When
+        // the tokenizer's pre-tokenizer chain does not include a `ByteLevel`
+        // entry (SentencePiece, Tiktoken, WordLevel fixtures) this returns
+        // `None` and the byte-fragment pass is skipped entirely.
+        let byte_reverse = if has_byte_level_pretokenizer(tokenizer) {
+            Some(build_byte_level_reverse_map())
+        } else {
+            None
+        };
 
         let mut tokens = Vec::with_capacity(vocab_size);
         let mut by_script: HashMap<Script, Vec<i32>> = HashMap::new();
@@ -345,10 +375,49 @@ impl TokenLanguageIndex {
                     .unwrap_or_default()
             };
 
-            let scripts = classify_token(&token_str);
-            let is_num = is_numeric(&token_str);
-            let is_punct = is_punctuation(&token_str);
+            let mut scripts = classify_token(&token_str);
+            let mut is_num = is_numeric(&token_str);
+            let mut is_punct = is_punctuation(&token_str);
             let is_ws = is_whitespace(&token_str);
+
+            // Issue #405 — byte-fragment second pass.
+            //
+            // Only runs when the tokenizer actually uses byte-level BPE and
+            // when the Phase 1 decode path produced no script information.
+            // Specials are skipped so we never reassign a BOS/EOS/PAD token.
+            // Byte-level pre-tokenizers map each raw byte 0x00..=0xFF to a
+            // printable Unicode char (see GPT-2 encoder). `id_to_token`
+            // returns that pre-image, so a vocab entry representing a single
+            // raw byte has `len_chars == 1` after stripping known BPE prefix
+            // markers. We reverse-map that char back to the raw byte and
+            // classify by UTF-8 start-byte range.
+            //
+            // When a byte-fragment is identified, its Phase 1
+            // `is_numeric`/`is_punctuation` flags are force-cleared. The
+            // replacement character (`U+FFFD`) is Unicode-Common and
+            // `is_punctuation` would otherwise return `true` for it,
+            // which would cause the exception-config filter to reject the
+            // fragment even with `include_byte_fragments = true`.
+            let mut is_byte_fragment = false;
+            if !is_special && scripts.is_empty() {
+                if let Some(reverse) = &byte_reverse {
+                    if token_str.is_empty()
+                        || token_str.chars().any(|c| c == '\u{FFFD}')
+                    {
+                        if let Some(raw_byte) = reverse_byte_for_token(tokenizer, id, reverse) {
+                            if let Some(script) = classify_byte_start(raw_byte) {
+                                scripts.push(script);
+                                is_byte_fragment = true;
+                                // U+FFFD-driven punctuation/numeric flags are
+                                // an artifact of the decode path, not the
+                                // token's real nature.
+                                is_num = false;
+                                is_punct = false;
+                            }
+                        }
+                    }
+                }
+            }
 
             // Populate the inverted index. Exception flags do NOT exclude from
             // by_script here — that filtering happens in B5 via ExceptionConfig.
@@ -363,6 +432,7 @@ impl TokenLanguageIndex {
                 is_numeric: is_num,
                 is_punctuation: is_punct,
                 is_whitespace: is_ws,
+                is_byte_fragment,
             });
         }
 
@@ -375,6 +445,151 @@ impl TokenLanguageIndex {
             tokens,
             by_script,
         })
+    }
+}
+
+// ============================================================================
+// Issue #405 — Byte-fragment CJK classification via UTF-8 start-byte analysis
+// ============================================================================
+
+/// Return `true` if the tokenizer's pre-tokenizer chain contains a
+/// [`tokenizers::pre_tokenizers::byte_level::ByteLevel`] entry.
+///
+/// Walks both the top-level `PreTokenizerWrapper` and any nested `Sequence`
+/// entries so that mixed chains (e.g. `Sequence[Split, ByteLevel]`) are
+/// detected. SentencePiece (`Metaspace`), Tiktoken, BERT, and other families
+/// return `false` here and the byte-fragment pass is skipped without error.
+fn has_byte_level_pretokenizer(tokenizer: &Tokenizer) -> bool {
+    use tokenizers::pre_tokenizers::PreTokenizerWrapper;
+    fn contains_byte_level(wrapper: &PreTokenizerWrapper) -> bool {
+        match wrapper {
+            PreTokenizerWrapper::ByteLevel(_) => true,
+            PreTokenizerWrapper::Sequence(seq) => {
+                seq.as_ref().iter().any(contains_byte_level)
+            }
+            _ => false,
+        }
+    }
+    match tokenizer.get_pre_tokenizer() {
+        Some(pt) => contains_byte_level(pt),
+        None => false,
+    }
+}
+
+/// Build the byte-level reverse map (char → raw byte) used by the byte-fragment
+/// classifier.
+///
+/// Mirrors the `bytes_char()` function from the `tokenizers` crate
+/// (`src/pre_tokenizers/byte_level.rs`), which is itself a port of the GPT-2
+/// encoder at <https://github.com/openai/gpt-2/blob/master/src/encoder.py#L9>.
+/// The forward map sends 0x00..=0xFF → a printable Unicode char; we build the
+/// inverse here so that `tokenizer.id_to_token(id)` char output can be turned
+/// back into the raw byte it represents.
+fn build_byte_level_reverse_map() -> HashMap<char, u8> {
+    // The forward alphabet is a stable mapping of 256 bytes to 256 distinct
+    // chars. We reproduce it locally rather than depending on the `tokenizers`
+    // private `BYTES_CHAR` static, so this code survives upstream refactors.
+    let mut bs: Vec<u8> = Vec::with_capacity(256);
+    bs.extend(b'!'..=b'~');
+    bs.extend(b'\xA1'..=b'\xAC');
+    bs.extend(b'\xAE'..=b'\xFF');
+
+    let mut cs: Vec<u32> = bs.iter().map(|&b| b as u32).collect();
+    let mut n: u32 = 0;
+    for b in 0u8..=255u8 {
+        if !bs.contains(&b) {
+            bs.push(b);
+            cs.push((1u32 << 8) + n);
+            n += 1;
+        }
+    }
+
+    bs.into_iter()
+        .zip(cs)
+        .map(|(raw, code)| {
+            // SAFETY: `cs` entries are constructed from values in
+            // 0..=0xFF and 0x100..=0x1FF, all well below the first
+            // surrogate or non-Unicode scalar. `from_u32_unchecked`
+            // matches the `tokenizers` crate implementation.
+            let ch = char::from_u32(code).expect("byte-level char is a valid scalar");
+            (ch, raw)
+        })
+        .collect()
+}
+
+/// Reverse-map the byte-level BPE token char for `id` back to its raw byte.
+///
+/// Returns `None` when the token is not a single byte-level character (for
+/// example, a multi-byte merged BPE token, or an added-tokens decoder special).
+/// BPE prefix markers (`▁`, `Ġ`, `Ċ`) are stripped before the lookup so that
+/// leading-space byte-fragment variants still classify correctly.
+fn reverse_byte_for_token(
+    tokenizer: &Tokenizer,
+    id: u32,
+    reverse: &HashMap<char, u8>,
+) -> Option<u8> {
+    let raw = tokenizer.id_to_token(id)?;
+    let mut iter = raw.chars().filter(|c| !is_bpe_prefix(*c));
+    let first = iter.next()?;
+    if iter.next().is_some() {
+        // More than one non-prefix char → this is a merged BPE token, not a
+        // byte-fragment leaf. Skip it.
+        return None;
+    }
+    reverse.get(&first).copied()
+}
+
+/// Classify a UTF-8 start byte into a likely [`Script`], using the table
+/// documented on [`ExceptionConfig::include_byte_fragments`].
+///
+/// Mapping (covers the start bytes most relevant to the 10 supported languages;
+/// continuation bytes `0x80`–`0xBF` are ambiguous across scripts and therefore
+/// stay `Script::Other`):
+///
+/// | Range           | Script  | Rationale |
+/// |-----------------|---------|-----------|
+/// | `0x00`–`0x7F`   | Latin   | ASCII — when used as a solo byte-fragment, typically Latin. |
+/// | `0xC2`–`0xCF`   | Latin   | 2-byte start for Latin Extended-A/B blocks. |
+/// | `0xD0`–`0xD1`   | Cyrillic| 2-byte start for the Cyrillic block. |
+/// | `0xD2`–`0xD6`   | Other   | Mixed Cyrillic Extended / Syriac / Arabic-adjacent. |
+/// | `0xD7`          | Hebrew  | 2-byte start for the Hebrew block. |
+/// | `0xD8`–`0xDB`   | Arabic  | 2-byte start for the Arabic / Arabic Extended blocks. |
+/// | `0xDC`–`0xDF`   | Other   | Samaritan / NKo / other historic scripts. |
+/// | `0xE0`          | Other   | Indic overflow — too ambiguous. |
+/// | `0xE0–0xE2`     | Other   | Devanagari / Thai span prefixes are 3-byte but the full start byte is always `0xE0` with a specific second-byte range; leave to the decode path. |
+/// | `0xE3`          | Hiragana| CJK Kana / Bopomofo (U+3040..U+312F live in `0xE3` space). Tagged as Hiragana because it catches the majority of kana fragment leaks on Qwen/GPT-2 tokenizers; Katakana-specific disambiguation would require continuation-byte analysis which is out of scope. |
+/// | `0xE4`–`0xE9`   | Han     | 3-byte start for CJK Unified Ideographs (U+4E00..U+9FFF). Also catches some Latin Extended Additional blocks — acceptable per issue #405 design (opt-in + operator metric). |
+/// | `0xEA`–`0xED`   | Hangul  | 3-byte start for Hangul Syllables (U+AC00..U+D7AF). |
+/// | `0xEE`–`0xEF`   | Other   | Private Use Area / CJK Compatibility / specials. |
+/// | `0xF0`–`0xF4`   | Han     | 4-byte start for supplementary planes — dominated by CJK Extension B–F. Tagged as Han for consistency with the 3-byte Han range. |
+/// | `0xF5`–`0xFF`   | Other   | Invalid UTF-8 start bytes or unallocated. |
+/// | `0x80`–`0xBF`   | `None`  | Continuation bytes — ambiguous without the start byte. |
+///
+/// Continuation bytes and invalid ranges return `None`, leaving the token with
+/// `scripts = []` (i.e. `Script::Other`). This is deliberate: start-byte
+/// suppression alone breaks the escape because a multi-byte UTF-8 sequence
+/// always leads with a start byte, so suppressing the start byte blocks the
+/// reassembly chain.
+fn classify_byte_start(byte: u8) -> Option<Script> {
+    match byte {
+        0x00..=0x7F => Some(Script::Latin),
+        // 2-byte starts (C2..DF)
+        0xC2..=0xCF => Some(Script::Latin),
+        0xD0..=0xD1 => Some(Script::Cyrillic),
+        0xD2..=0xD6 => None,
+        0xD7 => Some(Script::Hebrew),
+        0xD8..=0xDB => Some(Script::Arabic),
+        0xDC..=0xDF => None,
+        // 3-byte starts (E0..EF)
+        0xE0..=0xE2 => None,
+        0xE3 => Some(Script::Hiragana),
+        0xE4..=0xE9 => Some(Script::Han),
+        0xEA..=0xED => Some(Script::Hangul),
+        0xEE..=0xEF => None,
+        // 4-byte starts (F0..F4) — Supplementary planes, dominated by CJK Ext.
+        0xF0..=0xF4 => Some(Script::Han),
+        // Invalid UTF-8 start (F5..FF) or continuation bytes (80..BF).
+        _ => None,
     }
 }
 
@@ -479,6 +694,29 @@ pub struct ExceptionConfig {
     pub include_numeric: bool,
     /// If `true`, purely punctuation tokens are included.
     pub include_punctuation: bool,
+    /// If `true`, byte-fragment tokens (issue #405) participate in language
+    /// script matching via UTF-8 start-byte classification.
+    ///
+    /// Byte-level BPE tokenizers (Qwen, GPT-2, LLaMA, Mistral) represent
+    /// less-common CJK characters as sequences of individual byte tokens.
+    /// Each byte decodes to `U+FFFD` on its own and is classified as
+    /// `Script::Other` by the Phase 1 decode path, so a `zh=-inf` or
+    /// `ja=-inf` filter misses them and the fragments reassemble into the
+    /// target character at generation time.
+    ///
+    /// When this flag is `true`, the vocab scan builds a reverse byte-level
+    /// char→byte table and tags each byte-fragment leaf with a likely
+    /// [`Script`] based on its UTF-8 start byte (see
+    /// `TokenLanguageIndex::build` for the start-byte → Script table). The
+    /// flag is opt-in because start-byte analysis is an approximation — for
+    /// example, the `0xE4`–`0xE9` range covers most CJK Unified Ideographs
+    /// but also catches some Latin Extended Additional blocks. Operators who
+    /// need the stronger suppression can enable the flag and monitor the
+    /// `mlxcel_lang_bias_byte_fragment_suppressions_total` counter to back
+    /// out if over-suppression becomes a problem.
+    ///
+    /// Default: `false` (behavior bit-exact identical to Phase 1).
+    pub include_byte_fragments: bool,
 }
 
 /// Ordered list of per-language bias values (§5.6).
@@ -553,7 +791,9 @@ impl TokenLanguageIndex {
     /// 2. Special tokens are excluded unless `exceptions.include_special`.
     /// 3. Numeric tokens are excluded unless `exceptions.include_numeric`.
     /// 4. Punctuation tokens are excluded unless `exceptions.include_punctuation`.
-    /// 5. Tokens with no identified scripts (empty `scripts` field) never match.
+    /// 5. Byte-fragment tokens (issue #405) are excluded unless
+    ///    `exceptions.include_byte_fragments`.
+    /// 6. Tokens with no identified scripts (empty `scripts` field) never match.
     ///
     /// Used by: `to_token_bias` (B5), CLI debug tooling (B6).
     pub fn tokens_for_language(
@@ -580,6 +820,13 @@ impl TokenLanguageIndex {
                 if info.is_punctuation && !exceptions.include_punctuation {
                     return false;
                 }
+                // Issue #405 — byte-fragment tokens only participate when the
+                // opt-in flag is set. When disabled, behavior is bit-exact
+                // identical to Phase 1 regardless of what the vocab scan
+                // recorded.
+                if info.is_byte_fragment && !exceptions.include_byte_fragments {
+                    return false;
+                }
                 // Check script membership under the chosen policy.
                 matches_policy(&info.scripts, lang_scripts, policy)
             })
@@ -594,7 +841,9 @@ impl TokenLanguageIndex {
     /// 1. Iterate `lang_bias.ordered` in order (index 0 = highest priority).
     /// 2. For each `(code, bias)`, resolve `tokens_for_language(code, policy, exceptions)`.
     /// 3. For each token id, insert `(id, bias)` into the map **only if not already
-    ///    present** — first-language-wins.
+    ///    present** — first-language-wins. Byte-fragment entries (issue #405)
+    ///    are inserted via `TokenBiasMap::insert_byte_fragment` so they can be
+    ///    counted separately in the observability path.
     /// 4. Return the populated `TokenBiasMap`.
     ///
     /// Used by: generation loop integration (B8).
@@ -605,12 +854,30 @@ impl TokenLanguageIndex {
         exceptions: &ExceptionConfig,
     ) -> crate::sampling::TokenBiasMap {
         let mut map = crate::sampling::TokenBiasMap::new();
+        // Build a fast-lookup set of byte-fragment ids so we can tag each
+        // inserted entry without re-scanning `self.tokens` per call.
+        let byte_fragment_ids: std::collections::HashSet<i32> = if exceptions
+            .include_byte_fragments
+        {
+            self.tokens
+                .iter()
+                .filter(|info| info.is_byte_fragment)
+                .map(|info| info.token_id)
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         for &(code, bias) in &lang_bias.ordered {
             let token_ids = self.tokens_for_language(code, policy, exceptions);
             for id in token_ids {
                 // First-language-wins: only insert if not already claimed.
                 if !map.contains(id) {
-                    map.insert(id, bias);
+                    if byte_fragment_ids.contains(&id) {
+                        map.insert_byte_fragment(id, bias);
+                    } else {
+                        map.insert(id, bias);
+                    }
                 }
             }
         }
@@ -943,6 +1210,7 @@ mod tests {
                 is_numeric: is_num,
                 is_punctuation: is_punct,
                 is_whitespace: is_ws,
+                is_byte_fragment: false,
             });
         }
         TokenLanguageIndex {
@@ -1049,6 +1317,7 @@ mod tests {
                 is_numeric: true, // Force numeric=true even though it contains Hangul
                 is_punctuation: false,
                 is_whitespace: false,
+                is_byte_fragment: false,
             },
             TokenScriptInfo {
                 token_id: 1,
@@ -1057,6 +1326,7 @@ mod tests {
                 is_numeric: false,
                 is_punctuation: false,
                 is_whitespace: false,
+                is_byte_fragment: false,
             },
         ];
         let mut by_script: HashMap<Script, Vec<i32>> = HashMap::new();
@@ -1384,6 +1654,518 @@ mod tests {
         assert_eq!(
             mtime1, mtime2,
             "second resolve must not rewrite the cache file (disk hit expected)"
+        );
+    }
+
+    // =========================================================================
+    // Issue #405 — Byte-fragment CJK classification (UTF-8 start-byte analysis)
+    // =========================================================================
+
+    /// `classify_byte_start` honors the documented start-byte → Script table.
+    ///
+    /// Covers the six anchor bytes called out in issue #405: `0xC2` (Latin
+    /// Extended), `0xE3` (Hiragana/Katakana/Bopomofo), `0xE4`/`0xE5` (Han),
+    /// `0xEA` (Hangul), and `0xF0` (supplementary planes → Han). Also
+    /// explicitly verifies that continuation bytes stay unclassified.
+    #[test]
+    fn byte_fragment_classify_byte_start_anchor_ranges() {
+        assert_eq!(classify_byte_start(0xC2), Some(Script::Latin));
+        assert_eq!(classify_byte_start(0xE3), Some(Script::Hiragana));
+        assert_eq!(classify_byte_start(0xE4), Some(Script::Han));
+        assert_eq!(classify_byte_start(0xE5), Some(Script::Han));
+        assert_eq!(classify_byte_start(0xEA), Some(Script::Hangul));
+        assert_eq!(classify_byte_start(0xF0), Some(Script::Han));
+
+        // Cyrillic / Hebrew / Arabic anchors.
+        assert_eq!(classify_byte_start(0xD0), Some(Script::Cyrillic));
+        assert_eq!(classify_byte_start(0xD7), Some(Script::Hebrew));
+        assert_eq!(classify_byte_start(0xD8), Some(Script::Arabic));
+
+        // ASCII → Latin when solo.
+        assert_eq!(classify_byte_start(0x41), Some(Script::Latin));
+
+        // Continuation bytes — always None so they stay Other.
+        assert_eq!(classify_byte_start(0x80), None);
+        assert_eq!(classify_byte_start(0xA0), None);
+        assert_eq!(classify_byte_start(0xBF), None);
+
+        // Invalid UTF-8 start bytes.
+        assert_eq!(classify_byte_start(0xF5), None);
+        assert_eq!(classify_byte_start(0xFF), None);
+    }
+
+    /// The byte-level reverse map is a bijection over the 256 raw bytes and
+    /// does NOT clash with the BPE prefix markers (`▁`, `Ġ`, `Ċ`).
+    ///
+    /// The reverse map must round-trip every byte — if `bytes_char()` produced
+    /// the char `c`, then `reverse[c] == byte`.
+    #[test]
+    fn byte_fragment_reverse_map_is_bijection() {
+        let reverse = build_byte_level_reverse_map();
+        assert_eq!(reverse.len(), 256, "reverse map must cover 256 bytes");
+
+        // Sanity: reverse-maps for a handful of known GPT-2 chars.
+        // `Ġ` (U+0120) is byte 0x20 (space) in the byte-level alphabet.
+        assert_eq!(reverse.get(&'\u{0120}').copied(), Some(0x20));
+        // `Ċ` (U+010A) is byte 0x0A (newline).
+        assert_eq!(reverse.get(&'\u{010A}').copied(), Some(0x0A));
+        // Printable ASCII chars map to themselves.
+        assert_eq!(reverse.get(&'A').copied(), Some(b'A'));
+        assert_eq!(reverse.get(&'~').copied(), Some(b'~'));
+
+        // Every byte value 0..=0xFF must appear exactly once in the value set.
+        let mut seen = [false; 256];
+        for &byte in reverse.values() {
+            assert!(
+                !seen[byte as usize],
+                "byte 0x{byte:02X} appears twice in reverse map"
+            );
+            seen[byte as usize] = true;
+        }
+        assert!(seen.iter().all(|&x| x), "reverse map must cover every byte");
+    }
+
+    /// Helper that constructs an in-memory `TokenLanguageIndex` from a list of
+    /// `(token_id, raw_byte, expected_script)` triples, simulating what the
+    /// byte-fragment classifier would produce on a real byte-level tokenizer.
+    fn build_byte_fragment_test_index(
+        fragments: &[(i32, u8)],
+        extras: &[TokenScriptInfo],
+    ) -> TokenLanguageIndex {
+        let mut tokens: Vec<TokenScriptInfo> = fragments
+            .iter()
+            .map(|&(id, byte)| {
+                let mut scripts: SmallVec<[Script; 3]> = SmallVec::new();
+                let is_bf = if let Some(s) = classify_byte_start(byte) {
+                    scripts.push(s);
+                    true
+                } else {
+                    false
+                };
+                TokenScriptInfo {
+                    token_id: id,
+                    scripts,
+                    is_special: false,
+                    is_numeric: false,
+                    is_punctuation: false,
+                    is_whitespace: false,
+                    is_byte_fragment: is_bf,
+                }
+            })
+            .collect();
+        tokens.extend(extras.iter().cloned());
+
+        let mut by_script: HashMap<Script, Vec<i32>> = HashMap::new();
+        for t in &tokens {
+            for &s in &t.scripts {
+                by_script.entry(s).or_default().push(t.token_id);
+            }
+        }
+        TokenLanguageIndex {
+            vocab_hash: "byte_frag_test00".to_owned(),
+            version: CURRENT_VERSION,
+            tokens,
+            by_script,
+        }
+    }
+
+    /// With `include_byte_fragments = false` (the default), byte-fragment
+    /// tokens are invisible to `tokens_for_language` regardless of their
+    /// classified script. Behavior is bit-exact identical to Phase 1.
+    #[test]
+    fn byte_fragment_default_excluded_from_language_sets() {
+        // Byte-fragments spanning multiple scripts.
+        let index = build_byte_fragment_test_index(
+            &[
+                (100, 0xE4), // Han byte-fragment
+                (101, 0xE3), // Hiragana byte-fragment
+                (102, 0xEA), // Hangul byte-fragment
+            ],
+            &[],
+        );
+
+        let default_ex = ExceptionConfig::default();
+        assert!(
+            !default_ex.include_byte_fragments,
+            "default must have include_byte_fragments=false"
+        );
+
+        let zh_ids = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &default_ex,
+        );
+        assert!(
+            !zh_ids.contains(&100),
+            "byte-fragment Han must NOT appear in zh without include_byte_fragments: {zh_ids:?}"
+        );
+
+        let ja_ids = index.tokens_for_language(
+            LanguageCode::Ja,
+            InclusionPolicy::Conservative,
+            &default_ex,
+        );
+        assert!(
+            !ja_ids.contains(&101),
+            "byte-fragment Hiragana must NOT appear in ja without include_byte_fragments: {ja_ids:?}"
+        );
+
+        let ko_ids = index.tokens_for_language(
+            LanguageCode::Ko,
+            InclusionPolicy::Conservative,
+            &default_ex,
+        );
+        assert!(
+            !ko_ids.contains(&102),
+            "byte-fragment Hangul must NOT appear in ko without include_byte_fragments: {ko_ids:?}"
+        );
+    }
+
+    /// With `include_byte_fragments = true`, byte-fragment tokens participate
+    /// in language matching using their start-byte Script tag.
+    ///
+    /// This is the core of the issue #405 contract: the ` 年` leak described
+    /// in the issue (`[74577, 112]` on Qwen2.5) classifies the leading
+    /// fragment `74577` via its `0xE5`-family start byte and tags it as Han,
+    /// so `zh=-inf` catches it.
+    #[test]
+    fn byte_fragment_include_flag_catches_start_byte_leak() {
+        // Simulate the Qwen2.5 `[74577, 112]` situation: token 500 represents
+        // the Han start byte (0xE5 family), token 501 a continuation byte.
+        let index = build_byte_fragment_test_index(
+            &[
+                (500, 0xE5), // Han start byte — should be caught by zh
+                (501, 0xB4), // Continuation byte — must stay Other
+            ],
+            &[],
+        );
+
+        let ex = ExceptionConfig {
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+
+        let zh_ids = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &ex,
+        );
+        assert!(
+            zh_ids.contains(&500),
+            "byte-fragment Han start byte MUST appear in zh when include_byte_fragments=true: {zh_ids:?}"
+        );
+        assert!(
+            !zh_ids.contains(&501),
+            "continuation byte MUST stay Other even with include_byte_fragments=true: {zh_ids:?}"
+        );
+    }
+
+    /// A byte-fragment Hiragana leak (0xE3 start byte) is caught by the
+    /// Japanese language set when `include_byte_fragments = true`.
+    #[test]
+    fn byte_fragment_include_flag_catches_kana_leak() {
+        let index = build_byte_fragment_test_index(&[(600, 0xE3)], &[]);
+
+        let ex = ExceptionConfig {
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+
+        let ja_ids = index.tokens_for_language(
+            LanguageCode::Ja,
+            InclusionPolicy::Conservative,
+            &ex,
+        );
+        assert!(
+            ja_ids.contains(&600),
+            "byte-fragment Hiragana start byte must appear in ja: {ja_ids:?}"
+        );
+    }
+
+    /// Strict-policy bleed-through guard: enabling `include_byte_fragments`
+    /// must NOT leak Han-tagged fragments into the Korean Strict set (ko Strict
+    /// = {Hangul}). This protects the existing Korean suppression contract.
+    #[test]
+    fn byte_fragment_strict_policy_does_not_bleed_cross_script() {
+        let index = build_byte_fragment_test_index(
+            &[
+                (700, 0xE4), // Han byte-fragment
+                (701, 0xEA), // Hangul byte-fragment
+            ],
+            &[],
+        );
+
+        let ex = ExceptionConfig {
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+
+        let ko_strict_ids = index.tokens_for_language(
+            LanguageCode::Ko,
+            InclusionPolicy::Strict,
+            &ex,
+        );
+        assert!(
+            !ko_strict_ids.contains(&700),
+            "Han byte-fragment must NOT appear in ko Strict (Hangul-only): {ko_strict_ids:?}"
+        );
+        assert!(
+            ko_strict_ids.contains(&701),
+            "Hangul byte-fragment must appear in ko Strict: {ko_strict_ids:?}"
+        );
+
+        // ko Conservative includes Han, so the Han fragment DOES appear there.
+        let ko_conserv_ids = index.tokens_for_language(
+            LanguageCode::Ko,
+            InclusionPolicy::Conservative,
+            &ex,
+        );
+        assert!(
+            ko_conserv_ids.contains(&700),
+            "Han byte-fragment appears in ko Conservative (which includes Han): {ko_conserv_ids:?}"
+        );
+    }
+
+    /// Phase 1 (decode-path) tokens with a real script must NEVER be tagged as
+    /// byte-fragments — even when they co-exist in the same index. This guards
+    /// the "avoid double-counting" rule from issue #405.
+    #[test]
+    fn byte_fragment_does_not_override_phase1_classification() {
+        // Merged-token Han (like `年` → id 7948 on Qwen2.5), added manually.
+        let merged_han = TokenScriptInfo {
+            token_id: 7948,
+            scripts: {
+                let mut v: SmallVec<[Script; 3]> = SmallVec::new();
+                v.push(Script::Han);
+                v
+            },
+            is_special: false,
+            is_numeric: false,
+            is_punctuation: false,
+            is_whitespace: false,
+            is_byte_fragment: false, // must stay false
+        };
+
+        let index = build_byte_fragment_test_index(&[(800, 0xE5)], &[merged_han]);
+
+        // Both the merged and the byte-fragment Han tokens exist.
+        let ex_off = ExceptionConfig::default();
+        let zh_off = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &ex_off,
+        );
+        assert!(
+            zh_off.contains(&7948),
+            "merged Han token must always be in zh: {zh_off:?}"
+        );
+        assert!(
+            !zh_off.contains(&800),
+            "byte-fragment must be gated off by default: {zh_off:?}"
+        );
+
+        let ex_on = ExceptionConfig {
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+        let zh_on = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &ex_on,
+        );
+        assert!(
+            zh_on.contains(&7948) && zh_on.contains(&800),
+            "both merged and fragment Han must appear when byte-fragments enabled: {zh_on:?}"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Real-tokenizer integration: the synthetic `74577, 112` leak on Qwen2.5.
+    //
+    // A full Qwen2.5 tokenizer.json is ~11 MB and we do not ship it in the
+    // repo. Instead, the vocab-scan contract is exercised here via a crafted
+    // byte-level BPE tokenizer fixture that guarantees:
+    //   - It has a `ByteLevel` pretokenizer → byte-fragment pass runs.
+    //   - It contains two synthetic byte-fragment vocab entries whose char
+    //     reverse-maps to `0xE5` (Han start byte) and `0xB4` (continuation).
+    // When `include_byte_fragments = true`, the start-byte entry lands in the
+    // zh set; the continuation stays Other in both modes.
+    // -------------------------------------------------------------------------
+
+    /// End-to-end: a byte-level BPE tokenizer with a `0xE5`-represented byte
+    /// token. `TokenLanguageIndex::build` must tag it as Han byte-fragment.
+    #[test]
+    fn byte_fragment_build_tags_real_byte_level_tokenizer() {
+        // Construct a minimal byte-level BPE tokenizer JSON. The trick is
+        // that we need the `pre_tokenizer` to be `ByteLevel` so the detector
+        // fires, and the vocab must contain the byte-level char representing
+        // byte 0xE5.
+        //
+        // From the GPT-2 encoder: byte 0xE5 is not in the "printable" set
+        // (0x21..=0x7E ∪ 0xA1..=0xAC ∪ 0xAE..=0xFF contains it, since
+        // 0xE5 is in 0xAE..=0xFF, so byte 0xE5 maps to itself → 'å').
+        // Wait: 0xAE..=0xFF includes 0xE5, so the forward map sends 0xE5 → 0xE5
+        // as a codepoint, which is 'å' (U+00E5).
+        let char_e5 = '\u{00E5}'; // byte 0xE5 → 'å' in the GPT-2 alphabet
+        let char_b4 = '\u{0174}'; // byte 0xB4 is NOT in the printable set,
+        // so it maps to the first free slot above 0x100.
+        // We don't need to compute the exact char here — we discover it at
+        // runtime from the reverse map so this test stays robust.
+
+        let reverse = build_byte_level_reverse_map();
+        // Sanity: 0xE5 really is 'å' in the forward map.
+        assert_eq!(reverse.get(&char_e5).copied(), Some(0xE5));
+        // Find whatever char maps to byte 0xB4 (continuation byte).
+        let char_b4_actual = reverse
+            .iter()
+            .find(|(_, &b)| b == 0xB4)
+            .map(|(&c, _)| c)
+            .expect("byte 0xB4 must have a forward-map char");
+        let _ = char_b4;
+
+        // Build a tokenizer JSON with a BPE model and ByteLevel pre-tokenizer.
+        // We craft a tiny vocab with the byte-fragment chars plus a normal
+        // word so the tokenizer parses and builds without complaint.
+        //
+        // The byte-level chars `char_e5` (= U+00E5) and `char_b4_actual` are
+        // both valid printable Unicode scalars; we inject them directly into
+        // the JSON source so the tokenizer's serde path parses them as ordinary
+        // string literals.
+        let json = format!(
+            "{{\
+  \"version\": \"1.0\",\
+  \"truncation\": null,\
+  \"padding\": null,\
+  \"added_tokens\": [\
+    {{\"id\": 0, \"content\": \"<|endoftext|>\", \"single_word\": false, \"lstrip\": false, \"rstrip\": false, \"normalized\": false, \"special\": true}}\
+  ],\
+  \"normalizer\": null,\
+  \"pre_tokenizer\": {{\
+    \"type\": \"ByteLevel\",\
+    \"add_prefix_space\": false,\
+    \"trim_offsets\": true,\
+    \"use_regex\": true\
+  }},\
+  \"post_processor\": null,\
+  \"decoder\": {{\
+    \"type\": \"ByteLevel\",\
+    \"add_prefix_space\": false,\
+    \"trim_offsets\": true,\
+    \"use_regex\": true\
+  }},\
+  \"model\": {{\
+    \"type\": \"BPE\",\
+    \"dropout\": null,\
+    \"unk_token\": null,\
+    \"continuing_subword_prefix\": null,\
+    \"end_of_word_suffix\": null,\
+    \"fuse_unk\": false,\
+    \"byte_fallback\": false,\
+    \"ignore_merges\": true,\
+    \"vocab\": {{\
+      \"<|endoftext|>\": 0,\
+      \"hello\": 1,\
+      \"{char_e5}\": 2,\
+      \"{char_b4_actual}\": 3\
+    }},\
+    \"merges\": []\
+  }}\
+}}",
+            char_e5 = char_e5,
+            char_b4_actual = char_b4_actual,
+        );
+
+        let tok = Tokenizer::from_bytes(json.as_bytes())
+            .expect("byte-level fixture must parse");
+        assert!(
+            has_byte_level_pretokenizer(&tok),
+            "fixture must expose a ByteLevel pretokenizer"
+        );
+
+        let index = TokenLanguageIndex::build(&tok, json.as_bytes())
+            .expect("build on byte-level fixture");
+
+        // Token 2 is the 0xE5 byte-fragment — must be tagged Han + is_byte_fragment.
+        let tok2 = index.tokens.iter().find(|t| t.token_id == 2).expect("id=2");
+        assert!(
+            tok2.is_byte_fragment,
+            "token 2 (0xE5) must be flagged as byte-fragment: {tok2:?}"
+        );
+        assert!(
+            tok2.scripts.contains(&Script::Han),
+            "token 2 (0xE5) must carry Script::Han: {tok2:?}"
+        );
+
+        // Token 3 is the 0xB4 continuation byte — must stay Other (empty scripts).
+        let tok3 = index.tokens.iter().find(|t| t.token_id == 3).expect("id=3");
+        assert!(
+            tok3.scripts.is_empty(),
+            "continuation byte 0xB4 must stay Other: {tok3:?}"
+        );
+        assert!(
+            !tok3.is_byte_fragment,
+            "continuation byte must NOT be flagged as byte-fragment: {tok3:?}"
+        );
+
+        // Token 1 is the merged "hello" — must classify via Phase 1 path,
+        // not via byte-fragment.
+        let tok1 = index.tokens.iter().find(|t| t.token_id == 1).expect("id=1");
+        assert!(
+            tok1.scripts.contains(&Script::Latin),
+            "merged Latin token must still classify via Phase 1: {tok1:?}"
+        );
+        assert!(
+            !tok1.is_byte_fragment,
+            "merged token must NOT be flagged as byte-fragment: {tok1:?}"
+        );
+
+        // tokens_for_language: with the flag off, token 2 is excluded; on, included.
+        let ex_off = ExceptionConfig::default();
+        let zh_off = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &ex_off,
+        );
+        assert!(
+            !zh_off.contains(&2),
+            "flag off: byte-fragment Han token must be excluded from zh: {zh_off:?}"
+        );
+
+        let ex_on = ExceptionConfig {
+            include_byte_fragments: true,
+            ..Default::default()
+        };
+        let zh_on = index.tokens_for_language(
+            LanguageCode::Zh,
+            InclusionPolicy::Conservative,
+            &ex_on,
+        );
+        assert!(
+            zh_on.contains(&2),
+            "flag on: byte-fragment Han token MUST be in zh (issue #405 leak caught): {zh_on:?}"
+        );
+    }
+
+    /// When the tokenizer has no ByteLevel pretokenizer (SentencePiece-style
+    /// WordLevel fixture used in other tests), the byte-fragment pass must
+    /// silently no-op and every token should have `is_byte_fragment = false`.
+    #[test]
+    fn byte_fragment_no_op_on_non_byte_level_tokenizer() {
+        let json = resolve_mock_tokenizer_json("marker_no_byte_level");
+        let tok = make_tokenizer(&json);
+
+        // Sanity: WordLevel fixture has no ByteLevel pretokenizer.
+        assert!(
+            !has_byte_level_pretokenizer(&tok),
+            "WordLevel fixture must not report ByteLevel pretokenizer"
+        );
+
+        let index = TokenLanguageIndex::build(&tok, json.as_bytes())
+            .expect("build on non-byte-level tokenizer must succeed");
+
+        assert!(
+            index.tokens.iter().all(|t| !t.is_byte_fragment),
+            "no tokens should be tagged as byte-fragment on non-byte-level tokenizer"
         );
     }
 }

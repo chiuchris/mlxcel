@@ -148,7 +148,10 @@ pub(crate) fn spawn_model_worker_with_batch_config(
 
         // B9 — emit structured debug trace once at generator construction time
         // (after resolve, before the scheduler is started).
-        if let (true, Some(cfg)) = (!token_bias.is_empty(), sched_config.lang_bias_config.as_ref()) {
+        if let (true, Some(cfg)) = (
+            !token_bias.is_empty(),
+            sched_config.lang_bias_config.as_ref(),
+        ) {
             let langs: Vec<&str> = cfg
                 .bias_set
                 .ordered
@@ -161,12 +164,25 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             } else {
                 "conservative"
             };
-            tracing::debug!(
-                entries = token_bias.len(),
-                languages = %languages_str,
-                policy = %policy_str,
-                "lang_bias resolved"
-            );
+            // Issue #405 — emit byte_fragment_entries only when non-zero so
+            // the existing B9 field shape is preserved for Phase 1 configs.
+            let byte_fragment_entries = token_bias.byte_fragment_len();
+            if byte_fragment_entries > 0 {
+                tracing::debug!(
+                    entries = token_bias.len(),
+                    byte_fragment_entries,
+                    languages = %languages_str,
+                    policy = %policy_str,
+                    "lang_bias resolved"
+                );
+            } else {
+                tracing::debug!(
+                    entries = token_bias.len(),
+                    languages = %languages_str,
+                    policy = %policy_str,
+                    "lang_bias resolved"
+                );
+            }
         }
 
         let chunk_info = if sched_config.prefill_chunk_size > 0 {

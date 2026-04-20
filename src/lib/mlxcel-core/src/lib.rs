@@ -1853,7 +1853,11 @@ pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
 pub use sampling::TokenBiasMap;
 // Re-export B9 observability counter accessors so the server `/metrics` handler
 // can read process-wide lang-bias counters without a struct dependency.
-pub use sampling::{lang_bias_applied_total, lang_bias_tokens_suppressed_total};
+// Includes the byte-fragment suppression counter added in issue #405.
+pub use sampling::{
+    lang_bias_applied_total, lang_bias_byte_fragment_suppressions_total,
+    lang_bias_tokens_suppressed_total,
+};
 
 // Re-export Axis B language-steering types so downstream consumers (CLI, server, B6–B8)
 // can use them without referencing the internal module path.

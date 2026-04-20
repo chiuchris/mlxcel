@@ -20,7 +20,7 @@
 //! the same invariants via the public API surface.
 
 use mlxcel_core::lang_analyzer::{
-    cache, CURRENT_VERSION, Script, TokenLanguageIndex, classify_token, is_numeric, is_punctuation,
+    CURRENT_VERSION, Script, TokenLanguageIndex, cache, classify_token, is_numeric, is_punctuation,
     is_whitespace,
 };
 
@@ -29,7 +29,10 @@ use mlxcel_core::lang_analyzer::{
 static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+    ENV_LOCK
+        .get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
 }
 
 // ============================================================================
@@ -91,7 +94,10 @@ fn lang_analyze_pure_cyrillic() {
 #[test]
 fn lang_analyze_numeric_returns_empty_scripts() {
     let result = classify_token("12345");
-    assert!(result.is_empty(), "numeric string should yield no scripts; got {result:?}");
+    assert!(
+        result.is_empty(),
+        "numeric string should yield no scripts; got {result:?}"
+    );
 }
 
 #[test]
@@ -103,7 +109,10 @@ fn lang_analyze_numeric_is_numeric_flag() {
 #[test]
 fn lang_analyze_punctuation_returns_empty_scripts() {
     let result = classify_token(",.!?");
-    assert!(result.is_empty(), "punctuation string should yield no scripts; got {result:?}");
+    assert!(
+        result.is_empty(),
+        "punctuation string should yield no scripts; got {result:?}"
+    );
 }
 
 #[test]
@@ -291,16 +300,18 @@ fn build_vocab_hash_differs_across_tokenizers() {
 }
 
 #[test]
-fn version_constant_is_two() {
+fn version_constant_is_three() {
     // v1 → v2 bumped when classify switched from id_to_token to decode so
     // byte-level BPE tokenizers produce correct script assignments.
-    assert_eq!(CURRENT_VERSION, 2, "CURRENT_VERSION must be 2");
+    // v2 → v3 bumped (issue #405) when TokenScriptInfo gained the
+    // `is_byte_fragment` field and the opt-in byte-fragment classifier.
+    assert_eq!(CURRENT_VERSION, 3, "CURRENT_VERSION must be 3");
 
     // Also verify the built index carries the correct version.
     let tok = make_tokenizer(MOCK_TOKENIZER_100_JSON);
-    let idx = TokenLanguageIndex::build(&tok, MOCK_TOKENIZER_100_JSON.as_bytes())
-        .expect("build failed");
-    assert_eq!(idx.version, 2);
+    let idx =
+        TokenLanguageIndex::build(&tok, MOCK_TOKENIZER_100_JSON.as_bytes()).expect("build failed");
+    assert_eq!(idx.version, 3);
 }
 
 // ============================================================================
@@ -335,9 +346,14 @@ fn build_index_from_real_tokenizer_smoke() {
     let vocab_size = tok.get_vocab_size(true);
     assert!(vocab_size > 0, "tokenizer must have a non-empty vocabulary");
 
-    let idx = TokenLanguageIndex::build(&tok, &bytes).expect("build should succeed on real tokenizer");
+    let idx =
+        TokenLanguageIndex::build(&tok, &bytes).expect("build should succeed on real tokenizer");
 
-    assert_eq!(idx.tokens.len(), vocab_size, "index must have one entry per vocab token");
+    assert_eq!(
+        idx.tokens.len(),
+        vocab_size,
+        "index must have one entry per vocab token"
+    );
     assert_eq!(idx.version, CURRENT_VERSION);
     assert_eq!(
         idx.vocab_hash.len(),
@@ -435,7 +451,9 @@ fn b4_cache_integration_roundtrip() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let _guard = env_lock();
     // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
-    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+    unsafe {
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+    }
 
     let json = r#"{
   "version": "1.0",
@@ -470,27 +488,35 @@ fn b4_cache_integration_roundtrip() {
     assert_eq!(resolved, expected_path);
 
     // load_or_build: first call must build and persist.
-    let idx1 = cache::load_or_build(&tok, json_bytes, false)
-        .expect("first load_or_build should succeed");
+    let idx1 =
+        cache::load_or_build(&tok, json_bytes, false).expect("first load_or_build should succeed");
     assert_eq!(idx1.version, CURRENT_VERSION);
     assert_eq!(idx1.vocab_hash, hash);
-    assert!(resolved.exists(), "cache file must exist after first load_or_build");
+    assert!(
+        resolved.exists(),
+        "cache file must exist after first load_or_build"
+    );
 
     let mtime1 = std::fs::metadata(&resolved).unwrap().modified().unwrap();
 
     // load_or_build: second call must load from disk (mtime unchanged).
-    let idx2 = cache::load_or_build(&tok, json_bytes, false)
-        .expect("second load_or_build should succeed");
+    let idx2 =
+        cache::load_or_build(&tok, json_bytes, false).expect("second load_or_build should succeed");
     let mtime2 = std::fs::metadata(&resolved).unwrap().modified().unwrap();
 
     // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
-    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    unsafe {
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+    }
     drop(_guard);
 
     assert_eq!(idx1.vocab_hash, idx2.vocab_hash);
     assert_eq!(mtime1, mtime2, "second call must hit disk cache");
 
-    eprintln!("[ok] B4 cache integration: hash={hash}, path={}", resolved.display());
+    eprintln!(
+        "[ok] B4 cache integration: hash={hash}, path={}",
+        resolved.display()
+    );
 }
 
 /// Helper to build the expected cache path relative to a tempdir.
@@ -512,7 +538,9 @@ fn b4_cache_real_tokenizer_integration_smoke() {
 
     let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
     let Some(tok_path) = found else {
-        eprintln!("[skip] no model tokenizer.json found; skipping B4 real-tokenizer integration smoke test");
+        eprintln!(
+            "[skip] no model tokenizer.json found; skipping B4 real-tokenizer integration smoke test"
+        );
         return;
     };
 
@@ -522,7 +550,9 @@ fn b4_cache_real_tokenizer_integration_smoke() {
 
     let _guard = env_lock();
     // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
-    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+    unsafe {
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+    }
 
     let hash = TokenLanguageIndex::compute_vocab_hash(&json_bytes);
     let idx1 = cache::load_or_build(&tok, &json_bytes, false)
@@ -540,11 +570,16 @@ fn b4_cache_real_tokenizer_integration_smoke() {
     let mtime2 = std::fs::metadata(&path).unwrap().modified().unwrap();
 
     // SAFETY: serialized via ENV_LOCK; no other thread mutates MLXCEL_CACHE_DIR concurrently.
-    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    unsafe {
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+    }
     drop(_guard);
 
     assert_eq!(idx1.vocab_hash, idx2.vocab_hash);
-    assert_eq!(mtime1, mtime2, "real tokenizer: second call must hit disk cache");
+    assert_eq!(
+        mtime1, mtime2,
+        "real tokenizer: second call must hit disk cache"
+    );
 
     eprintln!(
         "[ok] B4 real-tokenizer integration smoke: vocab={}, hash={}",
@@ -602,7 +637,9 @@ fn b8_resolve_token_bias_empty_returns_empty() {
 
     let _guard = env_lock();
     // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+    unsafe {
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+    }
 
     let map = config
         .resolve_token_bias(&tok, json.as_bytes())
@@ -611,13 +648,20 @@ fn b8_resolve_token_bias_empty_returns_empty() {
     // Inspect the cache state before releasing the env override.
     let cache_subdir = tmp.path().join("tokenizer-scripts");
     let subdir_exists = cache_subdir.exists();
-    let entry_count = std::fs::read_dir(&cache_subdir).map(|rd| rd.count()).unwrap_or(0);
+    let entry_count = std::fs::read_dir(&cache_subdir)
+        .map(|rd| rd.count())
+        .unwrap_or(0);
 
     // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    unsafe {
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+    }
     drop(_guard);
 
-    assert!(map.is_empty(), "empty bias_set must yield empty TokenBiasMap");
+    assert!(
+        map.is_empty(),
+        "empty bias_set must yield empty TokenBiasMap"
+    );
     assert!(
         !subdir_exists,
         "empty-bias resolve must NOT create the tokenizer-scripts cache dir"
@@ -650,7 +694,9 @@ fn b8_resolve_token_bias_populates_from_cache() {
 
     let _guard = env_lock();
     // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::set_var("MLXCEL_CACHE_DIR", tmp.path()); }
+    unsafe {
+        std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
+    }
 
     // First call: cache miss -> build + persist.
     let map1 = config
@@ -660,21 +706,34 @@ fn b8_resolve_token_bias_populates_from_cache() {
     let hash = TokenLanguageIndex::compute_vocab_hash(json.as_bytes());
     let cache_file = cache_path_relative(&tmp, &hash);
     let exists_after_first = cache_file.exists();
-    let mtime1 = std::fs::metadata(&cache_file).ok().and_then(|m| m.modified().ok());
+    let mtime1 = std::fs::metadata(&cache_file)
+        .ok()
+        .and_then(|m| m.modified().ok());
 
     // Second call: cache hit -> no rewrite.
     let map2 = config
         .resolve_token_bias(&tok, json.as_bytes())
         .expect("second resolve must succeed");
-    let mtime2 = std::fs::metadata(&cache_file).ok().and_then(|m| m.modified().ok());
+    let mtime2 = std::fs::metadata(&cache_file)
+        .ok()
+        .and_then(|m| m.modified().ok());
 
     // SAFETY: serialized via ENV_LOCK.
-    unsafe { std::env::remove_var("MLXCEL_CACHE_DIR"); }
+    unsafe {
+        std::env::remove_var("MLXCEL_CACHE_DIR");
+    }
     drop(_guard);
 
-    assert!(exists_after_first, "first resolve must persist the cache file");
+    assert!(
+        exists_after_first,
+        "first resolve must persist the cache file"
+    );
     assert!(!map1.is_empty(), "non-empty bias must populate the map");
-    assert_eq!(map1.len(), map2.len(), "cache-hit map must match cache-build map");
+    assert_eq!(
+        map1.len(),
+        map2.len(),
+        "cache-hit map must match cache-build map"
+    );
     assert!(
         map1.iter().any(|(_id, &b)| b == f32::NEG_INFINITY),
         "ja=-inf entry must populate at least one Japanese-script token"

@@ -16,7 +16,10 @@ use clap::Parser;
 use std::path::PathBuf;
 
 use mlxcel::lang_bias::LangBiasCliArgs;
-use mlxcel::server::{ServerStartupInput, env_fallback_lang_bias, start_server};
+use mlxcel::server::{
+    ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    start_server,
+};
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
 ///
@@ -563,6 +566,8 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
     // validation and normalization as CLI flags. CLI flag wins on conflict
     // (see `env_fallback_lang_bias` INFO log).
     env_fallback_lang_bias(&mut args.lang_bias);
+    // Issue #405 — env-var fallback for the byte-fragment opt-in flag.
+    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).

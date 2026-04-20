@@ -275,6 +275,57 @@ pub fn env_fallback_lang_bias(args: &mut LangBiasCliArgs) {
     }
 }
 
+/// Apply `LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS` env var fallback to the
+/// `include_byte_fragments` field (issue #405).
+///
+/// Precedence rule: CLI flag beats env var, mirroring the B7 pattern for
+/// [`env_fallback_lang_bias`]. The env value is parsed permissively and
+/// accepts `true`/`false`/`1`/`0` (case-insensitive). Unparseable values are
+/// ignored with a warning so an operator typo does not crash the server.
+///
+/// - If `args.include_byte_fragments == false` (CLI unset) and the env var is
+///   set to a truthy value → flip the field to `true`.
+/// - If `args.include_byte_fragments == true` (CLI set) and the env var is
+///   also set → keep the CLI value and log an INFO-level message.
+pub fn env_fallback_lang_bias_include_byte_fragments(args: &mut LangBiasCliArgs) {
+    const KEY: &str = "LLAMA_ARG_LANG_BIAS_INCLUDE_BYTE_FRAGMENTS";
+    if !args.include_byte_fragments {
+        if let Ok(v) = std::env::var(KEY) {
+            match parse_env_bool(&v) {
+                Some(true) => {
+                    args.include_byte_fragments = true;
+                }
+                Some(false) => {
+                    // Explicitly false — no-op.
+                }
+                None => {
+                    tracing::warn!(
+                        "{KEY} env var has unparseable value {:?}; ignoring (expected true/false/1/0)",
+                        v
+                    );
+                }
+            }
+        }
+    } else if std::env::var_os(KEY).is_some() {
+        tracing::info!(
+            "{KEY} env var is set but --lang-bias-include-byte-fragments CLI flag takes precedence; \
+             ignoring {KEY}"
+        );
+    }
+}
+
+/// Parse an env-var bool: `true`/`false`/`1`/`0`, case-insensitive.
+///
+/// Returns `None` for any other value so the caller can warn once instead of
+/// treating garbage as `false`.
+fn parse_env_bool(s: &str) -> Option<bool> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Some(true),
+        "false" | "0" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
 /// Resolve a llama-server style `--flag` / `--no-flag` pair into a policy bool.
 pub fn resolve_compat_toggle(enabled: bool, disabled: bool) -> bool {
     enabled && !disabled

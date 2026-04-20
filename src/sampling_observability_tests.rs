@@ -30,8 +30,9 @@
 
 use mlxcel_core::{
     generate::SamplingConfig,
-    lang_bias_applied_total, lang_bias_tokens_suppressed_total,
-    sampling::{sample_token_optimized, TokenBiasMap},
+    lang_bias_applied_total, lang_bias_byte_fragment_suppressions_total,
+    lang_bias_tokens_suppressed_total,
+    sampling::{TokenBiasMap, sample_token_optimized},
 };
 
 // ---------------------------------------------------------------------------
@@ -43,8 +44,7 @@ use mlxcel_core::{
 /// The counters are process-global atomics. Running these tests in parallel
 /// would cause counter values to be unpredictable. The lock ensures each
 /// test gets an isolated baseline.
-static COUNTER_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> =
-    std::sync::OnceLock::new();
+static COUNTER_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
 fn counter_lock() -> std::sync::MutexGuard<'static, ()> {
     COUNTER_LOCK
@@ -74,6 +74,8 @@ fn call_sample(logits_data: &[f32], bias: TokenBiasMap) -> i32 {
 fn reset_counters() {
     mlxcel_core::sampling::LANG_BIAS_APPLIED_TOTAL.store(0, std::sync::atomic::Ordering::Relaxed);
     mlxcel_core::sampling::LANG_BIAS_TOKENS_SUPPRESSED_TOTAL
+        .store(0, std::sync::atomic::Ordering::Relaxed);
+    mlxcel_core::sampling::LANG_BIAS_BYTE_FRAGMENT_SUPPRESSIONS_TOTAL
         .store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -195,6 +197,79 @@ fn tokens_suppressed_metric_increments_only_on_neg_inf_top1() {
 }
 
 // ---------------------------------------------------------------------------
+// Issue #405 — byte-fragment suppression counter
+// ---------------------------------------------------------------------------
+
+/// When a `-inf`-suppressed top-1 token was tagged via
+/// `TokenBiasMap::insert_byte_fragment`, both the total-suppressed counter
+/// AND the byte-fragment counter increment. A regular (non-byte-fragment)
+/// suppression increments only the total counter.
+#[test]
+fn byte_fragment_suppression_counter_tracks_opt_in_entries() {
+    let _guard = counter_lock();
+    reset_counters();
+
+    // --- Byte-fragment case ---
+    // Token 0 is top-1 (logit 5.0) and is -inf via `insert_byte_fragment`.
+    let logits = [5.0f32, 1.0, 2.0, 0.5];
+    let mut bias_bf = TokenBiasMap::new();
+    bias_bf.insert_byte_fragment(0, f32::NEG_INFINITY);
+    call_sample(&logits, bias_bf);
+
+    assert_eq!(
+        lang_bias_tokens_suppressed_total(),
+        1,
+        "total suppressed counter must increment on byte-fragment suppression"
+    );
+    assert_eq!(
+        lang_bias_byte_fragment_suppressions_total(),
+        1,
+        "byte-fragment counter must increment when a byte-fragment entry was suppressed"
+    );
+
+    // --- Regular case ---
+    // Token 0 is top-1 again, but this time inserted via the regular `insert`
+    // path. The byte-fragment counter must NOT advance while the total
+    // suppressed counter does.
+    let mut bias_reg = TokenBiasMap::new();
+    bias_reg.insert(0, f32::NEG_INFINITY);
+    call_sample(&logits, bias_reg);
+
+    assert_eq!(
+        lang_bias_tokens_suppressed_total(),
+        2,
+        "total suppressed counter increments for regular suppression too"
+    );
+    assert_eq!(
+        lang_bias_byte_fragment_suppressions_total(),
+        1,
+        "byte-fragment counter must NOT increment for regular (non-byte-fragment) suppression"
+    );
+}
+
+/// `byte_fragment_len` reports the size of the byte-fragment id set and is
+/// the data source for the tracing debug field `byte_fragment_entries`.
+#[test]
+fn byte_fragment_len_counts_only_tagged_entries() {
+    let mut bias = TokenBiasMap::new();
+    bias.insert(10, -5.0);
+    bias.insert_byte_fragment(20, f32::NEG_INFINITY);
+    bias.insert_byte_fragment(21, f32::NEG_INFINITY);
+    bias.insert(22, 3.0);
+
+    assert_eq!(bias.len(), 4, "total len covers every inserted id");
+    assert_eq!(
+        bias.byte_fragment_len(),
+        2,
+        "byte_fragment_len reports only ids inserted via insert_byte_fragment"
+    );
+    assert!(!bias.is_byte_fragment(10));
+    assert!(bias.is_byte_fragment(20));
+    assert!(bias.is_byte_fragment(21));
+    assert!(!bias.is_byte_fragment(22));
+}
+
+// ---------------------------------------------------------------------------
 // B9 test: tracing field emission
 // ---------------------------------------------------------------------------
 
@@ -252,8 +327,8 @@ fn lang_bias_tracing_fields_emitted_on_construction() {
         );
     });
 
-    let output = String::from_utf8(log_buf.lock().unwrap().clone())
-        .expect("log output is valid UTF-8");
+    let output =
+        String::from_utf8(log_buf.lock().unwrap().clone()).expect("log output is valid UTF-8");
 
     assert!(
         output.contains("lang_bias resolved"),

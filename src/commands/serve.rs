@@ -19,7 +19,10 @@
 //! rules live in `mlxcel::server::ServerStartupInput` so `main.rs` stays focused
 //! on schema and routing.
 
-use mlxcel::server::{ServerStartupInput, env_fallback_lang_bias, start_server};
+use mlxcel::server::{
+    ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    start_server,
+};
 
 /// Run the `mlxcel serve` subcommand.
 #[tokio::main]
@@ -32,6 +35,8 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     // before resolving, so env-supplied values flow through the same
     // validation path as CLI flags. CLI flag wins on conflict.
     env_fallback_lang_bias(&mut args.lang_bias);
+    // Issue #405 — env-var fallback for the byte-fragment opt-in flag.
+    env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
 
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =

@@ -52,6 +52,22 @@ pub static LANG_BIAS_APPLIED_TOTAL: AtomicU64 = AtomicU64::new(0);
 /// actively overrode the model's most probable token at that step.
 pub static LANG_BIAS_TOKENS_SUPPRESSED_TOTAL: AtomicU64 = AtomicU64::new(0);
 
+/// Total sampling calls where the pre-bias top-1 token was both
+/// `-inf`-suppressed AND was a byte-fragment entry (issue #405).
+///
+/// Exposed via `/metrics` as
+/// `mlxcel_lang_bias_byte_fragment_suppressions_total`. This counter is a
+/// strict subset of `LANG_BIAS_TOKENS_SUPPRESSED_TOTAL`: it increments only
+/// when the suppressed token was classified via UTF-8 start-byte analysis and
+/// participated in the bias decision. Operators use the counter to observe
+/// how much of their suppression traffic comes from byte-fragment entries
+/// versus merged whole-character tokens, which matters because start-byte
+/// classification is an approximation and over-suppression is possible.
+///
+/// Populated via the bias-metadata channel wired in
+/// `apply_token_bias` below.
+pub static LANG_BIAS_BYTE_FRAGMENT_SUPPRESSIONS_TOTAL: AtomicU64 = AtomicU64::new(0);
+
 /// Read the current value of `mlxcel_lang_bias_applied_total`.
 #[inline]
 pub fn lang_bias_applied_total() -> u64 {
@@ -64,6 +80,13 @@ pub fn lang_bias_tokens_suppressed_total() -> u64 {
     LANG_BIAS_TOKENS_SUPPRESSED_TOTAL.load(Ordering::Relaxed)
 }
 
+/// Read the current value of
+/// `mlxcel_lang_bias_byte_fragment_suppressions_total` (issue #405).
+#[inline]
+pub fn lang_bias_byte_fragment_suppressions_total() -> u64 {
+    LANG_BIAS_BYTE_FRAGMENT_SUPPRESSIONS_TOTAL.load(Ordering::Relaxed)
+}
+
 
 /// Additive bias applied to specific token logits before any history-based penalty.
 ///
@@ -72,9 +95,17 @@ pub fn lang_bias_tokens_suppressed_total() -> u64 {
 ///
 /// When empty, `apply_token_bias` short-circuits without any array operations,
 /// preserving bit-exact baseline behavior.
+///
+/// Issue #405 — tokens that were classified via byte-fragment UTF-8 start-byte
+/// analysis are tracked in a separate set so the observability path can count
+/// how many suppressions originated from that opt-in classifier.
 #[derive(Debug, Clone, Default)]
 pub struct TokenBiasMap {
     entries: HashMap<i32, f32>,
+    /// Token ids that were tagged as byte-fragment entries during vocab scan.
+    /// Populated by `TokenLanguageIndex::to_token_bias` when
+    /// `ExceptionConfig::include_byte_fragments` is enabled.
+    byte_fragment_ids: std::collections::HashSet<i32>,
 }
 
 impl TokenBiasMap {
@@ -82,6 +113,7 @@ impl TokenBiasMap {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            byte_fragment_ids: std::collections::HashSet::new(),
         }
     }
 
@@ -91,6 +123,16 @@ impl TokenBiasMap {
     /// but silently ignored when the bias is applied (see `apply_token_bias`).
     pub fn insert(&mut self, token_id: i32, bias: f32) {
         self.entries.insert(token_id, bias);
+    }
+
+    /// Insert a bias and tag the token as a byte-fragment entry (issue #405).
+    ///
+    /// Used by `TokenLanguageIndex::to_token_bias` when the opt-in
+    /// `include_byte_fragments` flag is set. Equivalent to [`Self::insert`]
+    /// plus a side-channel annotation for the observability counter.
+    pub fn insert_byte_fragment(&mut self, token_id: i32, bias: f32) {
+        self.entries.insert(token_id, bias);
+        self.byte_fragment_ids.insert(token_id);
     }
 
     /// Returns `true` when no bias entries are stored.
@@ -117,6 +159,19 @@ impl TokenBiasMap {
     /// was `-inf`-suppressed.
     pub fn get(&self, token_id: &i32) -> Option<&f32> {
         self.entries.get(token_id)
+    }
+
+    /// Returns `true` when `token_id` was tagged as a byte-fragment entry.
+    pub fn is_byte_fragment(&self, token_id: i32) -> bool {
+        self.byte_fragment_ids.contains(&token_id)
+    }
+
+    /// Number of byte-fragment entries currently in the map (issue #405).
+    ///
+    /// Used by the tracing debug field `byte_fragment_entries` emitted
+    /// alongside the B9 `lang_bias resolved` event.
+    pub fn byte_fragment_len(&self) -> usize {
+        self.byte_fragment_ids.len()
     }
 
     /// Iterate over `(&token_id, &bias)` pairs.
@@ -197,6 +252,12 @@ pub fn sample_token_optimized(
             .is_some_and(|b| b.is_infinite() && b.is_sign_negative())
         {
             LANG_BIAS_TOKENS_SUPPRESSED_TOTAL.fetch_add(1, Ordering::Relaxed);
+            // Issue #405 — separate counter for suppressions that originated
+            // from the opt-in byte-fragment classifier. Strict subset of the
+            // total-suppressed counter above.
+            if config.token_bias.is_byte_fragment(top_id) {
+                LANG_BIAS_BYTE_FRAGMENT_SUPPRESSIONS_TOTAL.fetch_add(1, Ordering::Relaxed);
+            }
         }
 
         apply_token_bias(&last_logits, &config.token_bias)
