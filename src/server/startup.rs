@@ -216,6 +216,13 @@ pub struct ServerStartupConfig {
     /// `<think>` / `</think>` token IDs the scheduler resolves the token pair
     /// to `None` and the budget is silently ignored.
     pub reasoning_budget: Option<super::thinking_budget::ThinkingBudget>,
+
+    /// Issue #410: server-wide default chat-template kwargs.
+    ///
+    /// Parsed from the raw JSON string on [`super::ServerStartupInput`] via
+    /// [`super::chat_template_kwargs::ChatTemplateKwargs::from_json_str`].
+    /// `None` means no server defaults; per-request kwargs may still apply.
+    pub chat_template_kwargs: Option<super::chat_template_kwargs::ChatTemplateKwargs>,
 }
 
 impl Default for ServerStartupConfig {
@@ -294,6 +301,7 @@ impl Default for ServerStartupConfig {
             debug_pp_trace: None,
             lang_bias_config: None,
             reasoning_budget: None,
+            chat_template_kwargs: None,
         }
     }
 }
@@ -447,6 +455,7 @@ pub(super) fn build_server_config(
         vision_cache_size: startup.vision_cache_size,
         lang_bias_config: startup.lang_bias_config.clone(),
         reasoning_budget: startup.reasoning_budget,
+        chat_template_kwargs: startup.chat_template_kwargs.clone(),
     }
 }
 

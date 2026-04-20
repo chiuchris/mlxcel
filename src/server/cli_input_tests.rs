@@ -109,6 +109,7 @@ fn sample_input() -> ServerStartupInput {
         debug_pp_trace: None,
         lang_bias_config: None,
         reasoning_budget: -1,
+        chat_template_kwargs: None,
     }
 }
 
@@ -132,7 +133,7 @@ fn into_startup_config_normalizes_edge_only_flags() {
     input.no_warmup = true;
     input.seed = -1;
 
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
 
     assert!(!startup.enable_slots);
     assert!(!startup.warmup);
@@ -186,12 +187,12 @@ fn into_startup_config_propagates_no_batch_flag() {
     let mut input = sample_input();
     input.no_batch = true;
 
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
     assert!(startup.no_batch);
 
     let mut input2 = sample_input();
     input2.no_batch = false;
-    let startup2 = input2.into_startup_config();
+    let startup2 = input2.into_startup_config().expect("valid startup input");
     assert!(!startup2.no_batch);
 }
 
@@ -199,7 +200,7 @@ fn into_startup_config_propagates_no_batch_flag() {
 fn into_startup_config_resolves_batch_size_alias() {
     let mut input = sample_input();
     input.batch_size = Some(1024);
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
     assert_eq!(startup.prefill_chunk_size, 1024);
     assert!(!startup.batch_size_conflict);
     assert!(!startup.ubatch_size_provided);
@@ -211,7 +212,7 @@ fn into_startup_config_detects_batch_size_conflict() {
     input.prefill_chunk_size = 256;
     input.batch_size = Some(1024);
     input.ubatch_size = Some(64);
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
     assert_eq!(startup.prefill_chunk_size, 256);
     assert!(startup.batch_size_conflict);
     assert!(startup.ubatch_size_provided);
@@ -221,13 +222,15 @@ fn into_startup_config_detects_batch_size_conflict() {
 fn into_startup_config_propagates_pp_layers() {
     let mut input = sample_input();
     input.pp_layers = Some("0-15,16-31".to_string());
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
     assert_eq!(startup.pp_layers, Some("0-15,16-31".to_string()));
 }
 
 #[test]
 fn into_startup_config_pp_layers_none_by_default() {
-    let startup = sample_input().into_startup_config();
+    let startup = sample_input()
+        .into_startup_config()
+        .expect("valid startup input");
     assert_eq!(startup.pp_layers, None);
 }
 
@@ -235,8 +238,71 @@ fn into_startup_config_pp_layers_none_by_default() {
 fn into_startup_config_propagates_pp_micro_batch_size() {
     let mut input = sample_input();
     input.pp_micro_batch_size = 4;
-    let startup = input.into_startup_config();
+    let startup = input.into_startup_config().expect("valid startup input");
     assert_eq!(startup.pp_micro_batch_size, 4);
+}
+
+// -------------------------------------------------------------------------
+// Issue #410 — chat_template_kwargs normalization
+// -------------------------------------------------------------------------
+
+#[test]
+fn into_startup_config_accepts_valid_chat_template_kwargs_json() {
+    let mut input = sample_input();
+    input.chat_template_kwargs = Some(r#"{"preserve_thinking": true}"#.to_string());
+    let startup = input
+        .into_startup_config()
+        .expect("valid JSON object should succeed");
+    let kwargs = startup
+        .chat_template_kwargs
+        .expect("non-empty kwargs should materialize");
+    assert_eq!(kwargs.preserve_thinking(), true);
+}
+
+#[test]
+fn into_startup_config_rejects_malformed_chat_template_kwargs_json() {
+    let mut input = sample_input();
+    input.chat_template_kwargs = Some("{not-json".to_string());
+    let err = input
+        .into_startup_config()
+        .expect_err("malformed JSON must error at startup");
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("chat-template-kwargs"),
+        "error should reference the flag, got: {msg}"
+    );
+}
+
+#[test]
+fn into_startup_config_rejects_non_object_chat_template_kwargs_json() {
+    let mut input = sample_input();
+    input.chat_template_kwargs = Some("[true]".to_string());
+    let err = input
+        .into_startup_config()
+        .expect_err("arrays must be rejected at startup");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("chat-template-kwargs"));
+    assert!(
+        msg.contains("object"),
+        "error should mention object, got: {msg}"
+    );
+}
+
+#[test]
+fn into_startup_config_empty_chat_template_kwargs_collapses_to_none() {
+    let mut input = sample_input();
+    input.chat_template_kwargs = Some("".to_string());
+    let startup = input
+        .into_startup_config()
+        .expect("empty string is a valid no-op");
+    assert!(startup.chat_template_kwargs.is_none());
+
+    let mut input = sample_input();
+    input.chat_template_kwargs = Some("{}".to_string());
+    let startup = input
+        .into_startup_config()
+        .expect("empty JSON object is a valid no-op");
+    assert!(startup.chat_template_kwargs.is_none());
 }
 
 // -------------------------------------------------------------------------

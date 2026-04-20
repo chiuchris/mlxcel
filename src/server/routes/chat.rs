@@ -229,7 +229,12 @@ async fn non_stream_chat_completion(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
 
-    let prepared = prepare_chat_request(&state.chat_template, &request).await;
+    let prepared = prepare_chat_request(
+        &state.chat_template,
+        &request,
+        state.config.chat_template_kwargs.as_ref(),
+    )
+    .await;
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;
@@ -333,7 +338,12 @@ async fn stream_chat_completion(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
-    let prepared = prepare_chat_request(&state.chat_template, &request).await;
+    let prepared = prepare_chat_request(
+        &state.chat_template,
+        &request,
+        state.config.chat_template_kwargs.as_ref(),
+    )
+    .await;
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;

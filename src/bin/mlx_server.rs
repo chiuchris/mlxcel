@@ -17,8 +17,8 @@ use std::path::PathBuf;
 
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
-    ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
-    env_fallback_reasoning_budget, start_server,
+    ServerStartupInput, env_fallback_chat_template_kwargs, env_fallback_lang_bias,
+    env_fallback_lang_bias_include_byte_fragments, env_fallback_reasoning_budget, start_server,
 };
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -574,12 +574,36 @@ struct Args {
         value_name = "N"
     )]
     reasoning_budget: i32,
+
+    /// Issue #410: default chat-template kwargs (JSON object).
+    ///
+    /// Forwarded verbatim as Jinja template kwargs when rendering chat
+    /// conversations. Matches llama.cpp's `--chat-template-kwargs` shape.
+    ///
+    /// Examples:
+    ///   --chat-template-kwargs '{"preserve_thinking": true}'
+    ///   --chat-template-kwargs '{"enable_thinking": false, "preserve_thinking": true}'
+    ///
+    /// Per-request `chat_template_kwargs` (top-level or under `extra_body`)
+    /// overrides server defaults on a per-key basis; unrelated server-default
+    /// keys persist through the merge. The DashScope flat
+    /// `extra_body.preserve_thinking` shape is also accepted as a secondary
+    /// form (only for the `preserve_thinking` key).
+    ///
+    /// Also honors `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`; CLI wins on conflict.
+    /// Malformed JSON is rejected at startup with a clear error.
+    ///
+    /// Note: `preserve_thinking` quality benefits are validated on Qwen3.6;
+    /// Qwen3 / Qwen3.5 accept the flag but were trained on the
+    /// rolling-checkpoint convention.
+    #[arg(long = "chat-template-kwargs", value_name = "JSON")]
+    chat_template_kwargs: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    start_server(build_startup_input(args)?.into_startup_config()).await
+    start_server(build_startup_input(args)?.into_startup_config()?).await
 }
 
 fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
@@ -590,6 +614,8 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
     env_fallback_lang_bias(&mut args.lang_bias);
     // Issue #405 — env-var fallback for the byte-fragment opt-in flag.
     env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
+    // Issue #410 — env-var fallback for the chat-template kwargs default.
+    env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs);
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
@@ -684,5 +710,6 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
             env_fallback_reasoning_budget(&mut v);
             v
         },
+        chat_template_kwargs: args.chat_template_kwargs,
     })
 }

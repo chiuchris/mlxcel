@@ -740,6 +740,32 @@ pub(crate) struct ServeArgs {
     /// this value.
     #[arg(long = "reasoning-budget", default_value_t = -1, value_name = "N")]
     reasoning_budget: i32,
+
+    /// Issue #410: default chat-template kwargs (JSON object).
+    ///
+    /// Forwarded verbatim as Jinja template kwargs when rendering chat
+    /// conversations. Matches llama.cpp's `--chat-template-kwargs` shape so
+    /// a client switching from llama-server needs no request changes.
+    ///
+    /// Examples:
+    ///   --chat-template-kwargs '{"preserve_thinking": true}'
+    ///   --chat-template-kwargs '{"enable_thinking": false, "preserve_thinking": true}'
+    ///
+    /// Per-request `chat_template_kwargs` (top-level or under `extra_body`)
+    /// overrides server defaults on a per-key basis; unrelated server-default
+    /// keys persist through the merge. The DashScope flat
+    /// `extra_body.preserve_thinking` shape is also accepted as a secondary
+    /// form (only for `preserve_thinking`).
+    ///
+    /// Also honors `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`; CLI wins on conflict.
+    /// Malformed JSON causes the server to refuse to start with a clear
+    /// error. Non-thinking models silently ignore `preserve_thinking`.
+    ///
+    /// Note: quality benefits of `preserve_thinking` are only validated on
+    /// Qwen3.6. Qwen3 / Qwen3.5 accept the flag but were not trained on
+    /// multi-turn thinking traces.
+    #[arg(long = "chat-template-kwargs", value_name = "JSON")]
+    chat_template_kwargs: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {

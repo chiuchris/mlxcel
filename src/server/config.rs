@@ -246,6 +246,16 @@ pub struct ServerConfig {
     /// Per-request `thinking_budget_tokens` overrides this value (including
     /// a per-request `-1` reverting to unbounded for that one request).
     pub reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
+
+    /// Issue #410: server-wide default chat-template kwargs resolved from
+    /// `--chat-template-kwargs` and/or `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`.
+    ///
+    /// `None` means "no server-default kwargs"; per-request kwargs may still
+    /// set keys such as `preserve_thinking`. The per-request merge happens in
+    /// [`crate::server::chat_template_kwargs::merge_server_and_request`] so
+    /// every registered key — today `preserve_thinking`, tomorrow others —
+    /// inherits the same precedence rules.
+    pub chat_template_kwargs: Option<crate::server::chat_template_kwargs::ChatTemplateKwargs>,
 }
 
 impl Default for ServerConfig {
@@ -289,6 +299,7 @@ impl Default for ServerConfig {
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             lang_bias_config: None,
             reasoning_budget: None,
+            chat_template_kwargs: None,
         }
     }
 }

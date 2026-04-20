@@ -23,6 +23,7 @@ use anyhow::{Context, Result};
 use minijinja::{Environment, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
 
+use super::chat_template_kwargs::ChatTemplateKwargs;
 use super::types::request::Tool;
 
 /// A message in the conversation
@@ -178,11 +179,38 @@ impl ChatTemplateProcessor {
     ///
     /// When `tools` is `Some`, the tool definitions are passed to the Jinja2
     /// template context, enabling tool-calling prompt formatting.
+    ///
+    /// Thin wrapper that delegates to [`Self::apply_raw_with_kwargs`] with
+    /// empty kwargs. Preserved for legacy callers and tests.
     // Used by: chat_request, routes/chat
     pub fn apply_raw(
         &self,
         messages: &serde_json::Value,
         tools: Option<&[Tool]>,
+    ) -> Result<String> {
+        self.apply_raw_with_kwargs(messages, tools, &ChatTemplateKwargs::new())
+    }
+
+    /// Apply the chat template with raw JSON messages and additional Jinja
+    /// kwargs.
+    ///
+    /// Every key in `kwargs` is forwarded to the minijinja template context
+    /// under its original name (with a handful of canonical keys such as
+    /// `enable_thinking` overriding our default context entries so templates
+    /// that rely on those names see the operator-provided value). This is the
+    /// plumbing path used by issue #410's `preserve_thinking` feature and
+    /// generalizes to any future kwarg a HuggingFace chat template expects.
+    ///
+    /// When a kwarg key duplicates an already-provided context entry
+    /// (`messages`, `bos_token`, `eos_token`, `add_generation_prompt`,
+    /// `tools`), the kwarg value wins — this lets operators override defaults
+    /// if a template ships with unusual expectations.
+    // Used by: chat_request, routes/chat
+    pub fn apply_raw_with_kwargs(
+        &self,
+        messages: &serde_json::Value,
+        tools: Option<&[Tool]>,
+        kwargs: &ChatTemplateKwargs,
     ) -> Result<String> {
         let mut env = Environment::new();
         configure_environment(&mut env);
@@ -203,14 +231,15 @@ impl ChatTemplateProcessor {
             Some(t) => minijinja::Value::from_serialize(t),
             None => minijinja::Value::from_serialize(Vec::<Tool>::new()),
         };
-        let context = minijinja::context! {
-            messages => messages_val,
-            bos_token => &self.bos_token,
-            eos_token => &self.eos_token,
-            add_generation_prompt => self.add_generation_prompt,
-            tools => tools_val,
-            enable_thinking => false,
-        };
+
+        let context = build_template_context(
+            messages_val,
+            &self.bos_token,
+            &self.eos_token,
+            self.add_generation_prompt,
+            tools_val,
+            kwargs,
+        );
 
         let result = tmpl
             .render(context)
@@ -223,8 +252,27 @@ impl ChatTemplateProcessor {
     ///
     /// When `tools` is `Some`, the tool definitions are passed to the Jinja2
     /// template context, enabling tool-calling prompt formatting.
+    ///
+    /// Thin wrapper that delegates to [`Self::apply_with_kwargs`] with empty
+    /// kwargs. Preserved for legacy callers and tests.
     // Used by: chat_request, routes/chat
     pub fn apply(&self, messages: &[ChatMessage], tools: Option<&[Tool]>) -> Result<String> {
+        self.apply_with_kwargs(messages, tools, &ChatTemplateKwargs::new())
+    }
+
+    /// Apply the chat template with additional Jinja kwargs.
+    ///
+    /// See [`Self::apply_raw_with_kwargs`] for kwarg semantics. Non-thinking
+    /// models silently ignore unknown kwargs (the template simply does not
+    /// reference them), so it is safe to pass `preserve_thinking` or similar
+    /// keys universally.
+    // Used by: chat_request, routes/chat
+    pub fn apply_with_kwargs(
+        &self,
+        messages: &[ChatMessage],
+        tools: Option<&[Tool]>,
+        kwargs: &ChatTemplateKwargs,
+    ) -> Result<String> {
         let mut env = Environment::new();
         configure_environment(&mut env);
 
@@ -243,20 +291,115 @@ impl ChatTemplateProcessor {
             Some(t) => minijinja::Value::from_serialize(t),
             None => minijinja::Value::from_serialize(Vec::<Tool>::new()),
         };
-        let context = minijinja::context! {
-            messages => messages,
-            bos_token => &self.bos_token,
-            eos_token => &self.eos_token,
-            add_generation_prompt => self.add_generation_prompt,
-            tools => tools_val,
-            enable_thinking => false,
-        };
+
+        let messages_val = minijinja::Value::from_serialize(messages);
+        let context = build_template_context(
+            messages_val,
+            &self.bos_token,
+            &self.eos_token,
+            self.add_generation_prompt,
+            tools_val,
+            kwargs,
+        );
 
         let result = tmpl
             .render(context)
             .with_context(|| "Failed to render chat template")?;
 
         Ok(result)
+    }
+}
+
+/// Build the minijinja template context merging the standard chat fields with
+/// caller-provided kwargs.
+///
+/// Standard fields (`messages`, `bos_token`, `eos_token`,
+/// `add_generation_prompt`, `tools`) are always present and are **reserved**
+/// from kwargs overlay — a request cannot overwrite the canonical conversation
+/// or tool list by smuggling those keys through `chat_template_kwargs`.
+/// `enable_thinking` defaults to `false` for backward compatibility but may be
+/// overridden by `kwargs` (the same mechanism that lets issue #410's
+/// `preserve_thinking` reach the template). Any other kwarg key — including
+/// future template-specific hints — is passed through unchanged.
+fn build_template_context(
+    messages: minijinja::Value,
+    bos_token: &str,
+    eos_token: &str,
+    add_generation_prompt: bool,
+    tools: minijinja::Value,
+    kwargs: &ChatTemplateKwargs,
+) -> minijinja::Value {
+    // Start with the default context fields.
+    let mut ctx: std::collections::BTreeMap<&str, minijinja::Value> =
+        std::collections::BTreeMap::new();
+    ctx.insert("messages", messages);
+    ctx.insert("bos_token", minijinja::Value::from(bos_token));
+    ctx.insert("eos_token", minijinja::Value::from(eos_token));
+    ctx.insert(
+        "add_generation_prompt",
+        minijinja::Value::from(add_generation_prompt),
+    );
+    ctx.insert("tools", tools);
+    // Backward-compat default; may be overridden by kwargs below.
+    ctx.insert("enable_thinking", minijinja::Value::from(false));
+
+    // Overlay kwargs. Canonical prompt-construction keys are reserved so a
+    // client cannot smuggle a replacement `messages` array, swap `tools`, or
+    // flip `add_generation_prompt` through the request-side kwargs pass-through.
+    // Only `enable_thinking` (an intentional, tested override point) and any
+    // non-reserved key (e.g. `preserve_thinking`, future template hints)
+    // actually reach the Jinja context.
+    //
+    // We rebuild the map with owned String keys after merging so the final
+    // minijinja::Value owns all its entries.
+    const RESERVED_KEYS: &[&str] = &[
+        "messages",
+        "bos_token",
+        "eos_token",
+        "add_generation_prompt",
+        "tools",
+    ];
+    let mut owned: std::collections::BTreeMap<String, minijinja::Value> =
+        ctx.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    // Security (M-1): collect all reserved-key override attempts into a
+    // single bounded log line to prevent log-amplification DoS via
+    // attacker-controlled very-long kwargs keys. Keys are truncated to
+    // 64 chars before logging.
+    let mut dropped_keys: Vec<String> = Vec::new();
+    for (k, v) in kwargs.as_map() {
+        if RESERVED_KEYS.contains(&k.as_str()) {
+            dropped_keys.push(truncate_key_for_log(k));
+            continue;
+        }
+        owned.insert(k.clone(), minijinja::Value::from_serialize(v));
+    }
+    if !dropped_keys.is_empty() {
+        tracing::warn!(
+            "chat_template_kwargs keys [{}] are reserved for the server-managed \
+             template context and will be ignored; remove them from the request \
+             body or server default",
+            dropped_keys.join(", ")
+        );
+    }
+    minijinja::Value::from_serialize(&owned)
+}
+
+/// Security (M-1): truncate an attacker-controlled kwargs key to at most 64
+/// Unicode scalar values before including it in a log message.
+///
+/// An adversary can supply kwargs keys that are hundreds of kilobytes long.
+/// Logging them verbatim (e.g. via `{:?}`) multiplies that size by the number
+/// of reserved keys checked per request.  Bounding the logged representation
+/// keeps each log record small regardless of input.
+fn truncate_key_for_log(key: &str) -> String {
+    const MAX_CHARS: usize = 64;
+    let mut chars = key.chars();
+    let truncated: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        // Key had more than MAX_CHARS chars — append ellipsis.
+        format!("{truncated}\u{2026}")
+    } else {
+        truncated
     }
 }
 
@@ -1090,5 +1233,254 @@ TOOL
         // Without tools
         let result_no_tools = processor.apply_raw(&messages, None).unwrap();
         assert!(!result_no_tools.contains("[TOOLS]"));
+    }
+
+    #[test]
+    fn test_apply_with_kwargs_exposes_preserve_thinking() {
+        // Issue #410: verify that kwargs reach the Jinja template under the
+        // provided names. The template branches on preserve_thinking to emit
+        // a marker we can assert on.
+        let template = r#"{% if preserve_thinking %}[KEEP]{% else %}[STRIP]{% endif %}{% for m in messages %}{{ m.content }}{% endfor %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+
+        // preserve_thinking=true
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"preserve_thinking": true}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(out.contains("[KEEP]"));
+        assert!(!out.contains("[STRIP]"));
+
+        // preserve_thinking=false explicitly
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"preserve_thinking": false}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(out.contains("[STRIP]"));
+
+        // No kwarg: defaults to the template's `preserve_thinking` check
+        // (undefined/false → [STRIP]).
+        let out = processor
+            .apply_with_kwargs(&messages, None, &ChatTemplateKwargs::new())
+            .unwrap();
+        assert!(out.contains("[STRIP]"));
+    }
+
+    #[test]
+    fn test_apply_with_kwargs_passes_through_arbitrary_keys() {
+        // A future-proof sanity check: a template that references a
+        // hypothetical `custom_flag` kwarg must see the value we pass.
+        let template = r#"flag={{ custom_flag }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"custom_flag": 42}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(out.contains("flag=42"));
+    }
+
+    #[test]
+    fn test_apply_with_kwargs_allows_overriding_enable_thinking() {
+        // enable_thinking defaults to false for backward compat. Confirm
+        // kwargs can override that default without a dedicated plumbing
+        // path — critical for future `enable_thinking` support.
+        let template = r#"{% if enable_thinking %}[THINK]{% else %}[NOTHINK]{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": true}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(
+            out.contains("[THINK]"),
+            "enable_thinking kwarg must override default, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_apply_raw_with_kwargs_exposes_preserve_thinking() {
+        // Multimodal-path parity: apply_raw_with_kwargs must plumb kwargs too.
+        let template = r#"{% if preserve_thinking %}[KEEP]{% else %}[STRIP]{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"preserve_thinking": true}"#).unwrap();
+        let out = processor
+            .apply_raw_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(out.contains("[KEEP]"));
+    }
+
+    #[test]
+    fn test_kwargs_cannot_override_reserved_messages_key() {
+        // Regression guard: a request-side kwarg `messages` must NOT replace
+        // the real conversation. Template echoes content of the first message
+        // so we can detect replacement attempts.
+        let template = r#"[{{ messages[0].content }}]"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let real_messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "real-user-content".to_string(),
+        }];
+        let hostile_kwargs = ChatTemplateKwargs::from_json_str(
+            r#"{"messages": [{"role": "user", "content": "INJECTED"}]}"#,
+        )
+        .unwrap();
+        let out = processor
+            .apply_with_kwargs(&real_messages, None, &hostile_kwargs)
+            .expect("render must succeed");
+        assert!(
+            out.contains("real-user-content"),
+            "real messages must survive kwargs overlay; got: {out:?}"
+        );
+        assert!(
+            !out.contains("INJECTED"),
+            "kwarg `messages` must NOT replace the real conversation; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn test_kwargs_cannot_override_reserved_tools_key() {
+        // Regression guard: a kwarg `tools` must NOT change the tool set the
+        // template iterates over. The template writes `T` per tool so an
+        // override from an empty real-tools slice would be detectable.
+        let template = r#"{% for t in tools %}T{% endfor %}{% for m in messages %}{{ m.content }}{% endfor %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        // Request no tools in the real context.
+        let hostile_kwargs = ChatTemplateKwargs::from_json_str(
+            r#"{"tools": [{"type":"function","function":{"name":"injected","description":null,"parameters":null}}]}"#,
+        )
+        .unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &hostile_kwargs)
+            .expect("render must succeed");
+        assert!(
+            !out.contains("T"),
+            "kwarg `tools` must NOT populate the template tool list; got: {out:?}"
+        );
+        assert!(out.contains("hi"));
+    }
+
+    #[test]
+    fn test_kwargs_cannot_flip_reserved_add_generation_prompt() {
+        // Regression guard: a kwarg `add_generation_prompt` must NOT override
+        // the server-managed value. Template renders a marker only when
+        // add_generation_prompt is true.
+        let template = r#"{% if add_generation_prompt %}GEN{% else %}NOGEN{% endif %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(template.to_string());
+        processor.set_add_generation_prompt(false);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let hostile_kwargs =
+            ChatTemplateKwargs::from_json_str(r#"{"add_generation_prompt": true}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &hostile_kwargs)
+            .expect("render must succeed");
+        assert!(
+            out.contains("NOGEN"),
+            "kwarg must not flip add_generation_prompt; got: {out:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Security M-1: reserved-key filtering — truncation and aggregation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn truncate_key_for_log_short_key_unchanged() {
+        // A key within the 64-char limit must come back unchanged.
+        let key = "messages";
+        assert_eq!(truncate_key_for_log(key), "messages");
+    }
+
+    #[test]
+    fn truncate_key_for_log_exactly_64_chars_unchanged() {
+        let key: String = "x".repeat(64);
+        let out = truncate_key_for_log(&key);
+        assert_eq!(out.len(), 64, "exactly-64-char key must not be truncated");
+        assert!(
+            !out.contains('\u{2026}'),
+            "no ellipsis for exactly-64-char key"
+        );
+    }
+
+    #[test]
+    fn truncate_key_for_log_long_key_gets_ellipsis() {
+        // A key longer than 64 chars must be truncated and have the ellipsis appended.
+        let key: String = "a".repeat(400_000);
+        let out = truncate_key_for_log(&key);
+        // The result is 64 ASCII chars + 3-byte UTF-8 ellipsis (U+2026).
+        assert!(
+            out.ends_with('\u{2026}'),
+            "truncated key must end with ellipsis"
+        );
+        // The visible character count is 64 'a's + 1 ellipsis = 65 chars.
+        assert_eq!(out.chars().count(), 65);
+    }
+
+    #[test]
+    fn truncate_key_for_log_multibyte_chars_counted_by_char() {
+        // Use CJK characters (3 bytes each in UTF-8) to confirm we count
+        // Unicode scalar values, not bytes.
+        let key: String = "\u{4e2d}".repeat(65); // 65 Chinese chars
+        let out = truncate_key_for_log(&key);
+        assert!(out.ends_with('\u{2026}'));
+        assert_eq!(out.chars().count(), 65); // 64 CJK + ellipsis
+    }
+
+    #[test]
+    fn m1_multiple_reserved_key_overrides_all_filtered_correctly() {
+        // Supplying kwargs for three reserved keys — `messages`, `tools`, and
+        // `add_generation_prompt` — must:
+        //   1. Not panic.
+        //   2. Still render the real messages unchanged (no injection).
+        //   3. The normal kwarg key (`preserve_thinking`) still reaches the template.
+        let template =
+            r#"{% if preserve_thinking %}KEEP{% else %}STRIP{% endif %}|{{ messages[0].content }}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        let real_messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "real".to_string(),
+        }];
+        let kwargs = ChatTemplateKwargs::from_json_str(
+            r#"{
+                "messages": [{"role":"user","content":"INJECTED"}],
+                "tools": [{"type":"function","function":{"name":"bad","description":null,"parameters":null}}],
+                "add_generation_prompt": false,
+                "preserve_thinking": true
+            }"#,
+        )
+        .unwrap();
+        let out = processor
+            .apply_with_kwargs(&real_messages, None, &kwargs)
+            .expect("render must succeed despite reserved-key kwargs");
+
+        // Reserved keys must be silently dropped.
+        assert!(out.contains("real"), "real message content must survive");
+        assert!(
+            !out.contains("INJECTED"),
+            "injected messages must be blocked"
+        );
+        // Non-reserved kwarg must still reach the template.
+        assert!(
+            out.contains("KEEP"),
+            "preserve_thinking=true must reach template"
+        );
     }
 }

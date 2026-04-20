@@ -25,6 +25,7 @@ use std::path::PathBuf;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::ServerStartupConfig;
+use super::chat_template_kwargs::resolve_server_default_kwargs;
 use super::thinking_budget::{
     ThinkingBudget, ThinkingBudgetError, resolve_server_default_reasoning_budget,
 };
@@ -182,11 +183,33 @@ pub struct ServerStartupInput {
     /// The env-var fallback `LLAMA_ARG_REASONING_BUDGET` is applied by
     /// [`env_fallback_reasoning_budget`] before this struct is constructed.
     pub reasoning_budget: i32,
+
+    /// Issue #410: raw JSON string for the default chat-template kwargs.
+    ///
+    /// Mirrors llama.cpp's `--chat-template-kwargs` flag and the
+    /// `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` env var. `None` or an empty string
+    /// means "no server defaults." Invalid JSON is rejected at
+    /// [`ServerStartupInput::into_startup_config`] time with an
+    /// `anyhow::bail!`-equivalent error propagated back to the binary entry
+    /// point, so the server refuses to start on a clearly malformed flag.
+    ///
+    /// The env-var fallback is applied by
+    /// [`env_fallback_chat_template_kwargs`] in each binary before this
+    /// struct is constructed, so the precedence CLI > env is enforced
+    /// consistently.
+    pub chat_template_kwargs: Option<String>,
 }
 
 impl ServerStartupInput {
     /// Normalize edge-only CLI conventions into runtime startup policy.
-    pub fn into_startup_config(self) -> ServerStartupConfig {
+    ///
+    /// Returns an error when any edge input has a malformed shape that we
+    /// cannot reasonably paper over at runtime. Today the only hard-fail
+    /// input is `--chat-template-kwargs` (issue #410) because a malformed
+    /// JSON object cannot be silently "ignored" without degrading into a
+    /// confusing state where the operator thinks they configured kwargs but
+    /// didn't.
+    pub fn into_startup_config(self) -> anyhow::Result<ServerStartupConfig> {
         let resolution =
             resolve_prefill_chunk_size(self.prefill_chunk_size, self.batch_size, self.ubatch_size);
         // Issue #409: resolve the server-wide thinking budget once, up-front.
@@ -205,7 +228,13 @@ impl ServerStartupInput {
                 None
             }
         };
-        ServerStartupConfig {
+        // Issue #410: resolve the server-wide chat-template kwargs. Invalid
+        // JSON is a hard failure (see doc comment above) — return early with
+        // a clear error that the binary will surface as an exit code.
+        let chat_template_kwargs =
+            resolve_server_default_kwargs(self.chat_template_kwargs.as_deref())
+                .map_err(|e| anyhow::anyhow!("--chat-template-kwargs: {e}"))?;
+        Ok(ServerStartupConfig {
             model_path: self.model_path,
             adapter_path: self.adapter_path,
             model_alias: self.model_alias,
@@ -279,7 +308,8 @@ impl ServerStartupInput {
             debug_pp_trace: self.debug_pp_trace,
             lang_bias_config: self.lang_bias_config,
             reasoning_budget,
-        }
+            chat_template_kwargs,
+        })
     }
 }
 

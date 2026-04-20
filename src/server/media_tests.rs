@@ -38,6 +38,8 @@ fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        chat_template_kwargs: None,
+        extra_body: None,
         params: SamplingParams::default(),
     }
 }
@@ -174,6 +176,8 @@ async fn extract_chat_image_data_collects_images_across_messages() {
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
+        chat_template_kwargs: None,
+        extra_body: None,
         params: SamplingParams::default(),
     };
 

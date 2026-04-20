@@ -102,6 +102,7 @@ fn sample_args() -> crate::ServeArgs {
         debug_pp_trace: None,
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
         reasoning_budget: -1,
+        chat_template_kwargs: None,
     }
 }
 

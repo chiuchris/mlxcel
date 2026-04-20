@@ -18,6 +18,7 @@ pub mod app;
 pub mod batch;
 mod chat_request;
 pub mod chat_template;
+pub mod chat_template_kwargs;
 mod cli_input;
 mod config;
 mod media;
@@ -33,6 +34,10 @@ pub mod types;
 
 pub use app::create_app;
 pub use chat_template::ChatTemplateProcessor;
+pub use chat_template_kwargs::{
+    ChatTemplateKwargs, ChatTemplateKwargsError, LLAMA_ARG_CHAT_TEMPLATE_KWARGS,
+    env_fallback_chat_template_kwargs,
+};
 pub use cli_input::{
     ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
     env_fallback_reasoning_budget,
