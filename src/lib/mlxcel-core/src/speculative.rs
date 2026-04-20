@@ -180,8 +180,7 @@ impl SpeculativeGenerator {
         // History + EOS handling inherit the caller's policy; history-based
         // penalties apply to both models so we read flags from the caller's
         // raw config (same shape as `target_sampling` except for `token_bias`).
-        let eos_tokens =
-            merged_eos_token_ids(main_model.eos_token_ids(), &sampling.stop_token_ids);
+        let eos_tokens = merged_eos_token_ids(main_model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 

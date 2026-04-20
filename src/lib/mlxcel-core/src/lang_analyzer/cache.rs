@@ -177,7 +177,10 @@ mod tests {
     static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK.get_or_init(|| std::sync::Mutex::new(())).lock().unwrap_or_else(|e| e.into_inner())
+        ENV_LOCK
+            .get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
     }
 
     // -----------------------------------------------------------------------
@@ -189,7 +192,8 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn mock_json(marker: &str) -> String {
-        format!(r#"{{
+        format!(
+            r#"{{
   "version": "1.0",
   "truncation": null,
   "padding": null,
@@ -210,7 +214,8 @@ mod tests {
     }},
     "unk_token": "<unk>"
   }}
-}}"#)
+}}"#
+        )
     }
 
     fn make_tokenizer(json: &str) -> Tokenizer {
@@ -371,7 +376,10 @@ mod tests {
         std::env::remove_var("MLXCEL_CACHE_DIR");
         drop(_guard);
 
-        assert!(result.is_none(), "try_load should return None on corrupt file");
+        assert!(
+            result.is_none(),
+            "try_load should return None on corrupt file"
+        );
 
         // The original file must no longer exist.
         assert!(
@@ -410,8 +418,8 @@ mod tests {
         std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
 
         // First call — must build and save.
-        let idx1 = load_or_build(&tok, &json_bytes, false)
-            .expect("first load_or_build should succeed");
+        let idx1 =
+            load_or_build(&tok, &json_bytes, false).expect("first load_or_build should succeed");
         let path = cache_path(&idx1.vocab_hash);
         let mtime1 = std::fs::metadata(&path)
             .expect("cache file must exist after first call")
@@ -419,8 +427,8 @@ mod tests {
             .expect("mtime");
 
         // Second call — must load from disk (no rebuild, mtime unchanged).
-        let idx2 = load_or_build(&tok, &json_bytes, false)
-            .expect("second load_or_build should succeed");
+        let idx2 =
+            load_or_build(&tok, &json_bytes, false).expect("second load_or_build should succeed");
         let mtime2 = std::fs::metadata(&path)
             .expect("cache file must still exist")
             .modified()
@@ -506,7 +514,9 @@ mod tests {
 
         let found = candidates.iter().find(|p| std::path::Path::new(p).exists());
         let Some(tok_path) = found else {
-            eprintln!("[skip] no model tokenizer.json found; skipping real-tokenizer cache smoke test");
+            eprintln!(
+                "[skip] no model tokenizer.json found; skipping real-tokenizer cache smoke test"
+            );
             return;
         };
 
@@ -518,13 +528,16 @@ mod tests {
         std::env::set_var("MLXCEL_CACHE_DIR", tmp.path());
 
         // First call — build and persist.
-        let idx1 = load_or_build(&tok, &json_bytes, false)
-            .expect("first load_or_build on real tokenizer");
+        let idx1 =
+            load_or_build(&tok, &json_bytes, false).expect("first load_or_build on real tokenizer");
         assert_eq!(idx1.version, CURRENT_VERSION);
         assert_eq!(idx1.vocab_hash.len(), 16);
 
         let path = cache_path(&idx1.vocab_hash);
-        assert!(path.exists(), "cache file must exist after first load_or_build");
+        assert!(
+            path.exists(),
+            "cache file must exist after first load_or_build"
+        );
         let mtime1 = std::fs::metadata(&path).unwrap().modified().unwrap();
 
         // Second call — must load from disk.

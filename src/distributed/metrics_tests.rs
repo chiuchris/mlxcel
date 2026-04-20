@@ -196,7 +196,7 @@ fn percentiles_single_sample() {
 
 #[test]
 fn percentiles_ordered_correctly() {
-    let samples: VecDeque<Duration> = (1..=100).map(|i| Duration::from_millis(i)).collect();
+    let samples: VecDeque<Duration> = (1..=100).map(Duration::from_millis).collect();
     let p = compute_percentiles(&samples);
     assert_eq!(p.min, Duration::from_millis(1));
     assert_eq!(p.max, Duration::from_millis(100));

@@ -256,7 +256,7 @@ fn into_startup_config_accepts_valid_chat_template_kwargs_json() {
     let kwargs = startup
         .chat_template_kwargs
         .expect("non-empty kwargs should materialize");
-    assert_eq!(kwargs.preserve_thinking(), true);
+    assert!(kwargs.preserve_thinking());
 }
 
 #[test]

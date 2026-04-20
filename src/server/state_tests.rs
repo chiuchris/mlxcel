@@ -105,8 +105,8 @@ fn admission_control_rejects_when_queue_at_or_above_limit() {
     let max = 4usize;
 
     m.set_queue_depth(4);
-    assert!(!(m.queue_depth() < max), "queue at limit should reject");
+    assert!((m.queue_depth() >= max), "queue at limit should reject");
 
     m.set_queue_depth(10);
-    assert!(!(m.queue_depth() < max), "queue above limit should reject");
+    assert!((m.queue_depth() >= max), "queue above limit should reject");
 }

@@ -294,8 +294,8 @@ fn test_local_shapes_mqa_tp4() {
     assert_eq!(meta.q_head_range, 16..24);
     assert!(meta.kv_assignment.is_replicated());
     assert_eq!(meta.local_q_dim, 8 * 64);
-    assert_eq!(meta.local_k_dim, 1 * 64);
-    assert_eq!(meta.local_v_dim, 1 * 64);
+    assert_eq!(meta.local_k_dim, 64);
+    assert_eq!(meta.local_v_dim, 64);
     assert!(meta.needs_allreduce);
     assert_eq!(meta.attention_type, AttentionType::MQA);
 }

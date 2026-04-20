@@ -302,10 +302,7 @@ impl TokenLanguageIndex {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let digest = hasher.finalize();
-        digest[..8]
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect()
+        digest[..8].iter().map(|b| format!("{b:02x}")).collect()
     }
 
     /// Build the index by scanning the entire vocabulary.
@@ -333,7 +330,10 @@ impl TokenLanguageIndex {
     ///    back to its raw byte and classify by UTF-8 start-byte range. See
     ///    [`classify_byte_start`] for the start-byte → Script table.
     /// 6. Invert into `by_script`.
-    pub fn build(tokenizer: &Tokenizer, tokenizer_json_bytes: &[u8]) -> Result<Self, LangAnalyzerError> {
+    pub fn build(
+        tokenizer: &Tokenizer,
+        tokenizer_json_bytes: &[u8],
+    ) -> Result<Self, LangAnalyzerError> {
         let vocab_size = tokenizer.get_vocab_size(true);
         if vocab_size == 0 {
             return Err(LangAnalyzerError::EmptyVocab);
@@ -370,9 +370,7 @@ impl TokenLanguageIndex {
                 tokenizer.id_to_token(id).unwrap_or_default()
             } else {
                 // decode consumes a slice; returning the logical UTF-8 text.
-                tokenizer
-                    .decode(&[id], false)
-                    .unwrap_or_default()
+                tokenizer.decode(&[id], false).unwrap_or_default()
             };
 
             let mut scripts = classify_token(&token_str);
@@ -401,9 +399,7 @@ impl TokenLanguageIndex {
             let mut is_byte_fragment = false;
             if !is_special && scripts.is_empty() {
                 if let Some(reverse) = &byte_reverse {
-                    if token_str.is_empty()
-                        || token_str.chars().any(|c| c == '\u{FFFD}')
-                    {
+                    if token_str.is_empty() || token_str.chars().any(|c| c == '\u{FFFD}') {
                         if let Some(raw_byte) = reverse_byte_for_token(tokenizer, id, reverse) {
                             if let Some(script) = classify_byte_start(raw_byte) {
                                 scripts.push(script);
@@ -464,9 +460,7 @@ fn has_byte_level_pretokenizer(tokenizer: &Tokenizer) -> bool {
     fn contains_byte_level(wrapper: &PreTokenizerWrapper) -> bool {
         match wrapper {
             PreTokenizerWrapper::ByteLevel(_) => true,
-            PreTokenizerWrapper::Sequence(seq) => {
-                seq.as_ref().iter().any(contains_byte_level)
-            }
+            PreTokenizerWrapper::Sequence(seq) => seq.as_ref().iter().any(contains_byte_level),
             _ => false,
         }
     }
@@ -771,11 +765,13 @@ fn scripts_for(code: LanguageCode, policy: InclusionPolicy) -> &'static [Script]
 ///   `lang_scripts`. An empty `token_scripts` slice is considered non-qualifying
 ///   (tokens without identified scripts are not pure-script tokens).
 #[inline]
-fn matches_policy(token_scripts: &[Script], lang_scripts: &[Script], policy: InclusionPolicy) -> bool {
+fn matches_policy(
+    token_scripts: &[Script],
+    lang_scripts: &[Script],
+    policy: InclusionPolicy,
+) -> bool {
     match policy {
-        InclusionPolicy::Conservative => {
-            token_scripts.iter().any(|s| lang_scripts.contains(s))
-        }
+        InclusionPolicy::Conservative => token_scripts.iter().any(|s| lang_scripts.contains(s)),
         InclusionPolicy::Strict => {
             !token_scripts.is_empty() && token_scripts.iter().all(|s| lang_scripts.contains(s))
         }
@@ -856,8 +852,7 @@ impl TokenLanguageIndex {
         let mut map = crate::sampling::TokenBiasMap::new();
         // Build a fast-lookup set of byte-fragment ids so we can tag each
         // inserted entry without re-scanning `self.tokens` per call.
-        let byte_fragment_ids: std::collections::HashSet<i32> = if exceptions
-            .include_byte_fragments
+        let byte_fragment_ids: std::collections::HashSet<i32> = if exceptions.include_byte_fragments
         {
             self.tokens
                 .iter()
@@ -981,7 +976,10 @@ mod tests {
     fn classify_hangul_and_han() {
         let result = classify_token("韓국어");
         // 韓 is Han, 국어 is Hangul — both scripts must appear.
-        assert!(result.contains(&Script::Hangul), "expected Hangul in {result:?}");
+        assert!(
+            result.contains(&Script::Hangul),
+            "expected Hangul in {result:?}"
+        );
         assert!(result.contains(&Script::Han), "expected Han in {result:?}");
         assert_eq!(result.len(), 2);
     }
@@ -1002,7 +1000,10 @@ mod tests {
     fn classify_hiragana_and_han() {
         // "日本語のひらがな" — 日本語 is Han, の and ひらがな are Hiragana.
         let result = classify_token("日本語のひらがな");
-        assert!(result.contains(&Script::Hiragana), "expected Hiragana in {result:?}");
+        assert!(
+            result.contains(&Script::Hiragana),
+            "expected Hiragana in {result:?}"
+        );
         assert!(result.contains(&Script::Han), "expected Han in {result:?}");
         assert_eq!(result.len(), 2);
     }
@@ -1226,19 +1227,32 @@ mod tests {
     #[test]
     fn tokens_for_language_ja_conservative_includes_han() {
         let index = build_test_index(&[
-            (0, "▁", false),          // whitespace-only — excluded
-            (1, "hello", false),      // Latin — excluded from ja
-            (2, "中文", false),        // Han — included in ja Conservative
-            (3, "ひらがな", false),    // Hiragana — included in ja Conservative
+            (0, "▁", false),        // whitespace-only — excluded
+            (1, "hello", false),    // Latin — excluded from ja
+            (2, "中文", false),     // Han — included in ja Conservative
+            (3, "ひらがな", false), // Hiragana — included in ja Conservative
         ]);
         let exceptions = ExceptionConfig::default();
-        let ids = index.tokens_for_language(LanguageCode::Ja, InclusionPolicy::Conservative, &exceptions);
+        let ids =
+            index.tokens_for_language(LanguageCode::Ja, InclusionPolicy::Conservative, &exceptions);
         // Han token (id=2) and Hiragana token (id=3) should be included.
-        assert!(ids.contains(&2), "Han token must be in ja Conservative: {ids:?}");
-        assert!(ids.contains(&3), "Hiragana token must be in ja Conservative: {ids:?}");
+        assert!(
+            ids.contains(&2),
+            "Han token must be in ja Conservative: {ids:?}"
+        );
+        assert!(
+            ids.contains(&3),
+            "Hiragana token must be in ja Conservative: {ids:?}"
+        );
         // Latin (id=1) and whitespace (id=0) should not be included.
-        assert!(!ids.contains(&1), "Latin token must not be in ja Conservative: {ids:?}");
-        assert!(!ids.contains(&0), "Whitespace token must not be in ja Conservative: {ids:?}");
+        assert!(
+            !ids.contains(&1),
+            "Latin token must not be in ja Conservative: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&0),
+            "Whitespace token must not be in ja Conservative: {ids:?}"
+        );
     }
 
     /// `ko` Strict only includes Hangul tokens; Han-only tokens are excluded
@@ -1246,21 +1260,41 @@ mod tests {
     #[test]
     fn tokens_for_language_ko_strict_excludes_han() {
         let index = build_test_index(&[
-            (0, "한국어", false),  // Hangul — included in ko Strict
-            (1, "中文", false),    // Han only — excluded from ko Strict (not in {Hangul})
-            (2, "韓국어", false),  // Hangul + Han — excluded from ko Strict (Han not in {Hangul})
+            (0, "한국어", false), // Hangul — included in ko Strict
+            (1, "中文", false),   // Han only — excluded from ko Strict (not in {Hangul})
+            (2, "韓국어", false), // Hangul + Han — excluded from ko Strict (Han not in {Hangul})
         ]);
         let exceptions = ExceptionConfig::default();
 
-        let strict_ids = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &exceptions);
-        assert!(strict_ids.contains(&0), "Pure Hangul must be in ko Strict: {strict_ids:?}");
-        assert!(!strict_ids.contains(&1), "Han-only must NOT be in ko Strict: {strict_ids:?}");
-        assert!(!strict_ids.contains(&2), "Hangul+Han must NOT be in ko Strict: {strict_ids:?}");
+        let strict_ids =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &exceptions);
+        assert!(
+            strict_ids.contains(&0),
+            "Pure Hangul must be in ko Strict: {strict_ids:?}"
+        );
+        assert!(
+            !strict_ids.contains(&1),
+            "Han-only must NOT be in ko Strict: {strict_ids:?}"
+        );
+        assert!(
+            !strict_ids.contains(&2),
+            "Hangul+Han must NOT be in ko Strict: {strict_ids:?}"
+        );
 
-        let conserv_ids = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &exceptions);
-        assert!(conserv_ids.contains(&0), "Pure Hangul must be in ko Conservative: {conserv_ids:?}");
-        assert!(conserv_ids.contains(&1), "Han-only must be in ko Conservative: {conserv_ids:?}");
-        assert!(conserv_ids.contains(&2), "Hangul+Han must be in ko Conservative: {conserv_ids:?}");
+        let conserv_ids =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &exceptions);
+        assert!(
+            conserv_ids.contains(&0),
+            "Pure Hangul must be in ko Conservative: {conserv_ids:?}"
+        );
+        assert!(
+            conserv_ids.contains(&1),
+            "Han-only must be in ko Conservative: {conserv_ids:?}"
+        );
+        assert!(
+            conserv_ids.contains(&2),
+            "Hangul+Han must be in ko Conservative: {conserv_ids:?}"
+        );
     }
 
     /// Special tokens are excluded by default; setting `include_special=true`
@@ -1268,17 +1302,34 @@ mod tests {
     #[test]
     fn tokens_for_language_exceptions_default_excludes_special() {
         let index = build_test_index(&[
-            (0, "한국어", true),   // Hangul, special=true
-            (1, "한국", false),    // Hangul, special=false
+            (0, "한국어", true), // Hangul, special=true
+            (1, "한국", false),  // Hangul, special=false
         ]);
         let default_ex = ExceptionConfig::default();
-        let ids_default = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &default_ex);
-        assert!(!ids_default.contains(&0), "Special token must be absent by default: {ids_default:?}");
-        assert!(ids_default.contains(&1), "Non-special Hangul must be present: {ids_default:?}");
+        let ids_default =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &default_ex);
+        assert!(
+            !ids_default.contains(&0),
+            "Special token must be absent by default: {ids_default:?}"
+        );
+        assert!(
+            ids_default.contains(&1),
+            "Non-special Hangul must be present: {ids_default:?}"
+        );
 
-        let include_special_ex = ExceptionConfig { include_special: true, ..Default::default() };
-        let ids_with_special = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &include_special_ex);
-        assert!(ids_with_special.contains(&0), "Special token must appear with include_special=true: {ids_with_special:?}");
+        let include_special_ex = ExceptionConfig {
+            include_special: true,
+            ..Default::default()
+        };
+        let ids_with_special = index.tokens_for_language(
+            LanguageCode::Ko,
+            InclusionPolicy::Conservative,
+            &include_special_ex,
+        );
+        assert!(
+            ids_with_special.contains(&0),
+            "Special token must appear with include_special=true: {ids_with_special:?}"
+        );
     }
 
     /// Numeric tokens are excluded by default; `include_numeric=true` includes them.
@@ -1343,16 +1394,30 @@ mod tests {
         };
 
         let default_ex = ExceptionConfig::default();
-        let ids_default = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &default_ex);
+        let ids_default =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &default_ex);
         // Token 0 is numeric and excluded by default.
-        assert!(!ids_default.contains(&0), "Numeric token must be absent by default: {ids_default:?}");
+        assert!(
+            !ids_default.contains(&0),
+            "Numeric token must be absent by default: {ids_default:?}"
+        );
         // Token 1 is normal and present.
-        assert!(ids_default.contains(&1), "Non-numeric Hangul must be present: {ids_default:?}");
+        assert!(
+            ids_default.contains(&1),
+            "Non-numeric Hangul must be present: {ids_default:?}"
+        );
 
-        let include_num_ex = ExceptionConfig { include_numeric: true, ..Default::default() };
-        let ids_with_num = index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &include_num_ex);
+        let include_num_ex = ExceptionConfig {
+            include_numeric: true,
+            ..Default::default()
+        };
+        let ids_with_num =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &include_num_ex);
         // Token 0 should now pass the numeric exclusion and then pass the Hangul script check.
-        assert!(ids_with_num.contains(&0), "Numeric Hangul token must appear with include_numeric=true: {ids_with_num:?}");
+        assert!(
+            ids_with_num.contains(&0),
+            "Numeric Hangul token must appear with include_numeric=true: {ids_with_num:?}"
+        );
     }
 
     /// When a token belongs to both `ja` and `ko` (e.g. a Han character),
@@ -1367,9 +1432,17 @@ mod tests {
                 (LanguageCode::Ko, -2.0), // ko second — loses on token 10
             ],
         };
-        let map = index.to_token_bias(&lang_bias, InclusionPolicy::Conservative, &ExceptionConfig::default());
+        let map = index.to_token_bias(
+            &lang_bias,
+            InclusionPolicy::Conservative,
+            &ExceptionConfig::default(),
+        );
         let bias = map.iter().find(|(&id, _)| id == 10).map(|(_, &b)| b);
-        assert_eq!(bias, Some(3.0_f32), "ja should win for Han token; got {bias:?}");
+        assert_eq!(
+            bias,
+            Some(3.0_f32),
+            "ja should win for Han token; got {bias:?}"
+        );
     }
 
     /// Positive and negative biases coexist correctly in the same `TokenBiasMap`.
@@ -1382,30 +1455,46 @@ mod tests {
     #[test]
     fn to_token_bias_sign_mix() {
         let index = build_test_index(&[
-            (20, "한국어", false),  // Hangul — ko
-            (21, "中文", false),    // Han — ko Conservative includes Han
-            (22, "hello", false),   // Latin — en
-            (23, "γεια", false),    // Greek — not in ko or en
+            (20, "한국어", false), // Hangul — ko
+            (21, "中文", false),   // Han — ko Conservative includes Han
+            (22, "hello", false),  // Latin — en
+            (23, "γεια", false),   // Greek — not in ko or en
         ]);
         let lang_bias = LangBiasSet {
-            ordered: vec![
-                (LanguageCode::Ko, 5.0),
-                (LanguageCode::En, -3.5),
-            ],
+            ordered: vec![(LanguageCode::Ko, 5.0), (LanguageCode::En, -3.5)],
         };
-        let map = index.to_token_bias(&lang_bias, InclusionPolicy::Conservative, &ExceptionConfig::default());
+        let map = index.to_token_bias(
+            &lang_bias,
+            InclusionPolicy::Conservative,
+            &ExceptionConfig::default(),
+        );
         // Hangul token (id=20) present with +5.0
         let ko_bias = map.iter().find(|(&id, _)| id == 20).map(|(_, &b)| b);
-        assert_eq!(ko_bias, Some(5.0_f32), "Hangul token bias mismatch: {ko_bias:?}");
+        assert_eq!(
+            ko_bias,
+            Some(5.0_f32),
+            "Hangul token bias mismatch: {ko_bias:?}"
+        );
         // Han token (id=21) also claimed by ko (Conservative includes Han) with +5.0
         let han_bias = map.iter().find(|(&id, _)| id == 21).map(|(_, &b)| b);
-        assert_eq!(han_bias, Some(5.0_f32), "Han token (ko Conservative) bias mismatch: {han_bias:?}");
+        assert_eq!(
+            han_bias,
+            Some(5.0_f32),
+            "Han token (ko Conservative) bias mismatch: {han_bias:?}"
+        );
         // Latin token (id=22) claimed by en with -3.5
         let en_bias = map.iter().find(|(&id, _)| id == 22).map(|(_, &b)| b);
-        assert_eq!(en_bias, Some(-3.5_f32), "Latin token bias mismatch: {en_bias:?}");
+        assert_eq!(
+            en_bias,
+            Some(-3.5_f32),
+            "Latin token bias mismatch: {en_bias:?}"
+        );
         // Greek token (id=23) not in ko or en — absent
         let el_bias = map.iter().find(|(&id, _)| id == 23).map(|(_, &b)| b);
-        assert!(el_bias.is_none(), "Greek token should not appear for ko+en: {el_bias:?}");
+        assert!(
+            el_bias.is_none(),
+            "Greek token should not appear for ko+en: {el_bias:?}"
+        );
     }
 
     /// `f32::NEG_INFINITY` round-trips through insertion without panic.
@@ -1415,16 +1504,27 @@ mod tests {
         let lang_bias = LangBiasSet {
             ordered: vec![(LanguageCode::Ja, f32::NEG_INFINITY)],
         };
-        let map = index.to_token_bias(&lang_bias, InclusionPolicy::Conservative, &ExceptionConfig::default());
+        let map = index.to_token_bias(
+            &lang_bias,
+            InclusionPolicy::Conservative,
+            &ExceptionConfig::default(),
+        );
         let bias = map.iter().find(|(&id, _)| id == 30).map(|(_, &b)| b);
-        assert_eq!(bias, Some(f32::NEG_INFINITY), "NEG_INFINITY bias must survive insertion: {bias:?}");
+        assert_eq!(
+            bias,
+            Some(f32::NEG_INFINITY),
+            "NEG_INFINITY bias must survive insertion: {bias:?}"
+        );
     }
 
     /// `LanguageCode::from_str("xx")` must return an error.
     #[test]
     fn language_code_from_str_unknown_errors() {
         let result = "xx".parse::<LanguageCode>();
-        assert!(result.is_err(), "Unknown language code should error; got {result:?}");
+        assert!(
+            result.is_err(),
+            "Unknown language code should error; got {result:?}"
+        );
         // Valid codes must succeed.
         assert_eq!("ja".parse::<LanguageCode>().unwrap(), LanguageCode::Ja);
         assert_eq!("ko".parse::<LanguageCode>().unwrap(), LanguageCode::Ko);
@@ -1451,18 +1551,15 @@ mod tests {
         //   id=3  Han token (shared between ja and ko Conservative)
         //   id=4  special Hangul (excluded unless include_special=true)
         let index = build_test_index(&[
-            (0, "▁", false),        // whitespace
-            (1, "한국어", false),    // Hangul
-            (2, "hello", false),    // Latin
-            (3, "中文", false),      // Han
-            (4, "한", true),         // Hangul special
+            (0, "▁", false),      // whitespace
+            (1, "한국어", false), // Hangul
+            (2, "hello", false),  // Latin
+            (3, "中文", false),   // Han
+            (4, "한", true),      // Hangul special
         ]);
 
         let lang_bias = LangBiasSet {
-            ordered: vec![
-                (LanguageCode::Ko, -100.0),
-                (LanguageCode::En, 2.0),
-            ],
+            ordered: vec![(LanguageCode::Ko, -100.0), (LanguageCode::En, 2.0)],
         };
         let exceptions = ExceptionConfig::default();
         let map = index.to_token_bias(&lang_bias, InclusionPolicy::Conservative, &exceptions);
@@ -1470,11 +1567,23 @@ mod tests {
         // ko Conservative = {Hangul, Han}: id=1 (Hangul) and id=3 (Han) are included.
         // id=4 is excluded (special). id=0 is excluded (whitespace).
         // en Conservative = {Latin}: id=2 (Latin) is included; id=3 already claimed by ko.
-        assert!(map.contains(1), "Hangul token must be in ko set: map={map:?}");
+        assert!(
+            map.contains(1),
+            "Hangul token must be in ko set: map={map:?}"
+        );
         assert!(map.contains(3), "Han token must be in ko set: map={map:?}");
-        assert!(map.contains(2), "Latin token must be in en set: map={map:?}");
-        assert!(!map.contains(0), "Whitespace token must not appear: map={map:?}");
-        assert!(!map.contains(4), "Special Hangul token must not appear by default: map={map:?}");
+        assert!(
+            map.contains(2),
+            "Latin token must be in en set: map={map:?}"
+        );
+        assert!(
+            !map.contains(0),
+            "Whitespace token must not appear: map={map:?}"
+        );
+        assert!(
+            !map.contains(4),
+            "Special Hangul token must not appear by default: map={map:?}"
+        );
 
         // Bias values are correct.
         let bias_1: Vec<_> = map.iter().filter(|(&id, _)| id == 1).collect();
@@ -1628,7 +1737,10 @@ mod tests {
         std::env::remove_var("MLXCEL_CACHE_DIR");
         drop(_guard);
 
-        assert!(exists_after_first, "first resolve must write the cache file");
+        assert!(
+            exists_after_first,
+            "first resolve must write the cache file"
+        );
         // Both maps must be non-empty and equal in entry count.
         assert!(
             !map1.is_empty(),
@@ -1790,31 +1902,22 @@ mod tests {
             "default must have include_byte_fragments=false"
         );
 
-        let zh_ids = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &default_ex,
-        );
+        let zh_ids =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &default_ex);
         assert!(
             !zh_ids.contains(&100),
             "byte-fragment Han must NOT appear in zh without include_byte_fragments: {zh_ids:?}"
         );
 
-        let ja_ids = index.tokens_for_language(
-            LanguageCode::Ja,
-            InclusionPolicy::Conservative,
-            &default_ex,
-        );
+        let ja_ids =
+            index.tokens_for_language(LanguageCode::Ja, InclusionPolicy::Conservative, &default_ex);
         assert!(
             !ja_ids.contains(&101),
             "byte-fragment Hiragana must NOT appear in ja without include_byte_fragments: {ja_ids:?}"
         );
 
-        let ko_ids = index.tokens_for_language(
-            LanguageCode::Ko,
-            InclusionPolicy::Conservative,
-            &default_ex,
-        );
+        let ko_ids =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &default_ex);
         assert!(
             !ko_ids.contains(&102),
             "byte-fragment Hangul must NOT appear in ko without include_byte_fragments: {ko_ids:?}"
@@ -1845,11 +1948,8 @@ mod tests {
             ..Default::default()
         };
 
-        let zh_ids = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &ex,
-        );
+        let zh_ids =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &ex);
         assert!(
             zh_ids.contains(&500),
             "byte-fragment Han start byte MUST appear in zh when include_byte_fragments=true: {zh_ids:?}"
@@ -1871,11 +1971,8 @@ mod tests {
             ..Default::default()
         };
 
-        let ja_ids = index.tokens_for_language(
-            LanguageCode::Ja,
-            InclusionPolicy::Conservative,
-            &ex,
-        );
+        let ja_ids =
+            index.tokens_for_language(LanguageCode::Ja, InclusionPolicy::Conservative, &ex);
         assert!(
             ja_ids.contains(&600),
             "byte-fragment Hiragana start byte must appear in ja: {ja_ids:?}"
@@ -1900,11 +1997,8 @@ mod tests {
             ..Default::default()
         };
 
-        let ko_strict_ids = index.tokens_for_language(
-            LanguageCode::Ko,
-            InclusionPolicy::Strict,
-            &ex,
-        );
+        let ko_strict_ids =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Strict, &ex);
         assert!(
             !ko_strict_ids.contains(&700),
             "Han byte-fragment must NOT appear in ko Strict (Hangul-only): {ko_strict_ids:?}"
@@ -1915,11 +2009,8 @@ mod tests {
         );
 
         // ko Conservative includes Han, so the Han fragment DOES appear there.
-        let ko_conserv_ids = index.tokens_for_language(
-            LanguageCode::Ko,
-            InclusionPolicy::Conservative,
-            &ex,
-        );
+        let ko_conserv_ids =
+            index.tokens_for_language(LanguageCode::Ko, InclusionPolicy::Conservative, &ex);
         assert!(
             ko_conserv_ids.contains(&700),
             "Han byte-fragment appears in ko Conservative (which includes Han): {ko_conserv_ids:?}"
@@ -1950,11 +2041,8 @@ mod tests {
 
         // Both the merged and the byte-fragment Han tokens exist.
         let ex_off = ExceptionConfig::default();
-        let zh_off = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &ex_off,
-        );
+        let zh_off =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &ex_off);
         assert!(
             zh_off.contains(&7948),
             "merged Han token must always be in zh: {zh_off:?}"
@@ -1968,11 +2056,8 @@ mod tests {
             include_byte_fragments: true,
             ..Default::default()
         };
-        let zh_on = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &ex_on,
-        );
+        let zh_on =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &ex_on);
         assert!(
             zh_on.contains(&7948) && zh_on.contains(&800),
             "both merged and fragment Han must appear when byte-fragments enabled: {zh_on:?}"
@@ -2008,9 +2093,9 @@ mod tests {
         // as a codepoint, which is 'å' (U+00E5).
         let char_e5 = '\u{00E5}'; // byte 0xE5 → 'å' in the GPT-2 alphabet
         let char_b4 = '\u{0174}'; // byte 0xB4 is NOT in the printable set,
-        // so it maps to the first free slot above 0x100.
-        // We don't need to compute the exact char here — we discover it at
-        // runtime from the reverse map so this test stays robust.
+                                  // so it maps to the first free slot above 0x100.
+                                  // We don't need to compute the exact char here — we discover it at
+                                  // runtime from the reverse map so this test stays robust.
 
         let reverse = build_byte_level_reverse_map();
         // Sanity: 0xE5 really is 'å' in the forward map.
@@ -2075,15 +2160,14 @@ mod tests {
             char_b4_actual = char_b4_actual,
         );
 
-        let tok = Tokenizer::from_bytes(json.as_bytes())
-            .expect("byte-level fixture must parse");
+        let tok = Tokenizer::from_bytes(json.as_bytes()).expect("byte-level fixture must parse");
         assert!(
             has_byte_level_pretokenizer(&tok),
             "fixture must expose a ByteLevel pretokenizer"
         );
 
-        let index = TokenLanguageIndex::build(&tok, json.as_bytes())
-            .expect("build on byte-level fixture");
+        let index =
+            TokenLanguageIndex::build(&tok, json.as_bytes()).expect("build on byte-level fixture");
 
         // Token 2 is the 0xE5 byte-fragment — must be tagged Han + is_byte_fragment.
         let tok2 = index.tokens.iter().find(|t| t.token_id == 2).expect("id=2");
@@ -2121,11 +2205,8 @@ mod tests {
 
         // tokens_for_language: with the flag off, token 2 is excluded; on, included.
         let ex_off = ExceptionConfig::default();
-        let zh_off = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &ex_off,
-        );
+        let zh_off =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &ex_off);
         assert!(
             !zh_off.contains(&2),
             "flag off: byte-fragment Han token must be excluded from zh: {zh_off:?}"
@@ -2135,11 +2216,8 @@ mod tests {
             include_byte_fragments: true,
             ..Default::default()
         };
-        let zh_on = index.tokens_for_language(
-            LanguageCode::Zh,
-            InclusionPolicy::Conservative,
-            &ex_on,
-        );
+        let zh_on =
+            index.tokens_for_language(LanguageCode::Zh, InclusionPolicy::Conservative, &ex_on);
         assert!(
             zh_on.contains(&2),
             "flag on: byte-fragment Han token MUST be in zh (issue #405 leak caught): {zh_on:?}"

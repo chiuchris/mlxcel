@@ -22,7 +22,7 @@ use mlxcel_core as ffi;
 fn make_test_kv_cache(seq_len: i32, n_heads: i32, head_dim: i32) -> mlxcel_core::cache::KVCache {
     let mut cache = mlxcel_core::cache::KVCache::new();
     if seq_len > 0 {
-        let n_elements = (1 * n_heads * seq_len * head_dim) as usize;
+        let n_elements = (n_heads * seq_len * head_dim) as usize;
         let key_data: Vec<f32> = (0..n_elements).map(|i| i as f32 * 0.1).collect();
         let val_data: Vec<f32> = (0..n_elements).map(|i| i as f32 * 0.2).collect();
 

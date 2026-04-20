@@ -264,7 +264,7 @@ mod tests {
         let params = estimate_params_from_config(&config).unwrap();
         // Should estimate between 7B and 10B.
         assert!(
-            params >= 7.0 && params <= 10.0,
+            (7.0..=10.0).contains(&params),
             "Expected 7-10B for Llama3-8B config, got {:.2}B",
             params
         );
@@ -276,7 +276,7 @@ mod tests {
         let config = make_config(896, 24, 151936, 4864);
         let params = estimate_params_from_config(&config).unwrap();
         assert!(
-            params >= 0.3 && params <= 1.0,
+            (0.3..=1.0).contains(&params),
             "Expected 0.3-1.0B for Qwen2-0.5B config, got {:.2}B",
             params
         );

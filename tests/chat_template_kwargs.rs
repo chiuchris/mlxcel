@@ -17,8 +17,9 @@
 //! The end-to-end tests spin up `mlxcel-server` against a real Qwen3-family
 //! model and exercise the HTTP `/v1/chat/completions` surface in all three
 //! per-request shapes: top-level `chat_template_kwargs`, nested
-//! `extra_body.chat_template_kwargs`, and the DashScope flat
-//! `extra_body.preserve_thinking`.
+//! `extra_body.chat_template_kwargs`, the OpenAI SDK's flattened
+//! root-level `extra_body={"preserve_thinking": ...}` alias, and the
+//! DashScope flat `extra_body.preserve_thinking`.
 //!
 //! All tests in this file require Qwen3 weights at
 //! `models/qwen3-0.6b-4bit/` and are gated with
@@ -240,6 +241,49 @@ async fn chat_accepts_dashscope_flat_preserve_thinking() {
     assert!(
         status.is_success(),
         "DashScope flat extra_body.preserve_thinking must be accepted; got {status}"
+    );
+}
+
+/// OpenAI SDK shape: `extra_body={"preserve_thinking": true}` flattened into
+/// the request root.
+#[tokio::test]
+#[ignore = "requires local model weights and the mlxcel-server binary"]
+async fn chat_accepts_flattened_openai_extra_body_preserve_thinking() {
+    let model_dir = repo_model_dir(QWEN3_MODEL);
+    if !model_dir.exists() {
+        eprintln!("Skipping: model not present at {}", model_dir.display());
+        return;
+    }
+    let port = reserve_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let port_str = port.to_string();
+    let model_str = model_dir.to_string_lossy().to_string();
+    let mut child = spawn_server(&[
+        "--model",
+        &model_str,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port_str,
+        "--no-warmup",
+    ]);
+
+    let client = reqwest::Client::new();
+    wait_for_health(&client, &base_url).await;
+
+    let body = serde_json::json!({
+        "model": "qwen3",
+        "messages": [{"role": "user", "content": "hi"}],
+        "max_tokens": 16,
+        "temperature": 0.0,
+        "preserve_thinking": true
+    });
+    let resp = post_chat(&client, &base_url, body).await;
+    let status = resp.status();
+    stop_server(&mut child);
+    assert!(
+        status.is_success(),
+        "flattened OpenAI extra_body preserve_thinking must be accepted; got {status}"
     );
 }
 

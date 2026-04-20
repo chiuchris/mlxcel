@@ -314,6 +314,10 @@ fn role(m: &Msg) -> &str {
     m.role
 }
 
+fn content(m: &Msg) -> &str {
+    m.content
+}
+
 #[test]
 fn rolling_checkpoint_three_turn_conversation() {
     // u0, a0, u1, a1, u2 — threshold is index 4 (the last "user").
@@ -341,7 +345,7 @@ fn rolling_checkpoint_three_turn_conversation() {
             content: "q3",
         },
     ];
-    let strip_indices = strip_rolling_checkpoint(&messages, role);
+    let strip_indices = strip_rolling_checkpoint(&messages, role, content);
     assert_eq!(strip_indices, vec![1, 3]);
 }
 
@@ -369,7 +373,7 @@ fn rolling_checkpoint_tool_call_turn_does_not_anchor() {
     ];
     // Threshold = 2 (the last "user"). Indices strictly < 2 that are
     // "assistant": only index 1.
-    let strip_indices = strip_rolling_checkpoint(&messages, role);
+    let strip_indices = strip_rolling_checkpoint(&messages, role, content);
     assert_eq!(strip_indices, vec![1]);
 }
 
@@ -385,7 +389,7 @@ fn rolling_checkpoint_no_user_turns_strips_nothing() {
             content: "<think>t</think>a",
         },
     ];
-    let strip_indices = strip_rolling_checkpoint(&messages, role);
+    let strip_indices = strip_rolling_checkpoint(&messages, role, content);
     assert!(strip_indices.is_empty());
 }
 
@@ -395,8 +399,36 @@ fn rolling_checkpoint_single_turn_strips_nothing() {
         role: "user",
         content: "hi",
     }];
-    let strip_indices = strip_rolling_checkpoint(&messages, role);
+    let strip_indices = strip_rolling_checkpoint(&messages, role, content);
     assert!(strip_indices.is_empty());
+}
+
+#[test]
+fn rolling_checkpoint_pseudo_user_tool_response_does_not_anchor() {
+    let messages = vec![
+        Msg {
+            role: "user",
+            content: "q1",
+        },
+        Msg {
+            role: "assistant",
+            content: "<think>t1</think>a1",
+        },
+        Msg {
+            role: "user",
+            content: "q2",
+        },
+        Msg {
+            role: "assistant",
+            content: "<think>t2</think>a2",
+        },
+        Msg {
+            role: "user",
+            content: "<tool_response>tool output</tool_response>",
+        },
+    ];
+    let strip_indices = strip_rolling_checkpoint(&messages, role, content);
+    assert_eq!(strip_indices, vec![1]);
 }
 
 // ---------------------------------------------------------------------------

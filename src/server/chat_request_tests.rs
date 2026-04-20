@@ -32,6 +32,7 @@ fn request_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
         parallel_tool_calls: None,
         chat_template_kwargs: None,
         extra_body: None,
+        extra_body_fields: serde_json::Map::new(),
         params: SamplingParams::default(),
     }
 }
@@ -327,6 +328,7 @@ fn build_raw_json_messages_includes_tool_fields() {
         parallel_tool_calls: None,
         chat_template_kwargs: None,
         extra_body: None,
+        extra_body_fields: serde_json::Map::new(),
         params: SamplingParams::default(),
     };
 
@@ -590,6 +592,7 @@ async fn prefix_stability_across_turns_when_preserve_thinking_true() {
         parallel_tool_calls: None,
         chat_template_kwargs: kwargs.clone(),
         extra_body: None,
+        extra_body_fields: serde_json::Map::new(),
         params: SamplingParams::default(),
     };
     let request_t3 = ChatCompletionRequest {
@@ -604,6 +607,7 @@ async fn prefix_stability_across_turns_when_preserve_thinking_true() {
         parallel_tool_calls: None,
         chat_template_kwargs: kwargs,
         extra_body: None,
+        extra_body_fields: serde_json::Map::new(),
         params: SamplingParams::default(),
     };
 
@@ -654,6 +658,25 @@ fn deserialize_request_with_extra_body() {
     let e = req.extra_body.unwrap();
     assert_eq!(
         e.get("preserve_thinking"),
+        Some(&serde_json::Value::Bool(true))
+    );
+}
+
+#[test]
+fn deserialize_request_with_flattened_openai_extra_body_field() {
+    let json = r#"{
+        "model": "test",
+        "messages": [{"role": "user", "content": "hi"}],
+        "preserve_thinking": true
+    }"#;
+    let req: ChatCompletionRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(
+        req.extra_body_fields.get("preserve_thinking"),
+        Some(&serde_json::Value::Bool(true))
+    );
+    let merged = req.merged_extra_body().unwrap();
+    assert_eq!(
+        merged.get("preserve_thinking"),
         Some(&serde_json::Value::Bool(true))
     );
 }
@@ -729,4 +752,74 @@ async fn rolling_checkpoint_tolerates_tool_turn_in_middle() {
         "assistant reply content must be preserved after strip"
     );
     assert!(prepared.prompt.contains("tool-result"));
+}
+
+#[tokio::test]
+async fn flattened_openai_extra_body_preserve_thinking_reaches_request_kwargs() {
+    let mut request = three_turn_request_with_think_blocks();
+    request.extra_body_fields.insert(
+        "preserve_thinking".to_string(),
+        serde_json::Value::Bool(true),
+    );
+
+    let processor = ChatTemplateProcessor::with_template(dump_template());
+    let prepared = prepare_chat_request(&processor, &request, None).await;
+    assert!(prepared.prompt.contains("<think>"));
+    assert!(prepared.prompt.contains("calc 2+2"));
+    assert!(prepared.prompt.contains("calc 3+3"));
+}
+
+#[tokio::test]
+async fn rolling_checkpoint_ignores_pseudo_user_tool_response_anchor() {
+    let messages = vec![
+        Message {
+            role: Role::User,
+            content: MessageContent::Text("q1".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("<think>plan 1</think>a1".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::User,
+            content: MessageContent::Text("q2".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("<think>plan 2</think>a2".to_string()),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::User,
+            content: MessageContent::Text(
+                "<tool_response>{\"temp\": 72}</tool_response>".to_string(),
+            ),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        },
+    ];
+    let request = request_with_messages(messages);
+    let processor = ChatTemplateProcessor::with_template(dump_template());
+    let prepared = prepare_chat_request(&processor, &request, None).await;
+
+    assert!(
+        !prepared.prompt.contains("plan 1"),
+        "assistant turn before the latest real user turn must still be stripped"
+    );
+    assert!(
+        prepared.prompt.contains("plan 2"),
+        "assistant turn immediately before a pseudo-user tool response must remain"
+    );
 }

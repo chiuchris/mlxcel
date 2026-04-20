@@ -1223,7 +1223,8 @@ mod tests {
         // Both old and canonical keys present — canonical should survive
         for l in 0..2usize {
             for m in ["gate_proj"] {
-                for k in ["weight"] {
+                {
+                    let k = "weight";
                     insert_dummy(
                         &mut weights,
                         &format!("model.layers.{l}.switch_mlp.{m}.{k}"),

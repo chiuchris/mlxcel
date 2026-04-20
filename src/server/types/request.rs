@@ -358,21 +358,29 @@ pub struct ChatCompletionRequest {
     ///
     /// A JSON object whose keys are forwarded as Jinja template kwargs when
     /// rendering the conversation. Primary shape; wins over nested
-    /// `extra_body.chat_template_kwargs` and DashScope flat
-    /// `extra_body.preserve_thinking`. See
+    /// `extra_body.chat_template_kwargs`, flattened OpenAI-SDK `extra_body`
+    /// aliases, and DashScope flat `extra_body.preserve_thinking`. See
     /// [`crate::server::chat_template_kwargs::extract_request_kwargs`] for
     /// the full precedence chain.
     #[serde(default)]
     pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 
-    /// Issue #410: vLLM / OpenAI-SDK `extra_body` pass-through.
+    /// Issue #410: nested `extra_body` compatibility (vLLM / manual callers).
     ///
-    /// The `OpenAI` Python client serializes `extra_body={...}` as a
-    /// top-level `extra_body` object on the JSON request. Only the keys we
-    /// currently recognize are read back out; unknown keys are silently
-    /// ignored to match llama.cpp's lenient behavior.
+    /// Some callers send an actual top-level `extra_body` object. Only the
+    /// keys we currently recognize are read back out; unknown keys are
+    /// silently ignored to match llama.cpp's lenient behavior.
     #[serde(default)]
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
+
+    /// Issue #410: OpenAI SDK `extra_body={...}` flattened into the request root.
+    ///
+    /// The official OpenAI Python client merges `extra_body` into the top-level
+    /// JSON object instead of emitting a nested `"extra_body": {...}` wrapper.
+    /// Capture those unknown root keys here so request-kwarg extraction can
+    /// treat them the same as nested `extra_body` aliases.
+    #[serde(default, flatten)]
+    pub extra_body_fields: serde_json::Map<String, serde_json::Value>,
 
     /// Sampling parameters (flattened)
     #[serde(flatten)]
@@ -401,6 +409,25 @@ pub struct CompletionRequest {
 }
 
 impl ChatCompletionRequest {
+    /// Merge nested `extra_body` with flattened OpenAI-SDK root fields.
+    ///
+    /// Flattened root keys win over the nested object on collision because the
+    /// request body already exposed them at the higher-precedence top level.
+    pub fn merged_extra_body(&self) -> Option<serde_json::Map<String, serde_json::Value>> {
+        match (&self.extra_body, self.extra_body_fields.is_empty()) {
+            (None, true) => None,
+            (Some(extra), true) => Some(extra.clone()),
+            (None, false) => Some(self.extra_body_fields.clone()),
+            (Some(extra), false) => {
+                let mut merged = extra.clone();
+                for (key, value) in &self.extra_body_fields {
+                    merged.insert(key.clone(), value.clone());
+                }
+                Some(merged)
+            }
+        }
+    }
+
     /// Convert messages to a prompt string using a simple format
     pub fn to_prompt(&self) -> String {
         let mut prompt = String::new();

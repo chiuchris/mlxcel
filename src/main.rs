@@ -753,9 +753,9 @@ pub(crate) struct ServeArgs {
     ///
     /// Per-request `chat_template_kwargs` (top-level or under `extra_body`)
     /// overrides server defaults on a per-key basis; unrelated server-default
-    /// keys persist through the merge. The DashScope flat
-    /// `extra_body.preserve_thinking` shape is also accepted as a secondary
-    /// form (only for `preserve_thinking`).
+    /// keys persist through the merge. The `preserve_thinking` alias is also
+    /// accepted via nested `extra_body.preserve_thinking` and the OpenAI SDK's
+    /// flattened root-level `extra_body={"preserve_thinking": ...}` shape.
     ///
     /// Also honors `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`; CLI wins on conflict.
     /// Malformed JSON causes the server to refuse to start with a clear

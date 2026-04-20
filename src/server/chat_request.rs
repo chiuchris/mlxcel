@@ -41,16 +41,19 @@ pub(crate) async fn prepare_chat_request(
 ) -> PreparedChatRequest {
     // Determine effective tools based on tool_choice
     let effective_tools = effective_tools(request);
+    let merged_extra_body = request.merged_extra_body();
 
     // Issue #410: resolve merged kwargs once up-front.
     //
-    // Precedence: top-level `chat_template_kwargs` > `extra_body.chat_template_kwargs`
-    // > DashScope `extra_body.preserve_thinking`. The merge with server-default
-    // kwargs follows the "per-request wins per-key, unrelated server-default
-    // keys persist" rule so every future kwarg inherits the same plumbing.
+    // Precedence: top-level `chat_template_kwargs` >
+    // nested/flattened `extra_body.chat_template_kwargs` >
+    // nested/flattened DashScope/OpenAI-SDK `preserve_thinking` aliases. The
+    // merge with server-default kwargs follows the "per-request wins per-key,
+    // unrelated server-default keys persist" rule so every future kwarg
+    // inherits the same plumbing.
     let per_request_kwargs = extract_request_kwargs(
         request.chat_template_kwargs.as_ref(),
-        request.extra_body.as_ref(),
+        merged_extra_body.as_ref(),
     );
     let merged_kwargs = merge_server_and_request(server_default_kwargs, &per_request_kwargs);
     let preserve_thinking = merged_kwargs.preserve_thinking();
@@ -156,7 +159,7 @@ fn build_raw_json_messages_with_thinking(
     let strip_indices: std::collections::HashSet<usize> = if preserve_thinking {
         std::collections::HashSet::new()
     } else {
-        strip_rolling_checkpoint(&request.messages, |m| m.role.as_str())
+        strip_rolling_checkpoint(&request.messages, |m| m.role.as_str(), |m| m.content.text())
             .into_iter()
             .collect()
     };
@@ -249,7 +252,7 @@ fn build_chat_messages_with_thinking(
     let strip_indices: std::collections::HashSet<usize> = if preserve_thinking {
         std::collections::HashSet::new()
     } else {
-        strip_rolling_checkpoint(&request.messages, |m| m.role.as_str())
+        strip_rolling_checkpoint(&request.messages, |m| m.role.as_str(), |m| m.content.text())
             .into_iter()
             .collect()
     };

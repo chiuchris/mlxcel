@@ -87,7 +87,6 @@ pub fn lang_bias_byte_fragment_suppressions_total() -> u64 {
     LANG_BIAS_BYTE_FRAGMENT_SUPPRESSIONS_TOTAL.load(Ordering::Relaxed)
 }
 
-
 /// Additive bias applied to specific token logits before any history-based penalty.
 ///
 /// A positive bias makes a token more likely; a negative bias makes it less likely.
@@ -189,10 +188,7 @@ impl TokenBiasMap {
 /// no panic, no error.
 ///
 /// Used by: standard generation, speculative decoding, batch scheduler
-pub(crate) fn apply_token_bias(
-    logits: &MlxArray,
-    bias: &TokenBiasMap,
-) -> UniquePtr<MlxArray> {
+pub(crate) fn apply_token_bias(logits: &MlxArray, bias: &TokenBiasMap) -> UniquePtr<MlxArray> {
     if bias.is_empty() {
         return ffi::copy(logits);
     }
@@ -820,9 +816,17 @@ mod tests {
         let result = apply_token_bias(&logits, &bias);
         ffi::eval(&result);
         for i in 0..5i32 {
-            assert_eq!(logit_at(&result, i), i as f32, "token {i} should be unchanged");
+            assert_eq!(
+                logit_at(&result, i),
+                i as f32,
+                "token {i} should be unchanged"
+            );
         }
-        assert_eq!(logit_at(&result, 5), 7.0, "token 5 should be 5.0 + 2.0 = 7.0");
+        assert_eq!(
+            logit_at(&result, 5),
+            7.0,
+            "token 5 should be 5.0 + 2.0 = 7.0"
+        );
     }
 
     #[test]
@@ -836,7 +840,10 @@ mod tests {
         let probs = ffi::softmax(&biased, -1);
         ffi::eval(&probs);
         let prob_at_3 = logit_at(&probs, 3);
-        assert_eq!(prob_at_3, 0.0, "probability at suppressed token must be 0.0");
+        assert_eq!(
+            prob_at_3, 0.0,
+            "probability at suppressed token must be 0.0"
+        );
     }
 
     #[test]

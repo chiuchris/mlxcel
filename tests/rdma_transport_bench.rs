@@ -58,7 +58,7 @@ async fn rdma_vs_tcp_activation_transfer() {
     // test still completes in seconds on CI-class hardware.
     let scenarios: &[(usize, usize)] = &[
         (64 * 1024, 256),       // 64 KiB — RPC-sized handoff
-        (1 * 1024 * 1024, 128), // 1 MiB  — decode-step activation
+        (1024 * 1024, 128),     // 1 MiB  — decode-step activation
         (8 * 1024 * 1024, 64),  // 8 MiB  — prefill-sized activation
         (32 * 1024 * 1024, 16), // 32 MiB — stage hand-off worst case
     ];

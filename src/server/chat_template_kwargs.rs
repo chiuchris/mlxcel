@@ -25,10 +25,12 @@
 //! ## Resolution precedence (per-key)
 //!
 //! 1. Per-request `chat_template_kwargs` (top-level, llama.cpp shape).
-//! 2. Per-request `extra_body.chat_template_kwargs` (vLLM/OpenAI client shape).
-//! 3. Per-request `extra_body.preserve_thinking` — secondary DashScope flat
-//!    shape. **Only** recognized for the `preserve_thinking` key, not a
-//!    general-purpose fallback for other kwargs.
+//! 2. Per-request `extra_body.chat_template_kwargs` (nested or flattened
+//!    OpenAI-SDK/vLLM shape).
+//! 3. Per-request `preserve_thinking` alias carried via nested/flattened
+//!    `extra_body` — secondary DashScope/OpenAI-SDK flat shape. **Only**
+//!    recognized for the `preserve_thinking` key, not a general-purpose
+//!    fallback for other kwargs.
 //! 4. Server-wide default from `--chat-template-kwargs` CLI flag.
 //! 5. Server-wide default from `LLAMA_ARG_CHAT_TEMPLATE_KWARGS` env var (CLI
 //!    wins on conflict).
@@ -250,9 +252,11 @@ pub fn resolve_server_default_kwargs(
 /// body following the documented precedence order (primary wins):
 ///
 /// 1. Top-level `chat_template_kwargs` (llama.cpp shape).
-/// 2. `extra_body.chat_template_kwargs` (vLLM/OpenAI client shape).
-/// 3. `extra_body.preserve_thinking` (DashScope secondary shape; **only**
-///    materializes a `preserve_thinking` entry, not a general fallback).
+/// 2. `extra_body.chat_template_kwargs` (nested or flattened OpenAI-SDK/vLLM
+///    shape).
+/// 3. `extra_body.preserve_thinking` (nested or flattened DashScope/OpenAI-SDK
+///    secondary shape; **only** materializes a `preserve_thinking` entry, not
+///    a general fallback).
 ///
 /// Returns an empty `ChatTemplateKwargs` when no override is supplied.
 pub fn extract_request_kwargs(
@@ -315,9 +319,10 @@ pub fn merge_server_and_request(
 /// `preserve_thinking=true`, callers must skip this helper entirely.
 ///
 /// Algorithm:
-/// 1. Walk the message list in reverse to find the index of the latest user
-///    turn whose role is literally `"user"` (tool-call turns use role
-///    `"tool"`, so they don't count).
+/// 1. Walk the message list in reverse to find the index of the latest real
+///    user turn: role is literally `"user"` and the content is not wrapped in
+///    `<tool_response>...</tool_response>` (tool-call turns use role `"tool"`,
+///    so they don't count either).
 /// 2. For every assistant message at an index **strictly less** than that
 ///    threshold, strip its thinking block. (Messages at or after the
 ///    threshold are retained as-is, including the most recent assistant
@@ -332,18 +337,25 @@ pub fn merge_server_and_request(
 /// - No user turns present → nothing is stripped (threshold doesn't exist;
 ///   we conservatively keep all content so behavior is stable for system-only
 ///   or assistant-only prompts).
+/// - Synthetic pseudo-user tool responses (`<tool_response>...</tool_response>`)
+///   do not anchor the checkpoint, matching upstream Qwen templates.
 /// - Final message is a user turn → strip every assistant message before it.
 ///
 /// The helper operates on a slice of `(role, content)` tuples rather than
 /// `ChatMessage` so it is callable from both the typed `ChatMessage` path and
 /// the raw JSON `apply_raw` path without depending on types from
 /// `chat_template`.
-pub fn strip_rolling_checkpoint<'a, M, S>(messages: &'a [M], role_of: fn(&'a M) -> S) -> Vec<usize>
+pub fn strip_rolling_checkpoint<'a, M, R, C>(
+    messages: &'a [M],
+    role_of: fn(&'a M) -> R,
+    content_of: fn(&'a M) -> C,
+) -> Vec<usize>
 where
     M: 'a,
-    S: AsRef<str>,
+    R: AsRef<str>,
+    C: AsRef<str>,
 {
-    let Some(threshold) = latest_user_turn_index(messages, role_of) else {
+    let Some(threshold) = latest_user_turn_index(messages, role_of, content_of) else {
         return Vec::new();
     };
     messages
@@ -359,22 +371,37 @@ where
         .collect()
 }
 
-/// Find the index of the latest message whose role is literally `"user"`.
+/// Find the index of the latest real user message.
 ///
-/// `"tool"` role messages are *not* user turns; skipping them matches the
-/// upstream Qwen chat-template rule that the checkpoint is anchored on the
-/// most recent genuine user instruction, not on synthesized tool responses.
-fn latest_user_turn_index<'a, M, S>(messages: &'a [M], role_of: fn(&'a M) -> S) -> Option<usize>
+/// `"tool"` role messages are *not* user turns; likewise, a `role == "user"`
+/// message whose content is wrapped in `<tool_response>...</tool_response>` is
+/// treated as a synthesized tool-response carrier rather than a genuine user
+/// instruction. This matches the upstream Qwen chat-template checkpoint
+/// anchor.
+fn latest_user_turn_index<'a, M, R, C>(
+    messages: &'a [M],
+    role_of: fn(&'a M) -> R,
+    content_of: fn(&'a M) -> C,
+) -> Option<usize>
 where
     M: 'a,
-    S: AsRef<str>,
+    R: AsRef<str>,
+    C: AsRef<str>,
 {
     messages
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, m)| role_of(m).as_ref() == "user")
+        .find(|(_, m)| {
+            let role = role_of(m);
+            let content = content_of(m);
+            role.as_ref() == "user" && !is_tool_response_pseudo_user(content.as_ref())
+        })
         .map(|(idx, _)| idx)
+}
+
+fn is_tool_response_pseudo_user(content: &str) -> bool {
+    content.starts_with("<tool_response>") && content.ends_with("</tool_response>")
 }
 
 /// Strip the first balanced `<think>...</think>` block (greedy match) from a
