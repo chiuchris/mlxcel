@@ -32,11 +32,8 @@ async fn pool_acquire_and_release() {
     // Accept connections in the background (keep accepting indefinitely).
     let accept_handle = tokio::spawn(async move {
         let mut accepted = Vec::new();
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => accepted.push(stream),
-                Err(_) => break,
-            }
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted.push(stream);
         }
         accepted
     });

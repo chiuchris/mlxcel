@@ -704,7 +704,7 @@ impl PipelineCacheManager {
                 entries.sort_by_key(|a| a.current_offset);
             }
             PreemptionPolicy::Longest => {
-                entries.sort_by(|a, b| b.current_offset.cmp(&a.current_offset));
+                entries.sort_by_key(|a| std::cmp::Reverse(a.current_offset));
             }
         }
 

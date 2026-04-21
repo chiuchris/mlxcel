@@ -84,14 +84,14 @@ fn build_test_groups(world_size: usize) -> Vec<CollectiveGroup> {
     let mut rx_vec: Vec<_> = receivers.into_iter().map(Some).collect();
 
     let mut groups = Vec::with_capacity(world_size);
-    for rank in 0..world_size {
+    for (rank, rx_slot) in rx_vec.iter_mut().enumerate().take(world_size) {
         let config = CollectiveConfig {
             rank,
             world_size,
             chunk_size: 1024 * 1024,
         };
 
-        let my_rx = Arc::new(std::sync::Mutex::new(rx_vec[rank].take().unwrap()));
+        let my_rx = Arc::new(std::sync::Mutex::new(rx_slot.take().unwrap()));
         let all_senders = senders.clone();
 
         let exchange_fn = Arc::new(

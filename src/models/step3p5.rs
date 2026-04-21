@@ -239,12 +239,8 @@ impl Step3p5Config {
 
 fn get_limit_from_value(val: &serde_json::Value, layer_idx: usize) -> f32 {
     match val {
-        serde_json::Value::Array(arr) => {
-            if layer_idx < arr.len() {
-                arr[layer_idx].as_f64().unwrap_or(0.0) as f32
-            } else {
-                0.0
-            }
+        serde_json::Value::Array(arr) if layer_idx < arr.len() => {
+            arr[layer_idx].as_f64().unwrap_or(0.0) as f32
         }
         _ => 0.0,
     }

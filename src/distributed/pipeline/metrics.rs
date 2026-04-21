@@ -372,7 +372,7 @@ impl ActivationLatencyHistogram {
                 max_us: buckets.max,
             })
             .collect();
-        pairs.sort_by(|a, b| (a.src_stage, a.dst_stage).cmp(&(b.src_stage, b.dst_stage)));
+        pairs.sort_by_key(|a| (a.src_stage, a.dst_stage));
         pairs
     }
 }
@@ -782,11 +782,9 @@ impl RepartitionMetricsSnapshot {
     /// Mean drain duration (microseconds) across completed events, or zero
     /// when no completed drain has been observed yet.
     pub fn mean_drain_us(&self) -> u64 {
-        if self.drain_count == 0 {
-            0
-        } else {
-            self.drain_us_total / self.drain_count
-        }
+        self.drain_us_total
+            .checked_div(self.drain_count)
+            .unwrap_or(0)
     }
 }
 

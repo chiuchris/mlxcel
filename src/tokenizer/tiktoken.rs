@@ -99,7 +99,7 @@ impl TiktokenTokenizer {
             .iter()
             .map(|(k, &v)| (k.clone(), v))
             .collect();
-        special_tokens_sorted.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        special_tokens_sorted.sort_by_key(|a| std::cmp::Reverse(a.0.len()));
 
         let pat = Regex::new(HUNYUAN_PAT)?;
 

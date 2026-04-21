@@ -105,11 +105,10 @@ pub fn build_quality_report_with_actuals(
         .map(|s| s.estimated_bytes)
         .min()
         .unwrap_or(0);
-    let imbalance_pct = if min_val == 0 {
-        0
-    } else {
-        max_val.saturating_mul(100) / min_val
-    };
+    let imbalance_pct = max_val
+        .saturating_mul(100)
+        .checked_div(min_val)
+        .unwrap_or(0);
     PartitionQualityReport {
         per_stage,
         max_stage_estimated_bytes: max_val,

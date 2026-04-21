@@ -72,10 +72,6 @@ impl FakeDriver {
     fn release_calls(&self) -> usize {
         self.state.lock().unwrap().release_drain_calls
     }
-
-    fn ranges(&self) -> Vec<Range<usize>> {
-        self.ranges.lock().unwrap().clone()
-    }
 }
 
 impl ElasticRuntimeDriver for FakeDriver {

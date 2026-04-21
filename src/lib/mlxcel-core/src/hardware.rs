@@ -283,6 +283,7 @@ fn detect_hardware_macos() -> HardwareCapabilities {
 /// - `"Apple M1"` → `M1`
 /// - `"Apple M4 Max"` → `M4`
 /// - `"Apple M5 Pro"` → `M5`
+#[cfg(any(target_os = "macos", test))]
 fn parse_silicon_gen(brand: &str) -> AppleSiliconGen {
     // Look for "Apple M<n>" pattern anywhere in the string.
     if let Some(pos) = brand.find("Apple M") {
@@ -305,6 +306,7 @@ fn parse_silicon_gen(brand: &str) -> AppleSiliconGen {
 /// Parse `"major.minor[.patch]"` version strings.
 ///
 /// Returns `(major, minor)`. Returns `(0, 0)` on parse failure.
+#[cfg(any(target_os = "macos", test))]
 fn parse_macos_version(version: &str) -> (u32, u32) {
     let mut parts = version.split('.');
     let major = parts
@@ -321,6 +323,7 @@ fn parse_macos_version(version: &str) -> (u32, u32) {
 /// Return approximate memory bandwidth in GB/s based on chip generation and
 /// memory configuration.  Values are midpoints from Apple's published specs
 /// for the base chip variant at the given memory size.
+#[cfg(target_os = "macos")]
 fn estimate_bandwidth(gen: AppleSiliconGen, memory_gb: u32) -> f64 {
     match gen {
         AppleSiliconGen::M1 => {

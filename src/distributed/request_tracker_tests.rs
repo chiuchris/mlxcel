@@ -112,14 +112,14 @@ fn lifecycle_tracks_all_transitions() {
     let tracker = RequestTracker::new(RequestTrackerConfig::default());
     let id = tracker.submit();
 
-    tracker.transition(&id, RequestState::Routing);
-    tracker.transition(
+    assert!(tracker.transition(&id, RequestState::Routing));
+    assert!(tracker.transition(
         &id,
         RequestState::Processing {
             node_id: "node-0".to_string(),
         },
-    );
-    tracker.transition(&id, RequestState::Completed);
+    ));
+    assert!(tracker.transition(&id, RequestState::Completed));
 
     let lifecycle = tracker.get_lifecycle(&id).unwrap();
     assert_eq!(lifecycle.transitions.len(), 4); // Submitted + 3 transitions
@@ -135,14 +135,14 @@ fn active_count_tracks_non_terminal() {
     assert_eq!(tracker.active_count(), 2);
 
     // Walk id1 through valid states to Completed.
-    tracker.transition(&id1, RequestState::Routing);
-    tracker.transition(
+    assert!(tracker.transition(&id1, RequestState::Routing));
+    assert!(tracker.transition(
         &id1,
         RequestState::Processing {
             node_id: "node-0".to_string(),
         },
-    );
-    tracker.transition(&id1, RequestState::Completed);
+    ));
+    assert!(tracker.transition(&id1, RequestState::Completed));
     assert_eq!(tracker.active_count(), 1);
     assert_eq!(tracker.tracked_count(), 2);
 }
@@ -154,8 +154,18 @@ fn eviction_removes_oldest_completed() {
 
     let id1 = tracker.submit();
     let id2 = tracker.submit();
-    tracker.transition(&id1, RequestState::Completed);
-    tracker.transition(&id2, RequestState::Completed);
+    // Walk id1/id2 through valid transitions to Completed so eviction has
+    // actual terminal entries to consider.
+    for id in [&id1, &id2] {
+        assert!(tracker.transition(id, RequestState::Routing));
+        assert!(tracker.transition(
+            id,
+            RequestState::Processing {
+                node_id: "node-0".to_string(),
+            },
+        ));
+        assert!(tracker.transition(id, RequestState::Completed));
+    }
 
     // These submissions should trigger eviction of completed requests.
     let _id3 = tracker.submit();

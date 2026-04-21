@@ -35,7 +35,10 @@ async fn tcp_transport_send_recv_control_message() {
     .unwrap();
 
     // Connect sender to receiver.
-    send_transport.connect(&[recv_addr.clone()]).await.unwrap();
+    send_transport
+        .connect(std::slice::from_ref(&recv_addr))
+        .await
+        .unwrap();
 
     // Send a control message.
     let msg = TransportMessage::Control {
@@ -76,7 +79,10 @@ async fn tcp_transport_send_recv_tensor_data() {
     .await
     .unwrap();
 
-    send_transport.connect(&[recv_addr.clone()]).await.unwrap();
+    send_transport
+        .connect(std::slice::from_ref(&recv_addr))
+        .await
+        .unwrap();
 
     let tensor_data = vec![1u8; 1024];
     let msg = TransportMessage::TensorData {

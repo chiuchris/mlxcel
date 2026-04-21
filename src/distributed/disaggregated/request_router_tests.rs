@@ -403,7 +403,7 @@ fn handle_node_failure_fails_request_when_no_alternative() {
     let req_id = RequestId::new();
     router.route_to_prefill(req_id.clone(), 100).unwrap();
     router.route_to_decode(&req_id).unwrap();
-    router.mark_decoding(&req_id, "decode-0");
+    assert!(router.mark_decoding(&req_id, "decode-0"));
 
     let (rerouted, failed) = router.handle_node_failure("decode-0");
     assert_eq!(rerouted, 0);
@@ -430,8 +430,8 @@ fn metrics_are_updated() {
     let m = router.metrics();
     assert_eq!(m.routing_decisions, 2);
 
-    router.mark_decoding(&req_id, "decode-0");
-    router.mark_completed(&req_id);
+    assert!(router.mark_decoding(&req_id, "decode-0"));
+    assert!(router.mark_completed(&req_id));
     let m = router.metrics();
     assert_eq!(m.total_completed, 1);
 }
@@ -469,8 +469,8 @@ fn purge_terminal_removes_old_completed() {
     let req_id = RequestId::new();
     router.route_to_prefill(req_id.clone(), 100).unwrap();
     router.route_to_decode(&req_id).unwrap();
-    router.mark_decoding(&req_id, "decode-0");
-    router.mark_completed(&req_id);
+    assert!(router.mark_decoding(&req_id, "decode-0"));
+    assert!(router.mark_completed(&req_id));
 
     // Purge with zero max_age removes everything terminal.
     let removed = router.purge_terminal(Duration::ZERO);
@@ -704,7 +704,7 @@ fn auto_purge_removes_old_terminal_on_overflow() {
     for _ in 0..3 {
         let req_id = RequestId::new();
         router.route_to_prefill(req_id.clone(), 100).unwrap();
-        router.mark_completed(&req_id);
+        assert!(router.mark_completed(&req_id));
     }
 
     // 4th request should trigger auto-purge of completed entries.

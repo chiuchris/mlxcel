@@ -46,7 +46,8 @@ on:
       - "tests/pipeline_stage_executor_real_models.rs"
       - "tests/zero_config_cluster_init.rs"
       - "tests/rdma_transport_bench.rs"
-      - "scripts/ci/**"
+      - "scripts/ci/run-pp-*.sh"
+      - "scripts/ci/_common.sh"
       - ".github/workflows/pipeline-parallel-ci.yml"
   # Manual dispatch for ad-hoc runs of the 3-host job on a PR that did
   # not yet carry the `ci:pp-three-host` label at PR-open time.
@@ -109,12 +110,17 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
+          # liblapacke-dev ships lapacke.h, which MLX's CMake consumes via
+          # find_path(LAPACK_INCLUDE_DIRS lapacke.h ...). liblapack-dev alone
+          # only provides the Fortran LAPACK library, so without lapacke the
+          # header lookup returns NOTFOUND and the MLX configure step fails.
           sudo apt-get install -y --no-install-recommends \
             build-essential \
             cmake \
             ninja-build \
             libopenblas-dev \
             liblapack-dev \
+            liblapacke-dev \
             pkg-config
 
       - name: Validate workflow YAML

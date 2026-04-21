@@ -417,6 +417,7 @@ fn qwen3_5_27b_tp4_matches_single_rank_stepwise() {
     );
 }
 
+#[test]
 #[ignore = "requires local model weights and extended real-model generation"]
 fn ernie45_tp2_matches_single_rank_greedy_long_generation() {
     assert_tp_matches_single_rank(

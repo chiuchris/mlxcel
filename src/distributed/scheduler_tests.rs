@@ -249,7 +249,7 @@ fn active_request_count() {
     let (_id2, _) = scheduler.submit_request(None, None, None).unwrap();
     assert_eq!(scheduler.active_request_count(), 2);
 
-    scheduler.complete_request(&id1);
+    assert!(scheduler.complete_request(&id1));
     assert_eq!(scheduler.active_request_count(), 1);
     assert_eq!(scheduler.tracked_request_count(), 2);
 }

@@ -79,7 +79,7 @@ async fn rdma_vs_tcp_activation_transfer() {
     .await
     .unwrap();
     tcp_client
-        .connect(&[tcp_server_addr.clone()])
+        .connect(std::slice::from_ref(&tcp_server_addr))
         .await
         .unwrap();
     let drain_tcp = spawn_drain_task(tcp_server.clone());
@@ -118,7 +118,7 @@ async fn rdma_vs_tcp_activation_transfer() {
     .await
     .unwrap();
     rdma_client
-        .connect(&[rdma_server_addr.clone()])
+        .connect(std::slice::from_ref(&rdma_server_addr))
         .await
         .unwrap();
     let drain_rdma = spawn_drain_task(rdma_server.clone());

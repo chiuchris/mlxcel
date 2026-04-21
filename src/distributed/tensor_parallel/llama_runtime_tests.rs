@@ -245,14 +245,6 @@ fn concat_axis(
     })
 }
 
-fn sum_parts(
-    parts: Vec<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
-) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
-    let mut iter = parts.into_iter();
-    let first = iter.next().expect("sum_parts requires at least one part");
-    iter.fold(first, |acc, part| mlxcel_core::add(&acc, &part))
-}
-
 fn slice_last_dim(
     tensor: &mlxcel_core::MlxArray,
     start: i32,

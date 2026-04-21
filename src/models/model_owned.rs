@@ -102,7 +102,7 @@ impl<T> ModelOwnedSequenceState<T> {
         let result = f(&mut extracted);
 
         let mut sequences = self.sequences.borrow_mut();
-        for (seq_id, state) in seq_ids.iter().copied().zip(extracted.into_iter()) {
+        for (seq_id, state) in seq_ids.iter().copied().zip(extracted) {
             sequences.insert(seq_id, state);
         }
         Ok(result)

@@ -128,7 +128,7 @@ pub fn compute_minicpmo_image_bounds(
     }
 
     let mut bounds = Vec::with_capacity(start_positions.len());
-    for (start, end) in start_positions.into_iter().zip(end_positions.into_iter()) {
+    for (start, end) in start_positions.into_iter().zip(end_positions) {
         if end < start {
             return Err("MiniCPM-o image placeholder end appeared before start".to_string());
         }
