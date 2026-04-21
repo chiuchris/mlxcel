@@ -285,10 +285,18 @@ fn assert_multi_stage_coordinator_matches_dense_baseline(
 
 /// 2-host logical smoke: two PP stages as two processes in one runner.
 /// Driven by `scripts/ci/run-pp-two-host-logical.sh`.
+///
+/// The target model is resolved from `MLXCEL_CI_PP_MODEL` (the env var
+/// the workflow sets after extracting the CI fixture). When the env is
+/// unset — e.g. running locally — we fall back to `llama-3.2-1b-4bit`,
+/// which matches the historical default and what most developer setups
+/// keep under `models/`.
 #[test]
 #[ignore = "requires local model weights; CI drives with --ignored"]
 fn pipeline_multi_stage_two_host_logical_smoke() {
-    assert_multi_stage_coordinator_matches_dense_baseline("llama-3.2-1b-4bit", "Hello", 2);
+    let model =
+        std::env::var("MLXCEL_CI_PP_MODEL").unwrap_or_else(|_| "llama-3.2-1b-4bit".to_string());
+    assert_multi_stage_coordinator_matches_dense_baseline(&model, "Hello", 2);
 }
 
 /// 3-host real-model parity: validates that the 3-stage remote pipeline

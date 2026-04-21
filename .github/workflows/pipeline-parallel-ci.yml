@@ -127,6 +127,35 @@ jobs:
         run: |
           python3 -c "import yaml; yaml.safe_load(open('.github/workflows/pipeline-parallel-ci.yml'))"
 
+      # The multi-stage smoke test needs real model weights. We ship them
+      # out-of-band via a GitHub Release asset (pinned HF snapshot packaged
+      # by `scripts/ci/build-ci-fixture.sh`) so CI never calls HuggingFace
+      # during a build and the weights are byte-identical across runs.
+      #
+      # `CI_FIXTURE_TAG` is both the release tag and the cache key; bump
+      # the version suffix when the fixture is rotated.
+      - name: Cache CI fixture weights
+        id: ci-fixture-cache
+        uses: actions/cache@v4
+        with:
+          path: models/qwen3-0.6b-4bit
+          key: ${{ runner.os }}-ci-fixture-qwen3-0.6b-4bit-v1
+      - name: Download CI fixture
+        if: steps.ci-fixture-cache.outputs.cache-hit != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CI_FIXTURE_TAG: ci-fixtures/qwen3-0.6b-4bit-v1
+          CI_FIXTURE_ASSET: qwen3-0.6b-4bit.tar.gz
+        run: |
+          mkdir -p models
+          tmp_dir="$(mktemp -d)"
+          gh release download "$CI_FIXTURE_TAG" \
+            --pattern "$CI_FIXTURE_ASSET" \
+            --dir "$tmp_dir"
+          tar -xzf "$tmp_dir/$CI_FIXTURE_ASSET" -C models/
+          rm -rf "$tmp_dir"
+          ls -la models/qwen3-0.6b-4bit
+
       - name: Run heterogeneous-memory partition regressions
         env:
           CARGO_PROFILE: debug
@@ -135,10 +164,12 @@ jobs:
       - name: Run 2-host logical pipeline-parallel job
         env:
           CARGO_PROFILE: debug
-          # Model weights are not present on GitHub-hosted runners, so
-          # the ignored multi-stage test self-skips. The unit and
-          # heterogeneous-memory sections still run and gate the merge.
-          TEST_MODEL: llama-3.2-1b-4bit
+          # The fixture step above populates `models/qwen3-0.6b-4bit/`, so
+          # the multi-stage smoke actually exercises coordinator + transport
+          # + remote stage service against real weights — instead of
+          # self-skipping as it did before the fixture existed.
+          MLXCEL_CI_PP_MODEL: qwen3-0.6b-4bit
+          TEST_MODEL: qwen3-0.6b-4bit
         run: ./scripts/ci/run-pp-two-host-logical.sh
 
       - name: Clippy on PP modules
