@@ -67,6 +67,12 @@ pub struct GenerationResult {
     pub finish_reason: String,
     /// Per-token log probability data; `None` when logprobs were not requested
     pub logprobs: Option<Vec<TokenLogprobData>>,
+    /// Number of prompt tokens that were satisfied by the KV prefix cache.
+    ///
+    /// Non-zero only when the prompt-prefix cache feature is active and the
+    /// scheduler adopted a detached cache for this request. Exposed in the
+    /// OpenAI response body as `usage.prompt_tokens_details.cached_tokens`.
+    pub cached_tokens: usize,
 }
 
 #[path = "model_worker.rs"]

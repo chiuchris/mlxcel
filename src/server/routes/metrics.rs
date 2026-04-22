@@ -58,6 +58,40 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
     let slots_available = slots_total.saturating_sub(active);
     let queue_depth = state.batch_metrics.queue_depth();
 
+    // Epic #416 / issue #423: prompt-prefix cache Prometheus counters
+    let pc_hits = state
+        .batch_metrics
+        .prompt_cache_hits_total
+        .load(Ordering::Relaxed);
+    let pc_misses = state
+        .batch_metrics
+        .prompt_cache_misses_total
+        .load(Ordering::Relaxed);
+    let pc_reused_tokens = state
+        .batch_metrics
+        .prompt_cache_prefix_tokens_reused_total
+        .load(Ordering::Relaxed);
+    let pc_evict_lru = state
+        .batch_metrics
+        .prompt_cache_evictions_lru_total
+        .load(Ordering::Relaxed);
+    let pc_evict_ttl = state
+        .batch_metrics
+        .prompt_cache_evictions_ttl_total
+        .load(Ordering::Relaxed);
+    let pc_evict_capacity = state
+        .batch_metrics
+        .prompt_cache_evictions_capacity_total
+        .load(Ordering::Relaxed);
+    let pc_bytes = state
+        .batch_metrics
+        .prompt_cache_bytes
+        .load(Ordering::Relaxed);
+    let pc_entries = state
+        .batch_metrics
+        .prompt_cache_entries
+        .load(Ordering::Relaxed);
+
     // Batch observability counters
     let obs = state.batch_observability.snapshot();
 
@@ -137,7 +171,27 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
          mlxcel_lang_bias_tokens_suppressed_total {lang_bias_suppressed}\n\
          # HELP mlxcel_lang_bias_byte_fragment_suppressions_total Suppressions where the neg-inf top-1 token was classified via UTF-8 start-byte (issue #405)\n\
          # TYPE mlxcel_lang_bias_byte_fragment_suppressions_total counter\n\
-         mlxcel_lang_bias_byte_fragment_suppressions_total {lang_bias_byte_fragment}\n",
+         mlxcel_lang_bias_byte_fragment_suppressions_total {lang_bias_byte_fragment}\n\
+         # HELP mlxcel_prompt_cache_hits_total Successful prompt-prefix cache adoptions\n\
+         # TYPE mlxcel_prompt_cache_hits_total counter\n\
+         mlxcel_prompt_cache_hits_total {pc_hits}\n\
+         # HELP mlxcel_prompt_cache_misses_total Prompt-prefix cache lookups that produced no match\n\
+         # TYPE mlxcel_prompt_cache_misses_total counter\n\
+         mlxcel_prompt_cache_misses_total {pc_misses}\n\
+         # HELP mlxcel_prompt_cache_prefix_tokens_reused_total Total prompt tokens reused from prefix cache\n\
+         # TYPE mlxcel_prompt_cache_prefix_tokens_reused_total counter\n\
+         mlxcel_prompt_cache_prefix_tokens_reused_total {pc_reused_tokens}\n\
+         # HELP mlxcel_prompt_cache_evictions_total Prompt-prefix cache evictions labeled by reason\n\
+         # TYPE mlxcel_prompt_cache_evictions_total counter\n\
+         mlxcel_prompt_cache_evictions_total{{reason=\"lru\"}} {pc_evict_lru}\n\
+         mlxcel_prompt_cache_evictions_total{{reason=\"ttl\"}} {pc_evict_ttl}\n\
+         mlxcel_prompt_cache_evictions_total{{reason=\"capacity\"}} {pc_evict_capacity}\n\
+         # HELP mlxcel_prompt_cache_bytes Current byte footprint of all live prompt-cache entries\n\
+         # TYPE mlxcel_prompt_cache_bytes gauge\n\
+         mlxcel_prompt_cache_bytes {pc_bytes}\n\
+         # HELP mlxcel_prompt_cache_entries Current number of live prompt-cache entries\n\
+         # TYPE mlxcel_prompt_cache_entries gauge\n\
+         mlxcel_prompt_cache_entries {pc_entries}\n",
         gen_time_sec = gen_time_ms as f64 / 1000.0,
         seq_started = obs.sequences_started,
         seq_completed = obs.sequences_completed,
@@ -154,6 +208,14 @@ pub async fn metrics(State(state): State<AppState>) -> Response {
         paged_bytes_reserved = obs.cache_pool_paged_bytes_reserved,
         paged_bytes_in_use = obs.cache_pool_paged_bytes_in_use,
         decode_storage_fallbacks = obs.decode_storage_fallbacks,
+        pc_hits = pc_hits,
+        pc_misses = pc_misses,
+        pc_reused_tokens = pc_reused_tokens,
+        pc_evict_lru = pc_evict_lru,
+        pc_evict_ttl = pc_evict_ttl,
+        pc_evict_capacity = pc_evict_capacity,
+        pc_bytes = pc_bytes,
+        pc_entries = pc_entries,
     );
 
     let mut body = body;

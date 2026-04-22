@@ -148,3 +148,149 @@ fn prompt_cache_store_is_send_sync_via_arc() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Arc<super::super::prompt_cache::PromptCacheStore>>();
 }
+
+// ------------------------------------------------------------------
+// Prompt-cache BatchMetrics counters (issue #423)
+// ------------------------------------------------------------------
+
+#[test]
+fn batch_metrics_prompt_cache_hit_increments_counters() {
+    let m = BatchMetrics::new();
+
+    m.record_prompt_cache_hit(32);
+    m.record_prompt_cache_hit(48);
+
+    assert_eq!(
+        m.prompt_cache_hits_total.load(Ordering::Relaxed),
+        2,
+        "two hits should register as 2"
+    );
+    assert_eq!(
+        m.prompt_cache_prefix_tokens_reused_total.load(Ordering::Relaxed),
+        80,
+        "token counts 32+48=80 should be accumulated"
+    );
+    assert_eq!(
+        m.prompt_cache_misses_total.load(Ordering::Relaxed),
+        0,
+        "no misses should have been recorded"
+    );
+}
+
+#[test]
+fn batch_metrics_prompt_cache_miss_increments_counter() {
+    let m = BatchMetrics::new();
+
+    m.record_prompt_cache_miss();
+    m.record_prompt_cache_miss();
+
+    assert_eq!(
+        m.prompt_cache_misses_total.load(Ordering::Relaxed),
+        2,
+        "two misses should register as 2"
+    );
+    assert_eq!(
+        m.prompt_cache_hits_total.load(Ordering::Relaxed),
+        0,
+        "no hits should have been recorded"
+    );
+}
+
+#[test]
+fn batch_metrics_prompt_cache_evictions_labeled_by_reason() {
+    let m = BatchMetrics::new();
+
+    m.record_prompt_cache_eviction_lru();
+    m.record_prompt_cache_eviction_lru();
+    m.record_prompt_cache_eviction_ttl();
+    m.record_prompt_cache_eviction_capacity();
+
+    assert_eq!(
+        m.prompt_cache_evictions_lru_total.load(Ordering::Relaxed),
+        2,
+        "should have 2 LRU evictions"
+    );
+    assert_eq!(
+        m.prompt_cache_evictions_ttl_total.load(Ordering::Relaxed),
+        1,
+        "should have 1 TTL eviction"
+    );
+    assert_eq!(
+        m.prompt_cache_evictions_capacity_total.load(Ordering::Relaxed),
+        1,
+        "should have 1 capacity eviction"
+    );
+}
+
+#[test]
+fn batch_metrics_prompt_cache_gauges_update() {
+    let m = BatchMetrics::new();
+
+    m.update_prompt_cache_gauges(1024 * 1024, 10);
+
+    assert_eq!(
+        m.prompt_cache_bytes.load(Ordering::Relaxed),
+        1024 * 1024,
+        "byte gauge should reflect insert"
+    );
+    assert_eq!(
+        m.prompt_cache_entries.load(Ordering::Relaxed),
+        10,
+        "entry gauge should reflect insert"
+    );
+
+    // Simulate eviction
+    m.update_prompt_cache_gauges(512 * 1024, 5);
+
+    assert_eq!(
+        m.prompt_cache_bytes.load(Ordering::Relaxed),
+        512 * 1024,
+        "byte gauge should reflect eviction"
+    );
+    assert_eq!(
+        m.prompt_cache_entries.load(Ordering::Relaxed),
+        5,
+        "entry gauge should reflect eviction"
+    );
+}
+
+#[test]
+fn batch_metrics_cache_adapter_routes_lookups_to_hit_and_miss_counters() {
+    use std::sync::Arc;
+    use super::BatchMetricsCacheAdapter;
+    use super::super::prompt_cache::metrics::PromptCacheMetrics;
+
+    let m = Arc::new(BatchMetrics::new());
+    let adapter = BatchMetricsCacheAdapter::new(m.clone());
+
+    // Hit
+    adapter.record_lookup(true, 40);
+    // Miss
+    adapter.record_lookup(false, 0);
+    // Another hit
+    adapter.record_lookup(true, 20);
+
+    assert_eq!(m.prompt_cache_hits_total.load(Ordering::Relaxed), 2);
+    assert_eq!(
+        m.prompt_cache_prefix_tokens_reused_total.load(Ordering::Relaxed),
+        60
+    );
+    assert_eq!(m.prompt_cache_misses_total.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn batch_metrics_cache_adapter_routes_evictions() {
+    use std::sync::Arc;
+    use super::BatchMetricsCacheAdapter;
+    use super::super::prompt_cache::metrics::PromptCacheMetrics;
+
+    let m = Arc::new(BatchMetrics::new());
+    let adapter = BatchMetricsCacheAdapter::new(m.clone());
+
+    adapter.record_evict_lru(100);
+    adapter.record_evict_ttl(200);
+
+    assert_eq!(m.prompt_cache_evictions_lru_total.load(Ordering::Relaxed), 1);
+    assert_eq!(m.prompt_cache_evictions_ttl_total.load(Ordering::Relaxed), 1);
+    assert_eq!(m.prompt_cache_evictions_capacity_total.load(Ordering::Relaxed), 0);
+}

@@ -324,6 +324,8 @@ async fn non_stream_chat_completion(
         }
     });
 
+    let cached_tokens = result.cached_tokens;
+
     // Try to parse tool calls from the output
     if tool_calls::should_parse_tool_calls(&request) {
         let tools = request.tools.as_deref();
@@ -332,30 +334,36 @@ async fn non_stream_chat_completion(
         if parsed.has_tool_calls() {
             let tool_call_responses = tool_calls::build_tool_call_responses(&parsed, &request);
             if !tool_call_responses.is_empty() {
-                return Ok(Json(ChatCompletionResponse::new_with_tool_calls(
-                    request_id,
-                    model_id,
-                    parsed.content.clone(),
-                    tool_call_responses,
-                    result.prompt_tokens,
-                    result.completion_tokens,
-                    logprobs,
-                )));
+                return Ok(Json(
+                    ChatCompletionResponse::new_with_tool_calls(
+                        request_id,
+                        model_id,
+                        parsed.content.clone(),
+                        tool_call_responses,
+                        result.prompt_tokens,
+                        result.completion_tokens,
+                        logprobs,
+                    )
+                    .with_cached_tokens(cached_tokens, prompt_cache_enabled),
+                ));
             }
         }
 
         // No tool calls found, but tool parsing was enabled — use the cleaned
         // content from the parser (thinking blocks and structural markers
         // stripped) instead of the raw generation output.
-        return Ok(Json(ChatCompletionResponse::new_with_logprobs(
-            request_id,
-            model_id,
-            parsed.content,
-            result.prompt_tokens,
-            result.completion_tokens,
-            Some(result.finish_reason),
-            logprobs,
-        )));
+        return Ok(Json(
+            ChatCompletionResponse::new_with_logprobs(
+                request_id,
+                model_id,
+                parsed.content,
+                result.prompt_tokens,
+                result.completion_tokens,
+                Some(result.finish_reason),
+                logprobs,
+            )
+            .with_cached_tokens(cached_tokens, prompt_cache_enabled),
+        ));
     }
 
     // Even without tool-call parsing, strip structural tokens so Gemma 4
@@ -363,15 +371,18 @@ async fn non_stream_chat_completion(
     // plain chat responses.
     let cleaned_text = tool_calls::clean_structural_tokens(&result.text);
 
-    Ok(Json(ChatCompletionResponse::new_with_logprobs(
-        request_id,
-        model_id,
-        cleaned_text,
-        result.prompt_tokens,
-        result.completion_tokens,
-        Some(result.finish_reason),
-        logprobs,
-    )))
+    Ok(Json(
+        ChatCompletionResponse::new_with_logprobs(
+            request_id,
+            model_id,
+            cleaned_text,
+            result.prompt_tokens,
+            result.completion_tokens,
+            Some(result.finish_reason),
+            logprobs,
+        )
+        .with_cached_tokens(cached_tokens, prompt_cache_enabled),
+    ))
 }
 
 async fn stream_chat_completion(
@@ -577,11 +588,13 @@ async fn stream_chat_completion(
 
         // Send usage chunk if requested (stream_options.include_usage)
         if include_usage && let Ok(ref r) = result {
-            let usage_chunk = ChatCompletionChunk::usage(
+            let usage_chunk = ChatCompletionChunk::usage_with_cache(
                 request_id_clone.clone(),
                 model_id_clone.clone(),
                 r.prompt_tokens,
                 r.completion_tokens,
+                r.cached_tokens,
+                prompt_cache_enabled,
             );
             let _ = finish_events.json(&usage_chunk);
         }

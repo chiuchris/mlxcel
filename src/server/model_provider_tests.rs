@@ -31,6 +31,7 @@ fn sample_result() -> GenerationResult {
         generation_only_ms: 6,
         finish_reason: "stop".to_string(),
         logprobs: None,
+        cached_tokens: 0,
     }
 }
 

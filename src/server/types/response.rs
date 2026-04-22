@@ -65,12 +65,29 @@ pub struct CompletionLogprobs {
     pub top_logprobs: Vec<Option<std::collections::HashMap<String, f32>>>,
 }
 
+/// Breakdown of prompt tokens by origin.
+///
+/// Present in the response body as `usage.prompt_tokens_details` when the
+/// prompt-prefix cache is active. Omitted (`null` / absent) when the cache
+/// feature is disabled so that clients relying on the `null` sentinel do not
+/// need any changes (wire compatibility for disabled mode).
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptTokensDetails {
+    /// Number of prompt tokens that were served directly from the KV prefix
+    /// cache, bypassing recomputation in the prefill stage.
+    pub cached_tokens: u64,
+}
+
 /// Token usage statistics
 #[derive(Debug, Clone, Serialize)]
 pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub total_tokens: usize,
+    /// Breakdown of prompt-token origins. `None` when the prompt-prefix cache
+    /// feature is disabled (preserves wire compatibility for disabled mode).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 /// Chat completion choice
@@ -175,6 +192,7 @@ impl ChatCompletionResponse {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens_details: None,
             },
         }
     }
@@ -212,8 +230,27 @@ impl ChatCompletionResponse {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens_details: None,
             },
         }
+    }
+
+    /// Populate `usage.prompt_tokens_details.cached_tokens` from the
+    /// generation result's `cached_tokens` field. When `cached_tokens == 0`
+    /// and `cache_enabled == false`, the details field is left as `None` to
+    /// preserve wire compatibility. When `cache_enabled == true`, the field is
+    /// always set (possibly to zero for a cold-miss request) so clients can
+    /// distinguish "cache off" from "cache on but no hit".
+    ///
+    /// Used by: chat.rs (both streaming and non-streaming paths)
+    #[must_use]
+    pub fn with_cached_tokens(mut self, cached_tokens: usize, cache_enabled: bool) -> Self {
+        if cache_enabled {
+            self.usage.prompt_tokens_details = Some(PromptTokensDetails {
+                cached_tokens: cached_tokens as u64,
+            });
+        }
+        self
     }
 }
 
@@ -284,6 +321,7 @@ impl CompletionResponse {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
+                prompt_tokens_details: None,
             },
         }
     }
@@ -429,4 +467,100 @@ pub struct SlotInfo {
     pub generated_tokens: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub elapsed_ms: Option<u64>,
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -- Usage serialization (issue #423) ------------------------------------
+
+    /// When `prompt_tokens_details` is `None` the field must be omitted from
+    /// the JSON output entirely (wire compatibility for disabled-cache mode).
+    #[test]
+    fn usage_without_cache_omits_prompt_tokens_details() {
+        let usage = Usage {
+            prompt_tokens: 10,
+            completion_tokens: 5,
+            total_tokens: 15,
+            prompt_tokens_details: None,
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert!(!json.as_object().unwrap().contains_key("prompt_tokens_details"),
+            "prompt_tokens_details must be absent when None");
+        assert_eq!(json["prompt_tokens"], 10);
+        assert_eq!(json["completion_tokens"], 5);
+        assert_eq!(json["total_tokens"], 15);
+    }
+
+    /// When `prompt_tokens_details` is `Some`, the field must be present and
+    /// carry the correct `cached_tokens` value.
+    #[test]
+    fn usage_with_cache_includes_prompt_tokens_details() {
+        let usage = Usage {
+            prompt_tokens: 100,
+            completion_tokens: 20,
+            total_tokens: 120,
+            prompt_tokens_details: Some(PromptTokensDetails { cached_tokens: 64 }),
+        };
+        let json = serde_json::to_value(&usage).unwrap();
+        assert_eq!(json["prompt_tokens_details"]["cached_tokens"], 64);
+    }
+
+    /// `with_cached_tokens` must populate the field when `cache_enabled=true`.
+    #[test]
+    fn with_cached_tokens_sets_details_when_cache_enabled() {
+        let resp = ChatCompletionResponse::new(
+            "id".to_string(),
+            "model".to_string(),
+            "hi".to_string(),
+            50,
+            10,
+            Some("stop".to_string()),
+        )
+        .with_cached_tokens(32, true);
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 32);
+    }
+
+    /// `with_cached_tokens` must leave the field absent when `cache_enabled=false`.
+    #[test]
+    fn with_cached_tokens_omits_details_when_cache_disabled() {
+        let resp = ChatCompletionResponse::new(
+            "id".to_string(),
+            "model".to_string(),
+            "hi".to_string(),
+            50,
+            10,
+            Some("stop".to_string()),
+        )
+        .with_cached_tokens(99, false);
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
+            "prompt_tokens_details must be absent when cache is disabled");
+    }
+
+    /// `with_cached_tokens` with zero and `cache_enabled=true` should still
+    /// emit the field (cold miss on a cache-enabled server).
+    #[test]
+    fn with_cached_tokens_zero_with_cache_enabled_emits_field() {
+        let resp = ChatCompletionResponse::new(
+            "id".to_string(),
+            "model".to_string(),
+            "hi".to_string(),
+            50,
+            10,
+            Some("stop".to_string()),
+        )
+        .with_cached_tokens(0, true);
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    }
 }

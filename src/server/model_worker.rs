@@ -669,6 +669,7 @@ fn prepare_gemma4_audio_embeddings(
     Ok(Some(embeddings))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn build_generation_result(
     text: String,
     prompt_tokens: usize,
@@ -676,6 +677,30 @@ pub(crate) fn build_generation_result(
     elapsed_ms: u64,
     prompt_eval_ms: u64,
     max_tokens: usize,
+) -> GenerationResult {
+    build_generation_result_with_cache(
+        text,
+        prompt_tokens,
+        completion_tokens,
+        elapsed_ms,
+        prompt_eval_ms,
+        max_tokens,
+        0,
+    )
+}
+
+/// Build a `GenerationResult` with prompt-prefix cache information.
+///
+/// `cached_tokens` is the number of leading prompt tokens that were satisfied
+/// by the KV prefix cache (issue #423). Pass `0` for non-cached requests.
+pub(crate) fn build_generation_result_with_cache(
+    text: String,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    elapsed_ms: u64,
+    prompt_eval_ms: u64,
+    max_tokens: usize,
+    cached_tokens: usize,
 ) -> GenerationResult {
     let finish_reason = if completion_tokens >= max_tokens {
         "length"
@@ -692,6 +717,7 @@ pub(crate) fn build_generation_result(
         generation_only_ms: elapsed_ms.saturating_sub(prompt_eval_ms),
         finish_reason: finish_reason.to_string(),
         logprobs: None,
+        cached_tokens,
     }
 }
 
@@ -763,11 +789,24 @@ impl StreamingDecodeState {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn finish(
         self,
         start: Instant,
         prompt_token_count: usize,
         max_tokens: usize,
+    ) -> GenerationResult {
+        self.finish_with_cache(start, prompt_token_count, max_tokens, 0)
+    }
+
+    /// Like [`finish`] but records how many prompt tokens were served from
+    /// the KV prefix cache (epic #416 / issue #423).
+    pub(crate) fn finish_with_cache(
+        self,
+        start: Instant,
+        prompt_token_count: usize,
+        max_tokens: usize,
+        cached_tokens: usize,
     ) -> GenerationResult {
         let elapsed_ms = start.elapsed().as_millis() as u64;
         let prompt_eval_ms = self
@@ -775,13 +814,14 @@ impl StreamingDecodeState {
             .map(|t| (t - start).as_millis() as u64)
             .unwrap_or(elapsed_ms);
 
-        build_generation_result(
+        build_generation_result_with_cache(
             self.generated_text,
             prompt_token_count,
             self.completion_tokens,
             elapsed_ms,
             prompt_eval_ms,
             max_tokens,
+            cached_tokens,
         )
     }
 }

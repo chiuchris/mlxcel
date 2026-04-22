@@ -26,7 +26,7 @@ use crate::distributed::pipeline::{PipelineObservability, PpTracer};
 use crate::tokenizer::MlxcelTokenizer;
 
 use super::batch::BatchObservability;
-use super::prompt_cache::PromptCacheStore;
+use super::prompt_cache::{PromptCacheStore, metrics::PromptCacheMetrics};
 use super::{ChatTemplateProcessor, ModelProvider, ServerConfig};
 
 /// Server-wide metrics counters (atomic, lock-free).
@@ -84,6 +84,28 @@ pub struct BatchMetrics {
     pub total_tokens_generated: AtomicU64,
     /// Cumulative number of preemptive evictions.
     pub preemptions_total: AtomicU64,
+
+    // -- Epic #416 / issue #423: prompt-prefix cache Prometheus counters --
+    /// Cumulative successful prompt-cache adoptions (hits). Incremented by the
+    /// scheduler's `try_adopt_cached_prefix` when an entry is adopted.
+    pub prompt_cache_hits_total: AtomicU64,
+    /// Cumulative prompt-cache misses. Incremented in the scheduler when no
+    /// matching prefix is found and a cold allocate is used.
+    pub prompt_cache_misses_total: AtomicU64,
+    /// Cumulative prefix tokens reused across all hits. Σ matched-prefix
+    /// lengths from `try_adopt_cached_prefix`.
+    pub prompt_cache_prefix_tokens_reused_total: AtomicU64,
+    /// Cumulative evictions labeled by reason: lru / ttl / capacity.
+    ///
+    /// Stored as three separate atomics and combined into labeled Prometheus
+    /// output by the `/metrics` handler.
+    pub prompt_cache_evictions_lru_total: AtomicU64,
+    pub prompt_cache_evictions_ttl_total: AtomicU64,
+    pub prompt_cache_evictions_capacity_total: AtomicU64,
+    /// Current byte footprint of all live prompt-cache entries (gauge).
+    pub prompt_cache_bytes: AtomicU64,
+    /// Current number of live prompt-cache entries (gauge).
+    pub prompt_cache_entries: AtomicU64,
 }
 
 impl Default for BatchMetrics {
@@ -100,6 +122,14 @@ impl BatchMetrics {
             total_sequences_processed: AtomicU64::new(0),
             total_tokens_generated: AtomicU64::new(0),
             preemptions_total: AtomicU64::new(0),
+            prompt_cache_hits_total: AtomicU64::new(0),
+            prompt_cache_misses_total: AtomicU64::new(0),
+            prompt_cache_prefix_tokens_reused_total: AtomicU64::new(0),
+            prompt_cache_evictions_lru_total: AtomicU64::new(0),
+            prompt_cache_evictions_ttl_total: AtomicU64::new(0),
+            prompt_cache_evictions_capacity_total: AtomicU64::new(0),
+            prompt_cache_bytes: AtomicU64::new(0),
+            prompt_cache_entries: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +164,101 @@ impl BatchMetrics {
     /// Record a preemptive eviction (called by scheduler thread).
     pub fn record_preemption(&self) {
         self.preemptions_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    // -- Prompt-prefix cache helpers (epic #416 / issue #423) --
+
+    /// Record a prompt-cache hit and the number of tokens that were reused.
+    ///
+    /// Called by the scheduler's `try_adopt_cached_prefix` on success.
+    pub fn record_prompt_cache_hit(&self, matched_tokens: usize) {
+        self.prompt_cache_hits_total.fetch_add(1, Ordering::Relaxed);
+        self.prompt_cache_prefix_tokens_reused_total
+            .fetch_add(matched_tokens as u64, Ordering::Relaxed);
+    }
+
+    /// Record a prompt-cache miss (cold allocate path).
+    pub fn record_prompt_cache_miss(&self) {
+        self.prompt_cache_misses_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an LRU eviction from the prompt-cache store.
+    pub fn record_prompt_cache_eviction_lru(&self) {
+        self.prompt_cache_evictions_lru_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a TTL eviction from the prompt-cache store.
+    pub fn record_prompt_cache_eviction_ttl(&self) {
+        self.prompt_cache_evictions_ttl_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a capacity-pressure eviction from the prompt-cache store.
+    ///
+    /// A capacity eviction occurs when an insert triggers a byte-budget or
+    /// entry-count cap enforcement that ejects one or more existing entries.
+    pub fn record_prompt_cache_eviction_capacity(&self) {
+        self.prompt_cache_evictions_capacity_total
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Overwrite the prompt-cache byte and entry gauges.
+    ///
+    /// Called after every insert or eviction so `/metrics` always reflects
+    /// the current store size. Safe to call from the scheduler thread only.
+    pub fn update_prompt_cache_gauges(&self, bytes: usize, entries: usize) {
+        self.prompt_cache_bytes
+            .store(bytes as u64, Ordering::Relaxed);
+        self.prompt_cache_entries
+            .store(entries as u64, Ordering::Relaxed);
+    }
+}
+
+/// Bridges [`BatchMetrics`] into the [`PromptCacheMetrics`] callback surface
+/// consumed by [`PromptCacheStore`].
+///
+/// Constructed once at server startup and shared via `Arc` between the store
+/// and the metrics reader so the single `BatchMetrics` instance stays as the
+/// source of truth for all Prometheus output.
+///
+/// Used by: startup.rs (PromptCacheStore::with_metrics call site)
+pub struct BatchMetricsCacheAdapter {
+    inner: Arc<BatchMetrics>,
+}
+
+impl BatchMetricsCacheAdapter {
+    pub fn new(metrics: Arc<BatchMetrics>) -> Self {
+        Self { inner: metrics }
+    }
+}
+
+impl PromptCacheMetrics for BatchMetricsCacheAdapter {
+    fn record_insert(&self, _bytes: usize) {
+        // Gauge is updated via `update_prompt_cache_gauges`; no separate
+        // counter is defined for raw inserts at the `BatchMetrics` level.
+    }
+
+    fn record_reject_oversized(&self, _bytes: usize) {
+        // No dedicated counter in `BatchMetrics` for oversized rejects;
+        // `BatchObservability::prompt_cache_insert_rejects` covers this.
+    }
+
+    fn record_lookup(&self, hit: bool, matched_len: usize) {
+        if hit {
+            self.inner.record_prompt_cache_hit(matched_len);
+        } else {
+            self.inner.record_prompt_cache_miss();
+        }
+    }
+
+    fn record_evict_lru(&self, _bytes: usize) {
+        self.inner.record_prompt_cache_eviction_lru();
+    }
+
+    fn record_evict_ttl(&self, _bytes: usize) {
+        self.inner.record_prompt_cache_eviction_ttl();
     }
 }
 

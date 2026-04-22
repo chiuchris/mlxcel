@@ -191,6 +191,52 @@ fn completion_usage_chunk_has_empty_choices_and_populated_usage() {
     assert_eq!(json["usage"]["total_tokens"], 20);
 }
 
+// ── Cache-aware usage chunk tests (issue #423) ───────────────────────────────
+
+/// `usage_with_cache` with `cache_enabled=true` must include
+/// `prompt_tokens_details.cached_tokens` in the final chunk.
+#[test]
+fn usage_with_cache_chunk_includes_cached_tokens_when_enabled() {
+    let chunk = ChatCompletionChunk::usage_with_cache(
+        "chatcmpl-test".to_string(),
+        "model".to_string(),
+        100, // prompt_tokens
+        20,  // completion_tokens
+        64,  // cached_tokens
+        true,
+    );
+    let json = serde_json::to_value(&chunk).unwrap();
+    assert!(json["choices"].as_array().unwrap().is_empty());
+    assert_eq!(json["usage"]["prompt_tokens"], 100);
+    assert_eq!(json["usage"]["completion_tokens"], 20);
+    assert_eq!(json["usage"]["total_tokens"], 120);
+    assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 64);
+}
+
+/// `usage_with_cache` with `cache_enabled=false` must omit
+/// `prompt_tokens_details` entirely (wire compat for disabled-cache clients).
+#[test]
+fn usage_with_cache_chunk_omits_cached_tokens_when_disabled() {
+    let chunk = ChatCompletionChunk::usage_with_cache(
+        "chatcmpl-test".to_string(),
+        "model".to_string(),
+        50, 10, 99, false,
+    );
+    let json = serde_json::to_value(&chunk).unwrap();
+    assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
+        "prompt_tokens_details must be absent when cache is disabled");
+}
+
+/// Plain `usage()` must not include `prompt_tokens_details` (backward compat).
+#[test]
+fn plain_usage_chunk_has_no_prompt_tokens_details() {
+    let chunk =
+        ChatCompletionChunk::usage("chatcmpl-test".to_string(), "model".to_string(), 10, 5);
+    let json = serde_json::to_value(&chunk).unwrap();
+    assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
+        "plain usage chunk must not include prompt_tokens_details");
+}
+
 // ── Cancellation token tests ────────────────────────────────────────────────
 
 #[test]

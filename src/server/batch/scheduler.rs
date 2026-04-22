@@ -55,8 +55,8 @@ use crate::server::config::{
     DecodeStorageBackend, PreemptionPolicy, PromptCacheRequestContext, ReasoningBudgetOverride,
 };
 use crate::server::model_provider::model_worker::{
-    StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
-    prepare_request_vlm_embeddings,
+    StreamingDecodeState, build_generation_result_with_cache,
+    merge_config_stop_tokens, prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
 use crate::server::prompt_cache::key::{MultimodalDigest, PromptCacheKey};
@@ -470,6 +470,15 @@ impl BatchScheduler {
                 );
                 self.batch_observability
                     .record_prompt_cache_hit(matched_len);
+                // Issue #423: also increment BatchMetrics Prometheus counters.
+                self.batch_metrics.record_prompt_cache_hit(matched_len);
+                // Update byte/entry gauges so /metrics reflects current state.
+                if let Some(ref store) = self.prompt_cache {
+                    self.batch_metrics.update_prompt_cache_gauges(
+                        store.bytes(),
+                        store.len(),
+                    );
+                }
                 Some((adopted_id, matched_len))
             }
             Err(err) => {
@@ -551,6 +560,11 @@ impl BatchScheduler {
         match store.insert(&key, entry) {
             Ok(()) => {
                 self.batch_observability.record_prompt_cache_insert();
+                // Issue #423: refresh byte/entry gauges after a successful insert.
+                self.batch_metrics.update_prompt_cache_gauges(
+                    store.bytes(),
+                    store.len(),
+                );
             }
             Err(err) => {
                 // Oversized / disabled / prefix-too-short — drop the entry
@@ -846,6 +860,12 @@ impl BatchScheduler {
                 Some((adopted_id, matched_len)) => (adopted_id, matched_len, matched_len),
                 None => {
                     // Miss or feature disabled → regular allocate.
+                    // Issue #423: count misses only when the cache is actually
+                    // active (ctx_ref is Some) to avoid inflating the miss
+                    // counter for multimodal or cache-disabled requests.
+                    if ctx_ref.is_some() {
+                        self.batch_metrics.record_prompt_cache_miss();
+                    }
                     let seq_id = match self.allocate_sequence_state() {
                         Ok(id) => id,
                         Err(err) => {
@@ -1707,7 +1727,7 @@ impl BatchScheduler {
             {
                 tracing::error!("State transition error: {err}");
             }
-            let result = build_generation_result(
+            let result = build_generation_result_with_cache(
                 String::new(),
                 seq.prompt_tokens.len(),
                 0,
@@ -1716,6 +1736,16 @@ impl BatchScheduler {
                     .map(|t| (Instant::now() - t).as_millis() as u64)
                     .unwrap_or(0),
                 seq.max_tokens,
+                seq.already_cached_tokens,
+            );
+            tracing::info!(
+                prompt_tokens = seq.prompt_tokens.len(),
+                cached_tokens = seq.already_cached_tokens,
+                saved_ms = 0,
+                "prompt-cache: request completed (eos-at-prefill): \
+                 cached={}/{} prompt tokens, saved ~0ms",
+                seq.already_cached_tokens,
+                seq.prompt_tokens.len(),
             );
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
             // Prefill produced a valid KV cache (EOS on turn 1 is a healthy
@@ -1763,9 +1793,23 @@ impl BatchScheduler {
                 tracing::error!("State transition error: {err}");
             }
             seq.decode_state.flush(&self.tokenizer);
-            let result =
-                seq.decode_state
-                    .finish(seq.created_at, seq.prompt_tokens.len(), seq.max_tokens);
+            let cached = seq.already_cached_tokens;
+            let result = seq.decode_state.finish_with_cache(
+                seq.created_at,
+                seq.prompt_tokens.len(),
+                seq.max_tokens,
+                cached,
+            );
+            tracing::info!(
+                prompt_tokens = seq.prompt_tokens.len(),
+                cached_tokens = cached,
+                generation_time_ms = result.generation_time_ms,
+                "prompt-cache: request completed (max-tokens): \
+                 cached={}/{} prompt tokens, total {}ms",
+                cached,
+                seq.prompt_tokens.len(),
+                result.generation_time_ms,
+            );
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
             self.donate_finished_sequence_cache(
                 seq.seq_id,
@@ -2268,10 +2312,22 @@ impl BatchScheduler {
                 let tokens_generated = seq.generated_tokens.len();
 
                 seq.decode_state.flush(&self.tokenizer);
-                let result = seq.decode_state.finish(
+                let cached = seq.already_cached_tokens;
+                let result = seq.decode_state.finish_with_cache(
                     seq.created_at,
                     seq.prompt_tokens.len(),
                     seq.max_tokens,
+                    cached,
+                );
+                tracing::info!(
+                    prompt_tokens = seq.prompt_tokens.len(),
+                    cached_tokens = cached,
+                    generation_time_ms = result.generation_time_ms,
+                    "prompt-cache: request completed: \
+                     cached={}/{} prompt tokens, total {}ms",
+                    cached,
+                    seq.prompt_tokens.len(),
+                    result.generation_time_ms,
                 );
                 let _ = seq.response_tx.send(GenerateEvent::Done(result));
 
