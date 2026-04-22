@@ -147,6 +147,7 @@ nav:
       - LoRA Adapters: user-guide/lora.md
       - Speculative Decoding: user-guide/speculative-decoding.md
       - Continuous Batching: user-guide/continuous-batching.md
+      - Prompt Cache: prompt_cache.md
       - Language Bias: user-guide/lang-bias.md
   - API Reference:
       - api-reference/index.md
