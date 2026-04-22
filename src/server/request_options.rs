@@ -91,6 +91,9 @@ pub(crate) fn build_server_generate_options(
         logprobs: LogprobsConfig::default(),
         reasoning_budget: overrides.reasoning_budget,
         thinking_enter_block_on_start: overrides.thinking_enter_block_on_start,
+        // Default unset; chat routes populate this when the prompt cache
+        // store is installed (see `src/server/routes/chat.rs`).
+        prompt_cache_ctx: None,
     }
 }
 

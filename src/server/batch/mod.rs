@@ -30,6 +30,8 @@ mod active;
 pub mod observability;
 mod queue;
 pub(crate) mod scheduler;
+#[cfg(test)]
+mod scheduler_prompt_cache_tests;
 mod sequence;
 
 pub use active::ActiveBatch;

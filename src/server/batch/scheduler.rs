@@ -32,7 +32,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use mlxcel_core::cache::{CachePool, PagedKvLayout, SequenceId, SequenceStateLayout};
+use mlxcel_core::cache::{
+    CachePool, DetachedCacheSet, PagedKvLayout, SequenceId, SequenceStateBackend,
+    SequenceStateLayout,
+};
 use mlxcel_core::generate::{
     DecodeBatchContext, DecodeStorageBackend as CoreDecodeStorageBackend, LanguageModel,
 };
@@ -48,12 +51,16 @@ use mlxcel_core::{MlxStream, UniquePtr};
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::observability::BatchObservability;
-use crate::server::config::{DecodeStorageBackend, PreemptionPolicy, ReasoningBudgetOverride};
+use crate::server::config::{
+    DecodeStorageBackend, PreemptionPolicy, PromptCacheRequestContext, ReasoningBudgetOverride,
+};
 use crate::server::model_provider::model_worker::{
     StreamingDecodeState, build_generation_result, merge_config_stop_tokens,
     prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
+use crate::server::prompt_cache::key::PromptCacheKey;
+use crate::server::prompt_cache::{CacheEntry, PromptCacheStore};
 use crate::server::state::BatchMetrics;
 use crate::server::thinking_budget::{
     ThinkingBudget, ThinkingDecision, ThinkingState, ThinkingTokenIds,
@@ -186,6 +193,19 @@ pub struct BatchScheduler {
     /// `None`, every sequence's [`ThinkingState`] is constructed as disabled
     /// regardless of any budget configuration.
     thinking_token_ids: Option<ThinkingTokenIds>,
+
+    // -- Epic #416 / issue #421: cross-request prompt-prefix KV cache --
+    /// Shared store that hands out detached KV caches on prefix match and
+    /// absorbs donated caches on sequence finish. `None` when the feature is
+    /// disabled at config time so the hot path has zero overhead.
+    prompt_cache: Option<Arc<PromptCacheStore>>,
+
+    /// Parallel map indexed by `SequenceId`: remembers the
+    /// [`PromptCacheRequestContext`] per in-flight sequence so the donate-back
+    /// path on completion can rebuild the cache key without touching the HTTP
+    /// request layer again. Dropped automatically when the sequence is
+    /// removed from the map on finish / error.
+    prompt_cache_seq_ctx: std::collections::HashMap<SequenceId, PromptCacheRequestContext>,
 }
 
 impl BatchScheduler {
@@ -293,6 +313,8 @@ impl BatchScheduler {
             token_bias: TokenBiasMap::default(),
             reasoning_budget: None,
             thinking_token_ids: None,
+            prompt_cache: None,
+            prompt_cache_seq_ctx: std::collections::HashMap::new(),
         }
     }
 
@@ -345,6 +367,200 @@ impl BatchScheduler {
         self.reasoning_budget = budget;
         self.thinking_token_ids = token_ids;
         self
+    }
+
+    /// Attach the shared prompt-prefix KV cache store
+    /// (epic #416 / issue #421).
+    ///
+    /// When `Some(..)`, the scheduler:
+    /// * Looks up a longest-prefix match on each new request and calls
+    ///   [`CachePool::adopt`] on hit to skip re-prefill of the shared prefix.
+    /// * Donates the sequence's full cache back to the store on a healthy
+    ///   finish (normal stop / length / cancelled without error).
+    /// * Never donates back on OOM, transition errors, or
+    ///   `Finished(FinishReason::Error(..))`.
+    ///
+    /// When `None` every hot path short-circuits on the `is_some()` check
+    /// before any store access so the bit-exact baseline is preserved.
+    pub fn with_prompt_cache(mut self, store: Option<Arc<PromptCacheStore>>) -> Self {
+        self.prompt_cache = store;
+        self
+    }
+
+    /// Whether the installed prompt-cache store is currently accepting
+    /// lookups and inserts (scheduler-level gate for #424).
+    #[inline]
+    fn prompt_cache_active(&self) -> bool {
+        self.prompt_cache
+            .as_ref()
+            .map(|s| s.is_enabled())
+            .unwrap_or(false)
+    }
+
+    /// Build a [`PromptCacheKey`] bound to the per-request metadata the
+    /// scheduler captured at enqueue time. Returns `None` when the request
+    /// carried no [`PromptCacheRequestContext`] (e.g. non-chat endpoints).
+    fn compose_prompt_cache_key<'a>(
+        ctx: &'a PromptCacheRequestContext,
+        tokens: &'a [i32],
+    ) -> PromptCacheKey<'a> {
+        PromptCacheKey::new_full(
+            ctx.model_id.as_str(),
+            ctx.lora_id.as_deref(),
+            ctx.template_sig.as_str(),
+            Some(ctx.session_key.as_str()),
+            tokens,
+        )
+    }
+
+    /// Attempt to adopt a cached prefix for a freshly tokenized request,
+    /// returning the adopted `SequenceId` together with the matched-prefix
+    /// length on success.
+    ///
+    /// The caller invokes this **before** [`Self::allocate_sequence_state`]
+    /// so the adopted id becomes the sequence's canonical id and no
+    /// seq_id rebinding dance is required. On any miss path the caller
+    /// proceeds with a fresh allocation under a brand-new id.
+    ///
+    /// Gating (all of these yield `None`, which maps to a cold prefill):
+    /// * feature disabled at config time,
+    /// * request carried no [`PromptCacheRequestContext`] (non-chat endpoint),
+    /// * scheduler configured with the paged decode backend (paged adoption
+    ///   through the store is deferred — the store's [`CacheEntry`] type
+    ///   currently only carries dense detached sets),
+    /// * store miss / match shorter than `min_prefix_tokens`,
+    /// * race with another worker that already consumed the entry,
+    /// * empty-tensor detached set (e.g. stored against an aborted seq),
+    /// * [`CachePool::adopt`] error (capacity, unsupported backend, …).
+    fn try_adopt_cached_prefix(
+        &mut self,
+        ctx: &PromptCacheRequestContext,
+        tokens: &[i32],
+    ) -> Option<(SequenceId, usize)> {
+        if !self.prompt_cache_active() {
+            return None;
+        }
+        if self.decode_storage_backend == DecodeStorageBackend::Paged {
+            return None;
+        }
+
+        let store = self.prompt_cache.as_ref()?.clone();
+        let key = Self::compose_prompt_cache_key(ctx, tokens);
+        let (entry, matched_len) = store.lookup_longest_prefix(&key, tokens)?;
+        // `take_detached` is one-shot: it returns `None` if a racing lookup
+        // already consumed this entry. The miss path is safe — the current
+        // sequence just does a fresh prefill.
+        let detached = entry.take_detached()?;
+        if detached.caches.is_empty() || detached.caches.iter().all(|c| c.is_empty()) {
+            return None;
+        }
+
+        match self
+            .cache_pool
+            .adopt(&self.model as &dyn LanguageModel, detached)
+        {
+            Ok(adopted_id) => {
+                tracing::debug!(
+                    seq_id = %adopted_id,
+                    matched = matched_len,
+                    total = tokens.len(),
+                    "prompt-cache hit: adopted {matched_len}/{} tokens",
+                    tokens.len()
+                );
+                self.batch_observability
+                    .record_prompt_cache_hit(matched_len);
+                Some((adopted_id, matched_len))
+            }
+            Err(err) => {
+                tracing::debug!("prompt-cache adopt failed ({err}); falling back to cold prefill");
+                None
+            }
+        }
+    }
+
+    /// Donate a finished sequence's KV cache back to the store so future
+    /// requests sharing a prefix can adopt it.
+    ///
+    /// The caller must invoke this **before** calling
+    /// [`Self::release_sequence_caches`] — once release runs the underlying
+    /// tensors are gone. Safe to call unconditionally; all the gating checks
+    /// (feature enabled, healthy finish, context present, dense backend)
+    /// live inside this method so the caller can keep its hot-path code
+    /// simple.
+    fn donate_finished_sequence_cache(
+        &mut self,
+        seq_id: SequenceId,
+        prompt_tokens: &[i32],
+        generated_tokens: &[i32],
+        healthy_finish: bool,
+    ) {
+        if !healthy_finish {
+            return;
+        }
+        if !self.prompt_cache_active() {
+            return;
+        }
+        // Remove the context regardless of whether the donate-back succeeds
+        // so the map doesn't grow unbounded across sequences that never
+        // qualified for a donate-back.
+        let ctx = match self.prompt_cache_seq_ctx.remove(&seq_id) {
+            Some(c) => c,
+            None => return,
+        };
+
+        // Only dense sequences can travel through the store's
+        // `DetachedCacheSet` (paged follow-up work).
+        let backend = self
+            .cache_pool
+            .get_mut(seq_id)
+            .map(|s| s.backend)
+            .unwrap_or(SequenceStateBackend::ModelOwned);
+        if backend != SequenceStateBackend::DenseKvCache {
+            return;
+        }
+
+        let detached: DetachedCacheSet = match self.cache_pool.detach(seq_id) {
+            Some(d) => d,
+            None => return,
+        };
+        if detached.caches.is_empty() || detached.caches.iter().all(|c| c.is_empty()) {
+            // Nothing to cache: aborted before any prefill completed, or
+            // the model never populated the KV tensors.
+            return;
+        }
+
+        // Tokens stored against the entry are the full prompt + generated
+        // tail, so the next turn's `prompt + new user turn` can match at
+        // least up through the previous assistant reply.
+        let mut tokens = Vec::with_capacity(prompt_tokens.len() + generated_tokens.len());
+        tokens.extend_from_slice(prompt_tokens);
+        tokens.extend_from_slice(generated_tokens);
+
+        let store = match self.prompt_cache.as_ref() {
+            Some(s) => s.clone(),
+            None => return,
+        };
+        // The `CacheEntry` takes ownership of `tokens` and the key borrows
+        // from the same buffer. Build the entry first, then form the key
+        // against `entry.tokens` so both reference the same contiguous
+        // allocation without copying the vector.
+        let entry = CacheEntry::new(tokens, detached);
+        let key_tokens = entry.tokens.clone();
+        let key = Self::compose_prompt_cache_key(&ctx, &key_tokens);
+        match store.insert(&key, entry) {
+            Ok(()) => {
+                self.batch_observability.record_prompt_cache_insert();
+            }
+            Err(err) => {
+                // Oversized / disabled / prefix-too-short — drop the entry
+                // so the detached buffers are freed.
+                tracing::debug!(
+                    seq_id = %seq_id,
+                    "prompt-cache donate-back skipped: {err:?}"
+                );
+                self.batch_observability.record_prompt_cache_insert_reject();
+            }
+        }
     }
 
     /// Apply issue #409 thinking-budget enforcement to a freshly sampled
@@ -605,14 +821,42 @@ impl BatchScheduler {
             sampling.token_bias = self.token_bias.clone();
         }
 
-        let seq_id = match self.allocate_sequence_state() {
-            Ok(id) => id,
-            Err(err) => {
-                tracing::warn!("Cache pool allocation failed: {err}");
-                let _ = response_tx.send(GenerateEvent::Error(format!("Server busy: {err}")));
-                return;
-            }
+        // Epic #416 / issue #421: before allocating a fresh KV-cache slot,
+        // probe the prompt-prefix cache for a reusable detached set. On a
+        // hit, adopt under a brand-new SequenceId and record how many
+        // leading tokens the prefill can skip. On a miss (which includes
+        // feature-disabled, no ctx, and race paths), fall through to the
+        // cold-allocation path below.
+        //
+        // VLM / audio requests opt out of the cache path entirely: their
+        // pre-injection token stream is not self-describing (image token
+        // placeholders expand later inside `prepare_request_vlm_embeddings`),
+        // so matching against it risks reusing a KV slice built for a
+        // different media payload. Support for image-aware cache keys is
+        // tracked separately in issue #425.
+        let is_multimodal = !images.is_empty() || !audio.is_empty();
+        let ctx_ref = if is_multimodal {
+            None
+        } else {
+            options.prompt_cache_ctx.as_ref()
         };
+        let (seq_id, prefill_start_offset, already_cached_tokens) =
+            match ctx_ref.and_then(|ctx| self.try_adopt_cached_prefix(ctx, &prompt_tokens)) {
+                Some((adopted_id, matched_len)) => (adopted_id, matched_len, matched_len),
+                None => {
+                    // Miss or feature disabled → regular allocate.
+                    let seq_id = match self.allocate_sequence_state() {
+                        Ok(id) => id,
+                        Err(err) => {
+                            tracing::warn!("Cache pool allocation failed: {err}");
+                            let _ = response_tx
+                                .send(GenerateEvent::Error(format!("Server busy: {err}")));
+                            return;
+                        }
+                    };
+                    (seq_id, 0, 0)
+                }
+            };
 
         let vlm_embeddings = match prepare_request_vlm_embeddings(
             &self.model,
@@ -625,6 +869,9 @@ impl BatchScheduler {
         ) {
             Ok(emb) => emb,
             Err(err) => {
+                // Clean up the context map so a donate-back won't fire for
+                // a sequence that never reached a healthy finish.
+                self.prompt_cache_seq_ctx.remove(&seq_id);
                 self.release_sequence_caches(seq_id);
                 let _ = response_tx.send(GenerateEvent::Error(err.to_string()));
                 return;
@@ -643,6 +890,35 @@ impl BatchScheduler {
             options.thinking_enter_block_on_start,
         );
 
+        // Record the per-request prompt-cache context so the donate-back
+        // path can compose the insert key without reaching back into the
+        // HTTP layer. Only stored when the feature is active and the
+        // request actually carried a context — otherwise the map stays
+        // empty and the donate-back short-circuits. Multimodal requests
+        // opt out of the cache altogether (see above).
+        if self.prompt_cache_active()
+            && !is_multimodal
+            && let Some(ctx) = options.prompt_cache_ctx.clone()
+        {
+            self.prompt_cache_seq_ctx.insert(seq_id, ctx);
+        }
+
+        // Guard against a degenerate cache hit where the adopted prefix
+        // covers the entire tokenized prompt. This can legitimately happen
+        // when a client replays an identical prompt. Back off one token so
+        // the prefill path still runs and the sampler sees fresh logits.
+        let prefill_start_offset =
+            if prefill_start_offset >= prompt_tokens.len() && !prompt_tokens.is_empty() {
+                tracing::debug!(
+                    seq_id = %seq_id,
+                    "prompt-cache hit covered the entire prompt; re-running the \
+                     last token through prefill to produce a sampling logit"
+                );
+                prompt_tokens.len() - 1
+            } else {
+                prefill_start_offset
+            };
+
         let seq = SequenceInfo {
             seq_id,
             state: SequenceState::Queued,
@@ -659,6 +935,8 @@ impl BatchScheduler {
             generated_text: String::new(),
             decode_state,
             prefill_offset: 0,
+            prefill_start_offset,
+            already_cached_tokens,
             response_tx,
             cancelled,
             created_at: Instant::now(),
@@ -670,6 +948,7 @@ impl BatchScheduler {
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
+            self.prompt_cache_seq_ctx.remove(&rejected.seq_id);
             self.release_sequence_caches(rejected.seq_id);
             let _ = rejected.response_tx.send(GenerateEvent::Error(
                 "Server busy: prefill queue full".to_string(),
@@ -869,6 +1148,27 @@ impl BatchScheduler {
             return;
         }
 
+        // Epic #416 / issue #421: any sequence that adopted a cached prefix
+        // cannot participate in the padded batched prefill path because the
+        // KV-history offsets differ across sequences. Take the single-
+        // sequence path for those so their `prefill_start_offset` is
+        // honored correctly; batched-prefill continues for the rest of
+        // this batch in the normal padded pipeline below.
+        if seqs.iter().any(|s| s.prefill_start_offset > 0) {
+            tracing::debug!(
+                "batched prefill: falling back to sequential (adopted prompt-cache prefix in batch)"
+            );
+            for mut seq in seqs {
+                if let Err(err) = Self::begin_prefill(&mut seq) {
+                    tracing::error!("Batched prefill state transition error: {err}");
+                    self.abort_sequence(seq, &err);
+                    continue;
+                }
+                self.execute_full_prefill(seq);
+            }
+            return;
+        }
+
         let b = seqs.len();
         let max_len = seqs.iter().map(|s| s.prompt_tokens.len()).max().unwrap();
         let can_pad_prefill = self.model.supports_padded_prefill();
@@ -1000,15 +1300,25 @@ impl BatchScheduler {
     }
 
     /// Full-prompt prefill: process the entire prompt in one pass.
+    ///
+    /// Epic #416 / issue #421: when `seq.prefill_start_offset > 0`, a
+    /// prompt-cache hit has installed the first `prefill_start_offset` tokens
+    /// of KV state on this sequence. Only the suffix tokens are fed to the
+    /// model. The VLM-prefix path deliberately opts out of cache adoption at
+    /// the enqueue site, so this branch never has to mix the two.
     fn execute_full_prefill(&mut self, mut seq: SequenceInfo) {
         let _span = tracing::info_span!(
             "prefill",
             seq_id = %seq.seq_id,
             prompt_len = seq.prompt_tokens.len(),
+            cached = seq.prefill_start_offset,
         )
         .entered();
-        self.batch_observability
-            .record_prefill_start(seq.prompt_tokens.len());
+        // Only the suffix enters the prefill counters — the first
+        // `prefill_start_offset` tokens were resolved from the adopted
+        // detached cache with zero model work.
+        let suffix_len = seq.prompt_tokens.len() - seq.prefill_start_offset;
+        self.batch_observability.record_prefill_start(suffix_len);
 
         // Non-batching models use internal RefCell caches that are shared
         // across all sequences.  Reset them now (at prefill time) rather
@@ -1023,22 +1333,34 @@ impl BatchScheduler {
         let needs_history = seq.sampling.needs_token_history();
         let token_history = initial_token_history(&seq.prompt_tokens, needs_history);
 
+        // Feed only the suffix tokens to the model when a cached prefix was
+        // adopted. For cold prefills `start == 0` and this is identical to
+        // the legacy behavior.
+        let suffix_tokens: Vec<i32> = seq.prompt_tokens[seq.prefill_start_offset..].to_vec();
+
         // Run prefill (with or without VLM embeddings).
         // On M5+ hardware pad the prompt to a 32-token tile boundary for
         // optimal Neural Accelerator throughput.
-        let actual_len = seq.prompt_tokens.len();
+        let actual_len = suffix_tokens.len();
         let (effective_tokens, pad_mask_opt) = if should_align_prefill() {
             let padded_len = align_to_na_tile(actual_len);
             if padded_len > actual_len {
-                let mut padded = seq.prompt_tokens.clone();
+                let mut padded = suffix_tokens.clone();
                 padded.resize(padded_len, 0);
-                let mask = create_padded_prefill_mask(actual_len as i32, padded_len as i32, 0);
+                // The padding mask anchors to the adopted cache offset so
+                // the newly-prefilled positions see the correct KV-history
+                // positions on M5+ hardware.
+                let mask = create_padded_prefill_mask(
+                    actual_len as i32,
+                    padded_len as i32,
+                    seq.prefill_start_offset as i32,
+                );
                 (padded, Some(mask))
             } else {
-                (seq.prompt_tokens.clone(), None)
+                (suffix_tokens.clone(), None)
             }
         } else {
-            (seq.prompt_tokens.clone(), None)
+            (suffix_tokens.clone(), None)
         };
 
         let eff_len = effective_tokens.len() as i32;
@@ -1109,23 +1431,32 @@ impl BatchScheduler {
         self.sync_sequence_storage(seq.seq_id);
 
         mlxcel_core::clear_memory_cache();
-        seq.prefill_offset = actual_len;
+        // `prefill_offset` is a cursor into `prompt_tokens`, so it must
+        // include the adopted prefix even though those tokens bypassed the
+        // forward pass.
+        seq.prefill_offset = seq.prefill_start_offset + actual_len;
 
         self.finish_prefill(seq, logits, eos_tokens, token_history, needs_history);
     }
 
     /// Begin a chunked prefill: process the first chunk and store the
     /// sequence for continuation on subsequent ticks.
+    ///
+    /// Epic #416 / issue #421: `seq.prefill_start_offset` skips over the
+    /// leading tokens that the adopted prompt-cache entry already covers,
+    /// so the first chunk starts *after* the cached prefix.
     fn start_chunked_prefill(&mut self, mut seq: SequenceInfo) {
         let _span = tracing::info_span!(
             "chunked_prefill_start",
             seq_id = %seq.seq_id,
             prompt_len = seq.prompt_tokens.len(),
             chunk_size = self.prefill_chunk_size,
+            cached = seq.prefill_start_offset,
         )
         .entered();
-        self.batch_observability
-            .record_prefill_start(seq.prompt_tokens.len());
+        // Counter reflects only the work the model actually runs.
+        let suffix_len = seq.prompt_tokens.len() - seq.prefill_start_offset;
+        self.batch_observability.record_prefill_start(suffix_len);
 
         // Reset internal caches for non-batching models (same as execute_full_prefill).
         if !self.model.supports_batching() {
@@ -1133,8 +1464,9 @@ impl BatchScheduler {
         }
 
         let chunk_size = self.prefill_chunk_size;
-        let end = chunk_size.min(seq.prompt_tokens.len());
-        let chunk = &seq.prompt_tokens[..end];
+        let start = seq.prefill_start_offset;
+        let end = (start + chunk_size).min(seq.prompt_tokens.len());
+        let chunk = &seq.prompt_tokens[start..end];
 
         // Align the first chunk to a 32-token tile boundary on M5+ hardware.
         let actual_chunk_len = chunk.len();
@@ -1143,8 +1475,13 @@ impl BatchScheduler {
             if padded_len > actual_chunk_len {
                 let mut padded = chunk.to_vec();
                 padded.resize(padded_len, 0);
-                let mask =
-                    create_padded_prefill_mask(actual_chunk_len as i32, padded_len as i32, 0);
+                // Mask anchored to the KV offset the adopted prefix already
+                // installed (starts at zero for cold prefills).
+                let mask = create_padded_prefill_mask(
+                    actual_chunk_len as i32,
+                    padded_len as i32,
+                    start as i32,
+                );
                 (padded, Some(mask))
             } else {
                 (chunk.to_vec(), None)
@@ -1380,6 +1717,11 @@ impl BatchScheduler {
                 seq.max_tokens,
             );
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
+            // Prefill produced a valid KV cache (EOS on turn 1 is a healthy
+            // stop). Donate it back so the next turn can reuse the prompt
+            // prefix. `generated_tokens` is empty here by construction.
+            self.donate_finished_sequence_cache(seq.seq_id, &seq.prompt_tokens, &[], true);
+            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
             self.release_sequence_caches(seq.seq_id);
             return;
         }
@@ -1424,6 +1766,13 @@ impl BatchScheduler {
                 seq.decode_state
                     .finish(seq.created_at, seq.prompt_tokens.len(), seq.max_tokens);
             let _ = seq.response_tx.send(GenerateEvent::Done(result));
+            self.donate_finished_sequence_cache(
+                seq.seq_id,
+                &seq.prompt_tokens,
+                &seq.generated_tokens,
+                true,
+            );
+            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
             self.release_sequence_caches(seq.seq_id);
             return;
         }
@@ -1478,9 +1827,15 @@ impl BatchScheduler {
 
             // Reset the sequence for re-prefill: clear generated tokens,
             // reset decode state, and re-allocate a cache slot.
+            //
+            // Preemption discards the adopted prefix cache as well — the
+            // victim must re-prefill from scratch to stay consistent with
+            // the fresh `allocate_sequence_state` that follows.
             victim.generated_tokens.clear();
             victim.generated_text.clear();
             victim.prefill_offset = 0;
+            victim.prefill_start_offset = 0;
+            victim.already_cached_tokens = 0;
             victim.decode_state = StreamingDecodeState::new(&self.tokenizer, &victim.prompt_tokens);
             victim.token_history.clear();
             victim.merged_eos.clear();
@@ -1885,6 +2240,10 @@ impl BatchScheduler {
             let _ = seq.response_tx.send(GenerateEvent::Error(
                 "Request cancelled: client disconnected".to_string(),
             ));
+            // Cancellation during prefill means the KV cache is only
+            // partially populated; skip donate-back and just release. The
+            // context map still needs cleanup so no dangling entries leak.
+            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
             self.release_sequence_caches(seq.seq_id);
             self.batch_observability.record_sequence_completed();
         }
@@ -1915,6 +2274,29 @@ impl BatchScheduler {
                 );
                 let _ = seq.response_tx.send(GenerateEvent::Done(result));
 
+                // Epic #416 / issue #421: donate the full KV cache back to
+                // the prompt-cache store on *healthy* finishes (Stop /
+                // Length / Cancelled) so the next turn of the same
+                // conversation can adopt it. `Finished(Error)` paths bypass
+                // this branch — their cache is assumed tainted.
+                let healthy = matches!(
+                    seq.state,
+                    SequenceState::Finished(
+                        FinishReason::Stop | FinishReason::Length | FinishReason::Cancelled,
+                    )
+                );
+                self.donate_finished_sequence_cache(
+                    id,
+                    &seq.prompt_tokens,
+                    &seq.generated_tokens,
+                    healthy,
+                );
+                // `donate_finished_sequence_cache` already removed the
+                // context from `prompt_cache_seq_ctx` on donate; drop it
+                // defensively on the non-donate paths so the map cannot
+                // grow unbounded across long-lived workers.
+                self.prompt_cache_seq_ctx.remove(&id);
+
                 self.release_sequence_caches(id);
                 self.batch_metrics
                     .record_sequence_completed(tokens_generated);
@@ -1943,6 +2325,9 @@ impl BatchScheduler {
             let _ = seq.response_tx.send(GenerateEvent::Error(
                 "Request cancelled: client disconnected".to_string(),
             ));
+            // No prefill ran → no valid cache to donate. Clear the
+            // context entry so it cannot linger.
+            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
             self.release_sequence_caches(seq.seq_id);
             self.batch_observability.record_sequence_completed();
         }
@@ -1952,6 +2337,11 @@ impl BatchScheduler {
         let _ = seq
             .response_tx
             .send(GenerateEvent::Error(error.to_string()));
+        // Abort paths produce an error outcome (OOM / transition failure /
+        // invalid cache); the KV cache is untrustworthy and must not be
+        // donated back. Dropping the context entry prevents a future
+        // finalize pass from trying.
+        self.prompt_cache_seq_ctx.remove(&seq.seq_id);
         self.release_sequence_caches(seq.seq_id);
     }
 }

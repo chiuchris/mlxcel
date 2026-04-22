@@ -29,7 +29,9 @@ use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 
 use crate::server::batch::RequestPriority;
 use crate::server::chat_request::prepare_chat_request_with_cache;
-use crate::server::config::ReasoningBudgetOverride;
+use crate::server::chat_template_kwargs::{extract_request_kwargs, merge_server_and_request};
+use crate::server::config::{PromptCacheRequestContext, ReasoningBudgetOverride};
+use crate::server::prompt_cache::key::{resolve_session_key, template_sig};
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
@@ -42,6 +44,46 @@ use crate::server::types::{
 };
 use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
 use crate::tokenizer::MlxcelTokenizer;
+
+/// Build the per-request prompt-cache context (epic #416 / issue #421).
+///
+/// Returns `None` when the store is not installed on `state`, signalling to
+/// the scheduler that no cache lookup or donate-back should run for this
+/// request. When `Some`, the caller fills `options.prompt_cache_ctx` with
+/// the returned value so the scheduler can compose a stable
+/// [`crate::server::prompt_cache::key::PromptCacheKey`] on its own thread.
+fn build_prompt_cache_request_context(
+    state: &AppState,
+    request: &ChatCompletionRequest,
+) -> Option<PromptCacheRequestContext> {
+    state.prompt_cache.as_ref()?;
+    // Mirror the kwargs merge that `prepare_chat_request_with_cache` performs
+    // so the digest sees the same canonicalized map as the rendering pipeline.
+    let merged_extra_body = request.merged_extra_body();
+    let per_request_kwargs = extract_request_kwargs(
+        request.chat_template_kwargs.as_ref(),
+        merged_extra_body.as_ref(),
+    );
+    let merged_kwargs = merge_server_and_request(
+        state.config.chat_template_kwargs.as_ref(),
+        &per_request_kwargs,
+    );
+
+    let template_signature = template_sig(
+        state.chat_template.template_source(),
+        &merged_kwargs,
+        request.tool_choice.as_ref(),
+        request.tools.as_deref(),
+    );
+    let session_key =
+        resolve_session_key(request.resolve_prompt_cache_key(), request.resolve_user()).to_string();
+    Some(PromptCacheRequestContext {
+        model_id: state.display_model_id().to_string(),
+        lora_id: None,
+        template_sig: template_signature,
+        session_key,
+    })
+}
 
 /// Decode a single token ID to its text representation using the tokenizer.
 pub(crate) fn decode_token(tokenizer: &MlxcelTokenizer, token_id: i32) -> String {
@@ -234,6 +276,7 @@ async fn non_stream_chat_completion(
     // true. The store is built by startup.rs only when configured, so
     // `state.prompt_cache.is_some()` is the operator-visible flag here.
     let prompt_cache_enabled = state.prompt_cache.is_some();
+    let prompt_cache_ctx = build_prompt_cache_request_context(&state, &request);
     let prepared = prepare_chat_request_with_cache(
         &state.chat_template,
         &request,
@@ -244,6 +287,7 @@ async fn non_stream_chat_completion(
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;
+    options.prompt_cache_ctx = prompt_cache_ctx;
 
     // Set logprobs configuration when requested
     let top_k = request.top_logprobs.unwrap_or(0) as usize;
@@ -348,6 +392,7 @@ async fn stream_chat_completion(
     // both endpoints default preserve_thinking=true identically when the
     // cache is installed.
     let prompt_cache_enabled = state.prompt_cache.is_some();
+    let prompt_cache_ctx = build_prompt_cache_request_context(&state, &request);
     let prepared = prepare_chat_request_with_cache(
         &state.chat_template,
         &request,
@@ -358,6 +403,7 @@ async fn stream_chat_completion(
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;
+    options.prompt_cache_ctx = prompt_cache_ctx;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request

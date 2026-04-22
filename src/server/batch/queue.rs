@@ -221,6 +221,8 @@ mod tests {
             generated_text: String::new(),
             decode_state,
             prefill_offset: 0,
+            prefill_start_offset: 0,
+            already_cached_tokens: 0,
             response_tx: tx,
             cancelled: Arc::new(AtomicBool::new(false)),
             created_at: Instant::now(),

@@ -55,6 +55,31 @@ impl std::str::FromStr for DecodeStorageBackend {
     }
 }
 
+/// Per-request metadata that the scheduler needs to compose a
+/// [`crate::server::prompt_cache::key::PromptCacheKey`] without re-running
+/// the chat template pipeline on the worker thread (epic #416 / issue #421).
+///
+/// Route handlers build this once — when
+/// [`crate::server::state::AppState::prompt_cache`] is installed — and hand
+/// it to the scheduler via [`ServerGenerateOptions::prompt_cache_ctx`]. When
+/// `None` the scheduler falls back to its pre-cache behavior.
+#[derive(Debug, Clone)]
+pub struct PromptCacheRequestContext {
+    /// Display model id (matches
+    /// [`crate::server::state::AppState::display_model_id`]).
+    pub model_id: String,
+    /// LoRA adapter id; `None` for the base model.
+    pub lora_id: Option<String>,
+    /// Stable digest of the rendering pipeline inputs — see
+    /// [`crate::server::prompt_cache::key::template_sig`].
+    pub template_sig: String,
+    /// Resolved session key — see
+    /// [`crate::server::prompt_cache::key::resolve_session_key`]. Owned so
+    /// the scheduler can compose a [`crate::server::prompt_cache::key::PromptCacheKey`]
+    /// on demand without reaching back into the route layer.
+    pub session_key: String,
+}
+
 /// Bridge between server request params and `mlxcel-core` `SamplingConfig`.
 #[derive(Debug, Clone)]
 pub struct ServerGenerateOptions {
@@ -88,6 +113,14 @@ pub struct ServerGenerateOptions {
     /// `thinking_budget_tokens > 0` would miscount ordinary answer tokens as
     /// reasoning tokens.
     pub thinking_enter_block_on_start: bool,
+
+    /// Epic #416 / issue #421: cache-key metadata the scheduler uses to look
+    /// up a stored prompt prefix and adopt its detached KV cache. `None` when
+    /// the route did not install a
+    /// [`crate::server::prompt_cache::PromptCacheStore`] (the feature flag is
+    /// off) or when the request does not participate in prefix reuse (e.g.
+    /// raw text-completion endpoints that do not render a chat template).
+    pub prompt_cache_ctx: Option<PromptCacheRequestContext>,
 }
 
 /// Per-request reasoning-budget override.

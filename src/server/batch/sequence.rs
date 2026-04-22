@@ -244,6 +244,20 @@ pub struct SequenceInfo {
     /// `prefill_chunk_size`.
     pub prefill_offset: usize,
 
+    // -- Epic #416 / issue #421: prompt prefix cache --
+    /// Token count from the head of `prompt_tokens` that was already present
+    /// in the adopted KV cache. When `> 0`, prefill **skips** those leading
+    /// tokens and feeds only `prompt_tokens[prefill_start_offset..]` to the
+    /// model. When `0` (the default) the prefill processes the entire prompt
+    /// exactly as before the scheduler gained cache-adoption support.
+    pub prefill_start_offset: usize,
+
+    /// Mirror of `prefill_start_offset` at adopt time — the counter reported
+    /// to observability / `usage.cached_tokens`. Stored separately so that
+    /// the prefill path can rewrite `prefill_start_offset` for bookkeeping
+    /// (e.g. chunked prefill continuation math) without affecting the stat.
+    pub already_cached_tokens: usize,
+
     // -- Issue #409: thinking-token budget --
     /// Per-sequence thinking-budget state. Drives forced `</think>` injection
     /// when the in-block token count reaches the configured cap. Set to

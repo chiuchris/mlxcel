@@ -72,6 +72,20 @@ pub struct BatchObservability {
     pub cache_pool_paged_bytes_in_use: AtomicU64,
     /// Times paged decode was requested but fell back to dense.
     pub decode_storage_fallbacks: AtomicU64,
+
+    // -- Epic #416 / issue #421: prompt-prefix cache --
+    /// Cumulative count of successful prompt-cache adoptions (hits).
+    pub prompt_cache_hits: AtomicU64,
+    /// Cumulative count of prompt tokens that bypassed prefill because they
+    /// were already present in the adopted detached KV cache.
+    pub prompt_cache_hit_tokens: AtomicU64,
+    /// Cumulative count of sequences that donated their cache back to the
+    /// store on healthy completion.
+    pub prompt_cache_inserts: AtomicU64,
+    /// Cumulative count of donate-back attempts rejected by the store
+    /// (e.g. `InsertError::OversizedEntry`, `InsertError::Disabled`,
+    /// `InsertError::PrefixTooShort`).
+    pub prompt_cache_insert_rejects: AtomicU64,
 }
 
 impl Default for BatchObservability {
@@ -101,6 +115,10 @@ impl BatchObservability {
             cache_pool_paged_bytes_reserved: AtomicU64::new(0),
             cache_pool_paged_bytes_in_use: AtomicU64::new(0),
             decode_storage_fallbacks: AtomicU64::new(0),
+            prompt_cache_hits: AtomicU64::new(0),
+            prompt_cache_hit_tokens: AtomicU64::new(0),
+            prompt_cache_inserts: AtomicU64::new(0),
+            prompt_cache_insert_rejects: AtomicU64::new(0),
         }
     }
 
@@ -134,6 +152,29 @@ impl BatchObservability {
     /// Record that requested paged decode fell back to dense execution.
     pub fn record_decode_storage_fallback(&self) {
         self.decode_storage_fallbacks
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a successful prompt-cache hit (epic #416 / issue #421).
+    ///
+    /// `matched_tokens` is the number of leading tokens covered by the
+    /// adopted detached KV cache — exactly the count subtracted from the
+    /// sequence's prefill workload.
+    pub fn record_prompt_cache_hit(&self, matched_tokens: usize) {
+        self.prompt_cache_hits.fetch_add(1, Ordering::Relaxed);
+        self.prompt_cache_hit_tokens
+            .fetch_add(matched_tokens as u64, Ordering::Relaxed);
+    }
+
+    /// Record a successful donate-back insert into the prompt cache store.
+    pub fn record_prompt_cache_insert(&self) {
+        self.prompt_cache_inserts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record that a donate-back attempt was rejected by the store
+    /// (oversized entry, feature disabled, prefix too short, …).
+    pub fn record_prompt_cache_insert_reject(&self) {
+        self.prompt_cache_insert_rejects
             .fetch_add(1, Ordering::Relaxed);
     }
 
@@ -199,6 +240,10 @@ impl BatchObservability {
                 .cache_pool_paged_bytes_in_use
                 .load(Ordering::Relaxed),
             decode_storage_fallbacks: self.decode_storage_fallbacks.load(Ordering::Relaxed),
+            prompt_cache_hits: self.prompt_cache_hits.load(Ordering::Relaxed),
+            prompt_cache_hit_tokens: self.prompt_cache_hit_tokens.load(Ordering::Relaxed),
+            prompt_cache_inserts: self.prompt_cache_inserts.load(Ordering::Relaxed),
+            prompt_cache_insert_rejects: self.prompt_cache_insert_rejects.load(Ordering::Relaxed),
         }
     }
 }
@@ -226,6 +271,16 @@ pub struct ObservabilitySnapshot {
     pub cache_pool_paged_bytes_reserved: u64,
     pub cache_pool_paged_bytes_in_use: u64,
     pub decode_storage_fallbacks: u64,
+    /// Epic #416 / issue #421: successful prompt-cache adoptions.
+    pub prompt_cache_hits: u64,
+    /// Epic #416 / issue #421: tokens skipped due to cache hits (Σ
+    /// matched-prefix lengths across all hits).
+    pub prompt_cache_hit_tokens: u64,
+    /// Epic #416 / issue #421: successful donate-back inserts.
+    pub prompt_cache_inserts: u64,
+    /// Epic #416 / issue #421: rejected donate-back inserts (oversized
+    /// entry, store disabled, prefix too short, …).
+    pub prompt_cache_insert_rejects: u64,
 }
 
 #[cfg(test)]
@@ -253,6 +308,10 @@ mod tests {
         assert_eq!(snap.cache_pool_paged_bytes_reserved, 0);
         assert_eq!(snap.cache_pool_paged_bytes_in_use, 0);
         assert_eq!(snap.decode_storage_fallbacks, 0);
+        assert_eq!(snap.prompt_cache_hits, 0);
+        assert_eq!(snap.prompt_cache_hit_tokens, 0);
+        assert_eq!(snap.prompt_cache_inserts, 0);
+        assert_eq!(snap.prompt_cache_insert_rejects, 0);
     }
 
     #[test]

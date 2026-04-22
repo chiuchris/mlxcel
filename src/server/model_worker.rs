@@ -73,12 +73,9 @@ pub(crate) struct WorkerSchedulerConfig {
     /// adopt them on later requests. The store is thread-safe, so the same
     /// `Arc` is also handed to `AppState` for observation-only use.
     ///
-    /// `#[allow(dead_code)]`: this field is the plumbing hand-off for the
-    /// sub-issues that actually exercise the cache (#420 radix trie,
-    /// #423 metrics bridge, scheduler integration). The store Arc is still
-    /// moved into the worker thread so later issues can wire adopt/detach
-    /// without any additional plumbing changes.
-    #[allow(dead_code)]
+    /// Store handle passed to [`BatchScheduler::with_prompt_cache`] so the
+    /// scheduler can adopt detached prefixes on cache hits and donate-back
+    /// finished sequences (epic #416 / issue #421).
     pub prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
 }
 
@@ -259,7 +256,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         )
         .with_vision_cache_size(sched_config.vision_cache_size)
         .with_token_bias(token_bias)
-        .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids);
+        .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
+        .with_prompt_cache(sched_config.prompt_cache);
         scheduler.run();
     })
 }
