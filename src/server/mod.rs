@@ -51,8 +51,9 @@ pub use config::{
 };
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use prompt_cache::{
-    CacheEntry, InsertError as PromptCacheInsertError, PromptCacheConfig, PromptCacheKey,
-    PromptCacheStats, PromptCacheStore,
+    CacheEntry, InsertError as PromptCacheInsertError, MultimodalDigest, PromptCacheConfig,
+    PromptCacheKey, PromptCacheStats, PromptCacheStore, multimodal_digest,
+    multimodal_digest_from_vecs,
 };
 pub use startup::{ServerStartupConfig, start_server};
 pub use state::{AppState, BatchMetrics, Metrics};

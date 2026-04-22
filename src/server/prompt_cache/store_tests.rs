@@ -18,7 +18,7 @@ use std::thread;
 use std::time::Duration;
 
 use super::super::entry::CacheEntry;
-use super::super::key::PromptCacheKey;
+use super::super::key::{MultimodalDigest, PromptCacheKey};
 use super::super::metrics::AtomicPromptCacheMetrics;
 use super::super::policy::PromptCacheConfig;
 use super::{InsertError, PromptCacheStore};
@@ -38,7 +38,7 @@ fn tokens(base: i32, n: usize) -> Vec<i32> {
 }
 
 fn key_for<'a>(model: &'a str, tokens: &'a [i32]) -> PromptCacheKey<'a> {
-    PromptCacheKey::new_full(model, None, "tpl", None, tokens)
+    PromptCacheKey::new_full(model, None, "tpl", None, MultimodalDigest::empty(), tokens)
 }
 
 #[test]

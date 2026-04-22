@@ -17,15 +17,20 @@
 //! A [`PromptCacheKey`] composes the identity dimensions that define a
 //! reusable KV-cache bucket:
 //!
-//! * `model_id`     — which loaded model produced these tensors.
-//! * `lora_id`      — LoRA adapter identifier (`None` means base model).
-//! * `template_sig` — chat-template digest so two requests with different
+//! * `model_id`          — which loaded model produced these tensors.
+//! * `lora_id`           — LoRA adapter identifier (`None` means base model).
+//! * `template_sig`      — chat-template digest so two requests with different
 //!   `<|im_start|>` / tool prompts never collide. Composed via
 //!   [`template_sig`] from `(chat_template_source, chat_template_kwargs,
 //!   tool_choice, tools_digest)`.
-//! * `session_key`  — optional caller-supplied tenancy / conversation scope.
+//! * `session_key`       — optional caller-supplied tenancy / conversation scope.
 //!   Composed via [`resolve_session_key`] from `(prompt_cache_key, user,
 //!   anonymous bucket sentinel)`.
+//! * `mm_digest`         — stable, order-preserving digest of all multimodal
+//!   (image + audio) content resolved from the request messages. Computed via
+//!   [`multimodal_digest`] on the post-resolved byte slices, so two requests
+//!   that share text but differ on image/audio bytes always produce different
+//!   bucket digests. See [`MultimodalDigest`].
 //! * `tokens[..prefix_len]` — the actual prefix of token ids that the cache
 //!   bucket represents. Only the first `prefix_len` entries participate in
 //!   the bucket digest, so partially matching prefixes still map to
@@ -86,6 +91,145 @@ impl fmt::Display for PromptCacheKeyDigest {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Multimodal digest (issue #425)
+// ---------------------------------------------------------------------------
+
+/// A 32-byte BLAKE3 digest of the multimodal (image + audio) content present
+/// in a request's messages, computed in message-arrival order.
+///
+/// ## Relationship to `ModelVisionCaches`
+///
+/// `ModelVisionCaches` (see `src/vision/feature_cache.rs`) caches
+/// **post-projection vision embeddings** per image, keyed by image content
+/// identity. The prompt cache, by contrast, holds the **KV cache** over the
+/// full token stream, which includes image placeholder tokens interleaved with
+/// the text tokens. These are orthogonal caches:
+///
+/// * A `ModelVisionCaches` hit skips the vision tower forward pass.
+/// * A prompt cache hit (discriminated by `MultimodalDigest`) skips the
+///   language-model prefill for the cached token prefix.
+///
+/// Changing the multimodal payload invalidates the prompt cache key (because
+/// the image placeholder tokens change) but does **not** affect the
+/// `ModelVisionCaches` in any way — it uses its own SHA-256 image-content
+/// keying scheme and manages its own LRU eviction independently.
+///
+/// ## Digest construction
+///
+/// Built by [`multimodal_digest`] over the post-resolved byte slices (i.e.
+/// after base64 decoding, file reads, and URL fetches). The digest is
+/// **not** derived from image URLs or file paths — two requests that reference
+/// different URLs pointing to the same bytes produce the same digest and
+/// correctly share a cache bucket.
+///
+/// The `EMPTY` constant represents "no multimodal content", and is distinct
+/// from a hash that happens to have the same bit pattern by domain-separation
+/// in the construction.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct MultimodalDigest(pub(crate) [u8; 32]);
+
+impl MultimodalDigest {
+    /// Digest that represents "no multimodal content".
+    ///
+    /// This is the BLAKE3 hash of the domain-separated empty sequence, *not* a
+    /// zero array, so it is distinct from any hash that an empty-payload
+    /// collision could accidentally produce.
+    pub fn empty() -> Self {
+        multimodal_digest(&[], &[])
+    }
+
+    /// Raw bytes.
+    pub fn as_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
+    /// Lowercase hex string (64 chars).
+    pub fn to_hex(self) -> String {
+        let mut out = String::with_capacity(64);
+        for byte in self.0 {
+            out.push_str(&format!("{byte:02x}"));
+        }
+        out
+    }
+}
+
+/// Compute a stable, **order-preserving** BLAKE3 digest of all resolved
+/// multimodal (image + audio) bytes in a request.
+///
+/// ## Arguments
+///
+/// * `image_bytes` — resolved image payloads in the order they appear across
+///   all messages. Each `&[u8]` is the raw post-decoded bytes of one image
+///   (PNG, JPEG, etc.), obtained after base64 decoding or URL fetch. Pass the
+///   same slice that `extract_chat_image_data` returns.
+/// * `audio_bytes` — resolved audio payloads in message-arrival order, same
+///   semantics as `image_bytes`.
+///
+/// ## Design rationale
+///
+/// Digests are computed on **post-resolution bytes** (the content the model
+/// actually sees) rather than raw URLs or base64 strings. This ensures that
+/// two requests referencing different URLs that point to the same image bytes
+/// map to the same cache bucket.
+///
+/// The construction is domain-separated and length-prefixed, which prevents
+/// boundary-collision attacks where adjacent fields with overlapping byte
+/// sequences could otherwise hash identically.
+///
+/// ## Relationship to `ModelVisionCaches`
+///
+/// `ModelVisionCaches` (see `src/vision/feature_cache.rs`) is **not touched**
+/// by this function. It caches post-projection vision tower outputs per image
+/// using its own SHA-256 keying and LRU eviction. The prompt cache (keyed
+/// partially by this digest) caches the KV state over the token stream. The
+/// two caches are orthogonal: a `ModelVisionCaches` hit only bypasses the
+/// vision encoder; a prompt cache hit additionally bypasses the LLM prefill.
+/// Changing the multimodal content invalidates the prompt cache key but has
+/// no effect on `ModelVisionCaches` state.
+///
+/// ## Order sensitivity
+///
+/// The digest **is** order-sensitive: swapping two image messages produces a
+/// different digest. This is intentional — the order of image placeholder
+/// tokens in the LLM token stream is determined by the order images appear
+/// in the request, so two requests with the same images in different orders
+/// receive different KV activations and must not share a cache bucket.
+pub fn multimodal_digest(image_bytes: &[&[u8]], audio_bytes: &[&[u8]]) -> MultimodalDigest {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mlxcel:prompt-cache:multimodal:v1");
+
+    // Image section: count then each payload length-prefixed.
+    hasher.update(&(image_bytes.len() as u64).to_le_bytes());
+    for img in image_bytes {
+        write_field(&mut hasher, img);
+    }
+
+    // Audio section: count then each payload length-prefixed.
+    hasher.update(&(audio_bytes.len() as u64).to_le_bytes());
+    for aud in audio_bytes {
+        write_field(&mut hasher, aud);
+    }
+
+    let mut out = [0u8; 32];
+    hasher.finalize_xof().fill(&mut out);
+    MultimodalDigest(out)
+}
+
+/// Build a [`MultimodalDigest`] from owned `Vec<Vec<u8>>` slices returned by
+/// `extract_chat_image_data` / `extract_chat_audio_data`.
+///
+/// This is a thin convenience wrapper over [`multimodal_digest`] that avoids
+/// callers having to collect references manually.
+pub fn multimodal_digest_from_vecs(
+    image_bytes: &[Vec<u8>],
+    audio_bytes: &[Vec<u8>],
+) -> MultimodalDigest {
+    let img_refs: Vec<&[u8]> = image_bytes.iter().map(|v| v.as_slice()).collect();
+    let aud_refs: Vec<&[u8]> = audio_bytes.iter().map(|v| v.as_slice()).collect();
+    multimodal_digest(&img_refs, &aud_refs)
+}
+
 /// Composite identity for a prompt-prefix cache bucket.
 ///
 /// Construct one per logical lookup or insert; the struct intentionally
@@ -104,6 +248,14 @@ pub struct PromptCacheKey<'a> {
     pub template_sig: &'a str,
     /// Caller-supplied tenancy / conversation scope. `None` means global.
     pub session_key: Option<&'a str>,
+    /// Stable, order-preserving digest of all multimodal (image + audio)
+    /// content resolved from the request messages (issue #425).
+    ///
+    /// Ensures two requests with the same text but different images produce
+    /// different cache keys. Use [`MultimodalDigest::empty()`] for text-only
+    /// requests. Build from resolved bytes via [`multimodal_digest`] or
+    /// [`multimodal_digest_from_vecs`].
+    pub mm_digest: MultimodalDigest,
     /// Prefix slice of token ids. Only the first `prefix_len` elements are
     /// hashed.
     pub tokens: &'a [i32],
@@ -115,11 +267,16 @@ pub struct PromptCacheKey<'a> {
 impl<'a> PromptCacheKey<'a> {
     /// Build a cache key where the full `tokens` slice participates in the
     /// bucket digest.
+    ///
+    /// For text-only requests pass [`MultimodalDigest::empty()`] as
+    /// `mm_digest`. For multimodal requests pass the digest produced by
+    /// [`multimodal_digest`] or [`multimodal_digest_from_vecs`].
     pub fn new_full(
         model_id: &'a str,
         lora_id: Option<&'a str>,
         template_sig: &'a str,
         session_key: Option<&'a str>,
+        mm_digest: MultimodalDigest,
         tokens: &'a [i32],
     ) -> Self {
         Self {
@@ -127,17 +284,23 @@ impl<'a> PromptCacheKey<'a> {
             lora_id,
             template_sig,
             session_key,
+            mm_digest,
             tokens,
             prefix_len: tokens.len(),
         }
     }
 
     /// Build a cache key where only the first `prefix_len` tokens are hashed.
+    ///
+    /// For text-only requests pass [`MultimodalDigest::empty()`] as
+    /// `mm_digest`. For multimodal requests pass the digest produced by
+    /// [`multimodal_digest`] or [`multimodal_digest_from_vecs`].
     pub fn new_prefix(
         model_id: &'a str,
         lora_id: Option<&'a str>,
         template_sig: &'a str,
         session_key: Option<&'a str>,
+        mm_digest: MultimodalDigest,
         tokens: &'a [i32],
         prefix_len: usize,
     ) -> Self {
@@ -146,6 +309,7 @@ impl<'a> PromptCacheKey<'a> {
             lora_id,
             template_sig,
             session_key,
+            mm_digest,
             tokens,
             prefix_len: prefix_len.min(tokens.len()),
         }
@@ -161,24 +325,29 @@ impl<'a> PromptCacheKey<'a> {
     /// The input is a length-prefixed, domain-separated concatenation of:
     ///
     /// ```text
-    ///     "mlxcel:prompt-cache:v1"
+    ///     "mlxcel:prompt-cache:v2"
     ///     model_id              (len-prefixed utf-8 bytes)
     ///     lora_id               (len-prefixed utf-8 bytes, empty if None)
     ///     template_sig          (len-prefixed utf-8 bytes)
     ///     session_key           (len-prefixed utf-8 bytes, empty if None)
+    ///     mm_digest             (32 raw bytes from MultimodalDigest, issue #425)
     ///     prefix_len            (u64 little-endian)
     ///     tokens[..prefix_len]  (each token as i32 little-endian)
     /// ```
     ///
-    /// Length prefixes and the fixed `v1` tag keep the digest resistant to
+    /// Length prefixes and the fixed `v2` tag keep the digest resistant to
     /// accidental collisions between fields with overlapping bytes, and make
-    /// it safe to extend the schema later (new fields bump the `v1` tag).
+    /// it safe to extend the schema later (new fields bump the version tag).
+    /// The version changed from `v1` to `v2` when issue #425 added `mm_digest`
+    /// to prevent old v1 buckets from accidentally matching new multimodal keys.
     pub fn digest(&self) -> PromptCacheKeyDigest {
         let mut hasher = blake3::Hasher::new();
 
         // Domain separator so this digest cannot be reused from a different
         // hashing context accidentally.
-        hasher.update(b"mlxcel:prompt-cache:v1");
+        // NOTE: bumped to v2 when mm_digest was added (issue #425) so that
+        // stale v1 cache entries do not collide with new multimodal-aware keys.
+        hasher.update(b"mlxcel:prompt-cache:v2");
 
         write_field(&mut hasher, self.model_id.as_bytes());
         write_field(
@@ -190,6 +359,10 @@ impl<'a> PromptCacheKey<'a> {
             &mut hasher,
             self.session_key.map(str::as_bytes).unwrap_or_default(),
         );
+
+        // Multimodal digest (issue #425): 32 raw bytes, already a BLAKE3 hash
+        // so no length-prefix needed — the fixed size makes it unambiguous.
+        hasher.update(self.mm_digest.as_bytes());
 
         let prefix_len = self.effective_prefix_len();
         hasher.update(&(prefix_len as u64).to_le_bytes());

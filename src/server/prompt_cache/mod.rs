@@ -51,8 +51,9 @@ mod prefix_matcher_tests;
 
 pub use entry::CacheEntry;
 pub use key::{
-    ANONYMOUS_SESSION_SENTINEL, PromptCacheKey, PromptCacheKeyDigest, resolve_session_key,
-    template_sig, tools_digest,
+    ANONYMOUS_SESSION_SENTINEL, MultimodalDigest, PromptCacheKey, PromptCacheKeyDigest,
+    multimodal_digest, multimodal_digest_from_vecs, resolve_session_key, template_sig,
+    tools_digest,
 };
 pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheMetrics};
 pub use policy::{PromptCacheConfig, PromptCacheStats};
