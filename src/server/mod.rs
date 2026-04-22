@@ -41,7 +41,9 @@ pub use chat_template_kwargs::{
 };
 pub use cli_input::{
     ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
-    env_fallback_reasoning_budget,
+    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
+    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
+    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget,
 };
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,

@@ -223,6 +223,15 @@ pub struct ServerStartupConfig {
     /// [`super::chat_template_kwargs::ChatTemplateKwargs::from_json_str`].
     /// `None` means no server defaults; per-request kwargs may still apply.
     pub chat_template_kwargs: Option<super::chat_template_kwargs::ChatTemplateKwargs>,
+
+    /// Issue #424: resolved prompt-prefix KV cache policy.
+    ///
+    /// Built from CLI flags and env vars via
+    /// [`super::cli_input::build_prompt_cache_config`] inside
+    /// [`super::ServerStartupInput::into_startup_config`].
+    /// The default is [`super::prompt_cache::PromptCacheConfig::default`]
+    /// (enabled, 2 GiB cap, 1024 entries, 3600 s TTL, 32 token min).
+    pub prompt_cache: super::prompt_cache::PromptCacheConfig,
 }
 
 impl Default for ServerStartupConfig {
@@ -302,6 +311,7 @@ impl Default for ServerStartupConfig {
             lang_bias_config: None,
             reasoning_budget: None,
             chat_template_kwargs: None,
+            prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
         }
     }
 }
@@ -456,11 +466,9 @@ pub(super) fn build_server_config(
         lang_bias_config: startup.lang_bias_config.clone(),
         reasoning_budget: startup.reasoning_budget,
         chat_template_kwargs: startup.chat_template_kwargs.clone(),
-        // Issue #419 / #424: CLI flags arrive in #424. For now reuse the
-        // default policy so the feature is enabled out-of-the-box with
-        // conservative caps, and operators can still gate it by editing
-        // config at the Rust layer.
-        prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
+        // Issue #424: wire the CLI/env-resolved policy through instead of
+        // always using the compiled-in default.
+        prompt_cache: startup.prompt_cache.clone(),
     }
 }
 

@@ -766,6 +766,48 @@ pub(crate) struct ServeArgs {
     /// multi-turn thinking traces.
     #[arg(long = "chat-template-kwargs", value_name = "JSON")]
     chat_template_kwargs: Option<String>,
+
+    // Issue #424: cross-request prompt-prefix KV cache knobs.
+
+    /// Enable or disable the cross-request prompt-prefix KV cache (default: true).
+    ///
+    /// When disabled, the server performs no prefix-match lookup and no memory
+    /// is reserved for the cache. Disabling eliminates lock contention and
+    /// matcher overhead.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_ENABLED` (on/off/true/false/1/0) and
+    /// the llama.cpp-compat alias `LLAMA_ARG_CACHE_REUSE` when the CLI flag
+    /// is absent. CLI flag takes precedence over env vars.
+    #[arg(
+        long = "prompt-cache-enabled",
+        default_value_t = true,
+        value_name = "BOOL"
+    )]
+    prompt_cache_enabled: bool,
+
+    /// Maximum byte budget for the prompt-prefix KV cache (default: 2 GiB).
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES` when the CLI flag is absent.
+    #[arg(long = "prompt-cache-capacity-bytes", value_name = "BYTES")]
+    prompt_cache_capacity_bytes: Option<usize>,
+
+    /// Maximum number of live entries in the prompt-prefix KV cache (default: 1024).
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` when the CLI flag is absent.
+    #[arg(long = "prompt-cache-max-entries", value_name = "N")]
+    prompt_cache_max_entries: Option<usize>,
+
+    /// Time-to-live for a prompt-cache entry in seconds (default: 3600).
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_TTL` when the CLI flag is absent.
+    #[arg(long = "prompt-cache-ttl", value_name = "SECONDS")]
+    prompt_cache_ttl: Option<u64>,
+
+    /// Minimum prompt-prefix length (tokens) required before caching (default: 32).
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_MIN_PREFIX` when the CLI flag is absent.
+    #[arg(long = "prompt-cache-min-prefix", value_name = "N")]
+    prompt_cache_min_prefix: Option<usize>,
 }
 
 fn main() -> anyhow::Result<()> {

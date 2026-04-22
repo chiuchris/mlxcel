@@ -198,6 +198,36 @@ pub struct ServerStartupInput {
     /// struct is constructed, so the precedence CLI > env is enforced
     /// consistently.
     pub chat_template_kwargs: Option<String>,
+
+    // Issue #424: prompt-prefix KV cache knobs.
+    // Each field stores the raw CLI/env value before normalization into
+    // `PromptCacheConfig`. `None` on the `Option`-typed fields means "not
+    // provided by the CLI flag"; defaults come from `PromptCacheConfig::default()`.
+
+    /// Whether the prompt-prefix KV cache is enabled. Defaults to `true`.
+    /// Also accepts `MLXCEL_PROMPT_CACHE_ENABLED` and the llama.cpp-compat
+    /// alias `LLAMA_ARG_CACHE_REUSE` (parsed as a boolean on/off).
+    pub prompt_cache_enabled: bool,
+
+    /// Maximum byte budget for the prompt cache.
+    /// `None` means "use the compiled-in default (2 GiB)".
+    /// Also accepts `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES`.
+    pub prompt_cache_capacity_bytes: Option<usize>,
+
+    /// Maximum number of live cache entries.
+    /// `None` means "use the compiled-in default (1024)".
+    /// Also accepts `MLXCEL_PROMPT_CACHE_MAX_ENTRIES`.
+    pub prompt_cache_max_entries: Option<usize>,
+
+    /// Time-to-live for a cache entry in seconds.
+    /// `None` means "use the compiled-in default (3600 s)".
+    /// Also accepts `MLXCEL_PROMPT_CACHE_TTL`.
+    pub prompt_cache_ttl_seconds: Option<u64>,
+
+    /// Minimum prompt-prefix length (in tokens) before an entry is eligible
+    /// for caching. `None` means "use the compiled-in default (32)".
+    /// Also accepts `MLXCEL_PROMPT_CACHE_MIN_PREFIX`.
+    pub prompt_cache_min_prefix: Option<usize>,
 }
 
 impl ServerStartupInput {
@@ -234,6 +264,16 @@ impl ServerStartupInput {
         let chat_template_kwargs =
             resolve_server_default_kwargs(self.chat_template_kwargs.as_deref())
                 .map_err(|e| anyhow::anyhow!("--chat-template-kwargs: {e}"))?;
+        // Issue #424: build PromptCacheConfig from raw CLI/env-resolved values.
+        // Any field left at `None` picks up the compiled-in default.
+        let prompt_cache = build_prompt_cache_config(
+            self.prompt_cache_enabled,
+            self.prompt_cache_capacity_bytes,
+            self.prompt_cache_max_entries,
+            self.prompt_cache_ttl_seconds,
+            self.prompt_cache_min_prefix,
+        );
+
         Ok(ServerStartupConfig {
             model_path: self.model_path,
             adapter_path: self.adapter_path,
@@ -309,6 +349,7 @@ impl ServerStartupInput {
             lang_bias_config: self.lang_bias_config,
             reasoning_budget,
             chat_template_kwargs,
+            prompt_cache,
         })
     }
 }
@@ -415,6 +456,169 @@ pub fn resolve_compat_toggle(enabled: bool, disabled: bool) -> bool {
 /// Convert the CLI seed sentinel into the runtime representation.
 pub fn resolve_seed(seed: i64) -> Option<u64> {
     if seed < 0 { None } else { Some(seed as u64) }
+}
+
+// ── Issue #424 — prompt cache config resolution ──────────────────────────────
+
+/// Build a [`crate::server::prompt_cache::PromptCacheConfig`] from the raw
+/// values captured from CLI flags and env vars.
+///
+/// `None` for any numeric field falls back to the compiled-in default from
+/// [`crate::server::prompt_cache::PromptCacheConfig::default`].
+pub(super) fn build_prompt_cache_config(
+    enabled: bool,
+    capacity_bytes: Option<usize>,
+    max_entries: Option<usize>,
+    ttl_seconds: Option<u64>,
+    min_prefix: Option<usize>,
+) -> crate::server::prompt_cache::PromptCacheConfig {
+    use crate::server::prompt_cache::PromptCacheConfig;
+    let defaults = PromptCacheConfig::default();
+    PromptCacheConfig::new(
+        enabled,
+        capacity_bytes.unwrap_or(defaults.capacity_bytes),
+        max_entries.unwrap_or(defaults.max_entries),
+        std::time::Duration::from_secs(ttl_seconds.unwrap_or(defaults.ttl.as_secs())),
+        min_prefix.unwrap_or(defaults.min_prefix_tokens),
+    )
+}
+
+/// Apply `MLXCEL_PROMPT_CACHE_ENABLED` and the llama.cpp-compat
+/// `LLAMA_ARG_CACHE_REUSE` alias to the raw CLI bool.
+///
+/// Precedence:
+/// 1. CLI flag — always wins.
+/// 2. `MLXCEL_PROMPT_CACHE_ENABLED` env var.
+/// 3. `LLAMA_ARG_CACHE_REUSE` env var (llama.cpp compat alias).
+/// 4. Compiled-in default (`true`).
+///
+/// Both env vars accept: `true`/`false`/`1`/`0`/`yes`/`no`/`on`/`off`
+/// (case-insensitive). Unparseable values are warn-logged and ignored.
+///
+/// The `cli_was_set` parameter must be `true` when the binary's clap arg was
+/// explicitly provided (not the default), so that a default `true` from clap
+/// doesn't shadow an env var that says `false`.
+pub fn env_fallback_prompt_cache_enabled(enabled: &mut bool, cli_was_set: bool) {
+    const MLXCEL_KEY: &str = "MLXCEL_PROMPT_CACHE_ENABLED";
+    const LLAMA_KEY: &str = "LLAMA_ARG_CACHE_REUSE";
+
+    if cli_was_set {
+        // CLI explicitly set — log if either env var is also present.
+        if std::env::var_os(MLXCEL_KEY).is_some() || std::env::var_os(LLAMA_KEY).is_some() {
+            tracing::info!(
+                "Prompt-cache-enabled env var(s) are set but the CLI flag takes precedence"
+            );
+        }
+        return;
+    }
+
+    // Try MLXCEL_PROMPT_CACHE_ENABLED first.
+    if let Ok(raw) = std::env::var(MLXCEL_KEY) {
+        match parse_env_bool(&raw) {
+            Some(v) => {
+                *enabled = v;
+                return;
+            }
+            None => {
+                tracing::warn!(
+                    "{MLXCEL_KEY} has unparseable value {:?}; ignoring (expected true/false/1/0)",
+                    raw
+                );
+            }
+        }
+    }
+
+    // Fall back to llama.cpp compat alias LLAMA_ARG_CACHE_REUSE.
+    if let Ok(raw) = std::env::var(LLAMA_KEY) {
+        match parse_env_bool(&raw) {
+            Some(v) => {
+                *enabled = v;
+            }
+            None => {
+                tracing::warn!(
+                    "{LLAMA_KEY} has unparseable value {:?}; ignoring (expected on/off/true/false/1/0)",
+                    raw
+                );
+            }
+        }
+    }
+}
+
+/// Apply `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES` env var fallback.
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_prompt_cache_capacity_bytes(value: &mut Option<usize>) {
+    apply_optional_usize_env_fallback(
+        value,
+        "MLXCEL_PROMPT_CACHE_CAPACITY_BYTES",
+        "prompt-cache-capacity-bytes",
+    );
+}
+
+/// Apply `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` env var fallback.
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_prompt_cache_max_entries(value: &mut Option<usize>) {
+    apply_optional_usize_env_fallback(
+        value,
+        "MLXCEL_PROMPT_CACHE_MAX_ENTRIES",
+        "prompt-cache-max-entries",
+    );
+}
+
+/// Apply `MLXCEL_PROMPT_CACHE_TTL` env var fallback (value in seconds).
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_prompt_cache_ttl(value: &mut Option<u64>) {
+    const KEY: &str = "MLXCEL_PROMPT_CACHE_TTL";
+    if value.is_some() {
+        if std::env::var_os(KEY).is_some() {
+            tracing::info!("{KEY} env var is set but --prompt-cache-ttl CLI flag takes precedence");
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var(KEY) {
+        match raw.trim().parse::<u64>() {
+            Ok(v) => *value = Some(v),
+            Err(_) => tracing::warn!(
+                "{KEY} has unparseable value {:?}; ignoring (expected unsigned integer seconds)",
+                raw
+            ),
+        }
+    }
+}
+
+/// Apply `MLXCEL_PROMPT_CACHE_MIN_PREFIX` env var fallback.
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_prompt_cache_min_prefix(value: &mut Option<usize>) {
+    apply_optional_usize_env_fallback(
+        value,
+        "MLXCEL_PROMPT_CACHE_MIN_PREFIX",
+        "prompt-cache-min-prefix",
+    );
+}
+
+/// Shared helper for `Option<usize>` env-var fallbacks.
+///
+/// If `value` is `Some` (CLI was explicitly set) and the env var is present, an
+/// INFO log is emitted. If `value` is `None`, the env var is parsed and applied.
+fn apply_optional_usize_env_fallback(value: &mut Option<usize>, key: &str, flag_name: &str) {
+    if value.is_some() {
+        if std::env::var_os(key).is_some() {
+            tracing::info!("{key} env var is set but --{flag_name} CLI flag takes precedence");
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var(key) {
+        match raw.trim().parse::<usize>() {
+            Ok(v) => *value = Some(v),
+            Err(_) => tracing::warn!(
+                "{key} has unparseable value {:?}; ignoring (expected unsigned integer)",
+                raw
+            ),
+        }
+    }
 }
 
 /// Result of resolving the prefill chunk size from the explicit flag and llama-server aliases.

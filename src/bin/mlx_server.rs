@@ -18,7 +18,10 @@ use std::path::PathBuf;
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
     ServerStartupInput, env_fallback_chat_template_kwargs, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_reasoning_budget, start_server,
+    env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
+    env_fallback_reasoning_budget, start_server,
 };
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -598,6 +601,65 @@ struct Args {
     /// rolling-checkpoint convention.
     #[arg(long = "chat-template-kwargs", value_name = "JSON")]
     chat_template_kwargs: Option<String>,
+
+    // Issue #424: cross-request prompt-prefix KV cache knobs.
+
+    /// Enable or disable the cross-request prompt-prefix KV cache (default: true).
+    ///
+    /// When disabled, the server performs no prefix-match lookup and no memory
+    /// is reserved for the cache. Disabling eliminates any lock contention and
+    /// matcher overhead.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_ENABLED` (boolean on/off/true/false/1/0)
+    /// and the llama.cpp-compat alias `LLAMA_ARG_CACHE_REUSE` when the CLI flag
+    /// is not explicitly provided. CLI flag takes precedence over env vars.
+    #[arg(
+        long = "prompt-cache-enabled",
+        default_value_t = true,
+        value_name = "BOOL"
+    )]
+    prompt_cache_enabled: bool,
+
+    /// Maximum byte budget for the prompt-prefix KV cache (default: 2 GiB).
+    ///
+    /// Inserts that would push total cache size above this threshold after LRU
+    /// eviction are rejected. Setting to `0` effectively disables inserts.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES` when the CLI flag is
+    /// absent. CLI flag takes precedence.
+    #[arg(long = "prompt-cache-capacity-bytes", value_name = "BYTES")]
+    prompt_cache_capacity_bytes: Option<usize>,
+
+    /// Maximum number of live entries in the prompt-prefix KV cache (default: 1024).
+    ///
+    /// Once the limit is reached, the least-recently-used entry is evicted to
+    /// make room for a new one.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` when the CLI flag is absent.
+    /// CLI flag takes precedence.
+    #[arg(long = "prompt-cache-max-entries", value_name = "N")]
+    prompt_cache_max_entries: Option<usize>,
+
+    /// Time-to-live for a prompt-cache entry in seconds (default: 3600).
+    ///
+    /// Entries older than this value since their last hit are lazily evicted
+    /// on the next lookup or on an explicit eviction pass.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_TTL` when the CLI flag is absent.
+    /// CLI flag takes precedence.
+    #[arg(long = "prompt-cache-ttl", value_name = "SECONDS")]
+    prompt_cache_ttl: Option<u64>,
+
+    /// Minimum prompt-prefix length (tokens) required before an entry is cached
+    /// (default: 32).
+    ///
+    /// Prefixes shorter than this threshold are not stored to avoid polluting the
+    /// cache with tiny prefixes that cannot amortize the detach/adopt overhead.
+    ///
+    /// Also reads `MLXCEL_PROMPT_CACHE_MIN_PREFIX` when the CLI flag is absent.
+    /// CLI flag takes precedence.
+    #[arg(long = "prompt-cache-min-prefix", value_name = "N")]
+    prompt_cache_min_prefix: Option<usize>,
 }
 
 #[tokio::main]
@@ -616,6 +678,21 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
     env_fallback_lang_bias_include_byte_fragments(&mut args.lang_bias);
     // Issue #410 — env-var fallback for the chat-template kwargs default.
     env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs);
+
+    // Issue #424 — env-var fallbacks for prompt-cache knobs.
+    // `prompt_cache_enabled` clap default is `true`, so we must detect
+    // whether the flag was explicitly set. Since clap doesn't expose a
+    // "was this flag explicitly set" predicate for boolean defaults without
+    // using an `Option<bool>`, we pass `false` for `cli_was_set` here so
+    // that the env-var path is always consulted. CLI-sourced `false` is also
+    // correctly propagated because clap will have already stored `false`
+    // in `args.prompt_cache_enabled` when the user passes
+    // `--prompt-cache-enabled=false`.
+    env_fallback_prompt_cache_enabled(&mut args.prompt_cache_enabled, false);
+    env_fallback_prompt_cache_capacity_bytes(&mut args.prompt_cache_capacity_bytes);
+    env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
+    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
+    env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
@@ -711,5 +788,11 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
             v
         },
         chat_template_kwargs: args.chat_template_kwargs,
+        // Issue #424: prompt-cache knobs already resolved via env-var fallbacks above.
+        prompt_cache_enabled: args.prompt_cache_enabled,
+        prompt_cache_capacity_bytes: args.prompt_cache_capacity_bytes,
+        prompt_cache_max_entries: args.prompt_cache_max_entries,
+        prompt_cache_ttl_seconds: args.prompt_cache_ttl,
+        prompt_cache_min_prefix: args.prompt_cache_min_prefix,
     })
 }

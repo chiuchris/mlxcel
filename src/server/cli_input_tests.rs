@@ -110,6 +110,12 @@ fn sample_input() -> ServerStartupInput {
         lang_bias_config: None,
         reasoning_budget: -1,
         chat_template_kwargs: None,
+        // Issue #424: prompt-cache knobs — use defaults for the helper.
+        prompt_cache_enabled: true,
+        prompt_cache_capacity_bytes: None,
+        prompt_cache_max_entries: None,
+        prompt_cache_ttl_seconds: None,
+        prompt_cache_min_prefix: None,
     }
 }
 
@@ -538,4 +544,293 @@ fn byte_fragments_env_var_unparseable_is_ignored() {
         !args.include_byte_fragments,
         "unparseable env var must leave the CLI default (false) in place"
     );
+}
+
+// -------------------------------------------------------------------------
+// Issue #424 — prompt-cache CLI/env config tests
+// -------------------------------------------------------------------------
+
+/// Default construction of `ServerStartupInput` with prompt-cache defaults
+/// produces `PromptCacheConfig::default()` after normalization.
+#[test]
+fn prompt_cache_defaults_round_trip_through_into_startup_config() {
+    use crate::server::prompt_cache::PromptCacheConfig;
+
+    let input = sample_input();
+    let startup = input.into_startup_config().expect("valid input");
+
+    let expected = PromptCacheConfig::default();
+    assert_eq!(startup.prompt_cache.enabled, expected.enabled);
+    assert_eq!(startup.prompt_cache.capacity_bytes, expected.capacity_bytes);
+    assert_eq!(startup.prompt_cache.max_entries, expected.max_entries);
+    assert_eq!(startup.prompt_cache.ttl, expected.ttl);
+    assert_eq!(
+        startup.prompt_cache.min_prefix_tokens,
+        expected.min_prefix_tokens
+    );
+}
+
+/// CLI-supplied capacity is propagated.
+#[test]
+fn prompt_cache_capacity_cli_overrides_default() {
+    let mut input = sample_input();
+    input.prompt_cache_capacity_bytes = Some(1024 * 1024 * 512); // 512 MiB
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert_eq!(startup.prompt_cache.capacity_bytes, 1024 * 1024 * 512);
+}
+
+/// CLI-supplied max_entries is propagated.
+#[test]
+fn prompt_cache_max_entries_cli_overrides_default() {
+    let mut input = sample_input();
+    input.prompt_cache_max_entries = Some(256);
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert_eq!(startup.prompt_cache.max_entries, 256);
+}
+
+/// CLI-supplied TTL is propagated.
+#[test]
+fn prompt_cache_ttl_cli_overrides_default() {
+    let mut input = sample_input();
+    input.prompt_cache_ttl_seconds = Some(600);
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert_eq!(startup.prompt_cache.ttl.as_secs(), 600);
+}
+
+/// CLI-supplied min_prefix is propagated.
+#[test]
+fn prompt_cache_min_prefix_cli_overrides_default() {
+    let mut input = sample_input();
+    input.prompt_cache_min_prefix = Some(64);
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert_eq!(startup.prompt_cache.min_prefix_tokens, 64);
+}
+
+/// Disabling via CLI produces `enabled = false` in the config.
+#[test]
+fn prompt_cache_disabled_cli_propagates_through() {
+    let mut input = sample_input();
+    input.prompt_cache_enabled = false;
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert!(!startup.prompt_cache.enabled);
+    assert!(!startup.prompt_cache.is_enabled());
+}
+
+/// `MLXCEL_PROMPT_CACHE_ENABLED=false` disables the cache.
+#[test]
+fn prompt_cache_enabled_env_var_sets_false() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_ENABLED", "false");
+
+    let mut enabled = true; // default
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(!enabled, "MLXCEL_PROMPT_CACHE_ENABLED=false must set enabled=false");
+}
+
+/// `MLXCEL_PROMPT_CACHE_ENABLED=1` enables the cache.
+#[test]
+fn prompt_cache_enabled_env_var_accepts_numeric_one() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_ENABLED", "1");
+
+    let mut enabled = false;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(enabled, "MLXCEL_PROMPT_CACHE_ENABLED=1 must set enabled=true");
+}
+
+/// `LLAMA_ARG_CACHE_REUSE=on` enables the cache (llama.cpp compat).
+#[test]
+fn prompt_cache_llama_arg_cache_reuse_on_sets_true() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_REUSE", "on");
+
+    let mut enabled = false;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(enabled, "LLAMA_ARG_CACHE_REUSE=on must set enabled=true");
+}
+
+/// `LLAMA_ARG_CACHE_REUSE=off` disables the cache (llama.cpp compat).
+#[test]
+fn prompt_cache_llama_arg_cache_reuse_off_sets_false() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_REUSE", "off");
+
+    let mut enabled = true;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(!enabled, "LLAMA_ARG_CACHE_REUSE=off must set enabled=false");
+}
+
+/// When both `MLXCEL_PROMPT_CACHE_ENABLED` and `LLAMA_ARG_CACHE_REUSE` are
+/// set, the `MLXCEL_` key takes precedence.
+#[test]
+fn prompt_cache_mlxcel_env_wins_over_llama_arg_cache_reuse() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _mlxcel = EnvGuard::set("MLXCEL_PROMPT_CACHE_ENABLED", "true");
+    let _llama = EnvGuard::set("LLAMA_ARG_CACHE_REUSE", "off");
+
+    let mut enabled = false;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(
+        enabled,
+        "MLXCEL_PROMPT_CACHE_ENABLED must win over LLAMA_ARG_CACHE_REUSE"
+    );
+}
+
+/// CLI-set `enabled=false` wins over any env var.
+#[test]
+fn prompt_cache_cli_wins_over_env_for_enabled() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_ENABLED", "true");
+
+    let mut enabled = false; // CLI said false
+    env_fallback_prompt_cache_enabled(&mut enabled, true /* cli_was_set */);
+    assert!(!enabled, "CLI value must win when cli_was_set=true");
+}
+
+/// `MLXCEL_PROMPT_CACHE_CAPACITY_BYTES` is applied when CLI flag is absent.
+#[test]
+fn prompt_cache_capacity_env_var_applied_when_cli_absent() {
+    use super::env_fallback_prompt_cache_capacity_bytes;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_CAPACITY_BYTES", "1073741824"); // 1 GiB
+
+    let mut value: Option<usize> = None;
+    env_fallback_prompt_cache_capacity_bytes(&mut value);
+    assert_eq!(value, Some(1_073_741_824));
+}
+
+/// CLI-set `capacity_bytes` wins over env var.
+#[test]
+fn prompt_cache_capacity_cli_wins_over_env() {
+    use super::env_fallback_prompt_cache_capacity_bytes;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_CAPACITY_BYTES", "1073741824");
+
+    let mut value: Option<usize> = Some(536_870_912); // CLI set 512 MiB
+    env_fallback_prompt_cache_capacity_bytes(&mut value);
+    assert_eq!(value, Some(536_870_912), "CLI value must be preserved");
+}
+
+/// `MLXCEL_PROMPT_CACHE_MAX_ENTRIES` is applied when CLI flag is absent.
+#[test]
+fn prompt_cache_max_entries_env_var_applied() {
+    use super::env_fallback_prompt_cache_max_entries;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_MAX_ENTRIES", "512");
+
+    let mut value: Option<usize> = None;
+    env_fallback_prompt_cache_max_entries(&mut value);
+    assert_eq!(value, Some(512));
+}
+
+/// `MLXCEL_PROMPT_CACHE_TTL` is applied when CLI flag is absent.
+#[test]
+fn prompt_cache_ttl_env_var_applied() {
+    use super::env_fallback_prompt_cache_ttl;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_TTL", "1800");
+
+    let mut value: Option<u64> = None;
+    env_fallback_prompt_cache_ttl(&mut value);
+    assert_eq!(value, Some(1800));
+}
+
+/// `MLXCEL_PROMPT_CACHE_MIN_PREFIX` is applied when CLI flag is absent.
+#[test]
+fn prompt_cache_min_prefix_env_var_applied() {
+    use super::env_fallback_prompt_cache_min_prefix;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_MIN_PREFIX", "16");
+
+    let mut value: Option<usize> = None;
+    env_fallback_prompt_cache_min_prefix(&mut value);
+    assert_eq!(value, Some(16));
+}
+
+/// Unparseable `MLXCEL_PROMPT_CACHE_ENABLED` is ignored and the original value
+/// (default `true`) is preserved.
+#[test]
+fn prompt_cache_enabled_unparseable_env_var_ignored() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("MLXCEL_PROMPT_CACHE_ENABLED", "maybe-yes");
+
+    let mut enabled = true;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(
+        enabled,
+        "unparseable MLXCEL_PROMPT_CACHE_ENABLED must leave original value in place"
+    );
+}
+
+/// `LLAMA_ARG_CACHE_REUSE=0` disables the cache (numeric form).
+#[test]
+fn prompt_cache_llama_arg_cache_reuse_zero_sets_false() {
+    use super::env_fallback_prompt_cache_enabled;
+
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_REUSE", "0");
+
+    let mut enabled = true;
+    env_fallback_prompt_cache_enabled(&mut enabled, false);
+    assert!(!enabled, "LLAMA_ARG_CACHE_REUSE=0 must set enabled=false");
+}
+
+/// Integration: `into_startup_config` with `enabled=false` produces a
+/// `ServerStartupConfig` whose `prompt_cache.is_enabled()` returns `false`.
+#[test]
+fn startup_config_prompt_cache_disabled_produces_false_is_enabled() {
+    let mut input = sample_input();
+    input.prompt_cache_enabled = false;
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert!(
+        !startup.prompt_cache.is_enabled(),
+        "disabled prompt cache must not satisfy is_enabled()"
+    );
+}
+
+/// Integration: `into_startup_config` with the default produces a
+/// `ServerStartupConfig` whose `prompt_cache.is_enabled()` returns `true`.
+#[test]
+fn startup_config_prompt_cache_default_is_enabled() {
+    let startup = sample_input().into_startup_config().expect("valid input");
+    assert!(
+        startup.prompt_cache.is_enabled(),
+        "default prompt cache must satisfy is_enabled()"
+    );
+}
+
+/// Integration: `into_startup_config` with `capacity_bytes` overridden
+/// propagates the correct value to `ServerStartupConfig.prompt_cache`.
+#[test]
+fn prompt_cache_e2e_cli_capacity_bytes_flows_to_startup_config() {
+    let mut input = sample_input();
+    input.prompt_cache_capacity_bytes = Some(134_217_728); // 128 MiB
+
+    let startup = input.into_startup_config().expect("valid input");
+    assert_eq!(startup.prompt_cache.capacity_bytes, 134_217_728);
 }

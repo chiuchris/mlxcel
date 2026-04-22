@@ -878,3 +878,58 @@ fn validate_tensor_parallel_startup_accepts_gemma4_multi_rank_runtime() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+// -------------------------------------------------------------------------
+// Issue #424 — prompt-cache startup integration tests
+// -------------------------------------------------------------------------
+
+/// `build_server_config` with `enabled=false` produces a `ServerConfig`
+/// whose `prompt_cache.is_enabled()` returns `false`, confirming the cache
+/// gate in `startup.rs` will skip store construction.
+#[test]
+fn build_server_config_prompt_cache_disabled_produces_false_is_enabled() {
+    use crate::server::prompt_cache::PromptCacheConfig;
+
+    let startup = ServerStartupConfig {
+        prompt_cache: PromptCacheConfig::disabled(),
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert!(
+        !config.prompt_cache.is_enabled(),
+        "disabled PromptCacheConfig must not satisfy is_enabled() in ServerConfig"
+    );
+}
+
+/// `build_server_config` with the default startup config produces a
+/// `ServerConfig` whose `prompt_cache.is_enabled()` returns `true`.
+#[test]
+fn build_server_config_prompt_cache_default_is_enabled() {
+    let startup = ServerStartupConfig::default();
+    let config = build_server_config(&startup, None);
+    assert!(
+        config.prompt_cache.is_enabled(),
+        "default PromptCacheConfig must satisfy is_enabled() in ServerConfig"
+    );
+}
+
+/// `build_server_config` propagates a custom `capacity_bytes` value from
+/// `ServerStartupConfig.prompt_cache` into `ServerConfig.prompt_cache`.
+#[test]
+fn build_server_config_propagates_prompt_cache_capacity() {
+    use crate::server::prompt_cache::PromptCacheConfig;
+
+    const CUSTOM_CAP: usize = 134_217_728; // 128 MiB
+    let startup = ServerStartupConfig {
+        prompt_cache: PromptCacheConfig::new(
+            true,
+            CUSTOM_CAP,
+            PromptCacheConfig::DEFAULT_MAX_ENTRIES,
+            std::time::Duration::from_secs(PromptCacheConfig::DEFAULT_TTL_SECONDS),
+            PromptCacheConfig::DEFAULT_MIN_PREFIX_TOKENS,
+        ),
+        ..ServerStartupConfig::default()
+    };
+    let config = build_server_config(&startup, None);
+    assert_eq!(config.prompt_cache.capacity_bytes, CUSTOM_CAP);
+}

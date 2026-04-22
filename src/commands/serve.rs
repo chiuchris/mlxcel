@@ -21,7 +21,10 @@
 
 use mlxcel::server::{
     ServerStartupInput, env_fallback_chat_template_kwargs, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_reasoning_budget, start_server,
+    env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
+    env_fallback_reasoning_budget, start_server,
 };
 
 /// Run the `mlxcel serve` subcommand.
@@ -41,6 +44,12 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_reasoning_budget(&mut args.reasoning_budget);
     // Issue #410 — env-var fallback for the chat-template kwargs default.
     env_fallback_chat_template_kwargs(&mut args.chat_template_kwargs);
+    // Issue #424 — env-var fallbacks for prompt-cache knobs.
+    env_fallback_prompt_cache_enabled(&mut args.prompt_cache_enabled, false);
+    env_fallback_prompt_cache_capacity_bytes(&mut args.prompt_cache_capacity_bytes);
+    env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
+    env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
+    env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
 
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
@@ -127,6 +136,12 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         lang_bias_config,
         reasoning_budget: args.reasoning_budget,
         chat_template_kwargs: args.chat_template_kwargs,
+        // Issue #424: prompt-cache knobs already resolved via env-var fallbacks above.
+        prompt_cache_enabled: args.prompt_cache_enabled,
+        prompt_cache_capacity_bytes: args.prompt_cache_capacity_bytes,
+        prompt_cache_max_entries: args.prompt_cache_max_entries,
+        prompt_cache_ttl_seconds: args.prompt_cache_ttl,
+        prompt_cache_min_prefix: args.prompt_cache_min_prefix,
     })
 }
 
