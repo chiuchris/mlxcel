@@ -19,88 +19,44 @@
 //! `Arc<RwLock<Inner>>`: concurrent lookups take a read lock and match
 //! prefixes, while inserts/evictions take an exclusive write lock.
 //!
-//! Sub-issue #420 will replace the current linear scan inside
-//! [`PromptCacheStore::lookup_longest_prefix`] with a radix trie. The
-//! public API is stable and tested against that eventual replacement.
+//! The two-tier longest-prefix matcher (#420) lives in
+//! [`super::lookup`]; this module wires the matcher into the store's
+//! locking + metrics discipline. See that module and
+//! [`super::trie`] for the lookup algorithm and data structure choice.
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
-use thiserror::Error;
-
 use super::entry::CacheEntry;
 use super::key::{PromptCacheKey, PromptCacheKeyDigest};
 use super::metrics::{NoopPromptCacheMetrics, PromptCacheMetrics};
 use super::policy::{PromptCacheConfig, PromptCacheStats};
-
-/// Insert-time failure mode.
-#[derive(Clone, Debug, Error, PartialEq, Eq)]
-pub enum InsertError {
-    /// The feature is disabled (either via config or via store construction).
-    #[error("prompt cache is disabled")]
-    Disabled,
-    /// The token prefix being inserted is shorter than
-    /// [`PromptCacheConfig::min_prefix_tokens`].
-    #[error("prompt cache: prefix is too short ({got} < {min_required})")]
-    PrefixTooShort { got: usize, min_required: usize },
-    /// The single entry exceeds the store's configured byte budget on its
-    /// own, so no amount of eviction could make room for it.
-    #[error(
-        "prompt cache: entry size {entry_bytes} exceeds capacity {capacity_bytes} (cannot fit even alone)"
-    )]
-    OversizedEntry {
-        entry_bytes: usize,
-        capacity_bytes: usize,
-    },
-}
-
-/// Composition key (model/lora/template/session) kept alongside the digest
-/// so lookups can disambiguate partial prefix collisions.
-///
-/// The key identifies a *bucket* — a set of entries that share the same
-/// model/lora/template/session and can therefore share a KV-cache prefix.
-/// Token prefixes distinguish entries *within* a bucket.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct BucketKey {
-    pub model_id: String,
-    pub lora_id: Option<String>,
-    pub template_sig: String,
-    pub session_key: Option<String>,
-}
-
-impl BucketKey {
-    /// Build a bucket key from a [`PromptCacheKey`] (drops the token prefix
-    /// since it does not participate in bucket identity).
-    pub fn from_key(key: &PromptCacheKey<'_>) -> Self {
-        Self {
-            model_id: key.model_id.to_string(),
-            lora_id: key.lora_id.map(str::to_string),
-            template_sig: key.template_sig.to_string(),
-            session_key: key.session_key.map(str::to_string),
-        }
-    }
-}
+use super::trie::RadixTrie;
+pub(super) use super::types::SessionlessBucketKey;
+use super::types::{BucketKey, InsertError};
 
 /// Internal entry bookkeeping.
-struct EntrySlot {
-    entry: Arc<CacheEntry>,
+pub(super) struct EntrySlot {
+    pub(super) entry: Arc<CacheEntry>,
     /// Bucket identity for prefix-matching fallback paths. The digest is
     /// recoverable via the HashMap key, so we only keep the bucket key here.
-    bucket: BucketKey,
+    pub(super) bucket: BucketKey,
+    /// Session-agnostic bucket, used to locate the radix trie on evict /
+    /// replace paths without re-deriving from strings.
+    sessionless: SessionlessBucketKey,
 }
 
 struct Inner {
     config: PromptCacheConfig,
     // Primary map: digest -> entry.
     entries: HashMap<PromptCacheKeyDigest, EntrySlot>,
-    // Secondary map: bucket -> list of digests, so `lookup_longest_prefix`
-    // can efficiently enumerate candidate entries that share the bucket.
-    //
-    // TODO(#420): radix trie — replace this `Vec<Digest>` bucket index with
-    // a prefix-tree per bucket to avoid scanning every entry's token vector
-    // on lookup.
-    buckets: HashMap<BucketKey, Vec<PromptCacheKeyDigest>>,
+    // Per-(model, lora, template) radix trie. Each trie stores digests
+    // indexed by their stored-entry token prefix; lookups walk the trie
+    // to find the longest token-prefix match in `O(L)` where `L` is the
+    // matched depth. Cross-session reuse is handled at candidate-scoring
+    // time inside `lookup_longest_prefix`.
+    tries: HashMap<SessionlessBucketKey, RadixTrie>,
     total_bytes: usize,
     inserts: u64,
     rejections_oversized: u64,
@@ -115,7 +71,7 @@ impl Inner {
         Self {
             config,
             entries: HashMap::new(),
-            buckets: HashMap::new(),
+            tries: HashMap::new(),
             total_bytes: 0,
             inserts: 0,
             rejections_oversized: 0,
@@ -145,11 +101,15 @@ impl Inner {
     ) -> Option<(BucketKey, Arc<CacheEntry>)> {
         let slot = self.entries.remove(digest)?;
         self.total_bytes = self.total_bytes.saturating_sub(slot.entry.size_bytes);
-        if let Some(list) = self.buckets.get_mut(&slot.bucket) {
-            list.retain(|d| d != digest);
-            if list.is_empty() {
-                self.buckets.remove(&slot.bucket);
-            }
+
+        let trie_empty = if let Some(trie) = self.tries.get_mut(&slot.sessionless) {
+            trie.remove(&slot.entry.tokens, *digest);
+            trie.len() == 0
+        } else {
+            false
+        };
+        if trie_empty {
+            self.tries.remove(&slot.sessionless);
         }
         Some((slot.bucket, slot.entry))
     }
@@ -316,6 +276,7 @@ impl PromptCacheStore {
         let digest = key.digest();
         let entry_bytes = entry.size_bytes;
         let bucket = BucketKey::from_key(key);
+        let sessionless = SessionlessBucketKey::from_key(key);
 
         let mut guard = self.inner.write().expect("prompt cache inner lock");
 
@@ -352,12 +313,18 @@ impl PromptCacheStore {
 
         // Speculatively account for the new bytes, then evict as needed.
         guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
+        let tokens_for_trie = entry.tokens.clone();
         let slot = EntrySlot {
             entry: Arc::new(entry),
-            bucket: bucket.clone(),
+            bucket,
+            sessionless: sessionless.clone(),
         };
         guard.entries.insert(digest, slot);
-        guard.buckets.entry(bucket).or_default().push(digest);
+        guard
+            .tries
+            .entry(sessionless)
+            .or_default()
+            .insert(&tokens_for_trie, digest);
         guard.inserts = guard.inserts.saturating_add(1);
 
         let metrics = Arc::clone(&self.metrics);
@@ -370,14 +337,26 @@ impl PromptCacheStore {
         Ok(())
     }
 
-    /// Find the cache entry in the same bucket as `key` whose tokens form
-    /// the longest prefix of `tokens`. Returns the entry and the matched
-    /// length. `min_prefix_tokens` still applies: matches shorter than the
-    /// configured minimum are ignored.
+    /// Find the best cached entry whose stored token prefix forms the
+    /// longest common prefix of `tokens` and is reusable under `key`.
     ///
-    /// TODO(#420): radix trie — this currently scans every digest in the
-    /// bucket and compares token vectors element-by-element. A radix trie
-    /// per bucket will reduce the cost to `O(prefix_len)`.
+    /// Search is two-tier:
+    ///
+    /// 1. **Exact-session tier.** Filter candidates whose `session_key`
+    ///    matches `key.session_key`. If any clear the
+    ///    [`PromptCacheConfig::min_prefix_tokens`] threshold, return the
+    ///    longest match; ties resolved by most-recently-used.
+    /// 2. **Cross-session tier.** Fall back to candidates with a different
+    ///    `session_key` (or `None`), still under the same
+    ///    `(model, lora, template)` bucket. Same threshold, MRU tie-break.
+    ///
+    /// The cross-session tier only wins if its best match is **strictly
+    /// longer** than the exact-session tier's best match — otherwise the
+    /// exact-session match is preferred, matching the tie-break rule
+    /// "same `session_key` first".
+    ///
+    /// Underlying lookup uses the per-`(model, lora, template)` radix
+    /// trie from [`super::trie::RadixTrie`]: `O(L)` in the matched depth.
     pub fn lookup_longest_prefix(
         &self,
         key: &PromptCacheKey<'_>,
@@ -401,29 +380,19 @@ impl PromptCacheStore {
             }
         }
 
-        let bucket = BucketKey::from_key(key);
-        let guard = self.inner.read().expect("prompt cache inner lock");
-
-        let mut best: Option<(PromptCacheKeyDigest, usize)> = None;
-        if let Some(digests) = guard.buckets.get(&bucket) {
-            for digest in digests {
-                if let Some(slot) = guard.entries.get(digest) {
-                    if !slot.entry.has_detached() {
-                        continue;
-                    }
-                    let matched = common_prefix_len(&slot.entry.tokens, tokens);
-                    if matched < guard.config.min_prefix_tokens {
-                        continue;
-                    }
-                    match best {
-                        Some((_, b)) if b >= matched => {}
-                        _ => best = Some((*digest, matched)),
-                    }
+        let sessionless = SessionlessBucketKey::from_key(key);
+        let best = {
+            let guard = self.inner.read().expect("prompt cache inner lock");
+            let min_len = guard.config.min_prefix_tokens;
+            let trie = match guard.tries.get(&sessionless) {
+                Some(t) => t,
+                None => {
+                    drop(guard);
+                    return self.finalize_miss();
                 }
-            }
-        }
-
-        drop(guard);
+            };
+            super::lookup::select_best(trie, key, tokens, min_len, |d| guard.entries.get(d))
+        };
 
         // Increment lookup counters under the write lock so statistics stay
         // accurate even under concurrent readers. The hot path is the miss
@@ -432,9 +401,9 @@ impl PromptCacheStore {
             let mut guard = self.inner.write().expect("prompt cache inner lock");
             guard.lookups = guard.lookups.saturating_add(1);
             match best {
-                Some((digest, matched)) => {
+                Some(winner) => {
                     guard.hits = guard.hits.saturating_add(1);
-                    let slot = match guard.entries.get(&digest) {
+                    let slot = match guard.entries.get(&winner.digest) {
                         Some(s) => s,
                         None => {
                             drop(guard);
@@ -445,7 +414,7 @@ impl PromptCacheStore {
                     };
                     slot.entry.touch();
                     let entry = Arc::clone(&slot.entry);
-                    (Some(entry), matched)
+                    (Some(entry), winner.matched)
                 }
                 None => (None, 0),
             }
@@ -457,6 +426,19 @@ impl PromptCacheStore {
             None => metrics.record_lookup(false, 0),
         }
         entry.map(|e| (e, matched_len))
+    }
+
+    /// Account a lookup miss and return `None`. Factored out so the
+    /// two-tier fast-path `return` sites don't duplicate the metric /
+    /// counter bookkeeping.
+    fn finalize_miss(&self) -> Option<(Arc<CacheEntry>, usize)> {
+        {
+            let mut guard = self.inner.write().expect("prompt cache inner lock");
+            guard.lookups = guard.lookups.saturating_add(1);
+        }
+        let metrics = Arc::clone(&self.metrics);
+        metrics.record_lookup(false, 0);
+        None
     }
 
     /// Force a sweep. Returns the total bytes freed.
@@ -482,7 +464,7 @@ impl PromptCacheStore {
     pub fn clear(&self) {
         let mut guard = self.inner.write().expect("prompt cache inner lock");
         guard.entries.clear();
-        guard.buckets.clear();
+        guard.tries.clear();
         guard.total_bytes = 0;
     }
 }
@@ -500,11 +482,6 @@ impl std::fmt::Debug for PromptCacheStore {
             .field("stats", &stats)
             .finish()
     }
-}
-
-/// Length of the common prefix of two token slices.
-fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
-    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 #[cfg(test)]

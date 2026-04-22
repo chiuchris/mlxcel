@@ -26,7 +26,8 @@
 //! * #417 — [`mlxcel_core::cache::DetachedCacheSet`] and the
 //!   [`mlxcel_core::cache::CachePool`] detach/adopt API (upstream).
 //! * #419 — this module, PromptCacheStore itself.
-//! * #420 — radix trie inside `PromptCacheStore::lookup_longest_prefix`.
+//! * #420 — radix trie inside [`store::PromptCacheStore::lookup_longest_prefix`]
+//!   (via [`trie`]).
 //! * #422 — full `template_sig` wiring.
 //! * #423 — metrics bridge to [`super::state::BatchMetrics`].
 //! * #424 — CLI/env wiring for [`PromptCacheConfig`].
@@ -38,12 +39,19 @@
 
 pub mod entry;
 pub mod key;
+mod lookup;
 pub mod metrics;
 pub mod policy;
 pub mod store;
+mod trie;
+mod types;
+
+#[cfg(test)]
+mod prefix_matcher_tests;
 
 pub use entry::CacheEntry;
 pub use key::{PromptCacheKey, PromptCacheKeyDigest};
 pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheMetrics};
 pub use policy::{PromptCacheConfig, PromptCacheStats};
-pub use store::{BucketKey, InsertError, PromptCacheStore};
+pub use store::PromptCacheStore;
+pub use types::{BucketKey, InsertError};
