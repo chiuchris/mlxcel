@@ -18,6 +18,47 @@
 //! flattening, template rendering, and image extraction rules.
 //!
 //! Used by: routes/chat
+//!
+//! # Prefix stability guarantees (epic #416, issue #422)
+//!
+//! When the prompt prefix cache is enabled, [`prepare_chat_request`]
+//! guarantees that rendering the same conversation across turns yields a
+//! prompt that is a prefix of the next turn's prompt, so the KV cache is
+//! reusable:
+//!
+//! 1. **`preserve_thinking` defaulting.** With the prompt cache on, unset
+//!    `preserve_thinking` defaults to `true`. This disables the rolling
+//!    checkpoint stripper (see [`super::chat_template_kwargs::
+//!    strip_rolling_checkpoint`]) whose "strip every thinking block before
+//!    the latest user turn" rule is the primary source of prefix drift. Opt
+//!    out explicitly via `chat_template_kwargs.preserve_thinking = false`
+//!    when prefix instability is acceptable.
+//! 2. **Template signature in the cache key.** The
+//!    [`super::prompt_cache::key::template_sig`] hash is derived from
+//!    `(chat_template_source, chat_template_kwargs, tool_choice,
+//!    tools_digest)`. Any change in rendering inputs — including a
+//!    non-deterministic template tweak or a tool-list reorder — drops the
+//!    affected entries cleanly by producing a new `template_sig`.
+//! 3. **Known non-determinism sources and how they are handled.**
+//!    * `strftime_now` in Jinja (templates like Llama 3.x emit "today's
+//!      date"). This is an intentional per-render value; the cache keys the
+//!      prompt tokens rather than the template output, so a date-of-day
+//!      difference surfaces as a different token prefix and creates a new
+//!      bucket that naturally ages out. Documented, not silently masked.
+//!    * `<think>` block stripping across turns — invalidated by the
+//!      `preserve_thinking=true` default.
+//!    * Tool-schema hashing: [`super::prompt_cache::key::tools_digest`] is
+//!      order-preserving, so reordering tools invalidates the cache. This
+//!      is intentional: HuggingFace templates iterate tools in order and
+//!      some models key their protocol to the index.
+//!    * Kwargs-key reordering: kwargs are canonicalized with sorted object
+//!      keys before hashing, so map insertion-order drift is absorbed.
+//!    * `enable_thinking` / future `chat_template_kwargs` additions: any
+//!      new kwarg automatically propagates into `template_sig` because it
+//!      participates in the canonicalized map hash.
+
+use std::collections::HashSet;
+use std::sync::{Mutex, OnceLock};
 
 use super::chat_template::{ChatMessage, ChatTemplateProcessor};
 use super::chat_template_kwargs::{
@@ -25,6 +66,7 @@ use super::chat_template_kwargs::{
     strip_think_block,
 };
 use super::media::{extract_chat_audio_data, extract_chat_image_data};
+use super::prompt_cache::key::resolve_session_key;
 use super::types::ChatCompletionRequest;
 use super::types::request::Tool;
 
@@ -34,10 +76,51 @@ pub(crate) struct PreparedChatRequest {
     pub(crate) audio_data: Vec<Vec<u8>>,
 }
 
+/// Dedup set for the "defaulted `preserve_thinking=true`" info log.
+///
+/// Keyed by the resolved `session_key` (see [`resolve_session_key`]) so we
+/// log exactly once per logical session per server lifetime. Process-wide
+/// state — the dedup tracks the *runtime identity* of the server, not a
+/// persistent record. A restart resets the set, which is fine: operators
+/// should see the log after each restart confirming the defaulting is live.
+pub(super) fn log_once_sessions() -> &'static Mutex<HashSet<String>> {
+    static LOGGED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    LOGGED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Legacy wrapper preserved for tests and any callers outside the hot
+/// route path. Delegates to [`prepare_chat_request_with_cache`] with
+/// the cache-enabled flag set to `false`, matching pre-#422 behavior.
+///
+/// Production HTTP handlers (see `src/server/routes/chat.rs`) use the
+/// `_with_cache` variant directly so they can honor the installed
+/// [`super::prompt_cache::PromptCacheStore`].
+#[allow(dead_code)]
 pub(crate) async fn prepare_chat_request(
     processor: &ChatTemplateProcessor,
     request: &ChatCompletionRequest,
     server_default_kwargs: Option<&ChatTemplateKwargs>,
+) -> PreparedChatRequest {
+    prepare_chat_request_with_cache(processor, request, server_default_kwargs, false).await
+}
+
+/// Full variant of [`prepare_chat_request`] with explicit prompt-cache
+/// awareness (issue #422).
+///
+/// When `prompt_cache_enabled` is `true` and the caller has not explicitly
+/// set `preserve_thinking` anywhere in the request, this function defaults
+/// it to `true` before running the rendering pipeline. Explicit overrides
+/// (`chat_template_kwargs.preserve_thinking = false`, flattened OpenAI-SDK
+/// field, nested `extra_body`, or server-default kwargs) are respected
+/// unchanged.
+///
+/// When `prompt_cache_enabled` is `false` this is identical to the legacy
+/// [`prepare_chat_request`].
+pub(crate) async fn prepare_chat_request_with_cache(
+    processor: &ChatTemplateProcessor,
+    request: &ChatCompletionRequest,
+    server_default_kwargs: Option<&ChatTemplateKwargs>,
+    prompt_cache_enabled: bool,
 ) -> PreparedChatRequest {
     // Determine effective tools based on tool_choice
     let effective_tools = effective_tools(request);
@@ -55,7 +138,19 @@ pub(crate) async fn prepare_chat_request(
         request.chat_template_kwargs.as_ref(),
         merged_extra_body.as_ref(),
     );
-    let merged_kwargs = merge_server_and_request(server_default_kwargs, &per_request_kwargs);
+    let mut merged_kwargs = merge_server_and_request(server_default_kwargs, &per_request_kwargs);
+
+    // Issue #422: default preserve_thinking=true when the prompt cache is on
+    // and no layer of the precedence chain set it. The per-request-kwargs
+    // object already reflects top-level + flattened-SDK + nested-extra_body
+    // + DashScope flat shape, and `merged_kwargs` folds in the server
+    // default. So "not set anywhere" is precisely "the merged map lacks the
+    // key."
+    if prompt_cache_enabled && !merged_kwargs.as_map().contains_key("preserve_thinking") {
+        merged_kwargs.set_preserve_thinking(true);
+        maybe_log_defaulting_once(request);
+    }
+
     let preserve_thinking = merged_kwargs.preserve_thinking();
 
     let prompt = if has_tool_fields(request) {
@@ -97,6 +192,32 @@ pub(crate) async fn prepare_chat_request(
         prompt,
         image_data,
         audio_data,
+    }
+}
+
+/// Emit an INFO log exactly once per resolved session when the
+/// prompt-cache-driven `preserve_thinking=true` default kicks in.
+///
+/// The dedup key is the same `session_key` the cache uses, so distinct
+/// users (OpenAI-standard `user` field or `prompt_cache_key`) each get
+/// their own one-shot log line; anonymous traffic shares the log entry
+/// for [`super::prompt_cache::key::ANONYMOUS_SESSION_SENTINEL`].
+///
+/// The log is purely informational; the defaulting decision itself runs
+/// regardless.
+fn maybe_log_defaulting_once(request: &ChatCompletionRequest) {
+    let pck = request.resolve_prompt_cache_key();
+    let user = request.resolve_user();
+    let session = resolve_session_key(pck, user).to_string();
+    let Ok(mut set) = log_once_sessions().lock() else {
+        return;
+    };
+    if set.insert(session.clone()) {
+        tracing::info!(
+            session = %session,
+            "prompt cache on + preserve_thinking unset: defaulting preserve_thinking=true \
+             for prefix stability (override via chat_template_kwargs.preserve_thinking=false)"
+        );
     }
 }
 

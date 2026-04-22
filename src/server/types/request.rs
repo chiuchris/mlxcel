@@ -373,6 +373,33 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub extra_body: Option<serde_json::Map<String, serde_json::Value>>,
 
+    /// Issue #422: OpenAI-compatible prompt-cache key hint.
+    ///
+    /// Clients can send this to pin a conversation to a specific prompt-cache
+    /// session bucket. When present it wins over the standard OpenAI `user`
+    /// field in [`crate::server::prompt_cache::key::resolve_session_key`];
+    /// when absent the server falls back to `user`, then to an anonymous
+    /// bucket sentinel. The string is never echoed back to the client — it is
+    /// only used as a session-bucket discriminator inside the cache key hash.
+    ///
+    /// Also round-trips through the flattened OpenAI-SDK `extra_body`
+    /// mechanism ([`Self::extra_body_fields`]): SDKs that pass `extra_body=
+    /// {"prompt_cache_key": "..."}` land here via the flatten; SDKs that send
+    /// it at the request root land here directly.
+    #[serde(default)]
+    pub prompt_cache_key: Option<String>,
+
+    /// OpenAI-standard stable end-user identifier (issue #422).
+    ///
+    /// Used as a session-bucket fallback for the prompt-prefix cache when
+    /// `prompt_cache_key` is not supplied. See
+    /// [`crate::server::prompt_cache::key::resolve_session_key`] for the
+    /// full precedence chain. The value is treated as opaque bytes; the
+    /// server never attempts to interpret it as an identity or access control
+    /// token.
+    #[serde(default)]
+    pub user: Option<String>,
+
     /// Issue #410: OpenAI SDK `extra_body={...}` flattened into the request root.
     ///
     /// The official OpenAI Python client merges `extra_body` into the top-level
@@ -426,6 +453,68 @@ impl ChatCompletionRequest {
                 Some(merged)
             }
         }
+    }
+
+    /// Resolve the request-level `prompt_cache_key` (issue #422).
+    ///
+    /// Precedence (first non-empty wins):
+    ///   1. Top-level `prompt_cache_key`.
+    ///   2. Flattened OpenAI-SDK `extra_body` field of the same name.
+    ///   3. Nested `extra_body.prompt_cache_key`.
+    ///
+    /// Empty strings are treated as "not supplied" so a caller can't
+    /// accidentally smuggle themselves into an empty-string bucket.
+    pub fn resolve_prompt_cache_key(&self) -> Option<&str> {
+        if let Some(k) = self.prompt_cache_key.as_deref()
+            && !k.is_empty()
+        {
+            return Some(k);
+        }
+        if let Some(s) = self
+            .extra_body_fields
+            .get("prompt_cache_key")
+            .and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+        if let Some(body) = self.extra_body.as_ref()
+            && let Some(s) = body
+                .get("prompt_cache_key")
+                .and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+        None
+    }
+
+    /// Resolve the request-level OpenAI-standard `user` identifier (#422).
+    ///
+    /// Same precedence rules as [`Self::resolve_prompt_cache_key`]: top-level
+    /// field, then flattened `extra_body`, then nested `extra_body`. Empty
+    /// strings are ignored.
+    pub fn resolve_user(&self) -> Option<&str> {
+        if let Some(u) = self.user.as_deref()
+            && !u.is_empty()
+        {
+            return Some(u);
+        }
+        if let Some(s) = self
+            .extra_body_fields
+            .get("user")
+            .and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+        if let Some(body) = self.extra_body.as_ref()
+            && let Some(s) = body.get("user").and_then(serde_json::Value::as_str)
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
+        None
     }
 
     /// Convert messages to a prompt string using a simple format

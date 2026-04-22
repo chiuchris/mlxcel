@@ -50,7 +50,10 @@ mod types;
 mod prefix_matcher_tests;
 
 pub use entry::CacheEntry;
-pub use key::{PromptCacheKey, PromptCacheKeyDigest};
+pub use key::{
+    ANONYMOUS_SESSION_SENTINEL, PromptCacheKey, PromptCacheKeyDigest, resolve_session_key,
+    template_sig, tools_digest,
+};
 pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheMetrics};
 pub use policy::{PromptCacheConfig, PromptCacheStats};
 pub use store::PromptCacheStore;

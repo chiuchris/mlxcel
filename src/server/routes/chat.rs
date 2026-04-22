@@ -28,7 +28,7 @@ use axum::{
 use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 
 use crate::server::batch::RequestPriority;
-use crate::server::chat_request::prepare_chat_request;
+use crate::server::chat_request::prepare_chat_request_with_cache;
 use crate::server::config::ReasoningBudgetOverride;
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
@@ -229,10 +229,16 @@ async fn non_stream_chat_completion(
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
 
-    let prepared = prepare_chat_request(
+    // Issue #422: when the prompt-prefix cache is installed, enter the
+    // prefix-stable rendering path so unset preserve_thinking defaults to
+    // true. The store is built by startup.rs only when configured, so
+    // `state.prompt_cache.is_some()` is the operator-visible flag here.
+    let prompt_cache_enabled = state.prompt_cache.is_some();
+    let prepared = prepare_chat_request_with_cache(
         &state.chat_template,
         &request,
         state.config.chat_template_kwargs.as_ref(),
+        prompt_cache_enabled,
     )
     .await;
     let mut options = build_generate_options(&request.params, &state.config);
@@ -338,10 +344,15 @@ async fn stream_chat_completion(
 
     let request_id = format!("chatcmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
-    let prepared = prepare_chat_request(
+    // Issue #422: same prompt-cache flag as the non-streaming path so that
+    // both endpoints default preserve_thinking=true identically when the
+    // cache is installed.
+    let prompt_cache_enabled = state.prompt_cache.is_some();
+    let prepared = prepare_chat_request_with_cache(
         &state.chat_template,
         &request,
         state.config.chat_template_kwargs.as_ref(),
+        prompt_cache_enabled,
     )
     .await;
     let mut options = build_generate_options(&request.params, &state.config);

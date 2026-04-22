@@ -113,6 +113,18 @@ impl ChatTemplateProcessor {
         self.add_generation_prompt = add;
     }
 
+    /// Raw Jinja template source post-preprocessing.
+    ///
+    /// Used by the prompt-cache key composer (epic #416 / issue #422) to hash
+    /// a stable identifier of the rendering pipeline into `template_sig`. The
+    /// returned slice is the exact string used as the minijinja template, so
+    /// any non-determinism that depends on template text will be captured.
+    ///
+    /// Used by: server/prompt_cache/key::template_sig
+    pub fn template_source(&self) -> &str {
+        &self.template
+    }
+
     /// Check if the template uses the `tools` variable.
     ///
     /// Returns true when the template produces different output when `tools`

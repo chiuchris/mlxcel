@@ -138,6 +138,18 @@ impl ChatTemplateKwargs {
             .unwrap_or(false)
     }
 
+    /// Explicitly set the canonical `preserve_thinking` key.
+    ///
+    /// Used by the prompt-cache defaulting logic in
+    /// [`crate::server::chat_request::prepare_chat_request_with_cache`] to
+    /// flip the flag on when prefix stability requires it and the caller
+    /// hasn't specified a preference. Callers outside that path should
+    /// generally let the client + CLI precedence chain decide.
+    pub fn set_preserve_thinking(&mut self, value: bool) {
+        self.values
+            .insert("preserve_thinking".to_string(), Value::Bool(value));
+    }
+
     /// Merge `other` into `self` with "other wins per-key".
     ///
     /// Unrelated keys in `self` are preserved; keys present in both are
