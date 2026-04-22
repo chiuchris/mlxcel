@@ -52,6 +52,11 @@ thiserror = "2.0.11"
 # Cryptographic hashing (for vision feature cache keys)
 sha2 = "0.10"
 
+# Fast non-cryptographic-grade hashing for prompt prefix cache keys (issue #419).
+# BLAKE3 is used only for in-process cache-key digests; no security boundary
+# depends on it.
+blake3 = "1.5"
+
 # CLI
 clap = { version = "4.5.31", features = ["derive", "env"] }
 

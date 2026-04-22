@@ -26,6 +26,7 @@ use crate::distributed::pipeline::{PipelineObservability, PpTracer};
 use crate::tokenizer::MlxcelTokenizer;
 
 use super::batch::BatchObservability;
+use super::prompt_cache::PromptCacheStore;
 use super::{ChatTemplateProcessor, ModelProvider, ServerConfig};
 
 /// Server-wide metrics counters (atomic, lock-free).
@@ -159,6 +160,12 @@ pub struct AppState {
     /// Optional chrome-tracing writer (issue #350, `--debug-pp-trace`).
     /// `None` when tracing is disabled.
     pub pp_tracer: Option<Arc<PpTracer>>,
+    /// Cross-request prompt-prefix KV cache (epic #416 / issue #419). `None`
+    /// when the feature is disabled via [`super::config::ServerConfig::prompt_cache`].
+    /// The store is shared with [`ModelProvider`] so the worker thread can
+    /// publish and adopt detached caches. HTTP handlers may only call
+    /// read-only observation methods on this store.
+    pub prompt_cache: Option<Arc<PromptCacheStore>>,
 }
 
 impl AppState {
@@ -182,6 +189,7 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
+            prompt_cache: None,
         }
     }
 
@@ -209,7 +217,17 @@ impl AppState {
             metrics: Arc::new(Metrics::new()),
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
+            prompt_cache: None,
         }
+    }
+
+    /// Attach the shared prompt-prefix cache store. Pass `None` when the
+    /// feature is disabled so downstream consumers can branch on
+    /// `prompt_cache.is_some()`.
+    #[must_use]
+    pub fn with_prompt_cache(mut self, store: Option<Arc<PromptCacheStore>>) -> Self {
+        self.prompt_cache = store;
+        self
     }
 
     /// Override the default no-op pipeline observability aggregator. Used

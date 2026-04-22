@@ -23,6 +23,7 @@ mod cli_input;
 mod config;
 mod media;
 pub mod model_provider;
+pub mod prompt_cache;
 mod request_options;
 pub mod routes;
 mod startup;
@@ -47,5 +48,9 @@ pub use config::{
     RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
 };
 pub use model_provider::{GenerationResult, ModelProvider};
+pub use prompt_cache::{
+    CacheEntry, InsertError as PromptCacheInsertError, PromptCacheConfig, PromptCacheKey,
+    PromptCacheStats, PromptCacheStore,
+};
 pub use startup::{ServerStartupConfig, start_server};
 pub use state::{AppState, BatchMetrics, Metrics};

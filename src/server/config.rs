@@ -256,6 +256,15 @@ pub struct ServerConfig {
     /// every registered key — today `preserve_thinking`, tomorrow others —
     /// inherits the same precedence rules.
     pub chat_template_kwargs: Option<crate::server::chat_template_kwargs::ChatTemplateKwargs>,
+
+    /// Issue #419 / epic #416: cross-request prompt-prefix KV cache policy.
+    ///
+    /// Defaults to the baseline policy (enabled with 2 GiB / 1024 entries /
+    /// 1-hour TTL). When `enabled = false` the store is skipped entirely at
+    /// startup so no memory is reserved. CLI/env parsing for the individual
+    /// fields is tracked separately in sub-issue #424; for now operators set
+    /// the policy via the Rust API or keep the default.
+    pub prompt_cache: crate::server::prompt_cache::PromptCacheConfig,
 }
 
 impl Default for ServerConfig {
@@ -300,6 +309,7 @@ impl Default for ServerConfig {
             lang_bias_config: None,
             reasoning_budget: None,
             chat_template_kwargs: None,
+            prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
         }
     }
 }

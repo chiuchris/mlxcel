@@ -456,6 +456,11 @@ pub(super) fn build_server_config(
         lang_bias_config: startup.lang_bias_config.clone(),
         reasoning_budget: startup.reasoning_budget,
         chat_template_kwargs: startup.chat_template_kwargs.clone(),
+        // Issue #419 / #424: CLI flags arrive in #424. For now reuse the
+        // default policy so the feature is enabled out-of-the-box with
+        // conservative caps, and operators can still gate it by editing
+        // config at the Rust layer.
+        prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
     }
 }
 
@@ -1108,10 +1113,30 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     let batch_metrics = Arc::new(BatchMetrics::new());
     let batch_observability = Arc::new(BatchObservability::new());
 
-    let model_provider = Arc::new(ModelProvider::new_with_server_config(
+    // Cross-request prompt-prefix KV cache store (epic #416 / issue #419).
+    // Gated on the config flag so a disabled policy reserves zero memory.
+    let prompt_cache_store = if config.prompt_cache.is_enabled() {
+        let store = Arc::new(crate::server::prompt_cache::PromptCacheStore::with_config(
+            config.prompt_cache.clone(),
+        ));
+        tracing::info!(
+            capacity_bytes = config.prompt_cache.capacity_bytes,
+            max_entries = config.prompt_cache.max_entries,
+            ttl_seconds = config.prompt_cache.ttl.as_secs(),
+            min_prefix_tokens = config.prompt_cache.min_prefix_tokens,
+            "Prompt-prefix KV cache store enabled (epic #416 / issue #419)"
+        );
+        Some(store)
+    } else {
+        tracing::debug!("Prompt-prefix KV cache store disabled by config");
+        None
+    };
+
+    let model_provider = Arc::new(ModelProvider::new_with_server_config_and_prompt_cache(
         startup.model_path.clone(),
         startup.adapter_path.clone(),
         &config,
+        prompt_cache_store.clone(),
         batch_metrics.clone(),
         batch_observability.clone(),
     )?);
@@ -1155,7 +1180,8 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         batch_metrics,
         batch_observability,
     )
-    .with_pp_tracer(pp_tracer);
+    .with_pp_tracer(pp_tracer)
+    .with_prompt_cache(prompt_cache_store);
     let app = create_app(state);
 
     if startup.port == 0 {

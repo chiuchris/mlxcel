@@ -1,0 +1,49 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Cross-request prompt-prefix KV cache (epic #416).
+//!
+//! This module holds the shared, thread-safe store that retains detached
+//! KV caches keyed by `(model_id, lora_id, template_sig, session_key,
+//! token_prefix_hash)`. The store hands caches out to freshly arriving
+//! requests so that common prompt prefixes (system prompts, long context
+//! windows, tool-calling preambles, etc.) don't get re-prefilled per
+//! request.
+//!
+//! ## Sub-issues
+//!
+//! * #417 — [`mlxcel_core::cache::DetachedCacheSet`] and the
+//!   [`mlxcel_core::cache::CachePool`] detach/adopt API (upstream).
+//! * #419 — this module, PromptCacheStore itself.
+//! * #420 — radix trie inside `PromptCacheStore::lookup_longest_prefix`.
+//! * #422 — full `template_sig` wiring.
+//! * #423 — metrics bridge to [`super::state::BatchMetrics`].
+//! * #424 — CLI/env wiring for [`PromptCacheConfig`].
+//!
+//! Integration: [`super::startup`] constructs a shared `Arc<PromptCacheStore>`
+//! when [`PromptCacheConfig::enabled`] is true and installs it on both
+//! [`super::state::AppState`] and [`super::model_provider::ModelProvider`].
+//! When disabled the store slot stays `None` so no memory is reserved.
+
+pub mod entry;
+pub mod key;
+pub mod metrics;
+pub mod policy;
+pub mod store;
+
+pub use entry::CacheEntry;
+pub use key::{PromptCacheKey, PromptCacheKeyDigest};
+pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheMetrics};
+pub use policy::{PromptCacheConfig, PromptCacheStats};
+pub use store::{BucketKey, InsertError, PromptCacheStore};

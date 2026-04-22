@@ -65,6 +65,21 @@ pub(crate) struct WorkerSchedulerConfig {
     pub lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
     /// Issue #409: server-wide default thinking-token budget.
     pub reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
+    /// Epic #416 / issue #419: cross-request prompt-prefix KV cache store.
+    ///
+    /// `None` when the feature is disabled by
+    /// [`crate::server::prompt_cache::PromptCacheConfig::enabled`]. When
+    /// `Some`, the worker thread can publish detached caches and lookup /
+    /// adopt them on later requests. The store is thread-safe, so the same
+    /// `Arc` is also handed to `AppState` for observation-only use.
+    ///
+    /// `#[allow(dead_code)]`: this field is the plumbing hand-off for the
+    /// sub-issues that actually exercise the cache (#420 radix trie,
+    /// #423 metrics bridge, scheduler integration). The store Arc is still
+    /// moved into the worker thread so later issues can wire adopt/detach
+    /// without any additional plumbing changes.
+    #[allow(dead_code)]
+    pub prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(

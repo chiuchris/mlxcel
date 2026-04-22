@@ -110,3 +110,41 @@ fn admission_control_rejects_when_queue_at_or_above_limit() {
     m.set_queue_depth(10);
     assert!((m.queue_depth() >= max), "queue above limit should reject");
 }
+
+// ------------------------------------------------------------------
+// Prompt-prefix cache integration (issue #419)
+// ------------------------------------------------------------------
+
+/// `PromptCacheConfig` is wired onto `ServerConfig` with a sensible default
+/// (enabled, 2 GiB budget, 1024 entries, 1 h TTL, min-prefix 32 tokens).
+#[test]
+fn server_config_carries_prompt_cache_defaults() {
+    use super::super::prompt_cache::PromptCacheConfig;
+    let cfg = super::super::ServerConfig::default();
+    assert!(cfg.prompt_cache.enabled);
+    assert_eq!(
+        cfg.prompt_cache.capacity_bytes,
+        PromptCacheConfig::DEFAULT_CAPACITY_BYTES
+    );
+    assert_eq!(
+        cfg.prompt_cache.max_entries,
+        PromptCacheConfig::DEFAULT_MAX_ENTRIES
+    );
+    assert_eq!(
+        cfg.prompt_cache.ttl.as_secs(),
+        PromptCacheConfig::DEFAULT_TTL_SECONDS
+    );
+    assert_eq!(
+        cfg.prompt_cache.min_prefix_tokens,
+        PromptCacheConfig::DEFAULT_MIN_PREFIX_TOKENS
+    );
+}
+
+/// A `PromptCacheStore` behaves as `Send + Sync`, which is what lets us
+/// plumb it into both `AppState` and `ModelProvider` via `Arc`.
+#[test]
+fn prompt_cache_store_is_send_sync_via_arc() {
+    use std::sync::Arc;
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Arc<super::super::prompt_cache::PromptCacheStore>>();
+}

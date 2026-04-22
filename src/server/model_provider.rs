@@ -80,6 +80,9 @@ pub struct ModelProvider {
     loaded: Arc<AtomicBool>,
     batch_metrics: Arc<BatchMetrics>,
     batch_observability: Arc<BatchObservability>,
+    /// Shared cross-request prompt-prefix KV cache (epic #416 / issue #419).
+    /// `None` when the feature is disabled by config.
+    prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
     _worker_handle: thread::JoinHandle<()>,
 }
 
@@ -124,17 +127,44 @@ impl ModelProvider {
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
+        Self::new_with_server_config_and_prompt_cache(
+            model_path,
+            adapter_path,
+            config,
+            None,
+            batch_metrics,
+            batch_observability,
+        )
+    }
+
+    /// Same as [`Self::new_with_server_config`] but also wires the
+    /// cross-request prompt-prefix KV cache store (epic #416 / issue #419).
+    /// The legacy (`config.no_batch`) worker ignores the store because that
+    /// path never calls the batch scheduler that manages the cache.
+    pub fn new_with_server_config_and_prompt_cache(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        config: &crate::server::ServerConfig,
+        prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
+    ) -> Result<Self> {
         if config.no_batch {
-            Self::new_with_legacy_worker(
+            let mut provider = Self::new_with_legacy_worker(
                 model_path,
                 adapter_path,
                 config.tensor_parallel.clone(),
                 config.reasoning_budget,
                 batch_metrics,
                 batch_observability,
-            )
+            )?;
+            // Keep the store visible on the provider even though the
+            // legacy path won't exercise it yet — `AppState` should still
+            // be able to observe it via the model provider handle.
+            provider.prompt_cache = prompt_cache_store;
+            Ok(provider)
         } else {
-            Self::new_with_full_config_and_batch_prefill(
+            Self::new_with_full_config_and_prompt_cache(
                 model_path,
                 adapter_path,
                 config.max_batch_size,
@@ -148,6 +178,7 @@ impl ModelProvider {
                 config.vision_cache_size,
                 config.lang_bias_config.clone(),
                 config.reasoning_budget,
+                prompt_cache_store,
                 batch_metrics,
                 batch_observability,
             )
@@ -199,6 +230,7 @@ impl ModelProvider {
             loaded,
             batch_metrics,
             batch_observability,
+            prompt_cache: None,
             _worker_handle: worker_handle,
         })
     }
@@ -268,6 +300,51 @@ impl ModelProvider {
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
+        Self::new_with_full_config_and_prompt_cache(
+            model_path,
+            adapter_path,
+            max_batch_size,
+            max_queue_depth,
+            prefill_chunk_size,
+            enable_preemption,
+            preemption_policy,
+            max_batch_prefill,
+            decode_storage_backend,
+            pipeline_parallel_runtime,
+            vision_cache_size,
+            lang_bias_config,
+            reasoning_budget,
+            None,
+            batch_metrics,
+            batch_observability,
+        )
+    }
+
+    /// Full constructor variant that also accepts a shared prompt-prefix
+    /// KV cache store.
+    ///
+    /// Introduced by issue #419. `prompt_cache_store` is `None` when
+    /// [`crate::server::prompt_cache::PromptCacheConfig::enabled`] is
+    /// `false`; in that case the feature is a total no-op.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_full_config_and_prompt_cache(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        prefill_chunk_size: usize,
+        enable_preemption: bool,
+        preemption_policy: crate::server::config::PreemptionPolicy,
+        max_batch_prefill: usize,
+        decode_storage_backend: crate::server::DecodeStorageBackend,
+        pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
+        vision_cache_size: usize,
+        lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
+        reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
+        prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
+    ) -> Result<Self> {
         let model_id = model_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -294,6 +371,7 @@ impl ModelProvider {
             vision_cache_size,
             lang_bias_config,
             reasoning_budget,
+            prompt_cache: prompt_cache_store.clone(),
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -314,6 +392,7 @@ impl ModelProvider {
             loaded,
             batch_metrics,
             batch_observability,
+            prompt_cache: prompt_cache_store,
             _worker_handle: worker_handle,
         })
     }
@@ -359,6 +438,7 @@ impl ModelProvider {
             vision_cache_size: crate::vision::feature_cache::DEFAULT_VISION_CACHE_SIZE,
             lang_bias_config: None,
             reasoning_budget: None,
+            prompt_cache: None,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -379,6 +459,7 @@ impl ModelProvider {
             loaded,
             batch_metrics,
             batch_observability,
+            prompt_cache: None,
             _worker_handle: worker_handle,
         })
     }
@@ -391,6 +472,14 @@ impl ModelProvider {
     /// Get a reference to the shared batch observability counters.
     pub fn batch_observability(&self) -> &Arc<BatchObservability> {
         &self.batch_observability
+    }
+
+    /// Shared cross-request prompt-prefix KV cache store, if configured.
+    ///
+    /// `None` when the feature is disabled via
+    /// [`crate::server::prompt_cache::PromptCacheConfig::enabled`].
+    pub fn prompt_cache(&self) -> Option<&Arc<crate::server::prompt_cache::PromptCacheStore>> {
+        self.prompt_cache.as_ref()
     }
 
     /// Get model ID
