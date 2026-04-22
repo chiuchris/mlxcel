@@ -29,9 +29,10 @@
 //!   fresh [`super::SequenceId`] and prime the model's sidecar state for it.
 //!
 //! Only the **dense** KV cache backend (`SequenceStateBackend::DenseKvCache`)
-//! is supported by this API. Paged adoption is tracked separately in
-//! sub-issue #418 and intentionally rejected here with an explicit error so
-//! accidental scheduler misuse surfaces immediately.
+//! is handled directly by this file. Paged sequences are handled by the
+//! parallel API surface in [`super::paged_detach`] (sub-issue #418); this
+//! module delegates through the shared `DetachedHandle` namespace so parking
+//! remains a single pool-level abstraction.
 //!
 //! ## Memory accounting
 //!
@@ -320,6 +321,13 @@ impl DetachedHandle {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Construct a handle from a raw id. Provided for cross-module builders
+    /// (e.g. the paged detach surface in [`super::paged_detach`]) that mint
+    /// handles out of the same `CachePool::next_id` space.
+    pub(super) fn from_raw(id: u64) -> Self {
+        Self(id)
+    }
 }
 
 impl std::fmt::Display for DetachedHandle {
@@ -330,8 +338,10 @@ impl std::fmt::Display for DetachedHandle {
 
 /// Internal map of parked detached cache sets, keyed by handle. This map is
 /// attached to [`CachePool`] as `detached: DetachedMap` via the
-/// `detached` field declared in the parent module.
-pub(super) type DetachedMap = HashMap<DetachedHandle, DetachedCacheSet>;
+/// `detached` field declared in the parent module. The map stores a
+/// [`super::paged_detach::ParkedCache`] enum so dense and paged variants
+/// share the same handle namespace.
+pub(super) type DetachedMap = HashMap<DetachedHandle, super::paged_detach::ParkedCache>;
 
 // ---------------------------------------------------------------------------
 // CachePool extensions
@@ -483,20 +493,37 @@ impl CachePool {
     /// an `allocate()` slot — they only contribute to memory accounting.
     pub fn park_detached(&mut self, detached: DetachedCacheSet) -> DetachedHandle {
         let handle = DetachedHandle(self.next_id.fetch_add(1, Ordering::Relaxed));
-        self.detached.insert(handle, detached);
+        self.detached
+            .insert(handle, super::paged_detach::ParkedCache::Dense(detached));
         handle
     }
 
-    /// Retrieve a previously parked detached set, leaving the pool.
+    /// Retrieve a previously parked dense set, leaving the pool.
     ///
-    /// Returns `None` if the handle was already taken or never parked.
+    /// Returns `None` if the handle was never parked, already taken, or
+    /// points to a paged set (use [`CachePool::take_parked_paged`] for
+    /// paged sets).
     pub fn take_parked(&mut self, handle: DetachedHandle) -> Option<DetachedCacheSet> {
-        self.detached.remove(&handle)
+        match self.detached.remove(&handle) {
+            Some(super::paged_detach::ParkedCache::Dense(set)) => Some(set),
+            Some(other) => {
+                // Wrong variant — put it back so the caller can dispatch to
+                // the paged-side take_parked.
+                self.detached.insert(handle, other);
+                None
+            }
+            None => None,
+        }
     }
 
-    /// Read-only peek at a parked detached set (for inspection / metrics).
+    /// Read-only peek at a parked dense set (for inspection / metrics).
+    ///
+    /// Returns `None` if the handle points to a paged set.
     pub fn peek_parked(&self, handle: DetachedHandle) -> Option<&DetachedCacheSet> {
-        self.detached.get(&handle)
+        match self.detached.get(&handle) {
+            Some(super::paged_detach::ParkedCache::Dense(set)) => Some(set),
+            _ => None,
+        }
     }
 
     /// Convenience: consume a parked handle and re-adopt it in one call.
@@ -511,12 +538,12 @@ impl CachePool {
         self.adopt(model, detached)
     }
 
-    /// Number of currently parked detached sets.
+    /// Number of currently parked detached sets (dense and paged combined).
     pub fn parked_count(&self) -> usize {
         self.detached.len()
     }
 
-    /// Summed bytes across all parked detached sets.
+    /// Summed bytes across all parked detached sets (dense and paged).
     pub fn parked_bytes(&self) -> usize {
         self.detached.values().map(|d| d.nbytes()).sum()
     }

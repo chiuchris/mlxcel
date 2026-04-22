@@ -27,12 +27,14 @@
 
 mod detach;
 mod paged;
+mod paged_detach;
 
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache};
 pub use paged::{
     PagedBlockId, PagedBlockPool, PagedCacheStats, PagedKvLayout, PagedLayerState,
     PagedSequenceState,
 };
+pub use paged_detach::DetachedPagedCacheSet;
 
 use crate::concatenate;
 use crate::dtype;

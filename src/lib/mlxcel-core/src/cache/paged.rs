@@ -166,10 +166,34 @@ impl PagedSequenceState {
     }
 }
 
+/// Book-keeping for a single physical block owned by [`PagedBlockPool`].
+///
+/// `refcount` counts every live logical reference to the block: each
+/// `PagedSequenceState::block_ids` entry and each detached cache handle that
+/// retains the block contributes `1`. A block is considered free when
+/// `refcount == 0` and is not eligible for recycling as long as `refcount > 0`.
+///
+/// `in_use` is retained as a derived mirror of `refcount > 0` so the existing
+/// `stats_for_sequences` and internal debug assertions stay backwards
+/// compatible with call sites that inspected the flag directly before
+/// refcounts were introduced (#418).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PagedBlockRecord {
     layer_idx: usize,
-    in_use: bool,
+    refcount: u32,
+}
+
+impl PagedBlockRecord {
+    fn new(layer_idx: usize) -> Self {
+        Self {
+            layer_idx,
+            refcount: 1,
+        }
+    }
+
+    fn is_in_use(&self) -> bool {
+        self.refcount > 0
+    }
 }
 
 /// Aggregated allocator/storage counters for paged KV state.
@@ -328,7 +352,11 @@ impl PagedBlockPool {
         sequences: impl IntoIterator<Item = &'a PagedSequenceState>,
     ) -> PagedCacheStats {
         let allocated_blocks = self.blocks.len();
-        let free_blocks = self.blocks.values().filter(|record| !record.in_use).count();
+        let free_blocks = self
+            .blocks
+            .values()
+            .filter(|record| !record.is_in_use())
+            .count();
         let live_blocks = allocated_blocks.saturating_sub(free_blocks);
         let states: Vec<&PagedSequenceState> = sequences.into_iter().collect();
         let bytes_reserved = states
@@ -349,6 +377,64 @@ impl PagedBlockPool {
         }
     }
 
+    /// Current refcount of `block_id`, or `0` if the block is free or unknown.
+    ///
+    /// Used by: paged detach/adopt invariants (#418), diagnostics.
+    pub fn refcount(&self, block_id: PagedBlockId) -> u32 {
+        self.blocks
+            .get(&block_id)
+            .map(|record| record.refcount)
+            .unwrap_or(0)
+    }
+
+    /// Increment the refcount on an existing block so additional logical owners
+    /// (e.g. a detached cache handle) keep the underlying block alive.
+    ///
+    /// Fails if `block_id` is unknown or is currently on the free list (i.e.
+    /// `refcount == 0`), because pinning a freshly-reusable block would let
+    /// callers observe stale contents.
+    ///
+    /// Used by: `DetachedPagedCacheSet` construction in `cache/paged_detach.rs`.
+    pub fn retain_block(&mut self, block_id: PagedBlockId) -> Result<(), String> {
+        let record = self
+            .blocks
+            .get_mut(&block_id)
+            .ok_or_else(|| format!("PagedBlockPool: unknown block {block_id}"))?;
+        if record.refcount == 0 {
+            return Err(format!(
+                "PagedBlockPool: cannot retain released block {block_id}"
+            ));
+        }
+        record.refcount = record.refcount.saturating_add(1);
+        Ok(())
+    }
+
+    /// Drop one logical reference to `block_id`. The block returns to the free
+    /// list (and becomes eligible for recycling) only once the refcount
+    /// reaches zero.
+    ///
+    /// Used by: paged detach/adopt cleanup (#418), internal sequence tear-down.
+    pub fn release_block(&mut self, block_id: PagedBlockId) -> Result<(), String> {
+        let layer_idx = {
+            let record = self
+                .blocks
+                .get_mut(&block_id)
+                .ok_or_else(|| format!("PagedBlockPool: unknown block {block_id}"))?;
+            if record.refcount == 0 {
+                return Err(format!(
+                    "PagedBlockPool: block {block_id} was already released"
+                ));
+            }
+            record.refcount -= 1;
+            if record.refcount > 0 {
+                return Ok(());
+            }
+            record.layer_idx
+        };
+        self.free_lists[layer_idx].push(block_id);
+        Ok(())
+    }
+
     fn acquire_block(&mut self, layer_idx: usize) -> Result<PagedBlockId, String> {
         self.validate_layer(layer_idx)?;
         if let Some(block_id) = self.free_lists[layer_idx].pop() {
@@ -356,35 +442,19 @@ impl PagedBlockPool {
                 .blocks
                 .get_mut(&block_id)
                 .expect("free-list block must exist in registry");
-            record.in_use = true;
+            debug_assert_eq!(
+                record.refcount, 0,
+                "free-list block must have zero refcount"
+            );
+            record.refcount = 1;
             return Ok(block_id);
         }
 
         let block_id = PagedBlockId(self.next_block_id);
         self.next_block_id += 1;
-        self.blocks.insert(
-            block_id,
-            PagedBlockRecord {
-                layer_idx,
-                in_use: true,
-            },
-        );
+        self.blocks
+            .insert(block_id, PagedBlockRecord::new(layer_idx));
         Ok(block_id)
-    }
-
-    fn release_block(&mut self, block_id: PagedBlockId) -> Result<(), String> {
-        let record = self
-            .blocks
-            .get_mut(&block_id)
-            .ok_or_else(|| format!("PagedBlockPool: unknown block {block_id}"))?;
-        if !record.in_use {
-            return Err(format!(
-                "PagedBlockPool: block {block_id} was already released"
-            ));
-        }
-        record.in_use = false;
-        self.free_lists[record.layer_idx].push(block_id);
-        Ok(())
     }
 
     fn restore_block(&mut self, block_id: PagedBlockId, layer_idx: usize) -> Result<(), String> {
@@ -397,7 +467,7 @@ impl PagedBlockPool {
                     record.layer_idx, layer_idx
                 ));
             }
-            if record.in_use {
+            if record.is_in_use() {
                 return Err(format!(
                     "PagedBlockPool: restored block {block_id} is already marked in use"
                 ));
@@ -408,15 +478,10 @@ impl PagedBlockPool {
             {
                 self.free_lists[layer_idx].swap_remove(pos);
             }
-            record.in_use = true;
+            record.refcount = 1;
         } else {
-            self.blocks.insert(
-                block_id,
-                PagedBlockRecord {
-                    layer_idx,
-                    in_use: true,
-                },
-            );
+            self.blocks
+                .insert(block_id, PagedBlockRecord::new(layer_idx));
         }
 
         self.next_block_id = self.next_block_id.max(block_id.as_u64().saturating_add(1));
