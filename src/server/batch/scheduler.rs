@@ -59,7 +59,7 @@ use crate::server::model_provider::model_worker::{
     prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
-use crate::server::prompt_cache::key::PromptCacheKey;
+use crate::server::prompt_cache::key::{MultimodalDigest, PromptCacheKey};
 use crate::server::prompt_cache::{CacheEntry, PromptCacheStore};
 use crate::server::state::BatchMetrics;
 use crate::server::thinking_budget::{
@@ -409,6 +409,7 @@ impl BatchScheduler {
             ctx.lora_id.as_deref(),
             ctx.template_sig.as_str(),
             Some(ctx.session_key.as_str()),
+            MultimodalDigest::empty(),
             tokens,
         )
     }

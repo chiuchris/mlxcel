@@ -41,7 +41,8 @@ use mlxcel_core::cache::SequenceId;
 
 use crate::server::batch::BatchObservability;
 use crate::server::prompt_cache::{
-    CacheEntry, PromptCacheConfig, PromptCacheStore, key::PromptCacheKey,
+    CacheEntry, PromptCacheConfig, PromptCacheStore,
+    key::{MultimodalDigest, PromptCacheKey},
 };
 
 /// Produce a placeholder [`CacheEntry`] with a zero-tensor detached set.
@@ -71,7 +72,14 @@ fn make_key<'a>(
     template_sig: &'a str,
     tokens: &'a [i32],
 ) -> PromptCacheKey<'a> {
-    PromptCacheKey::new_full(model_id, None, template_sig, Some(session_key), tokens)
+    PromptCacheKey::new_full(
+        model_id,
+        None,
+        template_sig,
+        Some(session_key),
+        MultimodalDigest::empty(),
+        tokens,
+    )
 }
 
 // ---------------------------------------------------------------------------

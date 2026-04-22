@@ -103,6 +103,11 @@ fn sample_args() -> crate::ServeArgs {
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
         reasoning_budget: -1,
         chat_template_kwargs: None,
+        prompt_cache_enabled: true,
+        prompt_cache_capacity_bytes: None,
+        prompt_cache_max_entries: None,
+        prompt_cache_ttl: None,
+        prompt_cache_min_prefix: None,
     }
 }
 
