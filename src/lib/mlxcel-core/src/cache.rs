@@ -25,8 +25,10 @@
 //! method always returns FP16 tensors (dequantized on read), so the attention
 //! computation is unaffected.
 
+mod detach;
 mod paged;
 
+pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache};
 pub use paged::{
     PagedBlockId, PagedBlockPool, PagedCacheStats, PagedKvLayout, PagedLayerState,
     PagedSequenceState,
@@ -1453,6 +1455,9 @@ pub struct CachePool {
     active: HashMap<SequenceId, SequenceCacheSet>,
     max_sequences: usize,
     paged_pool: Option<PagedBlockPool>,
+    /// Detached cache sets parked inside the pool during cross-request
+    /// handoffs. See [`detach`] for the full design.
+    detached: detach::DetachedMap,
 }
 
 impl CachePool {
@@ -1463,6 +1468,7 @@ impl CachePool {
             active: HashMap::new(),
             max_sequences,
             paged_pool: None,
+            detached: HashMap::new(),
         }
     }
 
@@ -1592,9 +1598,20 @@ impl CachePool {
         self.active.len()
     }
 
-    /// Sum of `nbytes()` across all active cache sets.
+    /// Sum of `nbytes()` across all active cache sets, plus any detached
+    /// cache sets currently parked inside the pool.
+    ///
+    /// Parked sets are tensors the pool still physically holds in-flight
+    /// during cross-request handoffs (see `detach` / `adopt`), so including
+    /// them here keeps memory accounting consistent for schedulers that
+    /// admission-control on `memory_usage_bytes()`.
+    ///
+    /// Used by: `BatchScheduler::update_gauges` (server observability), any
+    /// admission-control path that caps KV memory before accepting new work.
     pub fn memory_usage_bytes(&self) -> usize {
-        self.active.values().map(|s| s.nbytes()).sum()
+        let active_bytes: usize = self.active.values().map(|s| s.nbytes()).sum();
+        let parked_bytes: usize = self.detached.values().map(|d| d.nbytes()).sum();
+        active_bytes + parked_bytes
     }
 
     pub fn append_paged_tokens(
