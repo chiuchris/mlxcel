@@ -946,6 +946,40 @@ pub struct DecoderLayer {
     pub(crate) layer_type: String,
 }
 
+/// Optional sub-op timer used by `MLXCEL_PROFILE_LAYER_SUBOPS=1` inside
+/// `DecoderLayer::forward`. Each `tick` evaluates the tensor (forcing a sync)
+/// and prints `[SUBOP ...] layer=.. name=.. ms=..` to stderr.
+struct SubopTimer {
+    enabled: bool,
+    layer_idx: usize,
+    last: std::time::Instant,
+}
+
+impl SubopTimer {
+    fn new(enabled: bool, layer_idx: usize) -> Self {
+        Self {
+            enabled,
+            layer_idx,
+            last: std::time::Instant::now(),
+        }
+    }
+
+    fn tick(&mut self, name: &str, tensor: &MlxArray) {
+        if !self.enabled {
+            return;
+        }
+        mlxcel_core::eval(tensor);
+        let dt = self.last.elapsed();
+        eprintln!(
+            "[SUBOP] layer={:02} name={} ms={:.4}",
+            self.layer_idx,
+            name,
+            dt.as_secs_f64() * 1000.0
+        );
+        self.last = std::time::Instant::now();
+    }
+}
+
 impl DecoderLayer {
     pub(crate) fn forward(
         &self,
@@ -958,61 +992,112 @@ impl DecoderLayer {
         UniquePtr<MlxArray>,
         Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
     ) {
-        let residual = mlxcel_core::copy(x);
+        self.forward_with_profile(
+            x,
+            mask,
+            cache,
+            per_layer_input,
+            shared_kv,
+            usize::MAX,
+            false,
+        )
+    }
 
-        let h = self.input_layernorm.forward(x);
-        let (h, stored_kv) = self.self_attn.forward(&h, mask, cache, shared_kv);
-        let h = self.post_attention_layernorm.forward(&h);
-        let mut h = mlxcel_core::add(&residual, &h);
+    pub(crate) fn forward_with_profile(
+        &self,
+        x: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: &mut dyn CacheInterface,
+        per_layer_input: Option<&MlxArray>,
+        shared_kv: Option<(&MlxArray, &MlxArray)>,
+        layer_idx: usize,
+        profile_subops: bool,
+    ) -> (
+        UniquePtr<MlxArray>,
+        Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
+    ) {
+        let mut timer = SubopTimer::new(profile_subops, layer_idx);
+        // Mirror mlx-lm's `residual = x` aliasing by holding a reference to
+        // the prior stage's tensor instead of copying it. The earlier
+        // `mlxcel_core::copy` calls produced a MLX Copy primitive and a fresh
+        // UniquePtr<MlxArray> per layer; both are wasted work since the
+        // residual is only *read* by the final `add`.
+        let h_attn = self.input_layernorm.forward(x);
+        timer.tick("input_layernorm", &h_attn);
+        let (h_attn, stored_kv) = self.self_attn.forward(&h_attn, mask, cache, shared_kv);
+        timer.tick("self_attn", &h_attn);
+        let h_attn = self.post_attention_layernorm.forward(&h_attn);
+        timer.tick("post_attention_layernorm", &h_attn);
+        let after_attn = mlxcel_core::add(x, &h_attn);
+        timer.tick("attn_residual_add", &after_attn);
 
-        let residual = mlxcel_core::copy(&h);
-
-        if let (Some(router), Some(experts)) = (&self.router, &self.experts) {
-            let h1 = self.pre_feedforward_layernorm.forward(&h);
+        let ffn_out = if let (Some(router), Some(experts)) = (&self.router, &self.experts) {
+            let h1 = self.pre_feedforward_layernorm.forward(&after_attn);
+            timer.tick("pre_ffn_ln_shared_mlp", &h1);
             let h1 = self.mlp.forward(&h1);
+            timer.tick("shared_mlp", &h1);
             let h1 = self
                 .post_feedforward_layernorm_1
                 .as_ref()
                 .expect("Missing Gemma4 MoE post_feedforward_layernorm_1")
                 .forward(&h1);
+            timer.tick("post_shared_mlp_ln", &h1);
 
-            let (top_k_indices, top_k_weights) = router.forward(&h);
+            let (top_k_indices, top_k_weights) = router.forward(&after_attn);
+            timer.tick("router", &top_k_indices);
             let h2 = self
                 .pre_feedforward_layernorm_2
                 .as_ref()
                 .expect("Missing Gemma4 MoE pre_feedforward_layernorm_2")
-                .forward(&h);
+                .forward(&after_attn);
+            timer.tick("pre_moe_ln", &h2);
             let h2 = experts.forward(&h2, &top_k_indices, &top_k_weights);
+            timer.tick("experts", &h2);
             let h2 = self
                 .post_feedforward_layernorm_2
                 .as_ref()
                 .expect("Missing Gemma4 MoE post_feedforward_layernorm_2")
                 .forward(&h2);
-            h = mlxcel_core::add(&h1, &h2);
+            timer.tick("post_moe_ln", &h2);
+            let combined = mlxcel_core::add(&h1, &h2);
+            timer.tick("moe_shared_add", &combined);
+            combined
         } else {
-            let h_norm = self.pre_feedforward_layernorm.forward(&h);
-            h = self.mlp.forward(&h_norm);
-        }
+            let h_norm = self.pre_feedforward_layernorm.forward(&after_attn);
+            timer.tick("pre_ffn_ln", &h_norm);
+            let out = self.mlp.forward(&h_norm);
+            timer.tick("mlp", &out);
+            out
+        };
 
-        h = self.post_feedforward_layernorm.forward(&h);
-        h = mlxcel_core::add(&residual, &h);
+        let ffn_out = self.post_feedforward_layernorm.forward(&ffn_out);
+        timer.tick("post_ffn_ln", &ffn_out);
+        let after_ffn = mlxcel_core::add(&after_attn, &ffn_out);
+        timer.tick("ffn_residual_add", &after_ffn);
 
-        if let (Some(gate_proj), Some(proj), Some(post_norm), Some(per_layer_input)) = (
+        let h = if let (Some(gate_proj), Some(proj), Some(post_norm), Some(per_layer_input)) = (
             &self.per_layer_input_gate,
             &self.per_layer_projection,
             &self.post_per_layer_input_norm,
             per_layer_input,
         ) {
-            let residual = mlxcel_core::copy(&h);
-            let gate = gate_proj.forward(&h);
+            let gate = gate_proj.forward(&after_ffn);
+            timer.tick("per_layer_gate_proj", &gate);
             let gate = mlxcel_core::gelu_approx(&gate);
             let gate = mlxcel_core::multiply(&gate, per_layer_input);
             let gate = proj.forward(&gate);
+            timer.tick("per_layer_proj", &gate);
             let gate = post_norm.forward(&gate);
-            h = mlxcel_core::add(&residual, &gate);
-        }
+            timer.tick("per_layer_post_norm", &gate);
+            let combined = mlxcel_core::add(&after_ffn, &gate);
+            timer.tick("per_layer_residual_add", &combined);
+            combined
+        } else {
+            after_ffn
+        };
 
-        h = mlxcel_core::multiply(&h, &self.layer_scalar);
+        let h = mlxcel_core::multiply(&h, &self.layer_scalar);
+        timer.tick("layer_scalar", &h);
         (h, stored_kv)
     }
 
@@ -1219,6 +1304,19 @@ impl Gemma4TextModel {
             HashMap::new();
         let n_layers = self.layers.len();
 
+        // Per-layer profiling: set `MLXCEL_PROFILE_PER_LAYER=1` to dump a
+        // `[LAYER xx] type=... ms=...` line to stderr for every layer on
+        // every call. Forces `eval` before and after each layer so the
+        // measured times include all kernels queued inside that layer.
+        // Distorts absolute decode throughput (short-circuits graph
+        // fusion), so use it for relative per-layer breakdowns only.
+        //
+        // `MLXCEL_PROFILE_LAYER_SUBOPS=1` extends this by emitting a
+        // `[SUBOP] layer=xx name=.. ms=..` line per sub-step inside the
+        // layer (input_ln, self_attn, post_ln, MoE router/experts, etc.).
+        let profile_per_layer = std::env::var("MLXCEL_PROFILE_PER_LAYER").is_ok();
+        let profile_subops = std::env::var("MLXCEL_PROFILE_LAYER_SUBOPS").is_ok();
+
         for (i, layer) in self.layers.iter().enumerate() {
             let cache = caches[i].as_interface();
             let mut shared_kv = None;
@@ -1247,14 +1345,32 @@ impl Gemma4TextModel {
             });
 
             let pre_offset = cache.offset();
-            let (next_h, stored_kv) = layer.forward(
+            let layer_start = if profile_per_layer {
+                mlxcel_core::eval(&h);
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
+            let (next_h, stored_kv) = layer.forward_with_profile(
                 &h,
                 local_mask,
                 cache,
                 layer_input.as_ref().map(|arr| arr.as_ref().unwrap()),
                 shared_kv,
+                i,
+                profile_subops,
             );
             h = next_h;
+            if let Some(start) = layer_start {
+                mlxcel_core::eval(&h);
+                eprintln!(
+                    "[LAYER {:02}] type={} seq_len={} ms={:.3}",
+                    i,
+                    layer.layer_type,
+                    l,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
 
             if let Some((keys, values)) = stored_kv {
                 shared_kv_store.insert(i, (keys, values, pre_offset));
@@ -2158,6 +2274,15 @@ impl LanguageModel for Gemma4Wrapper {
     }
 
     fn supports_padded_prefill(&self) -> bool {
+        // Tried enabling NA tile-aligned padded prefill (both with explicit
+        // mask and maskless-causal) for the per_layer_input-free variants
+        // (26B-a4b, 31B) and measured no change vs the default bulk forward
+        // (26B long prefill 1836 → 1832 tok/s, 31B 430 → 435 tok/s — all
+        // within run-to-run noise). Gemma 4's attention mix (sliding window,
+        // K=V for full-attention layers, proportional RoPE) does not benefit
+        // from the tile-aligned path in the same way plain causal models do,
+        // so we keep the conservative default until a profiling-driven
+        // rewrite of the prefill path.
         false
     }
 }
