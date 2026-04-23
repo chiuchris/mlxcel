@@ -25,6 +25,13 @@ pub struct Delta {
     pub role: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
+    /// Reasoning / thinking channel content for models that expose a separate
+    /// scratchpad (Gemma 4 `<|channel>thought\n...<channel|>`, Qwen3/DeepSeek
+    /// `<think>...</think>`, Gemini `<thought>...</thought>`). Mirrors OpenAI's
+    /// `o1` / DeepSeek R1 streaming convention so downstream routers and UIs
+    /// can render a "thinking" status without parsing model-specific markers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     /// Tool call deltas for streaming tool call output
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallDelta>>,
@@ -102,6 +109,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: None,
@@ -134,10 +142,41 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: Some(content),
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: None,
                 logprobs,
+            }],
+            usage: None,
+        }
+    }
+
+    /// Create a reasoning-channel chunk.
+    ///
+    /// Emitted while the model is inside a scratchpad/thinking block (Gemma 4
+    /// `<|channel>thought\n...<channel|>`, Qwen3/DeepSeek `<think>...</think>`,
+    /// etc.). Carried as `delta.reasoning_content` instead of `delta.content`
+    /// so downstream routers and UIs can surface a "thinking" state without
+    /// parsing model-specific markers themselves. Matches OpenAI's `o1` and
+    /// DeepSeek R1 streaming conventions.
+    pub fn reasoning_content(id: String, model: String, text: String) -> Self {
+        Self {
+            id,
+            object: "chat.completion.chunk".to_string(),
+            created: chrono::Utc::now().timestamp(),
+            model,
+            system_fingerprint: None,
+            choices: vec![StreamChoice {
+                index: 0,
+                delta: Delta {
+                    role: None,
+                    content: None,
+                    reasoning_content: Some(text),
+                    tool_calls: None,
+                },
+                finish_reason: None,
+                logprobs: None,
             }],
             usage: None,
         }
@@ -156,6 +195,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                     tool_calls: None,
                 },
                 finish_reason: Some(finish_reason),
@@ -184,6 +224,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index,
                         id: Some(call_id),
@@ -219,6 +260,7 @@ impl ChatCompletionChunk {
                 delta: Delta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
                     tool_calls: Some(vec![ToolCallDelta {
                         index,
                         id: None,

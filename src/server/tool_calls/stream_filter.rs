@@ -25,6 +25,45 @@
 //!
 //! Used by: routes/chat (streaming path)
 
+/// Split output from [`StreamFilter::feed`] / [`StreamFilter::flush`].
+///
+/// `content` is text that should be emitted to the client as
+/// `delta.content`; `reasoning` is text that belongs inside a scratchpad /
+/// thinking block (Gemma 4 `<|channel>thought\n...<channel|>`) and should be
+/// emitted as `delta.reasoning_content` so downstream routers and UIs can
+/// display a "thinking" status without parsing model-specific markers. Both
+/// are `None` when the fragment was fully buffered or fell inside a
+/// tool-call block (tool calls are materialized by the non-streaming parser
+/// path, not here).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilterOutput {
+    pub content: Option<String>,
+    pub reasoning: Option<String>,
+}
+
+impl FilterOutput {
+    /// Convenience constructor for a content-only emit.
+    pub fn content(text: String) -> Self {
+        Self {
+            content: Some(text),
+            reasoning: None,
+        }
+    }
+
+    /// Convenience constructor for a reasoning-only emit.
+    pub fn reasoning(text: String) -> Self {
+        Self {
+            content: None,
+            reasoning: Some(text),
+        }
+    }
+
+    /// `true` when the filter produced no output at all.
+    pub fn is_empty(&self) -> bool {
+        self.content.is_none() && self.reasoning.is_none()
+    }
+}
+
 /// Action to take when a delimiter is matched.
 #[derive(Debug, Clone, Copy)]
 enum DelimiterAction {
@@ -101,30 +140,54 @@ impl StreamFilter {
         }
     }
 
-    /// Feed a decoded text fragment.  Returns content to emit as a
-    /// `delta.content` chunk, or `None` if the text was suppressed.
-    pub fn feed(&mut self, fragment: &str) -> Option<String> {
+    /// Create a filter that starts inside a `Thinking` block.
+    ///
+    /// Use when the chat template's generation prompt primed an open
+    /// `<|channel>thought\n` (Gemma 4 `enable_thinking=true` branch): the
+    /// first emitted token is already reasoning content, not a regular
+    /// response, so suppress it until the model emits `<channel|>` to
+    /// transition back to `Content`. If the model never closes the block,
+    /// the entire generation is suppressed — matching the non-streaming
+    /// post-processor behavior in `routes::chat::strip_unclosed_primed_thinking`.
+    pub fn new_primed_open_thinking() -> Self {
+        let mut s = Self::new();
+        s.state = FilterState::Thinking;
+        s
+    }
+
+    /// Feed a decoded text fragment. Returns split output: `content` holds
+    /// text that should be emitted as `delta.content`, `reasoning` holds
+    /// text that should be emitted as `delta.reasoning_content`. Either (or
+    /// both) may be `None` when the fragment is entirely buffered / suppressed.
+    pub fn feed(&mut self, fragment: &str) -> FilterOutput {
         self.buffer.push_str(fragment);
         self.drain_buffer()
     }
 
     /// Flush any remaining buffered content at the end of generation.
-    pub fn flush(&mut self) -> Option<String> {
+    ///
+    /// Emits the tail under the channel that matches the filter's current
+    /// state: anything still buffered inside `Thinking` surfaces as
+    /// `reasoning`, anything inside `Content` surfaces as `content`, and
+    /// anything inside `ToolCall` is discarded (tool-call deltas are emitted
+    /// via the parser path, not here).
+    pub fn flush(&mut self) -> FilterOutput {
         if self.buffer.is_empty() {
-            return None;
+            return FilterOutput::default();
         }
         let remaining = std::mem::take(&mut self.buffer);
-        if self.state == FilterState::Content && !remaining.is_empty() {
-            Some(remaining)
-        } else {
-            None
+        match self.state {
+            FilterState::Content if !remaining.is_empty() => FilterOutput::content(remaining),
+            FilterState::Thinking if !remaining.is_empty() => FilterOutput::reasoning(remaining),
+            _ => FilterOutput::default(),
         }
     }
 
-    /// Process the internal buffer: find delimiters, emit content, and
-    /// transition states.
-    fn drain_buffer(&mut self) -> Option<String> {
-        let mut output = String::new();
+    /// Process the internal buffer: find delimiters, emit content/reasoning,
+    /// and transition states.
+    fn drain_buffer(&mut self) -> FilterOutput {
+        let mut content = String::new();
+        let mut reasoning = String::new();
 
         loop {
             if self.buffer.is_empty() {
@@ -133,9 +196,15 @@ impl StreamFilter {
 
             match self.find_earliest_delimiter() {
                 Some((pos, delim_len, action)) => {
-                    // Text before the delimiter
-                    if pos > 0 && self.state == FilterState::Content {
-                        output.push_str(&self.buffer[..pos]);
+                    // Text before the delimiter is attributed to the current
+                    // state so thinking fragments surface as reasoning and
+                    // regular fragments surface as content.
+                    if pos > 0 {
+                        match self.state {
+                            FilterState::Content => content.push_str(&self.buffer[..pos]),
+                            FilterState::Thinking => reasoning.push_str(&self.buffer[..pos]),
+                            FilterState::ToolCall => {}
+                        }
                     }
 
                     // Consume the delimiter and transition (drain in-place
@@ -149,10 +218,12 @@ impl StreamFilter {
                     // at the tail and hold it back.
                     let safe_len = self.safe_emit_length();
 
-                    if safe_len > 0 && self.state == FilterState::Content {
-                        output.push_str(&self.buffer[..safe_len]);
-                    }
                     if safe_len > 0 {
+                        match self.state {
+                            FilterState::Content => content.push_str(&self.buffer[..safe_len]),
+                            FilterState::Thinking => reasoning.push_str(&self.buffer[..safe_len]),
+                            FilterState::ToolCall => {}
+                        }
                         self.buffer.drain(..safe_len);
                     }
                     break;
@@ -160,10 +231,13 @@ impl StreamFilter {
             }
         }
 
-        if output.is_empty() {
-            None
-        } else {
-            Some(output)
+        FilterOutput {
+            content: if content.is_empty() { None } else { Some(content) },
+            reasoning: if reasoning.is_empty() {
+                None
+            } else {
+                Some(reasoning)
+            },
         }
     }
 
@@ -242,13 +316,13 @@ mod tests {
     #[test]
     fn no_special_tokens_passthrough() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("Hello world"), Some("Hello world".to_string()));
+        assert_eq!(f.feed("Hello world").content, Some("Hello world".to_string()));
     }
 
     #[test]
     fn empty_fragment() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed(""), None);
+        assert_eq!(f.feed("").content, None);
     }
 
     // -- Thinking blocks --
@@ -257,15 +331,14 @@ mod tests {
     fn thinking_only() {
         let mut f = StreamFilter::new();
         let result = f.feed("<|channel>thought\nI should search.<channel|><turn|>");
-        assert_eq!(result, None);
+        assert_eq!(result.content, None);
     }
 
     #[test]
     fn thinking_then_content() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer."),
-            Some("Here is the answer.".to_string())
+            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.").content, Some("Here is the answer.".to_string())
         );
     }
 
@@ -273,8 +346,7 @@ mod tests {
     fn thinking_then_content_with_turn() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.<turn|>"),
-            Some("Here is the answer.".to_string())
+            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.<turn|>").content, Some("Here is the answer.".to_string())
         );
     }
 
@@ -283,7 +355,7 @@ mod tests {
         let mut f = StreamFilter::new();
         let input = "<|channel>thought\nI need to search.<channel|>\
                       <|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|><turn|>";
-        assert_eq!(f.feed(input), None);
+        assert_eq!(f.feed(input).content, None);
     }
 
     // -- Tool call blocks --
@@ -292,15 +364,14 @@ mod tests {
     fn content_then_tool_call() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("Let me search.<|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|>"),
-            Some("Let me search.".to_string())
+            f.feed("Let me search.<|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|>").content, Some("Let me search.".to_string())
         );
     }
 
     #[test]
     fn tool_call_only() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("<|tool_call>call:fn{}<tool_call|>"), None);
+        assert_eq!(f.feed("<|tool_call>call:fn{}<tool_call|>").content, None);
     }
 
     // -- Turn markers --
@@ -308,22 +379,21 @@ mod tests {
     #[test]
     fn strips_trailing_turn() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("Answer"), Some("Answer".to_string()));
-        assert_eq!(f.feed("<turn|>"), None);
+        assert_eq!(f.feed("Answer").content, Some("Answer".to_string()));
+        assert_eq!(f.feed("<turn|>").content, None);
     }
 
     #[test]
     fn strips_leading_turn() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("<|turn>Hello"), Some("Hello".to_string()));
+        assert_eq!(f.feed("<|turn>Hello").content, Some("Hello".to_string()));
     }
 
     #[test]
     fn strips_think_marker() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("Before<|think|>After"),
-            Some("BeforeAfter".to_string())
+            f.feed("Before<|think|>After").content, Some("BeforeAfter".to_string())
         );
     }
 
@@ -333,28 +403,27 @@ mod tests {
     fn partial_delimiter_at_end() {
         let mut f = StreamFilter::new();
         // Fragment ends mid-delimiter "<|to" — could be "<|tool_call>"
-        assert_eq!(f.feed("Hello <|to"), Some("Hello ".to_string()));
+        assert_eq!(f.feed("Hello <|to").content, Some("Hello ".to_string()));
         // Next fragment completes the delimiter
-        assert_eq!(f.feed("ol_call>rest<tool_call|>"), None);
+        assert_eq!(f.feed("ol_call>rest<tool_call|>").content, None);
     }
 
     #[test]
     fn partial_delimiter_resolves_to_content() {
         let mut f = StreamFilter::new();
         // "<|" at the end could start a delimiter
-        assert_eq!(f.feed("test <|"), Some("test ".to_string()));
+        assert_eq!(f.feed("test <|").content, Some("test ".to_string()));
         // Next fragment shows it's not a delimiter
-        assert_eq!(f.feed("not_a_delim"), Some("<|not_a_delim".to_string()));
+        assert_eq!(f.feed("not_a_delim").content, Some("<|not_a_delim".to_string()));
     }
 
     #[test]
     fn partial_channel_delimiter() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("Hello <|cha"), Some("Hello ".to_string()));
+        assert_eq!(f.feed("Hello <|cha").content, Some("Hello ".to_string()));
         // Completes the channel delimiter
         assert_eq!(
-            f.feed("nnel>thought\nthinking<channel|>World"),
-            Some("World".to_string())
+            f.feed("nnel>thought\nthinking<channel|>World").content, Some("World".to_string())
         );
     }
 
@@ -363,16 +432,16 @@ mod tests {
         let mut f = StreamFilter::new();
         // "< 3" does NOT match any delimiter prefix (none start with "< ")
         // so the entire text passes through immediately.
-        assert_eq!(f.feed("2 < 3"), Some("2 < 3".to_string()));
+        assert_eq!(f.feed("2 < 3").content, Some("2 < 3".to_string()));
     }
 
     #[test]
     fn trailing_angle_bracket_buffered() {
         let mut f = StreamFilter::new();
         // A lone '<' at the very end IS held back (could start any delimiter)
-        assert_eq!(f.feed("end<"), Some("end".to_string()));
+        assert_eq!(f.feed("end<").content, Some("end".to_string()));
         // Next fragment resolves it — not a delimiter
-        assert_eq!(f.feed(" more"), Some("< more".to_string()));
+        assert_eq!(f.feed(" more").content, Some("< more".to_string()));
     }
 
     // -- Multi-fragment streaming --
@@ -380,33 +449,32 @@ mod tests {
     #[test]
     fn token_by_token_content() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("Hello"), Some("Hello".to_string()));
-        assert_eq!(f.feed(" "), Some(" ".to_string()));
-        assert_eq!(f.feed("world"), Some("world".to_string()));
+        assert_eq!(f.feed("Hello").content, Some("Hello".to_string()));
+        assert_eq!(f.feed(" ").content, Some(" ".to_string()));
+        assert_eq!(f.feed("world").content, Some("world".to_string()));
     }
 
     #[test]
     fn token_by_token_thinking_then_content() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("<|channel>"), None);
-        assert_eq!(f.feed("thought\n"), None);
-        assert_eq!(f.feed("I am thinking."), None);
-        assert_eq!(f.feed("<channel|>"), None);
+        assert_eq!(f.feed("<|channel>").content, None);
+        assert_eq!(f.feed("thought\n").content, None);
+        assert_eq!(f.feed("I am thinking.").content, None);
+        assert_eq!(f.feed("<channel|>").content, None);
         assert_eq!(
-            f.feed("Here is my answer."),
-            Some("Here is my answer.".to_string())
+            f.feed("Here is my answer.").content, Some("Here is my answer.".to_string())
         );
     }
 
     #[test]
     fn token_by_token_tool_call() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("<|tool_call>"), None);
-        assert_eq!(f.feed("call:search{"), None);
-        assert_eq!(f.feed("query:<|\"|>test<|\"|>}"), None);
-        assert_eq!(f.feed("<tool_call|>"), None);
+        assert_eq!(f.feed("<|tool_call>").content, None);
+        assert_eq!(f.feed("call:search{").content, None);
+        assert_eq!(f.feed("query:<|\"|>test<|\"|>}").content, None);
+        assert_eq!(f.feed("<tool_call|>").content, None);
         // Back in content state
-        assert_eq!(f.flush(), None);
+        assert_eq!(f.flush().content, None);
     }
 
     // -- Flush --
@@ -415,17 +483,17 @@ mod tests {
     fn flush_emits_buffered_content() {
         let mut f = StreamFilter::new();
         // '<' is held back as potential delimiter start
-        assert_eq!(f.feed("end<"), Some("end".to_string()));
+        assert_eq!(f.feed("end<").content, Some("end".to_string()));
         // Flush at end of generation: emit the held-back '<'
-        assert_eq!(f.flush(), Some("<".to_string()));
+        assert_eq!(f.flush().content, Some("<".to_string()));
     }
 
     #[test]
     fn flush_in_thinking_suppresses() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("<|channel>unclosed thinking"), None);
+        assert_eq!(f.feed("<|channel>unclosed thinking").content, None);
         // Still in thinking state at flush — suppress
-        assert_eq!(f.flush(), None);
+        assert_eq!(f.flush().content, None);
     }
 
     // -- No false positives --
@@ -435,14 +503,85 @@ mod tests {
         let mut f = StreamFilter::new();
         // HTML-like content should pass through
         assert_eq!(
-            f.feed("<div>hello</div>"),
-            Some("<div>hello</div>".to_string())
+            f.feed("<div>hello</div>").content, Some("<div>hello</div>".to_string())
         );
     }
 
     #[test]
     fn pipe_in_normal_text() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("a | b | c"), Some("a | b | c".to_string()));
+        assert_eq!(f.feed("a | b | c").content, Some("a | b | c".to_string()));
+    }
+
+    // -- Reasoning split (FilterOutput.content vs .reasoning) --
+
+    #[test]
+    fn thinking_block_surfaces_as_reasoning_not_content() {
+        // Inside a `<|channel>thought…<channel|>` block, fragments belong to
+        // `reasoning` so the server can emit them as `delta.reasoning_content`
+        // SSE chunks. Content after the close stays in `content`.
+        let mut f = StreamFilter::new();
+        let out = f.feed("<|channel>thought\nReasoning text<channel|>Answer text");
+        assert_eq!(out.reasoning.as_deref(), Some("thought\nReasoning text"));
+        assert_eq!(out.content.as_deref(), Some("Answer text"));
+    }
+
+    #[test]
+    fn primed_open_thinking_starts_in_reasoning_state() {
+        // When the chat template primed an open `<|channel>thought\n` at the
+        // end of the generation prompt, the model's first emitted tokens are
+        // already inside the thinking channel. Starting the filter in
+        // `Thinking` state routes them to `reasoning`.
+        let mut f = StreamFilter::new_primed_open_thinking();
+        let out = f.feed("I am thinking<channel|>the answer");
+        assert_eq!(out.reasoning.as_deref(), Some("I am thinking"));
+        assert_eq!(out.content.as_deref(), Some("the answer"));
+    }
+
+    #[test]
+    fn primed_open_thinking_unclosed_suppresses_content_entirely() {
+        // Model ran out of budget inside the primed channel — never emits
+        // `<channel|>`. The filter keeps every token in `reasoning` and
+        // leaves `content` empty, including on flush.
+        let mut f = StreamFilter::new_primed_open_thinking();
+        let out = f.feed("reasoning continues");
+        assert_eq!(out.content, None);
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning continues"));
+
+        let flushed = f.flush();
+        assert_eq!(flushed.content, None);
+        // Buffer was already drained inside feed, so flush has nothing left
+        // to surface. Either None or empty is acceptable.
+        assert!(
+            flushed.reasoning.as_deref().unwrap_or("").is_empty(),
+            "flush must not leak buffered reasoning as content"
+        );
+    }
+
+    #[test]
+    fn primed_open_thinking_token_by_token() {
+        // Fragment-by-fragment streaming: every pre-close token is reasoning,
+        // every post-close token is content.
+        let mut f = StreamFilter::new_primed_open_thinking();
+        assert_eq!(f.feed("Let me").reasoning.as_deref(), Some("Let me"));
+        assert_eq!(f.feed(" think.").reasoning.as_deref(), Some(" think."));
+        // Close marker transitions state; nothing emitted on the marker itself.
+        let closing = f.feed("<channel|>");
+        assert!(closing.reasoning.is_none());
+        assert!(closing.content.is_none());
+        // After the close, fragments are content.
+        assert_eq!(f.feed("Done.").content.as_deref(), Some("Done."));
+    }
+
+    #[test]
+    fn flush_in_content_state_emits_content_only() {
+        // Pre-existing behavior: when the filter is in the Content state at
+        // flush, any buffered tail surfaces as content (not reasoning).
+        let mut f = StreamFilter::new();
+        // '<' is held back as a potential delimiter start.
+        assert_eq!(f.feed("end<").content.as_deref(), Some("end"));
+        let flushed = f.flush();
+        assert_eq!(flushed.content.as_deref(), Some("<"));
+        assert!(flushed.reasoning.is_none());
     }
 }

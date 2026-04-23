@@ -29,11 +29,37 @@ use crate::server::types::request::Tool;
 /// - `<think>...</think>` — DeepSeek R1, Granite 3.3, etc.
 /// - `<|channel>...<channel|>` — Gemma 4 thinking channels
 ///
+/// Also handles the **prompt-primed** Gemma 4 case: when the chat template's
+/// generation prompt ended with `<|channel>thought\n` (open), the model's
+/// generated text starts inside the thinking channel and only carries the
+/// closing `<channel|>` — no matching `<|channel>` is ever emitted. Without
+/// this case, every token before the first `<channel|>` leaks into the
+/// user-visible content. Treat a leading (pre-first-`<|channel>`) `<channel|>`
+/// as the close of an implicit open.
+///
 /// Used by: tool_calls::parser
 fn strip_thinking(text: &str) -> String {
-    let pairs: &[(&str, &str)] = &[("<think>", "</think>"), ("<|channel>", "<channel|>")];
+    // Prompt-primed Gemma 4: strip everything up to (and including) the first
+    // `<channel|>` when no opening `<|channel>` precedes it. Runs before the
+    // balanced-pair pass so subsequent `<|channel>...<channel|>` blocks (if
+    // any) still get handled uniformly.
+    let mut result = {
+        const CLOSE: &str = "<channel|>";
+        const OPEN: &str = "<|channel>";
+        match text.find(CLOSE) {
+            Some(close_pos) => {
+                let before_close = &text[..close_pos];
+                if before_close.contains(OPEN) {
+                    text.to_string()
+                } else {
+                    text[close_pos + CLOSE.len()..].to_string()
+                }
+            }
+            None => text.to_string(),
+        }
+    };
 
-    let mut result = text.to_string();
+    let pairs: &[(&str, &str)] = &[("<think>", "</think>"), ("<|channel>", "<channel|>")];
     for &(open, close) in pairs {
         let mut new_result = String::with_capacity(result.len());
         let mut remaining = result.as_str();
@@ -104,7 +130,14 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
     let text = cleaned.trim();
 
     if text.is_empty() {
-        return ToolCallParseResult::none(raw_output.to_string());
+        // All generation was thinking-channel content (common when the Gemma 4
+        // generation prompt primes an open `<|channel>thought\n` and the
+        // model fills it for the whole window). Returning the raw bytes here
+        // would leak every token of reasoning into the user-visible content;
+        // return empty content instead so the response is a clean "model
+        // thought but produced no answer" rather than a wall of `<|channel>`
+        // markers.
+        return ToolCallParseResult::none(String::new());
     }
 
     // Try each format in order of specificity (most distinctive markers first)
@@ -447,5 +480,66 @@ mod tests {
         let input = "<|turn>content<turn|><|think|>";
         let result = clean_content_markers(input);
         assert_eq!(result, "content");
+    }
+
+    // -- Prompt-primed Gemma 4 (enable_thinking=true) --
+    //
+    // When the chat template ends the generation prompt with an OPEN
+    // `<|channel>thought\n` marker, the model's generated text begins inside
+    // the thinking channel and only carries the closing `<channel|>` — no
+    // matching open is ever emitted. `strip_thinking` must recognize that
+    // lonely close as the end of the primed thinking block.
+
+    #[test]
+    fn strip_thinking_prompt_primed_close_drops_preceding_thinking() {
+        // Model wrote scratchpad notes, then closed the channel the prompt
+        // primed, then wrote its real answer. The scratchpad has no matching
+        // `<|channel>` in the generated text (the open was in the prompt).
+        let input = "*   Goal: …\n    *   Steps …<channel|>Here is the answer.";
+        let result = strip_thinking(input);
+        assert_eq!(result, "Here is the answer.");
+    }
+
+    #[test]
+    fn strip_thinking_prompt_primed_close_then_tool_call() {
+        // Same shape but the post-thinking content is a Gemma 4 tool call.
+        // The parser below extracts the call; strip_thinking is only
+        // responsible for dropping the prompt-primed thinking prefix.
+        let input =
+            "thinking about it<channel|><|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>";
+        let result = strip_thinking(input);
+        assert_eq!(
+            result,
+            "<|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>"
+        );
+    }
+
+    #[test]
+    fn strip_thinking_preserves_balanced_channel_after_orphan_close() {
+        // A close without a preceding open strips; a second balanced
+        // `<|channel>…<channel|>` block afterwards strips normally too.
+        let input = "prompt thinking<channel|>middle<|channel>more thought<channel|>tail";
+        let result = strip_thinking(input);
+        assert_eq!(result, "middletail");
+    }
+
+    #[test]
+    fn parse_tool_calls_empty_after_strip_returns_empty_content() {
+        // Previously we fell back to `raw_output` when stripping emptied the
+        // text, which leaked the scratchpad back into the visible response.
+        // Now the empty result is respected so the user sees nothing rather
+        // than a wall of thinking markers when the model ran past budget
+        // inside a primed channel.
+        let raw = "thinking that never closes the channel";
+        let result = parse_tool_calls(raw, None);
+        // The prep-step in strip_thinking finds no `<channel|>` and leaves
+        // text as-is, so for this specific input nothing is stripped.
+        assert_eq!(result.content, "thinking that never closes the channel");
+
+        // But when the prompt-primed orphan close IS present and consumes
+        // everything, content stays empty (no fallback to raw).
+        let raw2 = "all thinking<channel|>";
+        let result2 = parse_tool_calls(raw2, None);
+        assert_eq!(result2.content, "");
     }
 }

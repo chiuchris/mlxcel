@@ -125,6 +125,64 @@ impl ChatTemplateProcessor {
         &self.template
     }
 
+    /// Detect a Gemma-4-style chat template whose `enable_thinking=true`
+    /// branch produces a generation prompt ending at `<|turn>model\n`
+    /// (no `<|channel>thought` priming).
+    ///
+    /// Without a priming marker, quantized Gemma 4 produces degenerate
+    /// first-token logits when the system turn also carries non-trivial
+    /// tool declarations ("own- own-", "fear- own-" style loops). The
+    /// companion [`Self::patch_gemma4_generation_prompt`] fixes this by
+    /// appending an OPEN `<|channel>thought\n` marker so the model reliably
+    /// enters its reasoning channel and can emit `<|tool_call>` blocks
+    /// afterwards.
+    ///
+    /// The detection is intentionally conservative: it requires BOTH the
+    /// `<|channel>thought` marker AND the `not enable_thinking` guard that
+    /// define this branch, so Qwen3's `<think>` path and other non-Gemma
+    /// templates are unaffected.
+    fn enable_thinking_drops_priming(&self) -> bool {
+        self.template.contains("<|channel>thought")
+            && self.template.contains("not enable_thinking")
+    }
+
+    /// Append an open `<|channel>thought\n` priming to a Gemma-4-rendered
+    /// prompt when the template produced the un-primed `<|turn>model\n`
+    /// ending. Returns the input unchanged when the template is not
+    /// Gemma-4 style, `enable_thinking` is not `true`, or the rendered
+    /// prompt already ends with a priming marker.
+    fn patch_gemma4_generation_prompt(
+        &self,
+        rendered: String,
+        kwargs: &ChatTemplateKwargs,
+    ) -> String {
+        if !self.add_generation_prompt || !self.enable_thinking_drops_priming() {
+            return rendered;
+        }
+        let thinking_on = kwargs
+            .get("enable_thinking")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true);
+        if !thinking_on {
+            return rendered;
+        }
+        // Only patch the exact ending the un-primed branch produces. Any
+        // trailing whitespace, extra marker, or pre-existing priming means
+        // the prompt is already in a shape we don't want to touch.
+        const BAD_END: &str = "<|turn>model\n";
+        if !rendered.ends_with(BAD_END) {
+            return rendered;
+        }
+        tracing::debug!(
+            "Gemma 4: appending open <|channel>thought\\n priming for enable_thinking=true \
+             (raw template leaves the prompt at <|turn>model\\n, which destabilizes first \
+             token logits and suppresses tool-call emission)"
+        );
+        let mut out = rendered;
+        out.push_str("<|channel>thought\n");
+        out
+    }
+
     /// Check if the template uses the `tools` variable.
     ///
     /// Returns true when the template produces different output when `tools`
@@ -257,7 +315,7 @@ impl ChatTemplateProcessor {
             .render(context)
             .with_context(|| "Failed to render chat template")?;
 
-        Ok(result)
+        Ok(self.patch_gemma4_generation_prompt(result, kwargs))
     }
 
     /// Apply the chat template to messages.
@@ -318,7 +376,7 @@ impl ChatTemplateProcessor {
             .render(context)
             .with_context(|| "Failed to render chat template")?;
 
-        Ok(result)
+        Ok(self.patch_gemma4_generation_prompt(result, kwargs))
     }
 }
 
@@ -1494,5 +1552,103 @@ TOOL
             out.contains("KEEP"),
             "preserve_thinking=true must reach template"
         );
+    }
+
+    // ----- Gemma 4 enable_thinking priming fix -----
+    //
+    // These tests cover the regression where Gemma 4's chat template
+    // dropped the generation-prompt priming when `enable_thinking=true`,
+    // leaving the prompt at `<|turn>model\n` and destabilizing first-token
+    // logits. The fix appends an open `<|channel>thought\n` priming so the
+    // model reliably enters its reasoning channel.
+
+    /// Minimal Gemma-4-shaped template that reproduces the pattern of
+    /// interest: opens a `<|turn>model\n` generation prompt and guards the
+    /// `<|channel>thought\n<channel|>` priming behind `not enable_thinking`.
+    /// Small enough to keep tests fast; keeps the exact marker strings the
+    /// detection helpers look for and mirrors the upstream template's use
+    /// of explicit `\n` literals inside whitespace-stripped blocks so the
+    /// rendered prompt really ends with `<|turn>model\n`.
+    const GEMMA4_LIKE_TEMPLATE: &str = "{{- bos_token -}}<|turn>user\n\
+        {{- messages[0].content -}}<turn|>\n\
+        {{- '<|turn>model\\n' -}}\
+        {%- if not enable_thinking | default(false) -%}\
+        {{- '<|channel>thought\\n<channel|>' -}}\
+        {%- endif -%}";
+
+    #[test]
+    fn enable_thinking_drops_priming_detects_gemma4_shape() {
+        let gemma4 = ChatTemplateProcessor::with_template(GEMMA4_LIKE_TEMPLATE.to_string());
+        assert!(gemma4.enable_thinking_drops_priming());
+
+        // Plain default (no channel marker) must NOT trigger — guards against
+        // false positives on non-Gemma templates such as Qwen3's <think> path.
+        let plain = ChatTemplateProcessor::default();
+        assert!(!plain.enable_thinking_drops_priming());
+
+        // A template with `<|channel>` but no `not enable_thinking` guard
+        // (hypothetical unconditional priming) must also not trigger, since
+        // we only patch the specific un-primed branch.
+        let unconditional = r#"<|turn>model
+<|channel>thought
+<channel|>"#;
+        let p = ChatTemplateProcessor::with_template(unconditional.to_string());
+        assert!(!p.enable_thinking_drops_priming());
+    }
+
+    #[test]
+    fn patch_gemma4_generation_prompt_appends_open_thinking_when_primed() {
+        let gemma4 = ChatTemplateProcessor::with_template(GEMMA4_LIKE_TEMPLATE.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+
+        // enable_thinking=false (default branch): template already primes
+        // with `<|channel>thought\n<channel|>`, so the patch is a no-op.
+        let closed =
+            ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": false}"#).unwrap();
+        let rendered_closed = gemma4.apply_with_kwargs(&messages, None, &closed).unwrap();
+        assert!(
+            rendered_closed.contains("<|channel>thought\n<channel|>"),
+            "default branch must still prime a closed thinking block"
+        );
+        assert!(
+            !rendered_closed.ends_with("<|turn>model\n"),
+            "closed priming must remain the final content"
+        );
+
+        // enable_thinking=true: without the patch the prompt would end at
+        // `<|turn>model\n`. With the patch, an OPEN `<|channel>thought\n`
+        // marker is appended so the model enters the reasoning channel.
+        let open = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": true}"#).unwrap();
+        let rendered_open = gemma4.apply_with_kwargs(&messages, None, &open).unwrap();
+        assert!(
+            rendered_open.ends_with("<|channel>thought\n"),
+            "enable_thinking=true must append an open thinking priming, got: {rendered_open:?}"
+        );
+        assert!(
+            !rendered_open.contains("<channel|>"),
+            "the appended priming must be OPEN (no <channel|> close)"
+        );
+    }
+
+    #[test]
+    fn patch_gemma4_generation_prompt_is_noop_on_non_gemma_templates() {
+        // Qwen3-shaped template uses <think> / </think>, not <|channel>, so
+        // `enable_thinking=true` must flow through untouched even though the
+        // kwarg value matches — we don't want to accidentally inject Gemma 4
+        // markers into other model families.
+        let qwen = r#"{% if enable_thinking %}<think>
+{% endif %}{{ messages[0].content }}"#;
+        let processor = ChatTemplateProcessor::with_template(qwen.to_string());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hello".to_string(),
+        }];
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": true}"#).unwrap();
+        let out = processor.apply_with_kwargs(&messages, None, &kwargs).unwrap();
+        assert!(out.starts_with("<think>"));
+        assert!(!out.contains("<|channel>thought"));
     }
 }

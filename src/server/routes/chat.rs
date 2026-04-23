@@ -284,6 +284,7 @@ async fn non_stream_chat_completion(
         prompt_cache_enabled,
     )
     .await;
+    let primed_open_thinking = is_prompt_primed_open_thinking(&prepared.prompt);
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;
@@ -334,11 +335,16 @@ async fn non_stream_chat_completion(
         if parsed.has_tool_calls() {
             let tool_call_responses = tool_calls::build_tool_call_responses(&parsed, &request);
             if !tool_call_responses.is_empty() {
+                let content = strip_unclosed_primed_thinking(
+                    parsed.content.clone(),
+                    &result.text,
+                    primed_open_thinking,
+                );
                 return Ok(Json(
                     ChatCompletionResponse::new_with_tool_calls(
                         request_id,
                         model_id,
-                        parsed.content.clone(),
+                        content,
                         tool_call_responses,
                         result.prompt_tokens,
                         result.completion_tokens,
@@ -352,11 +358,13 @@ async fn non_stream_chat_completion(
         // No tool calls found, but tool parsing was enabled — use the cleaned
         // content from the parser (thinking blocks and structural markers
         // stripped) instead of the raw generation output.
+        let content =
+            strip_unclosed_primed_thinking(parsed.content, &result.text, primed_open_thinking);
         return Ok(Json(
             ChatCompletionResponse::new_with_logprobs(
                 request_id,
                 model_id,
-                parsed.content,
+                content,
                 result.prompt_tokens,
                 result.completion_tokens,
                 Some(result.finish_reason),
@@ -369,7 +377,11 @@ async fn non_stream_chat_completion(
     // Even without tool-call parsing, strip structural tokens so Gemma 4
     // (and similar) markers like `<channel|>` / `<turn|>` never leak into
     // plain chat responses.
-    let cleaned_text = tool_calls::clean_structural_tokens(&result.text);
+    let cleaned_text = strip_unclosed_primed_thinking(
+        tool_calls::clean_structural_tokens(&result.text),
+        &result.text,
+        primed_open_thinking,
+    );
 
     Ok(Json(
         ChatCompletionResponse::new_with_logprobs(
@@ -411,6 +423,7 @@ async fn stream_chat_completion(
         prompt_cache_enabled,
     )
     .await;
+    let primed_open_thinking = is_prompt_primed_open_thinking(&prepared.prompt);
     let mut options = build_generate_options(&request.params, &state.config);
     options.priority = priority;
     options.reasoning_budget = budget_override;
@@ -469,7 +482,20 @@ async fn stream_chat_completion(
         // Always on — for non-tool chat requests we still need to suppress
         // the thinking-channel markers and stray turn tokens that Gemma 4
         // models occasionally emit.
-        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(StreamFilter::new()));
+        //
+        // When the generation prompt primed an open Gemma 4 thinking channel
+        // (patch_gemma4_generation_prompt appended `<|channel>thought\n`), the
+        // model's first emitted tokens are already reasoning content. Start
+        // the filter in `Thinking` state so those tokens are suppressed until
+        // the model emits `<channel|>`; otherwise the scratchpad leaks to the
+        // user when max_tokens is reached mid-reasoning.
+        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(
+            if primed_open_thinking {
+                StreamFilter::new_primed_open_thinking()
+            } else {
+                StreamFilter::new()
+            },
+        ));
         let filter_for_callback = stream_filter.clone();
 
         let result = state
@@ -486,16 +512,30 @@ async fn stream_chat_completion(
                         acc.push_str(&token);
                     }
 
-                    // Apply stream filter to strip structural tokens
-                    let emit_text = filter_for_callback
+                    // Apply stream filter to split thinking scratchpad from
+                    // user-facing content. Thinking goes out as
+                    // `delta.reasoning_content` so routers/UIs can surface a
+                    // "thinking" state; regular text goes as `delta.content`.
+                    let emit = filter_for_callback
                         .lock()
                         .ok()
-                        .and_then(|mut f| f.feed(&token));
+                        .map(|mut f| f.feed(&token))
+                        .unwrap_or_default();
 
-                    if let Some(text) = emit_text {
-                        if text.is_empty() {
-                            return;
-                        }
+                    if let Some(reasoning_text) = emit.reasoning
+                        && !reasoning_text.is_empty()
+                    {
+                        let chunk = ChatCompletionChunk::reasoning_content(
+                            request_id_inner.clone(),
+                            model_id_inner.clone(),
+                            reasoning_text,
+                        );
+                        let _ = token_events.json(&chunk);
+                    }
+
+                    if let Some(text) = emit.content
+                        && !text.is_empty()
+                    {
                         let logprobs = if logprobs_enabled {
                             lp_data
                                 .as_ref()
@@ -515,13 +555,28 @@ async fn stream_chat_completion(
             );
 
         // Flush any remaining buffered content from the stream filter
-        if let Some(remaining) = stream_filter.lock().ok().and_then(|mut f| f.flush())
-            && !remaining.is_empty()
+        let remaining = stream_filter
+            .lock()
+            .ok()
+            .map(|mut f| f.flush())
+            .unwrap_or_default();
+        if let Some(text) = remaining.reasoning
+            && !text.is_empty()
+        {
+            let chunk = ChatCompletionChunk::reasoning_content(
+                request_id_clone.clone(),
+                model_id_clone.clone(),
+                text,
+            );
+            let _ = finish_events.json(&chunk);
+        }
+        if let Some(text) = remaining.content
+            && !text.is_empty()
         {
             let chunk = ChatCompletionChunk::content_with_logprobs(
                 request_id_clone.clone(),
                 model_id_clone.clone(),
-                remaining,
+                text,
                 None,
             );
             let _ = finish_events.json(&chunk);
@@ -611,6 +666,36 @@ async fn stream_chat_completion(
 /// being rendered through the Jinja2 chat template.
 pub(crate) const MAX_TOOLS: usize = 128;
 
+/// Sentinel used by [`is_prompt_primed_open_thinking`] to recognize the Gemma
+/// 4 open-thinking generation prompt produced by
+/// [`crate::server::chat_template::ChatTemplateProcessor::patch_gemma4_generation_prompt`].
+const GEMMA4_OPEN_THINKING_SUFFIX: &str = "<|channel>thought\n";
+
+/// Whether the rendered chat prompt primed an open Gemma 4 thinking channel
+/// whose close marker (`<channel|>`) the model never emitted.
+///
+/// When this is true and the raw generation contains no `<channel|>`, every
+/// generated token is inside the scratchpad channel and must not be shown to
+/// the user as assistant content. Typical trigger: the model hit `max_tokens`
+/// or stopped on an EOS before closing the reasoning block.
+fn is_prompt_primed_open_thinking(prompt: &str) -> bool {
+    prompt.ends_with(GEMMA4_OPEN_THINKING_SUFFIX)
+}
+
+/// Strip thinking content that would otherwise leak when the prompt primed
+/// an open `<|channel>thought\n` and the model never emitted `<channel|>`.
+///
+/// * Returns `content` unchanged when the prompt did not prime open thinking.
+/// * Returns `content` unchanged when `raw_output` contains a `<channel|>`
+///   marker — the usual parsers already handle that case.
+/// * Returns an empty string when the whole generation was unclosed thinking.
+fn strip_unclosed_primed_thinking(content: String, raw_output: &str, primed: bool) -> String {
+    if !primed || raw_output.contains("<channel|>") {
+        return content;
+    }
+    String::new()
+}
+
 /// Build ServerGenerateOptions using request params with server config as defaults
 pub(crate) fn build_generate_options(
     params: &SamplingParams,
@@ -685,5 +770,72 @@ mod tests {
             .map(|i| make_tool(&format!("fn_{i}")))
             .collect();
         assert!(tools.len() > MAX_TOOLS);
+    }
+
+    // -- Gemma 4 open-thinking prompt-primed detection --
+
+    #[test]
+    fn prompt_primed_detection_matches_exact_suffix() {
+        // Prompts produced by `patch_gemma4_generation_prompt` end in
+        // exactly `<|channel>thought\n`. Only that exact suffix counts.
+        assert!(is_prompt_primed_open_thinking(
+            "<|turn>model\n<|channel>thought\n"
+        ));
+    }
+
+    #[test]
+    fn prompt_primed_detection_rejects_closed_priming() {
+        // `enable_thinking=false` templates end with the CLOSED priming.
+        // Those are NOT prompt-primed open-thinking and must not trigger.
+        assert!(!is_prompt_primed_open_thinking(
+            "<|turn>model\n<|channel>thought\n<channel|>\n"
+        ));
+    }
+
+    #[test]
+    fn prompt_primed_detection_rejects_unrelated_endings() {
+        assert!(!is_prompt_primed_open_thinking("<|turn>model\n"));
+        assert!(!is_prompt_primed_open_thinking(""));
+        assert!(!is_prompt_primed_open_thinking("some content"));
+    }
+
+    // -- strip_unclosed_primed_thinking --
+
+    #[test]
+    fn strip_unclosed_primed_thinking_empties_when_primed_and_no_close() {
+        // Classic failure mode: model hit max_tokens inside the primed
+        // channel, raw output contains no `<channel|>`. Return empty content.
+        let content = "reasoning overflow".to_string();
+        let raw = "reasoning overflow";
+        assert_eq!(
+            strip_unclosed_primed_thinking(content, raw, true),
+            String::new()
+        );
+    }
+
+    #[test]
+    fn strip_unclosed_primed_thinking_preserves_when_close_present() {
+        // Primed but model DID close the channel. The parser already
+        // stripped the thinking block; whatever remains in `content` is
+        // real user-visible text and must pass through.
+        let content = "the answer".to_string();
+        let raw = "thinking<channel|>the answer";
+        assert_eq!(
+            strip_unclosed_primed_thinking(content.clone(), raw, true),
+            content
+        );
+    }
+
+    #[test]
+    fn strip_unclosed_primed_thinking_noop_when_not_primed() {
+        // Non-primed requests (enable_thinking=false, or non-Gemma model)
+        // must never be touched by this helper — preserves backward compat
+        // for every other template.
+        let content = "whatever the parser returned".to_string();
+        let raw = "whatever the parser returned";
+        assert_eq!(
+            strip_unclosed_primed_thinking(content.clone(), raw, false),
+            content
+        );
     }
 }
