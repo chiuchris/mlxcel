@@ -236,7 +236,7 @@ jobs:
         env:
           # Must match GIT_TAG in src/lib/mlx-cpp/CMakeLists.txt and
           # MLX_EXPECTED_COMMIT in src/lib/mlxcel-core/build.rs
-          MLX_EXPECTED_COMMIT: "b98831ad0e4b7c9c0f09d89ee76baea7d1bded5b"
+          MLX_EXPECTED_COMMIT: "68cf2fddd8de5edd8ab3d926391772b2e2cedad8"
         run: |
           # Check every _deps directory for a valid .mlx-build-commit marker.
           # If the marker is missing or doesn't match, purge that _deps/ entirely.

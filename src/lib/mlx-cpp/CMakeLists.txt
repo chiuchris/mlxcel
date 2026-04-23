@@ -16,13 +16,18 @@ set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
 function(mlx_apply_source_overlays mlx_source_dir)
-  # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix)
+  # Metal patches: JIT type promotion fix + kernel utils (SIMD group matrix).
+  #
+  # The SDPA / steel-attention overlays (scaled_dot_product_attention.cpp,
+  # scaled_dot_product_attention.metal, steel_attention.metal,
+  # steel_attention_nax.metal) were dropped when the MLX pin moved to
+  # v0.31.2 — that release already carries the NAX fixes we had been
+  # carrying locally (`#3361 int16 overflow in SDPA NAX mask indexing`,
+  # `#3422 Speed up NAX split-K`, `#3419 Segmented mm nax kernel`). Removing
+  # the patches keeps our build binary-equivalent to the upstream Python
+  # wheel and simplifies future upstream syncs.
   set(_metal_patch_files
       "mlx/backend/metal/compiled.cpp"
-      "mlx/backend/metal/scaled_dot_product_attention.cpp"
-      "mlx/backend/metal/kernels/scaled_dot_product_attention.metal"
-      "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention.metal"
-      "mlx/backend/metal/kernels/steel/attn/kernels/steel_attention_nax.metal"
       "mlx/backend/metal/kernels/utils.h")
   foreach(_patch_file ${_metal_patch_files})
     if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/patches/${_patch_file}")
@@ -84,7 +89,7 @@ else()
   FetchContent_Declare(
     mlx
     GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-    GIT_TAG b98831ad0e4b7c9c0f09d89ee76baea7d1bded5b)
+    GIT_TAG 68cf2fddd8de5edd8ab3d926391772b2e2cedad8)
 
   # Use FetchContent_Populate + add_subdirectory so we can apply source
   # overlays before the MLX build system processes the files.
