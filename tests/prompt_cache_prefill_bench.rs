@@ -124,10 +124,7 @@ impl DepthSample {
     /// Effective decode throughput. For turns where `ttft == total` (a
     /// very small completion) we report 0.0 rather than risking a divide.
     fn throughput_tps(&self) -> f64 {
-        let decode = self
-            .total_latency
-            .saturating_sub(self.ttft)
-            .as_secs_f64();
+        let decode = self.total_latency.saturating_sub(self.ttft).as_secs_f64();
         if decode <= 0.0 || self.completion_tokens == 0 {
             return 0.0;
         }
@@ -357,15 +354,13 @@ async fn sweep_depths(cache_enabled: bool) -> Vec<DepthSample> {
         let messages = build_messages_for_depth(depth);
         // Warmup: one request so the cache can populate with the prefix
         // for this exact conversation shape.
-        let _warmup =
-            run_streaming_turn(&client, &base_url, model_alias, &messages, depth).await;
+        let _warmup = run_streaming_turn(&client, &base_url, model_alias, &messages, depth).await;
 
         // Measurement: a second request with the identical prefix. When
         // the cache is enabled this should adopt the entire prefix the
         // warmup donated back; when disabled it should look just like
         // the warmup.
-        let sample =
-            run_streaming_turn(&client, &base_url, model_alias, &messages, depth).await;
+        let sample = run_streaming_turn(&client, &base_url, model_alias, &messages, depth).await;
         samples.push(sample);
     }
     stop_server(&mut child);

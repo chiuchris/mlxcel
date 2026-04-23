@@ -220,21 +220,33 @@ fn usage_with_cache_chunk_omits_cached_tokens_when_disabled() {
     let chunk = ChatCompletionChunk::usage_with_cache(
         "chatcmpl-test".to_string(),
         "model".to_string(),
-        50, 10, 99, false,
+        50,
+        10,
+        99,
+        false,
     );
     let json = serde_json::to_value(&chunk).unwrap();
-    assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
-        "prompt_tokens_details must be absent when cache is disabled");
+    assert!(
+        !json["usage"]
+            .as_object()
+            .unwrap()
+            .contains_key("prompt_tokens_details"),
+        "prompt_tokens_details must be absent when cache is disabled"
+    );
 }
 
 /// Plain `usage()` must not include `prompt_tokens_details` (backward compat).
 #[test]
 fn plain_usage_chunk_has_no_prompt_tokens_details() {
-    let chunk =
-        ChatCompletionChunk::usage("chatcmpl-test".to_string(), "model".to_string(), 10, 5);
+    let chunk = ChatCompletionChunk::usage("chatcmpl-test".to_string(), "model".to_string(), 10, 5);
     let json = serde_json::to_value(&chunk).unwrap();
-    assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
-        "plain usage chunk must not include prompt_tokens_details");
+    assert!(
+        !json["usage"]
+            .as_object()
+            .unwrap()
+            .contains_key("prompt_tokens_details"),
+        "plain usage chunk must not include prompt_tokens_details"
+    );
 }
 
 // ── Cancellation token tests ────────────────────────────────────────────────

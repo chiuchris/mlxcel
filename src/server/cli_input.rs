@@ -203,7 +203,6 @@ pub struct ServerStartupInput {
     // Each field stores the raw CLI/env value before normalization into
     // `PromptCacheConfig`. `None` on the `Option`-typed fields means "not
     // provided by the CLI flag"; defaults come from `PromptCacheConfig::default()`.
-
     /// Whether the prompt-prefix KV cache is enabled. Defaults to `true`.
     /// Also accepts `MLXCEL_PROMPT_CACHE_ENABLED` and the llama.cpp-compat
     /// alias `LLAMA_ARG_CACHE_REUSE` (parsed as a boolean on/off).

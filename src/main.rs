@@ -768,7 +768,6 @@ pub(crate) struct ServeArgs {
     chat_template_kwargs: Option<String>,
 
     // Issue #424: cross-request prompt-prefix KV cache knobs.
-
     /// Enable or disable the cross-request prompt-prefix KV cache (default: true).
     ///
     /// When disabled, the server performs no prefix-match lookup and no memory

@@ -166,7 +166,8 @@ fn batch_metrics_prompt_cache_hit_increments_counters() {
         "two hits should register as 2"
     );
     assert_eq!(
-        m.prompt_cache_prefix_tokens_reused_total.load(Ordering::Relaxed),
+        m.prompt_cache_prefix_tokens_reused_total
+            .load(Ordering::Relaxed),
         80,
         "token counts 32+48=80 should be accumulated"
     );
@@ -216,7 +217,8 @@ fn batch_metrics_prompt_cache_evictions_labeled_by_reason() {
         "should have 1 TTL eviction"
     );
     assert_eq!(
-        m.prompt_cache_evictions_capacity_total.load(Ordering::Relaxed),
+        m.prompt_cache_evictions_capacity_total
+            .load(Ordering::Relaxed),
         1,
         "should have 1 capacity eviction"
     );
@@ -256,9 +258,9 @@ fn batch_metrics_prompt_cache_gauges_update() {
 
 #[test]
 fn batch_metrics_cache_adapter_routes_lookups_to_hit_and_miss_counters() {
-    use std::sync::Arc;
-    use super::BatchMetricsCacheAdapter;
     use super::super::prompt_cache::metrics::PromptCacheMetrics;
+    use super::BatchMetricsCacheAdapter;
+    use std::sync::Arc;
 
     let m = Arc::new(BatchMetrics::new());
     let adapter = BatchMetricsCacheAdapter::new(m.clone());
@@ -272,7 +274,8 @@ fn batch_metrics_cache_adapter_routes_lookups_to_hit_and_miss_counters() {
 
     assert_eq!(m.prompt_cache_hits_total.load(Ordering::Relaxed), 2);
     assert_eq!(
-        m.prompt_cache_prefix_tokens_reused_total.load(Ordering::Relaxed),
+        m.prompt_cache_prefix_tokens_reused_total
+            .load(Ordering::Relaxed),
         60
     );
     assert_eq!(m.prompt_cache_misses_total.load(Ordering::Relaxed), 1);
@@ -280,9 +283,9 @@ fn batch_metrics_cache_adapter_routes_lookups_to_hit_and_miss_counters() {
 
 #[test]
 fn batch_metrics_cache_adapter_routes_evictions() {
-    use std::sync::Arc;
-    use super::BatchMetricsCacheAdapter;
     use super::super::prompt_cache::metrics::PromptCacheMetrics;
+    use super::BatchMetricsCacheAdapter;
+    use std::sync::Arc;
 
     let m = Arc::new(BatchMetrics::new());
     let adapter = BatchMetricsCacheAdapter::new(m.clone());
@@ -290,7 +293,17 @@ fn batch_metrics_cache_adapter_routes_evictions() {
     adapter.record_evict_lru(100);
     adapter.record_evict_ttl(200);
 
-    assert_eq!(m.prompt_cache_evictions_lru_total.load(Ordering::Relaxed), 1);
-    assert_eq!(m.prompt_cache_evictions_ttl_total.load(Ordering::Relaxed), 1);
-    assert_eq!(m.prompt_cache_evictions_capacity_total.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        m.prompt_cache_evictions_lru_total.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        m.prompt_cache_evictions_ttl_total.load(Ordering::Relaxed),
+        1
+    );
+    assert_eq!(
+        m.prompt_cache_evictions_capacity_total
+            .load(Ordering::Relaxed),
+        0
+    );
 }

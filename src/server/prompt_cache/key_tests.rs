@@ -88,7 +88,8 @@ fn digest_changes_with_each_extra_token() {
 #[test]
 fn prefix_len_saturates_at_token_length() {
     let toks = tokens(8);
-    let k = PromptCacheKey::new_prefix("m", None, "tpl", None, MultimodalDigest::empty(), &toks, 64);
+    let k =
+        PromptCacheKey::new_prefix("m", None, "tpl", None, MultimodalDigest::empty(), &toks, 64);
     assert_eq!(k.effective_prefix_len(), 8);
 }
 
@@ -526,9 +527,12 @@ fn multimodal_multi_turn_prefix_stability() {
 
     // For each turn, compute a prefix-scoped key over the first 16 tokens
     // (the shared prefix) and confirm it stays the same across turns.
-    let prefix_key_turn1 = PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn1_tokens, 16);
-    let prefix_key_turn2 = PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn2_tokens, 16);
-    let prefix_key_turn3 = PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn3_tokens, 16);
+    let prefix_key_turn1 =
+        PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn1_tokens, 16);
+    let prefix_key_turn2 =
+        PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn2_tokens, 16);
+    let prefix_key_turn3 =
+        PromptCacheKey::new_prefix("m", None, "tpl", None, mm, &turn3_tokens, 16);
 
     assert_eq!(
         prefix_key_turn1.digest(),

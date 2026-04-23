@@ -506,8 +506,13 @@ mod tests {
             prompt_tokens_details: None,
         };
         let json = serde_json::to_value(&usage).unwrap();
-        assert!(!json.as_object().unwrap().contains_key("prompt_tokens_details"),
-            "prompt_tokens_details must be absent when None");
+        assert!(
+            !json
+                .as_object()
+                .unwrap()
+                .contains_key("prompt_tokens_details"),
+            "prompt_tokens_details must be absent when None"
+        );
         assert_eq!(json["prompt_tokens"], 10);
         assert_eq!(json["completion_tokens"], 5);
         assert_eq!(json["total_tokens"], 15);
@@ -558,8 +563,13 @@ mod tests {
         .with_cached_tokens(99, false);
 
         let json = serde_json::to_value(&resp).unwrap();
-        assert!(!json["usage"].as_object().unwrap().contains_key("prompt_tokens_details"),
-            "prompt_tokens_details must be absent when cache is disabled");
+        assert!(
+            !json["usage"]
+                .as_object()
+                .unwrap()
+                .contains_key("prompt_tokens_details"),
+            "prompt_tokens_details must be absent when cache is disabled"
+        );
     }
 
     /// `with_cached_tokens` with zero and `cache_enabled=true` should still
@@ -662,8 +672,7 @@ mod tests {
         let message = &json["choices"][0]["message"];
         assert_eq!(message["content"], "hello world");
         assert!(
-            message.get("tool_calls").is_none()
-                || message["tool_calls"].is_null(),
+            message.get("tool_calls").is_none() || message["tool_calls"].is_null(),
             "non-tool response must omit tool_calls field"
         );
     }

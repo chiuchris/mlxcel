@@ -142,8 +142,7 @@ impl ChatTemplateProcessor {
     /// define this branch, so Qwen3's `<think>` path and other non-Gemma
     /// templates are unaffected.
     fn enable_thinking_drops_priming(&self) -> bool {
-        self.template.contains("<|channel>thought")
-            && self.template.contains("not enable_thinking")
+        self.template.contains("<|channel>thought") && self.template.contains("not enable_thinking")
     }
 
     /// Append an open `<|channel>thought\n` priming to a Gemma-4-rendered
@@ -1606,8 +1605,7 @@ TOOL
 
         // enable_thinking=false (default branch): template already primes
         // with `<|channel>thought\n<channel|>`, so the patch is a no-op.
-        let closed =
-            ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": false}"#).unwrap();
+        let closed = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": false}"#).unwrap();
         let rendered_closed = gemma4.apply_with_kwargs(&messages, None, &closed).unwrap();
         assert!(
             rendered_closed.contains("<|channel>thought\n<channel|>"),
@@ -1647,7 +1645,9 @@ TOOL
             content: "hello".to_string(),
         }];
         let kwargs = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": true}"#).unwrap();
-        let out = processor.apply_with_kwargs(&messages, None, &kwargs).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
         assert!(out.starts_with("<think>"));
         assert!(!out.contains("<|channel>thought"));
     }

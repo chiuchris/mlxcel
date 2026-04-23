@@ -505,13 +505,9 @@ mod tests {
         // Same shape but the post-thinking content is a Gemma 4 tool call.
         // The parser below extracts the call; strip_thinking is only
         // responsible for dropping the prompt-primed thinking prefix.
-        let input =
-            "thinking about it<channel|><|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>";
+        let input = "thinking about it<channel|><|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>";
         let result = strip_thinking(input);
-        assert_eq!(
-            result,
-            "<|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>"
-        );
+        assert_eq!(result, "<|tool_call>call:fn{k:<|\"|>v<|\"|>}<tool_call|>");
     }
 
     #[test]

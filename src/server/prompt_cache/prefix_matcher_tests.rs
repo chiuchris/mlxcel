@@ -47,7 +47,14 @@ fn key_for_session<'a>(
     session: Option<&'a str>,
     tokens: &'a [i32],
 ) -> PromptCacheKey<'a> {
-    PromptCacheKey::new_full(model, None, "tpl", session, MultimodalDigest::empty(), tokens)
+    PromptCacheKey::new_full(
+        model,
+        None,
+        "tpl",
+        session,
+        MultimodalDigest::empty(),
+        tokens,
+    )
 }
 
 #[test]
@@ -216,8 +223,22 @@ fn prefix_matcher_different_template_does_not_cross_contaminate() {
     let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
     let toks = tokens(0, 16);
 
-    let key_a = PromptCacheKey::new_full("m", None, "tplA", Some("sess"), MultimodalDigest::empty(), &toks);
-    let key_b = PromptCacheKey::new_full("m", None, "tplB", Some("sess"), MultimodalDigest::empty(), &toks);
+    let key_a = PromptCacheKey::new_full(
+        "m",
+        None,
+        "tplA",
+        Some("sess"),
+        MultimodalDigest::empty(),
+        &toks,
+    );
+    let key_b = PromptCacheKey::new_full(
+        "m",
+        None,
+        "tplB",
+        Some("sess"),
+        MultimodalDigest::empty(),
+        &toks,
+    );
 
     store
         .insert(&key_a, CacheEntry::new_for_test(toks.clone(), 1024))

@@ -246,8 +246,7 @@ pub fn resolve_thinking_token_ids(
     // `<|channel>thought\n…<channel|>`. We track the outer delimiter pair;
     // the `thought\n` stream between them is ordinary content that
     // `ThinkingState` counts via `in_block_count`.
-    if let (Some(open), Some(close)) =
-        (hf.token_to_id("<|channel>"), hf.token_to_id("<channel|>"))
+    if let (Some(open), Some(close)) = (hf.token_to_id("<|channel>"), hf.token_to_id("<channel|>"))
     {
         return Some(ThinkingTokenIds {
             open: open as i32,
@@ -835,12 +834,7 @@ mod tests {
     fn resolve_prefers_qwen_think_pair_when_present() {
         // Simulate a tokenizer that has BOTH pairs (hypothetical, but
         // exercises the ordering contract). Qwen pair wins.
-        let tok = mlxcel_from(&[
-            "<think>",
-            "</think>",
-            "<|channel>",
-            "<channel|>",
-        ]);
+        let tok = mlxcel_from(&["<think>", "</think>", "<|channel>", "<channel|>"]);
         let ids = resolve_thinking_token_ids(&tok).expect("qwen pair should resolve");
         // `<think>`/`</think>` are added first, so they get the lowest IDs
         // among the added set. Re-look them up to be robust against the
@@ -924,6 +918,9 @@ mod tests {
             Some(ThinkingBudget::ImmediateClose),
             /*enter_block_on_start=*/ true,
         );
-        assert_eq!(s.decide_override(10), ThinkingDecision::ForceClose(ids().close));
+        assert_eq!(
+            s.decide_override(10),
+            ThinkingDecision::ForceClose(ids().close)
+        );
     }
 }

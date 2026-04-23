@@ -55,8 +55,8 @@ use crate::server::config::{
     DecodeStorageBackend, PreemptionPolicy, PromptCacheRequestContext, ReasoningBudgetOverride,
 };
 use crate::server::model_provider::model_worker::{
-    StreamingDecodeState, build_generation_result_with_cache,
-    merge_config_stop_tokens, prepare_request_vlm_embeddings,
+    StreamingDecodeState, build_generation_result_with_cache, merge_config_stop_tokens,
+    prepare_request_vlm_embeddings,
 };
 use crate::server::model_provider::{GenerateEvent, ModelRequest};
 use crate::server::prompt_cache::key::{MultimodalDigest, PromptCacheKey};
@@ -474,10 +474,8 @@ impl BatchScheduler {
                 self.batch_metrics.record_prompt_cache_hit(matched_len);
                 // Update byte/entry gauges so /metrics reflects current state.
                 if let Some(ref store) = self.prompt_cache {
-                    self.batch_metrics.update_prompt_cache_gauges(
-                        store.bytes(),
-                        store.len(),
-                    );
+                    self.batch_metrics
+                        .update_prompt_cache_gauges(store.bytes(), store.len());
                 }
                 Some((adopted_id, matched_len))
             }
@@ -561,10 +559,8 @@ impl BatchScheduler {
             Ok(()) => {
                 self.batch_observability.record_prompt_cache_insert();
                 // Issue #423: refresh byte/entry gauges after a successful insert.
-                self.batch_metrics.update_prompt_cache_gauges(
-                    store.bytes(),
-                    store.len(),
-                );
+                self.batch_metrics
+                    .update_prompt_cache_gauges(store.bytes(), store.len());
             }
             Err(err) => {
                 // Oversized / disabled / prefix-too-short — drop the entry

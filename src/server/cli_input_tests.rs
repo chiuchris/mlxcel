@@ -631,7 +631,10 @@ fn prompt_cache_enabled_env_var_sets_false() {
 
     let mut enabled = true; // default
     env_fallback_prompt_cache_enabled(&mut enabled, false);
-    assert!(!enabled, "MLXCEL_PROMPT_CACHE_ENABLED=false must set enabled=false");
+    assert!(
+        !enabled,
+        "MLXCEL_PROMPT_CACHE_ENABLED=false must set enabled=false"
+    );
 }
 
 /// `MLXCEL_PROMPT_CACHE_ENABLED=1` enables the cache.
@@ -644,7 +647,10 @@ fn prompt_cache_enabled_env_var_accepts_numeric_one() {
 
     let mut enabled = false;
     env_fallback_prompt_cache_enabled(&mut enabled, false);
-    assert!(enabled, "MLXCEL_PROMPT_CACHE_ENABLED=1 must set enabled=true");
+    assert!(
+        enabled,
+        "MLXCEL_PROMPT_CACHE_ENABLED=1 must set enabled=true"
+    );
 }
 
 /// `LLAMA_ARG_CACHE_REUSE=on` enables the cache (llama.cpp compat).

@@ -1129,15 +1129,13 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // Issue #423: wire BatchMetrics into the store so hits/misses/evictions
     // are counted and exposed via /metrics.
     let prompt_cache_store = if config.prompt_cache.is_enabled() {
-        let cache_metrics = Arc::new(
-            crate::server::state::BatchMetricsCacheAdapter::new(batch_metrics.clone()),
-        );
-        let store = Arc::new(
-            crate::server::prompt_cache::PromptCacheStore::with_metrics(
-                config.prompt_cache.clone(),
-                cache_metrics,
-            ),
-        );
+        let cache_metrics = Arc::new(crate::server::state::BatchMetricsCacheAdapter::new(
+            batch_metrics.clone(),
+        ));
+        let store = Arc::new(crate::server::prompt_cache::PromptCacheStore::with_metrics(
+            config.prompt_cache.clone(),
+            cache_metrics,
+        ));
         tracing::info!(
             capacity_bytes = config.prompt_cache.capacity_bytes,
             max_entries = config.prompt_cache.max_entries,
