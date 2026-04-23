@@ -634,9 +634,13 @@ impl VisionPatchEmbedder {
         let shape = mlxcel_core::array_shape(&hidden_states);
         let batch = shape[0];
         let seq_len = shape[1];
-        let hidden_size = shape[2];
-
+        // After patchify, last dim is patch_size² * channels (768 for 16×16×3);
+        // only after input_proj does it become config.hidden_size, which is what
+        // position_embedding_{x,y} are shaped for. Reading hidden_size from the
+        // post-projection tensor fixes 26B/31B (vision.hidden_size=1152) where
+        // the two values diverge. e2b/e4b happen to have both equal 768.
         let hidden_states = self.input_proj.forward(&hidden_states);
+        let hidden_size = mlxcel_core::array_shape(&hidden_states)[2];
         let pos_x = take_2d_embedding(
             &self.position_embedding_x,
             patch_x,
