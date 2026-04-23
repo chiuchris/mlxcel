@@ -277,27 +277,68 @@ struct SwitchGeGLU {
 
 impl SwitchGeGLU {
     fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+        // `MLXCEL_PROFILE_MOE_INNER=1` emits `[MOE] name=... ms=...` per
+        // sub-sub-op so the `experts` band in the sub-op profiler can be
+        // drilled one level further. Like the outer profilers this forces a
+        // sync at every step and distorts absolute throughput; use it only
+        // for relative distribution analysis.
+        let profile_inner = std::env::var("MLXCEL_PROFILE_MOE_INNER").is_ok();
+        let mut inner_tick = |name: &str, arr: &MlxArray, last: &mut std::time::Instant| {
+            if !profile_inner {
+                return;
+            }
+            mlxcel_core::eval(arr);
+            let dt = last.elapsed();
+            eprintln!(
+                "[MOE] name={} ms={:.4}",
+                name,
+                dt.as_secs_f64() * 1000.0
+            );
+            *last = std::time::Instant::now();
+        };
+        let mut last = std::time::Instant::now();
+
         let indices_shape = mlxcel_core::array_shape(indices);
         let n_tokens = indices_shape[0];
         let top_k = indices_shape[1];
         let do_sort = n_tokens * top_k >= 64;
 
-        let x_exp = mlxcel_core::expand_dims(x, -2);
-        let x_exp = mlxcel_core::expand_dims(&x_exp, -3);
+        // Single multi-axis expand_dims matches mlx-lm's
+        // `x.expand_dims((-2, -3))`. Previously two sequential calls here
+        // cost ~0.28 ms/layer on 26B-a4b decode (first call ~0.80 ms, second
+        // ~0.02 ms), versus Python's single 0.54 ms — the extra call forced
+        // an additional FFI boundary + MLX graph node. Folding them into one
+        // call closed the primary per-layer gap identified by
+        // `MLXCEL_PROFILE_MOE_INNER`.
+        let x_exp = mlxcel_core::expand_dims_multi(x, &[-2, -3]);
+        inner_tick("expand_dims", &x_exp, &mut last);
 
         if do_sort {
             let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
+            inner_tick("gather_sort", &sorted_x, &mut last);
             let gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
+            inner_tick("gate_proj", &gate, &mut last);
             let up = self.up_proj.forward(&sorted_x, &sorted_idx, true);
+            inner_tick("up_proj", &up, &mut last);
             let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+            inner_tick("geglu", &activated, &mut last);
             let output = self.down_proj.forward(&activated, &sorted_idx, true);
-            scatter_unsort(&output, &inv_order, &indices_shape)
+            inner_tick("down_proj", &output, &mut last);
+            let unsorted = scatter_unsort(&output, &inv_order, &indices_shape);
+            inner_tick("scatter_unsort", &unsorted, &mut last);
+            unsorted
         } else {
             let gate = self.gate_proj.forward(&x_exp, indices, false);
+            inner_tick("gate_proj", &gate, &mut last);
             let up = self.up_proj.forward(&x_exp, indices, false);
+            inner_tick("up_proj", &up, &mut last);
             let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+            inner_tick("geglu", &activated, &mut last);
             let output = self.down_proj.forward(&activated, indices, false);
-            mlxcel_core::squeeze_axis(&output, -2)
+            inner_tick("down_proj", &output, &mut last);
+            let squeezed = mlxcel_core::squeeze_axis(&output, -2);
+            inner_tick("squeeze", &squeezed, &mut last);
+            squeezed
         }
     }
 

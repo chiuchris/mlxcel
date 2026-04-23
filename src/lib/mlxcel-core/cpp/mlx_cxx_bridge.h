@@ -183,6 +183,9 @@ std::unique_ptr<MlxArray> reshape(const MlxArray& a, rust::Slice<const int32_t> 
 
 // Shape operations.
 std::unique_ptr<MlxArray> expand_dims(const MlxArray& a, int32_t axis);
+std::unique_ptr<MlxArray> expand_dims_multi(
+    const MlxArray& a,
+    rust::Slice<const int32_t> axes);
 std::unique_ptr<MlxArray> squeeze(const MlxArray& a);
 std::unique_ptr<MlxArray> squeeze_axis(const MlxArray& a, int32_t axis);
 std::unique_ptr<MlxArray> broadcast_to(const MlxArray& a, rust::Slice<const int32_t> shape);

@@ -356,6 +356,12 @@ mod ffi {
         /// Expand dimensions at axis
         fn expand_dims(a: &MlxArray, axis: i32) -> UniquePtr<MlxArray>;
 
+        /// Expand dimensions at multiple axes in a single call. Equivalent to
+        /// `mx.expand_dims(a, tuple(axes))`. Cheaper than calling
+        /// `expand_dims(a, axis)` back-to-back because there is only one FFI
+        /// boundary crossing and one MLX graph node added.
+        fn expand_dims_multi(a: &MlxArray, axes: &[i32]) -> UniquePtr<MlxArray>;
+
         /// Remove all singleton dimensions
         fn squeeze(a: &MlxArray) -> UniquePtr<MlxArray>;
 

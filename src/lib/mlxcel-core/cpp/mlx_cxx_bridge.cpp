@@ -659,6 +659,24 @@ std::unique_ptr<MlxArray> expand_dims(const MlxArray& a, int32_t axis) {
     return std::make_unique<MlxArray>(mlx::core::expand_dims(a.inner, axis));
 }
 
+// Multi-axis variant: mirrors Python's `mx.expand_dims(a, (ax0, ax1, ...))`,
+// which ends up in the `expand_dims(array, std::vector<int>)` MLX overload.
+// A single bridge call avoids the per-axis FFI + UniquePtr alloc overhead
+// that was showing up in SwitchGeGLU decode profiles (first expand_dims
+// taking ~0.8 ms because the preceding layer's graph had to sync, even
+// though the second back-to-back call was ~0.02 ms).
+std::unique_ptr<MlxArray> expand_dims_multi(
+    const MlxArray& a,
+    rust::Slice<const int32_t> axes
+) {
+    std::vector<int> ax;
+    ax.reserve(axes.size());
+    for (int32_t axis : axes) {
+        ax.push_back(static_cast<int>(axis));
+    }
+    return std::make_unique<MlxArray>(mlx::core::expand_dims(a.inner, ax));
+}
+
 std::unique_ptr<MlxArray> squeeze(const MlxArray& a) {
     return std::make_unique<MlxArray>(mlx::core::squeeze(a.inner));
 }
