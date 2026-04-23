@@ -217,22 +217,44 @@ pub struct ThinkingTokenIds {
     pub close: i32,
 }
 
-/// Resolve the `<think>` / `</think>` token IDs from the tokenizer.
+/// Resolve the reasoning-block open/close token IDs from the tokenizer.
 ///
-/// Qwen3-family tokenizers carry these as non-special added tokens in
-/// `tokenizer.json`. A HuggingFace-backed tokenizer's `token_to_id` maps the
-/// literal strings directly; non-HF tokenizers are not supported for thinking
-/// budget enforcement in v1 (the parameter is silently ignored with a warning).
+/// Prefers the Qwen3-family `<think>` / `</think>` pair when present; falls
+/// back to the Gemma 4 `<|channel>` / `<channel|>` pair when the Qwen tokens
+/// are absent. Both pairs are non-special added tokens that the tokenizer
+/// exposes through `token_to_id` (`<think>` / `</think>` for Qwen3/Qwen3.5;
+/// IDs 100 / 101 for `<|channel>` / `<channel|>` in Gemma 4's
+/// `tokenizer.json`). The returned `ThinkingTokenIds` is opaque to the rest
+/// of the scheduler — callers never need to know which family produced it.
 ///
-/// Returns `None` when either of the two strings is absent, which is the
-/// expected case for non-thinking models.
+/// Non-HF tokenizers are not supported for thinking-budget enforcement;
+/// models without either pair return `None` and the budget parameter is
+/// silently ignored.
+///
+/// Used by: `server::model_worker` at startup to cache per-model IDs.
 pub fn resolve_thinking_token_ids(
     tokenizer: &crate::tokenizer::MlxcelTokenizer,
 ) -> Option<ThinkingTokenIds> {
     let hf = tokenizer.hf_tokenizer()?;
-    let open = hf.token_to_id("<think>")? as i32;
-    let close = hf.token_to_id("</think>")? as i32;
-    Some(ThinkingTokenIds { open, close })
+    if let (Some(open), Some(close)) = (hf.token_to_id("<think>"), hf.token_to_id("</think>")) {
+        return Some(ThinkingTokenIds {
+            open: open as i32,
+            close: close as i32,
+        });
+    }
+    // Gemma 4 fallback: the reasoning block is wrapped in
+    // `<|channel>thought\n…<channel|>`. We track the outer delimiter pair;
+    // the `thought\n` stream between them is ordinary content that
+    // `ThinkingState` counts via `in_block_count`.
+    if let (Some(open), Some(close)) =
+        (hf.token_to_id("<|channel>"), hf.token_to_id("<channel|>"))
+    {
+        return Some(ThinkingTokenIds {
+            open: open as i32,
+            close: close as i32,
+        });
+    }
+    None
 }
 
 /// Runtime state tracking thinking-block position for one sequence.
@@ -783,5 +805,125 @@ mod tests {
             -1,
             "no CLI flag and no env var must yield unbounded (-1)"
         );
+    }
+
+    // -- Gemma 4 token-id fallback in resolve_thinking_token_ids --
+    //
+    // We can't easily construct a full `MlxcelTokenizer` without loading a
+    // real model, so these tests exercise the decision directly against a
+    // minimal in-memory HF tokenizer built from an added-vocab set. The
+    // intent is to guard the "prefer Qwen, fall back to Gemma 4" ordering
+    // and the "neither → None" non-thinking case so a future refactor
+    // doesn't silently drop a family.
+
+    use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
+
+    fn mlxcel_from(tokens: &[&str]) -> crate::tokenizer::MlxcelTokenizer {
+        // Minimal BPE base (same shape `MlxcelTokenizer::stub` uses). We
+        // only care about the added-vocab mappings, so the base model's
+        // details are irrelevant here.
+        let mut hf = Tokenizer::new(BPE::default());
+        let added: Vec<AddedToken> = tokens
+            .iter()
+            .map(|s| AddedToken::from(*s, /*special=*/ true))
+            .collect();
+        hf.add_tokens(&added);
+        crate::tokenizer::MlxcelTokenizer::HuggingFace(hf)
+    }
+
+    #[test]
+    fn resolve_prefers_qwen_think_pair_when_present() {
+        // Simulate a tokenizer that has BOTH pairs (hypothetical, but
+        // exercises the ordering contract). Qwen pair wins.
+        let tok = mlxcel_from(&[
+            "<think>",
+            "</think>",
+            "<|channel>",
+            "<channel|>",
+        ]);
+        let ids = resolve_thinking_token_ids(&tok).expect("qwen pair should resolve");
+        // `<think>`/`</think>` are added first, so they get the lowest IDs
+        // among the added set. Re-look them up to be robust against the
+        // underlying tokenizer's id-assignment scheme.
+        let hf = tok.hf_tokenizer().unwrap();
+        assert_eq!(ids.open as u32, hf.token_to_id("<think>").unwrap());
+        assert_eq!(ids.close as u32, hf.token_to_id("</think>").unwrap());
+    }
+
+    #[test]
+    fn resolve_falls_back_to_gemma4_channel_pair() {
+        // Qwen pair absent, Gemma 4 pair present. Budget should be usable.
+        let tok = mlxcel_from(&["<|channel>", "<channel|>"]);
+        let ids = resolve_thinking_token_ids(&tok).expect("gemma4 pair should resolve");
+        let hf = tok.hf_tokenizer().unwrap();
+        assert_eq!(ids.open as u32, hf.token_to_id("<|channel>").unwrap());
+        assert_eq!(ids.close as u32, hf.token_to_id("<channel|>").unwrap());
+    }
+
+    #[test]
+    fn resolve_returns_none_for_non_thinking_tokenizer() {
+        let tok = mlxcel_from(&["<|user|>", "<|assistant|>"]);
+        assert!(resolve_thinking_token_ids(&tok).is_none());
+    }
+
+    #[test]
+    fn resolve_partial_gemma4_pair_does_not_resolve() {
+        // Guard: only the opening marker is present (malformed config).
+        // Must not silently pretend the pair exists.
+        let tok = mlxcel_from(&["<|channel>"]);
+        assert!(resolve_thinking_token_ids(&tok).is_none());
+
+        let tok2 = mlxcel_from(&["<channel|>"]);
+        assert!(resolve_thinking_token_ids(&tok2).is_none());
+    }
+
+    // -- ThinkingState behavior with the prompt-primed open channel path --
+
+    #[test]
+    fn primed_open_thinking_with_bounded_budget_force_closes_at_cap() {
+        // Reproduces the Gemma 4 `enable_thinking=true` wiring the scheduler
+        // applies: token_ids match `<|channel>`/`<channel|>`, budget=3, and
+        // `enter_block_on_start=true` because the prompt left the model
+        // inside the open thinking channel. After three in-block tokens the
+        // next decide_override must force the close marker so generation
+        // exits the channel and the model can emit a tool_call afterwards.
+        let mut s = ThinkingState::new(
+            Some(ids()), // reuses the module-local (100, 200) pair
+            Some(ThinkingBudget::from_raw_i32(3).unwrap().unwrap()),
+            /*enter_block_on_start=*/ true,
+        );
+        // Three reasoning tokens allowed.
+        for token in [10, 20, 30] {
+            assert_eq!(s.decide_override(token), ThinkingDecision::NoOverride);
+            s.observe(token);
+        }
+        assert_eq!(s.in_block_count, 3);
+        assert!(matches!(s.phase, ThinkingPhase::InBlock));
+
+        // Fourth would exceed cap → force-emit close.
+        let decision = s.decide_override(40);
+        assert_eq!(decision, ThinkingDecision::ForceClose(ids().close));
+        s.observe(ids().close);
+        assert!(matches!(s.phase, ThinkingPhase::Closed));
+
+        // Post-close tokens pass through unchanged — this is where the model
+        // gets to emit its `<|tool_call>…<tool_call|>` for the tool-requiring
+        // prompt after budget intervened.
+        for token in [50, 60] {
+            assert_eq!(s.decide_override(token), ThinkingDecision::NoOverride);
+        }
+    }
+
+    #[test]
+    fn primed_open_thinking_with_budget_zero_forces_close_immediately() {
+        // Budget 0 + primed prompt = "no reasoning allowed, skip to action"
+        // — the first decode step emits the close marker so token #1 is
+        // already outside the thinking channel.
+        let s = ThinkingState::new(
+            Some(ids()),
+            Some(ThinkingBudget::ImmediateClose),
+            /*enter_block_on_start=*/ true,
+        );
+        assert_eq!(s.decide_override(10), ThinkingDecision::ForceClose(ids().close));
     }
 }

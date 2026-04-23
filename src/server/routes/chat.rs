@@ -289,6 +289,16 @@ async fn non_stream_chat_completion(
     options.priority = priority;
     options.reasoning_budget = budget_override;
     options.prompt_cache_ctx = prompt_cache_ctx;
+    // `ThinkingState` counts reasoning tokens from the first decoded token
+    // only when the prompt already left the model inside an open thinking
+    // block. The chat template decides this at render time (Qwen primes
+    // `<think>\n`; Gemma 4's enable_thinking=true path primes
+    // `<|channel>thought\n`; every other path leaves generation starting
+    // outside any block). Setting this per-request keeps
+    // `thinking_budget_tokens` functional for both families and avoids
+    // counting ordinary content tokens as reasoning when the prompt
+    // wasn't primed.
+    options.thinking_enter_block_on_start = primed_open_thinking;
 
     // Set logprobs configuration when requested
     let top_k = request.top_logprobs.unwrap_or(0) as usize;
@@ -428,6 +438,16 @@ async fn stream_chat_completion(
     options.priority = priority;
     options.reasoning_budget = budget_override;
     options.prompt_cache_ctx = prompt_cache_ctx;
+    // `ThinkingState` counts reasoning tokens from the first decoded token
+    // only when the prompt already left the model inside an open thinking
+    // block. The chat template decides this at render time (Qwen primes
+    // `<think>\n`; Gemma 4's enable_thinking=true path primes
+    // `<|channel>thought\n`; every other path leaves generation starting
+    // outside any block). Setting this per-request keeps
+    // `thinking_budget_tokens` functional for both families and avoids
+    // counting ordinary content tokens as reasoning when the prompt
+    // wasn't primed.
+    options.thinking_enter_block_on_start = primed_open_thinking;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request
@@ -666,31 +686,60 @@ async fn stream_chat_completion(
 /// being rendered through the Jinja2 chat template.
 pub(crate) const MAX_TOOLS: usize = 128;
 
-/// Sentinel used by [`is_prompt_primed_open_thinking`] to recognize the Gemma
-/// 4 open-thinking generation prompt produced by
-/// [`crate::server::chat_template::ChatTemplateProcessor::patch_gemma4_generation_prompt`].
-const GEMMA4_OPEN_THINKING_SUFFIX: &str = "<|channel>thought\n";
-
-/// Whether the rendered chat prompt primed an open Gemma 4 thinking channel
-/// whose close marker (`<channel|>`) the model never emitted.
+/// Suffixes that a rendered chat prompt uses to leave the model inside an
+/// open thinking block. Each corresponds to a family-specific reasoning
+/// convention:
 ///
-/// When this is true and the raw generation contains no `<channel|>`, every
-/// generated token is inside the scratchpad channel and must not be shown to
-/// the user as assistant content. Typical trigger: the model hit `max_tokens`
-/// or stopped on an EOS before closing the reasoning block.
+/// * `<think>\n` — Qwen3 / Qwen3.5 / Exaone4 / Jamba and similar templates
+///   that emit `<think>\n` at the end of the generation prompt to prime
+///   reasoning. The close marker in generated text is `</think>`.
+/// * `<|channel>thought\n` — Gemma 4 when `enable_thinking=true`, courtesy
+///   of [`crate::server::chat_template::ChatTemplateProcessor::patch_gemma4_generation_prompt`].
+///   The close marker in generated text is `<channel|>`.
+///
+/// Ordered longest-first so the match is unambiguous.
+const OPEN_THINKING_SUFFIXES: &[&str] = &["<|channel>thought\n", "<think>\n"];
+
+/// Whether the rendered chat prompt primed an open thinking block whose
+/// close marker the model is expected to emit (`</think>` for Qwen-style,
+/// `<channel|>` for Gemma 4). Callers use this to:
+///
+/// * initialize the streaming filter and non-streaming thinking stripper
+///   so the first generated tokens surface as reasoning rather than
+///   assistant content,
+/// * choose `thinking_enter_block_on_start` for the scheduler's
+///   `ThinkingState` so per-request `thinking_budget_tokens` counts every
+///   emitted token from the start (otherwise the state would wait for an
+///   opening token that never appears because the prompt already contains
+///   it).
 fn is_prompt_primed_open_thinking(prompt: &str) -> bool {
-    prompt.ends_with(GEMMA4_OPEN_THINKING_SUFFIX)
+    OPEN_THINKING_SUFFIXES
+        .iter()
+        .any(|suffix| prompt.ends_with(suffix))
 }
 
-/// Strip thinking content that would otherwise leak when the prompt primed
-/// an open `<|channel>thought\n` and the model never emitted `<channel|>`.
+/// Close markers for each supported open-thinking priming convention. Paired
+/// by family with [`OPEN_THINKING_SUFFIXES`] — either one closes "a block
+/// the prompt opened", so the post-processor treats the generation as
+/// closed when any of them appears in the raw output.
+const OPEN_THINKING_CLOSE_MARKERS: &[&str] = &["<channel|>", "</think>"];
+
+/// Strip reasoning content that would otherwise leak when the prompt primed
+/// an open thinking block and the model never emitted its close marker.
 ///
 /// * Returns `content` unchanged when the prompt did not prime open thinking.
-/// * Returns `content` unchanged when `raw_output` contains a `<channel|>`
-///   marker — the usual parsers already handle that case.
+/// * Returns `content` unchanged when `raw_output` contains any known close
+///   marker (`<channel|>` for Gemma 4, `</think>` for Qwen-style) — the
+///   regular parsers already handle that case.
 /// * Returns an empty string when the whole generation was unclosed thinking.
 fn strip_unclosed_primed_thinking(content: String, raw_output: &str, primed: bool) -> String {
-    if !primed || raw_output.contains("<channel|>") {
+    if !primed {
+        return content;
+    }
+    if OPEN_THINKING_CLOSE_MARKERS
+        .iter()
+        .any(|m| raw_output.contains(m))
+    {
         return content;
     }
     String::new()
@@ -725,10 +774,12 @@ pub(crate) fn build_generate_options(
             // explicitly after `build_generate_options` returns, so the
             // default here is just a placeholder.
             reasoning_budget: ReasoningBudgetOverride::default(),
-            // Issue #409: chat templates prime `<think>\n` so the first
-            // decoded token is already inside the reasoning block for Qwen3
-            // family models.
-            thinking_enter_block_on_start: true,
+            // Placeholder: the caller overrides this with
+            // `is_prompt_primed_open_thinking(&prepared.prompt)` once the
+            // chat template has rendered, so the value picked up by the
+            // scheduler matches the actual prompt tail (Qwen `<think>\n`,
+            // Gemma 4 `<|channel>thought\n`, or neither).
+            thinking_enter_block_on_start: false,
         },
     )
 }

@@ -472,11 +472,16 @@ pub fn try_gemma4(text: &str) -> Option<ToolCallParseResult> {
         return None;
     }
 
-    // Strip Gemma 4 structural markers from content (e.g. trailing <turn|>)
+    // Strip Gemma 4 structural markers from content (e.g. trailing `<turn|>`,
+    // stray `<channel|>` left over from an out-of-order thinking close when
+    // `thinking_budget_tokens` force-injected the close marker). `<|channel>`
+    // is included for symmetry so partial/malformed emissions don't leak.
     let content = content
         .replace("<turn|>", "")
         .replace("<|turn>", "")
-        .replace("<|think|>", "");
+        .replace("<|think|>", "")
+        .replace("<channel|>", "")
+        .replace("<|channel>", "");
     let content = content.trim().to_string();
 
     Some(ToolCallParseResult {
