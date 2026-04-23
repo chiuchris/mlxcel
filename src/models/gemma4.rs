@@ -958,17 +958,18 @@ impl DecoderLayer {
         UniquePtr<MlxArray>,
         Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)>,
     ) {
-        let residual = mlxcel_core::copy(x);
+        // Mirror mlx-lm's `residual = x` aliasing by holding a reference to
+        // the prior stage's tensor instead of copying it. The earlier
+        // `mlxcel_core::copy` calls produced a MLX Copy primitive and a fresh
+        // UniquePtr<MlxArray> per layer; both are wasted work since the
+        // residual is only *read* by the final `add`.
+        let h_attn = self.input_layernorm.forward(x);
+        let (h_attn, stored_kv) = self.self_attn.forward(&h_attn, mask, cache, shared_kv);
+        let h_attn = self.post_attention_layernorm.forward(&h_attn);
+        let after_attn = mlxcel_core::add(x, &h_attn);
 
-        let h = self.input_layernorm.forward(x);
-        let (h, stored_kv) = self.self_attn.forward(&h, mask, cache, shared_kv);
-        let h = self.post_attention_layernorm.forward(&h);
-        let mut h = mlxcel_core::add(&residual, &h);
-
-        let residual = mlxcel_core::copy(&h);
-
-        if let (Some(router), Some(experts)) = (&self.router, &self.experts) {
-            let h1 = self.pre_feedforward_layernorm.forward(&h);
+        let ffn_out = if let (Some(router), Some(experts)) = (&self.router, &self.experts) {
+            let h1 = self.pre_feedforward_layernorm.forward(&after_attn);
             let h1 = self.mlp.forward(&h1);
             let h1 = self
                 .post_feedforward_layernorm_1
@@ -976,43 +977,44 @@ impl DecoderLayer {
                 .expect("Missing Gemma4 MoE post_feedforward_layernorm_1")
                 .forward(&h1);
 
-            let (top_k_indices, top_k_weights) = router.forward(&h);
+            let (top_k_indices, top_k_weights) = router.forward(&after_attn);
             let h2 = self
                 .pre_feedforward_layernorm_2
                 .as_ref()
                 .expect("Missing Gemma4 MoE pre_feedforward_layernorm_2")
-                .forward(&h);
+                .forward(&after_attn);
             let h2 = experts.forward(&h2, &top_k_indices, &top_k_weights);
             let h2 = self
                 .post_feedforward_layernorm_2
                 .as_ref()
                 .expect("Missing Gemma4 MoE post_feedforward_layernorm_2")
                 .forward(&h2);
-            h = mlxcel_core::add(&h1, &h2);
+            mlxcel_core::add(&h1, &h2)
         } else {
-            let h_norm = self.pre_feedforward_layernorm.forward(&h);
-            h = self.mlp.forward(&h_norm);
-        }
+            let h_norm = self.pre_feedforward_layernorm.forward(&after_attn);
+            self.mlp.forward(&h_norm)
+        };
 
-        h = self.post_feedforward_layernorm.forward(&h);
-        h = mlxcel_core::add(&residual, &h);
+        let ffn_out = self.post_feedforward_layernorm.forward(&ffn_out);
+        let after_ffn = mlxcel_core::add(&after_attn, &ffn_out);
 
-        if let (Some(gate_proj), Some(proj), Some(post_norm), Some(per_layer_input)) = (
+        let h = if let (Some(gate_proj), Some(proj), Some(post_norm), Some(per_layer_input)) = (
             &self.per_layer_input_gate,
             &self.per_layer_projection,
             &self.post_per_layer_input_norm,
             per_layer_input,
         ) {
-            let residual = mlxcel_core::copy(&h);
-            let gate = gate_proj.forward(&h);
+            let gate = gate_proj.forward(&after_ffn);
             let gate = mlxcel_core::gelu_approx(&gate);
             let gate = mlxcel_core::multiply(&gate, per_layer_input);
             let gate = proj.forward(&gate);
             let gate = post_norm.forward(&gate);
-            h = mlxcel_core::add(&residual, &gate);
-        }
+            mlxcel_core::add(&after_ffn, &gate)
+        } else {
+            after_ffn
+        };
 
-        h = mlxcel_core::multiply(&h, &self.layer_scalar);
+        let h = mlxcel_core::multiply(&h, &self.layer_scalar);
         (h, stored_kv)
     }
 
