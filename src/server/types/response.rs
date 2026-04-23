@@ -100,11 +100,19 @@ pub struct ChatChoice {
     pub logprobs: Option<ChatLogprobs>,
 }
 
-/// Chat message in response
+/// Chat message in response.
+///
+/// `content` is always serialized (as a string or JSON `null`) so the shape
+/// matches the OpenAI / llama.cpp / vLLM convention: when the assistant
+/// turn is a tool call with no accompanying text, `content` comes back as
+/// explicit `null` rather than `""`. Routers that key on `content.is_null()`
+/// to distinguish tool-only turns rely on this distinction
+/// (`continuum-router/src/core/tool_calling/response.rs:21`,
+/// `src/core/tool_calling/streaming.rs:258`).
 #[derive(Debug, Clone, Serialize)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: Option<String>,
     /// Tool calls made by the assistant (present when finish_reason is "tool_calls")
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCallResponse>>,
@@ -182,7 +190,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: Some(content),
                     tool_calls: None,
                 },
                 finish_reason,
@@ -199,7 +207,10 @@ impl ChatCompletionResponse {
 
     /// Create a response with tool calls.
     ///
-    /// `content` is set to empty when tool calls are present (per OpenAI spec).
+    /// When `content` is empty, the serialized message sets `content` to
+    /// JSON `null` (per OpenAI / llama.cpp / vLLM convention for tool-only
+    /// assistant turns). A non-empty `content` is preserved verbatim so
+    /// mixed-content responses (text preamble + tool call) still round-trip.
     /// `finish_reason` is automatically set to "tool_calls".
     pub fn new_with_tool_calls(
         id: String,
@@ -210,6 +221,11 @@ impl ChatCompletionResponse {
         completion_tokens: usize,
         logprobs: Option<ChatLogprobs>,
     ) -> Self {
+        let message_content = if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        };
         Self {
             id,
             object: "chat.completion".to_string(),
@@ -220,7 +236,7 @@ impl ChatCompletionResponse {
                 index: 0,
                 message: ChatMessage {
                     role: "assistant".to_string(),
-                    content,
+                    content: message_content,
                     tool_calls: Some(tool_calls),
                 },
                 finish_reason: Some("tool_calls".to_string()),
@@ -562,5 +578,110 @@ mod tests {
 
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 0);
+    }
+
+    // -- OpenAI/llama.cpp/vLLM tool-call content=null shape --
+    //
+    // continuum-router documents the target OpenAI/llama.cpp format with
+    // `"content": null` for tool-only assistant turns
+    // (`src/core/tool_calling/response.rs:21`). These tests lock the wire
+    // shape so the router's null-check consumers keep working.
+
+    #[test]
+    fn tool_only_turn_serializes_content_as_null() {
+        let tool_call = ToolCallResponse {
+            id: "call_abc".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunctionResponse {
+                name: "get_current_time".to_string(),
+                arguments: "{\"format\":\"human\"}".to_string(),
+            },
+        };
+        let resp = ChatCompletionResponse::new_with_tool_calls(
+            "chatcmpl-1".to_string(),
+            "g4".to_string(),
+            String::new(),
+            vec![tool_call],
+            10,
+            5,
+            None,
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let message = &json["choices"][0]["message"];
+        assert!(
+            message["content"].is_null(),
+            "tool-only turn must serialize content as JSON null, got: {}",
+            message
+        );
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(
+            message["tool_calls"][0]["function"]["name"],
+            "get_current_time"
+        );
+    }
+
+    #[test]
+    fn tool_call_with_text_preamble_preserves_content() {
+        // Mixed responses (text + tool call) must keep the preamble string
+        // intact; the null treatment is reserved for empty-content tool-only
+        // turns. Round-trip the OpenAI "content alongside tool_calls" shape.
+        let tool_call = ToolCallResponse {
+            id: "call_xyz".to_string(),
+            call_type: "function".to_string(),
+            function: ToolCallFunctionResponse {
+                name: "calculator".to_string(),
+                arguments: "{\"expression\":\"2+2\"}".to_string(),
+            },
+        };
+        let resp = ChatCompletionResponse::new_with_tool_calls(
+            "chatcmpl-2".to_string(),
+            "g4".to_string(),
+            "Let me compute that.".to_string(),
+            vec![tool_call],
+            10,
+            8,
+            None,
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["content"], "Let me compute that.");
+        assert_eq!(json["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn regular_response_serializes_content_as_string() {
+        let resp = ChatCompletionResponse::new(
+            "chatcmpl-3".to_string(),
+            "g4".to_string(),
+            "hello world".to_string(),
+            5,
+            3,
+            Some("stop".to_string()),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        let message = &json["choices"][0]["message"];
+        assert_eq!(message["content"], "hello world");
+        assert!(
+            message.get("tool_calls").is_none()
+                || message["tool_calls"].is_null(),
+            "non-tool response must omit tool_calls field"
+        );
+    }
+
+    #[test]
+    fn regular_response_with_empty_content_serializes_as_empty_string() {
+        // A regular (non-tool) response with explicitly empty text stays a
+        // string — the null treatment is specific to tool-only turns. This
+        // prevents a refactor from accidentally broadening the null rule.
+        let resp = ChatCompletionResponse::new(
+            "chatcmpl-4".to_string(),
+            "g4".to_string(),
+            String::new(),
+            5,
+            0,
+            Some("length".to_string()),
+        );
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["choices"][0]["message"]["content"], "");
     }
 }
