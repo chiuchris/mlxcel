@@ -497,25 +497,25 @@ async fn stream_chat_completion(
         let accumulated = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
         let acc_clone = accumulated.clone();
 
-        // Stream filter: strips Gemma 4 (and similar) structural tokens from
-        // content deltas so clients never see <|channel>, <|tool_call>, etc.
-        // Always on — for non-tool chat requests we still need to suppress
-        // the thinking-channel markers and stray turn tokens that Gemma 4
-        // models occasionally emit.
+        // Stream filter: strips model-specific structural tokens from content
+        // deltas so clients never see <|channel>, <|tool_call>, <think>, etc.
+        // Always on — even non-tool chat requests need to suppress thinking-
+        // channel markers and stray turn tokens emitted by Gemma 4 and Qwen-
+        // style reasoning models.
         //
-        // When the generation prompt primed an open Gemma 4 thinking channel
-        // (patch_gemma4_generation_prompt appended `<|channel>thought\n`), the
+        // When the generation prompt primed an open thinking marker — either
+        // `<|channel>thought\n` (Gemma 4 enable_thinking=true) or `<think>\n`
+        // (Qwen-style enable_thinking=true via OPEN_THINKING_SUFFIXES) — the
         // model's first emitted tokens are already reasoning content. Start
-        // the filter in `Thinking` state so those tokens are suppressed until
-        // the model emits `<channel|>`; otherwise the scratchpad leaks to the
-        // user when max_tokens is reached mid-reasoning.
-        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(
-            if primed_open_thinking {
-                StreamFilter::new_primed_open_thinking()
-            } else {
-                StreamFilter::new()
-            },
-        ));
+        // the filter in `Thinking` state so those tokens route to
+        // `reasoning_content` until the model emits the matching close marker
+        // (`<channel|>` or `</think>`); otherwise the scratchpad leaks to the
+        // client when max_tokens is reached mid-reasoning.
+        let stream_filter = std::sync::Arc::new(std::sync::Mutex::new(if primed_open_thinking {
+            StreamFilter::new_primed_open_thinking()
+        } else {
+            StreamFilter::new()
+        }));
         let filter_for_callback = stream_filter.clone();
 
         let result = state

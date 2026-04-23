@@ -12,16 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Streaming content filter for Gemma 4 special tokens.
+//! Streaming content filter for model-specific structural tokens.
 //!
-//! Prevents model-internal structural tokens (`<|channel>`, `<|tool_call>`,
-//! `<turn|>`, etc.) from leaking into SSE content deltas during streaming
-//! generation.
+//! Prevents model-internal structural tokens (`<think>`, `</think>`,
+//! `<|channel>`, `<|tool_call>`, `<turn|>`, etc.) from leaking into SSE
+//! content deltas during streaming generation.
 //!
 //! The filter operates as a state machine on decoded text fragments (after
 //! `StreamingDecodeState` has resolved UTF-8 boundaries).  It buffers text
 //! at delimiter boundaries to handle the case where a delimiter straddles
 //! two decode fragments.
+//!
+//! **Supported families:**
+//! - Qwen-style: `<think>` / `</think>` — Qwen3.x, Exaone4, Hunyuan, GLM4, etc.
+//! - Gemma 4: `<|channel>` / `<channel|>`, `<|tool_call>` / `<tool_call|>`,
+//!   `<|think|>`, `<|turn>` / `<turn|>`
+//!
+//! The non-streaming counterpart (`tool_calls::parser::strip_thinking`) already
+//! handles both families; this filter keeps the streaming path consistent.
 //!
 //! Used by: routes/chat (streaming path)
 
@@ -29,12 +37,12 @@
 ///
 /// `content` is text that should be emitted to the client as
 /// `delta.content`; `reasoning` is text that belongs inside a scratchpad /
-/// thinking block (Gemma 4 `<|channel>thought\n...<channel|>`) and should be
-/// emitted as `delta.reasoning_content` so downstream routers and UIs can
-/// display a "thinking" status without parsing model-specific markers. Both
-/// are `None` when the fragment was fully buffered or fell inside a
-/// tool-call block (tool calls are materialized by the non-streaming parser
-/// path, not here).
+/// thinking block (e.g. `<think>…</think>` for Qwen-style models or
+/// `<|channel>thought\n…<channel|>` for Gemma 4) and should be emitted as
+/// `delta.reasoning_content` so downstream routers and UIs can display a
+/// "thinking" status without parsing model-specific markers. Both are `None`
+/// when the fragment was fully buffered or fell inside a tool-call block
+/// (tool calls are materialized by the non-streaming parser path, not here).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterOutput {
     pub content: Option<String>,
@@ -79,11 +87,27 @@ enum DelimiterAction {
     Strip,
 }
 
-/// Gemma 4 special tokens and their associated actions.
+/// Delimiter table shared across reasoning model families.
 ///
-/// The delimiter list is ordered by length (longest first) so that longer
-/// matches take priority over shorter prefixes during scanning.
-const GEMMA4_DELIMITERS: &[(&str, DelimiterAction)] = &[
+/// Qwen-style markers (`<think>` / `</think>`) appear **before** Gemma 4
+/// markers to mirror the probe ordering in
+/// `thinking_budget::resolve_thinking_token_ids`, which also checks the Qwen
+/// pair first.  The ordering is a consistency convention rather than a
+/// functional guard — no Qwen delimiter prefix-matches any Gemma 4 delimiter
+/// in practice.
+///
+/// Tool-call delimiters (`<|tool_call>` / `<tool_call|>`) and the turn/think
+/// strip markers remain Gemma-4-scoped — Qwen-style templates use a different
+/// tool-call mechanism (`<tool_call>` Hermes markers handled by `parser.rs`).
+///
+/// TODO (#444): Consider extracting this into a startup-time configurable
+/// owned by the model worker so new reasoning families don't require a rebuild.
+const CHAT_DELIMITERS: &[(&str, DelimiterAction)] = &[
+    // Qwen-style reasoning (Qwen3.x, Exaone4, Hunyuan, GLM4, Nemotron-H, SmolLM3, …)
+    // Probe these first to mirror resolve_thinking_token_ids ordering.
+    ("</think>", DelimiterAction::ExitThinking),
+    ("<think>", DelimiterAction::EnterThinking),
+    // Gemma 4 reasoning channel
     ("<|tool_call>", DelimiterAction::EnterToolCall),
     ("<tool_call|>", DelimiterAction::ExitToolCall),
     ("<|channel>", DelimiterAction::EnterThinking),
@@ -104,8 +128,13 @@ enum FilterState {
     ToolCall,
 }
 
-/// Streaming content filter that strips Gemma 4 structural tokens from
-/// content deltas.
+/// Streaming content filter that strips model-specific structural tokens from
+/// content deltas, routing reasoning-block text to `delta.reasoning_content`
+/// and regular response text to `delta.content`.
+///
+/// Covers both Qwen-style (`<think>` / `</think>`) and Gemma 4
+/// (`<|channel>` / `<channel|>`) reasoning families, plus Gemma 4 tool-call
+/// and turn markers.
 ///
 /// Feed decoded text fragments via [`feed()`](StreamFilter::feed).  The
 /// filter returns only the content that should be emitted to the client.
@@ -125,9 +154,9 @@ impl Default for StreamFilter {
 }
 
 impl StreamFilter {
-    /// Create a new stream filter with Gemma 4 delimiter set.
+    /// Create a new stream filter covering Qwen-style and Gemma 4 delimiters.
     pub fn new() -> Self {
-        let max_delim_len = GEMMA4_DELIMITERS
+        let max_delim_len = CHAT_DELIMITERS
             .iter()
             .map(|(s, _)| s.len())
             .max()
@@ -142,13 +171,15 @@ impl StreamFilter {
 
     /// Create a filter that starts inside a `Thinking` block.
     ///
-    /// Use when the chat template's generation prompt primed an open
-    /// `<|channel>thought\n` (Gemma 4 `enable_thinking=true` branch): the
-    /// first emitted token is already reasoning content, not a regular
-    /// response, so suppress it until the model emits `<channel|>` to
-    /// transition back to `Content`. If the model never closes the block,
-    /// the entire generation is suppressed — matching the non-streaming
-    /// post-processor behavior in `routes::chat::strip_unclosed_primed_thinking`.
+    /// Use when the chat template's generation prompt primed an open thinking
+    /// marker — either `<|channel>thought\n` (Gemma 4 `enable_thinking=true`)
+    /// or `<think>\n` (Qwen-style `enable_thinking=true`): the first emitted
+    /// token is already reasoning content, not a regular response, so it is
+    /// routed to `reasoning` until the model emits the matching close marker
+    /// (`<channel|>` or `</think>`) to transition back to `Content`.  If the
+    /// model never closes the block, the entire generation is suppressed —
+    /// matching the non-streaming post-processor behavior in
+    /// `routes::chat::strip_unclosed_primed_thinking`.
     pub fn new_primed_open_thinking() -> Self {
         let mut s = Self::new();
         s.state = FilterState::Thinking;
@@ -232,7 +263,11 @@ impl StreamFilter {
         }
 
         FilterOutput {
-            content: if content.is_empty() { None } else { Some(content) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             reasoning: if reasoning.is_empty() {
                 None
             } else {
@@ -247,7 +282,7 @@ impl StreamFilter {
     fn find_earliest_delimiter(&self) -> Option<(usize, usize, DelimiterAction)> {
         let mut earliest: Option<(usize, usize, DelimiterAction)> = None;
 
-        for &(delim, action) in GEMMA4_DELIMITERS {
+        for &(delim, action) in CHAT_DELIMITERS {
             if let Some(pos) = self.buffer.find(delim) {
                 match earliest {
                     Some((best_pos, best_len, _)) => {
@@ -283,7 +318,7 @@ impl StreamFilter {
                 continue;
             }
             let suffix = &buf[i..];
-            for &(delim, _) in GEMMA4_DELIMITERS {
+            for &(delim, _) in CHAT_DELIMITERS {
                 // A suffix is a partial match if it's a proper prefix of a
                 // delimiter (shorter, and the delimiter starts with it).
                 if suffix.len() < delim.len() && delim.starts_with(suffix) {
@@ -311,12 +346,23 @@ impl StreamFilter {
 mod tests {
     use super::*;
 
+    // Accepted design constraint: any model (including non-thinking models)
+    // that emits literal `<think>…</think>` text in its response will have
+    // that text routed to `reasoning_content` rather than `content`.  This is
+    // intentional and matches the non-streaming `strip_thinking` behavior in
+    // `tool_calls::parser` — both paths treat the markers as structural
+    // regardless of context.  A model that wants to discuss the `<think>` tag
+    // as prose should escape or paraphrase it.
+
     // -- Basic passthrough --
 
     #[test]
     fn no_special_tokens_passthrough() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("Hello world").content, Some("Hello world".to_string()));
+        assert_eq!(
+            f.feed("Hello world").content,
+            Some("Hello world".to_string())
+        );
     }
 
     #[test]
@@ -338,7 +384,9 @@ mod tests {
     fn thinking_then_content() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.").content, Some("Here is the answer.".to_string())
+            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.")
+                .content,
+            Some("Here is the answer.".to_string())
         );
     }
 
@@ -346,7 +394,9 @@ mod tests {
     fn thinking_then_content_with_turn() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.<turn|>").content, Some("Here is the answer.".to_string())
+            f.feed("<|channel>thought\nPlanning.<channel|>Here is the answer.<turn|>")
+                .content,
+            Some("Here is the answer.".to_string())
         );
     }
 
@@ -364,7 +414,9 @@ mod tests {
     fn content_then_tool_call() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("Let me search.<|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|>").content, Some("Let me search.".to_string())
+            f.feed("Let me search.<|tool_call>call:web_search{query:<|\"|>rust<|\"|>}<tool_call|>")
+                .content,
+            Some("Let me search.".to_string())
         );
     }
 
@@ -393,7 +445,8 @@ mod tests {
     fn strips_think_marker() {
         let mut f = StreamFilter::new();
         assert_eq!(
-            f.feed("Before<|think|>After").content, Some("BeforeAfter".to_string())
+            f.feed("Before<|think|>After").content,
+            Some("BeforeAfter".to_string())
         );
     }
 
@@ -414,7 +467,10 @@ mod tests {
         // "<|" at the end could start a delimiter
         assert_eq!(f.feed("test <|").content, Some("test ".to_string()));
         // Next fragment shows it's not a delimiter
-        assert_eq!(f.feed("not_a_delim").content, Some("<|not_a_delim".to_string()));
+        assert_eq!(
+            f.feed("not_a_delim").content,
+            Some("<|not_a_delim".to_string())
+        );
     }
 
     #[test]
@@ -423,7 +479,8 @@ mod tests {
         assert_eq!(f.feed("Hello <|cha").content, Some("Hello ".to_string()));
         // Completes the channel delimiter
         assert_eq!(
-            f.feed("nnel>thought\nthinking<channel|>World").content, Some("World".to_string())
+            f.feed("nnel>thought\nthinking<channel|>World").content,
+            Some("World".to_string())
         );
     }
 
@@ -462,7 +519,8 @@ mod tests {
         assert_eq!(f.feed("I am thinking.").content, None);
         assert_eq!(f.feed("<channel|>").content, None);
         assert_eq!(
-            f.feed("Here is my answer.").content, Some("Here is my answer.".to_string())
+            f.feed("Here is my answer.").content,
+            Some("Here is my answer.".to_string())
         );
     }
 
@@ -503,7 +561,8 @@ mod tests {
         let mut f = StreamFilter::new();
         // HTML-like content should pass through
         assert_eq!(
-            f.feed("<div>hello</div>").content, Some("<div>hello</div>".to_string())
+            f.feed("<div>hello</div>").content,
+            Some("<div>hello</div>".to_string())
         );
     }
 
@@ -583,5 +642,114 @@ mod tests {
         let flushed = f.flush();
         assert_eq!(flushed.content.as_deref(), Some("<"));
         assert!(flushed.reasoning.is_none());
+    }
+
+    // -- Qwen-style <think> / </think> reasoning (issue #444) --
+
+    #[test]
+    fn qwen_think_full_chunk() {
+        // Full chunk: reasoning inside <think>…</think> surfaces as `reasoning`,
+        // content after the close surfaces as `content`, no raw markers leak.
+        let mut f = StreamFilter::new();
+        let out = f.feed("<think>reasoning here</think>content");
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning here"));
+        assert_eq!(out.content.as_deref(), Some("content"));
+        // Verify markers themselves don't appear in either field
+        assert!(!out.reasoning.as_deref().unwrap_or("").contains("<think>"));
+        assert!(!out.reasoning.as_deref().unwrap_or("").contains("</think>"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("<think>"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
+    }
+
+    #[test]
+    fn qwen_think_prompt_primed() {
+        // Prompt-primed case: generation prompt appended `<think>\n` so the
+        // model's first token is already reasoning.  Start the filter in
+        // Thinking state; the first `</think>` closes the block.
+        let mut f = StreamFilter::new_primed_open_thinking();
+        let out = f.feed("reasoning here</think>content");
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning here"));
+        assert_eq!(out.content.as_deref(), Some("content"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
+    }
+
+    #[test]
+    fn qwen_think_token_by_token_full_chunk() {
+        // Token-by-token streaming of the full-chunk case: feed one short
+        // fragment at a time and aggregate the deltas.
+        let mut f = StreamFilter::new();
+        let fragments = [
+            "<thi", "nk>", "rea", "son", "ing", " he", "re<", "/th", "ink", ">con", "tent",
+        ];
+        let mut total_reasoning = String::new();
+        let mut total_content = String::new();
+        for frag in &fragments {
+            let out = f.feed(frag);
+            if let Some(r) = out.reasoning {
+                total_reasoning.push_str(&r);
+            }
+            if let Some(c) = out.content {
+                total_content.push_str(&c);
+            }
+        }
+        // Flush picks up anything still buffered
+        let flushed = f.flush();
+        if let Some(r) = flushed.reasoning {
+            total_reasoning.push_str(&r);
+        }
+        if let Some(c) = flushed.content {
+            total_content.push_str(&c);
+        }
+        assert_eq!(total_reasoning, "reasoning here");
+        assert_eq!(total_content, "content");
+        assert!(!total_reasoning.contains("<think>"));
+        assert!(!total_reasoning.contains("</think>"));
+        assert!(!total_content.contains("<think>"));
+        assert!(!total_content.contains("</think>"));
+    }
+
+    #[test]
+    fn qwen_think_token_by_token_prompt_primed() {
+        // Token-by-token streaming of the prompt-primed case.
+        let mut f = StreamFilter::new_primed_open_thinking();
+        let fragments = [
+            "rea", "son", "ing", " he", "re<", "/th", "ink", ">con", "tent",
+        ];
+        let mut total_reasoning = String::new();
+        let mut total_content = String::new();
+        for frag in &fragments {
+            let out = f.feed(frag);
+            if let Some(r) = out.reasoning {
+                total_reasoning.push_str(&r);
+            }
+            if let Some(c) = out.content {
+                total_content.push_str(&c);
+            }
+        }
+        let flushed = f.flush();
+        if let Some(r) = flushed.reasoning {
+            total_reasoning.push_str(&r);
+        }
+        if let Some(c) = flushed.content {
+            total_content.push_str(&c);
+        }
+        assert_eq!(total_reasoning, "reasoning here");
+        assert_eq!(total_content, "content");
+    }
+
+    // -- Gemma 4 regression guard (issue #444) --
+
+    #[test]
+    fn gemma4_regression_channel_reasoning_and_content() {
+        // Regression guard: Gemma 4 `<|channel>reasoning<channel|>content`
+        // must still route correctly after the Qwen entries were added to
+        // CHAT_DELIMITERS. Any change to the filter that silently breaks
+        // Gemma 4 will be caught here.
+        let mut f = StreamFilter::new();
+        let out = f.feed("<|channel>thought\nReasoning text<channel|>Answer text");
+        assert_eq!(out.reasoning.as_deref(), Some("thought\nReasoning text"));
+        assert_eq!(out.content.as_deref(), Some("Answer text"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("<|channel>"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("<channel|>"));
     }
 }
