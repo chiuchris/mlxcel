@@ -138,6 +138,30 @@ impl Inner {
         (bytes, count)
     }
 
+    /// Remove entries whose detached cache was already consumed by an adopt
+    /// path. The store keeps lookup results as `Arc<CacheEntry>`, so the
+    /// scheduler drains the detached payload after the store lock is released.
+    /// Sweeping these drained shells on the next store touch keeps byte-budget
+    /// accounting and trie candidates aligned with reusable cache state.
+    fn sweep_drained(&mut self) -> (usize, usize) {
+        if self.entries.is_empty() {
+            return (0, 0);
+        }
+        let drained: Vec<PromptCacheKeyDigest> = self
+            .entries
+            .iter()
+            .filter(|(_, slot)| !slot.entry.has_detached())
+            .map(|(digest, _)| *digest)
+            .collect();
+        let mut bytes = 0;
+        for digest in &drained {
+            if let Some((_, entry)) = self.remove_entry(digest) {
+                bytes += entry.size_bytes;
+            }
+        }
+        (bytes, drained.len())
+    }
+
     /// Evict the single oldest entry. Returns the number of bytes freed, or
     /// `0` if the store is empty.
     fn evict_oldest(&mut self) -> usize {
@@ -371,6 +395,7 @@ impl PromptCacheStore {
             if !guard.config.is_enabled() {
                 return None;
             }
+            let _ = guard.sweep_drained();
             let (freed, count) = guard.sweep_ttl(now);
             if let Some(per_entry) = freed.checked_div(count) {
                 let metrics = Arc::clone(&self.metrics);
@@ -392,6 +417,7 @@ impl PromptCacheStore {
                 }
             };
             super::lookup::select_best(trie, key, tokens, min_len, |d| guard.entries.get(d))
+                .or_else(|| select_best_by_scan(&guard, &sessionless, key, tokens, min_len))
         };
 
         // Increment lookup counters under the write lock so statistics stay
@@ -447,6 +473,7 @@ impl PromptCacheStore {
         if !guard.config.is_enabled() {
             return 0;
         }
+        let (drained_freed, _) = guard.sweep_drained();
         let now = Instant::now();
         let (ttl_freed, ttl_count) = guard.sweep_ttl(now);
         if let Some(per_entry) = ttl_freed.checked_div(ttl_count) {
@@ -457,7 +484,7 @@ impl PromptCacheStore {
         }
         let metrics = Arc::clone(&self.metrics);
         let cap_freed = guard.enforce_caps(metrics.as_ref());
-        ttl_freed + cap_freed
+        drained_freed + ttl_freed + cap_freed
     }
 
     /// Drop every entry. Primarily for tests and shutdown paths.
@@ -466,6 +493,69 @@ impl PromptCacheStore {
         guard.entries.clear();
         guard.tries.clear();
         guard.total_bytes = 0;
+    }
+}
+
+fn better_candidate(a: &super::lookup::BestCandidate, b: &super::lookup::BestCandidate) -> bool {
+    if a.matched != b.matched {
+        return a.matched > b.matched;
+    }
+    a.last_used > b.last_used
+}
+
+fn select_best_by_scan(
+    guard: &Inner,
+    sessionless: &SessionlessBucketKey,
+    key: &PromptCacheKey<'_>,
+    tokens: &[i32],
+    min_len: usize,
+) -> Option<super::lookup::BestCandidate> {
+    let caller_session = key.session_key;
+    let mut best_same_session: Option<super::lookup::BestCandidate> = None;
+    let mut best_other_session: Option<super::lookup::BestCandidate> = None;
+
+    for (digest, slot) in &guard.entries {
+        if &slot.sessionless != sessionless || !slot.entry.has_detached() {
+            continue;
+        }
+        let token_len = slot.entry.tokens.len();
+        if token_len < min_len || token_len > tokens.len() {
+            continue;
+        }
+        if slot.entry.tokens.as_slice() != &tokens[..token_len] {
+            continue;
+        }
+
+        let same_session = match (&slot.bucket.session_key, caller_session) {
+            (Some(a), Some(b)) => a.as_str() == b,
+            (None, None) => true,
+            _ => false,
+        };
+        let candidate = super::lookup::BestCandidate {
+            digest: *digest,
+            matched: token_len,
+            last_used: slot.entry.last_used(),
+        };
+        let bucket = if same_session {
+            &mut best_same_session
+        } else {
+            &mut best_other_session
+        };
+        match bucket {
+            None => *bucket = Some(candidate),
+            Some(existing) => {
+                if better_candidate(&candidate, existing) {
+                    *existing = candidate;
+                }
+            }
+        }
+    }
+
+    match (best_same_session, best_other_session) {
+        (Some(s), Some(o)) if o.matched > s.matched => Some(o),
+        (Some(s), _) => Some(s),
+        (None, Some(o)) => Some(o),
+        (None, None) => None,
     }
 }
 

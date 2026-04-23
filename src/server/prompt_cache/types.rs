@@ -22,7 +22,7 @@
 
 use thiserror::Error;
 
-use super::key::PromptCacheKey;
+use super::key::{MultimodalDigest, PromptCacheKey};
 
 /// Insert-time failure mode.
 #[derive(Clone, Debug, Error, PartialEq, Eq)]
@@ -58,6 +58,7 @@ pub struct BucketKey {
     pub model_id: String,
     pub lora_id: Option<String>,
     pub template_sig: String,
+    pub mm_digest: MultimodalDigest,
     pub session_key: Option<String>,
 }
 
@@ -69,6 +70,7 @@ impl BucketKey {
             model_id: key.model_id.to_string(),
             lora_id: key.lora_id.map(str::to_string),
             template_sig: key.template_sig.to_string(),
+            mm_digest: key.mm_digest,
             session_key: key.session_key.map(str::to_string),
         }
     }
@@ -77,15 +79,16 @@ impl BucketKey {
 /// Session-independent bucket identity. Used as the index key for the
 /// per-model/lora/template radix trie that powers
 /// [`super::store::PromptCacheStore::lookup_longest_prefix`]. Two entries
-/// with identical `(model_id, lora_id, template_sig)` but different
+/// with identical `(model_id, lora_id, template_sig, mm_digest)` but different
 /// `session_key`s share the same trie, so cross-session prefix reuse is
-/// possible — subject to the tie-break rules documented on the lookup
-/// method.
+/// possible only when the rendered template and resolved multimodal payload
+/// match — subject to the tie-break rules documented on the lookup method.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) struct SessionlessBucketKey {
     pub model_id: String,
     pub lora_id: Option<String>,
     pub template_sig: String,
+    pub mm_digest: MultimodalDigest,
 }
 
 impl SessionlessBucketKey {
@@ -94,6 +97,7 @@ impl SessionlessBucketKey {
             model_id: key.model_id.to_string(),
             lora_id: key.lora_id.map(str::to_string),
             template_sig: key.template_sig.to_string(),
+            mm_digest: key.mm_digest,
         }
     }
 }

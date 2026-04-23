@@ -469,7 +469,8 @@ fn multimodal_digest_from_vecs_matches_direct() {
     let aud = fake_audio(9);
 
     let via_slices = multimodal_digest(&[img.as_slice()], &[aud.as_slice()]);
-    let via_vecs = multimodal_digest_from_vecs(&[img.clone()], &[aud.clone()]);
+    let via_vecs =
+        multimodal_digest_from_vecs(std::slice::from_ref(&img), std::slice::from_ref(&aud));
     assert_eq!(via_slices, via_vecs);
 }
 

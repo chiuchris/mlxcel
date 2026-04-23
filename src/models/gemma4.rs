@@ -283,17 +283,13 @@ impl SwitchGeGLU {
         // sync at every step and distorts absolute throughput; use it only
         // for relative distribution analysis.
         let profile_inner = std::env::var("MLXCEL_PROFILE_MOE_INNER").is_ok();
-        let mut inner_tick = |name: &str, arr: &MlxArray, last: &mut std::time::Instant| {
+        let inner_tick = |name: &str, arr: &MlxArray, last: &mut std::time::Instant| {
             if !profile_inner {
                 return;
             }
             mlxcel_core::eval(arr);
             let dt = last.elapsed();
-            eprintln!(
-                "[MOE] name={} ms={:.4}",
-                name,
-                dt.as_secs_f64() * 1000.0
-            );
+            eprintln!("[MOE] name={} ms={:.4}", name, dt.as_secs_f64() * 1000.0);
             *last = std::time::Instant::now();
         };
         let mut last = std::time::Instant::now();

@@ -103,7 +103,17 @@ where
         if !slot.entry.has_detached() {
             return;
         }
+        // A detached KV set can only be adopted safely when the whole stored
+        // token prefix is contained in the incoming prompt. If the request
+        // diverged before the stored entry ended, adopting that entry would
+        // import KV state for tokens the caller did not send.
+        if dl.token_len > tokens.len() {
+            return;
+        }
         let matched = match_depth.min(dl.token_len);
+        if matched != dl.token_len {
+            return;
+        }
         if matched < min_len {
             return;
         }

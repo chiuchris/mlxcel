@@ -41,6 +41,14 @@ fn key_for<'a>(model: &'a str, tokens: &'a [i32]) -> PromptCacheKey<'a> {
     PromptCacheKey::new_full(model, None, "tpl", None, MultimodalDigest::empty(), tokens)
 }
 
+fn key_for_mm<'a>(
+    model: &'a str,
+    mm_digest: MultimodalDigest,
+    tokens: &'a [i32],
+) -> PromptCacheKey<'a> {
+    PromptCacheKey::new_full(model, None, "tpl", None, mm_digest, tokens)
+}
+
 #[test]
 fn insert_then_lookup_returns_entry_and_matched_len() {
     let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
@@ -308,17 +316,16 @@ fn longest_prefix_across_multiple_entries_same_bucket() {
     assert_eq!(matched, 24);
     assert_eq!(entry.tokens.len(), 24);
 
-    // Incoming request has 10 tokens. Both stored entries start with the
-    // same 10 tokens (they share the common `tokens(0, N)` prefix), so the
-    // longer stored entry also yields a 10-token common prefix and should
-    // be the winner — longest match wins deterministically.
+    // Incoming request has 10 tokens. The 24-token entry shares those 10
+    // tokens, but adopting it would import KV state for tokens that are not
+    // present in this request. It must therefore be ignored; the shorter
+    // fully-contained 8-token entry is the only safe hit.
     let incoming = tokens(0, 10);
     let (entry, matched) = store
         .lookup_longest_prefix(&key_for("m", &incoming), &incoming)
         .expect("lookup hit");
-    assert_eq!(matched, 10);
-    // Entry identity should be one of the two stored entries.
-    assert!(entry.tokens.len() == 8 || entry.tokens.len() == 24);
+    assert_eq!(matched, 8);
+    assert_eq!(entry.tokens.len(), 8);
 
     // Now exercise the "divergence past a certain index" case explicitly:
     // an incoming request whose tokens diverge at index 8 from the longer
@@ -329,6 +336,82 @@ fn longest_prefix_across_multiple_entries_same_bucket() {
         .lookup_longest_prefix(&key_for("m", &diverging), &diverging)
         .expect("lookup hit");
     assert_eq!(matched, 8);
+}
+
+#[test]
+fn lookup_ignores_stored_prefix_longer_than_request_when_no_safe_entry_exists() {
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let stored = tokens(0, 24);
+    store
+        .insert(
+            &key_for("m", &stored),
+            CacheEntry::new_for_test(stored.clone(), 512),
+        )
+        .unwrap();
+
+    let incoming = tokens(0, 10);
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for("m", &incoming), &incoming)
+            .is_none(),
+        "a longer stored KV prefix must not be adopted for a shorter request"
+    );
+}
+
+#[test]
+fn multimodal_digest_isolates_prefix_lookup_buckets() {
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    let image_a = MultimodalDigest([1; 32]);
+    let image_b = MultimodalDigest([2; 32]);
+
+    store
+        .insert(
+            &key_for_mm("m", image_a, &toks),
+            CacheEntry::new_for_test(toks.clone(), 1024),
+        )
+        .unwrap();
+
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_mm("m", image_b, &toks), &toks)
+            .is_none(),
+        "same text with different multimodal digest must not share KV entries"
+    );
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for_mm("m", image_a, &toks), &toks)
+            .is_some(),
+        "same text with same multimodal digest should still hit"
+    );
+}
+
+#[test]
+fn consumed_entries_are_swept_from_accounting_on_next_store_touch() {
+    let store = PromptCacheStore::with_config(cfg(1 << 20, 64, 4));
+    let toks = tokens(0, 16);
+    store
+        .insert(
+            &key_for("m", &toks),
+            CacheEntry::new_for_test(toks.clone(), 4096),
+        )
+        .unwrap();
+
+    let (entry, _) = store
+        .lookup_longest_prefix(&key_for("m", &toks), &toks)
+        .expect("first lookup hits");
+    assert!(entry.take_detached().is_some());
+    assert_eq!(store.len(), 1);
+    assert_eq!(store.bytes(), 4096);
+
+    assert!(
+        store
+            .lookup_longest_prefix(&key_for("m", &toks), &toks)
+            .is_none(),
+        "next lookup should sweep the drained shell before matching"
+    );
+    assert_eq!(store.len(), 0);
+    assert_eq!(store.bytes(), 0);
 }
 
 #[test]

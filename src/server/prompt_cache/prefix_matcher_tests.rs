@@ -204,7 +204,16 @@ fn prefix_matcher_respects_min_prefix_in_both_tiers() {
             .is_none()
     );
 
-    // Incoming that matches >= 32 tokens must hit even cross-session.
+    // Incoming that fully contains a stored >=32-token prefix must hit even
+    // cross-session. Longer stored entries are deliberately ignored because
+    // their detached KV state includes tokens absent from the request.
+    let safe_prefix = tokens(0, 40);
+    store
+        .insert(
+            &key_for_session("m", Some("sessA"), &safe_prefix),
+            CacheEntry::new_for_test(safe_prefix.clone(), 1024),
+        )
+        .unwrap();
     let divergent = {
         let mut v = tokens(0, 40);
         v.extend([999, 999]);
