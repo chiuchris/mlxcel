@@ -310,10 +310,10 @@ impl SwitchGeGLU {
         if do_sort {
             let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
             inner_tick("gather_sort", &sorted_x, &mut last);
-            let gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
-            inner_tick("gate_proj", &gate, &mut last);
             let up = self.up_proj.forward(&sorted_x, &sorted_idx, true);
             inner_tick("up_proj", &up, &mut last);
+            let gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
+            inner_tick("gate_proj", &gate, &mut last);
             let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
             inner_tick("geglu", &activated, &mut last);
             let output = self.down_proj.forward(&activated, &sorted_idx, true);
@@ -356,10 +356,10 @@ impl SwitchGeGLU {
                 inner_tick("switch_geglu_fused", &output, &mut last);
                 output
             } else {
-                let gate = self.gate_proj.forward(&x_exp, indices, false);
-                inner_tick("gate_proj", &gate, &mut last);
                 let up = self.up_proj.forward(&x_exp, indices, false);
                 inner_tick("up_proj", &up, &mut last);
+                let gate = self.gate_proj.forward(&x_exp, indices, false);
+                inner_tick("gate_proj", &gate, &mut last);
                 let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
                 inner_tick("geglu", &activated, &mut last);
                 let output = self.down_proj.forward(&activated, indices, false);
