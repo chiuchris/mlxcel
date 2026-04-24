@@ -322,14 +322,13 @@ impl SwitchGeGLU {
             inner_tick("scatter_unsort", &unsorted, &mut last);
             unsorted
         } else {
-            // Keep the decode-hot path in the same op shape as mlx-lm by
-            // default: separate gather_qmm(gate/up/down) with only the GeGLU
-            // elementwise chain compiled. A wider compile window around
-            // gather_qmm has regressed Gemma 4 26B/31B decode in profiling, so
-            // it is retained as an explicit experiment only.
-            let enable_compiled_switch =
-                std::env::var_os("MLXCEL_ENABLE_COMPILED_SWITCH_QGEGLU").is_some();
-            let output = if enable_compiled_switch
+            // Decode defaults to a wider compiled SwitchGeGLU window when the
+            // quantized expert weights match the supported affine 4-bit shape.
+            // The separate gather_qmm path remains available as an opt-out
+            // diagnostic if backend scheduling regresses on a future MLX build.
+            let disable_compiled_switch =
+                std::env::var_os("MLXCEL_DISABLE_COMPILED_SWITCH_QGEGLU").is_some();
+            let output = if !disable_compiled_switch
                 && let (Some(gate_q), Some(up_q), Some(down_q)) = (
                     self.gate_proj.quantized_parts(),
                     self.up_proj.quantized_parts(),
