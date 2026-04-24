@@ -72,6 +72,25 @@ static int32_t from_dtype(Dtype dtype) {
     }
 }
 
+// MLX Python's nn.gelu_approx uses the tanh approximation:
+// 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+// Keep this helper local so exact-GELU models can continue to use the
+// erf-based compiled_geglu_activation path.
+static array gelu_tanh_approx(const array& x) {
+    auto dtype = x.dtype();
+    auto half = array(0.5f, dtype);
+    auto one = array(1.0f, dtype);
+    auto coeff = array(0.7978845608028654f, dtype);  // sqrt(2/pi)
+    auto cubic_coeff = array(0.044715f, dtype);
+    auto x2 = mlx::core::multiply(x, x);
+    auto x3 = mlx::core::multiply(x2, x);
+    auto inner = mlx::core::multiply(
+        coeff,
+        mlx::core::add(x, mlx::core::multiply(cubic_coeff, x3)));
+    auto cdf = mlx::core::multiply(half, mlx::core::add(one, mlx::core::tanh(inner)));
+    return mlx::core::multiply(x, cdf);
+}
+
 // Stream functions.
 std::unique_ptr<MlxStream> default_stream() {
     return std::make_unique<MlxStream>(mlx::core::default_stream(mlx::core::default_device()));
@@ -991,9 +1010,6 @@ std::unique_ptr<MlxArray> quantized_linear_forward(
     int32_t bits,
     rust::Str mode
 ) {
-    // Fast path for affine mode: omit mode parameter entirely to match
-    // Python's nn.QuantizedLinear calling convention. Passing mode="affine"
-    // explicitly adds ~7% overhead per call in MLX's dispatch.
     bool is_affine = (mode.size() == 6 && std::memcmp(mode.data(), "affine", 6) == 0);
     array result = [&]() {
         if (is_affine) {
@@ -1184,6 +1200,28 @@ std::unique_ptr<MlxArray> compiled_geglu_activation(
     const MlxArray& x
 ) {
     static auto compiled_fn = get_compiled_geglu();
+    auto result = compiled_fn({gate.inner, x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled GeGLU using Python MLX's tanh-approx GELU.
+// Used by: Gemma4
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_geglu_approx() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& gate = inputs[0];
+            const auto& x = inputs[1];
+            return {mlx::core::multiply(gelu_tanh_approx(gate), x)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_geglu_approx_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+) {
+    static auto compiled_fn = get_compiled_geglu_approx();
     auto result = compiled_fn({gate.inner, x.inner});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
@@ -1487,7 +1525,6 @@ namespace {
 
             int group_size = 64;
             int bits = 4;
-
             // gate = quantized_matmul(x, gate_w, gate_s, gate_b)
             auto gate = mlx::core::quantized_matmul(x, gate_w, gate_s, gate_b, true, group_size, bits);
 
@@ -1575,6 +1612,93 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     return std::make_unique<MlxArray>(std::move(down));
 }
 
+// Compiled quantized GeGLU MLP using Python MLX's tanh-approx GELU.
+// Used by: Gemma4
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_qgelu_approx_mlp() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b
+            const auto& x = inputs[0];
+            const auto& gate_w = inputs[1];
+            const auto& gate_s = inputs[2];
+            const auto& gate_b = inputs[3];
+            const auto& up_w = inputs[4];
+            const auto& up_s = inputs[5];
+            const auto& up_b = inputs[6];
+            const auto& down_w = inputs[7];
+            const auto& down_s = inputs[8];
+            const auto& down_b = inputs[9];
+
+            int group_size = 64;
+            int bits = 4;
+            auto gate = mlx::core::quantized_matmul(
+                x, gate_w, gate_s, gate_b, true, group_size, bits);
+            auto up = mlx::core::quantized_matmul(
+                x, up_w, up_s, up_b, true, group_size, bits);
+
+            auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
+
+            auto down = mlx::core::quantized_matmul(
+                activated, down_w, down_s, down_b, true, group_size, bits);
+
+            return {down};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_approx_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_biases && up_biases && down_biases) {
+        static auto compiled_fn = get_compiled_qgelu_approx_mlp();
+
+        auto result = compiled_fn({
+            x.inner,
+            gate_proj.inner, gate_scales.inner, gate_biases->inner,
+            up_proj.inner, up_scales.inner, up_biases->inner,
+            down_proj.inner, down_scales.inner, down_biases->inner
+        });
+
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    std::optional<array> gb_opt = gate_biases ? std::optional(gate_biases->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_biases ? std::optional(up_biases->inner) : std::nullopt;
+    std::optional<array> db_opt = down_biases ? std::optional(down_biases->inner) : std::nullopt;
+
+    auto gate = mlx::core::quantized_matmul(
+        x.inner, gate_proj.inner, gate_scales.inner, gb_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+    auto up = mlx::core::quantized_matmul(
+        x.inner, up_proj.inner, up_scales.inner, ub_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
+
+    auto down = mlx::core::quantized_matmul(
+        activated, down_proj.inner, down_scales.inner, db_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    return std::make_unique<MlxArray>(std::move(down));
+}
+
 // Compiled GeGLU SwitchGLU MLP forward: down(gelu(gate_gqm(x)) * up_gqm(x))
 // where gate/up/down each use `mx::core::gather_qmm` for per-expert
 // routing. Mirrors the dense `compiled_qgelu_mlp` pattern but with
@@ -1621,15 +1745,8 @@ namespace {
                 std::nullopt, std::optional<array>(rhs_indices),
                 transpose, group_size, bits, "affine", sorted_indices);
 
-            // GeGLU: gelu(gate) * up  (erf-based GELU matches existing
-            // compiled_geglu_activation so numerics are unchanged).
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto gelu_gate = mlx::core::multiply(gate, scale);
-            auto activated = mlx::core::multiply(gelu_gate, up);
+            // GeGLU: Python mlx-lm uses nn.gelu_approx(gate) * up.
+            auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
 
             auto down = mlx::core::gather_qmm(
                 activated, down_w, down_s, std::optional<array>(down_b),
@@ -1683,9 +1800,9 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         return std::make_unique<MlxArray>(std::move(result[0]));
     }
 
-    // Non-compiled fallback: three separate gather_qmm calls + erf-based
-    // GeGLU. Same math as the compiled path, just without the compile
-    // window (for non-affine quantization modes or missing biases).
+    // Non-compiled fallback: three separate gather_qmm calls + tanh-approx
+    // GeGLU. Same math as the compiled path, just without the compile window
+    // (for non-affine quantization modes or missing biases).
     std::optional<array> gb_opt = gate_b ? std::optional(gate_b->inner) : std::nullopt;
     std::optional<array> ub_opt = up_b ? std::optional(up_b->inner) : std::nullopt;
     std::optional<array> db_opt = down_b ? std::optional(down_b->inner) : std::nullopt;
@@ -1702,13 +1819,7 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         std::optional<int>(group_size), std::optional<int>(bits),
         mode_str, false);
 
-    auto sqrt2 = array(std::sqrt(2.0f));
-    auto half = array(0.5f);
-    auto one = array(1.0f);
-    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-    auto gelu_gate = mlx::core::multiply(gate, scale);
-    auto activated = mlx::core::multiply(gelu_gate, up);
+    auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
 
     auto down = mlx::core::gather_qmm(
         activated, down_w.inner, down_s.inner, db_opt,
@@ -2361,7 +2472,8 @@ std::unique_ptr<MlxArray> quantized_embedding(
         std::optional<int>(group_size),
         std::optional<int>(bits),
         mode_str,
-        std::nullopt  // use default dtype
+        std::nullopt,  // global_scale
+        std::optional<Dtype>(scales.inner.dtype())
     );
 
     // Get hidden dimension from dequantized result
@@ -2706,13 +2818,7 @@ namespace {
             auto gate = mlx::core::quantized_matmul(
                 after_ffn, gate_w, gate_s, gate_b, true, group_size, bits);
 
-            // Erf-based GELU (matches the existing gelu_approx helper).
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto gelu_gate = mlx::core::multiply(gate, scale);
+            auto gelu_gate = gelu_tanh_approx(gate);
 
             auto gated = mlx::core::multiply(gelu_gate, per_layer);
             auto projected = mlx::core::quantized_matmul(
@@ -2765,12 +2871,7 @@ std::unique_ptr<MlxArray> compiled_per_layer_input_gate(
         after_ffn.inner, gate_w.inner, gate_s.inner, gb,
         true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
 
-    auto sqrt2 = array(std::sqrt(2.0f));
-    auto half = array(0.5f);
-    auto one = array(1.0f);
-    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-    auto gelu_gate = mlx::core::multiply(gate, scale);
+    auto gelu_gate = gelu_tanh_approx(gate);
     auto gated = mlx::core::multiply(gelu_gate, per_layer_input.inner);
 
     auto projected = mlx::core::quantized_matmul(
@@ -3419,7 +3520,6 @@ namespace {
             // params[0] = group_size, params[1] = bits
             int group_size = 64;  // hardcoded for common case
             int bits = 4;
-
             // gate = quantized_matmul(x, gate_w, gate_s, gate_b)
             auto gate = mlx::core::quantized_matmul(x, gate_w, gate_s, gate_b, true, group_size, bits);
 
@@ -3510,6 +3610,12 @@ void async_eval_all(rust::Slice<const MlxArray* const> arrays) {
         arrs.push_back(a->inner);
     }
     mlx::core::async_eval(arrs);
+}
+
+void detach_all(rust::Slice<const MlxArray* const> arrays) {
+    for (const auto* a : arrays) {
+        const_cast<array&>(a->inner).detach();
+    }
 }
 
 void synchronize_default() {

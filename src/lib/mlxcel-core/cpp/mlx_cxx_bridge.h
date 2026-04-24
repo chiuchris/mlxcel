@@ -359,8 +359,16 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
 
 // GeGLU activation - compiled with kernel fusion (shapeless=true)
 // output = gelu(gate) * x
-// Used by: Gemma2, Gemma3 MLP layers
+// Used by: Gemma, Gemma2, Gemma3 MLP layers
 std::unique_ptr<MlxArray> compiled_geglu_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+);
+
+// GeGLU activation with Python MLX tanh-approx GELU.
+// output = gelu_approx(gate) * x
+// Used by: Gemma4 MLP and SwitchGeGLU layers
+std::unique_ptr<MlxArray> compiled_geglu_approx_activation(
     const MlxArray& gate,
     const MlxArray& x
 );
@@ -426,8 +434,27 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     rust::Str mode
 );
 
+// Compiled GELU-approx MLP forward: down_proj(gelu_approx(gate_proj(x)) * up_proj(x))
+// Fuses the quantized projections and Python MLX tanh-approx GeGLU.
+// Used by: Gemma4 dense MLP
+std::unique_ptr<MlxArray> compiled_gelu_approx_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+);
+
 // Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
-// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+// Wraps three `gather_qmm` calls (gate/up/down) plus a tanh-approx
 // GeGLU activation into a single `mx::core::compile` window so MLX
 // can schedule gate/up in parallel and fuse the intermediate
 // element-wise ops. Only the no-sort path is fused; callers should
@@ -930,6 +957,7 @@ void clear_memory_cache();
 // Async evaluation
 void async_eval(const MlxArray& arr);
 void async_eval_all(rust::Slice<const MlxArray* const> arrays);
+void detach_all(rust::Slice<const MlxArray* const> arrays);
 
 // Synchronize stream
 void synchronize_default();

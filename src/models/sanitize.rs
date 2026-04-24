@@ -19,7 +19,7 @@
 //! `models/mod.rs`.
 
 use memmap2::MmapOptions;
-use safetensors::{Dtype as SafeTensorDtype, SafeTensors, tensor::TensorView};
+use safetensors::{tensor::TensorView, Dtype as SafeTensorDtype, SafeTensors};
 use serde_json::Value;
 use std::fs::File;
 use std::path::Path;
@@ -414,6 +414,13 @@ fn tensor_view_to_array(
                     .last()
                     .ok_or_else(|| format!("Failed to retain borrowed buffer for tensor {name}"))?;
                 mlxcel_core::from_bytes_nocopy(backing, &shape, mlxcel_core::dtype::FLOAT32)
+            } else if mode == SelectiveLoadMode::DeferredMaterialize {
+                // Gemma 4 quantized checkpoints store scales, biases, norm
+                // weights, and layer scalars as bf16. Preserve them as native
+                // bf16 leaves so decode graphs do not inherit a
+                // from_f32 -> astype(bf16/f16) loader subgraph for every
+                // tensor use.
+                mlxcel_core::from_bytes_f16(tensor.data(), &shape, true)
             } else if should_convert_bf16_to_f16() {
                 let values = tensor
                     .data()
@@ -634,7 +641,10 @@ where
         }
         let array = tensor_view_to_array(&name, &tensor, mode, owned_buffers.as_deref_mut())?;
         if debug_gemma4 {
-            eprintln!("  loaded {name}");
+            eprintln!(
+                "  loaded {name} mlx_dtype={}",
+                mlxcel_core::array_dtype(&array)
+            );
         }
         weights.insert(name, array);
     }
@@ -742,15 +752,55 @@ pub(crate) fn load_gemma4_text_weights_with_backing<P: AsRef<Path>>(
         .collect();
     if !ptrs.is_empty() {
         unsafe { mlxcel_core::eval_all(&ptrs) };
+        unsafe { mlxcel_core::detach_all(&ptrs) };
     }
 
     Ok((weights, backing))
 }
 
-pub(crate) fn load_gemma4_vlm_weights<P: AsRef<Path>>(
+pub(crate) fn load_gemma4_vlm_weights_with_backing<P: AsRef<Path>>(
     model_dir: P,
-) -> Result<mlxcel_core::weights::WeightMap, String> {
-    load_weights_from_dir_with_filter(model_dir, is_gemma4_vlm_weight, false)
+) -> Result<(mlxcel_core::weights::WeightMap, Gemma4WeightBacking), String> {
+    let model_dir = model_dir.as_ref();
+    let mut weights = mlxcel_core::weights::WeightMap::new();
+    let mut backing = Gemma4WeightBacking::default();
+
+    let mut shard_paths: Vec<_> = std::fs::read_dir(model_dir)
+        .map_err(|e| format!("Failed to read directory: {e}"))?
+        .filter_map(|entry| {
+            let entry = entry.ok()?;
+            let path = entry.path();
+            if path.extension().is_some_and(|ext| ext == "safetensors") {
+                Some(path)
+            } else {
+                None
+            }
+        })
+        .collect();
+    shard_paths.sort();
+
+    for path in shard_paths {
+        load_filtered_shard(
+            &path,
+            &mut weights,
+            is_gemma4_vlm_weight,
+            false,
+            SelectiveLoadMode::DeferredMaterialize,
+            Some(&mut backing.mmaps),
+            Some(&mut backing.owned_buffers),
+        )?;
+    }
+
+    let ptrs: Vec<*const mlxcel_core::MlxArray> = weights
+        .values()
+        .filter_map(|v| v.as_ref().map(|arr| arr as *const mlxcel_core::MlxArray))
+        .collect();
+    if !ptrs.is_empty() {
+        unsafe { mlxcel_core::eval_all(&ptrs) };
+        unsafe { mlxcel_core::detach_all(&ptrs) };
+    }
+
+    Ok((weights, backing))
 }
 
 /// Ensure lm_head weights exist for models with tied embeddings.

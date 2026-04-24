@@ -524,6 +524,10 @@ mod ffi {
         /// Used by: Gemma2, Gemma3 MLP layers
         fn compiled_geglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled GeGLU activation using Python MLX tanh-approx GELU.
+        /// Used by: Gemma4 MLP and SwitchGeGLU layers
+        fn compiled_geglu_approx_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+
         /// Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
         /// gelu_approx(max(0, x - (mean + std * multiplier)))
         /// Used by: Gemma3n MLP layers with activation_sparsity > 0
@@ -581,8 +585,27 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled GELU-approx MLP forward:
+        /// down_proj(gelu_approx(gate_proj(x)) * up_proj(x)).
+        /// Used by: Gemma4 dense MLP
+        unsafe fn compiled_gelu_approx_mlp_forward(
+            x: &MlxArray,
+            gate_proj: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: *const MlxArray,
+            up_proj: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: *const MlxArray,
+            down_proj: &MlxArray,
+            down_scales: &MlxArray,
+            down_biases: *const MlxArray,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
         /// Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
-        /// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+        /// Wraps three `gather_qmm` calls (gate/up/down) plus a tanh-approx
         /// GeGLU activation into a single `mx::core::compile` window so
         /// MLX can schedule gate/up in parallel and fuse the intermediate
         /// element-wise ops. Only the no-sort path is fused; callers
@@ -1430,6 +1453,9 @@ mod ffi {
 
         /// Async eval multiple arrays at once
         unsafe fn async_eval_all(arrays: &[*const MlxArray]);
+
+        /// Detach evaluated arrays from their construction graphs.
+        unsafe fn detach_all(arrays: &[*const MlxArray]);
 
         /// Synchronize default stream
         fn synchronize_default();

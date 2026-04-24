@@ -314,7 +314,7 @@ impl SwitchGeGLU {
             inner_tick("gate_proj", &gate, &mut last);
             let up = self.up_proj.forward(&sorted_x, &sorted_idx, true);
             inner_tick("up_proj", &up, &mut last);
-            let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+            let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
             inner_tick("geglu", &activated, &mut last);
             let output = self.down_proj.forward(&activated, &sorted_idx, true);
             inner_tick("down_proj", &output, &mut last);
@@ -360,7 +360,7 @@ impl SwitchGeGLU {
                 inner_tick("gate_proj", &gate, &mut last);
                 let up = self.up_proj.forward(&x_exp, indices, false);
                 inner_tick("up_proj", &up, &mut last);
-                let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+                let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
                 inner_tick("geglu", &activated, &mut last);
                 let output = self.down_proj.forward(&activated, indices, false);
                 inner_tick("down_proj", &output, &mut last);
@@ -424,7 +424,7 @@ impl MLP {
             self.down_proj.quantized_weight(),
         ) {
             return unsafe {
-                mlxcel_core::compiled_gelu_mlp_forward(
+                mlxcel_core::compiled_gelu_approx_mlp_forward(
                     x,
                     &gate_qw.weight,
                     &gate_qw.scales,
@@ -450,8 +450,7 @@ impl MLP {
 
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        let activated = mlxcel_core::gelu_approx(&gate);
-        let hidden = mlxcel_core::multiply(&activated, &up);
+        let hidden = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
         self.down_proj.forward(&hidden)
     }
 
@@ -1234,9 +1233,9 @@ impl DecoderLayer {
                     }
                 } else {
                     let gate = gate_proj.forward(&after_ffn);
-                    let gate = mlxcel_core::gelu_approx(&gate);
-                    let gate = mlxcel_core::multiply(&gate, per_layer_input);
-                    let gate = proj.forward(&gate);
+                    let gated =
+                        mlxcel_core::compiled_geglu_approx_activation(&gate, per_layer_input);
+                    let gate = proj.forward(&gated);
                     let gate = post_norm.forward(&gate);
                     mlxcel_core::add(&after_ffn, &gate)
                 };
@@ -1465,6 +1464,7 @@ impl Gemma4TextModel {
         // `[SUBOP] layer=xx name=.. ms=..` line per sub-step inside the
         // layer (input_ln, self_attn, post_ln, MoE router/experts, etc.).
         let profile_per_layer = std::env::var("MLXCEL_PROFILE_PER_LAYER").is_ok();
+        let profile_layer_build = std::env::var("MLXCEL_PROFILE_LAYER_BUILD").is_ok();
         let profile_subops = std::env::var("MLXCEL_PROFILE_LAYER_SUBOPS").is_ok();
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -1501,6 +1501,11 @@ impl Gemma4TextModel {
             } else {
                 None
             };
+            let layer_build_start = if profile_layer_build {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let (next_h, stored_kv) = layer.forward_with_profile(
                 &h,
                 local_mask,
@@ -1511,6 +1516,15 @@ impl Gemma4TextModel {
                 profile_subops,
             );
             h = next_h;
+            if let Some(start) = layer_build_start {
+                eprintln!(
+                    "[LAYER_BUILD {:02}] type={} seq_len={} ms={:.3}",
+                    i,
+                    layer.layer_type,
+                    l,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             if let Some(start) = layer_start {
                 mlxcel_core::eval(&h);
                 eprintln!(
