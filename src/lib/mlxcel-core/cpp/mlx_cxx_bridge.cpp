@@ -1573,6 +1573,150 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     return std::make_unique<MlxArray>(std::move(down));
 }
 
+// Compiled GeGLU SwitchGLU MLP forward: down(gelu(gate_gqm(x)) * up_gqm(x))
+// where gate/up/down each use `mx::core::gather_qmm` for per-expert
+// routing. Mirrors the dense `compiled_qgelu_mlp` pattern but with
+// `gather_qmm` instead of `quantized_matmul`, collapsing three
+// `gather_qmm` calls + the GeGLU activation + the final `gather_qmm`
+// into one compile window so MLX can schedule gate/up in parallel
+// and fuse the intermediate element-wise ops.
+//
+// Only covers the decode-friendly no-sort path (sorted_indices=false).
+// The sort path (prefill when n_tokens * top_k >= 64) stays on the
+// separate-ops path inside `SwitchGeGLU::forward`.
+//
+// Used by: Gemma 4 26B-a4b SwitchGeGLU experts
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_switch_qgeglu() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: x, gate_w, gate_s, gate_b, up_w, up_s, up_b,
+            //         down_w, down_s, down_b, rhs_indices
+            const auto& x = inputs[0];
+            const auto& gate_w = inputs[1];
+            const auto& gate_s = inputs[2];
+            const auto& gate_b = inputs[3];
+            const auto& up_w = inputs[4];
+            const auto& up_s = inputs[5];
+            const auto& up_b = inputs[6];
+            const auto& down_w = inputs[7];
+            const auto& down_s = inputs[8];
+            const auto& down_b = inputs[9];
+            const auto& rhs_indices = inputs[10];
+
+            int group_size = 64;
+            int bits = 4;
+            bool transpose = true;
+            bool sorted_indices = false;
+
+            auto gate = mlx::core::gather_qmm(
+                x, gate_w, gate_s, std::optional<array>(gate_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                transpose, group_size, bits, "affine", sorted_indices);
+
+            auto up = mlx::core::gather_qmm(
+                x, up_w, up_s, std::optional<array>(up_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                transpose, group_size, bits, "affine", sorted_indices);
+
+            // GeGLU: gelu(gate) * up  (erf-based GELU matches existing
+            // compiled_geglu_activation so numerics are unchanged).
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            auto gelu_gate = mlx::core::multiply(gate, scale);
+            auto activated = mlx::core::multiply(gelu_gate, up);
+
+            auto down = mlx::core::gather_qmm(
+                activated, down_w, down_s, std::optional<array>(down_b),
+                std::nullopt, std::optional<array>(rhs_indices),
+                transpose, group_size, bits, "affine", sorted_indices);
+
+            return {down};
+        };
+        // shapeless=false: `gather_qmm`'s `Primitive::output_shapes`
+        // cannot infer result shape without concrete `rhs_indices`
+        // dims, so we key the compile on concrete input shapes. Decode
+        // passes through the same shapes on every layer, so the cache
+        // still resolves to a single compiled graph after the first
+        // call.
+        return mlx::core::compile(fn, false);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
+    const MlxArray& x,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& up_w,
+    const MlxArray& up_s,
+    const MlxArray* up_b,
+    const MlxArray& down_w,
+    const MlxArray& down_s,
+    const MlxArray* down_b,
+    const MlxArray& rhs_indices,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+
+    // Fused compile only covers affine mode with group_size=64, bits=4,
+    // biases present, sorted_indices=false — the decode-hot case for
+    // Gemma 4 26B-a4b experts. Any other combination falls back to
+    // three separate `gather_qmm` calls at the Rust layer.
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_b && up_b && down_b) {
+        static auto compiled_fn = get_compiled_switch_qgeglu();
+        auto result = compiled_fn({
+            x.inner,
+            gate_w.inner, gate_s.inner, gate_b->inner,
+            up_w.inner, up_s.inner, up_b->inner,
+            down_w.inner, down_s.inner, down_b->inner,
+            rhs_indices.inner
+        });
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    // Non-compiled fallback: three separate gather_qmm calls + erf-based
+    // GeGLU. Same math as the compiled path, just without the compile
+    // window (for non-affine quantization modes or missing biases).
+    std::optional<array> gb_opt = gate_b ? std::optional(gate_b->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_b ? std::optional(up_b->inner) : std::nullopt;
+    std::optional<array> db_opt = down_b ? std::optional(down_b->inner) : std::nullopt;
+    std::optional<array> rhs_opt = std::optional(rhs_indices.inner);
+
+    auto gate = mlx::core::gather_qmm(
+        x.inner, gate_w.inner, gate_s.inner, gb_opt,
+        std::nullopt, rhs_opt, true,
+        std::optional<int>(group_size), std::optional<int>(bits),
+        mode_str, false);
+    auto up = mlx::core::gather_qmm(
+        x.inner, up_w.inner, up_s.inner, ub_opt,
+        std::nullopt, rhs_opt, true,
+        std::optional<int>(group_size), std::optional<int>(bits),
+        mode_str, false);
+
+    auto sqrt2 = array(std::sqrt(2.0f));
+    auto half = array(0.5f);
+    auto one = array(1.0f);
+    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+    auto gelu_gate = mlx::core::multiply(gate, scale);
+    auto activated = mlx::core::multiply(gelu_gate, up);
+
+    auto down = mlx::core::gather_qmm(
+        activated, down_w.inner, down_s.inner, db_opt,
+        std::nullopt, rhs_opt, true,
+        std::optional<int>(group_size), std::optional<int>(bits),
+        mode_str, false);
+
+    return std::make_unique<MlxArray>(std::move(down));
+}
+
 // SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
 //   down_proj(silu(gate_proj(x)) * up_proj(x))
 //

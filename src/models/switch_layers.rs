@@ -91,6 +91,48 @@ impl SwitchLinear {
         Self::from_weights_with_mode(weights, prefix, group_size, bits, "affine")
     }
 
+    /// Expose the quantized triple (weight, scales, biases, group_size,
+    /// bits, mode) for callers that want to drive a fused compile path
+    /// over several `SwitchLinear`s (e.g. SwitchGeGLU gate/up/down
+    /// compiled into one graph). Returns `None` for the non-quantized
+    /// `Regular` variant or when biases are absent (the fused compile
+    /// currently requires affine biases).
+    pub fn quantized_parts(&self) -> Option<QuantizedSwitchLinearRef<'_>> {
+        match self {
+            Self::Quantized {
+                weight,
+                scales,
+                biases: Some(biases),
+                group_size,
+                bits,
+                mode,
+            } => Some(QuantizedSwitchLinearRef {
+                weight,
+                scales,
+                biases,
+                group_size: *group_size,
+                bits: *bits,
+                mode: mode.as_str(),
+            }),
+            _ => None,
+        }
+    }
+}
+
+/// Borrowed view over a `SwitchLinear::Quantized` with biases present,
+/// used to drive fused compile paths over several quantized switch
+/// linears without moving the originals.
+pub struct QuantizedSwitchLinearRef<'a> {
+    pub weight: &'a UniquePtr<MlxArray>,
+    pub scales: &'a UniquePtr<MlxArray>,
+    pub biases: &'a UniquePtr<MlxArray>,
+    pub group_size: i32,
+    pub bits: i32,
+    pub mode: &'a str,
+}
+
+impl SwitchLinear {
+
     pub fn from_weights_with_mode(
         weights: &WeightMap,
         prefix: &str,

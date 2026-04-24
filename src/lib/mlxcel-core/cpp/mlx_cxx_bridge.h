@@ -426,6 +426,30 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     rust::Str mode
 );
 
+// Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
+// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+// GeGLU activation into a single `mx::core::compile` window so MLX
+// can schedule gate/up in parallel and fuse the intermediate
+// element-wise ops. Only the no-sort path is fused; callers should
+// fall back to separate `gather_qmm` calls when `sorted_indices` is
+// true (prefill). Used by: Gemma 4 26B-a4b SwitchGeGLU experts.
+std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
+    const MlxArray& x,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& up_w,
+    const MlxArray& up_s,
+    const MlxArray* up_b,
+    const MlxArray& down_w,
+    const MlxArray& down_s,
+    const MlxArray* down_b,
+    const MlxArray& rhs_indices,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+);
+
 // Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) weights:
 //   down_proj(silu(gate_proj(x)) * up_proj(x))
 // Fuses gate_proj + silu + up_proj + multiply + down_proj into compiled graph.

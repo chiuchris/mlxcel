@@ -324,14 +324,46 @@ impl SwitchGeGLU {
             inner_tick("scatter_unsort", &unsorted, &mut last);
             unsorted
         } else {
-            let gate = self.gate_proj.forward(&x_exp, indices, false);
-            inner_tick("gate_proj", &gate, &mut last);
-            let up = self.up_proj.forward(&x_exp, indices, false);
-            inner_tick("up_proj", &up, &mut last);
-            let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
-            inner_tick("geglu", &activated, &mut last);
-            let output = self.down_proj.forward(&activated, indices, false);
-            inner_tick("down_proj", &output, &mut last);
+            // Fused compile window: if all three switch_linears are
+            // quantized-affine with biases, call `gather_qmm × 3 +
+            // erf-GeGLU + multiply` inside a single `mx::core::compile`
+            // graph so MLX can schedule gate/up in parallel and fuse
+            // the intermediate element-wise ops. The dense shared_mlp
+            // already uses the same pattern via
+            // `compiled_gelu_mlp_forward`.
+            let output = if let (Some(gate_q), Some(up_q), Some(down_q)) = (
+                self.gate_proj.quantized_parts(),
+                self.up_proj.quantized_parts(),
+                self.down_proj.quantized_parts(),
+            ) {
+                unsafe {
+                    mlxcel_core::compiled_switch_qgeglu_forward(
+                        &x_exp,
+                        gate_q.weight,
+                        gate_q.scales,
+                        gate_q.biases.as_ref().unwrap() as *const _,
+                        up_q.weight,
+                        up_q.scales,
+                        up_q.biases.as_ref().unwrap() as *const _,
+                        down_q.weight,
+                        down_q.scales,
+                        down_q.biases.as_ref().unwrap() as *const _,
+                        indices,
+                        gate_q.group_size,
+                        gate_q.bits,
+                        gate_q.mode,
+                    )
+                }
+            } else {
+                let gate = self.gate_proj.forward(&x_exp, indices, false);
+                inner_tick("gate_proj", &gate, &mut last);
+                let up = self.up_proj.forward(&x_exp, indices, false);
+                inner_tick("up_proj", &up, &mut last);
+                let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+                inner_tick("geglu", &activated, &mut last);
+                self.down_proj.forward(&activated, indices, false)
+            };
+            inner_tick("switch_geglu_fused", &output, &mut last);
             let squeezed = mlxcel_core::squeeze_axis(&output, -2);
             inner_tick("squeeze", &squeezed, &mut last);
             squeezed

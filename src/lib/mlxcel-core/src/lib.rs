@@ -581,6 +581,31 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
+        /// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+        /// GeGLU activation into a single `mx::core::compile` window so
+        /// MLX can schedule gate/up in parallel and fuse the intermediate
+        /// element-wise ops. Only the no-sort path is fused; callers
+        /// should fall back to separate `gather_qmm` calls when
+        /// `sorted_indices == true` (prefill).
+        /// Used by: Gemma 4 26B-a4b SwitchGeGLU experts (decode)
+        unsafe fn compiled_switch_qgeglu_forward(
+            x: &MlxArray,
+            gate_w: &MlxArray,
+            gate_s: &MlxArray,
+            gate_b: *const MlxArray,
+            up_w: &MlxArray,
+            up_s: &MlxArray,
+            up_b: *const MlxArray,
+            down_w: &MlxArray,
+            down_s: &MlxArray,
+            down_b: *const MlxArray,
+            rhs_indices: &MlxArray,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
         /// Compiled SwiGLU MLP forward for non-quantized (FP16/BF16) weights
         /// Fuses gate_proj + silu + up_proj + multiply + down_proj into compiled graph
         /// Used by: Llama, Qwen2, Qwen3, Mistral and other SwiGLU FP models
