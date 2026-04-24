@@ -698,6 +698,57 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     const MlxArray& freqs
 );
 
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Wraps
+// the slice/concat/rope/slice/concat chain in one `mx::core::compile`
+// window. Requires `rotated_dims > 0` and `last_dim == head_dim`;
+// the rare `last_dim > head_dim` tail case must stay on the
+// op-at-a-time path. `offset` flows through as a scalar array input
+// so the same compiled graph serves every decode step.
+std::unique_ptr<MlxArray> compiled_proportional_rope(
+    const MlxArray& x,
+    const MlxArray& freqs,
+    int32_t head_dim,
+    int32_t rotated_dims,
+    int32_t offset
+);
+
+// Compiled Gemma 4 Q-path with proportional RoPE. Folds
+// `reshape → fast::rms_norm → transpose → ProportionalRoPE` into
+// one compile window so MLX sees a single fused subgraph instead
+// of four cxx-bridge calls. Used on Gemma 4 full-attention
+// layers only.
+std::unique_ptr<MlxArray> compiled_q_path_proportional(
+    const MlxArray& q_proj_out,
+    const MlxArray& q_norm_weight,
+    const MlxArray& freqs,
+    float rms_eps,
+    int32_t n_heads,
+    int32_t head_dim,
+    int32_t rotated_dims,
+    int32_t offset
+);
+
+// Compiled Gemma 4 per-layer-input-gate chain (e2b / e4b variants).
+// Fuses `gate_proj → gelu_approx → multiply(per_layer) → proj →
+// post_norm → add(after_ffn)` into one compile window. Requires
+// affine / gs=64 / bits=4 with biases present; other modes fall
+// through to an op-at-a-time fallback.
+std::unique_ptr<MlxArray> compiled_per_layer_input_gate(
+    const MlxArray& after_ffn,
+    const MlxArray& per_layer_input,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& proj_w,
+    const MlxArray& proj_s,
+    const MlxArray* proj_b,
+    const MlxArray& post_norm_w,
+    float post_norm_eps,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+);
+
 // Fast RMS norm using MLX fast kernel
 std::unique_ptr<MlxArray> fast_rms_norm(
     const MlxArray& x,
@@ -1227,6 +1278,11 @@ void fused_gated_delta_decode_step(
 
 // Check if GatedDeltaNet Metal kernel is available (Metal GPU only)
 bool gated_delta_kernel_available();
+
+// Start/stop Metal GPU capture. Requires the process to run under
+// `MTL_CAPTURE_ENABLED=1`; otherwise Metal drops the capture silently.
+void metal_start_capture(rust::Str path);
+void metal_stop_capture();
 
 // GatedDeltaNet custom Metal kernel forward.
 // Handles both T=1 (decode) and T>1 (prefill) in a single GPU dispatch.

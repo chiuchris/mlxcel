@@ -737,17 +737,41 @@ impl Attention {
         let l = shape[1];
         let offset = cache.offset();
 
-        let queries = match &self.projection {
+        let q_proj_out = match &self.projection {
             AttentionProjection::Fused(proj) => {
                 let (q, _, _) = proj.forward(x);
                 q
             }
             AttentionProjection::Separate { q_proj, .. } => q_proj.forward(x),
         };
-        let queries = mlxcel_core::reshape(&queries, &[b, l, self.n_heads, self.head_dim]);
-        let queries = self.q_norm.forward(&queries);
-        let queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
-        let queries = self.apply_rope(&queries, offset);
+
+        // Fast path: full-attention Gemma 4 layers run
+        // `reshape → q_norm → transpose → ProportionalRoPE` inside a
+        // single `mx::core::compile` window. Sliding layers and
+        // layers with non-proportional RoPE stay on the op-at-a-time
+        // chain.
+        let queries = if let Some(ref freqs) = self.proportional_rope_freqs {
+            let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
+                * self.head_dim as f64
+                / 2.0)
+                .floor() as i32)
+                .max(0);
+            mlxcel_core::compiled_q_path_proportional(
+                &q_proj_out,
+                &self.q_norm.weight,
+                freqs,
+                self.q_norm.eps,
+                self.n_heads,
+                self.head_dim,
+                rotated_dims,
+                offset,
+            )
+        } else {
+            let queries = mlxcel_core::reshape(&q_proj_out, &[b, l, self.n_heads, self.head_dim]);
+            let queries = self.q_norm.forward(&queries);
+            let queries = mlxcel_core::transpose_axes(&queries, &[0, 2, 1, 3]);
+            self.apply_rope(&queries, offset)
+        };
 
         if self.is_kv_shared_layer
             && let Some((keys, values)) = shared_kv
@@ -821,14 +845,14 @@ impl Attention {
         offset: i32,
         cache: &mut dyn CacheInterface,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let (keys, values) = match &self.projection {
+        let (raw_keys, raw_values) = match &self.projection {
             AttentionProjection::Fused(proj) => {
                 let (_, k, v) = proj.forward(x);
                 (k, v)
             }
             AttentionProjection::Separate { k_proj, v_proj, .. } => {
                 let raw_keys = k_proj.forward(x);
-                let values = if self.use_k_eq_v {
+                let raw_values = if self.use_k_eq_v {
                     mlxcel_core::copy(&raw_keys)
                 } else {
                     v_proj
@@ -836,19 +860,40 @@ impl Attention {
                         .expect("Gemma4 attention expected v_proj for non-k_eq_v layer")
                         .forward(x)
                 };
-                (raw_keys, values)
+                (raw_keys, raw_values)
             }
         };
 
-        let keys = mlxcel_core::reshape(&keys, &[b, l, self.n_kv_heads, self.head_dim]);
-        let values = mlxcel_core::reshape(&values, &[b, l, self.n_kv_heads, self.head_dim]);
+        // Fast path: on full-attention layers the K branch is the same
+        // `reshape → norm → transpose → ProportionalRoPE` shape as the
+        // Q branch, so it reuses `compiled_q_path_proportional` with
+        // `n_kv_heads` and the k_norm weight.
+        let keys = if let Some(ref freqs) = self.proportional_rope_freqs {
+            let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
+                * self.head_dim as f64
+                / 2.0)
+                .floor() as i32)
+                .max(0);
+            mlxcel_core::compiled_q_path_proportional(
+                &raw_keys,
+                &self.k_norm.weight,
+                freqs,
+                self.k_norm.eps,
+                self.n_kv_heads,
+                self.head_dim,
+                rotated_dims,
+                offset,
+            )
+        } else {
+            let keys = mlxcel_core::reshape(&raw_keys, &[b, l, self.n_kv_heads, self.head_dim]);
+            let keys = self.k_norm.forward(&keys);
+            let keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
+            self.apply_rope(&keys, offset)
+        };
 
-        let keys = self.k_norm.forward(&keys);
+        let values = mlxcel_core::reshape(&raw_values, &[b, l, self.n_kv_heads, self.head_dim]);
         let values = self.v_norm.forward(&values);
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
-
-        let keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
-        let keys = self.apply_rope(&keys, offset);
 
         cache.update_and_fetch(keys, values)
     }
@@ -1158,16 +1203,42 @@ impl DecoderLayer {
             &self.post_per_layer_input_norm,
             per_layer_input,
         ) {
-            let gate = gate_proj.forward(&after_ffn);
-            timer.tick("per_layer_gate_proj", &gate);
-            let gate = mlxcel_core::gelu_approx(&gate);
-            let gate = mlxcel_core::multiply(&gate, per_layer_input);
-            let gate = proj.forward(&gate);
-            timer.tick("per_layer_proj", &gate);
-            let gate = post_norm.forward(&gate);
-            timer.tick("per_layer_post_norm", &gate);
-            let combined = mlxcel_core::add(&after_ffn, &gate);
-            timer.tick("per_layer_residual_add", &combined);
+            // Fast path: when both gate and proj are quantized,
+            // collapse the whole chain
+            //   gate_proj → gelu_approx → mul(per_layer) → proj →
+            //   post_norm → add(after_ffn)
+            // into a single `mx::core::compile` graph. Falls back
+            // to the op-at-a-time chain for non-quantized variants.
+            let combined =
+                if let (Some(gate_qw), Some(proj_qw)) =
+                    (gate_proj.quantized_weight(), proj.quantized_weight())
+                {
+                    unsafe {
+                        mlxcel_core::compiled_per_layer_input_gate(
+                            &after_ffn,
+                            per_layer_input,
+                            &gate_qw.weight,
+                            &gate_qw.scales,
+                            gate_qw.biases_ptr(),
+                            &proj_qw.weight,
+                            &proj_qw.scales,
+                            proj_qw.biases_ptr(),
+                            &post_norm.weight,
+                            post_norm.eps,
+                            gate_qw.group_size,
+                            gate_qw.bits,
+                            &gate_qw.mode,
+                        )
+                    }
+                } else {
+                    let gate = gate_proj.forward(&after_ffn);
+                    let gate = mlxcel_core::gelu_approx(&gate);
+                    let gate = mlxcel_core::multiply(&gate, per_layer_input);
+                    let gate = proj.forward(&gate);
+                    let gate = post_norm.forward(&gate);
+                    mlxcel_core::add(&after_ffn, &gate)
+                };
+            timer.tick("per_layer_input_gate", &combined);
             combined
         } else {
             after_ffn

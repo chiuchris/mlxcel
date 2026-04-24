@@ -17,7 +17,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace mlx_cxx {
 
@@ -2405,6 +2407,367 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     ));
 }
 
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Collapses
+// the slice/concat/rope/slice/concat chain into one
+// `mx::core::compile` graph so MLX issues a single fused dispatch per
+// layer instead of ~15 independent Metal kernels. Covers the common
+// case `last_dim == head_dim` (Gemma 4 Q/K inputs). Caller must
+// short-circuit `rotated_dims <= 0` and the `last_dim > head_dim`
+// tail case — those stay on the op-at-a-time path.
+//
+// Compile cache is keyed on `(head_dim, rotated_dims)`. Each model
+// variant contributes at most one entry.
+namespace {
+    using CompiledFn =
+        std::function<std::vector<array>(const std::vector<array>&)>;
+
+    static CompiledFn& get_compiled_proportional_rope(
+        int head_dim, int rotated_dims
+    ) {
+        static std::mutex mu;
+        static std::unordered_map<int64_t, CompiledFn> cache;
+
+        int64_t key = (static_cast<int64_t>(head_dim) << 32)
+            | static_cast<int64_t>(static_cast<uint32_t>(rotated_dims));
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+
+        int half = head_dim / 2;
+        int rot_half = rotated_dims / 2;
+
+        auto fn = [head_dim, half, rotated_dims, rot_half]
+            (const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& x = inputs[0];       // rank-4 [B, n_heads, L, head_dim]
+            const auto& freqs = inputs[1];
+            const auto& offset = inputs[2];  // scalar int32 array
+
+            auto shape = x.shape();           // concrete under shapeless=false
+            auto rk = shape.size();
+            Shape start_full(rk, 0);
+            Shape stop_full(shape.begin(), shape.end());
+
+            // left = x[..., :half], right = x[..., half:head_dim]
+            auto stop_half = stop_full;
+            stop_half.back() = half;
+            auto left = mlx::core::slice(x, start_full, stop_half);
+
+            auto start_half = start_full;
+            start_half.back() = half;
+            auto stop_head = stop_full;
+            stop_head.back() = head_dim;
+            auto right = mlx::core::slice(x, start_half, stop_head);
+
+            // rotated = concat(left[..., :rot_half], right[..., :rot_half])
+            auto stop_rot = start_full;
+            stop_rot = stop_full;
+            stop_rot.back() = rot_half;
+            auto left_first = mlx::core::slice(left, start_full, stop_rot);
+            auto right_first = mlx::core::slice(right, start_full, stop_rot);
+            auto rotated = mlx::core::concatenate(
+                {left_first, right_first}, -1);
+
+            auto rotated_out = mlx::core::fast::rope(
+                rotated, rotated_dims, false,
+                std::nullopt, 1.0f, offset, freqs);
+
+            // Split rotated_out back into two halves.
+            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
+            auto start_rot_b = start_full;
+            start_rot_b.back() = rot_half;
+            auto stop_rot_full = stop_full;
+            stop_rot_full.back() = rotated_dims;
+            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
+
+            // Replace first rot_half slots of each half with rot_a/rot_b;
+            // preserve the rest [rot_half:half].
+            auto start_rest = start_full;
+            start_rest.back() = rot_half;
+            auto stop_rest = stop_full;
+            stop_rest.back() = half;
+            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
+            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
+
+            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
+            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
+            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
+
+            return {head_new};
+        };
+
+        auto [iter, _] = cache.emplace(
+            key, mlx::core::compile(fn, /*shapeless=*/false));
+        return iter->second;
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_proportional_rope(
+    const MlxArray& x,
+    const MlxArray& freqs,
+    int32_t head_dim,
+    int32_t rotated_dims,
+    int32_t offset
+) {
+    // `offset` flows through as a scalar array so the same compiled
+    // graph serves every decode step without recompilation.
+    auto offset_arr = array(offset);
+    auto& compiled_fn = get_compiled_proportional_rope(head_dim, rotated_dims);
+    auto result = compiled_fn({x.inner, freqs.inner, offset_arr});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled Gemma 4 Q-path with proportional RoPE. Folds
+//   reshape → fast_rms_norm → transpose → ProportionalRoPE
+// into a single `mx::core::compile` graph, replacing four
+// cxx-bridge calls (plus ~14 slice/concat ops inside RoPE) with
+// one fused subgraph. Used on Gemma 4 full-attention layers only
+// (`rope_type == "proportional"`); sliding-attention layers stay
+// on the op-at-a-time path since their standard `fast_rope` chain
+// is already short.
+namespace {
+    static CompiledFn& get_compiled_q_path_proportional(
+        int head_dim, int rotated_dims, int n_heads, float rms_eps
+    ) {
+        struct Key { int head_dim; int rotated_dims; int n_heads; float rms_eps; };
+        struct KeyHash {
+            size_t operator()(const Key& k) const noexcept {
+                size_t h = std::hash<int>{}(k.head_dim);
+                h ^= std::hash<int>{}(k.rotated_dims) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<int>{}(k.n_heads) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                h ^= std::hash<float>{}(k.rms_eps) + 0x9e3779b9 + (h << 6) + (h >> 2);
+                return h;
+            }
+        };
+        struct KeyEq {
+            bool operator()(const Key& a, const Key& b) const noexcept {
+                return a.head_dim == b.head_dim && a.rotated_dims == b.rotated_dims
+                    && a.n_heads == b.n_heads && a.rms_eps == b.rms_eps;
+            }
+        };
+
+        static std::mutex mu;
+        static std::unordered_map<Key, CompiledFn, KeyHash, KeyEq> cache;
+        std::lock_guard<std::mutex> lock(mu);
+        Key key{head_dim, rotated_dims, n_heads, rms_eps};
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+
+        int half = head_dim / 2;
+        int rot_half = rotated_dims / 2;
+
+        auto fn = [head_dim, rotated_dims, n_heads, rms_eps, half, rot_half]
+            (const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& q_in = inputs[0];      // [B, L, n_heads * head_dim]
+            const auto& q_norm_w = inputs[1];  // [head_dim]
+            const auto& freqs = inputs[2];
+            const auto& offset = inputs[3];    // scalar int array
+
+            auto in_shape = q_in.shape();
+            int B = in_shape[0];
+            int L = in_shape[1];
+
+            auto q = mlx::core::reshape(q_in, {B, L, n_heads, head_dim});
+            q = mlx::core::fast::rms_norm(q, q_norm_w, rms_eps);
+            q = mlx::core::transpose(q, {0, 2, 1, 3});
+
+            // Inlined ProportionalRoPE: last_dim == head_dim is
+            // guaranteed by caller.
+            auto qs = q.shape();
+            auto rk = qs.size();
+            Shape start_full(rk, 0);
+            Shape stop_full(qs.begin(), qs.end());
+
+            auto stop_half = stop_full;
+            stop_half.back() = half;
+            auto left = mlx::core::slice(q, start_full, stop_half);
+
+            auto start_half = start_full;
+            start_half.back() = half;
+            auto stop_head = stop_full;
+            stop_head.back() = head_dim;
+            auto right = mlx::core::slice(q, start_half, stop_head);
+
+            auto stop_rot = stop_full;
+            stop_rot.back() = rot_half;
+            auto left_first = mlx::core::slice(left, start_full, stop_rot);
+            auto right_first = mlx::core::slice(right, start_full, stop_rot);
+            auto rotated = mlx::core::concatenate({left_first, right_first}, -1);
+
+            auto rotated_out = mlx::core::fast::rope(
+                rotated, rotated_dims, false,
+                std::nullopt, 1.0f, offset, freqs);
+
+            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
+            auto start_rot_b = start_full;
+            start_rot_b.back() = rot_half;
+            auto stop_rot_full = stop_full;
+            stop_rot_full.back() = rotated_dims;
+            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
+
+            auto start_rest = start_full;
+            start_rest.back() = rot_half;
+            auto stop_rest = stop_full;
+            stop_rest.back() = half;
+            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
+            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
+
+            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
+            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
+            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
+
+            return {head_new};
+        };
+
+        auto [iter, _] = cache.emplace(
+            key, mlx::core::compile(fn, /*shapeless=*/false));
+        return iter->second;
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_q_path_proportional(
+    const MlxArray& q_proj_out,
+    const MlxArray& q_norm_weight,
+    const MlxArray& freqs,
+    float rms_eps,
+    int32_t n_heads,
+    int32_t head_dim,
+    int32_t rotated_dims,
+    int32_t offset
+) {
+    auto offset_arr = array(offset);
+    auto& compiled_fn = get_compiled_q_path_proportional(
+        head_dim, rotated_dims, n_heads, rms_eps);
+    auto result = compiled_fn(
+        {q_proj_out.inner, q_norm_weight.inner, freqs.inner, offset_arr});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled Gemma 4 per-layer-input-gate chain (e2b / e4b variants).
+// Collapses
+//   gate = gate_proj(after_ffn)
+//   gate = gelu_approx(gate)
+//   gate = gate * per_layer_input
+//   gate = proj(gate)
+//   gate = post_norm(gate)
+//   out  = after_ffn + gate
+// into one `mx::core::compile` graph. Covers the common
+// affine/gs=64/bits=4 quantized configuration; other modes fall
+// back to the op-at-a-time path at the Rust layer.
+namespace {
+    using CompiledFn =
+        std::function<std::vector<array>(const std::vector<array>&)>;
+
+    // Eps is captured in the compile closure because `fast::rms_norm`
+    // takes a scalar float (not an array), so it has to be a
+    // compile-time constant. A single Gemma 4 variant uses one eps
+    // value, so the cache is expected to hold one entry.
+    static CompiledFn& get_compiled_per_layer_input_gate(float eps) {
+        static std::mutex mu;
+        static std::unordered_map<uint32_t, CompiledFn> cache;
+        uint32_t key;
+        std::memcpy(&key, &eps, sizeof(float));
+        std::lock_guard<std::mutex> lock(mu);
+        auto it = cache.find(key);
+        if (it != cache.end()) return it->second;
+
+        auto fn = [eps](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: after_ffn, per_layer_input,
+            //         gate_w, gate_s, gate_b,
+            //         proj_w,  proj_s,  proj_b,
+            //         post_norm_w
+            const auto& after_ffn = inputs[0];
+            const auto& per_layer = inputs[1];
+            const auto& gate_w = inputs[2];
+            const auto& gate_s = inputs[3];
+            const auto& gate_b = inputs[4];
+            const auto& proj_w = inputs[5];
+            const auto& proj_s = inputs[6];
+            const auto& proj_b = inputs[7];
+            const auto& post_norm_w = inputs[8];
+
+            int group_size = 64;
+            int bits = 4;
+
+            auto gate = mlx::core::quantized_matmul(
+                after_ffn, gate_w, gate_s, gate_b, true, group_size, bits);
+
+            // Erf-based GELU (matches the existing gelu_approx helper).
+            auto sqrt2 = array(std::sqrt(2.0f));
+            auto half = array(0.5f);
+            auto one = array(1.0f);
+            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+            auto gelu_gate = mlx::core::multiply(gate, scale);
+
+            auto gated = mlx::core::multiply(gelu_gate, per_layer);
+            auto projected = mlx::core::quantized_matmul(
+                gated, proj_w, proj_s, proj_b, true, group_size, bits);
+            auto normed = mlx::core::fast::rms_norm(projected, post_norm_w, eps);
+            auto combined = mlx::core::add(after_ffn, normed);
+            return {combined};
+        };
+        auto [iter, _] = cache.emplace(
+            key, mlx::core::compile(fn, /*shapeless=*/true));
+        return iter->second;
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_per_layer_input_gate(
+    const MlxArray& after_ffn,
+    const MlxArray& per_layer_input,
+    const MlxArray& gate_w,
+    const MlxArray& gate_s,
+    const MlxArray* gate_b,
+    const MlxArray& proj_w,
+    const MlxArray& proj_s,
+    const MlxArray* proj_b,
+    const MlxArray& post_norm_w,
+    float post_norm_eps,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+
+    // Compiled path only supports affine / gs=64 / bits=4 / both
+    // biases present. Anything else falls back in Rust.
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_b && proj_b) {
+        auto& compiled_fn = get_compiled_per_layer_input_gate(post_norm_eps);
+        auto result = compiled_fn({
+            after_ffn.inner, per_layer_input.inner,
+            gate_w.inner, gate_s.inner, gate_b->inner,
+            proj_w.inner, proj_s.inner, proj_b->inner,
+            post_norm_w.inner
+        });
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    // Non-compiled fallback.
+    std::optional<array> gb = gate_b ? std::optional(gate_b->inner) : std::nullopt;
+    std::optional<array> pb = proj_b ? std::optional(proj_b->inner) : std::nullopt;
+    auto gate = mlx::core::quantized_matmul(
+        after_ffn.inner, gate_w.inner, gate_s.inner, gb,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    auto sqrt2 = array(std::sqrt(2.0f));
+    auto half = array(0.5f);
+    auto one = array(1.0f);
+    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
+    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
+    auto gelu_gate = mlx::core::multiply(gate, scale);
+    auto gated = mlx::core::multiply(gelu_gate, per_layer_input.inner);
+
+    auto projected = mlx::core::quantized_matmul(
+        gated, proj_w.inner, proj_s.inner, pb,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+    auto normed = mlx::core::fast::rms_norm(projected, post_norm_w.inner, post_norm_eps);
+    auto combined = mlx::core::add(after_ffn.inner, normed);
+    return std::make_unique<MlxArray>(std::move(combined));
+}
+
 std::unique_ptr<MlxArray> fast_rms_norm(
     const MlxArray& x,
     const MlxArray& weight,
@@ -4397,6 +4760,20 @@ bool gated_delta_kernel_available() {
 #else
     return false;
 #endif
+}
+
+// Start a GPU trace capture and stop an active one. Mirrors the Python
+// `mx.metal.start_capture` / `mx.metal.stop_capture` API so a mlxcel
+// decode run can emit the same `.gputrace` files that `mlx-lm` produces
+// and both be loaded into Xcode's Metal Debugger side by side.
+// The process must have been launched with `MTL_CAPTURE_ENABLED=1`,
+// otherwise Metal silently drops the capture.
+void metal_start_capture(rust::Str path) {
+    mlx::core::metal::start_capture(std::string(path.data(), path.size()));
+}
+
+void metal_stop_capture() {
+    mlx::core::metal::stop_capture();
 }
 
 void metal_gated_delta_forward(

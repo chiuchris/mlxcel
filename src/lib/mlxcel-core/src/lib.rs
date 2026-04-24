@@ -962,6 +962,60 @@ mod ffi {
             freqs: &MlxArray,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled ProportionalRoPE: collapses the
+        /// slice/concat/rope/slice/concat chain used by Gemma 4
+        /// full-attention layers into one `mx::core::compile` graph.
+        /// Only valid when `rotated_dims > 0` and the input's last
+        /// dim equals `head_dim`; callers must short-circuit the
+        /// trivial / tail cases. Offset flows through as a scalar
+        /// array inside the compile so per-step recompilation is
+        /// avoided.
+        fn compiled_proportional_rope(
+            x: &MlxArray,
+            freqs: &MlxArray,
+            head_dim: i32,
+            rotated_dims: i32,
+            offset: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled Gemma 4 Q-path with proportional RoPE:
+        /// `reshape → fast::rms_norm → transpose → ProportionalRoPE`
+        /// folded into one compile window. `q_proj_out` is shaped
+        /// `[B, L, n_heads * head_dim]` (output of `q_proj`).
+        /// Applies only to Gemma 4 full-attention layers.
+        fn compiled_q_path_proportional(
+            q_proj_out: &MlxArray,
+            q_norm_weight: &MlxArray,
+            freqs: &MlxArray,
+            rms_eps: f32,
+            n_heads: i32,
+            head_dim: i32,
+            rotated_dims: i32,
+            offset: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Compiled Gemma 4 per-layer-input-gate chain (e2b / e4b
+        /// variants): `gate_proj → gelu_approx → mul(per_layer) →
+        /// proj → post_norm → add(after_ffn)` in one compile window.
+        /// Falls back to op-at-a-time inside C++ when the quantized
+        /// config is not affine / gs=64 / bits=4 with biases.
+        #[allow(clippy::too_many_arguments)]
+        unsafe fn compiled_per_layer_input_gate(
+            after_ffn: &MlxArray,
+            per_layer_input: &MlxArray,
+            gate_w: &MlxArray,
+            gate_s: &MlxArray,
+            gate_b: *const MlxArray,
+            proj_w: &MlxArray,
+            proj_s: &MlxArray,
+            proj_b: *const MlxArray,
+            post_norm_w: &MlxArray,
+            post_norm_eps: f32,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
         /// Fast RMS norm using MLX fast kernel
         fn fast_rms_norm(x: &MlxArray, weight: &MlxArray, eps: f32) -> UniquePtr<MlxArray>;
 
@@ -1238,6 +1292,17 @@ mod ffi {
         // GatedDeltaNet custom Metal kernel.
         /// Check if GatedDeltaNet Metal kernel is available
         fn gated_delta_kernel_available() -> bool;
+
+        /// Start a Metal GPU trace capture. `path` must be an absolute
+        /// path ending in `.gputrace` and must not already exist. The
+        /// process must have been launched with `MTL_CAPTURE_ENABLED=1`;
+        /// otherwise Metal drops the capture silently. Mirrors Python's
+        /// `mx.metal.start_capture` so mlxcel traces can be compared
+        /// side-by-side with mlx-lm traces in Xcode's Metal Debugger.
+        fn metal_start_capture(path: &str);
+
+        /// Stop an active Metal GPU trace capture.
+        fn metal_stop_capture();
 
         /// GatedDeltaNet custom Metal kernel forward.
         /// Handles both T=1 (decode) and T>1 (prefill) in a single GPU dispatch.

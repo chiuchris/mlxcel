@@ -579,10 +579,23 @@ fn generate_standard<M: LanguageModel>(
     let _ = generator.generate(model, prompt_tokens, 1, sampling_config);
     generator.reset_with_model(model);
 
+    let capture_path = std::env::var("MLXCEL_METAL_CAPTURE_PATH").ok();
+    if let Some(ref path) = capture_path {
+        // Requires the mlxcel binary to be launched with
+        // `MTL_CAPTURE_ENABLED=1`; otherwise Metal drops the capture.
+        // Warmup above already primed MLX compile caches so the capture
+        // covers steady-state decode work only.
+        mlxcel_core::metal_start_capture(path);
+    }
+
     let start_time = Instant::now();
     let tokens = generator.generate(model, prompt_tokens, max_tokens, sampling_config);
     let total_time = start_time.elapsed();
     let generated_len = tokens.len();
+
+    if capture_path.is_some() {
+        mlxcel_core::metal_stop_capture();
+    }
 
     (
         tokens,

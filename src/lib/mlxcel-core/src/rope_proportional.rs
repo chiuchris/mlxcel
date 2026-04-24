@@ -31,8 +31,8 @@
 //! Used by: Gemma4
 
 use crate::{
-    array_shape, concatenate, copy, fast_rope_with_freqs, from_slice_f32, slice, MlxArray,
-    UniquePtr,
+    array_shape, compiled_proportional_rope, concatenate, copy, fast_rope_with_freqs,
+    from_slice_f32, slice, MlxArray, UniquePtr,
 };
 
 /// Compute the frequency table for proportional RoPE.
@@ -127,6 +127,16 @@ pub fn apply_proportional_rope(
         last_dim >= head_dim,
         "apply_proportional_rope: last dim ({last_dim}) must be >= head_dim ({head_dim})"
     );
+
+    // Fast path: when `last_dim == head_dim` (the standard Gemma 4
+    // Q/K shape) fold the slice/concat/rope/slice/concat chain into
+    // a single `mx::core::compile` graph. Reduces the GPU interval
+    // count by ~35 % vs the op-at-a-time path, measured via
+    // `xctrace --template "Metal System Trace"` on a matched 10 s
+    // decode window.
+    if last_dim == head_dim {
+        return compiled_proportional_rope(x, freqs, head_dim, rotated_dims, offset);
+    }
 
     // head = x[..., :head_dim]; tail = x[..., head_dim:]
     let start_full = vec![0_i32; rank as usize];
