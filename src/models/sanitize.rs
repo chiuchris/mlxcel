@@ -27,6 +27,7 @@ use std::path::Path;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SelectiveLoadMode {
     Materialize,
+    DeferredMaterialize,
     Borrowed,
 }
 
@@ -724,10 +725,23 @@ pub(crate) fn load_gemma4_text_weights_with_backing<P: AsRef<Path>>(
             &mut weights,
             is_gemma4_text_weight,
             false,
-            SelectiveLoadMode::Materialize,
+            SelectiveLoadMode::DeferredMaterialize,
             Some(&mut backing.mmaps),
             Some(&mut backing.owned_buffers),
         )?;
+    }
+
+    // Used by: Gemma4 quantized text loader. The backing mmaps are retained in
+    // `Gemma4WeightBacking`, so we can delay realization until all selected
+    // tensors are present and ask MLX to evaluate the whole weight set at once.
+    // This avoids the per-tensor eval pattern that inflates load-time Metal
+    // command-buffer and GPU-interval counts compared with mlx-lm.
+    let ptrs: Vec<*const mlxcel_core::MlxArray> = weights
+        .values()
+        .filter_map(|v| v.as_ref().map(|arr| arr as *const mlxcel_core::MlxArray))
+        .collect();
+    if !ptrs.is_empty() {
+        unsafe { mlxcel_core::eval_all(&ptrs) };
     }
 
     Ok((weights, backing))

@@ -276,7 +276,7 @@ struct SwitchGeGLU {
 }
 
 impl SwitchGeGLU {
-    fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+    fn forward(&self, x: &MlxArray, indices: &MlxArray, hidden_size: i32) -> UniquePtr<MlxArray> {
         // `MLXCEL_PROFILE_MOE_INNER=1` emits `[MOE] name=... ms=...` per
         // sub-sub-op so the `experts` band in the sub-op profiler can be
         // drilled one level further. Like the outer profilers this forces a
@@ -299,14 +299,12 @@ impl SwitchGeGLU {
         let top_k = indices_shape[1];
         let do_sort = n_tokens * top_k >= 64;
 
-        // Single multi-axis expand_dims matches mlx-lm's
-        // `x.expand_dims((-2, -3))`. Previously two sequential calls here
-        // cost ~0.28 ms/layer on 26B-a4b decode (first call ~0.80 ms, second
-        // ~0.02 ms), versus Python's single 0.54 ms — the extra call forced
-        // an additional FFI boundary + MLX graph node. Folding them into one
-        // call closed the primary per-layer gap identified by
-        // `MLXCEL_PROFILE_MOE_INNER`.
-        let x_exp = mlxcel_core::expand_dims_multi(x, &[-2, -3]);
+        // `Experts::forward` always passes a flattened `[tokens, hidden]`
+        // input here. Python writes this as `expand_dims((-2, -3))`, which
+        // gives `[tokens, 1, 1, hidden]`; a reshape is equivalent for this
+        // rank-2 internal path and avoids an extra shape primitive in the
+        // decode-hot SwitchGeGLU graph.
+        let x_exp = mlxcel_core::reshape(x, &[n_tokens, 1, 1, hidden_size]);
         inner_tick("expand_dims", &x_exp, &mut last);
 
         if do_sort {
@@ -324,19 +322,20 @@ impl SwitchGeGLU {
             inner_tick("scatter_unsort", &unsorted, &mut last);
             unsorted
         } else {
-            // Fused compile window: if all three switch_linears are
-            // quantized-affine with biases, call `gather_qmm × 3 +
-            // erf-GeGLU + multiply` inside a single `mx::core::compile`
-            // graph so MLX can schedule gate/up in parallel and fuse
-            // the intermediate element-wise ops. The dense shared_mlp
-            // already uses the same pattern via
-            // `compiled_gelu_mlp_forward`.
-            let output = if let (Some(gate_q), Some(up_q), Some(down_q)) = (
-                self.gate_proj.quantized_parts(),
-                self.up_proj.quantized_parts(),
-                self.down_proj.quantized_parts(),
-            ) {
-                unsafe {
+            // Keep the decode-hot path in the same op shape as mlx-lm by
+            // default: separate gather_qmm(gate/up/down) with only the GeGLU
+            // elementwise chain compiled. A wider compile window around
+            // gather_qmm has regressed Gemma 4 26B/31B decode in profiling, so
+            // it is retained as an explicit experiment only.
+            let enable_compiled_switch =
+                std::env::var_os("MLXCEL_ENABLE_COMPILED_SWITCH_QGEGLU").is_some();
+            let output = if enable_compiled_switch
+                && let (Some(gate_q), Some(up_q), Some(down_q)) = (
+                    self.gate_proj.quantized_parts(),
+                    self.up_proj.quantized_parts(),
+                    self.down_proj.quantized_parts(),
+                ) {
+                let output = unsafe {
                     mlxcel_core::compiled_switch_qgeglu_forward(
                         &x_exp,
                         gate_q.weight,
@@ -353,7 +352,9 @@ impl SwitchGeGLU {
                         gate_q.bits,
                         gate_q.mode,
                     )
-                }
+                };
+                inner_tick("switch_geglu_fused", &output, &mut last);
+                output
             } else {
                 let gate = self.gate_proj.forward(&x_exp, indices, false);
                 inner_tick("gate_proj", &gate, &mut last);
@@ -361,9 +362,10 @@ impl SwitchGeGLU {
                 inner_tick("up_proj", &up, &mut last);
                 let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
                 inner_tick("geglu", &activated, &mut last);
-                self.down_proj.forward(&activated, indices, false)
+                let output = self.down_proj.forward(&activated, indices, false);
+                inner_tick("down_proj", &output, &mut last);
+                output
             };
-            inner_tick("switch_geglu_fused", &output, &mut last);
             let squeezed = mlxcel_core::squeeze_axis(&output, -2);
             inner_tick("squeeze", &squeezed, &mut last);
             squeezed
@@ -564,7 +566,7 @@ impl Experts {
 
         let x_flat = mlxcel_core::reshape(x, &[b * s, h]);
         let indices_flat = mlxcel_core::reshape(top_k_indices, &[b * s, k]);
-        let expert_out = self.switch_geglu.forward(&x_flat, &indices_flat);
+        let expert_out = self.switch_geglu.forward(&x_flat, &indices_flat, h);
 
         let weights = mlxcel_core::reshape(top_k_weights, &[b * s, k, 1]);
         let weighted = mlxcel_core::multiply(&expert_out, &weights);

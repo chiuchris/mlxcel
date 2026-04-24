@@ -2424,8 +2424,13 @@ namespace {
     static CompiledFn& get_compiled_proportional_rope(
         int head_dim, int rotated_dims
     ) {
-        static std::mutex mu;
-        static std::unordered_map<int64_t, CompiledFn> cache;
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked: compiled function destruction calls back into
+        // MLX's process-wide CompilerCache. This map is constructed before
+        // that cache during first compile(), so normal static destruction would
+        // tear it down after MLX and can crash at process exit.
+        static std::unordered_map<int64_t, CompiledFn>& cache =
+            *new std::unordered_map<int64_t, CompiledFn>();
 
         int64_t key = (static_cast<int64_t>(head_dim) << 32)
             | static_cast<int64_t>(static_cast<uint32_t>(rotated_dims));
@@ -2547,8 +2552,13 @@ namespace {
             }
         };
 
-        static std::mutex mu;
-        static std::unordered_map<Key, CompiledFn, KeyHash, KeyEq> cache;
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked: compiled function destruction calls back into
+        // MLX's process-wide CompilerCache. This map is constructed before
+        // that cache during first compile(), so normal static destruction would
+        // tear it down after MLX and can crash at process exit.
+        static std::unordered_map<Key, CompiledFn, KeyHash, KeyEq>& cache =
+            *new std::unordered_map<Key, CompiledFn, KeyHash, KeyEq>();
         std::lock_guard<std::mutex> lock(mu);
         Key key{head_dim, rotated_dims, n_heads, rms_eps};
         auto it = cache.find(key);
@@ -2664,8 +2674,11 @@ namespace {
     // compile-time constant. A single Gemma 4 variant uses one eps
     // value, so the cache is expected to hold one entry.
     static CompiledFn& get_compiled_per_layer_input_gate(float eps) {
-        static std::mutex mu;
-        static std::unordered_map<uint32_t, CompiledFn> cache;
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked for the same static-destruction ordering reason
+        // as the proportional RoPE compiled-function caches above.
+        static std::unordered_map<uint32_t, CompiledFn>& cache =
+            *new std::unordered_map<uint32_t, CompiledFn>();
         uint32_t key;
         std::memcpy(&key, &eps, sizeof(float));
         std::lock_guard<std::mutex> lock(mu);
