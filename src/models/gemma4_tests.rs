@@ -126,7 +126,8 @@ fn gemma4_proportional_rope_freqs_match_python_semantics() {
     //
     //   freqs[i] = base^(2 * i / head_dim)   for i in [0, rope_angles)
     //
-    // with rope_angles = int(partial_rotary_factor * head_dim / 2). The
+    // with rope_angles = int(partial_rotary_factor * head_dim / 2), followed
+    // by an `inf` tail that disables rotation for the remaining pairs. The
     // denominator is the FULL head_dim — this is what distinguishes
     // "proportional" RoPE from the default `nn.RoPE(rope_dims)` form.
     //
@@ -144,30 +145,37 @@ fn gemma4_proportional_rope_freqs_match_python_semantics() {
     .expect("freqs must exist for prf=0.25");
     mlxcel_core::eval(&freqs);
 
-    // For head_dim=256 and prf=0.25, rope_angles = 32.
+    // For head_dim=256 and prf=0.25, rope_angles = 32, but upstream pads the
+    // table to head_dim/2 with `inf`.
     assert_eq!(
         mlxcel_core::array_shape(&freqs),
-        vec![32],
-        "freqs length must equal rope_angles"
+        vec![128],
+        "freqs length must equal head_dim / 2"
     );
 
     // Pull the values back to host and spot-check a handful of entries.
     let freqs_f32 = mlxcel_core::astype(&freqs, mlxcel_core::dtype::FLOAT32);
     mlxcel_core::eval(&freqs_f32);
     let freq_bytes = mlxcel_core::array_to_raw_bytes(&freqs_f32);
-    assert_eq!(freq_bytes.len(), 32 * 4);
+    assert_eq!(freq_bytes.len(), 128 * 4);
     let freq_values: Vec<f32> = freq_bytes
         .chunks_exact(4)
         .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
         .collect();
-    assert_eq!(freq_values.len(), 32);
+    assert_eq!(freq_values.len(), 128);
 
-    for (i, &got) in freq_values.iter().enumerate() {
+    for (i, &got) in freq_values.iter().take(32).enumerate() {
         let expected = base.powf((2 * i) as f32 / head_dim as f32);
         let rel = (got - expected).abs() / expected.max(1.0);
         assert!(
             rel < 1e-4,
             "freqs[{i}] expected {expected}, got {got} (rel err {rel})"
+        );
+    }
+    for (i, &got) in freq_values.iter().enumerate().skip(32) {
+        assert!(
+            got.is_infinite() && got.is_sign_positive(),
+            "freqs[{i}] must be +inf"
         );
     }
 

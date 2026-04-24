@@ -543,6 +543,8 @@ impl Default for KVCache {
 ///
 /// Maintains a fixed-size circular buffer for keys/values. Oversized prefill
 /// is linearized before single-token decode so wraparound stays well-defined.
+///
+/// Used by: Gemma3, Gemma4, Ministral3, GPT-OSS, RecurrentGemma, Exaone
 pub struct RotatingKVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
     pub values: Option<UniquePtr<MlxArray>>,
@@ -550,6 +552,7 @@ pub struct RotatingKVCache {
     pub offset: i32,
     /// Current write position in the buffer (separate from offset to handle trim correctly)
     idx: i32,
+    step: i32,
 }
 
 impl RotatingKVCache {
@@ -561,6 +564,7 @@ impl RotatingKVCache {
             max_size,
             offset: 0,
             idx: 0,
+            step: 256,
         }
     }
 
@@ -689,13 +693,15 @@ impl RotatingKVCache {
             let batch = shape[0];
             let heads = shape[1];
             let head_dim = shape[3];
+            let value_shape = ffi::array_shape(&new_values);
+            let value_head_dim = value_shape[3];
 
             let k_zeros = ffi::zeros(
                 &[batch, heads, self.max_size, head_dim],
                 ffi::array_dtype(&new_keys),
             );
             let v_zeros = ffi::zeros(
-                &[batch, heads, self.max_size, head_dim],
+                &[batch, heads, self.max_size, value_head_dim],
                 ffi::array_dtype(&new_values),
             );
 
@@ -709,7 +715,7 @@ impl RotatingKVCache {
                 &v_zeros,
                 &new_values,
                 &[0, 0, 0, 0],
-                &[batch, heads, 1, head_dim],
+                &[batch, heads, 1, value_head_dim],
             );
 
             self.offset = 1;
@@ -718,28 +724,35 @@ impl RotatingKVCache {
             self.values = Some(ffi::contiguous(&v, false));
 
             let k_out = ffi::slice(&k, &[0, 0, 0, 0], &[batch, heads, 1, head_dim]);
-            let v_out = ffi::slice(&v, &[0, 0, 0, 0], &[batch, heads, 1, head_dim]);
+            let v_out = ffi::slice(&v, &[0, 0, 0, 0], &[batch, heads, 1, value_head_dim]);
             return (k_out, v_out);
         }
 
-        let k_buffer = self.keys.take().unwrap();
-        let v_buffer = self.values.take().unwrap();
+        let mut k_buffer = self.keys.take().unwrap();
+        let mut v_buffer = self.values.take().unwrap();
 
         let shape = ffi::array_shape(&k_buffer);
         let batch = shape[0];
         let heads = shape[1];
         let buffer_size = shape[2];
         let head_dim = shape[3];
+        let value_shape = ffi::array_shape(&v_buffer);
+        let value_head_dim = value_shape[3];
 
         if self.idx >= buffer_size && buffer_size < self.max_size {
-            let k_concat = concatenate(&k_buffer, &new_keys, 2);
-            let v_concat = concatenate(&v_buffer, &new_values, 2);
-
-            self.offset += 1;
-            self.idx += 1;
-            self.keys = Some(ffi::contiguous(&k_concat, false));
-            self.values = Some(ffi::contiguous(&v_concat, false));
-            return (k_concat, v_concat);
+            let grow_by = self.step.min(self.max_size - buffer_size).max(0);
+            if grow_by > 0 {
+                let k_zeros = ffi::zeros(
+                    &[batch, heads, grow_by, head_dim],
+                    ffi::array_dtype(&new_keys),
+                );
+                let v_zeros = ffi::zeros(
+                    &[batch, heads, grow_by, value_head_dim],
+                    ffi::array_dtype(&new_values),
+                );
+                k_buffer = concatenate(&k_buffer, &k_zeros, 2);
+                v_buffer = concatenate(&v_buffer, &v_zeros, 2);
+            }
         }
 
         if self.idx >= self.max_size {
@@ -757,7 +770,7 @@ impl RotatingKVCache {
             &v_buffer,
             &new_values,
             &[0, 0, pos, 0],
-            &[batch, heads, pos + 1, head_dim],
+            &[batch, heads, pos + 1, value_head_dim],
         );
 
         self.offset += 1;
@@ -772,7 +785,7 @@ impl RotatingKVCache {
             let v_out = ffi::slice(
                 &v_buffer,
                 &[0, 0, 0, 0],
-                &[batch, heads, self.offset, head_dim],
+                &[batch, heads, self.offset, value_head_dim],
             );
             self.keys = Some(k_buffer);
             self.values = Some(v_buffer);

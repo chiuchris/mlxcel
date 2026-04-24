@@ -524,6 +524,10 @@ mod ffi {
         /// Used by: Gemma2, Gemma3 MLP layers
         fn compiled_geglu_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
 
+        /// Compiled GeGLU activation using Python MLX tanh-approx GELU.
+        /// Used by: Gemma4 MLP and SwitchGeGLU layers
+        fn compiled_geglu_approx_activation(gate: &MlxArray, x: &MlxArray) -> UniquePtr<MlxArray>;
+
         /// Compiled gelu_topk: sparse GELU with dynamic threshold — single fused kernel
         /// gelu_approx(max(0, x - (mean + std * multiplier)))
         /// Used by: Gemma3n MLP layers with activation_sparsity > 0
@@ -581,8 +585,27 @@ mod ffi {
             mode: &str,
         ) -> UniquePtr<MlxArray>;
 
+        /// Compiled GELU-approx MLP forward:
+        /// down_proj(gelu_approx(gate_proj(x)) * up_proj(x)).
+        /// Used by: Gemma4 dense MLP
+        unsafe fn compiled_gelu_approx_mlp_forward(
+            x: &MlxArray,
+            gate_proj: &MlxArray,
+            gate_scales: &MlxArray,
+            gate_biases: *const MlxArray,
+            up_proj: &MlxArray,
+            up_scales: &MlxArray,
+            up_biases: *const MlxArray,
+            down_proj: &MlxArray,
+            down_scales: &MlxArray,
+            down_biases: *const MlxArray,
+            group_size: i32,
+            bits: i32,
+            mode: &str,
+        ) -> UniquePtr<MlxArray>;
+
         /// Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
-        /// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+        /// Wraps three `gather_qmm` calls (gate/up/down) plus a tanh-approx
         /// GeGLU activation into a single `mx::core::compile` window so
         /// MLX can schedule gate/up in parallel and fuse the intermediate
         /// element-wise ops. Only the no-sort path is fused; callers
@@ -962,14 +985,12 @@ mod ffi {
             freqs: &MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        /// Compiled ProportionalRoPE: collapses the
-        /// slice/concat/rope/slice/concat chain used by Gemma 4
-        /// full-attention layers into one `mx::core::compile` graph.
-        /// Only valid when `rotated_dims > 0` and the input's last
-        /// dim equals `head_dim`; callers must short-circuit the
-        /// trivial / tail cases. Offset flows through as a scalar
-        /// array inside the compile so per-step recompilation is
-        /// avoided.
+        /// Compiled ProportionalRoPE: mirrors mlx-lm's full-head RoPE call
+        /// with an `inf` frequency tail inside one `mx::core::compile`
+        /// graph. Only valid when `rotated_dims > 0` and the input's last
+        /// dim equals `head_dim`; callers must short-circuit the trivial /
+        /// tail cases. Offset flows through as a scalar array inside the
+        /// compile so per-step recompilation is avoided.
         fn compiled_proportional_rope(
             x: &MlxArray,
             freqs: &MlxArray,
@@ -979,10 +1000,10 @@ mod ffi {
         ) -> UniquePtr<MlxArray>;
 
         /// Compiled Gemma 4 Q-path with proportional RoPE:
-        /// `reshape → fast::rms_norm → transpose → ProportionalRoPE`
+        /// `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
         /// folded into one compile window. `q_proj_out` is shaped
-        /// `[B, L, n_heads * head_dim]` (output of `q_proj`).
-        /// Applies only to Gemma 4 full-attention layers.
+        /// `[B, L, n_heads * head_dim]` (output of `q_proj`). Applies only to
+        /// Gemma 4 full-attention layers.
         fn compiled_q_path_proportional(
             q_proj_out: &MlxArray,
             q_norm_weight: &MlxArray,
@@ -1431,6 +1452,9 @@ mod ffi {
         /// Async eval multiple arrays at once
         unsafe fn async_eval_all(arrays: &[*const MlxArray]);
 
+        /// Detach evaluated arrays from their construction graphs.
+        unsafe fn detach_all(arrays: &[*const MlxArray]);
+
         /// Synchronize default stream
         fn synchronize_default();
 
@@ -1467,6 +1491,9 @@ mod ffi {
 
         /// Async eval two arrays at once (for lookahead pipelining)
         fn async_eval_pair(a: &MlxArray, b: &MlxArray);
+
+        /// Export two unevaluated arrays as a DOT graph for profiling.
+        fn export_to_dot_pair(path: &str, a: &MlxArray, b: &MlxArray);
 
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
@@ -2060,16 +2087,16 @@ pub fn causal_attention(
     let q_len = ffi::array_shape(q)[2];
     let k_len = ffi::array_shape(k)[2];
 
-    if softcap > 0.0 || window_size > 0 {
-        // Decode single-query fast path:
-        // - Causal masking is unnecessary when q_len == 1 (no future positions).
-        // - Sliding-window masking is only needed if cached KV exceeds window.
-        // This avoids per-token mask materialization for common decode cases.
-        let needs_window_mask = window_size > 0 && k_len > window_size;
-        if q_len == 1 && !needs_window_mask && use_single_query_maskless_path() {
-            return layers::attention(q, k, v, scale, None, softcap, window_size);
-        }
+    // Decode single-query fast path:
+    // - Causal masking is unnecessary when q_len == 1 (no future positions).
+    // - Sliding-window masking is only needed if cached KV exceeds window.
+    // This avoids per-token mask materialization for common decode cases.
+    let needs_window_mask = window_size > 0 && k_len > window_size;
+    if q_len == 1 && !needs_window_mask && use_single_query_maskless_path() {
+        return layers::attention(q, k, v, scale, None, softcap, window_size);
+    }
 
+    if softcap > 0.0 || window_size > 0 {
         let offset = (k_len - q_len).max(0);
         let mask = if softcap == 0.0 && use_bool_causal_mask_path() {
             if window_size > 0 {

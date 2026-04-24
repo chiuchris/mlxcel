@@ -79,6 +79,7 @@ pub struct Gemma4VLModel {
     pub boa_token_id: i32,
     pub eoa_token_id: i32,
     cached_per_layer_inputs: std::cell::RefCell<Option<UniquePtr<MlxArray>>>,
+    _weight_backing: crate::models::Gemma4WeightBacking,
 }
 
 impl Gemma4VLModel {
@@ -105,7 +106,12 @@ impl Gemma4VLModel {
             boa_token_id: 256_000,
             eoa_token_id: 258_883,
             cached_per_layer_inputs: std::cell::RefCell::new(None),
+            _weight_backing: crate::models::Gemma4WeightBacking::default(),
         }
+    }
+
+    pub(crate) fn set_weight_backing(&mut self, weight_backing: crate::models::Gemma4WeightBacking) {
+        self._weight_backing = weight_backing;
     }
 
     /// Set audio tower and embedder for audio-capable models.

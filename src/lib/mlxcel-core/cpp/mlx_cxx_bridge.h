@@ -359,8 +359,16 @@ std::unique_ptr<MlxArray> compiled_swiglu_activation(
 
 // GeGLU activation - compiled with kernel fusion (shapeless=true)
 // output = gelu(gate) * x
-// Used by: Gemma2, Gemma3 MLP layers
+// Used by: Gemma, Gemma2, Gemma3 MLP layers
 std::unique_ptr<MlxArray> compiled_geglu_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+);
+
+// GeGLU activation with Python MLX tanh-approx GELU.
+// output = gelu_approx(gate) * x
+// Used by: Gemma4 MLP and SwitchGeGLU layers
+std::unique_ptr<MlxArray> compiled_geglu_approx_activation(
     const MlxArray& gate,
     const MlxArray& x
 );
@@ -426,8 +434,27 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     rust::Str mode
 );
 
+// Compiled GELU-approx MLP forward: down_proj(gelu_approx(gate_proj(x)) * up_proj(x))
+// Fuses the quantized projections and Python MLX tanh-approx GeGLU.
+// Used by: Gemma4 dense MLP
+std::unique_ptr<MlxArray> compiled_gelu_approx_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+);
+
 // Compiled GeGLU SwitchGLU MLP forward for quantized MoE experts.
-// Wraps three `gather_qmm` calls (gate/up/down) plus an erf-based
+// Wraps three `gather_qmm` calls (gate/up/down) plus a tanh-approx
 // GeGLU activation into a single `mx::core::compile` window so MLX
 // can schedule gate/up in parallel and fuse the intermediate
 // element-wise ops. Only the no-sort path is fused; callers should
@@ -698,12 +725,12 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     const MlxArray& freqs
 );
 
-// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Wraps
-// the slice/concat/rope/slice/concat chain in one `mx::core::compile`
-// window. Requires `rotated_dims > 0` and `last_dim == head_dim`;
-// the rare `last_dim > head_dim` tail case must stay on the
-// op-at-a-time path. `offset` flows through as a scalar array input
-// so the same compiled graph serves every decode step.
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Wraps the
+// mlx-lm full-head `fast::rope` call with an `inf` frequency tail in one
+// `mx::core::compile` window. Requires `rotated_dims > 0` and
+// `last_dim == head_dim`; the rare `last_dim > head_dim` tail case must
+// stay on the op-at-a-time path. `offset` flows through as a scalar array
+// input so the same compiled graph serves every decode step.
 std::unique_ptr<MlxArray> compiled_proportional_rope(
     const MlxArray& x,
     const MlxArray& freqs,
@@ -713,10 +740,9 @@ std::unique_ptr<MlxArray> compiled_proportional_rope(
 );
 
 // Compiled Gemma 4 Q-path with proportional RoPE. Folds
-// `reshape → fast::rms_norm → transpose → ProportionalRoPE` into
-// one compile window so MLX sees a single fused subgraph instead
-// of four cxx-bridge calls. Used on Gemma 4 full-attention
-// layers only.
+// `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
+// into one compile window so MLX sees a single fused subgraph instead of
+// four cxx-bridge calls. Used on Gemma 4 full-attention layers only.
 std::unique_ptr<MlxArray> compiled_q_path_proportional(
     const MlxArray& q_proj_out,
     const MlxArray& q_norm_weight,
@@ -930,6 +956,7 @@ void clear_memory_cache();
 // Async evaluation
 void async_eval(const MlxArray& arr);
 void async_eval_all(rust::Slice<const MlxArray* const> arrays);
+void detach_all(rust::Slice<const MlxArray* const> arrays);
 
 // Synchronize stream
 void synchronize_default();
@@ -964,6 +991,9 @@ std::unique_ptr<MlxArray> reshape_token_for_forward(const MlxArray& token);
 
 // Async eval two arrays at once (for lookahead pipelining)
 void async_eval_pair(const MlxArray& a, const MlxArray& b);
+
+// Export a pair of unevaluated arrays as a DOT graph for profiling.
+void export_to_dot_pair(rust::Str path, const MlxArray& a, const MlxArray& b);
 
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream);

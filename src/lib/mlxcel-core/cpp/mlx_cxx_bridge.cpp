@@ -8,6 +8,7 @@
 #include "mlx/memory.h"
 #include "mlx/linalg.h"
 #include "mlx/fft.h"
+#include "mlx/graph_utils.h"
 #include "mlx/random.h"
 #include "mlx/einsum.h"
 #include "mlx/utils.h"
@@ -16,6 +17,7 @@
 #endif
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -70,6 +72,25 @@ static int32_t from_dtype(Dtype dtype) {
         case complex64.val(): return 13;
         default: return 10;  // float32
     }
+}
+
+// MLX Python's nn.gelu_approx uses the tanh approximation:
+// 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3))).
+// Keep this helper local so exact-GELU models can continue to use the
+// erf-based compiled_geglu_activation path.
+static array gelu_tanh_approx(const array& x) {
+    auto dtype = x.dtype();
+    auto half = array(0.5f, dtype);
+    auto one = array(1.0f, dtype);
+    auto coeff = array(0.7978845608028654f, dtype);  // sqrt(2/pi)
+    auto cubic_coeff = array(0.044715f, dtype);
+    auto x2 = mlx::core::multiply(x, x);
+    auto x3 = mlx::core::multiply(x2, x);
+    auto inner = mlx::core::multiply(
+        coeff,
+        mlx::core::add(x, mlx::core::multiply(cubic_coeff, x3)));
+    auto cdf = mlx::core::multiply(half, mlx::core::add(one, mlx::core::tanh(inner)));
+    return mlx::core::multiply(x, cdf);
 }
 
 // Stream functions.
@@ -991,9 +1012,6 @@ std::unique_ptr<MlxArray> quantized_linear_forward(
     int32_t bits,
     rust::Str mode
 ) {
-    // Fast path for affine mode: omit mode parameter entirely to match
-    // Python's nn.QuantizedLinear calling convention. Passing mode="affine"
-    // explicitly adds ~7% overhead per call in MLX's dispatch.
     bool is_affine = (mode.size() == 6 && std::memcmp(mode.data(), "affine", 6) == 0);
     array result = [&]() {
         if (is_affine) {
@@ -1184,6 +1202,28 @@ std::unique_ptr<MlxArray> compiled_geglu_activation(
     const MlxArray& x
 ) {
     static auto compiled_fn = get_compiled_geglu();
+    auto result = compiled_fn({gate.inner, x.inner});
+    return std::make_unique<MlxArray>(std::move(result[0]));
+}
+
+// Compiled GeGLU using Python MLX's tanh-approx GELU.
+// Used by: Gemma4
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)> get_compiled_geglu_approx() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            const auto& gate = inputs[0];
+            const auto& x = inputs[1];
+            return {mlx::core::multiply(gelu_tanh_approx(gate), x)};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_geglu_approx_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+) {
+    static auto compiled_fn = get_compiled_geglu_approx();
     auto result = compiled_fn({gate.inner, x.inner});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
@@ -1487,7 +1527,6 @@ namespace {
 
             int group_size = 64;
             int bits = 4;
-
             // gate = quantized_matmul(x, gate_w, gate_s, gate_b)
             auto gate = mlx::core::quantized_matmul(x, gate_w, gate_s, gate_b, true, group_size, bits);
 
@@ -1575,6 +1614,93 @@ std::unique_ptr<MlxArray> compiled_gelu_mlp_forward(
     return std::make_unique<MlxArray>(std::move(down));
 }
 
+// Compiled quantized GeGLU MLP using Python MLX's tanh-approx GELU.
+// Used by: Gemma4
+namespace {
+    static std::function<std::vector<array>(const std::vector<array>&)>
+    get_compiled_qgelu_approx_mlp() {
+        auto fn = [](const std::vector<array>& inputs) -> std::vector<array> {
+            // inputs: x, gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b
+            const auto& x = inputs[0];
+            const auto& gate_w = inputs[1];
+            const auto& gate_s = inputs[2];
+            const auto& gate_b = inputs[3];
+            const auto& up_w = inputs[4];
+            const auto& up_s = inputs[5];
+            const auto& up_b = inputs[6];
+            const auto& down_w = inputs[7];
+            const auto& down_s = inputs[8];
+            const auto& down_b = inputs[9];
+
+            int group_size = 64;
+            int bits = 4;
+            auto gate = mlx::core::quantized_matmul(
+                x, gate_w, gate_s, gate_b, true, group_size, bits);
+            auto up = mlx::core::quantized_matmul(
+                x, up_w, up_s, up_b, true, group_size, bits);
+
+            auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
+
+            auto down = mlx::core::quantized_matmul(
+                activated, down_w, down_s, down_b, true, group_size, bits);
+
+            return {down};
+        };
+        return mlx::core::compile(fn, true);
+    }
+}
+
+std::unique_ptr<MlxArray> compiled_gelu_approx_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray* gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray* up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray* down_biases,
+    int32_t group_size,
+    int32_t bits,
+    rust::Str mode
+) {
+    std::string mode_str(mode.data(), mode.size());
+
+    if (mode_str == "affine" && group_size == 64 && bits == 4
+        && gate_biases && up_biases && down_biases) {
+        static auto compiled_fn = get_compiled_qgelu_approx_mlp();
+
+        auto result = compiled_fn({
+            x.inner,
+            gate_proj.inner, gate_scales.inner, gate_biases->inner,
+            up_proj.inner, up_scales.inner, up_biases->inner,
+            down_proj.inner, down_scales.inner, down_biases->inner
+        });
+
+        return std::make_unique<MlxArray>(std::move(result[0]));
+    }
+
+    std::optional<array> gb_opt = gate_biases ? std::optional(gate_biases->inner) : std::nullopt;
+    std::optional<array> ub_opt = up_biases ? std::optional(up_biases->inner) : std::nullopt;
+    std::optional<array> db_opt = down_biases ? std::optional(down_biases->inner) : std::nullopt;
+
+    auto gate = mlx::core::quantized_matmul(
+        x.inner, gate_proj.inner, gate_scales.inner, gb_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+    auto up = mlx::core::quantized_matmul(
+        x.inner, up_proj.inner, up_scales.inner, ub_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
+
+    auto down = mlx::core::quantized_matmul(
+        activated, down_proj.inner, down_scales.inner, db_opt,
+        true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
+
+    return std::make_unique<MlxArray>(std::move(down));
+}
+
 // Compiled GeGLU SwitchGLU MLP forward: down(gelu(gate_gqm(x)) * up_gqm(x))
 // where gate/up/down each use `mx::core::gather_qmm` for per-expert
 // routing. Mirrors the dense `compiled_qgelu_mlp` pattern but with
@@ -1621,15 +1747,8 @@ namespace {
                 std::nullopt, std::optional<array>(rhs_indices),
                 transpose, group_size, bits, "affine", sorted_indices);
 
-            // GeGLU: gelu(gate) * up  (erf-based GELU matches existing
-            // compiled_geglu_activation so numerics are unchanged).
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto gelu_gate = mlx::core::multiply(gate, scale);
-            auto activated = mlx::core::multiply(gelu_gate, up);
+            // GeGLU: Python mlx-lm uses nn.gelu_approx(gate) * up.
+            auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
 
             auto down = mlx::core::gather_qmm(
                 activated, down_w, down_s, std::optional<array>(down_b),
@@ -1683,9 +1802,9 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         return std::make_unique<MlxArray>(std::move(result[0]));
     }
 
-    // Non-compiled fallback: three separate gather_qmm calls + erf-based
-    // GeGLU. Same math as the compiled path, just without the compile
-    // window (for non-affine quantization modes or missing biases).
+    // Non-compiled fallback: three separate gather_qmm calls + tanh-approx
+    // GeGLU. Same math as the compiled path, just without the compile window
+    // (for non-affine quantization modes or missing biases).
     std::optional<array> gb_opt = gate_b ? std::optional(gate_b->inner) : std::nullopt;
     std::optional<array> ub_opt = up_b ? std::optional(up_b->inner) : std::nullopt;
     std::optional<array> db_opt = down_b ? std::optional(down_b->inner) : std::nullopt;
@@ -1702,13 +1821,7 @@ std::unique_ptr<MlxArray> compiled_switch_qgeglu_forward(
         std::optional<int>(group_size), std::optional<int>(bits),
         mode_str, false);
 
-    auto sqrt2 = array(std::sqrt(2.0f));
-    auto half = array(0.5f);
-    auto one = array(1.0f);
-    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-    auto gelu_gate = mlx::core::multiply(gate, scale);
-    auto activated = mlx::core::multiply(gelu_gate, up);
+    auto activated = mlx::core::multiply(gelu_tanh_approx(gate), up);
 
     auto down = mlx::core::gather_qmm(
         activated, down_w.inner, down_s.inner, db_opt,
@@ -2361,7 +2474,8 @@ std::unique_ptr<MlxArray> quantized_embedding(
         std::optional<int>(group_size),
         std::optional<int>(bits),
         mode_str,
-        std::nullopt  // use default dtype
+        std::nullopt,  // global_scale
+        std::optional<Dtype>(scales.inner.dtype())
     );
 
     // Get hidden dimension from dequantized result
@@ -2407,11 +2521,10 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     ));
 }
 
-// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Collapses
-// the slice/concat/rope/slice/concat chain into one
-// `mx::core::compile` graph so MLX issues a single fused dispatch per
-// layer instead of ~15 independent Metal kernels. Covers the common
-// case `last_dim == head_dim` (Gemma 4 Q/K inputs). Caller must
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Mirrors
+// mlx-lm's full-head `mx.fast.rope(..., freqs=[finite..., inf...])`
+// call inside one `mx::core::compile` graph. Covers the common case
+// `last_dim == head_dim` (Gemma 4 Q/K inputs). Caller must
 // short-circuit `rotated_dims <= 0` and the `last_dim > head_dim`
 // tail case — those stay on the op-at-a-time path.
 //
@@ -2421,80 +2534,31 @@ namespace {
     using CompiledFn =
         std::function<std::vector<array>(const std::vector<array>&)>;
 
-    static CompiledFn& get_compiled_proportional_rope(
-        int head_dim, int rotated_dims
-    ) {
-        static std::mutex mu;
-        static std::unordered_map<int64_t, CompiledFn> cache;
+    static CompiledFn& get_compiled_proportional_rope(int head_dim) {
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked: compiled function destruction calls back into
+        // MLX's process-wide CompilerCache. This map is constructed before
+        // that cache during first compile(), so normal static destruction would
+        // tear it down after MLX and can crash at process exit.
+        static std::unordered_map<int64_t, CompiledFn>& cache =
+            *new std::unordered_map<int64_t, CompiledFn>();
 
-        int64_t key = (static_cast<int64_t>(head_dim) << 32)
-            | static_cast<int64_t>(static_cast<uint32_t>(rotated_dims));
+        int64_t key = static_cast<int64_t>(head_dim);
         std::lock_guard<std::mutex> lock(mu);
         auto it = cache.find(key);
         if (it != cache.end()) {
             return it->second;
         }
 
-        int half = head_dim / 2;
-        int rot_half = rotated_dims / 2;
-
-        auto fn = [head_dim, half, rotated_dims, rot_half]
+        auto fn = [head_dim]
             (const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];       // rank-4 [B, n_heads, L, head_dim]
             const auto& freqs = inputs[1];
             const auto& offset = inputs[2];  // scalar int32 array
 
-            auto shape = x.shape();           // concrete under shapeless=false
-            auto rk = shape.size();
-            Shape start_full(rk, 0);
-            Shape stop_full(shape.begin(), shape.end());
-
-            // left = x[..., :half], right = x[..., half:head_dim]
-            auto stop_half = stop_full;
-            stop_half.back() = half;
-            auto left = mlx::core::slice(x, start_full, stop_half);
-
-            auto start_half = start_full;
-            start_half.back() = half;
-            auto stop_head = stop_full;
-            stop_head.back() = head_dim;
-            auto right = mlx::core::slice(x, start_half, stop_head);
-
-            // rotated = concat(left[..., :rot_half], right[..., :rot_half])
-            auto stop_rot = start_full;
-            stop_rot = stop_full;
-            stop_rot.back() = rot_half;
-            auto left_first = mlx::core::slice(left, start_full, stop_rot);
-            auto right_first = mlx::core::slice(right, start_full, stop_rot);
-            auto rotated = mlx::core::concatenate(
-                {left_first, right_first}, -1);
-
-            auto rotated_out = mlx::core::fast::rope(
-                rotated, rotated_dims, false,
-                std::nullopt, 1.0f, offset, freqs);
-
-            // Split rotated_out back into two halves.
-            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
-            auto start_rot_b = start_full;
-            start_rot_b.back() = rot_half;
-            auto stop_rot_full = stop_full;
-            stop_rot_full.back() = rotated_dims;
-            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
-
-            // Replace first rot_half slots of each half with rot_a/rot_b;
-            // preserve the rest [rot_half:half].
-            auto start_rest = start_full;
-            start_rest.back() = rot_half;
-            auto stop_rest = stop_full;
-            stop_rest.back() = half;
-            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
-            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
-
-            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
-            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
-            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
-
-            return {head_new};
+            auto out = mlx::core::fast::rope(
+                x, head_dim, false, std::nullopt, 1.0f, offset, freqs);
+            return {out};
         };
 
         auto [iter, _] = cache.emplace(
@@ -2512,17 +2576,17 @@ std::unique_ptr<MlxArray> compiled_proportional_rope(
 ) {
     // `offset` flows through as a scalar array so the same compiled
     // graph serves every decode step without recompilation.
+    (void)rotated_dims;
     auto offset_arr = array(offset);
-    auto& compiled_fn = get_compiled_proportional_rope(head_dim, rotated_dims);
+    auto& compiled_fn = get_compiled_proportional_rope(head_dim);
     auto result = compiled_fn({x.inner, freqs.inner, offset_arr});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
 // Compiled Gemma 4 Q-path with proportional RoPE. Folds
-//   reshape → fast_rms_norm → transpose → ProportionalRoPE
+//   reshape → fast_rms_norm → transpose → full-head ProportionalRoPE
 // into a single `mx::core::compile` graph, replacing four
-// cxx-bridge calls (plus ~14 slice/concat ops inside RoPE) with
-// one fused subgraph. Used on Gemma 4 full-attention layers only
+// cxx-bridge calls with one fused subgraph. Used on Gemma 4 full-attention layers only
 // (`rope_type == "proportional"`); sliding-attention layers stay
 // on the op-at-a-time path since their standard `fast_rope` chain
 // is already short.
@@ -2547,17 +2611,19 @@ namespace {
             }
         };
 
-        static std::mutex mu;
-        static std::unordered_map<Key, CompiledFn, KeyHash, KeyEq> cache;
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked: compiled function destruction calls back into
+        // MLX's process-wide CompilerCache. This map is constructed before
+        // that cache during first compile(), so normal static destruction would
+        // tear it down after MLX and can crash at process exit.
+        static std::unordered_map<Key, CompiledFn, KeyHash, KeyEq>& cache =
+            *new std::unordered_map<Key, CompiledFn, KeyHash, KeyEq>();
         std::lock_guard<std::mutex> lock(mu);
         Key key{head_dim, rotated_dims, n_heads, rms_eps};
         auto it = cache.find(key);
         if (it != cache.end()) return it->second;
 
-        int half = head_dim / 2;
-        int rot_half = rotated_dims / 2;
-
-        auto fn = [head_dim, rotated_dims, n_heads, rms_eps, half, rot_half]
+        auto fn = [head_dim, n_heads, rms_eps]
             (const std::vector<array>& inputs) -> std::vector<array> {
             const auto& q_in = inputs[0];      // [B, L, n_heads * head_dim]
             const auto& q_norm_w = inputs[1];  // [head_dim]
@@ -2572,52 +2638,9 @@ namespace {
             q = mlx::core::fast::rms_norm(q, q_norm_w, rms_eps);
             q = mlx::core::transpose(q, {0, 2, 1, 3});
 
-            // Inlined ProportionalRoPE: last_dim == head_dim is
-            // guaranteed by caller.
-            auto qs = q.shape();
-            auto rk = qs.size();
-            Shape start_full(rk, 0);
-            Shape stop_full(qs.begin(), qs.end());
-
-            auto stop_half = stop_full;
-            stop_half.back() = half;
-            auto left = mlx::core::slice(q, start_full, stop_half);
-
-            auto start_half = start_full;
-            start_half.back() = half;
-            auto stop_head = stop_full;
-            stop_head.back() = head_dim;
-            auto right = mlx::core::slice(q, start_half, stop_head);
-
-            auto stop_rot = stop_full;
-            stop_rot.back() = rot_half;
-            auto left_first = mlx::core::slice(left, start_full, stop_rot);
-            auto right_first = mlx::core::slice(right, start_full, stop_rot);
-            auto rotated = mlx::core::concatenate({left_first, right_first}, -1);
-
-            auto rotated_out = mlx::core::fast::rope(
-                rotated, rotated_dims, false,
-                std::nullopt, 1.0f, offset, freqs);
-
-            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
-            auto start_rot_b = start_full;
-            start_rot_b.back() = rot_half;
-            auto stop_rot_full = stop_full;
-            stop_rot_full.back() = rotated_dims;
-            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
-
-            auto start_rest = start_full;
-            start_rest.back() = rot_half;
-            auto stop_rest = stop_full;
-            stop_rest.back() = half;
-            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
-            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
-
-            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
-            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
-            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
-
-            return {head_new};
+            auto out = mlx::core::fast::rope(
+                q, head_dim, false, std::nullopt, 1.0f, offset, freqs);
+            return {out};
         };
 
         auto [iter, _] = cache.emplace(
@@ -2664,8 +2687,11 @@ namespace {
     // compile-time constant. A single Gemma 4 variant uses one eps
     // value, so the cache is expected to hold one entry.
     static CompiledFn& get_compiled_per_layer_input_gate(float eps) {
-        static std::mutex mu;
-        static std::unordered_map<uint32_t, CompiledFn> cache;
+        static std::mutex& mu = *new std::mutex();
+        // Intentionally leaked for the same static-destruction ordering reason
+        // as the proportional RoPE compiled-function caches above.
+        static std::unordered_map<uint32_t, CompiledFn>& cache =
+            *new std::unordered_map<uint32_t, CompiledFn>();
         uint32_t key;
         std::memcpy(&key, &eps, sizeof(float));
         std::lock_guard<std::mutex> lock(mu);
@@ -2693,13 +2719,7 @@ namespace {
             auto gate = mlx::core::quantized_matmul(
                 after_ffn, gate_w, gate_s, gate_b, true, group_size, bits);
 
-            // Erf-based GELU (matches the existing gelu_approx helper).
-            auto sqrt2 = array(std::sqrt(2.0f));
-            auto half = array(0.5f);
-            auto one = array(1.0f);
-            auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-            auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-            auto gelu_gate = mlx::core::multiply(gate, scale);
+            auto gelu_gate = gelu_tanh_approx(gate);
 
             auto gated = mlx::core::multiply(gelu_gate, per_layer);
             auto projected = mlx::core::quantized_matmul(
@@ -2752,12 +2772,7 @@ std::unique_ptr<MlxArray> compiled_per_layer_input_gate(
         after_ffn.inner, gate_w.inner, gate_s.inner, gb,
         true, std::optional<int>(group_size), std::optional<int>(bits), mode_str);
 
-    auto sqrt2 = array(std::sqrt(2.0f));
-    auto half = array(0.5f);
-    auto one = array(1.0f);
-    auto erf_val = mlx::core::erf(mlx::core::divide(gate, sqrt2));
-    auto scale = mlx::core::multiply(half, mlx::core::add(one, erf_val));
-    auto gelu_gate = mlx::core::multiply(gate, scale);
+    auto gelu_gate = gelu_tanh_approx(gate);
     auto gated = mlx::core::multiply(gelu_gate, per_layer_input.inner);
 
     auto projected = mlx::core::quantized_matmul(
@@ -3406,7 +3421,6 @@ namespace {
             // params[0] = group_size, params[1] = bits
             int group_size = 64;  // hardcoded for common case
             int bits = 4;
-
             // gate = quantized_matmul(x, gate_w, gate_s, gate_b)
             auto gate = mlx::core::quantized_matmul(x, gate_w, gate_s, gate_b, true, group_size, bits);
 
@@ -3497,6 +3511,12 @@ void async_eval_all(rust::Slice<const MlxArray* const> arrays) {
         arrs.push_back(a->inner);
     }
     mlx::core::async_eval(arrs);
+}
+
+void detach_all(rust::Slice<const MlxArray* const> arrays) {
+    for (const auto* a : arrays) {
+        const_cast<array&>(a->inner).detach();
+    }
 }
 
 void synchronize_default() {
@@ -3598,6 +3618,16 @@ std::unique_ptr<MlxArray> reshape_token_for_forward(const MlxArray& token) {
 void async_eval_pair(const MlxArray& a, const MlxArray& b) {
     std::vector<array> arrs = {a.inner, b.inner};
     mlx::core::async_eval(arrs);
+}
+
+// Export a pair of unevaluated arrays as a DOT graph for profiling.
+void export_to_dot_pair(rust::Str path, const MlxArray& a, const MlxArray& b) {
+    std::ofstream os(std::string(path.data(), path.size()));
+    if (!os.is_open()) {
+        throw std::runtime_error("failed to open DOT export path");
+    }
+    std::vector<array> arrs = {a.inner, b.inner};
+    mlx::core::export_to_dot(os, arrs);
 }
 
 // Set default stream for subsequent operations

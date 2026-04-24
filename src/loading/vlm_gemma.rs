@@ -302,7 +302,7 @@ fn sanitize_gemma4_audio_weights(weights: &mut mlxcel_core::weights::WeightMap) 
 pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let args: models::gemma4::ModelArgs = parse_vlm_config(&config_str, "Gemma4 config")?;
-    let mut weights = models::load_gemma4_vlm_weights(model_path)
+    let (mut weights, weight_backing) = models::load_gemma4_vlm_weights_with_backing(model_path)
         .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 VLM weights: {}", e))?;
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
@@ -388,6 +388,7 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
             .and_then(|value| value.as_i64())
             .unwrap_or(258_882) as i32,
     );
+    vlm.set_weight_backing(weight_backing);
 
     // Load audio tower if audio_config is present
     if let Some(audio_config_val) = full_config.get("audio_config")

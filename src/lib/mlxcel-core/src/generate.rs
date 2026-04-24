@@ -777,6 +777,7 @@ impl CxxGenerator {
         let trace_dtype = std::env::var("MLXCEL_TRACE_DTYPE").is_ok();
         let force_sync = std::env::var("MLXCEL_FORCE_SYNC").is_ok();
         let profile_pipeline = std::env::var("MLXCEL_PROFILE_PIPELINE").is_ok();
+        let profile_pipeline_detail = std::env::var("MLXCEL_PROFILE_PIPELINE_DETAIL").is_ok();
 
         // Prefill: process all prompt tokens at once.
         // On M5+ hardware pad the sequence to a 32-token tile boundary for
@@ -840,6 +841,10 @@ impl CxxGenerator {
         // 5. Move next to current
         let mut build_ns_total = 0u128;
         let mut wait_ns_total = 0u128;
+        let mut reshape_ns_total = 0u128;
+        let mut forward_ns_total = 0u128;
+        let mut sample_ns_total = 0u128;
+        let mut async_eval_ns_total = 0u128;
         let mut profile_count = 0u32;
 
         let mut n = 0;
@@ -852,18 +857,55 @@ impl CxxGenerator {
             };
 
             let (next_y, next_logprobs) = if n + 1 < max_tokens {
+                let detail_start = if profile_pipeline_detail {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let next_input = ffi::reshape_token_for_forward(&y);
+                if let Some(start) = detail_start {
+                    reshape_ns_total += start.elapsed().as_nanos();
+                }
+                let detail_start = if profile_pipeline_detail {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let next_logits = model.forward(&next_input, &mut self.caches, None);
+                if let Some(start) = detail_start {
+                    forward_ns_total += start.elapsed().as_nanos();
+                }
                 if trace_dtype && n == 0 {
                     ffi::eval(&next_logits);
                     eprintln!("[LOGITS] decode dtype={}", ffi::array_dtype(&next_logits));
                 }
+                let detail_start = if profile_pipeline_detail {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
                 let (next_tok, next_log) =
                     sample_token_optimized(&next_logits, sampling, &token_history);
+                if let Some(start) = detail_start {
+                    sample_ns_total += start.elapsed().as_nanos();
+                }
+                let detail_start = if profile_pipeline_detail {
+                    Some(std::time::Instant::now())
+                } else {
+                    None
+                };
+                if n == 0 {
+                    if let Ok(path) = std::env::var("MLXCEL_EXPORT_DECODE_DOT") {
+                        ffi::export_to_dot_pair(&path, &next_tok, &next_log);
+                    }
+                }
                 if force_sync {
                     ffi::eval(&next_tok);
                 } else {
                     ffi::async_eval_pair(&next_tok, &next_log);
+                }
+                if let Some(start) = detail_start {
+                    async_eval_ns_total += start.elapsed().as_nanos();
                 }
                 (Some(next_tok), Some(next_log))
             } else {
@@ -936,6 +978,17 @@ impl CxxGenerator {
                 wait_avg / 1e6,
                 (build_avg + wait_avg) / 1e6,
                 profile_count,
+            );
+        }
+        if profile_pipeline_detail && profile_count > 3 {
+            let denom = profile_count as f64;
+            eprintln!(
+                "[PIPELINE_DETAIL] reshape={:.3}ms/tok forward={:.3}ms/tok sample={:.3}ms/tok async_eval={:.3}ms/tok item_wait={:.3}ms/tok",
+                reshape_ns_total as f64 / denom / 1e6,
+                forward_ns_total as f64 / denom / 1e6,
+                sample_ns_total as f64 / denom / 1e6,
+                async_eval_ns_total as f64 / denom / 1e6,
+                wait_ns_total as f64 / denom / 1e6,
             );
         }
 

@@ -276,7 +276,7 @@ struct SwitchGeGLU {
 }
 
 impl SwitchGeGLU {
-    fn forward(&self, x: &MlxArray, indices: &MlxArray) -> UniquePtr<MlxArray> {
+    fn forward(&self, x: &MlxArray, indices: &MlxArray, hidden_size: i32) -> UniquePtr<MlxArray> {
         // `MLXCEL_PROFILE_MOE_INNER=1` emits `[MOE] name=... ms=...` per
         // sub-sub-op so the `experts` band in the sub-op profiler can be
         // drilled one level further. Like the outer profilers this forces a
@@ -299,24 +299,22 @@ impl SwitchGeGLU {
         let top_k = indices_shape[1];
         let do_sort = n_tokens * top_k >= 64;
 
-        // Single multi-axis expand_dims matches mlx-lm's
-        // `x.expand_dims((-2, -3))`. Previously two sequential calls here
-        // cost ~0.28 ms/layer on 26B-a4b decode (first call ~0.80 ms, second
-        // ~0.02 ms), versus Python's single 0.54 ms — the extra call forced
-        // an additional FFI boundary + MLX graph node. Folding them into one
-        // call closed the primary per-layer gap identified by
-        // `MLXCEL_PROFILE_MOE_INNER`.
-        let x_exp = mlxcel_core::expand_dims_multi(x, &[-2, -3]);
+        // `Experts::forward` always passes a flattened `[tokens, hidden]`
+        // input here. Python writes this as `expand_dims((-2, -3))`, which
+        // gives `[tokens, 1, 1, hidden]`; a reshape is equivalent for this
+        // rank-2 internal path and avoids an extra shape primitive in the
+        // decode-hot SwitchGeGLU graph.
+        let x_exp = mlxcel_core::reshape(x, &[n_tokens, 1, 1, hidden_size]);
         inner_tick("expand_dims", &x_exp, &mut last);
 
         if do_sort {
             let (sorted_x, sorted_idx, inv_order) = gather_sort(&x_exp, indices);
             inner_tick("gather_sort", &sorted_x, &mut last);
-            let gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
-            inner_tick("gate_proj", &gate, &mut last);
             let up = self.up_proj.forward(&sorted_x, &sorted_idx, true);
             inner_tick("up_proj", &up, &mut last);
-            let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+            let gate = self.gate_proj.forward(&sorted_x, &sorted_idx, true);
+            inner_tick("gate_proj", &gate, &mut last);
+            let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
             inner_tick("geglu", &activated, &mut last);
             let output = self.down_proj.forward(&activated, &sorted_idx, true);
             inner_tick("down_proj", &output, &mut last);
@@ -324,19 +322,19 @@ impl SwitchGeGLU {
             inner_tick("scatter_unsort", &unsorted, &mut last);
             unsorted
         } else {
-            // Fused compile window: if all three switch_linears are
-            // quantized-affine with biases, call `gather_qmm × 3 +
-            // erf-GeGLU + multiply` inside a single `mx::core::compile`
-            // graph so MLX can schedule gate/up in parallel and fuse
-            // the intermediate element-wise ops. The dense shared_mlp
-            // already uses the same pattern via
-            // `compiled_gelu_mlp_forward`.
-            let output = if let (Some(gate_q), Some(up_q), Some(down_q)) = (
-                self.gate_proj.quantized_parts(),
-                self.up_proj.quantized_parts(),
-                self.down_proj.quantized_parts(),
-            ) {
-                unsafe {
+            // Decode defaults to a wider compiled SwitchGeGLU window when the
+            // quantized expert weights match the supported affine 4-bit shape.
+            // The separate gather_qmm path remains available as an opt-out
+            // diagnostic if backend scheduling regresses on a future MLX build.
+            let disable_compiled_switch =
+                std::env::var_os("MLXCEL_DISABLE_COMPILED_SWITCH_QGEGLU").is_some();
+            let output = if !disable_compiled_switch
+                && let (Some(gate_q), Some(up_q), Some(down_q)) = (
+                    self.gate_proj.quantized_parts(),
+                    self.up_proj.quantized_parts(),
+                    self.down_proj.quantized_parts(),
+                ) {
+                let output = unsafe {
                     mlxcel_core::compiled_switch_qgeglu_forward(
                         &x_exp,
                         gate_q.weight,
@@ -353,17 +351,20 @@ impl SwitchGeGLU {
                         gate_q.bits,
                         gate_q.mode,
                     )
-                }
+                };
+                inner_tick("switch_geglu_fused", &output, &mut last);
+                output
             } else {
-                let gate = self.gate_proj.forward(&x_exp, indices, false);
-                inner_tick("gate_proj", &gate, &mut last);
                 let up = self.up_proj.forward(&x_exp, indices, false);
                 inner_tick("up_proj", &up, &mut last);
-                let activated = mlxcel_core::compiled_geglu_activation(&gate, &up);
+                let gate = self.gate_proj.forward(&x_exp, indices, false);
+                inner_tick("gate_proj", &gate, &mut last);
+                let activated = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
                 inner_tick("geglu", &activated, &mut last);
-                self.down_proj.forward(&activated, indices, false)
+                let output = self.down_proj.forward(&activated, indices, false);
+                inner_tick("down_proj", &output, &mut last);
+                output
             };
-            inner_tick("switch_geglu_fused", &output, &mut last);
             let squeezed = mlxcel_core::squeeze_axis(&output, -2);
             inner_tick("squeeze", &squeezed, &mut last);
             squeezed
@@ -422,7 +423,7 @@ impl MLP {
             self.down_proj.quantized_weight(),
         ) {
             return unsafe {
-                mlxcel_core::compiled_gelu_mlp_forward(
+                mlxcel_core::compiled_gelu_approx_mlp_forward(
                     x,
                     &gate_qw.weight,
                     &gate_qw.scales,
@@ -448,8 +449,7 @@ impl MLP {
 
         let gate = self.gate_proj.forward(x);
         let up = self.up_proj.forward(x);
-        let activated = mlxcel_core::gelu_approx(&gate);
-        let hidden = mlxcel_core::multiply(&activated, &up);
+        let hidden = mlxcel_core::compiled_geglu_approx_activation(&gate, &up);
         self.down_proj.forward(&hidden)
     }
 
@@ -502,12 +502,10 @@ impl Router {
         let expert_scores = self.proj.forward(&x);
 
         // Pick top-k before softmax so softmax runs over k=8 values,
-        // not the full num_experts=128. MLX `argpartition` returns
-        // the k-smallest positions, so negate first to find the
-        // k-largest.
-        let neg_scores = mlxcel_core::negative(&expert_scores);
-        let top_k_indices = mlxcel_core::argpartition(&neg_scores, self.top_k_experts - 1, -1);
-        let top_k_indices = slice_axis(&top_k_indices, -1, 0, self.top_k_experts);
+        // not the full num_experts=128. Use the same negative-kth
+        // argpartition shape as mlx-lm to avoid an extra negation graph.
+        let top_k_indices = mlxcel_core::argpartition(&expert_scores, -self.top_k_experts, -1);
+        let top_k_indices = slice_axis(&top_k_indices, -1, -self.top_k_experts, -1);
 
         let top_k_weights = mlxcel_core::take_along_axis(&expert_scores, &top_k_indices, -1);
         let top_k_weights = mlxcel_core::softmax(&top_k_weights, -1);
@@ -564,7 +562,7 @@ impl Experts {
 
         let x_flat = mlxcel_core::reshape(x, &[b * s, h]);
         let indices_flat = mlxcel_core::reshape(top_k_indices, &[b * s, k]);
-        let expert_out = self.switch_geglu.forward(&x_flat, &indices_flat);
+        let expert_out = self.switch_geglu.forward(&x_flat, &indices_flat, h);
 
         let weights = mlxcel_core::reshape(top_k_weights, &[b * s, k, 1]);
         let weighted = mlxcel_core::multiply(&expert_out, &weights);
@@ -675,14 +673,15 @@ pub struct Attention {
     pub(crate) head_dim: i32,
     /// For `rope_type == "default"`, this is `head_dim * partial_rotary_factor`
     /// (the historical mlxcel / pre-bb91e23 mlx-vlm behavior).
-    /// For `rope_type == "proportional"`, this is unused — proportional RoPE
-    /// is driven by the precomputed `proportional_rope_freqs` table below and
-    /// always rotates on the full `head_dim`.
+    /// For `rope_type == "proportional"`, this is unused; proportional RoPE
+    /// is driven by the precomputed full-head `proportional_rope_freqs` table
+    /// below.
     pub(crate) rope_dims: i32,
     pub(crate) rope_theta: f32,
     /// If `Some`, the layer uses proportional RoPE (Gemma 4 full-attention
-    /// layers). Holds the length-`rotated_dims / 2` frequency table consumed
-    /// by `mlxcel_core::rope_proportional::apply_proportional_rope`.
+    /// layers). Holds the length-`head_dim / 2` frequency table consumed by
+    /// `mlxcel_core::rope_proportional::apply_proportional_rope`; entries past
+    /// the rotated prefix are `inf` so MLX's RoPE applies zero phase there.
     pub(crate) proportional_rope_freqs: Option<UniquePtr<MlxArray>>,
     /// Only meaningful when `proportional_rope_freqs.is_some()`. Matches the
     /// `partial_rotary_factor` passed in to
@@ -701,10 +700,9 @@ impl Attention {
     /// Apply the layer's configured RoPE variant.
     ///
     /// * Proportional RoPE (Gemma 4 full-attention layers, `rope_type ==
-    ///   "proportional"`): slice the first `rotated_dims` entries of the
-    ///   head, call `mx.fast.rope` with exponents normalized by the FULL
-    ///   `head_dim`, and splice the rotated slice back. This matches
-    ///   `mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE` numerically.
+    ///   "proportional"`): call `mx.fast.rope` across the full `head_dim`
+    ///   with exponents normalized by the full dimension and an `inf`
+    ///   frequency tail. This matches `mlx_lm.models.rope_utils.ProportionalRoPE`.
     /// * Default RoPE (sliding-attention layers and legacy configs): rotate
     ///   only the first `rope_dims = head_dim * partial_rotary_factor` slots
     ///   with the standard `fast_rope` kernel.
@@ -746,10 +744,9 @@ impl Attention {
         };
 
         // Fast path: full-attention Gemma 4 layers run
-        // `reshape → q_norm → transpose → ProportionalRoPE` inside a
-        // single `mx::core::compile` window. Sliding layers and
-        // layers with non-proportional RoPE stay on the op-at-a-time
-        // chain.
+        // `reshape -> q_norm -> transpose -> full-head ProportionalRoPE`
+        // inside a single `mx::core::compile` window. Sliding layers and
+        // layers with non-proportional RoPE stay on the op-at-a-time chain.
         let queries = if let Some(ref freqs) = self.proportional_rope_freqs {
             let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
                 * self.head_dim as f64
@@ -848,25 +845,27 @@ impl Attention {
         let (raw_keys, raw_values) = match &self.projection {
             AttentionProjection::Fused(proj) => {
                 let (_, k, v) = proj.forward(x);
-                (k, v)
+                (k, Some(v))
             }
             AttentionProjection::Separate { k_proj, v_proj, .. } => {
                 let raw_keys = k_proj.forward(x);
                 let raw_values = if self.use_k_eq_v {
-                    mlxcel_core::copy(&raw_keys)
+                    None
                 } else {
-                    v_proj
-                        .as_ref()
-                        .expect("Gemma4 attention expected v_proj for non-k_eq_v layer")
-                        .forward(x)
+                    Some(
+                        v_proj
+                            .as_ref()
+                            .expect("Gemma4 attention expected v_proj for non-k_eq_v layer")
+                            .forward(x),
+                    )
                 };
                 (raw_keys, raw_values)
             }
         };
 
         // Fast path: on full-attention layers the K branch is the same
-        // `reshape → norm → transpose → ProportionalRoPE` shape as the
-        // Q branch, so it reuses `compiled_q_path_proportional` with
+        // `reshape -> norm -> transpose -> full-head ProportionalRoPE` shape
+        // as the Q branch, so it reuses `compiled_q_path_proportional` with
         // `n_kv_heads` and the k_norm weight.
         let keys = if let Some(ref freqs) = self.proportional_rope_freqs {
             let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
@@ -891,7 +890,11 @@ impl Attention {
             self.apply_rope(&keys, offset)
         };
 
-        let values = mlxcel_core::reshape(&raw_values, &[b, l, self.n_kv_heads, self.head_dim]);
+        let raw_values_ref = raw_values
+            .as_ref()
+            .map(|values| values.as_ref().unwrap())
+            .unwrap_or_else(|| raw_keys.as_ref().unwrap());
+        let values = mlxcel_core::reshape(raw_values_ref, &[b, l, self.n_kv_heads, self.head_dim]);
         let values = self.v_norm.forward(&values);
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
@@ -911,7 +914,8 @@ impl Attention {
         let rope_dims = (head_dim as f32 * rope_params.partial_rotary_factor) as i32;
         // For `rope_type == "proportional"`, precompute the proportional
         // frequency table once per layer. The exponents are normalized by the
-        // FULL head_dim, matching upstream `ProportionalRoPE` semantics.
+        // full head_dim, and the non-rotated tail is filled with `inf`,
+        // matching upstream `ProportionalRoPE` semantics.
         // Other rope_types fall through to the historical partial-dim
         // `fast_rope` path (no precomputed freqs).
         let proportional_rope_freqs = if rope_params.rope_type == "proportional" {
@@ -957,6 +961,10 @@ impl Attention {
             false
         };
 
+        // Gemma 4 matches mlx-lm's separate Q/K/V projection path by default.
+        // A concatenated QKV projection reduces QuantizedMatmul count, but on
+        // 26B/31B decode it adds slice-heavy graphs and measures slower.
+        let enable_fused_qkv = std::env::var_os("MLXCEL_GEMMA4_ENABLE_FUSED_QKV").is_some();
         let projection = if use_k_eq_v {
             AttentionProjection::Separate {
                 q_proj: UnifiedLinear::from_weights(
@@ -973,7 +981,7 @@ impl Attention {
                 )?,
                 v_proj: None,
             }
-        } else {
+        } else if enable_fused_qkv {
             AttentionProjection::Fused(FusedQKVLinear::from_weights_separate(
                 weights,
                 prefix,
@@ -983,6 +991,27 @@ impl Attention {
                 n_kv_heads,
                 head_dim,
             )?)
+        } else {
+            AttentionProjection::Separate {
+                q_proj: UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.q_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?,
+                k_proj: UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.k_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?,
+                v_proj: Some(UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.v_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?),
+            }
         };
 
         Ok(Self {
@@ -1232,9 +1261,9 @@ impl DecoderLayer {
                     }
                 } else {
                     let gate = gate_proj.forward(&after_ffn);
-                    let gate = mlxcel_core::gelu_approx(&gate);
-                    let gate = mlxcel_core::multiply(&gate, per_layer_input);
-                    let gate = proj.forward(&gate);
+                    let gated =
+                        mlxcel_core::compiled_geglu_approx_activation(&gate, per_layer_input);
+                    let gate = proj.forward(&gated);
                     let gate = post_norm.forward(&gate);
                     mlxcel_core::add(&after_ffn, &gate)
                 };
@@ -1463,6 +1492,7 @@ impl Gemma4TextModel {
         // `[SUBOP] layer=xx name=.. ms=..` line per sub-step inside the
         // layer (input_ln, self_attn, post_ln, MoE router/experts, etc.).
         let profile_per_layer = std::env::var("MLXCEL_PROFILE_PER_LAYER").is_ok();
+        let profile_layer_build = std::env::var("MLXCEL_PROFILE_LAYER_BUILD").is_ok();
         let profile_subops = std::env::var("MLXCEL_PROFILE_LAYER_SUBOPS").is_ok();
 
         for (i, layer) in self.layers.iter().enumerate() {
@@ -1499,6 +1529,11 @@ impl Gemma4TextModel {
             } else {
                 None
             };
+            let layer_build_start = if profile_layer_build {
+                Some(std::time::Instant::now())
+            } else {
+                None
+            };
             let (next_h, stored_kv) = layer.forward_with_profile(
                 &h,
                 local_mask,
@@ -1509,6 +1544,15 @@ impl Gemma4TextModel {
                 profile_subops,
             );
             h = next_h;
+            if let Some(start) = layer_build_start {
+                eprintln!(
+                    "[LAYER_BUILD {:02}] type={} seq_len={} ms={:.3}",
+                    i,
+                    layer.layer_type,
+                    l,
+                    start.elapsed().as_secs_f64() * 1000.0
+                );
+            }
             if let Some(start) = layer_start {
                 mlxcel_core::eval(&h);
                 eprintln!(

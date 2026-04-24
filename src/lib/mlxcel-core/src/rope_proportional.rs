@@ -14,19 +14,17 @@
 
 //! Proportional RoPE helper for Gemma 4 full-attention layers.
 //!
-//! The Gemma 4 reference (`mlx_vlm/models/gemma4/rope_utils.py`) defines a
+//! The Gemma 4 reference (`mlx_lm/models/rope_utils.py`) defines a
 //! `ProportionalRoPE` variant whose frequency exponents are normalized by the
 //! FULL head dimension (`dims`) rather than the rotated-only slice
 //! (`rotated_dims = int(dims * partial_rotary_factor // 2) * 2`). Only the
 //! first `rotated_dims / 2` HF-style pairs actually rotate; the remaining
 //! entries pass through unchanged.
 //!
-//! This module mirrors upstream's slice / concat / `mx.fast.rope` / re-splice
-//! layout. The zero-padded `freqs` shortcut (fill the tail of `freqs` with
-//! zeros and pass the full `head_dim` to `fast_rope_with_freqs`) is **NOT**
-//! equivalent, because MLX's `fast::rope` computes `inv_freqs = 1 / freqs`
-//! internally — a zero entry would therefore produce `inf` angles and `NaN`
-//! output. We must operate on the truly-rotated slice.
+//! This module mirrors upstream's full-head `mx.fast.rope` call by padding the
+//! custom frequency table with `inf` entries for the non-rotated tail. MLX's
+//! `fast::rope` computes `inv_freqs = 1 / freqs` internally, so those tail
+//! entries become zero phase and pass through unchanged.
 //!
 //! Used by: Gemma4
 
@@ -37,8 +35,9 @@ use crate::{
 
 /// Compute the frequency table for proportional RoPE.
 ///
-/// Returns a length-`rotated_dims / 2` tensor where
-/// `freqs[i] = factor * base^(2 * i / head_dim)`.
+/// Returns a length-`head_dim / 2` tensor where
+/// `freqs[i] = factor * base^(2 * i / head_dim)` for the rotated prefix and
+/// `inf` for the non-rotated tail.
 ///
 /// Note the denominator is the FULL `head_dim`, not `rotated_dims` — this is
 /// the defining feature of "proportional" RoPE.
@@ -81,22 +80,24 @@ pub fn compute_proportional_rope_freqs(
         return None;
     }
 
-    let mut freqs = Vec::with_capacity(rope_angles as usize);
+    let half = head_dim / 2;
+    let mut freqs = Vec::with_capacity(half as usize);
     for i in 0..rope_angles {
         // exponent = (2 * i) / head_dim — denominator is FULL head_dim,
         // matching upstream's `arange(0, rotated_dims, 2) / dims` expression.
         let exponent = (2 * i) as f32 / head_dim as f32;
         freqs.push(factor * base.powf(exponent));
     }
-    Some(from_slice_f32(&freqs, &[rope_angles]))
+    freqs.resize(half as usize, f32::INFINITY);
+    Some(from_slice_f32(&freqs, &[half]))
 }
 
 /// Apply proportional RoPE to `x` along the last dimension.
 ///
 /// The last dimension of `x` must equal `head_dim`. Only the first
 /// `rotated_dims` entries are rotated — the remainder passes through
-/// unchanged — mirroring the upstream Python reference
-/// (`mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE.__call__`).
+/// unchanged via the `inf` frequency tail — mirroring the upstream Python
+/// reference (`mlx_lm.models.rope_utils.ProportionalRoPE.__call__`).
 ///
 /// `freqs` must have been produced by [`compute_proportional_rope_freqs`]
 /// with the same `head_dim` and `partial_rotary_factor`. `None` means no
@@ -128,12 +129,9 @@ pub fn apply_proportional_rope(
         "apply_proportional_rope: last dim ({last_dim}) must be >= head_dim ({head_dim})"
     );
 
-    // Fast path: when `last_dim == head_dim` (the standard Gemma 4
-    // Q/K shape) fold the slice/concat/rope/slice/concat chain into
-    // a single `mx::core::compile` graph. Reduces the GPU interval
-    // count by ~35 % vs the op-at-a-time path, measured via
-    // `xctrace --template "Metal System Trace"` on a matched 10 s
-    // decode window.
+    // Fast path: when `last_dim == head_dim` (the standard Gemma 4 Q/K shape)
+    // use the same full-head RoPE call as mlx-lm. The `inf` tail in `freqs`
+    // produces zero phase for non-rotated pairs.
     if last_dim == head_dim {
         return compiled_proportional_rope(x, freqs, head_dim, rotated_dims, offset);
     }
@@ -211,7 +209,7 @@ mod tests {
     #[test]
     fn proportional_rope_freqs_match_python_formula() {
         // Gemma 4 full-attention layer: head_dim=256, partial_rotary_factor=0.25,
-        // rope_theta=1_000_000 → rope_angles = 32.
+        // rope_theta=1_000_000 -> rope_angles = 32, followed by an `inf` tail.
         let head_dim = 256_i32;
         let prf = 0.25_f32;
         let base = 1_000_000.0_f32;
@@ -222,8 +220,8 @@ mod tests {
 
         assert_eq!(
             array_shape(&freqs),
-            vec![32],
-            "freqs length must equal rope_angles (32 for head_dim=256, prf=0.25)"
+            vec![128],
+            "freqs length must equal head_dim / 2"
         );
 
         let freqs_f32 = astype(&freqs, dtype::FLOAT32);
@@ -233,15 +231,21 @@ mod tests {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        assert_eq!(values.len(), 32);
+        assert_eq!(values.len(), 128);
 
-        for (i, &got) in values.iter().enumerate() {
+        for (i, &got) in values.iter().take(32).enumerate() {
             // Expected: base^(2*i / head_dim)
             let expected = base.powf((2 * i) as f32 / head_dim as f32);
             let rel = (got - expected).abs() / expected.max(1.0);
             assert!(
                 rel < 1e-4,
                 "freqs[{i}] expected {expected}, got {got} (rel {rel})"
+            );
+        }
+        for (i, &got) in values.iter().enumerate().skip(32) {
+            assert!(
+                got.is_infinite() && got.is_sign_positive(),
+                "freqs[{i}] must be +inf"
             );
         }
     }
