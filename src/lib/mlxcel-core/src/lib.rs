@@ -1492,6 +1492,9 @@ mod ffi {
         /// Async eval two arrays at once (for lookahead pipelining)
         fn async_eval_pair(a: &MlxArray, b: &MlxArray);
 
+        /// Export two unevaluated arrays as a DOT graph for profiling.
+        fn export_to_dot_pair(path: &str, a: &MlxArray, b: &MlxArray);
+
         /// Set default stream for subsequent operations
         fn set_default_stream(stream: &MlxStream);
 

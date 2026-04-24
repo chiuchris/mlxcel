@@ -992,6 +992,9 @@ std::unique_ptr<MlxArray> reshape_token_for_forward(const MlxArray& token);
 // Async eval two arrays at once (for lookahead pipelining)
 void async_eval_pair(const MlxArray& a, const MlxArray& b);
 
+// Export a pair of unevaluated arrays as a DOT graph for profiling.
+void export_to_dot_pair(rust::Str path, const MlxArray& a, const MlxArray& b);
+
 // Set default stream for subsequent operations
 void set_default_stream(const MlxStream& stream);
 

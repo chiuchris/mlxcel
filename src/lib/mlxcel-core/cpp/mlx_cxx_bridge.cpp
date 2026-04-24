@@ -8,6 +8,7 @@
 #include "mlx/memory.h"
 #include "mlx/linalg.h"
 #include "mlx/fft.h"
+#include "mlx/graph_utils.h"
 #include "mlx/random.h"
 #include "mlx/einsum.h"
 #include "mlx/utils.h"
@@ -16,6 +17,7 @@
 #endif
 #include <cstring>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -3616,6 +3618,16 @@ std::unique_ptr<MlxArray> reshape_token_for_forward(const MlxArray& token) {
 void async_eval_pair(const MlxArray& a, const MlxArray& b) {
     std::vector<array> arrs = {a.inner, b.inner};
     mlx::core::async_eval(arrs);
+}
+
+// Export a pair of unevaluated arrays as a DOT graph for profiling.
+void export_to_dot_pair(rust::Str path, const MlxArray& a, const MlxArray& b) {
+    std::ofstream os(std::string(path.data(), path.size()));
+    if (!os.is_open()) {
+        throw std::runtime_error("failed to open DOT export path");
+    }
+    std::vector<array> arrs = {a.inner, b.inner};
+    mlx::core::export_to_dot(os, arrs);
 }
 
 // Set default stream for subsequent operations

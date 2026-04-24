@@ -958,6 +958,10 @@ impl Attention {
             false
         };
 
+        // Gemma 4 matches mlx-lm's separate Q/K/V projection path by default.
+        // A concatenated QKV projection reduces QuantizedMatmul count, but on
+        // 26B/31B decode it adds slice-heavy graphs and measures slower.
+        let enable_fused_qkv = std::env::var_os("MLXCEL_GEMMA4_ENABLE_FUSED_QKV").is_some();
         let projection = if use_k_eq_v {
             AttentionProjection::Separate {
                 q_proj: UnifiedLinear::from_weights(
@@ -974,7 +978,7 @@ impl Attention {
                 )?,
                 v_proj: None,
             }
-        } else {
+        } else if enable_fused_qkv {
             AttentionProjection::Fused(FusedQKVLinear::from_weights_separate(
                 weights,
                 prefix,
@@ -984,6 +988,27 @@ impl Attention {
                 n_kv_heads,
                 head_dim,
             )?)
+        } else {
+            AttentionProjection::Separate {
+                q_proj: UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.q_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?,
+                k_proj: UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.k_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?,
+                v_proj: Some(UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.v_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?),
+            }
         };
 
         Ok(Self {

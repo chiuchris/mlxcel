@@ -894,6 +894,11 @@ impl CxxGenerator {
                 } else {
                     None
                 };
+                if n == 0 {
+                    if let Ok(path) = std::env::var("MLXCEL_EXPORT_DECODE_DOT") {
+                        ffi::export_to_dot_pair(&path, &next_tok, &next_log);
+                    }
+                }
                 if force_sync {
                     ffi::eval(&next_tok);
                 } else {
