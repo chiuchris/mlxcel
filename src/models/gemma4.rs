@@ -503,12 +503,10 @@ impl Router {
         let expert_scores = self.proj.forward(&x);
 
         // Pick top-k before softmax so softmax runs over k=8 values,
-        // not the full num_experts=128. MLX `argpartition` returns
-        // the k-smallest positions, so negate first to find the
-        // k-largest.
-        let neg_scores = mlxcel_core::negative(&expert_scores);
-        let top_k_indices = mlxcel_core::argpartition(&neg_scores, self.top_k_experts - 1, -1);
-        let top_k_indices = slice_axis(&top_k_indices, -1, 0, self.top_k_experts);
+        // not the full num_experts=128. Use the same negative-kth
+        // argpartition shape as mlx-lm to avoid an extra negation graph.
+        let top_k_indices = mlxcel_core::argpartition(&expert_scores, -self.top_k_experts, -1);
+        let top_k_indices = slice_axis(&top_k_indices, -1, -self.top_k_experts, -1);
 
         let top_k_weights = mlxcel_core::take_along_axis(&expert_scores, &top_k_indices, -1);
         let top_k_weights = mlxcel_core::softmax(&top_k_weights, -1);
