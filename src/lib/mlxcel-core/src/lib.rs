@@ -2087,16 +2087,16 @@ pub fn causal_attention(
     let q_len = ffi::array_shape(q)[2];
     let k_len = ffi::array_shape(k)[2];
 
-    if softcap > 0.0 || window_size > 0 {
-        // Decode single-query fast path:
-        // - Causal masking is unnecessary when q_len == 1 (no future positions).
-        // - Sliding-window masking is only needed if cached KV exceeds window.
-        // This avoids per-token mask materialization for common decode cases.
-        let needs_window_mask = window_size > 0 && k_len > window_size;
-        if q_len == 1 && !needs_window_mask && use_single_query_maskless_path() {
-            return layers::attention(q, k, v, scale, None, softcap, window_size);
-        }
+    // Decode single-query fast path:
+    // - Causal masking is unnecessary when q_len == 1 (no future positions).
+    // - Sliding-window masking is only needed if cached KV exceeds window.
+    // This avoids per-token mask materialization for common decode cases.
+    let needs_window_mask = window_size > 0 && k_len > window_size;
+    if q_len == 1 && !needs_window_mask && use_single_query_maskless_path() {
+        return layers::attention(q, k, v, scale, None, softcap, window_size);
+    }
 
+    if softcap > 0.0 || window_size > 0 {
         let offset = (k_len - q_len).max(0);
         let mask = if softcap == 0.0 && use_bool_causal_mask_path() {
             if window_size > 0 {

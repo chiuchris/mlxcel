@@ -2484,6 +2484,38 @@ mod tests {
     }
 
     #[test]
+    fn causal_attention_single_query_matches_explicit_mask() {
+        let q = crate::from_slice_f32(&[0.1, -0.2, 0.3, -0.1], &[1, 1, 1, 4]);
+        let k = crate::from_slice_f32(
+            &[
+                0.2, 0.0, -0.1, 0.3, 0.1, -0.2, 0.2, 0.0, -0.3, 0.2, 0.1, -0.2, 0.4, -0.1, 0.0, 0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let v = crate::from_slice_f32(
+            &[
+                0.5, 0.1, -0.3, 0.2, -0.2, 0.4, 0.3, -0.1, 0.1, -0.5, 0.2, 0.6, -0.4, 0.2, 0.1,
+                -0.2,
+            ],
+            &[1, 1, 4, 4],
+        );
+        let scale = 0.5_f32;
+
+        let out_fast = crate::causal_attention(&q, &k, &v, scale, 0.0, 0);
+        let mask = crate::utils::create_causal_mask(1, 3);
+        let out_masked = attention(&q, &k, &v, scale, Some(mask.as_ref().unwrap()), 0.0, 0);
+
+        let diff = crate::subtract(out_fast.as_ref().unwrap(), out_masked.as_ref().unwrap());
+        let diff_abs = crate::abs(&diff);
+        let diff_sum = crate::sum_all(&diff_abs);
+        crate::eval(&diff_sum);
+        assert!(
+            crate::item_f32(&diff_sum) < 1e-5,
+            "single-query causal fast path should match explicit mask path"
+        );
+    }
+
+    #[test]
     fn causal_attention_single_query_softcap_matches_explicit_mask() {
         let q = crate::from_slice_f32(&[0.1, -0.2, 0.3, -0.1], &[1, 1, 1, 4]);
         let k = crate::from_slice_f32(

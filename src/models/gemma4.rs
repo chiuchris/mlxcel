@@ -846,17 +846,19 @@ impl Attention {
         let (raw_keys, raw_values) = match &self.projection {
             AttentionProjection::Fused(proj) => {
                 let (_, k, v) = proj.forward(x);
-                (k, v)
+                (k, Some(v))
             }
             AttentionProjection::Separate { k_proj, v_proj, .. } => {
                 let raw_keys = k_proj.forward(x);
                 let raw_values = if self.use_k_eq_v {
-                    mlxcel_core::copy(&raw_keys)
+                    None
                 } else {
-                    v_proj
-                        .as_ref()
-                        .expect("Gemma4 attention expected v_proj for non-k_eq_v layer")
-                        .forward(x)
+                    Some(
+                        v_proj
+                            .as_ref()
+                            .expect("Gemma4 attention expected v_proj for non-k_eq_v layer")
+                            .forward(x),
+                    )
                 };
                 (raw_keys, raw_values)
             }
@@ -889,7 +891,11 @@ impl Attention {
             self.apply_rope(&keys, offset)
         };
 
-        let values = mlxcel_core::reshape(&raw_values, &[b, l, self.n_kv_heads, self.head_dim]);
+        let raw_values_ref = raw_values
+            .as_ref()
+            .map(|values| values.as_ref().unwrap())
+            .unwrap_or_else(|| raw_keys.as_ref().unwrap());
+        let values = mlxcel_core::reshape(raw_values_ref, &[b, l, self.n_kv_heads, self.head_dim]);
         let values = self.v_norm.forward(&values);
         let values = mlxcel_core::transpose_axes(&values, &[0, 2, 1, 3]);
 
