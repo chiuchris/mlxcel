@@ -985,14 +985,12 @@ mod ffi {
             freqs: &MlxArray,
         ) -> UniquePtr<MlxArray>;
 
-        /// Compiled ProportionalRoPE: collapses the
-        /// slice/concat/rope/slice/concat chain used by Gemma 4
-        /// full-attention layers into one `mx::core::compile` graph.
-        /// Only valid when `rotated_dims > 0` and the input's last
-        /// dim equals `head_dim`; callers must short-circuit the
-        /// trivial / tail cases. Offset flows through as a scalar
-        /// array inside the compile so per-step recompilation is
-        /// avoided.
+        /// Compiled ProportionalRoPE: mirrors mlx-lm's full-head RoPE call
+        /// with an `inf` frequency tail inside one `mx::core::compile`
+        /// graph. Only valid when `rotated_dims > 0` and the input's last
+        /// dim equals `head_dim`; callers must short-circuit the trivial /
+        /// tail cases. Offset flows through as a scalar array inside the
+        /// compile so per-step recompilation is avoided.
         fn compiled_proportional_rope(
             x: &MlxArray,
             freqs: &MlxArray,
@@ -1002,10 +1000,10 @@ mod ffi {
         ) -> UniquePtr<MlxArray>;
 
         /// Compiled Gemma 4 Q-path with proportional RoPE:
-        /// `reshape → fast::rms_norm → transpose → ProportionalRoPE`
+        /// `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
         /// folded into one compile window. `q_proj_out` is shaped
-        /// `[B, L, n_heads * head_dim]` (output of `q_proj`).
-        /// Applies only to Gemma 4 full-attention layers.
+        /// `[B, L, n_heads * head_dim]` (output of `q_proj`). Applies only to
+        /// Gemma 4 full-attention layers.
         fn compiled_q_path_proportional(
             q_proj_out: &MlxArray,
             q_norm_weight: &MlxArray,

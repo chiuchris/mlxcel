@@ -2519,11 +2519,10 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     ));
 }
 
-// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Collapses
-// the slice/concat/rope/slice/concat chain into one
-// `mx::core::compile` graph so MLX issues a single fused dispatch per
-// layer instead of ~15 independent Metal kernels. Covers the common
-// case `last_dim == head_dim` (Gemma 4 Q/K inputs). Caller must
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Mirrors
+// mlx-lm's full-head `mx.fast.rope(..., freqs=[finite..., inf...])`
+// call inside one `mx::core::compile` graph. Covers the common case
+// `last_dim == head_dim` (Gemma 4 Q/K inputs). Caller must
 // short-circuit `rotated_dims <= 0` and the `last_dim > head_dim`
 // tail case — those stay on the op-at-a-time path.
 //
@@ -2533,9 +2532,7 @@ namespace {
     using CompiledFn =
         std::function<std::vector<array>(const std::vector<array>&)>;
 
-    static CompiledFn& get_compiled_proportional_rope(
-        int head_dim, int rotated_dims
-    ) {
+    static CompiledFn& get_compiled_proportional_rope(int head_dim) {
         static std::mutex& mu = *new std::mutex();
         // Intentionally leaked: compiled function destruction calls back into
         // MLX's process-wide CompilerCache. This map is constructed before
@@ -2544,74 +2541,22 @@ namespace {
         static std::unordered_map<int64_t, CompiledFn>& cache =
             *new std::unordered_map<int64_t, CompiledFn>();
 
-        int64_t key = (static_cast<int64_t>(head_dim) << 32)
-            | static_cast<int64_t>(static_cast<uint32_t>(rotated_dims));
+        int64_t key = static_cast<int64_t>(head_dim);
         std::lock_guard<std::mutex> lock(mu);
         auto it = cache.find(key);
         if (it != cache.end()) {
             return it->second;
         }
 
-        int half = head_dim / 2;
-        int rot_half = rotated_dims / 2;
-
-        auto fn = [head_dim, half, rotated_dims, rot_half]
+        auto fn = [head_dim]
             (const std::vector<array>& inputs) -> std::vector<array> {
             const auto& x = inputs[0];       // rank-4 [B, n_heads, L, head_dim]
             const auto& freqs = inputs[1];
             const auto& offset = inputs[2];  // scalar int32 array
 
-            auto shape = x.shape();           // concrete under shapeless=false
-            auto rk = shape.size();
-            Shape start_full(rk, 0);
-            Shape stop_full(shape.begin(), shape.end());
-
-            // left = x[..., :half], right = x[..., half:head_dim]
-            auto stop_half = stop_full;
-            stop_half.back() = half;
-            auto left = mlx::core::slice(x, start_full, stop_half);
-
-            auto start_half = start_full;
-            start_half.back() = half;
-            auto stop_head = stop_full;
-            stop_head.back() = head_dim;
-            auto right = mlx::core::slice(x, start_half, stop_head);
-
-            // rotated = concat(left[..., :rot_half], right[..., :rot_half])
-            auto stop_rot = start_full;
-            stop_rot = stop_full;
-            stop_rot.back() = rot_half;
-            auto left_first = mlx::core::slice(left, start_full, stop_rot);
-            auto right_first = mlx::core::slice(right, start_full, stop_rot);
-            auto rotated = mlx::core::concatenate(
-                {left_first, right_first}, -1);
-
-            auto rotated_out = mlx::core::fast::rope(
-                rotated, rotated_dims, false,
-                std::nullopt, 1.0f, offset, freqs);
-
-            // Split rotated_out back into two halves.
-            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
-            auto start_rot_b = start_full;
-            start_rot_b.back() = rot_half;
-            auto stop_rot_full = stop_full;
-            stop_rot_full.back() = rotated_dims;
-            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
-
-            // Replace first rot_half slots of each half with rot_a/rot_b;
-            // preserve the rest [rot_half:half].
-            auto start_rest = start_full;
-            start_rest.back() = rot_half;
-            auto stop_rest = stop_full;
-            stop_rest.back() = half;
-            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
-            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
-
-            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
-            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
-            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
-
-            return {head_new};
+            auto out = mlx::core::fast::rope(
+                x, head_dim, false, std::nullopt, 1.0f, offset, freqs);
+            return {out};
         };
 
         auto [iter, _] = cache.emplace(
@@ -2629,17 +2574,17 @@ std::unique_ptr<MlxArray> compiled_proportional_rope(
 ) {
     // `offset` flows through as a scalar array so the same compiled
     // graph serves every decode step without recompilation.
+    (void)rotated_dims;
     auto offset_arr = array(offset);
-    auto& compiled_fn = get_compiled_proportional_rope(head_dim, rotated_dims);
+    auto& compiled_fn = get_compiled_proportional_rope(head_dim);
     auto result = compiled_fn({x.inner, freqs.inner, offset_arr});
     return std::make_unique<MlxArray>(std::move(result[0]));
 }
 
 // Compiled Gemma 4 Q-path with proportional RoPE. Folds
-//   reshape → fast_rms_norm → transpose → ProportionalRoPE
+//   reshape → fast_rms_norm → transpose → full-head ProportionalRoPE
 // into a single `mx::core::compile` graph, replacing four
-// cxx-bridge calls (plus ~14 slice/concat ops inside RoPE) with
-// one fused subgraph. Used on Gemma 4 full-attention layers only
+// cxx-bridge calls with one fused subgraph. Used on Gemma 4 full-attention layers only
 // (`rope_type == "proportional"`); sliding-attention layers stay
 // on the op-at-a-time path since their standard `fast_rope` chain
 // is already short.
@@ -2676,10 +2621,7 @@ namespace {
         auto it = cache.find(key);
         if (it != cache.end()) return it->second;
 
-        int half = head_dim / 2;
-        int rot_half = rotated_dims / 2;
-
-        auto fn = [head_dim, rotated_dims, n_heads, rms_eps, half, rot_half]
+        auto fn = [head_dim, n_heads, rms_eps]
             (const std::vector<array>& inputs) -> std::vector<array> {
             const auto& q_in = inputs[0];      // [B, L, n_heads * head_dim]
             const auto& q_norm_w = inputs[1];  // [head_dim]
@@ -2694,52 +2636,9 @@ namespace {
             q = mlx::core::fast::rms_norm(q, q_norm_w, rms_eps);
             q = mlx::core::transpose(q, {0, 2, 1, 3});
 
-            // Inlined ProportionalRoPE: last_dim == head_dim is
-            // guaranteed by caller.
-            auto qs = q.shape();
-            auto rk = qs.size();
-            Shape start_full(rk, 0);
-            Shape stop_full(qs.begin(), qs.end());
-
-            auto stop_half = stop_full;
-            stop_half.back() = half;
-            auto left = mlx::core::slice(q, start_full, stop_half);
-
-            auto start_half = start_full;
-            start_half.back() = half;
-            auto stop_head = stop_full;
-            stop_head.back() = head_dim;
-            auto right = mlx::core::slice(q, start_half, stop_head);
-
-            auto stop_rot = stop_full;
-            stop_rot.back() = rot_half;
-            auto left_first = mlx::core::slice(left, start_full, stop_rot);
-            auto right_first = mlx::core::slice(right, start_full, stop_rot);
-            auto rotated = mlx::core::concatenate({left_first, right_first}, -1);
-
-            auto rotated_out = mlx::core::fast::rope(
-                rotated, rotated_dims, false,
-                std::nullopt, 1.0f, offset, freqs);
-
-            auto rot_a = mlx::core::slice(rotated_out, start_full, stop_rot);
-            auto start_rot_b = start_full;
-            start_rot_b.back() = rot_half;
-            auto stop_rot_full = stop_full;
-            stop_rot_full.back() = rotated_dims;
-            auto rot_b = mlx::core::slice(rotated_out, start_rot_b, stop_rot_full);
-
-            auto start_rest = start_full;
-            start_rest.back() = rot_half;
-            auto stop_rest = stop_full;
-            stop_rest.back() = half;
-            auto left_rest = mlx::core::slice(left, start_rest, stop_rest);
-            auto right_rest = mlx::core::slice(right, start_rest, stop_rest);
-
-            auto left_new = mlx::core::concatenate({rot_a, left_rest}, -1);
-            auto right_new = mlx::core::concatenate({rot_b, right_rest}, -1);
-            auto head_new = mlx::core::concatenate({left_new, right_new}, -1);
-
-            return {head_new};
+            auto out = mlx::core::fast::rope(
+                q, head_dim, false, std::nullopt, 1.0f, offset, freqs);
+            return {out};
         };
 
         auto [iter, _] = cache.emplace(

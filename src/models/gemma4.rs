@@ -676,14 +676,15 @@ pub struct Attention {
     pub(crate) head_dim: i32,
     /// For `rope_type == "default"`, this is `head_dim * partial_rotary_factor`
     /// (the historical mlxcel / pre-bb91e23 mlx-vlm behavior).
-    /// For `rope_type == "proportional"`, this is unused — proportional RoPE
-    /// is driven by the precomputed `proportional_rope_freqs` table below and
-    /// always rotates on the full `head_dim`.
+    /// For `rope_type == "proportional"`, this is unused; proportional RoPE
+    /// is driven by the precomputed full-head `proportional_rope_freqs` table
+    /// below.
     pub(crate) rope_dims: i32,
     pub(crate) rope_theta: f32,
     /// If `Some`, the layer uses proportional RoPE (Gemma 4 full-attention
-    /// layers). Holds the length-`rotated_dims / 2` frequency table consumed
-    /// by `mlxcel_core::rope_proportional::apply_proportional_rope`.
+    /// layers). Holds the length-`head_dim / 2` frequency table consumed by
+    /// `mlxcel_core::rope_proportional::apply_proportional_rope`; entries past
+    /// the rotated prefix are `inf` so MLX's RoPE applies zero phase there.
     pub(crate) proportional_rope_freqs: Option<UniquePtr<MlxArray>>,
     /// Only meaningful when `proportional_rope_freqs.is_some()`. Matches the
     /// `partial_rotary_factor` passed in to
@@ -702,10 +703,9 @@ impl Attention {
     /// Apply the layer's configured RoPE variant.
     ///
     /// * Proportional RoPE (Gemma 4 full-attention layers, `rope_type ==
-    ///   "proportional"`): slice the first `rotated_dims` entries of the
-    ///   head, call `mx.fast.rope` with exponents normalized by the FULL
-    ///   `head_dim`, and splice the rotated slice back. This matches
-    ///   `mlx_vlm.models.gemma4.rope_utils.ProportionalRoPE` numerically.
+    ///   "proportional"`): call `mx.fast.rope` across the full `head_dim`
+    ///   with exponents normalized by the full dimension and an `inf`
+    ///   frequency tail. This matches `mlx_lm.models.rope_utils.ProportionalRoPE`.
     /// * Default RoPE (sliding-attention layers and legacy configs): rotate
     ///   only the first `rope_dims = head_dim * partial_rotary_factor` slots
     ///   with the standard `fast_rope` kernel.
@@ -747,10 +747,9 @@ impl Attention {
         };
 
         // Fast path: full-attention Gemma 4 layers run
-        // `reshape → q_norm → transpose → ProportionalRoPE` inside a
-        // single `mx::core::compile` window. Sliding layers and
-        // layers with non-proportional RoPE stay on the op-at-a-time
-        // chain.
+        // `reshape -> q_norm -> transpose -> full-head ProportionalRoPE`
+        // inside a single `mx::core::compile` window. Sliding layers and
+        // layers with non-proportional RoPE stay on the op-at-a-time chain.
         let queries = if let Some(ref freqs) = self.proportional_rope_freqs {
             let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
                 * self.head_dim as f64
@@ -866,8 +865,8 @@ impl Attention {
         };
 
         // Fast path: on full-attention layers the K branch is the same
-        // `reshape → norm → transpose → ProportionalRoPE` shape as the
-        // Q branch, so it reuses `compiled_q_path_proportional` with
+        // `reshape -> norm -> transpose -> full-head ProportionalRoPE` shape
+        // as the Q branch, so it reuses `compiled_q_path_proportional` with
         // `n_kv_heads` and the k_norm weight.
         let keys = if let Some(ref freqs) = self.proportional_rope_freqs {
             let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
@@ -912,7 +911,8 @@ impl Attention {
         let rope_dims = (head_dim as f32 * rope_params.partial_rotary_factor) as i32;
         // For `rope_type == "proportional"`, precompute the proportional
         // frequency table once per layer. The exponents are normalized by the
-        // FULL head_dim, matching upstream `ProportionalRoPE` semantics.
+        // full head_dim, and the non-rotated tail is filled with `inf`,
+        // matching upstream `ProportionalRoPE` semantics.
         // Other rope_types fall through to the historical partial-dim
         // `fast_rope` path (no precomputed freqs).
         let proportional_rope_freqs = if rope_params.rope_type == "proportional" {

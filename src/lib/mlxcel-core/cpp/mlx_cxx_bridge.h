@@ -725,12 +725,12 @@ std::unique_ptr<MlxArray> fast_rope_with_freqs(
     const MlxArray& freqs
 );
 
-// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Wraps
-// the slice/concat/rope/slice/concat chain in one `mx::core::compile`
-// window. Requires `rotated_dims > 0` and `last_dim == head_dim`;
-// the rare `last_dim > head_dim` tail case must stay on the
-// op-at-a-time path. `offset` flows through as a scalar array input
-// so the same compiled graph serves every decode step.
+// Compiled ProportionalRoPE (Gemma 4 full-attention layers). Wraps the
+// mlx-lm full-head `fast::rope` call with an `inf` frequency tail in one
+// `mx::core::compile` window. Requires `rotated_dims > 0` and
+// `last_dim == head_dim`; the rare `last_dim > head_dim` tail case must
+// stay on the op-at-a-time path. `offset` flows through as a scalar array
+// input so the same compiled graph serves every decode step.
 std::unique_ptr<MlxArray> compiled_proportional_rope(
     const MlxArray& x,
     const MlxArray& freqs,
@@ -740,10 +740,9 @@ std::unique_ptr<MlxArray> compiled_proportional_rope(
 );
 
 // Compiled Gemma 4 Q-path with proportional RoPE. Folds
-// `reshape → fast::rms_norm → transpose → ProportionalRoPE` into
-// one compile window so MLX sees a single fused subgraph instead
-// of four cxx-bridge calls. Used on Gemma 4 full-attention
-// layers only.
+// `reshape → fast::rms_norm → transpose → full-head ProportionalRoPE`
+// into one compile window so MLX sees a single fused subgraph instead of
+// four cxx-bridge calls. Used on Gemma 4 full-attention layers only.
 std::unique_ptr<MlxArray> compiled_q_path_proportional(
     const MlxArray& q_proj_out,
     const MlxArray& q_norm_weight,
