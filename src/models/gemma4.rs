@@ -452,29 +452,33 @@ impl MLP {
 }
 
 pub struct Router {
-    pub(crate) norm: RMSNormNoScale,
+    /// Precomputed `scale * hidden_size^-0.5` fed as the weight to
+    /// `fast_rms_norm`, collapsing the old
+    /// `rms_norm_no_weight → multiply_scalar → multiply` trio into
+    /// one fused Metal kernel to match Python's
+    /// `mx.fast.rms_norm(x, self.scale * self._root_size, self.eps)`.
+    pub(crate) scale_with_root: UniquePtr<MlxArray>,
+    pub(crate) rms_eps: f32,
     pub(crate) proj: UnifiedLinear,
-    pub(crate) scale: UniquePtr<MlxArray>,
     pub(crate) per_expert_scale: UniquePtr<MlxArray>,
-    pub(crate) hidden_root_scale: f32,
     pub(crate) top_k_experts: i32,
 }
 
 impl Router {
     pub fn forward(&self, x: &MlxArray) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-        let x = self.norm.forward(x);
-        let x = mlxcel_core::multiply_scalar(&x, self.hidden_root_scale);
-        let x = mlxcel_core::multiply(&x, &self.scale);
-
+        let x = mlxcel_core::fast_rms_norm(x, &self.scale_with_root, self.rms_eps);
         let expert_scores = self.proj.forward(&x);
-        let router_probs = mlxcel_core::softmax(&expert_scores, -1);
+
+        // Pick top-k before softmax so softmax runs over k=8 values,
+        // not the full num_experts=128. MLX `argpartition` returns
+        // the k-smallest positions, so negate first to find the
+        // k-largest.
         let neg_scores = mlxcel_core::negative(&expert_scores);
         let top_k_indices = mlxcel_core::argpartition(&neg_scores, self.top_k_experts - 1, -1);
         let top_k_indices = slice_axis(&top_k_indices, -1, 0, self.top_k_experts);
 
-        let top_k_weights = mlxcel_core::take_along_axis(&router_probs, &top_k_indices, -1);
-        let denom = mlxcel_core::sum_axis(&top_k_weights, -1, true);
-        let top_k_weights = mlxcel_core::divide(&top_k_weights, &denom);
+        let top_k_weights = mlxcel_core::take_along_axis(&expert_scores, &top_k_indices, -1);
+        let top_k_weights = mlxcel_core::softmax(&top_k_weights, -1);
         let expert_scale = mlxcel_core::take(&self.per_expert_scale, &top_k_indices, 0);
         let top_k_weights = mlxcel_core::multiply(&top_k_weights, &expert_scale);
 
@@ -486,17 +490,21 @@ impl Router {
         config: &TextConfig,
         prefix: &str,
     ) -> Result<Self, String> {
+        let raw_scale = get_weight_copy(weights, &format!("{}.scale", prefix))?;
+        let root = (config.hidden_size as f32).powf(-0.5);
+        let scale_with_root = mlxcel_core::multiply_scalar(&raw_scale, root);
+        mlxcel_core::eval(&scale_with_root);
+
         Ok(Self {
-            norm: RMSNormNoScale::new(config.hidden_size as i32, config.rms_norm_eps),
+            scale_with_root,
+            rms_eps: config.rms_norm_eps,
             proj: UnifiedLinear::from_weights(
                 weights,
                 &format!("{}.proj", prefix),
                 config.group_size(),
                 config.bits(),
             )?,
-            scale: get_weight_copy(weights, &format!("{}.scale", prefix))?,
             per_expert_scale: get_weight_copy(weights, &format!("{}.per_expert_scale", prefix))?,
-            hidden_root_scale: (config.hidden_size as f32).powf(-0.5),
             top_k_experts: config
                 .top_k_experts
                 .ok_or_else(|| "Missing top_k_experts for Gemma4 MoE router".to_string())?
