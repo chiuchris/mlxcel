@@ -1,3 +1,53 @@
+mlxcel (0.0.25-1~jammy1) jammy; urgency=medium
+
+  * Feat: Cross-sequence prompt-prefix KV cache — KVCache trim/detach/adopt
+    API, paged-cache block-table prefix reuse, PromptCacheStore shared LRU,
+    longest common token-prefix matcher, scheduler integration that adopts
+    cached prefix and prefills only the suffix
+  * Feat: Multimodal/vision-aware prompt cache key (MultimodalDigest) and
+    prefix stability hardening with session-key parsing
+  * Feat: OpenAI-compatible cached_tokens reporting + Prometheus metrics for
+    prompt cache; multi-turn E2E test and prefill-latency benchmark
+  * Feat: --prompt-cache-size, --prompt-cache-min-tokens CLI flags and
+    matching LLAMA_ARG_* env vars wired through mlxcel-server
+  * Feat: Language-bias steering Axis B Phase 1 — lang_analyzer Unicode
+    script classifier, TokenLanguageIndex builder with disk cache,
+    TokenBiasMap + apply_token_bias primitive, LangBiasSet Conservative/
+    Strict policy, CLI flags + YAML config + LLAMA_ARG_LANG_BIAS
+  * Feat: Lang-bias generator-pipeline wiring, B9 tracing fields and
+    Prometheus counters, byte-fragment CJK classification via UTF-8
+    start-byte analysis, byte-level reverse-map token decode
+  * Feat: thinking_token_budget for Qwen3 family
+  * Feat: preserve_thinking for Qwen 3.6 multi-turn reasoning retention
+  * Feat: StreamFilter recognizes Qwen-style <think>/</think> for streaming
+    reasoning_content
+  * Feat: Extend thinking_budget_tokens to Gemma 4
+  * Feat: Bridge-overhead microbench tool (Rust cxx vs Python nanobind)
+  * Feat: Multi-stage pipeline-parallel CI smoke with Qwen3-0.6B fixture
+  * Perf: Gemma 4 mlx-lm decode parity pass on 26B / 31B / e2b — fused
+    Router RMS norm with top-k-then-softmax, fused SwitchGeGLU compile
+    window, Metal-trace-driven attention/RoPE/per-layer fusion, BF16 decode
+    graph alignment, proportional RoPE, SwitchGLU projection order, QKV
+    projection shape, router top-k, single-query causal mask skip,
+    redundant residual copy removal
+  * Update: MLX upstream pin upgraded to v0.31.2; SDPA / steel-attention
+    overlays dropped (now covered upstream)
+  * Fix: CUDA QMM patches updated for new upstream lhs/rhs_indices
+    signatures
+  * Fix: Qwen 3.5 SSM decode masks aligned with mlx-lm
+  * Fix: Gemma 4 enable_thinking degeneracy + reasoning_content streaming
+  * Fix: emit content=null for tool-only assistant turns (OpenAI schema
+    compliance)
+  * Fix: chat-template flattened extra_body and pseudo-user tool responses
+  * Fix: Prompt cache prefix isolation across detach/adopt boundary
+  * Fix: Pipeline Parallel CI on Ubuntu (LAPACK + clippy -D warnings)
+  * Fix: Gemma 4 vision encoder hidden_size read after input_proj
+  * Fix: bump cc to 1.2.60 to silence BSD ar probe warning
+  * Chore: SIGTERM running mlxcel-server after binary copy so respawn
+    picks up the new binary
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Fri, 24 Apr 2026 18:00:00 +0900
+
 mlxcel (0.0.24-1~jammy1) jammy; urgency=medium
 
   * Feat: Zero-config multi-machine pipeline-parallel bring-up via

@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [v0.0.25] - 2026-04-24
+
+### Added
+- Cross-sequence prompt-prefix KV cache. New `KVCache::trim/detach/adopt` API enables adopting a previously-cached prefix on the next request. Backed by `PromptCacheStore`, an in-process LRU keyed by tokenized prompt prefix, plus a longest common token-prefix matcher (`PrefixMatcher`) for fast lookup. Paged KV cache gains block-table prefix reuse so adopted prefixes share physical blocks. Scheduler integration prefills only the unmatched suffix on cache hits. Wired into the server via `--prompt-cache-size`, `--prompt-cache-min-tokens`, and matching `LLAMA_ARG_*` env vars; multimodal/vision-aware cache key (`MultimodalDigest`) prevents cross-modality collisions. OpenAI-compatible `cached_tokens` is reported in `/v1/chat/completions` responses, mirrored to Prometheus counters, and verified by a multi-turn E2E test plus a prefill-latency benchmark. Design rationale and operator guide added to docs (#418, #419, #420, #421, #422, #423, #424, #425, #426, #427, #428, #429, #430, #431, #432, #433, #434, #435, #436, #437, #438).
+- Language-bias steering (Axis B, Phase 1). New `lang_analyzer` module with a Unicode script classifier (B2, #391) and `TokenLanguageIndex` builder that scans the tokenizer vocabulary, partitions tokens by script, and persists the result to disk for fast warm starts (B3 #392, B4 #394). Sampling primitive `TokenBiasMap` + `apply_token_bias` (#390) is wired through `LangBiasSet` with `Conservative` / `Strict` policies (B5 #393), exposed via CLI flags and a YAML config (B6 #395), `LLAMA_ARG_LANG_BIAS` env var in `mlxcel-server` (B7 #397), `LangBiasConfig` injection into the generator pipelines (B8 #398), tracing fields and Prometheus counters (B9 #400), byte-fragment CJK classification via UTF-8 start-byte analysis so byte-level BPE tokenizers correctly attribute fragments (#408, closes #405), byte-level reverse map for token decoding (#402, fixes #401), and integration tests for the steering matrix (B10 #399, #407). User guide and Quickstart published (B11 #396, #404).
+- `thinking_token_budget` sampling parameter for the Qwen3 family — caps tokens emitted between `<think>` / `</think>` markers without disabling streaming (#411).
+- `preserve_thinking` chat-template hook for Qwen 3.6 so multi-turn conversations retain prior `<think>` blocks instead of stripping them on subsequent turns (#412).
+- `StreamFilter` extended to recognize Qwen-style `<think>` / `</think>` token boundaries during streaming and route the segment into `reasoning_content` (#445).
+- `thinking_budget_tokens` extended to Gemma 4 (#442).
+- `feat(benchmarks)`: bridge-overhead microbench tool measuring per-op cost of the Rust cxx bridge against Python nanobind across MLX primitives, with a published baseline and reproduction steps (#450).
+- `feat(ci)`: multi-stage pipeline-parallel smoke job activated using a Qwen3-0.6B fixture so PR runs catch PP regressions (#415).
+- Per-layer + per-sub-op decode profiling for Gemma 4, plus a Gemma 4 perf harness with the 2026-04-22 baseline used to drive the parity work below.
+
+### Fixed
+- Prompt cache prefix isolation — sequences whose prompts share a non-trivial prefix no longer leak adopted KV state across each other after detach/adopt (#448).
+- `MultimodalDigest` propagated to all `PromptCacheKey` callers after the issue #421 + #425 merge so vision-aware cache lookups stay collision-free.
+- Gemma 4 `enable_thinking=false` no longer triggers degenerate output, and `reasoning_content` now streams correctly when `enable_thinking=true` (#440).
+- Tool-only assistant turns now emit `content: null` instead of `""` to match the OpenAI Chat Completions schema (#441).
+- `chat-template`: support flattened `extra_body` and pseudo-user tool responses so OpenAI-style tool flows render correctly under HF-style templates (#413).
+- `lang-analyzer`: decode tokens using the byte-level reverse map (#401) instead of the textual tokenizer view, so byte-level BPE (Qwen, Llama) tokens are classified by their actual code-point payload (#402).
+- `ci`: unblock Pipeline Parallel CI on Ubuntu by installing LAPACK and treating clippy `-D warnings` consistently (#414).
+- `vision`: read Gemma 4 encoder `hidden_size` from after `input_proj` so the multimodal projector wires the correct dimension on encoders that include a learned input projection.
+- Bumped `cc` to 1.2.60 to silence the BSD `ar` probe warning surfaced by recent `cc-rs` releases (#439).
+
+### Changed
+- Gemma 4 mlx-lm decode parity pass (closes the remaining gap on 26B / 31B / e2b, #454):
+  - Router RMS norm fused with top-k-then-softmax to remove a separate normalization pass (#451).
+  - SwitchGeGLU gate / up / geglu / down fused into a single `mlx::core::compile` window (#452).
+  - Metal-trace-driven attention / RoPE / per-layer chain fusion (#453).
+  - Compiled Gemma 4 SwitchGeGLU decode path enabled.
+  - Single-query causal masks skipped in decode.
+  - BF16 decode graph aligned with mlx-lm.
+  - Proportional RoPE aligned with mlx-lm (no rotated-only normalization).
+  - SwitchGLU projection order matched to mlx-lm.
+  - QKV projection shape matched to mlx-lm.
+  - Router top-k aligned with mlx-lm.
+  - Load and MoE decode paths tuned.
+  - Redundant residual copies in the decoder layer dropped.
+  - SwitchGeGLU `expand_dims` collapsed and a MoE inner profiler added (#447).
+- `Qwen 3.5`: SSM decode masks aligned with mlx-lm; benchmark artifacts cleanup (#455).
+- `MLX`: upstream pin upgraded to **v0.31.2**; in-tree SDPA and steel-attention overlays dropped now that upstream covers them. Three-location update (`src/lib/mlx-cpp/CMakeLists.txt`, `src/lib/mlxcel-core/build.rs`, `.github/workflows/release.yml`) per CLAUDE.md (#449).
+- `CUDA`: QMM patches updated for the new upstream `lhs/rhs_indices` signatures (#456).
+- `deploy`: SIGTERM the running `mlxcel-server` after binary copy so the respawned supervisor picks up the new binary (#443).
+- `style`: `cargo fmt` swept across server modules to land previously-unformatted blocks.
+
 ## [v0.0.24] - 2026-04-18
 
 ### Added
@@ -501,6 +546,7 @@ Initial public release of mlxcel.
 - GitHub Actions release workflow for macOS ARM64
 - Profile mode for prefill/decode timing analysis
 
+[v0.0.25]: https://github.com/lablup/mlxcel/compare/v0.0.24...v0.0.25
 [v0.0.24]: https://github.com/lablup/mlxcel/compare/v0.0.23...v0.0.24
 [v0.0.23]: https://github.com/lablup/mlxcel/compare/v0.0.22...v0.0.23
 [v0.0.22]: https://github.com/lablup/mlxcel/compare/v0.0.21...v0.0.22
