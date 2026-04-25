@@ -17,6 +17,7 @@ use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
 mod commands;
+use mlxcel::downloader::DownloadArgs;
 use mlxcel::lang_bias::LangBiasCliArgs;
 
 /// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs
@@ -64,6 +65,9 @@ enum Commands {
     /// List supported model architectures
     #[command(visible_alias = "ls")]
     List,
+
+    /// Download a HuggingFace model repository snapshot
+    Download(DownloadArgs),
 }
 
 #[derive(Args, Debug)]
@@ -819,6 +823,7 @@ fn main() -> anyhow::Result<()> {
             print_supported_models();
             Ok(())
         }
+        Commands::Download(args) => commands::run_download(args),
     }
 }
 

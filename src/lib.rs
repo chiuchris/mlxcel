@@ -19,6 +19,7 @@
 
 pub mod audio;
 pub mod distributed;
+pub mod downloader;
 pub mod execution;
 pub mod lang_bias;
 pub mod lora;

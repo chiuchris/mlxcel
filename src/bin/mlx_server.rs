@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use clap::Parser;
+use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
+use mlxcel::downloader::{DownloadArgs, DownloadOptions, download_repo};
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
     ServerStartupInput, env_fallback_chat_template_kwargs, env_fallback_lang_bias,
@@ -29,12 +30,27 @@ use mlxcel::server::{
 /// Drop-in replacement for llama-server (llama.cpp) using Apple Silicon MLX or
 /// CUDA backends. Supports OpenAI-compatible API endpoints and llama-server
 /// native endpoints.
+///
+/// Usage modes:
+///
+/// 1. Legacy flag-only invocation (backward-compatible default):
+///    `mlxcel-server -m models/foo --port 8080`
+///    With no subcommand, the binary boots the HTTP server using the
+///    flattened server flags below.
+///
+/// 2. Subcommand mode:
+///    `mlxcel-server download <REPO_ID>`
+///    `download` fetches a HuggingFace model snapshot using the same
+///    downloader the `mlxcel` CLI uses (issue #457). Server flags are
+///    rejected when a subcommand is supplied.
 #[derive(Parser, Debug)]
 #[command(
     name = "mlxcel-server",
     author = "Lablup Inc.",
     version,
     about = "llama-server compatible HTTP server for MLX inference on Apple Silicon and CUDA GPUs",
+    args_conflicts_with_subcommands = true,
+    flatten_help = true,
     after_help = "\
 Tensor Parallel Runtime:
   Current multi-rank support: dense Llama, Qwen2/2.5, Qwen3, Qwen3.5 text, Gemma 3 text, Gemma 4 text, ERNIE 4.5, Hunyuan v1 Dense
@@ -74,17 +90,49 @@ Thunderbolt mode:
   Thunderbolt Bridge IP (for example 169.254.x.x). The current Thunderbolt
   path uses the shared TCP transport core over the Bridge network.
 
+Subcommands:
+  download <REPO_ID>    Fetch a HuggingFace model snapshot into models/<basename>
+
 See also: docs/PIPELINE_PARALLELISM.md"
 )]
-struct Args {
-    /// Path to the model directory
+struct Cli {
+    /// Subcommand to run. When omitted, the binary boots the HTTP server
+    /// using the flattened [`ServerArgs`] flags (legacy invocation).
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Server-start arguments. Mutually exclusive with `command` (enforced by
+    /// `args_conflicts_with_subcommands = true` on the parent command).
+    #[command(flatten)]
+    server: ServerArgs,
+}
+
+/// Subcommands supported by `mlxcel-server`.
+///
+/// The set is intentionally narrow: only operations that legitimately need to
+/// share the server binary (currently just model downloading) live here. The
+/// long-form server-start flags remain at the top level for full backward
+/// compatibility with existing scripts and llama-server drop-in usage.
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Download a HuggingFace model repository snapshot
+    Download(DownloadArgs),
+}
+
+#[derive(ClapArgs, Debug)]
+struct ServerArgs {
+    /// Path to the model directory.
+    ///
+    /// Required when running in legacy server-start mode (no subcommand).
+    /// Modeled as `Option<PathBuf>` so the `download` subcommand can be
+    /// invoked without supplying `-m`.
     #[arg(
         short = 'm',
         long = "model",
         env = "LLAMA_ARG_MODEL",
         value_name = "PATH"
     )]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// Model alias (shown in API responses instead of directory name)
     #[arg(
@@ -663,11 +711,27 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-    start_server(build_startup_input(args)?.into_startup_config()?).await
+    let cli = Cli::parse();
+
+    match cli.command {
+        // Subcommand-driven dispatch (issue #457). Currently only `download`
+        // exists; future operational subcommands (e.g. cache inspection) can
+        // be added to [`Commands`] without touching the legacy server-start
+        // path.
+        Some(Commands::Download(args)) => run_download(args),
+        // Legacy invocation: no subcommand → boot the HTTP server using the
+        // flattened server flags. Backward-compatible with every prior
+        // `mlxcel-server -m foo --port 8080 ...` invocation.
+        None => start_server(build_startup_input(cli.server)?.into_startup_config()?).await,
+    }
 }
 
-fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
+fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
+    let opts = DownloadOptions::from_args(&args);
+    download_repo(opts)
+}
+
+fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInput> {
     // Axis B Epic #362 (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
     // before resolving, so env-supplied values flow through the same
     // validation and normalization as CLI flags. CLI flag wins on conflict
@@ -700,8 +764,14 @@ fn build_startup_input(mut args: Args) -> anyhow::Result<ServerStartupInput> {
         .resolve()
         .map_err(|e| anyhow::anyhow!("--lang-bias: {e}"))?;
 
+    let model_path = args.model.ok_or_else(|| {
+        anyhow::anyhow!(
+            "--model/-m is required to start the server (set the LLAMA_ARG_MODEL env var or pass -m <PATH>)"
+        )
+    })?;
+
     Ok(ServerStartupInput {
-        model_path: args.model,
+        model_path,
         adapter_path: args.lora,
         model_alias: args.alias,
         host: args.host,
