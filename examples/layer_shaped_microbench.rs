@@ -28,9 +28,7 @@
 //          [ HIDDEN ] [ N_LAYERS ] [ N_STEPS ]
 // Defaults: HIDDEN=2816 (Gemma 4 26B-a4b), N_LAYERS=30, N_STEPS=50.
 
-use mlxcel_core::{
-    add, eval, fast_rms_norm, from_slice_f32, matmul, synchronize_default,
-};
+use mlxcel_core::{add, eval, fast_rms_norm, from_slice_f32, matmul, synchronize_default};
 use std::time::Instant;
 
 fn init_weight(shape: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {

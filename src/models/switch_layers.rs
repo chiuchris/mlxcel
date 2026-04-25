@@ -132,7 +132,6 @@ pub struct QuantizedSwitchLinearRef<'a> {
 }
 
 impl SwitchLinear {
-
     pub fn from_weights_with_mode(
         weights: &WeightMap,
         prefix: &str,

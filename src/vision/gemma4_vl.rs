@@ -110,7 +110,10 @@ impl Gemma4VLModel {
         }
     }
 
-    pub(crate) fn set_weight_backing(&mut self, weight_backing: crate::models::Gemma4WeightBacking) {
+    pub(crate) fn set_weight_backing(
+        &mut self,
+        weight_backing: crate::models::Gemma4WeightBacking,
+    ) {
         self._weight_backing = weight_backing;
     }
 

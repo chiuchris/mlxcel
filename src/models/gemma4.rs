@@ -748,11 +748,10 @@ impl Attention {
         // inside a single `mx::core::compile` window. Sliding layers and
         // layers with non-proportional RoPE stay on the op-at-a-time chain.
         let queries = if let Some(ref freqs) = self.proportional_rope_freqs {
-            let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
-                * self.head_dim as f64
-                / 2.0)
-                .floor() as i32)
-                .max(0);
+            let rotated_dims = 2
+                * ((self.proportional_partial_rotary_factor as f64 * self.head_dim as f64 / 2.0)
+                    .floor() as i32)
+                    .max(0);
             mlxcel_core::compiled_q_path_proportional(
                 &q_proj_out,
                 &self.q_norm.weight,
@@ -868,11 +867,10 @@ impl Attention {
         // as the Q branch, so it reuses `compiled_q_path_proportional` with
         // `n_kv_heads` and the k_norm weight.
         let keys = if let Some(ref freqs) = self.proportional_rope_freqs {
-            let rotated_dims = 2 * ((self.proportional_partial_rotary_factor as f64
-                * self.head_dim as f64
-                / 2.0)
-                .floor() as i32)
-                .max(0);
+            let rotated_dims = 2
+                * ((self.proportional_partial_rotary_factor as f64 * self.head_dim as f64 / 2.0)
+                    .floor() as i32)
+                    .max(0);
             mlxcel_core::compiled_q_path_proportional(
                 &raw_keys,
                 &self.k_norm.weight,
@@ -1238,35 +1236,33 @@ impl DecoderLayer {
             //   post_norm → add(after_ffn)
             // into a single `mx::core::compile` graph. Falls back
             // to the op-at-a-time chain for non-quantized variants.
-            let combined =
-                if let (Some(gate_qw), Some(proj_qw)) =
-                    (gate_proj.quantized_weight(), proj.quantized_weight())
-                {
-                    unsafe {
-                        mlxcel_core::compiled_per_layer_input_gate(
-                            &after_ffn,
-                            per_layer_input,
-                            &gate_qw.weight,
-                            &gate_qw.scales,
-                            gate_qw.biases_ptr(),
-                            &proj_qw.weight,
-                            &proj_qw.scales,
-                            proj_qw.biases_ptr(),
-                            &post_norm.weight,
-                            post_norm.eps,
-                            gate_qw.group_size,
-                            gate_qw.bits,
-                            &gate_qw.mode,
-                        )
-                    }
-                } else {
-                    let gate = gate_proj.forward(&after_ffn);
-                    let gated =
-                        mlxcel_core::compiled_geglu_approx_activation(&gate, per_layer_input);
-                    let gate = proj.forward(&gated);
-                    let gate = post_norm.forward(&gate);
-                    mlxcel_core::add(&after_ffn, &gate)
-                };
+            let combined = if let (Some(gate_qw), Some(proj_qw)) =
+                (gate_proj.quantized_weight(), proj.quantized_weight())
+            {
+                unsafe {
+                    mlxcel_core::compiled_per_layer_input_gate(
+                        &after_ffn,
+                        per_layer_input,
+                        &gate_qw.weight,
+                        &gate_qw.scales,
+                        gate_qw.biases_ptr(),
+                        &proj_qw.weight,
+                        &proj_qw.scales,
+                        proj_qw.biases_ptr(),
+                        &post_norm.weight,
+                        post_norm.eps,
+                        gate_qw.group_size,
+                        gate_qw.bits,
+                        &gate_qw.mode,
+                    )
+                }
+            } else {
+                let gate = gate_proj.forward(&after_ffn);
+                let gated = mlxcel_core::compiled_geglu_approx_activation(&gate, per_layer_input);
+                let gate = proj.forward(&gated);
+                let gate = post_norm.forward(&gate);
+                mlxcel_core::add(&after_ffn, &gate)
+            };
             timer.tick("per_layer_input_gate", &combined);
             combined
         } else {

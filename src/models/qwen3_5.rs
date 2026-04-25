@@ -263,7 +263,10 @@ impl Qwen35GatedDeltaNet {
         mask: Option<&MlxArray>,
         cache: Option<&mut GatedDeltaCache>,
     ) -> UniquePtr<MlxArray> {
-        let out = self.forward_hidden_internal(inputs, mask, cache, true);
+        // Standalone Qwen3.5 follows mlx-lm create_ssm_mask(): no mask when
+        // all tokens are valid. The tensor-parallel path keeps the forced mask
+        // in forward_hidden_tp() for CUDA parity.
+        let out = self.forward_hidden_internal(inputs, mask, cache, false);
         self.out_proj.forward(&out)
     }
 

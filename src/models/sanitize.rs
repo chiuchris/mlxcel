@@ -19,7 +19,7 @@
 //! `models/mod.rs`.
 
 use memmap2::MmapOptions;
-use safetensors::{tensor::TensorView, Dtype as SafeTensorDtype, SafeTensors};
+use safetensors::{Dtype as SafeTensorDtype, SafeTensors, tensor::TensorView};
 use serde_json::Value;
 use std::fs::File;
 use std::path::Path;
