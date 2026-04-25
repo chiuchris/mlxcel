@@ -1,5 +1,7 @@
 // Copyright © 2026 Apple Inc.
-// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
+// Patched by mlxcel: matches upstream 68cf2fdd (declarations updated for the
+// new optional<array> lhs_indices / rhs_indices parameters added to qmm_sm80
+// and qmm_naive).
 
 #pragma once
 
@@ -50,6 +52,8 @@ void qmm_sm80(
     const array& w,
     const array& scales,
     const std::optional<array>& biases,
+    const std::optional<array>& lhs_indices,
+    const std::optional<array>& rhs_indices,
     array& out,
     int bits,
     int group_size,
@@ -73,6 +77,8 @@ void qmm_naive(
     const array& w,
     const array& scales,
     const std::optional<array>& biases,
+    const std::optional<array>& lhs_indices,
+    const std::optional<array>& rhs_indices,
     array& out,
     bool transpose,
     int bits,

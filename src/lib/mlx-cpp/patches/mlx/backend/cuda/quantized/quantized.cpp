@@ -1,7 +1,9 @@
 // Copyright © 2025 Apple Inc.
 // Patched by mlxcel: ensure input contiguity in QuantizedMatmul for
 // non-contiguous 3D batched weights (e.g. GLM-4 MLA embed_q with
-// transpose=false).
+// transpose=false). Updated for upstream 68cf2fdd, which added optional
+// lhs_indices/rhs_indices parameters to qmm_sm80 / qmm_naive and routed
+// GatherQMM through them.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
@@ -57,7 +59,18 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
   };
   auto call_qmm_sm80 = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
-    qmm_sm80(x, w, scales, biases, out, bits_, group_size_, mode_, encoder);
+    qmm_sm80(
+        x,
+        w,
+        scales,
+        biases,
+        std::nullopt,
+        std::nullopt,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
   };
   auto call_qmm_naive = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
@@ -66,6 +79,8 @@ void QuantizedMatmul::eval_gpu(const std::vector<array>& inputs, array& out) {
         w,
         scales,
         biases,
+        std::nullopt,
+        std::nullopt,
         out,
         transpose_,
         bits_,
@@ -150,7 +165,7 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   array lhs_indices = ensure_contiguous(inputs[inputs.size() - 2], encoder, s);
   array rhs_indices = ensure_contiguous(inputs[inputs.size() - 1], encoder, s);
 
-  int M = out.shape(-2);
+  int M = out.ndim() > 1 ? out.shape(-2) : 1;
   int N = out.shape(-1);
   int K = x.shape(-1);
   int B = out.size() / (M * N);
@@ -168,8 +183,41 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder.device());
   };
+  bool can_use_qmm_sm80 = supports(supports_qmm_sm80);
+  bool can_use_qmm_naive = supports(supports_qmm_naive);
   bool can_use_qmv = supports(supports_qmv);
 
+  auto call_qmm_sm80 = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_sm80(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
+  auto call_qmm_naive = [&]() {
+    out.set_data(cu::malloc_async(out.nbytes(), encoder));
+    qmm_naive(
+        x,
+        w,
+        scales,
+        biases,
+        lhs_indices,
+        rhs_indices,
+        out,
+        transpose_,
+        bits_,
+        group_size_,
+        mode_,
+        encoder);
+  };
   auto call_qmv = [&]() {
     out.set_data(cu::malloc_async(out.nbytes(), encoder));
     gather_qmv(
@@ -185,6 +233,24 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
         mode_,
         encoder);
   };
+
+  if (can_use_qmm_sm80) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      call_qmm_sm80();
+    }
+    return;
+  }
+
+  if (can_use_qmm_naive) {
+    if (can_use_qmv && (M * B < 8)) {
+      call_qmv();
+    } else {
+      call_qmm_naive();
+    }
+    return;
+  }
 
   if (can_use_qmv) {
     call_qmv();

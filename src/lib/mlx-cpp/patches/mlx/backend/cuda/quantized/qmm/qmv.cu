@@ -1,6 +1,7 @@
 // Copyright © 2026 Apple Inc.
-// Patched by mlxcel: matches upstream b98831ad (no modifications needed).
-// Includes GatherQMM via gather_qmv_kernel using shared qmv_kernel_impl.
+// Patched by mlxcel: matches upstream 68cf2fdd. The only practical change
+// vs the previous pin is GatherQMM's broadcast_w predicate, which now also
+// triggers for non-contiguous batched weights via w.size() != w.data_size().
 
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/cuda/quantized/qmm/cute_dequant.cuh"
@@ -408,7 +409,7 @@ void qmv(
   int n = out.shape(-1);
   int k = x.shape(-1);
   int l = out.size() / (m * n);
-  bool broadcast_w = w.ndim() == 2;
+  bool broadcast_w = (w.ndim() <= 2) || (w.size() != w.data_size());
 
   dispatch_element_types(out.dtype(), tag, [&]<typename T>() {
     dispatch_quant_types<T>(
