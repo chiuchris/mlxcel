@@ -69,7 +69,10 @@ use cxx::UniquePtr;
 use crate::ffi;
 use crate::ffi::MlxArray;
 
-use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, SequenceStateBackend};
+use super::{
+    CachePool, KVCache, KVCacheMode, RotatingKVCache, SequenceCacheSet, SequenceId,
+    SequenceStateBackend,
+};
 
 // ---------------------------------------------------------------------------
 // DetachedKVCache
@@ -280,6 +283,174 @@ impl KVCache {
             let probe = self.v_packed.as_ref().or(self.k_packed.as_ref());
             if let Some(p) = probe {
                 let shape = ffi::array_shape(p);
+                if shape.len() == 4 && shape[3] > 0 {
+                    let head_dim = (shape[3] as u32) * 2;
+                    self.turbo_params = Some(super::turbo::TurboQuantParams::new(
+                        head_dim,
+                        self.turbo_seed,
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DetachedRotatingKVCache (B9, issue #481)
+// ---------------------------------------------------------------------------
+
+/// Inert snapshot of a single [`RotatingKVCache`] (sliding-window cache) that
+/// can outlive the sequence which produced it.
+///
+/// Mirrors [`DetachedKVCache`] for the rotating cache backend, including the
+/// `Turbo4Asym` packed sidecar buffers (`v_packed`, `v_norms`) and the
+/// deterministic seed so the adopted cache can rebuild
+/// [`crate::cache::turbo::TurboQuantParams`] without consulting the originating
+/// cache. Adds the rotating-specific `max_size` and `idx` fields so the ring
+/// position is preserved across the round-trip — without `idx`, a wrap-around
+/// state would silently fall back to "no wraparound yet" semantics.
+///
+/// Used by: prompt prefix cache reuse for sliding-window models (Gemma 3/4,
+/// Ministral 3, GPT-OSS, RecurrentGemma, Exaone) under the same #416/#417
+/// architecture as the dense `DetachedKVCache`.
+pub struct DetachedRotatingKVCache {
+    pub(super) keys: Option<UniquePtr<MlxArray>>,
+    pub(super) values: Option<UniquePtr<MlxArray>>,
+    pub(super) max_size: i32,
+    pub(super) offset: i32,
+    pub(super) idx: i32,
+    pub(super) step: i32,
+    pub(super) mode: KVCacheMode,
+    pub(super) key_scales: Option<UniquePtr<MlxArray>>,
+    pub(super) val_scales: Option<UniquePtr<MlxArray>>,
+    pub(super) v_packed: Option<UniquePtr<MlxArray>>,
+    pub(super) v_norms: Option<UniquePtr<MlxArray>>,
+    pub(super) turbo_seed: u32,
+}
+
+impl DetachedRotatingKVCache {
+    /// Logical sequence length at detach time (matches `RotatingKVCache::offset`).
+    pub fn seq_len(&self) -> i32 {
+        self.offset
+    }
+
+    /// Quantization mode of the detached cache.
+    pub fn mode(&self) -> KVCacheMode {
+        self.mode
+    }
+
+    /// Sliding window upper bound preserved across the round-trip.
+    pub fn max_size(&self) -> i32 {
+        self.max_size
+    }
+
+    /// Total byte footprint of the detached tensors.
+    pub fn nbytes(&self) -> usize {
+        let k = self.keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let v = self.values.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let ks = self.key_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let vs = self.val_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let vp = self.v_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn
+    }
+
+    /// Whether the detached handle carries no data (all tensors were `None`).
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_none()
+    }
+}
+
+impl std::fmt::Debug for DetachedRotatingKVCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DetachedRotatingKVCache")
+            .field("max_size", &self.max_size)
+            .field("offset", &self.offset)
+            .field("idx", &self.idx)
+            .field("step", &self.step)
+            .field("mode", &self.mode)
+            .field("has_keys", &self.keys.is_some())
+            .field("has_values", &self.values.is_some())
+            .field("has_v_packed", &self.v_packed.is_some())
+            .field("has_v_norms", &self.v_norms.is_some())
+            .field("turbo_seed", &self.turbo_seed)
+            .finish()
+    }
+}
+
+impl RotatingKVCache {
+    /// Move the underlying MLX buffers out of this rotating cache into a
+    /// [`DetachedRotatingKVCache`] handle.
+    ///
+    /// After this call the source `RotatingKVCache` is empty
+    /// (`is_empty() == true`, `offset == 0`, `idx == 0`) but retains its
+    /// `max_size`, quantization mode, step, and `turbo_seed` so it can be
+    /// reused for a new sequence. The returned handle carries the original
+    /// tensors unchanged — including `v_packed` / `v_norms` for `Turbo4Asym`
+    /// — so adopt is a zero-copy operation.
+    ///
+    /// Used by: sliding-window prompt prefix cache detach/adopt (B9 of #481;
+    /// dense counterpart is [`KVCache::clone_handle`]).
+    pub fn clone_handle(&mut self) -> DetachedRotatingKVCache {
+        let handle = DetachedRotatingKVCache {
+            keys: self.keys.take(),
+            values: self.values.take(),
+            max_size: self.max_size,
+            offset: std::mem::replace(&mut self.offset, 0),
+            idx: std::mem::replace(&mut self.idx, 0),
+            step: self.step,
+            mode: self.mode,
+            key_scales: self.key_scales.take(),
+            val_scales: self.val_scales.take(),
+            v_packed: self.v_packed.take(),
+            v_norms: self.v_norms.take(),
+            turbo_seed: self.turbo_seed,
+        };
+        // Mirror `KVCache::clone_handle` (LOW-1 from #474): clear cached
+        // turbo_params on the source so the next quantize call rebuilds them
+        // from scratch (slot may be reused with a different head_dim).
+        self.turbo_params = None;
+        handle
+    }
+
+    /// Re-install a previously detached rotating cache into this slot.
+    ///
+    /// Inverse of [`RotatingKVCache::clone_handle`]. The receiver must be
+    /// empty (`is_empty() == true`) so no live buffer is silently dropped;
+    /// callers that need to overwrite a populated cache should construct a
+    /// fresh `RotatingKVCache::new_with_mode_and_seed` and install into that.
+    ///
+    /// Block alignment: the adopted state is bit-identical to the source's,
+    /// including `idx`. Because per-token Turbo4 quantization is independent
+    /// across slots, no alignment-recovery work is needed at install time.
+    pub fn install_detached(
+        &mut self,
+        detached: DetachedRotatingKVCache,
+    ) -> Result<(), String> {
+        if !self.is_empty() {
+            return Err(
+                "RotatingKVCache::install_detached: target cache is not empty".into(),
+            );
+        }
+        self.keys = detached.keys;
+        self.values = detached.values;
+        self.max_size = detached.max_size;
+        self.offset = detached.offset;
+        self.idx = detached.idx;
+        self.step = detached.step;
+        self.mode = detached.mode;
+        self.key_scales = detached.key_scales;
+        self.val_scales = detached.val_scales;
+        self.v_packed = detached.v_packed;
+        self.v_norms = detached.v_norms;
+        self.turbo_seed = detached.turbo_seed;
+        // Pre-build turbo_params from v_packed shape if available so the
+        // first dequantize-only consumer doesn't need to wait for an update
+        // call (mirrors `KVCache::install_detached`).
+        if self.mode == KVCacheMode::Turbo4Asym {
+            if let Some(ref vp) = self.v_packed {
+                let shape = ffi::array_shape(vp);
                 if shape.len() == 4 && shape[3] > 0 {
                     let head_dim = (shape[3] as u32) * 2;
                     self.turbo_params = Some(super::turbo::TurboQuantParams::new(

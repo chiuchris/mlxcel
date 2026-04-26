@@ -47,7 +47,7 @@ pub mod turbo;
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
 
-pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache};
+pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
     PagedBlockId, PagedBlockPool, PagedCacheStats, PagedKvLayout, PagedLayerState,
     PagedSequenceState,
@@ -1065,6 +1065,46 @@ impl Default for KVCache {
 /// Maintains a fixed-size circular buffer for keys/values. Oversized prefill
 /// is linearized before single-token decode so wraparound stays well-defined.
 ///
+/// # KV Cache Quantization
+///
+/// `RotatingKVCache` supports the same `KVCacheMode` set as `KVCache`:
+/// `Fp16` (default), `Int8`, and `Turbo4Asym`. The mode is selected at
+/// construction time via [`RotatingKVCache::new_with_mode`].
+///
+/// In `KVCacheMode::Turbo4Asym` the V buffer is replaced by `v_packed`
+/// (`[B, H, max_size, head_dim/2]` UINT8) plus `v_norms`
+/// (`[B, H, max_size, 1]` FP16); the `values` field stays `None`. K stays
+/// FP16 in the regular `keys` buffer.
+///
+/// ## Block alignment invariant (B9, issue #481, epic #458)
+///
+/// TurboQuant V quantization is **per-token**: each token's `head_dim` vector
+/// is rotated and quantized independently along the last axis. There is no
+/// cross-token shared state in the rotation pipeline (the `BLOCK_SIZE` = 32
+/// constant only governs buffer growth granularity for the dense `KVCache`).
+///
+/// As a result, the ring-buffer wraparound at position `idx` is correct
+/// **for any** `max_size` — single-token writes simply overwrite the packed
+/// bytes and the per-token norm at `idx`, regardless of where `idx` falls.
+///
+/// However, we still require `max_size` to be a multiple of
+/// [`turbo::BLOCK_SIZE`] (32) when `mode == Turbo4Asym` for two reasons:
+///
+/// 1. **Future-proofing**: B5 (3-bit packing, issue #477) introduces 24-bit
+///    groups that span byte boundaries. A non-32-aligned ring would force
+///    partial-block re-quantization on every wraparound. Locking the
+///    invariant here means B5 only has to revisit pack/unpack, not the cache.
+/// 2. **Trim path simplicity**: the dense `KVCache::trim` path already
+///    exploits 32-alignment to avoid mid-block re-quantize work. Holding the
+///    same invariant in `RotatingKVCache` keeps speculative-decode rewinds
+///    bit-identical between dense and rotating caches.
+///
+/// All sliding-window models we ship today (Gemma 3 4 K, Gemma 4 8 K,
+/// Ministral 3 8 K, GPT-OSS 4 K / 16 K, RecurrentGemma 2 K, Exaone 4 K)
+/// already use 32-divisible window sizes, so this constraint is non-binding
+/// in practice. The constructor enforces it with a clear error message
+/// rather than silently accepting an invalid configuration.
+///
 /// Used by: Gemma3, Gemma4, Ministral3, GPT-OSS, RecurrentGemma, Exaone
 pub struct RotatingKVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
@@ -1074,11 +1114,63 @@ pub struct RotatingKVCache {
     /// Current write position in the buffer (separate from offset to handle trim correctly)
     idx: i32,
     step: i32,
+    /// Quantization mode for stored keys/values.
+    pub mode: KVCacheMode,
+    /// INT8-mode per-token K scale buffer: `[B, H, max_size, 1]` FP16.
+    pub(crate) key_scales: Option<UniquePtr<MlxArray>>,
+    /// INT8-mode per-token V scale buffer: `[B, H, max_size, 1]` FP16.
+    pub(crate) val_scales: Option<UniquePtr<MlxArray>>,
+    /// Turbo4Asym-mode V-side packed indices: `[B, H, max_size, head_dim/2]` u8.
+    pub(crate) v_packed: Option<UniquePtr<MlxArray>>,
+    /// Turbo4Asym-mode V-side per-token norms: `[B, H, max_size, 1]` fp16.
+    pub(crate) v_norms: Option<UniquePtr<MlxArray>>,
+    /// Cached PolarQuant params (sign vectors + codebook) for Turbo4Asym.
+    /// Lazily initialised on the first Turbo4 update once V `head_dim` is
+    /// known; deterministic given `turbo_seed` so detach/adopt round-trips
+    /// without recomputing rotations.
+    pub(crate) turbo_params: Option<turbo::TurboQuantParams>,
+    /// Deterministic seed for the Turbo4 sign vectors. Set at construction
+    /// time so detach/adopt round-trip without recomputing rotations.
+    pub(crate) turbo_seed: u32,
 }
 
 impl RotatingKVCache {
-    /// Create a new rotating KV cache with specified maximum size
+    /// Create a new rotating KV cache with specified maximum size (FP16 mode).
     pub fn new(max_size: i32) -> Self {
+        Self::new_with_mode_and_seed(max_size, KVCacheMode::Fp16, TURBO_DEFAULT_SEED)
+    }
+
+    /// Create a new rotating KV cache with the specified maximum size and
+    /// quantization mode.
+    ///
+    /// `Turbo4Asym` requires `max_size` to be a positive multiple of
+    /// [`turbo::BLOCK_SIZE`] — see the type-level docs for rationale.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `mode == Turbo4Asym` and `max_size` is not a positive
+    /// multiple of `turbo::BLOCK_SIZE`. Misconfiguring this would leave the
+    /// trim path silently broken; failing fast at construction is the only
+    /// correct contract.
+    pub fn new_with_mode(max_size: i32, mode: KVCacheMode) -> Self {
+        Self::new_with_mode_and_seed(max_size, mode, TURBO_DEFAULT_SEED)
+    }
+
+    /// Like [`RotatingKVCache::new_with_mode`] but lets the caller pin a
+    /// specific Turbo4 sign-vector seed.
+    ///
+    /// Production callers should prefer `new_with_mode`; the explicit seed is
+    /// exposed for tests, benchmarks, and the detach/adopt path which must
+    /// preserve the original seed.
+    pub fn new_with_mode_and_seed(max_size: i32, mode: KVCacheMode, turbo_seed: u32) -> Self {
+        if mode == KVCacheMode::Turbo4Asym {
+            assert!(
+                max_size > 0 && max_size % turbo::BLOCK_SIZE == 0,
+                "RotatingKVCache::new_with_mode: max_size must be a positive multiple of \
+                 turbo::BLOCK_SIZE ({}); got {max_size}. See type docs for rationale.",
+                turbo::BLOCK_SIZE
+            );
+        }
         Self {
             keys: None,
             values: None,
@@ -1086,6 +1178,13 @@ impl RotatingKVCache {
             offset: 0,
             idx: 0,
             step: 256,
+            mode,
+            key_scales: None,
+            val_scales: None,
+            v_packed: None,
+            v_norms: None,
+            turbo_params: None,
+            turbo_seed,
         }
     }
 
@@ -1110,8 +1209,30 @@ impl RotatingKVCache {
 
     /// Update cache with new key/value, rotating if necessary.
     ///
-    /// Returns the full cached keys/values.
+    /// Returns the full cached keys/values, always in FP16 — the public
+    /// contract is mode-independent. The `Turbo4Asym` path quantizes V on
+    /// write and dequantizes the visible window on read so attention kernels
+    /// see standard FP16 tensors regardless of stored representation.
     pub fn update_and_fetch(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        match self.mode {
+            KVCacheMode::Fp16 => self.update_and_fetch_fp16(new_keys, new_values),
+            KVCacheMode::Int8 => {
+                // INT8 support for RotatingKVCache is not part of B9 / issue
+                // #481. Fall back to FP16 storage so the path is correct, even
+                // if mis-configured. A future sub-issue can wire INT8 in.
+                self.update_and_fetch_fp16(new_keys, new_values)
+            }
+            KVCacheMode::Turbo4Asym => {
+                self.update_and_fetch_turbo4_asym(new_keys, new_values)
+            }
+        }
+    }
+
+    fn update_and_fetch_fp16(
         &mut self,
         new_keys: UniquePtr<MlxArray>,
         new_values: UniquePtr<MlxArray>,
@@ -1318,6 +1439,302 @@ impl RotatingKVCache {
             self.values = Some(v_buffer);
             (k_out, v_out)
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Turbo4Asym update path (B9, issue #481, epic #458)
+    //
+    // Storage layout when `mode == KVCacheMode::Turbo4Asym`:
+    //   - keys     : [B, H, max_size, K_dim]    FP16 — same as Fp16 path
+    //   - v_packed : [B, H, max_size, V_dim/2]  UINT8 — nibble-packed indices
+    //   - v_norms  : [B, H, max_size, 1]        FP16 — per-token V L2 norms
+    //   - values   : None — Turbo4Asym never stores fp16 V
+    //
+    // Block alignment invariant: `max_size % BLOCK_SIZE == 0` (asserted by
+    // `new_with_mode`). Quantization is per-token along `head_dim`, so each
+    // ring-buffer slot is independent — wraparound at any 32-aligned `idx`
+    // lands on a fresh slot whose packed bytes can be overwritten without
+    // disturbing neighbours.
+    // -----------------------------------------------------------------------
+
+    fn update_and_fetch_turbo4_asym(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let new_seq_len = {
+            let shape = ffi::array_shape(&new_keys);
+            shape[2]
+        };
+
+        // Cast incoming K/V to FP16 to match the cache contract, then quantize
+        // V before any cache mutation.
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        // Lazy-init TurboQuantParams once V head_dim is known.
+        if self.turbo_params.is_none() {
+            let v_shape = ffi::array_shape(&new_values_f16);
+            let v_head_dim = v_shape[3] as u32;
+            self.turbo_params = Some(turbo::TurboQuantParams::new(v_head_dim, self.turbo_seed));
+        }
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params just initialised");
+        let (v_packed_new, v_norms_new) =
+            turbo::quant::quantize_v_turbo4(&new_values_f16, params);
+
+        if new_seq_len > 1 {
+            self.update_turbo4_concat(new_keys_f16, v_packed_new, v_norms_new, new_seq_len)
+        } else {
+            self.update_turbo4_in_place(new_keys_f16, v_packed_new, v_norms_new)
+        }
+    }
+
+    /// Multi-token (prefill) path for Turbo4Asym. Mirrors
+    /// `update_concat` but operates on the V sidecars instead of an FP16 V
+    /// buffer. K side is identical to the FP16 path.
+    fn update_turbo4_concat(
+        &mut self,
+        new_keys_f16: UniquePtr<MlxArray>,
+        v_packed_new: UniquePtr<MlxArray>,
+        v_norms_new: UniquePtr<MlxArray>,
+        new_seq_len: i32,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        // First update: just install (Same shape semantics as Fp16 path.)
+        if self.keys.is_none() {
+            self.offset += new_seq_len;
+            self.idx = new_seq_len;
+            self.keys = Some(ffi::contiguous(&new_keys_f16, false));
+            self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
+            self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            // Build fp16 V output by dequantizing the packed slice we just stored.
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("turbo_params populated by caller");
+            let v_out = turbo::quant::dequantize_v_turbo4(&v_packed_new, &v_norms_new, params);
+            return (new_keys_f16, v_out);
+        }
+
+        let current_seq_len = {
+            let shape = ffi::array_shape(self.keys.as_ref().unwrap());
+            shape[2]
+        };
+
+        let concat_k = concatenate(self.keys.as_ref().unwrap(), &new_keys_f16, 2);
+        let concat_vp = concatenate(self.v_packed.as_ref().unwrap(), &v_packed_new, 2);
+        let concat_vn = concatenate(self.v_norms.as_ref().unwrap(), &v_norms_new, 2);
+
+        let total_len = current_seq_len + new_seq_len;
+        self.offset += new_seq_len;
+
+        // Block alignment is preserved: per-token quantization means slicing
+        // a packed buffer along axis=2 always yields valid packed tokens. No
+        // partial-block re-quantization is needed regardless of `start`.
+        if total_len > self.max_size {
+            let start = total_len - self.max_size;
+            let k = ffi::slice(
+                &concat_k,
+                &[0, 0, start, 0],
+                &[i32::MAX, i32::MAX, total_len, i32::MAX],
+            );
+            let vp = ffi::slice(
+                &concat_vp,
+                &[0, 0, start, 0],
+                &[i32::MAX, i32::MAX, total_len, i32::MAX],
+            );
+            let vn = ffi::slice(
+                &concat_vn,
+                &[0, 0, start, 0],
+                &[i32::MAX, i32::MAX, total_len, i32::MAX],
+            );
+            self.idx = self.max_size;
+            self.keys = Some(ffi::contiguous(&k, false));
+            self.v_packed = Some(ffi::contiguous(&vp, false));
+            self.v_norms = Some(ffi::contiguous(&vn, false));
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("turbo_params populated by caller");
+            let v_out = turbo::quant::dequantize_v_turbo4(&vp, &vn, params);
+            (k, v_out)
+        } else {
+            self.idx = total_len;
+            self.keys = Some(ffi::contiguous(&concat_k, false));
+            self.v_packed = Some(ffi::contiguous(&concat_vp, false));
+            self.v_norms = Some(ffi::contiguous(&concat_vn, false));
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("turbo_params populated by caller");
+            let v_out =
+                turbo::quant::dequantize_v_turbo4(&concat_vp, &concat_vn, params);
+            (concat_k, v_out)
+        }
+    }
+
+    /// Single-token (decode) path for Turbo4Asym. Mirrors `update_in_place`,
+    /// writing the new packed token + norm into the ring buffer at `self.idx`.
+    /// Wraparound at `idx == max_size` resets `idx` to 0 — because each token
+    /// is independently quantized, the overwrite is byte-correct without any
+    /// re-quantize work.
+    fn update_turbo4_in_place(
+        &mut self,
+        new_keys_f16: UniquePtr<MlxArray>,
+        v_packed_new: UniquePtr<MlxArray>,
+        v_norms_new: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        // First-call init mirrors the FP16 path: pre-allocate the ring buffer.
+        if self.keys.is_none() {
+            let shape = ffi::array_shape(&new_keys_f16);
+            let batch = shape[0];
+            let heads = shape[1];
+            let head_dim = shape[3];
+            let vp_shape = ffi::array_shape(&v_packed_new);
+            let v_packed_dim = vp_shape[3];
+
+            let k_zeros = ffi::zeros(
+                &[batch, heads, self.max_size, head_dim],
+                ffi::array_dtype(&new_keys_f16),
+            );
+            let vp_zeros = ffi::zeros(
+                &[batch, heads, self.max_size, v_packed_dim],
+                dtype::UINT8,
+            );
+            let vn_zeros = ffi::zeros(&[batch, heads, self.max_size, 1], dtype::FLOAT16);
+
+            let k = ffi::slice_update(
+                &k_zeros,
+                &new_keys_f16,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, head_dim],
+            );
+            let vp = ffi::slice_update(
+                &vp_zeros,
+                &v_packed_new,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, v_packed_dim],
+            );
+            let vn = ffi::slice_update(
+                &vn_zeros,
+                &v_norms_new,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, 1],
+            );
+
+            self.offset = 1;
+            self.idx = 1;
+            self.keys = Some(ffi::contiguous(&k, false));
+            self.v_packed = Some(ffi::contiguous(&vp, false));
+            self.v_norms = Some(ffi::contiguous(&vn, false));
+
+            // Build the FP16 V view from the single packed token.
+            let params = self
+                .turbo_params
+                .as_ref()
+                .expect("turbo_params populated by caller");
+            let vp_slice = ffi::slice(&vp, &[0, 0, 0, 0], &[batch, heads, 1, v_packed_dim]);
+            let vn_slice = ffi::slice(&vn, &[0, 0, 0, 0], &[batch, heads, 1, 1]);
+            let v_out = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
+            let k_out = ffi::slice(&k, &[0, 0, 0, 0], &[batch, heads, 1, head_dim]);
+            return (k_out, v_out);
+        }
+
+        let mut k_buffer = self.keys.take().unwrap();
+        let mut vp_buffer = self.v_packed.take().unwrap();
+        let mut vn_buffer = self.v_norms.take().unwrap();
+
+        let shape = ffi::array_shape(&k_buffer);
+        let batch = shape[0];
+        let heads = shape[1];
+        let buffer_size = shape[2];
+        let head_dim = shape[3];
+        let vp_shape = ffi::array_shape(&vp_buffer);
+        let v_packed_dim = vp_shape[3];
+
+        // Lazy buffer growth (mirrors fp16 path). For Turbo4Asym this only
+        // fires before the first wraparound; once `buffer_size == max_size`
+        // we stay there forever.
+        if self.idx >= buffer_size && buffer_size < self.max_size {
+            let grow_by = self.step.min(self.max_size - buffer_size).max(0);
+            if grow_by > 0 {
+                let k_zeros = ffi::zeros(
+                    &[batch, heads, grow_by, head_dim],
+                    ffi::array_dtype(&new_keys_f16),
+                );
+                let vp_zeros = ffi::zeros(
+                    &[batch, heads, grow_by, v_packed_dim],
+                    dtype::UINT8,
+                );
+                let vn_zeros = ffi::zeros(&[batch, heads, grow_by, 1], dtype::FLOAT16);
+                k_buffer = concatenate(&k_buffer, &k_zeros, 2);
+                vp_buffer = concatenate(&vp_buffer, &vp_zeros, 2);
+                vn_buffer = concatenate(&vn_buffer, &vn_zeros, 2);
+            }
+        }
+
+        // Wraparound. Per-token independence makes this a simple in-place
+        // overwrite; no block-edge re-quantization is required.
+        if self.idx >= self.max_size {
+            self.idx = 0;
+        }
+
+        let pos = self.idx;
+        let k_buffer = ffi::slice_update(
+            &k_buffer,
+            &new_keys_f16,
+            &[0, 0, pos, 0],
+            &[batch, heads, pos + 1, head_dim],
+        );
+        let vp_buffer = ffi::slice_update(
+            &vp_buffer,
+            &v_packed_new,
+            &[0, 0, pos, 0],
+            &[batch, heads, pos + 1, v_packed_dim],
+        );
+        let vn_buffer = ffi::slice_update(
+            &vn_buffer,
+            &v_norms_new,
+            &[0, 0, pos, 0],
+            &[batch, heads, pos + 1, 1],
+        );
+
+        self.offset += 1;
+        self.idx += 1;
+
+        // Build the FP16 V view from the visible window and return.
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params populated by caller");
+        let result = if self.offset < self.max_size {
+            let visible = self.offset;
+            let k_out = ffi::slice(
+                &k_buffer,
+                &[0, 0, 0, 0],
+                &[batch, heads, visible, head_dim],
+            );
+            let vp_view = ffi::slice(
+                &vp_buffer,
+                &[0, 0, 0, 0],
+                &[batch, heads, visible, v_packed_dim],
+            );
+            let vn_view = ffi::slice(&vn_buffer, &[0, 0, 0, 0], &[batch, heads, visible, 1]);
+            let v_out = turbo::quant::dequantize_v_turbo4(&vp_view, &vn_view, params);
+            (k_out, v_out)
+        } else {
+            // Ring is full — return the contiguous full buffer view (matches
+            // fp16 semantics: callers see the complete sliding window).
+            let k_out = ffi::contiguous(&k_buffer, false);
+            let v_out = turbo::quant::dequantize_v_turbo4(&vp_buffer, &vn_buffer, params);
+            (k_out, v_out)
+        };
+        self.keys = Some(k_buffer);
+        self.v_packed = Some(vp_buffer);
+        self.v_norms = Some(vn_buffer);
+        result
     }
 
     /// Get the current offset

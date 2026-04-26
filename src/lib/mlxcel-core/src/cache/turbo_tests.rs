@@ -491,3 +491,342 @@ fn turbo4_asym_nbytes_includes_v_sidecars_and_excludes_values() {
     // Values tensor stays None — it should NOT contribute to the byte count.
     assert!(cache.values.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// RotatingKVCache + Turbo4Asym (B9, issue #481)
+// ---------------------------------------------------------------------------
+
+/// Constructor must reject non-32-aligned `max_size` for `Turbo4Asym`.
+#[test]
+#[should_panic(expected = "max_size must be a positive multiple of")]
+fn rotating_turbo4_rejects_misaligned_max_size() {
+    // 100 is not divisible by 32 — must fail loudly.
+    let _ = RotatingKVCache::new_with_mode(100, KVCacheMode::Turbo4Asym);
+}
+
+/// Constructor must accept the canonical sliding-window sizes used by today's
+/// models (Gemma 3 4 K, Gemma 4 8 K, Ministral 3 8 K, etc.).
+#[test]
+fn rotating_turbo4_accepts_canonical_window_sizes() {
+    for &n in &[32, 64, 256, 1024, 4096, 8192] {
+        let cache = RotatingKVCache::new_with_mode(n, KVCacheMode::Turbo4Asym);
+        assert_eq!(cache.max_size, n);
+        assert_eq!(cache.mode, KVCacheMode::Turbo4Asym);
+        assert!(cache.is_empty());
+    }
+}
+
+/// Backward-compat: the old `RotatingKVCache::new(max_size)` constructor must
+/// still produce an FP16 cache so existing models keep working unchanged.
+#[test]
+fn rotating_new_defaults_to_fp16_mode() {
+    let cache = RotatingKVCache::new(4096);
+    assert_eq!(cache.mode, KVCacheMode::Fp16);
+    assert!(cache.v_packed.is_none());
+    assert!(cache.v_norms.is_none());
+}
+
+/// Single-token decode update returns FP16 V regardless of the underlying
+/// packed storage.
+#[test]
+fn rotating_turbo4_single_token_returns_fp16_v() {
+    let head_dim = 128;
+    let mut cache = RotatingKVCache::new_with_mode(64, KVCacheMode::Turbo4Asym);
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 201);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 202);
+    let (k_out, v_out) = cache.update_and_fetch(k, v);
+    assert_eq!(ffi::array_dtype(&v_out), dtype::FLOAT16);
+    assert_eq!(ffi::array_shape(&v_out)[3], head_dim);
+    assert_eq!(ffi::array_dtype(&k_out), dtype::FLOAT16);
+    assert!(cache.v_packed.is_some());
+    assert!(cache.v_norms.is_some());
+    assert!(cache.values.is_none());
+    assert_eq!(cache.get_offset(), 1);
+}
+
+/// Multi-token (prefill) update populates the packed sidecars and visible
+/// window matches the input sequence length when below `max_size`.
+#[test]
+fn rotating_turbo4_prefill_populates_sidecars() {
+    let head_dim = 64;
+    let mut cache = RotatingKVCache::new_with_mode(128, KVCacheMode::Turbo4Asym);
+    let k = synth_kv_tensor(1, 1, 8, head_dim, 211);
+    let v = synth_kv_tensor(1, 1, 8, head_dim, 212);
+    let (k_out, v_out) = cache.update_and_fetch(k, v);
+    assert_eq!(ffi::array_shape(&k_out)[2], 8);
+    assert_eq!(ffi::array_shape(&v_out)[2], 8);
+    assert_eq!(cache.get_offset(), 8);
+    let vp_shape = ffi::array_shape(cache.v_packed.as_ref().unwrap());
+    assert_eq!(vp_shape[2], 8); // packed rows match offset, not max_size
+    assert_eq!(vp_shape[3], head_dim / 2); // nibble-packed
+}
+
+/// Wraparound write at `idx == max_size` produces correct dequantized output
+/// for the freshly-written token. This is the core invariant for B9: a
+/// single-token decode that lands on slot 0 must overwrite cleanly.
+#[test]
+fn rotating_turbo4_wraparound_overwrites_oldest_slot() {
+    let head_dim: i32 = 64;
+    let max_size: i32 = 32; // exactly one BLOCK_SIZE
+
+    let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
+
+    // Prime the cache with `max_size` distinct tokens so the next write wraps.
+    for t in 0..max_size {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 1000 + t as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 2000 + t as u32);
+        cache.update_and_fetch(k, v);
+    }
+    assert_eq!(cache.get_offset(), max_size);
+
+    // Write one more token — this lands on physical slot 0, overwriting the
+    // very first token.
+    let new_k = synth_kv_tensor(1, 1, 1, head_dim, 31337);
+    let new_v_data: Vec<f32> = (0..head_dim).map(|i| (i as f32 / head_dim as f32) - 0.5).collect();
+    let new_v = ffi::from_slice_f32(&new_v_data, &[1, 1, 1, head_dim]);
+
+    let (_k_out, v_out) = cache.update_and_fetch(new_k, new_v);
+    assert_eq!(cache.get_offset(), max_size + 1);
+
+    // The visible window is exactly `max_size` tokens (full ring).
+    assert_eq!(ffi::array_shape(&v_out)[2], max_size);
+
+    // The packed bytes for slot 0 must reflect the new token. Read the
+    // packed buffer at slot 0, dequantize via params, and compare relative
+    // L2 against the input. Allow up to 15% per-token reconstruction error
+    // (the same bound as direct quant tests).
+    let params = cache.turbo_params.as_ref().unwrap();
+    let vp_buf = cache.v_packed.as_ref().unwrap();
+    let vn_buf = cache.v_norms.as_ref().unwrap();
+    let vp_slot = ffi::slice(vp_buf, &[0, 0, 0, 0], &[1, 1, 1, head_dim / 2]);
+    let vn_slot = ffi::slice(vn_buf, &[0, 0, 0, 0], &[1, 1, 1, 1]);
+    let v_recovered_arr = super::turbo::quant::dequantize_v_turbo4(&vp_slot, &vn_slot, params);
+    let v_recovered = flatten_fp32(&v_recovered_arr);
+    let mut num = 0.0_f32;
+    let mut den = 0.0_f32;
+    for i in 0..head_dim as usize {
+        let diff = new_v_data[i] - v_recovered[i];
+        num += diff * diff;
+        den += new_v_data[i] * new_v_data[i];
+    }
+    let rel = (num / den.max(1e-12)).sqrt();
+    assert!(
+        rel < 0.15,
+        "wraparound overwrite at slot 0 must produce correct dequantized V: \
+         relative L2 error {rel:.4} > 15% — block alignment likely broken"
+    );
+}
+
+/// Block alignment invariant: at the wraparound boundary, every 32-token
+/// block must contain self-consistent packed bytes (i.e., per-token quant
+/// is independent so each slot decodes correctly regardless of its
+/// neighbours). Verifies that writing a wrap-around token does NOT corrupt
+/// the previous block.
+#[test]
+fn rotating_turbo4_wraparound_preserves_other_block_data() {
+    let head_dim: i32 = 64;
+    let max_size: i32 = 64; // two BLOCK_SIZE blocks
+
+    let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
+
+    // Write a sentinel token at slot 31 (last token in block 0).
+    let sentinel_data: Vec<f32> =
+        (0..head_dim).map(|i| (i as f32 / head_dim as f32) - 0.25).collect();
+    let sentinel_v = ffi::from_slice_f32(&sentinel_data, &[1, 1, 1, head_dim]);
+    let sentinel_k = synth_kv_tensor(1, 1, 1, head_dim, 999);
+
+    // Prime: 31 nondescript tokens, then sentinel, then 32 more.
+    for t in 0..31 {
+        cache.update_and_fetch(
+            synth_kv_tensor(1, 1, 1, head_dim, 100 + t as u32),
+            synth_kv_tensor(1, 1, 1, head_dim, 200 + t as u32),
+        );
+    }
+    cache.update_and_fetch(sentinel_k, sentinel_v);
+    for t in 0..32 {
+        cache.update_and_fetch(
+            synth_kv_tensor(1, 1, 1, head_dim, 300 + t as u32),
+            synth_kv_tensor(1, 1, 1, head_dim, 400 + t as u32),
+        );
+    }
+    // Now write a wraparound token at physical slot 0 (one past max_size).
+    cache.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 31337),
+        synth_kv_tensor(1, 1, 1, head_dim, 31338),
+    );
+    assert_eq!(cache.get_offset(), max_size + 1);
+
+    // The sentinel at physical slot 31 (block 0, last position) MUST still
+    // dequantize correctly — block alignment + per-token independence
+    // guarantee the wraparound write to slot 0 cannot have touched slot 31.
+    let params = cache.turbo_params.as_ref().unwrap();
+    let vp_buf = cache.v_packed.as_ref().unwrap();
+    let vn_buf = cache.v_norms.as_ref().unwrap();
+    let vp_sentinel = ffi::slice(vp_buf, &[0, 0, 31, 0], &[1, 1, 32, head_dim / 2]);
+    let vn_sentinel = ffi::slice(vn_buf, &[0, 0, 31, 0], &[1, 1, 32, 1]);
+    let v_recovered_arr =
+        super::turbo::quant::dequantize_v_turbo4(&vp_sentinel, &vn_sentinel, params);
+    let v_recovered = flatten_fp32(&v_recovered_arr);
+    let mut num = 0.0_f32;
+    let mut den = 0.0_f32;
+    for i in 0..head_dim as usize {
+        let diff = sentinel_data[i] - v_recovered[i];
+        num += diff * diff;
+        den += sentinel_data[i] * sentinel_data[i];
+    }
+    let rel = (num / den.max(1e-12)).sqrt();
+    assert!(
+        rel < 0.15,
+        "block-alignment invariant violated: sentinel at slot 31 corrupted by \
+         wraparound write to slot 0 (relative L2 = {rel:.4})"
+    );
+}
+
+/// FP16 mode of `RotatingKVCache` must remain bit-identical to the pre-B9
+/// behavior — we cannot regress non-Turbo paths.
+#[test]
+fn rotating_fp16_mode_unchanged_by_b9() {
+    let head_dim = 32;
+    let mut cache = RotatingKVCache::new_with_mode(8, KVCacheMode::Fp16);
+    let k = synth_kv_tensor(1, 1, 4, head_dim, 50);
+    let v = synth_kv_tensor(1, 1, 4, head_dim, 51);
+    let (_k_out, v_out) = cache.update_and_fetch(k, v);
+    let v_out_shape = ffi::array_shape(&v_out);
+    assert_eq!(v_out_shape[2], 4);
+    // No Turbo sidecars in FP16 mode.
+    assert!(cache.v_packed.is_none());
+    assert!(cache.v_norms.is_none());
+    // Standard `values` buffer is populated.
+    assert!(cache.values.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// detach / install_detached round-trip on RotatingKVCache + Turbo4Asym
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rotating_turbo4_clone_handle_round_trip_preserves_sidecars() {
+    let head_dim = 64;
+    let max_size = 64;
+    let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
+
+    // Populate enough tokens to exceed half the ring (so `idx` matters).
+    for t in 0..40 {
+        cache.update_and_fetch(
+            synth_kv_tensor(1, 1, 1, head_dim, 800 + t as u32),
+            synth_kv_tensor(1, 1, 1, head_dim, 900 + t as u32),
+        );
+    }
+    assert_eq!(cache.get_offset(), 40);
+    let pre_idx_offset = cache.get_offset();
+
+    let pre_vp = ffi::array_to_raw_bytes(cache.v_packed.as_ref().unwrap());
+    let pre_vn = ffi::array_to_raw_bytes(cache.v_norms.as_ref().unwrap());
+    let pre_seed = cache.turbo_seed;
+
+    let handle = cache.clone_handle();
+    assert_eq!(handle.mode(), KVCacheMode::Turbo4Asym);
+    assert_eq!(handle.max_size(), max_size);
+    assert_eq!(handle.seq_len(), pre_idx_offset);
+
+    // Source cache should be empty after clone_handle.
+    assert!(cache.is_empty());
+    assert!(cache.v_packed.is_none());
+    assert!(cache.v_norms.is_none());
+    assert_eq!(cache.get_offset(), 0);
+
+    let mut restored = RotatingKVCache::new_with_mode_and_seed(
+        max_size,
+        KVCacheMode::Turbo4Asym,
+        pre_seed,
+    );
+    restored.install_detached(handle).unwrap();
+
+    assert_eq!(restored.get_offset(), pre_idx_offset);
+    assert_eq!(restored.max_size, max_size);
+    assert_eq!(restored.mode, KVCacheMode::Turbo4Asym);
+    assert!(restored.v_packed.is_some());
+    assert!(restored.v_norms.is_some());
+    assert!(restored.turbo_params.is_some());
+    assert_eq!(restored.turbo_seed, pre_seed);
+
+    let post_vp = ffi::array_to_raw_bytes(restored.v_packed.as_ref().unwrap());
+    let post_vn = ffi::array_to_raw_bytes(restored.v_norms.as_ref().unwrap());
+    assert_eq!(pre_vp, post_vp, "v_packed must survive detach/adopt bit-for-bit");
+    assert_eq!(pre_vn, post_vn, "v_norms must survive detach/adopt bit-for-bit");
+}
+
+/// `idx` and `offset` must round-trip across detach/adopt so wraparound
+/// state is preserved. Without this, an adopted cache that was already in
+/// the wrap-around regime would silently fall back to "no wraparound yet".
+#[test]
+fn rotating_turbo4_detach_preserves_idx_after_wraparound() {
+    let head_dim = 64;
+    let max_size = 32; // one BLOCK_SIZE — easy to exhaust
+    let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
+
+    // Drive into wrap-around: write `max_size + 5` tokens.
+    for t in 0..(max_size + 5) {
+        cache.update_and_fetch(
+            synth_kv_tensor(1, 1, 1, head_dim, 700 + t as u32),
+            synth_kv_tensor(1, 1, 1, head_dim, 800 + t as u32),
+        );
+    }
+    let pre_offset = cache.get_offset();
+    assert_eq!(pre_offset, max_size + 5);
+
+    let handle = cache.clone_handle();
+    assert_eq!(handle.seq_len(), pre_offset);
+
+    let mut restored = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
+    restored.install_detached(handle).unwrap();
+    assert_eq!(restored.get_offset(), pre_offset);
+    // `visible_len()` should still be max_size (we're past wraparound).
+    assert_eq!(restored.visible_len(), max_size);
+    // Continuing to write must not corrupt the ring. One more token brings
+    // us to offset = max_size + 6, still wrapped.
+    let (_k, v_out) = restored.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 90001),
+        synth_kv_tensor(1, 1, 1, head_dim, 90002),
+    );
+    assert_eq!(restored.get_offset(), pre_offset + 1);
+    assert_eq!(ffi::array_shape(&v_out)[2], max_size);
+}
+
+/// Install on a non-empty cache must error to prevent silent buffer drops.
+#[test]
+fn rotating_install_detached_rejects_non_empty_target() {
+    let mut a = RotatingKVCache::new_with_mode(32, KVCacheMode::Turbo4Asym);
+    a.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, 64, 1),
+        synth_kv_tensor(1, 1, 1, 64, 2),
+    );
+
+    let mut b = RotatingKVCache::new_with_mode(32, KVCacheMode::Turbo4Asym);
+    b.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, 64, 3),
+        synth_kv_tensor(1, 1, 1, 64, 4),
+    );
+
+    let handle = a.clone_handle();
+    let err = b.install_detached(handle).unwrap_err();
+    assert!(err.contains("not empty"), "expected non-empty error, got: {err}");
+}
+
+/// LOW-1 parity with `KVCache`: `clone_handle` clears `turbo_params` on the
+/// source so the slot can be reused with a different head_dim if needed.
+#[test]
+fn rotating_turbo4_clone_handle_clears_turbo_params_on_source() {
+    let head_dim = 128;
+    let mut cache = RotatingKVCache::new_with_mode(64, KVCacheMode::Turbo4Asym);
+    cache.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 11),
+        synth_kv_tensor(1, 1, 1, head_dim, 12),
+    );
+    assert!(cache.turbo_params.is_some());
+    let _handle = cache.clone_handle();
+    assert!(
+        cache.turbo_params.is_none(),
+        "clone_handle must clear turbo_params on source for slot reuse"
+    );
+}
