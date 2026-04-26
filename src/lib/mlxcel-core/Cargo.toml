@@ -37,3 +37,7 @@ cmake = "0.1"
 [[example]]
 name = "benchmark"
 path = "examples/benchmark.rs"
+
+[[example]]
+name = "wht_microbench"
+path = "examples/wht_microbench.rs"

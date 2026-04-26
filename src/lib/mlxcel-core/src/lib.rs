@@ -1970,7 +1970,7 @@ pub use ffi::*;
 
 // Re-export cxx::UniquePtr for consumers of this crate
 pub use cxx::UniquePtr;
-pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned};
+pub use ops::{concatenate, divide_scalar, multiply_scalar, stack, stack_owned, wht};
 
 // Re-export sampling primitives needed by generation-loop wiring (B8) and server layers.
 pub use sampling::TokenBiasMap;

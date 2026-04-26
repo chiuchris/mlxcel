@@ -68,3 +68,46 @@ pub fn divide_scalar(a: &ffi::MlxArray, scalar: f32) -> UniquePtr<ffi::MlxArray>
     let scalar_array = ffi::full_f32(&[1], scalar, a_dtype);
     ffi::divide(a, &scalar_array)
 }
+
+/// Walsh–Hadamard Transform along the last axis (B0 spike for issue #470,
+/// epic #458 — TurboQuant KV cache compression).
+///
+/// Applies an orthonormal Hadamard transform to the last axis of `x`, scaled by
+/// `1/sqrt(N)` where `N` is the size of the last axis. This is the "graph-only"
+/// path the spike validates: it delegates to the MLX-native `hadamard_transform`
+/// op which dispatches to the platform's optimized backend (Metal kernel on
+/// Apple Silicon, the same one used by community Hadamard-quantization codepaths
+/// upstream).
+///
+/// **Supported head_dim**: powers of 2 only — `{64, 128, 256}` covers the
+/// production model matrix in mlxcel. The MLX op also accepts `m * 2^k` for
+/// `m ∈ {12, 20, 28}` (i.e. `{80, 96, 192, …}`) but uses a different
+/// normalization for those, so the involution `wht(wht(x)) ≈ x` does not hold
+/// — they are intentionally out of scope per the issue body's "Out of scope"
+/// statement and current model coverage.
+///
+/// This is the foundational op that the asymmetric KV compression sub-issues
+/// (B2 onward) compose with random sign flips to form the structured rotation
+/// `D2 · H · D1 · x`. The sign-flip wiring is intentionally out of scope here.
+///
+/// # Panics
+///
+/// Panics if the last axis size is 0 or not a power of 2. The MLX C++ side
+/// throws `std::invalid_argument` for unsupported sizes, but the cxx-generated
+/// extern is `noexcept` so an unguarded thrown exception aborts the process via
+/// `std::terminate`. Validating in Rust gives callers a recoverable panic with
+/// a clear message instead. (Production models all use power-of-2 head_dims so
+/// this path is unreachable in normal usage; the guard exists so future B2
+/// integration can rely on a sane error contract.)
+///
+/// Used by: TurboQuant cache compression (planned: cache::turbo, sub-issues
+/// #472–#485 under epic #458).
+pub fn wht(x: &ffi::MlxArray) -> UniquePtr<ffi::MlxArray> {
+    let shape = ffi::array_shape(x);
+    let last = shape.last().copied().unwrap_or(0);
+    assert!(
+        last > 0 && (last as u32).is_power_of_two(),
+        "wht: last axis must be a non-zero power of 2; got shape={shape:?}"
+    );
+    ffi::hadamard_transform(x)
+}
