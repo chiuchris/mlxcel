@@ -806,6 +806,38 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         .kv_cache_mode
         .parse::<KVCacheMode>()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
+
+    // Boundary-V (B6, issue #478): the CLI flag --turbo-boundary-v wins over
+    // any pre-existing MLXCEL_KV_BOUNDARY_V_LAYERS env value. We translate
+    // the flag into the env var so cache::turbo::boundary::boundary_v_layers_from_env
+    // (used by CxxGenerator::new_with_kv_mode and reset_with_model) picks it
+    // up without threading another argument through the entire generation
+    // surface. SAFETY: setting an env var is process-global, but this happens
+    // before we spawn the generator and the CLI binary is single-threaded
+    // before this point.
+    if let Some(boundary) = args.generation.turbo_boundary_v {
+        // SAFETY: this set_var runs during the CLI startup path before any
+        // generator thread is spawned and before MLX kicks off any
+        // background streams that read environment variables. The mlxcel
+        // binary is single-threaded at this point, so no other thread can
+        // observe a torn read of MLXCEL_KV_BOUNDARY_V_LAYERS.
+        unsafe {
+            std::env::set_var(
+                mlxcel_core::cache::turbo::BOUNDARY_V_ENV,
+                boundary.to_string(),
+            );
+        }
+        if matches!(
+            kv_cache_mode,
+            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+        ) {
+            println!(
+                "Boundary-V: protecting {boundary} layer(s) on each end at Fp16 \
+                 (issue #478, epic #458)"
+            );
+        }
+    }
+
     match kv_cache_mode {
         KVCacheMode::Int8 => {
             println!("KV cache mode: int8 (per-token absmax quantization)");

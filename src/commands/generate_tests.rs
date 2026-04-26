@@ -105,6 +105,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             no_chat_template: false,
             recommend_quant: false,
             kv_cache_mode: "fp16".to_string(),
+            turbo_boundary_v: None,
         },
         sampling: crate::SamplingOptions {
             temp: 0.0,

@@ -20,9 +20,11 @@
 //!
 //! | Sub-module    | Sub-issue   | Status   | Description                          |
 //! |---------------|-------------|----------|--------------------------------------|
-//! | `codebook`    | B1 (#472)   | ✓ done   | Lloyd-Max centroid generator         |
-//! | `quant`       | B2/B4 (#474, #476) | ✓ done | V-side + K-side PolarQuant pipeline |
-//! | (more to come)| B3–B12      | pending  | Boundary-V, sparse-V, paged KV       |
+//! | `codebook`    | B1 (#472)   | done     | Lloyd-Max centroid generator         |
+//! | `quant`       | B2/B4 (#474, #476) | done | V-side + K-side PolarQuant pipeline |
+//! | `allowlist`   | B4 (#476)   | done     | Per-model symmetric Turbo4 gating    |
+//! | `boundary`    | B6 (#478)   | done     | First/last layer V protection policy |
+//! | (more to come)| B5/B8/B10–B12 | pending  | turbo3 / sparse-V / paged KV     |
 //!
 //! # Usage by downstream sub-issues
 //!
@@ -33,11 +35,17 @@
 //! ```
 
 pub mod allowlist;
+pub mod boundary;
 pub mod codebook;
 pub mod quant;
 
 pub use allowlist::{
     is_symmetric_turbo_allowed, symmetric_turbo_warning_message, ALLOWED_SYMMETRIC_TURBO_FAMILIES,
+};
+pub use boundary::{
+    boundary_mode_for, boundary_v_layers_from_env, is_boundary_layer, parse_boundary_v_str,
+    resolve_boundary_count, resolve_layer_mode, resolve_layer_modes, BOUNDARY_V_ENV,
+    BOUNDARY_V_ENV_ALT, DEFAULT_BOUNDARY_V_LAYERS,
 };
 
 // Re-export the most commonly used entry points for convenience

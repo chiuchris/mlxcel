@@ -616,10 +616,27 @@ impl CxxGenerator {
     ///
     /// Use `KVCacheMode::Int8` to halve KV cache memory at the cost of
     /// small per-token quantization error.
+    ///
+    /// When `kv_cache_mode` is one of the `Turbo4*` variants, the
+    /// **Boundary-V** policy (B6, issue #478, epic #458) is applied: the
+    /// first / last N transformer layers' caches are upgraded to
+    /// `KVCacheMode::Fp16` to recover the per-layer V-quantization quality
+    /// gap measured in `references/turboquant_plus/docs/papers/
+    /// layer-aware-v-compression.md`. The boundary count is read from the
+    /// `MLXCEL_KV_BOUNDARY_V_LAYERS` env var (default 2; `0` disables) and
+    /// clamped to `n_layers / 2`. For non-Turbo4 modes the policy is inert
+    /// — every layer's cache uses `kv_cache_mode` unchanged.
     pub fn new_with_kv_mode(num_layers: usize, kv_cache_mode: KVCacheMode) -> Self {
+        let requested = crate::cache::turbo::boundary_v_layers_from_env();
+        let layer_modes = crate::cache::turbo::resolve_layer_modes(
+            kv_cache_mode,
+            num_layers,
+            requested,
+        );
         Self {
-            caches: (0..num_layers)
-                .map(|_| KVCache::new_with_mode(kv_cache_mode))
+            caches: layer_modes
+                .into_iter()
+                .map(KVCache::new_with_mode)
                 .collect(),
             generated_tokens: Vec::new(),
             generation_stream: new_generation_stream(),
@@ -686,10 +703,18 @@ impl CxxGenerator {
     ///
     /// Must call `reset_with_model` instead when the model uses internal caches
     /// (e.g. Gemma3, Jamba, Mamba, NemotronH, etc.) to ensure those are also reset.
+    ///
+    /// Preserves the per-layer Boundary-V mode mapping (issue #478, epic #458)
+    /// computed at construction time: each layer's pre-existing
+    /// `KVCacheMode` (which may differ from `self.kv_cache_mode` for
+    /// boundary layers) is reused so quality protection survives a reset.
     pub fn reset(&mut self) {
-        let mode = self.kv_cache_mode;
         for cache in &mut self.caches {
-            *cache = KVCache::new_with_mode(mode);
+            // Preserve the resolved per-layer mode; the constructor already
+            // applied the boundary upgrade where needed and we must not
+            // collapse it back to a uniform Turbo4 setup here.
+            let layer_mode = cache.mode;
+            *cache = KVCache::new_with_mode(layer_mode);
         }
         self.generated_tokens.clear();
     }
@@ -700,21 +725,48 @@ impl CxxGenerator {
     /// their own state inside `make_caches()`. This method ensures both the
     /// generator's cache vector and the model's internal caches are cleared.
     /// The kv_cache_mode is applied to the freshly created caches.
+    ///
+    /// Honors the Boundary-V policy (issue #478): when `self.kv_cache_mode`
+    /// is one of the `Turbo4*` variants, the first / last N caches are
+    /// re-resolved to `KVCacheMode::Fp16` instead of the nominal mode.
+    /// The boundary count is read from `MLXCEL_KV_BOUNDARY_V_LAYERS` so a
+    /// runtime-tuned count is honored on every reset.
     pub fn reset_with_model<M: LanguageModel + ?Sized>(&mut self, model: &M) {
         self.caches = model.make_caches();
-        // Apply the configured KV cache mode to all freshly created caches
-        let mode = self.kv_cache_mode;
-        if mode != KVCacheMode::Fp16 {
-            for cache in &mut self.caches {
-                cache.mode = mode;
-            }
-        }
+        // Apply the configured KV cache mode (with Boundary-V upgrade) to
+        // all freshly created caches.
+        self.apply_kv_cache_mode_with_boundary_policy();
         self.generated_tokens.clear();
     }
 
     /// Get mutable access to caches (used by speculative decoding)
     pub fn caches_mut(&mut self) -> &mut [KVCache] {
         &mut self.caches
+    }
+
+    /// Apply the configured KV cache mode (with Boundary-V policy) to every
+    /// cache slot.
+    ///
+    /// Called from each generation entry point right after `ensure_model_caches`
+    /// rebuilds caches from `model.make_caches()` (which always uses the
+    /// default Fp16 mode). Centralizes the per-layer mode resolution so the
+    /// Boundary-V policy (issue #478) survives the entire generation lifecycle
+    /// including `reset_with_model` boundary cases.
+    ///
+    /// No-op when `self.kv_cache_mode == Fp16` — every layer is already FP16
+    /// so there is nothing to apply.
+    fn apply_kv_cache_mode_with_boundary_policy(&mut self) {
+        let nominal = self.kv_cache_mode;
+        if nominal == KVCacheMode::Fp16 {
+            return;
+        }
+        let n_layers = self.caches.len();
+        let requested = crate::cache::turbo::boundary_v_layers_from_env();
+        let layer_modes =
+            crate::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
+        for (cache, mode) in self.caches.iter_mut().zip(layer_modes.into_iter()) {
+            cache.mode = mode;
+        }
     }
 
     /// Generate tokens from the model (original implementation)
@@ -760,12 +812,10 @@ impl CxxGenerator {
         // (which always uses the default Fp16 mode), so re-apply kv_cache_mode
         // afterwards when a non-default mode is configured.
         ensure_model_caches(&mut self.caches, model);
-        let kv_mode = self.kv_cache_mode;
-        if kv_mode != KVCacheMode::Fp16 {
-            for cache in &mut self.caches {
-                cache.mode = kv_mode;
-            }
-        }
+        // Honor the Boundary-V policy (issue #478) when applying the
+        // nominal mode to per-layer caches: the first/last N layers stay
+        // at FP16 to recover the V-quantization quality gap.
+        self.apply_kv_cache_mode_with_boundary_policy();
 
         // Set generation stream as default for better pipelining
         install_default_stream(self.generation_stream.as_ref());
@@ -1023,12 +1073,10 @@ impl CxxGenerator {
 
         ensure_model_caches(&mut self.caches, model);
         // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches
-        let kv_mode = self.kv_cache_mode;
-        if kv_mode != KVCacheMode::Fp16 {
-            for cache in &mut self.caches {
-                cache.mode = kv_mode;
-            }
-        }
+        // Honor the Boundary-V policy (issue #478) when applying the
+        // nominal mode to per-layer caches: the first/last N layers stay
+        // at FP16 to recover the V-quantization quality gap.
+        self.apply_kv_cache_mode_with_boundary_policy();
 
         install_default_stream(self.generation_stream.as_ref());
 
@@ -1169,12 +1217,10 @@ impl CxxGenerator {
         seed_rng_if_needed(sampling);
         ensure_model_caches(&mut self.caches, model);
         // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches
-        let kv_mode = self.kv_cache_mode;
-        if kv_mode != KVCacheMode::Fp16 {
-            for cache in &mut self.caches {
-                cache.mode = kv_mode;
-            }
-        }
+        // Honor the Boundary-V policy (issue #478) when applying the
+        // nominal mode to per-layer caches: the first/last N layers stay
+        // at FP16 to recover the V-quantization quality gap.
+        self.apply_kv_cache_mode_with_boundary_policy();
         install_default_stream(self.generation_stream.as_ref());
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -1322,12 +1368,10 @@ impl CxxGenerator {
         // Ensure caches are initialized for this model.
         // Re-apply kv_cache_mode in case ensure_model_caches rebuilt caches.
         ensure_model_caches(&mut self.caches, model);
-        let kv_mode = self.kv_cache_mode;
-        if kv_mode != KVCacheMode::Fp16 {
-            for cache in &mut self.caches {
-                cache.mode = kv_mode;
-            }
-        }
+        // Honor the Boundary-V policy (issue #478) when applying the
+        // nominal mode to per-layer caches: the first/last N layers stay
+        // at FP16 to recover the V-quantization quality gap.
+        self.apply_kv_cache_mode_with_boundary_policy();
 
         // Set generation stream as default for better pipelining
         install_default_stream(self.generation_stream.as_ref());

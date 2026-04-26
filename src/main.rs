@@ -170,6 +170,25 @@ pub(crate) struct GenerationOptions {
     /// where KV cache becomes the memory bottleneck.
     #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     pub(crate) kv_cache_mode: String,
+
+    /// Number of boundary transformer layers to protect at higher precision
+    /// when a Turbo4* KV cache mode is active.
+    ///
+    /// Per `references/turboquant_plus/docs/papers/layer-aware-v-compression.md`,
+    /// the first 2 and last 2 V layers contribute disproportionately to
+    /// quality loss under aggressive V quantization. Keeping these 4 layers
+    /// at higher precision (Fp16) recovers 37–91% of the perplexity gap at
+    /// zero speed cost.
+    ///
+    /// `0` disables the policy entirely. The count is clamped to
+    /// `min(value, n_layers / 2)` so a too-large value on a shallow model
+    /// degrades gracefully into "every layer Fp16". Inert when
+    /// `--kv-cache-mode` is `fp16` or `int8`.
+    ///
+    /// Equivalent to setting `MLXCEL_KV_BOUNDARY_V_LAYERS=<value>` in the
+    /// environment; the CLI flag wins when both are present.
+    #[arg(long = "turbo-boundary-v", value_name = "COUNT")]
+    pub(crate) turbo_boundary_v: Option<i32>,
 }
 
 /// Sampling strategy options

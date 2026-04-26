@@ -830,3 +830,263 @@ fn rotating_turbo4_clone_handle_clears_turbo_params_on_source() {
         "clone_handle must clear turbo_params on source for slot reuse"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Boundary-V (B6, issue #478) integration tests
+// ---------------------------------------------------------------------------
+//
+// These integration tests cover the cache-side behavior of the boundary
+// policy. The pure-helper unit tests for the resolver itself live in
+// `cache/turbo/boundary.rs`.
+
+mod boundary_v {
+    use super::*;
+    use crate::cache::turbo::boundary::{
+        is_boundary_layer, resolve_boundary_count, resolve_layer_mode, resolve_layer_modes,
+        DEFAULT_BOUNDARY_V_LAYERS,
+    };
+
+    /// The default count must be the LA-V7 boundary width (2) per the
+    /// layer-aware-v-compression paper. Changing this constant requires a
+    /// quality-gate re-run on the B3 PPL/NIAH suite.
+    #[test]
+    fn default_boundary_count_is_two() {
+        assert_eq!(DEFAULT_BOUNDARY_V_LAYERS, 2);
+    }
+
+    /// Inert when the nominal mode is not a Turbo4* variant — every layer
+    /// keeps the nominal mode regardless of the boundary count.
+    #[test]
+    fn fp16_mode_is_unaffected_by_boundary_policy() {
+        let modes = resolve_layer_modes(KVCacheMode::Fp16, 8, 4);
+        assert!(modes.iter().all(|m| *m == KVCacheMode::Fp16));
+    }
+
+    #[test]
+    fn int8_mode_is_unaffected_by_boundary_policy() {
+        let modes = resolve_layer_modes(KVCacheMode::Int8, 8, 4);
+        assert!(modes.iter().all(|m| *m == KVCacheMode::Int8));
+    }
+
+    /// Boundary clamping: when `boundary >= n_layers / 2` every layer ends up
+    /// boundary-protected (degenerates into "all layers are Fp16").
+    #[test]
+    fn boundary_clamping_does_not_overprotect_shallow_models() {
+        // 4-layer model with requested boundary = 8 → clamp to 2 each side
+        // → all 4 layers are boundary, all upgrade to Fp16.
+        let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, 4, 8);
+        assert_eq!(modes.len(), 4);
+        for (i, m) in modes.iter().enumerate() {
+            assert_eq!(*m, KVCacheMode::Fp16, "layer {i} should be FP16");
+        }
+        // resolve_boundary_count clamps the raw value to n_layers / 2.
+        assert_eq!(resolve_boundary_count(8, 4), 2);
+    }
+
+    /// On a 32-layer model with default boundary count (2 each side), exactly
+    /// 4 layers (0, 1, 30, 31) get the FP16 upgrade — the rest stay
+    /// Turbo4Asym.
+    #[test]
+    fn typical_32_layer_split_protects_first_two_and_last_two() {
+        let n = 32;
+        let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, n, 2);
+        for i in 0..n {
+            let expected = if i < 2 || i >= n - 2 {
+                KVCacheMode::Fp16
+            } else {
+                KVCacheMode::Turbo4Asym
+            };
+            assert_eq!(modes[i], expected, "layer {i}");
+        }
+    }
+
+    /// The single-layer helper agrees with the bulk helper for every layer
+    /// position. Round-trip across all layers in the model.
+    #[test]
+    fn single_layer_helper_matches_bulk_for_turbo_modes() {
+        let n = 16;
+        for mode in [
+            KVCacheMode::Turbo4Asym,
+            KVCacheMode::Turbo4,
+            KVCacheMode::Turbo4Delegated,
+        ] {
+            let bulk = resolve_layer_modes(mode, n, 2);
+            for i in 0..n {
+                let single = resolve_layer_mode(mode, i, n, 2);
+                assert_eq!(
+                    bulk[i], single,
+                    "{mode:?} layer {i}: bulk vs single helper disagree"
+                );
+            }
+        }
+    }
+
+    /// Zero boundary disables the policy entirely — every layer keeps the
+    /// nominal mode even when nominal is a Turbo4* variant.
+    #[test]
+    fn zero_boundary_disables_policy() {
+        for mode in [
+            KVCacheMode::Turbo4Asym,
+            KVCacheMode::Turbo4,
+            KVCacheMode::Turbo4Delegated,
+        ] {
+            let modes = resolve_layer_modes(mode, 16, 0);
+            assert!(modes.iter().all(|m| *m == mode));
+        }
+    }
+
+    /// Boundary-protected layer caches actually allocate the FP16 buffers
+    /// (not the packed/turbo sidecars), and middle-layer caches use the
+    /// turbo sidecars. Verifies the resolver wires through to real cache
+    /// state, not just a stored field.
+    #[test]
+    fn boundary_layer_caches_use_fp16_storage() {
+        let head_dim = 64;
+        let n_layers = 8usize;
+
+        // Build the per-layer modes that the generator would produce.
+        let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, n_layers, 2);
+
+        let mut caches: Vec<KVCache> = modes
+            .iter()
+            .copied()
+            .map(KVCache::new_with_mode)
+            .collect();
+
+        // Push one token per cache so the storage paths actually fire.
+        for (i, cache) in caches.iter_mut().enumerate() {
+            let k = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 17 + 1);
+            let v = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 17 + 2);
+            cache.update_and_fetch(k, v);
+            assert_eq!(cache.seq_len(), 1, "layer {i} update");
+        }
+
+        for (i, cache) in caches.iter().enumerate() {
+            if is_boundary_layer(i, n_layers, 2) {
+                assert_eq!(
+                    cache.mode,
+                    KVCacheMode::Fp16,
+                    "layer {i} should be Fp16 (boundary)"
+                );
+                // FP16 mode keeps `values` populated and never touches the
+                // turbo sidecars.
+                assert!(
+                    cache.keys.is_some(),
+                    "boundary layer {i} must have FP16 keys"
+                );
+                assert!(
+                    cache.values.is_some(),
+                    "boundary layer {i} must have FP16 values"
+                );
+                assert!(
+                    cache.v_packed.is_none(),
+                    "boundary layer {i} must NOT have packed V (Fp16 mode)"
+                );
+                assert!(
+                    cache.v_norms.is_none(),
+                    "boundary layer {i} must NOT have V norms"
+                );
+            } else {
+                assert_eq!(
+                    cache.mode,
+                    KVCacheMode::Turbo4Asym,
+                    "layer {i} should be Turbo4Asym (middle)"
+                );
+                // Turbo4Asym keeps `values` empty; sidecars hold the V state.
+                assert!(
+                    cache.keys.is_some(),
+                    "middle layer {i} must have FP16 keys (asymmetric)"
+                );
+                assert!(
+                    cache.values.is_none(),
+                    "middle layer {i} must NOT have FP16 values"
+                );
+                assert!(
+                    cache.v_packed.is_some(),
+                    "middle layer {i} must have packed V"
+                );
+                assert!(
+                    cache.v_norms.is_some(),
+                    "middle layer {i} must have V norms"
+                );
+            }
+        }
+    }
+
+    /// nbytes() accounting reflects the per-layer mode mix: boundary layers
+    /// charge FP16 K + V, middle layers charge FP16 K + packed V + V norms.
+    /// The exact numbers depend on step-grown buffer capacity, so we assert
+    /// the inequality boundary > middle (FP16 V is more bytes than packed V
+    /// for the same logical content) instead of fixed totals.
+    #[test]
+    fn nbytes_reflects_per_layer_mode_mix() {
+        let head_dim = 64;
+        let n_layers = 8usize;
+        let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, n_layers, 2);
+
+        let mut boundary_total = 0usize;
+        let mut middle_total = 0usize;
+
+        for (i, mode) in modes.iter().enumerate() {
+            let mut cache = KVCache::new_with_mode(*mode);
+            let k = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 11 + 1);
+            let v = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 11 + 2);
+            cache.update_and_fetch(k, v);
+            let bytes = cache.nbytes();
+            if is_boundary_layer(i, n_layers, 2) {
+                boundary_total += bytes;
+            } else {
+                middle_total += bytes;
+            }
+            // Sanity: every cache reports non-zero memory after one token.
+            assert!(bytes > 0, "layer {i} mode {mode:?} reported zero nbytes");
+        }
+
+        // Boundary layers store full FP16 V; middle layers store packed V.
+        // For 1 token at head_dim=64:
+        // - FP16 V: 64 * 2 = 128 bytes (per layer logical, more after step
+        //   alignment to 256).
+        // - Packed V: 64 / 2 = 32 bytes + 1 norm fp16 = 34 bytes per layer.
+        // The step-grown buffers amplify both but boundary should always be
+        // strictly larger than middle (per layer).
+        let avg_boundary = boundary_total / 4; // 4 boundary layers
+        let avg_middle = middle_total / 4; // 4 middle layers
+        assert!(
+            avg_boundary > avg_middle,
+            "boundary avg={avg_boundary} should exceed middle avg={avg_middle} \
+             (FP16 storage is denser than packed Turbo4)"
+        );
+    }
+
+    /// Round-trip via clone_handle / install_detached preserves the per-layer
+    /// mode (the detach handle carries the layer's effective mode so adopt
+    /// rebuilds an identically-resolved cache slot).
+    #[test]
+    fn detach_adopt_preserves_per_layer_mode() {
+        let head_dim = 64;
+        let n_layers = 8usize;
+        let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, n_layers, 2);
+
+        for (i, mode) in modes.iter().enumerate() {
+            let mut src = KVCache::new_with_mode(*mode);
+            let k = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 7 + 1);
+            let v = synth_kv_tensor(1, 1, 1, head_dim, (i as u32) * 7 + 2);
+            src.update_and_fetch(k, v);
+
+            let handle = src.clone_handle();
+            assert_eq!(
+                handle.mode(),
+                *mode,
+                "detach handle must preserve layer {i} mode"
+            );
+
+            let mut dst = KVCache::new_with_mode(*mode);
+            dst.install_detached(handle).expect("install_detached");
+            assert_eq!(
+                dst.mode, *mode,
+                "adopted cache must match layer {i} resolved mode"
+            );
+            assert_eq!(dst.seq_len(), 1, "adopted cache must keep offset");
+        }
+    }
+}
