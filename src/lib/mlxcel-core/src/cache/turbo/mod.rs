@@ -18,11 +18,11 @@
 //! used by the KV cache compression pipeline. Sub-modules are added
 //! incrementally as the sub-issues land:
 //!
-//! | Sub-module    | Sub-issue | Status   | Description                      |
-//! |---------------|-----------|----------|----------------------------------|
-//! | `codebook`    | B1 (#472) | ✓ done   | Lloyd-Max centroid generator     |
-//! | `quant`       | B2 (#474) | ✓ done   | V-side PolarQuant pipeline       |
-//! | (more to come)| B3–B12    | pending  | Quality gates, K-side, paged KV  |
+//! | Sub-module    | Sub-issue   | Status   | Description                          |
+//! |---------------|-------------|----------|--------------------------------------|
+//! | `codebook`    | B1 (#472)   | ✓ done   | Lloyd-Max centroid generator         |
+//! | `quant`       | B2/B4 (#474, #476) | ✓ done | V-side + K-side PolarQuant pipeline |
+//! | (more to come)| B3–B12      | pending  | Boundary-V, sparse-V, paged KV       |
 //!
 //! # Usage by downstream sub-issues
 //!
@@ -32,8 +32,13 @@
 //! let cb = optimal_codebook(4, 128);
 //! ```
 
+pub mod allowlist;
 pub mod codebook;
 pub mod quant;
+
+pub use allowlist::{
+    is_symmetric_turbo_allowed, symmetric_turbo_warning_message, ALLOWED_SYMMETRIC_TURBO_FAMILIES,
+};
 
 // Re-export the most commonly used entry points for convenience
 pub use codebook::{
@@ -41,6 +46,7 @@ pub use codebook::{
     optimal_centroids, optimal_codebook, Codebook,
 };
 pub use quant::{
-    dequantize_v_turbo4, generate_signs, quantize_v_turbo4, turbo4_v_rotate, TurboQuantParams,
-    BLOCK_SIZE, V_BIT_WIDTH,
+    dequantize_k_turbo4, dequantize_v_turbo4, generate_signs, quantize_k_turbo4,
+    quantize_v_turbo4, turbo4_v_rotate, TurboQuantParams, BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET,
+    V_BIT_WIDTH,
 };

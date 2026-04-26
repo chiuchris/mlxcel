@@ -30,6 +30,14 @@
 //! reducing total KV memory by ~26% at long context. The compressed V buffers
 //! live in dedicated sidecar fields (`v_packed`, `v_norms`) and the
 //! quantize/dequantize helpers in [`turbo::quant`] handle the math.
+//!
+//! `KVCacheMode::Turbo4` (issue #476, epic #458) extends Turbo4Asym to a
+//! **symmetric** 4-bit K + 4-bit V layout, reducing KV memory by ~73% at
+//! long context. The K side mirrors the V side bit-for-bit but uses an
+//! independent pair of sign vectors (see [`turbo::quant::K_SEED_OFFSET`]).
+//! Symmetric Turbo4 is **dangerous** on dense Q4_K_M weights — see the
+//! [`turbo::allowlist`] module for the per-model allowlist that gates
+//! end-user opt-in.
 
 mod detach;
 mod paged;
@@ -74,6 +82,12 @@ pub enum KVCacheMode {
     /// PolarQuant with Walsh–Hadamard rotation for ~26% net KV memory savings
     /// at long context. See issue #474 / epic #458.
     Turbo4Asym,
+    /// Symmetric Turbo4-K + Turbo4-V. Both K and V use 4-bit PolarQuant with
+    /// independent Walsh–Hadamard rotations for ~73% net KV memory savings
+    /// at long context. **Dangerous on dense Q4_K_M weights** — gated by
+    /// the per-model allowlist in [`turbo::allowlist`]. See issue #476 /
+    /// epic #458.
+    Turbo4,
 }
 
 impl std::str::FromStr for KVCacheMode {
@@ -87,9 +101,15 @@ impl std::str::FromStr for KVCacheMode {
             // ("fp16+turbo4") makes the asymmetric K/V split explicit, while
             // "turbo4-asym" is a shorter alias for scripts and tests.
             "turbo4-asym" | "fp16+turbo4" => Ok(Self::Turbo4Asym),
+            // Symmetric Turbo4 (4-bit K + 4-bit V). The canonical user-facing
+            // string is "turbo4"; "turbo4-sym" is an explicit alias used in
+            // tests/scripts when readers benefit from the K/V symmetry being
+            // spelled out.
+            "turbo4" | "turbo4-sym" => Ok(Self::Turbo4),
             other => Err(format!(
                 "unknown kv-cache-mode \"{other}\"; expected one of \
-                 \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\")"
+                 \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\"), \
+                 \"turbo4\" (alias \"turbo4-sym\")"
             )),
         }
     }
@@ -101,6 +121,7 @@ impl std::fmt::Display for KVCacheMode {
             Self::Fp16 => f.write_str("fp16"),
             Self::Int8 => f.write_str("int8"),
             Self::Turbo4Asym => f.write_str("fp16+turbo4"),
+            Self::Turbo4 => f.write_str("turbo4"),
         }
     }
 }
@@ -177,11 +198,18 @@ pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issu
 /// and shared codebook used by the quantize/dequantize helpers in
 /// [`turbo::quant`]. The standard `values` field stays `None` in this mode.
 ///
+/// When `mode` is `KVCacheMode::Turbo4` (symmetric, issue #476), the K
+/// buffers are *also* replaced by `k_packed` + `k_norms` sidecars; the
+/// `keys` field stays `None`. The same `turbo_params` instance carries an
+/// independent K-side sign-vector pair so the K and V quantization noise
+/// is uncorrelated.
+///
 /// Used by: All transformer models (Llama, Qwen, Gemma, etc.). The shared
 /// `update`, `update_and_fetch`, `trim`, `nbytes`, and
-/// `bytes_per_reserved_token` methods dispatch over `mode` and support all
-/// of `KVCacheMode::Fp16`, `KVCacheMode::Int8`, and `KVCacheMode::Turbo4Asym`
-/// (epic #458, issue #474) without per-model branching.
+/// `bytes_per_reserved_token` methods dispatch over `mode` and support
+/// `KVCacheMode::Fp16`, `KVCacheMode::Int8`, `KVCacheMode::Turbo4Asym`
+/// (epic #458, issue #474), and `KVCacheMode::Turbo4` (epic #458,
+/// issue #476) without per-model branching.
 pub struct KVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
     pub values: Option<UniquePtr<MlxArray>>,
@@ -192,15 +220,21 @@ pub struct KVCache {
     // INT8-mode scale factors: [B, H, L, 1] FP16, None when mode == Fp16
     pub(crate) key_scales: Option<UniquePtr<MlxArray>>,
     pub(crate) val_scales: Option<UniquePtr<MlxArray>>,
-    // Turbo4Asym-mode V-side packed indices: [B, H, L, head_dim/2] u8
+    // Turbo4Asym/Turbo4-mode V-side packed indices: [B, H, L, head_dim/2] u8
     pub(crate) v_packed: Option<UniquePtr<MlxArray>>,
-    // Turbo4Asym-mode V-side per-token norms: [B, H, L, 1] fp16
+    // Turbo4Asym/Turbo4-mode V-side per-token norms: [B, H, L, 1] fp16
     pub(crate) v_norms: Option<UniquePtr<MlxArray>>,
-    /// Cached PolarQuant params (sign vectors + codebook) for Turbo4Asym.
+    // Turbo4-mode (symmetric) K-side packed indices: [B, H, L, head_dim/2] u8
+    pub(crate) k_packed: Option<UniquePtr<MlxArray>>,
+    // Turbo4-mode (symmetric) K-side per-token norms: [B, H, L, 1] fp16
+    pub(crate) k_norms: Option<UniquePtr<MlxArray>>,
+    /// Cached PolarQuant params (sign vectors + codebook) for Turbo4* modes.
     ///
     /// Lazily initialised on the first Turbo4 update once the V `head_dim` is
-    /// known. The deterministic seed is derived from the cache's `mode_seed`
-    /// so detach/adopt and re-construction reproduce the same rotation.
+    /// known. The deterministic seed is derived from the cache's `turbo_seed`
+    /// so detach/adopt and re-construction reproduce the same rotation. In
+    /// symmetric `Turbo4` mode the same params carry both V and K sign
+    /// vectors (`signs1`/`signs2` for V, `k_signs1`/`k_signs2` for K).
     pub(crate) turbo_params: Option<turbo::TurboQuantParams>,
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
@@ -220,6 +254,8 @@ impl KVCache {
             val_scales: None,
             v_packed: None,
             v_norms: None,
+            k_packed: None,
+            k_norms: None,
             turbo_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
         }
@@ -229,9 +265,13 @@ impl KVCache {
     ///
     /// Use `KVCacheMode::Int8` to store accumulated keys/values in INT8 format.
     /// Use `KVCacheMode::Turbo4Asym` for asymmetric Fp16-K + Turbo4-V
-    /// compression (issue #474). The `update_and_fetch` method will
-    /// transparently quantize incoming tensors and dequantize them on read,
-    /// so callers always receive FP16.
+    /// compression (issue #474). Use `KVCacheMode::Turbo4` for symmetric
+    /// Turbo4-K + Turbo4-V compression (issue #476) — note that this mode
+    /// is dangerous on dense Q4_K_M weights and must be gated by the
+    /// per-model allowlist in [`turbo::allowlist`] before being exposed
+    /// to end users. The `update_and_fetch` method will transparently
+    /// quantize incoming tensors and dequantize them on read, so callers
+    /// always receive FP16.
     pub fn new_with_mode(mode: KVCacheMode) -> Self {
         Self::new_with_mode_and_seed(mode, TURBO_DEFAULT_SEED)
     }
@@ -254,6 +294,8 @@ impl KVCache {
             val_scales: None,
             v_packed: None,
             v_norms: None,
+            k_packed: None,
+            k_norms: None,
             turbo_params: None,
             turbo_seed,
         }
@@ -261,7 +303,10 @@ impl KVCache {
 
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
-        self.keys.is_none()
+        // Symmetric Turbo4 has no `keys` buffer (K is packed into
+        // `k_packed`), so check both. The cache is empty iff neither the
+        // dense K buffer nor the packed K buffer is allocated.
+        self.keys.is_none() && self.k_packed.is_none()
     }
 
     /// Get current sequence length in cache
@@ -271,7 +316,11 @@ impl KVCache {
 
     /// Get the allocated buffer size (sequence dimension)
     fn buffer_seq_len(&self) -> i32 {
-        match &self.keys {
+        // In symmetric Turbo4 mode the `keys` field stays None and the
+        // step-grown buffer lives in `k_packed`; consult that instead. All
+        // other modes (Fp16, Int8, Turbo4Asym) keep the buffer in `keys`.
+        let buf = self.keys.as_ref().or(self.k_packed.as_ref());
+        match buf {
             Some(k) => {
                 let shape = ffi::array_shape(k);
                 if shape.len() >= 3 {
@@ -290,12 +339,15 @@ impl KVCache {
     /// storage; scale factors are accumulated in a parallel `[B, H, L, 1]`
     /// buffer. In `KVCacheMode::Turbo4Asym` the K side stays FP16 while the V
     /// side is quantized to packed 4-bit indices plus per-token norms via
-    /// [`turbo::quant::quantize_v_turbo4`]. In `KVCacheMode::Fp16` this behaves
-    /// identically to the original implementation.
+    /// [`turbo::quant::quantize_v_turbo4`]. In `KVCacheMode::Turbo4` (issue
+    /// #476) **both** K and V are quantized via the symmetric Turbo4 path
+    /// using independent sign-vector pairs. In `KVCacheMode::Fp16` this
+    /// behaves identically to the original implementation.
     pub fn update(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
         match self.mode {
             KVCacheMode::Int8 => self.update_int8(new_keys, new_values),
             KVCacheMode::Turbo4Asym => self.update_turbo4_asym(new_keys, new_values),
+            KVCacheMode::Turbo4 => self.update_turbo4_sym(new_keys, new_values),
             KVCacheMode::Fp16 => self.update_fp16(new_keys, new_values),
         }
     }
@@ -602,11 +654,166 @@ impl KVCache {
         ));
     }
 
+    /// Symmetric Turbo4 update path — quantizes both K and V to 4-bit
+    /// PolarQuant indices using independent sign-vector pairs.
+    ///
+    /// Layout of stored buffers (step-aligned, grown lazily):
+    /// - `k_packed`: `[B, H, capacity, K_dim/2]` UINT8 (K-side nibble-packed indices).
+    /// - `k_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original K).
+    /// - `v_packed`: `[B, H, capacity, V_dim/2]` UINT8 (V-side nibble-packed indices).
+    /// - `v_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original V).
+    ///
+    /// Both `keys` and `values` stay `None` in this mode — the FP16 K/V
+    /// tensors are reconstructed lazily on `update_and_fetch` via
+    /// [`turbo::quant::dequantize_k_turbo4`] / [`turbo::quant::dequantize_v_turbo4`].
+    ///
+    /// **Safety**: callers must consult [`turbo::is_symmetric_turbo_allowed`]
+    /// before constructing a cache in this mode for an arbitrary model — see
+    /// [`turbo::allowlist`] for the rationale.
+    ///
+    /// Used by: `KVCache::update` dispatch when `mode == KVCacheMode::Turbo4`
+    /// (epic #458, issue #476).
+    fn update_turbo4_sym(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) {
+        // Cast incoming K/V to FP16 to match the cache contract.
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        // Lazy-init TurboQuantParams once we know the V head_dim. Both K and
+        // V must share the same head_dim because attention requires Q·Kᵀ to
+        // be a valid inner product — if the model used different head_dims
+        // for K and V it would be a different architecture entirely. The
+        // assertion below catches any future architecture that violates
+        // this assumption.
+        let v_shape = ffi::array_shape(&new_values_f16);
+        let k_shape_in = ffi::array_shape(&new_keys_f16);
+        debug_assert_eq!(
+            k_shape_in[3], v_shape[3],
+            "symmetric Turbo4 requires K and V head_dim to match; \
+             got K head_dim={} V head_dim={} — this model likely uses \
+             differently-sized K/V projections and is incompatible with \
+             this mode.",
+            k_shape_in[3], v_shape[3],
+        );
+        if self.turbo_params.is_none() {
+            let v_head_dim = v_shape[3] as u32;
+            self.turbo_params = Some(turbo::TurboQuantParams::new(v_head_dim, self.turbo_seed));
+        }
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params just initialised");
+
+        let (k_packed_new, k_norms_new) = turbo::quant::quantize_k_turbo4(&new_keys_f16, params);
+        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&new_values_f16, params);
+
+        let key_shape = ffi::array_shape(&new_keys_f16);
+        let new_seq_len = key_shape[2];
+        let prev = self.offset;
+        let k_packed_shape = ffi::array_shape(&k_packed_new);
+        let v_packed_shape = ffi::array_shape(&v_packed_new);
+
+        if prev == 0 && self.is_empty() && direct_prefill_cache_store_enabled() {
+            self.k_packed = Some(ffi::contiguous(&k_packed_new, false));
+            self.k_norms = Some(ffi::contiguous(&k_norms_new, false));
+            self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
+            self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            self.offset = new_seq_len;
+            return;
+        }
+
+        if self.k_packed.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
+            let b = key_shape[0];
+            let n_kv_heads = key_shape[1];
+            let k_packed_dim = k_packed_shape[3];
+            let v_packed_dim = v_packed_shape[3];
+
+            let n_steps = (self.step + new_seq_len - 1) / self.step;
+            let buf_size = n_steps * self.step;
+
+            let new_kp_buf = ffi::zeros(&[b, n_kv_heads, buf_size, k_packed_dim], dtype::UINT8);
+            let new_kn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            let new_vp_buf = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
+            let new_vn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+
+            if self.k_packed.is_some() {
+                if prev % self.step != 0 {
+                    self.k_packed = Some(ffi::slice(
+                        self.k_packed.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, k_packed_dim],
+                    ));
+                    self.k_norms = Some(ffi::slice(
+                        self.k_norms.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, 1],
+                    ));
+                    self.v_packed = Some(ffi::slice(
+                        self.v_packed.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, v_packed_dim],
+                    ));
+                    self.v_norms = Some(ffi::slice(
+                        self.v_norms.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, 1],
+                    ));
+                }
+                self.k_packed = Some(concatenate(self.k_packed.as_ref().unwrap(), &new_kp_buf, 2));
+                self.k_norms = Some(concatenate(self.k_norms.as_ref().unwrap(), &new_kn_buf, 2));
+                self.v_packed = Some(concatenate(self.v_packed.as_ref().unwrap(), &new_vp_buf, 2));
+                self.v_norms = Some(concatenate(self.v_norms.as_ref().unwrap(), &new_vn_buf, 2));
+            } else {
+                self.k_packed = Some(new_kp_buf);
+                self.k_norms = Some(new_kn_buf);
+                self.v_packed = Some(new_vp_buf);
+                self.v_norms = Some(new_vn_buf);
+            }
+        }
+
+        self.offset += new_seq_len;
+
+        let kp_shape = ffi::array_shape(self.k_packed.as_ref().unwrap());
+        let kn_shape = ffi::array_shape(self.k_norms.as_ref().unwrap());
+        let vp_shape = ffi::array_shape(self.v_packed.as_ref().unwrap());
+        let vn_shape = ffi::array_shape(self.v_norms.as_ref().unwrap());
+
+        self.k_packed = Some(ffi::slice_update(
+            self.k_packed.as_ref().unwrap(),
+            &k_packed_new,
+            &[0, 0, prev, 0],
+            &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
+        ));
+        self.k_norms = Some(ffi::slice_update(
+            self.k_norms.as_ref().unwrap(),
+            &k_norms_new,
+            &[0, 0, prev, 0],
+            &[kn_shape[0], kn_shape[1], self.offset, 1],
+        ));
+        self.v_packed = Some(ffi::slice_update(
+            self.v_packed.as_ref().unwrap(),
+            &v_packed_new,
+            &[0, 0, prev, 0],
+            &[vp_shape[0], vp_shape[1], self.offset, vp_shape[3]],
+        ));
+        self.v_norms = Some(ffi::slice_update(
+            self.v_norms.as_ref().unwrap(),
+            &v_norms_new,
+            &[0, 0, prev, 0],
+            &[vn_shape[0], vn_shape[1], self.offset, 1],
+        ));
+    }
+
     /// Trim the last `n` entries from the cache.
     ///
     /// Returns the number of entries actually trimmed.
     /// In INT8 mode the corresponding scale buffers are also trimmed.
     /// In Turbo4Asym mode the V-packed and V-norms buffers are also trimmed.
+    /// In Turbo4 (symmetric) mode both the K- and V-side packed sidecars are
+    /// trimmed.
     /// Used by: speculative decoding cache rewinds
     pub fn trim(&mut self, n: i32) -> i32 {
         let n = n.min(self.offset);
@@ -621,6 +828,8 @@ impl KVCache {
             self.val_scales = None;
             self.v_packed = None;
             self.v_norms = None;
+            self.k_packed = None;
+            self.k_norms = None;
             // Clear turbo_params so the next quantize call rebuilds it from
             // scratch (required if the caller reuses this cache slot with a
             // different head_dim). LOW-1 fix (#474).
@@ -663,10 +872,12 @@ impl KVCache {
                     ));
                 }
             }
-            // Trim Turbo4Asym V sidecars (per-token; speculative-decode rewinds
+            // Trim Turbo4* V sidecars (per-token; speculative-decode rewinds
             // <1 block at a time so we never need to re-quantize a partial
             // block — the trimmed tail is already block-aligned in the buffer).
-            if self.mode == KVCacheMode::Turbo4Asym {
+            // Both `Turbo4Asym` and `Turbo4` carry the V sidecars; only
+            // `Turbo4` (symmetric) additionally carries the K-side sidecars.
+            if matches!(self.mode, KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4) {
                 if let Some(ref vp) = self.v_packed {
                     let vp_shape = ffi::array_shape(vp);
                     self.v_packed = Some(ffi::slice(
@@ -684,6 +895,25 @@ impl KVCache {
                     ));
                 }
             }
+            // K-side sidecars are present only in symmetric Turbo4.
+            if self.mode == KVCacheMode::Turbo4 {
+                if let Some(ref kp) = self.k_packed {
+                    let kp_shape = ffi::array_shape(kp);
+                    self.k_packed = Some(ffi::slice(
+                        kp,
+                        &[0, 0, 0, 0],
+                        &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
+                    ));
+                }
+                if let Some(ref kn) = self.k_norms {
+                    let kn_shape = ffi::array_shape(kn);
+                    self.k_norms = Some(ffi::slice(
+                        kn,
+                        &[0, 0, 0, 0],
+                        &[kn_shape[0], kn_shape[1], self.offset, 1],
+                    ));
+                }
+            }
         }
         n
     }
@@ -695,6 +925,8 @@ impl KVCache {
     /// FP16 before returning, so attention kernels always receive FP16 tensors.
     /// In `KVCacheMode::Turbo4Asym` returns FP16 keys (untouched) and a V tensor
     /// reconstructed from the packed 4-bit indices + per-token norms.
+    /// In `KVCacheMode::Turbo4` (symmetric) **both** K and V are reconstructed
+    /// from packed 4-bit indices using independent sign-vector pairs.
     pub fn update_and_fetch(
         &mut self,
         new_keys: UniquePtr<MlxArray>,
@@ -750,6 +982,32 @@ impl KVCache {
                 let v_dequantized = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
                 (k_slice, v_dequantized)
             }
+            KVCacheMode::Turbo4 => {
+                let kp = self.k_packed.as_ref().unwrap();
+                let kn = self.k_norms.as_ref().unwrap();
+                let vp = self.v_packed.as_ref().unwrap();
+                let vn = self.v_norms.as_ref().unwrap();
+                let params = self
+                    .turbo_params
+                    .as_ref()
+                    .expect("turbo_params must be initialised after first update_turbo4_sym");
+
+                let kps = ffi::array_shape(kp);
+                let kns = ffi::array_shape(kn);
+                let vps = ffi::array_shape(vp);
+                let vns = ffi::array_shape(vn);
+
+                let kp_slice =
+                    ffi::slice(kp, &[0, 0, 0, 0], &[kps[0], kps[1], self.offset, kps[3]]);
+                let kn_slice = ffi::slice(kn, &[0, 0, 0, 0], &[kns[0], kns[1], self.offset, 1]);
+                let vp_slice =
+                    ffi::slice(vp, &[0, 0, 0, 0], &[vps[0], vps[1], self.offset, vps[3]]);
+                let vn_slice = ffi::slice(vn, &[0, 0, 0, 0], &[vns[0], vns[1], self.offset, 1]);
+
+                let k_dequantized = turbo::quant::dequantize_k_turbo4(&kp_slice, &kn_slice, params);
+                let v_dequantized = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
+                (k_dequantized, v_dequantized)
+            }
             KVCacheMode::Fp16 => {
                 let k = self.keys.as_ref().unwrap();
                 let v = self.values.as_ref().unwrap();
@@ -768,6 +1026,8 @@ impl KVCache {
     /// In INT8 mode this includes both the INT8 buffers and the scale tensors.
     /// In Turbo4Asym mode this counts the FP16 keys plus the packed-V and
     /// V-norm sidecars; the original FP16 values tensor is not stored.
+    /// In Turbo4 (symmetric) mode this counts only the K- and V-side packed
+    /// sidecars; both the FP16 keys and FP16 values tensors are absent.
     pub fn nbytes(&self) -> usize {
         let k_bytes = self.keys.as_ref().map_or(0, |k| ffi::array_nbytes(k));
         let v_bytes = self.values.as_ref().map_or(0, |v| ffi::array_nbytes(v));
@@ -775,7 +1035,9 @@ impl KVCache {
         let vs_bytes = self.val_scales.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let vp_bytes = self.v_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let vn_bytes = self.v_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
-        k_bytes + v_bytes + ks_bytes + vs_bytes + vp_bytes + vn_bytes
+        let kp_bytes = self.k_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
+        let kn_bytes = self.k_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
+        k_bytes + v_bytes + ks_bytes + vs_bytes + vp_bytes + vn_bytes + kp_bytes + kn_bytes
     }
 
     /// Estimated storage bytes per reserved token slot in the backing buffer.

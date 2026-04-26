@@ -86,6 +86,7 @@ use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, Seque
 /// per-token V norms, and the deterministic Turbo4 seed so the adopted cache
 /// can rebuild [`crate::cache::turbo::TurboQuantParams`] without referring
 /// back to the originating `KVCache`.
+/// Turbo4 (symmetric) caches also carry packed-K + per-token K norms.
 pub struct DetachedKVCache {
     pub(super) keys: Option<UniquePtr<MlxArray>>,
     pub(super) values: Option<UniquePtr<MlxArray>>,
@@ -96,6 +97,8 @@ pub struct DetachedKVCache {
     pub(super) val_scales: Option<UniquePtr<MlxArray>>,
     pub(super) v_packed: Option<UniquePtr<MlxArray>>,
     pub(super) v_norms: Option<UniquePtr<MlxArray>>,
+    pub(super) k_packed: Option<UniquePtr<MlxArray>>,
+    pub(super) k_norms: Option<UniquePtr<MlxArray>>,
     pub(super) turbo_seed: u32,
 }
 
@@ -112,7 +115,8 @@ impl DetachedKVCache {
     }
 
     /// Total byte footprint of the detached tensors (keys + values + INT8
-    /// scales + Turbo4Asym v_packed/v_norms when applicable).
+    /// scales + Turbo4Asym v_packed/v_norms + Turbo4 symmetric
+    /// k_packed/k_norms when applicable).
     pub fn nbytes(&self) -> usize {
         let k = self.keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let v = self.values.as_ref().map_or(0, |a| ffi::array_nbytes(a));
@@ -120,12 +124,14 @@ impl DetachedKVCache {
         let vs = self.val_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vp = self.v_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn
+        let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn + kp + kn
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
     pub fn is_empty(&self) -> bool {
-        self.keys.is_none()
+        self.keys.is_none() && self.k_packed.is_none()
     }
 
     /// Read-only access to the detached keys tensor.
@@ -151,6 +157,8 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("has_val_scales", &self.val_scales.is_some())
             .field("has_v_packed", &self.v_packed.is_some())
             .field("has_v_norms", &self.v_norms.is_some())
+            .field("has_k_packed", &self.k_packed.is_some())
+            .field("has_k_norms", &self.k_norms.is_some())
             .field("turbo_seed", &self.turbo_seed)
             .finish()
     }
@@ -225,6 +233,8 @@ impl KVCache {
             val_scales: self.val_scales.take(),
             v_packed: self.v_packed.take(),
             v_norms: self.v_norms.take(),
+            k_packed: self.k_packed.take(),
+            k_norms: self.k_norms.take(),
             turbo_seed: self.turbo_seed,
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
@@ -258,14 +268,18 @@ impl KVCache {
         self.val_scales = detached.val_scales;
         self.v_packed = detached.v_packed;
         self.v_norms = detached.v_norms;
+        self.k_packed = detached.k_packed;
+        self.k_norms = detached.k_norms;
         self.turbo_seed = detached.turbo_seed;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still
-        // work. Detect it from v_packed shape: [B, H, T, head_dim/2].
-        if self.mode == KVCacheMode::Turbo4Asym {
-            if let Some(ref vp) = self.v_packed {
-                let shape = ffi::array_shape(vp);
+        // work. Detect it from v_packed (or k_packed for symmetric Turbo4)
+        // shape: [B, H, T, head_dim/2].
+        if matches!(self.mode, KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4) {
+            let probe = self.v_packed.as_ref().or(self.k_packed.as_ref());
+            if let Some(p) = probe {
+                let shape = ffi::array_shape(p);
                 if shape.len() == 4 && shape[3] > 0 {
                     let head_dim = (shape[3] as u32) * 2;
                     self.turbo_params = Some(super::turbo::TurboQuantParams::new(

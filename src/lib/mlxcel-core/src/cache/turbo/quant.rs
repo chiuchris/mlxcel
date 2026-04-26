@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! TurboQuant V-side PolarQuant pipeline (B2, issue #474, epic #458).
+//! TurboQuant K/V-side PolarQuant pipeline (B2 + B4, issues #474 and #476,
+//! epic #458).
 //!
-//! Implements the V-cache quantization path used by `KVCacheMode::Turbo4Asym`:
+//! Implements the per-token compression used by `KVCacheMode::Turbo4Asym`
+//! (V only) and `KVCacheMode::Turbo4` (both K and V):
 //!
 //! 1. Per-token L2 norm extraction.
 //! 2. Sign-flip × Walsh–Hadamard × sign-flip rotation (the structured fast
@@ -27,6 +29,14 @@
 //! The dequantize path is the exact inverse: unpack nibbles → centroid
 //! gather → optional rotated-norm correction → reverse rotation → rescale by
 //! the stored norm.
+//!
+//! K-side compression mirrors V-side bit-for-bit, but uses an *independent*
+//! pair of sign vectors derived from a different seed offset
+//! ([`K_SEED_OFFSET`]). This decorrelates the K and V quantization noise so
+//! that the inner product `Q · Kᵀ` in attention does not see additive bias
+//! from a shared rotation. This is the exact pattern the TurboQuant+
+//! reference uses (`seed + 500` in `references/turboquant_plus/turboquant/
+//! kv_cache.py::KVCacheCompressor.__init__`).
 //!
 //! # Storage layout
 //!
@@ -70,9 +80,23 @@ use crate::ffi;
 use crate::ffi::MlxArray;
 use crate::ops::wht;
 
-/// V-side PolarQuant bit-width. Locked to 4 bits for `Turbo4Asym`. (B5/#477
-/// will add 3-bit, but lives in its own variant.)
+/// V-side PolarQuant bit-width. Locked to 4 bits for `Turbo4Asym` and
+/// symmetric `Turbo4`. (B5/#477 will add 3-bit, but lives in its own
+/// variant.)
 pub const V_BIT_WIDTH: u8 = 4;
+
+/// K-side PolarQuant bit-width. Locked to 4 bits for symmetric `Turbo4`
+/// (issue #476). The K side is only quantized in symmetric mode; in
+/// `Turbo4Asym` (issue #474) the K side stays in FP16.
+pub const K_BIT_WIDTH: u8 = 4;
+
+/// Seed offset added to the cache's `turbo_seed` before deriving the K-side
+/// sign vectors. Matches the TurboQuant+ reference pattern
+/// (`references/turboquant_plus/turboquant/kv_cache.py::KVCacheCompressor`,
+/// which uses `seed + 500`). The exact value matters less than the property
+/// that K and V sign vectors are *independent* — see the module docstring
+/// for why this matters for attention quality.
+pub const K_SEED_OFFSET: u32 = 0x4B5F_5345; // "K_SE" in ASCII
 
 /// Buffer growth granularity (tokens) for the packed V buffer. Matches the
 /// TurboQuant+ "block_size=32" default. Speculative decoding rewinds at most
@@ -117,17 +141,33 @@ impl Lcg32 {
 /// runtime model and a deterministic seed. The codebook is fetched from the
 /// global `OnceLock`-backed cache so multiple caches share the centroids.
 ///
+/// In symmetric `Turbo4` mode (issue #476) the *same* params struct also
+/// carries an independent pair of K-side sign vectors (`k_signs1` /
+/// `k_signs2`) so K compression decorrelates from V. The codebook is
+/// re-used as the post-WHT coordinate distribution is identical for K and V.
+///
 /// Used by: `KVCache::update_turbo4_asym` (cache.rs),
-/// `turbo::quant::dequantize_v_turbo4` (this module).
+/// `KVCache::update_turbo4_sym` (cache.rs, issue #476),
+/// `turbo::quant::dequantize_v_turbo4` (this module),
+/// `turbo::quant::dequantize_k_turbo4` (this module).
 #[derive(Clone, Debug)]
 pub struct TurboQuantParams {
     /// V head dimension (must be a non-zero power of two — power-of-two is
     /// the WHT op's hard requirement, see `mlxcel_core::ops::wht`).
     pub head_dim: u32,
-    /// `±1.0` sign vector applied **before** the WHT. Length = `head_dim`.
+    /// V-side `±1.0` sign vector applied **before** the WHT. Length =
+    /// `head_dim`.
     pub signs1: Arc<[f32]>,
-    /// `±1.0` sign vector applied **after** the WHT. Length = `head_dim`.
+    /// V-side `±1.0` sign vector applied **after** the WHT. Length =
+    /// `head_dim`.
     pub signs2: Arc<[f32]>,
+    /// K-side `±1.0` sign vector applied **before** the WHT (symmetric
+    /// `Turbo4` only). Length = `head_dim`. Derived from `seed +
+    /// K_SEED_OFFSET` so K is statistically independent from V.
+    pub k_signs1: Arc<[f32]>,
+    /// K-side `±1.0` sign vector applied **after** the WHT (symmetric
+    /// `Turbo4` only). Length = `head_dim`.
+    pub k_signs2: Arc<[f32]>,
     /// Cached centroid + boundary tables for `(V_BIT_WIDTH, head_dim)`.
     pub codebook: Codebook,
 }
@@ -150,11 +190,20 @@ impl TurboQuantParams {
         let signs1 = generate_signs(head_dim as usize, seed);
         // Use a different sub-seed for signs2 so the two are independent.
         let signs2 = generate_signs(head_dim as usize, seed.wrapping_add(0x9E37_79B9));
+        // K-side sign vectors derived from `seed + K_SEED_OFFSET` so the K
+        // and V rotations are statistically independent (mirrors the
+        // TurboQuant+ reference's `seed + 500` offset between K and V
+        // quantizers).
+        let k_seed = seed.wrapping_add(K_SEED_OFFSET);
+        let k_signs1 = generate_signs(head_dim as usize, k_seed);
+        let k_signs2 = generate_signs(head_dim as usize, k_seed.wrapping_add(0x9E37_79B9));
         let codebook = optimal_codebook(V_BIT_WIDTH, head_dim);
         Self {
             head_dim,
             signs1,
             signs2,
+            k_signs1,
+            k_signs2,
             codebook,
         }
     }
@@ -180,43 +229,60 @@ pub fn generate_signs(len: usize, seed: u32) -> Arc<[f32]> {
 // Quantize / dequantize — graph + readback hybrid
 // ---------------------------------------------------------------------------
 
-/// Quantize a V tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into
-/// the packed Turbo4 representation.
+/// Quantize a 4-D `[B, H, T, D]` tensor into the packed Turbo4 representation
+/// using the supplied sign-flip pair and the V-bit-width Lloyd-Max codebook.
 ///
-/// Returns `(v_packed, v_norms)` where:
-/// - `v_packed`: `[B, H, T, D/2]` u8 — nibble-packed 4-bit indices.
-/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token L2 norm of the *original*
-///   V vector (used for rescaling on dequantize).
+/// This is the shared core for both V-side ([`quantize_v_turbo4`]) and K-side
+/// ([`quantize_k_turbo4`]) compression — only the sign vectors differ; the
+/// rotation algorithm, packing layout, and norm-storage contract are
+/// identical. Per-token norms of the *original* (pre-rotation) tensor are
+/// returned alongside the packed indices and re-applied on dequantize.
 ///
-/// Used by: `KVCache::update` (Turbo4Asym mode).
-pub fn quantize_v_turbo4(
-    v: &MlxArray,
+/// `signs1` / `signs2` must have length `params.head_dim`. The packed result
+/// is shape `[B, H, T, D/2]` u8 (low nibble = even coord, high nibble = odd
+/// coord); the norm tensor is shape `[B, H, T, 1]` fp16.
+fn quantize_into_packed(
+    x: &MlxArray,
     params: &TurboQuantParams,
+    signs1: &[f32],
+    signs2: &[f32],
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-    // Cast V to fp32 for stable norm + rotation arithmetic. The MLX WHT op
-    // accepts fp32/fp16/bf16; fp32 keeps the centroid lookup well-conditioned
-    // even for very small / very large V magnitudes.
-    let v_f32 = ffi::astype(v, dtype::FLOAT32);
+    // Cast input to fp32 for stable norm + rotation arithmetic. The MLX WHT
+    // op accepts fp32/fp16/bf16; fp32 keeps the centroid lookup
+    // well-conditioned even for very small / very large magnitudes.
+    let v_f32 = ffi::astype(x, dtype::FLOAT32);
     let shape = ffi::array_shape(&v_f32);
-    debug_assert_eq!(shape.len(), 4, "V must be 4-D [B, H, T, D]");
+    debug_assert_eq!(shape.len(), 4, "input must be 4-D [B, H, T, D]");
     let _b = shape[0];
     let _h = shape[1];
     let t = shape[2];
     let d = shape[3];
     debug_assert_eq!(
         d as u32, params.head_dim,
-        "V last dim ({d}) must match TurboQuantParams head_dim ({})",
+        "input last dim ({d}) must match TurboQuantParams head_dim ({})",
         params.head_dim
     );
+    debug_assert_eq!(
+        signs1.len(),
+        d as usize,
+        "signs1 length ({}) must match head_dim ({d})",
+        signs1.len()
+    );
+    debug_assert_eq!(
+        signs2.len(),
+        d as usize,
+        "signs2 length ({}) must match head_dim ({d})",
+        signs2.len()
+    );
 
-    // 1. Per-token L2 norm: ||v||_2 along last axis, keepdims=true → [B, H, T, 1]
+    // 1. Per-token L2 norm: ||x||_2 along last axis, keepdims=true → [B, H, T, 1]
     let v_sq = ffi::multiply(&v_f32, &v_f32);
     let sum_sq = ffi::sum_axis(&v_sq, -1, true);
     let norm_full = ffi::sqrt(&sum_sq);
     // Avoid divide-by-zero **only** for the exact-zero case. Using
     // `maximum(norm, 1.0)` here is mathematically wrong: it clamps any
     // norm below 1.0 *up* to 1.0, destroying direction information for
-    // small-magnitude V vectors. Use a `where` op so non-zero norms pass
+    // small-magnitude vectors. Use a `where` op so non-zero norms pass
     // through unchanged. Mirrors the Python reference at
     // `references/turboquant_plus/turboquant/polar_quant.py:60`:
     // `safe_norms = np.where(norms > 0, norms, 1.0)`.
@@ -226,9 +292,9 @@ pub fn quantize_v_turbo4(
     let safe_norm = ffi::where_cond(&positive_mask, &norm_full, &one);
     let v_normalized = ffi::divide(&v_f32, &safe_norm); // [B, H, T, D]
 
-    // 2. Apply random rotation: D2 · H · D1 · v.
-    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d]);
-    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d]);
+    // 2. Apply random rotation: D2 · H · D1 · x.
+    let signs1_arr = ffi::from_slice_f32(signs1, &[1, 1, 1, d]);
+    let signs2_arr = ffi::from_slice_f32(signs2, &[1, 1, 1, d]);
     let v_d1 = ffi::multiply(&v_normalized, &signs1_arr);
     let v_h = wht(&v_d1);
     let v_rot = ffi::multiply(&v_h, &signs2_arr);
@@ -293,32 +359,74 @@ pub fn quantize_v_turbo4(
     (v_packed, v_norms)
 }
 
-/// Dequantize a packed-V slice back to fp16 for the attention kernel.
+/// Quantize a V tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into
+/// the packed Turbo4 representation.
 ///
-/// Inputs:
-/// - `v_packed`: `[B, H, T, D/2]` u8 (output of [`quantize_v_turbo4`]).
-/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token original-V L2 norms.
-/// - `params`:   the `TurboQuantParams` used at quantize time (centroids +
-///   sign vectors + head_dim).
+/// Returns `(v_packed, v_norms)` where:
+/// - `v_packed`: `[B, H, T, D/2]` u8 — nibble-packed 4-bit indices.
+/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token L2 norm of the *original*
+///   V vector (used for rescaling on dequantize).
 ///
-/// Returns a fresh fp16 tensor of shape `[B, H, T, D]`, suitable for the
-/// existing `attention()` codepath — same shape and dtype contract as the
-/// `Fp16` and `Int8` modes.
-///
-/// Used by: `KVCache::update_and_fetch` (Turbo4Asym mode).
-pub fn dequantize_v_turbo4(
-    v_packed: &MlxArray,
-    v_norms: &MlxArray,
+/// Used by: `KVCache::update` (Turbo4Asym mode, Turbo4 mode).
+pub fn quantize_v_turbo4(
+    v: &MlxArray,
     params: &TurboQuantParams,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    quantize_into_packed(v, params, &params.signs1, &params.signs2)
+}
+
+/// Quantize a K tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into
+/// the packed Turbo4 representation, using the K-side sign vectors so the
+/// resulting indices are statistically independent from any V-side
+/// quantization noise.
+///
+/// Returns `(k_packed, k_norms)` analogous to [`quantize_v_turbo4`]. Storage
+/// layout matches the V-side path bit-for-bit, so the cache layer can reuse
+/// the same packing/unpacking helpers.
+///
+/// Used by: `KVCache::update` (Turbo4 symmetric mode, issue #476, epic
+/// #458).
+pub fn quantize_k_turbo4(
+    k: &MlxArray,
+    params: &TurboQuantParams,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    quantize_into_packed(k, params, &params.k_signs1, &params.k_signs2)
+}
+
+/// Shared core for [`dequantize_v_turbo4`] and [`dequantize_k_turbo4`].
+///
+/// `signs1` / `signs2` are the rotation sign vectors used at *quantize* time
+/// — for V-side reads the caller passes `params.signs1` / `params.signs2`,
+/// for K-side reads (symmetric Turbo4) the caller passes `params.k_signs1`
+/// / `params.k_signs2`. Apart from that the dequantize path is bit-for-bit
+/// identical for K and V.
+fn dequantize_from_packed(
+    packed: &MlxArray,
+    norms: &MlxArray,
+    params: &TurboQuantParams,
+    signs1: &[f32],
+    signs2: &[f32],
 ) -> UniquePtr<MlxArray> {
-    let packed_shape = ffi::array_shape(v_packed);
-    debug_assert_eq!(packed_shape.len(), 4, "v_packed must be 4-D");
+    let packed_shape = ffi::array_shape(packed);
+    debug_assert_eq!(packed_shape.len(), 4, "packed must be 4-D");
     let b = packed_shape[0];
     let h = packed_shape[1];
     let t = packed_shape[2];
     let bytes_per_token = packed_shape[3];
     let d = bytes_per_token * 2;
     debug_assert_eq!(d as u32, params.head_dim, "head_dim mismatch on dequantize");
+    debug_assert_eq!(
+        signs1.len(),
+        d as usize,
+        "signs1 length ({}) must match head_dim ({d})",
+        signs1.len()
+    );
+    debug_assert_eq!(
+        signs2.len(),
+        d as usize,
+        "signs2 length ({}) must match head_dim ({d})",
+        signs2.len()
+    );
 
     // 1. Unpack nibbles entirely on-device. The earlier implementation forced
     //    a sync + host round-trip per call, which dominates decode latency at
@@ -326,15 +434,15 @@ pub fn dequantize_v_turbo4(
     //    We now stay on the GPU using bitwise ops + stack/reshape to interleave
     //    the two nibbles in the documented "low = even, high = odd" order.
     //
-    //    Layout (matches the quantize-time packing in `quantize_v_turbo4`):
+    //    Layout (matches the quantize-time packing in `quantize_into_packed`):
     //        byte[i] low nibble  → indices[2*i]   (even coord)
     //        byte[i] high nibble → indices[2*i+1] (odd coord)
     //    so `stack([low, high], axis=-1)` builds `[..., D/2, 2]` with the
     //    correct interleave; `reshape` to `[..., D]` flattens that pair axis.
     let mask_u8 = ffi::full_f32(&[1], 0x0F_u8 as f32, dtype::UINT8);
     let shift4_u8 = ffi::full_f32(&[1], 4.0, dtype::UINT8);
-    let low_nibble = ffi::bitwise_and(v_packed, &mask_u8); // [B, H, T, D/2] u8
-    let high_nibble = ffi::right_shift(v_packed, &shift4_u8); // [B, H, T, D/2] u8
+    let low_nibble = ffi::bitwise_and(packed, &mask_u8); // [B, H, T, D/2] u8
+    let high_nibble = ffi::right_shift(packed, &shift4_u8); // [B, H, T, D/2] u8
     let indices_u8 = {
         let stacked = crate::ops::stack_owned(&[low_nibble, high_nibble], -1); // [B, H, T, D/2, 2]
         ffi::reshape(&stacked, &[b, h, t, d]) // [B, H, T, D] u8
@@ -354,24 +462,67 @@ pub fn dequantize_v_turbo4(
     let y_hat_sum_sq = ffi::sum_axis(&y_hat_sq, -1, true);
     let y_hat_norm = ffi::sqrt(&y_hat_sum_sq);
     // Guard against zero (shouldn't happen in practice — codebook always has
-    // a non-zero magnitude — but defensive against the all-zero-V edge case).
+    // a non-zero magnitude — but defensive against the all-zero edge case).
     let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
     let safe_y_norm = ffi::maximum(&y_hat_norm, &eps);
     let y_hat_unit = ffi::divide(&y_hat, &safe_y_norm);
 
     // 4. Inverse rotation. Since D and H are symmetric (D^T = D, H^T = H),
     //    the transpose D2·H·D1 is D1·H·D2 — apply in reverse.
-    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d]);
-    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d]);
+    let signs1_arr = ffi::from_slice_f32(signs1, &[1, 1, 1, d]);
+    let signs2_arr = ffi::from_slice_f32(signs2, &[1, 1, 1, d]);
     let v_pre_h = ffi::multiply(&y_hat_unit, &signs2_arr);
     let v_pre_d1 = wht(&v_pre_h);
     let v_unit = ffi::multiply(&v_pre_d1, &signs1_arr);
 
-    // 5. Rescale by the stored original-V norms. norms shape is [B, H, T, 1]
+    // 5. Rescale by the stored original norms. norms shape is [B, H, T, 1]
     //    fp16; cast to fp32 to match v_unit, then back to fp16 at the end.
-    let norms_f32 = ffi::astype(v_norms, dtype::FLOAT32);
+    let norms_f32 = ffi::astype(norms, dtype::FLOAT32);
     let v_full_f32 = ffi::multiply(&v_unit, &norms_f32);
     ffi::astype(&v_full_f32, dtype::FLOAT16)
+}
+
+/// Dequantize a packed-V slice back to fp16 for the attention kernel.
+///
+/// Inputs:
+/// - `v_packed`: `[B, H, T, D/2]` u8 (output of [`quantize_v_turbo4`]).
+/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token original-V L2 norms.
+/// - `params`:   the `TurboQuantParams` used at quantize time (centroids +
+///   sign vectors + head_dim).
+///
+/// Returns a fresh fp16 tensor of shape `[B, H, T, D]`, suitable for the
+/// existing `attention()` codepath — same shape and dtype contract as the
+/// `Fp16` and `Int8` modes.
+///
+/// Used by: `KVCache::update_and_fetch` (Turbo4Asym mode, Turbo4 mode).
+pub fn dequantize_v_turbo4(
+    v_packed: &MlxArray,
+    v_norms: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    dequantize_from_packed(v_packed, v_norms, params, &params.signs1, &params.signs2)
+}
+
+/// Dequantize a packed-K slice back to fp16 for the attention kernel.
+///
+/// Mirrors [`dequantize_v_turbo4`] but uses the K-side sign vectors. The
+/// caller is responsible for slicing `k_packed` and `k_norms` to the visible
+/// portion of the cache (the same way the V-side path does in
+/// `KVCache::update_and_fetch`).
+///
+/// Used by: `KVCache::update_and_fetch` (Turbo4 symmetric mode, issue #476).
+pub fn dequantize_k_turbo4(
+    k_packed: &MlxArray,
+    k_norms: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    dequantize_from_packed(
+        k_packed,
+        k_norms,
+        params,
+        &params.k_signs1,
+        &params.k_signs2,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -479,6 +630,114 @@ mod tests {
         assert_eq!(p.codebook.boundaries.len(), p.codebook.centroids.len() - 1);
         assert_eq!(p.signs1.len(), 128);
         assert_eq!(p.signs2.len(), 128);
+        assert_eq!(p.k_signs1.len(), 128);
+        assert_eq!(p.k_signs2.len(), 128);
+    }
+
+    /// K-side and V-side sign vectors must be statistically distinct — if
+    /// they were equal, the K and V quantization noise would correlate and
+    /// the inner product `Q · Kᵀ` in attention would see additive bias.
+    /// This test enforces the *property* (different vectors) at construction
+    /// time so a future refactor cannot accidentally collapse them.
+    #[test]
+    fn k_and_v_sign_vectors_are_independent() {
+        let p = TurboQuantParams::new(128, 42);
+        assert_ne!(
+            p.signs1.as_ref(),
+            p.k_signs1.as_ref(),
+            "K-side and V-side signs1 must differ for symmetric Turbo4 to be safe"
+        );
+        assert_ne!(
+            p.signs2.as_ref(),
+            p.k_signs2.as_ref(),
+            "K-side and V-side signs2 must differ for symmetric Turbo4 to be safe"
+        );
+    }
+
+    /// K-side dequantize must round-trip the input within the same Lloyd-Max
+    /// distortion bound as the V-side path. Verifies that the K-side sign
+    /// vectors and shared codebook produce a numerically valid round-trip,
+    /// not just a syntactically valid one.
+    #[test]
+    fn k_side_quantize_dequantize_round_trip_bounded_error() {
+        let head_dim: i32 = 128;
+        let params = TurboQuantParams::new(head_dim as u32, 0xCAFE_F00D);
+
+        let mut rng = Lcg32::new(0xBEEF_CACE);
+        let n_tokens = 4usize;
+        let hd_usize = head_dim as usize;
+        let mut k_data: Vec<f32> = Vec::with_capacity(n_tokens * hd_usize);
+        let token_scales = [0.5_f32, 1.5, 4.0, 12.0];
+        for tok in 0..n_tokens {
+            let scale = token_scales[tok];
+            for _ in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for _ in 0..6 {
+                    acc += if rng.next_bit() == 0 { -1.0 } else { 1.0 };
+                }
+                k_data.push((acc / 6.0) * scale);
+            }
+        }
+        let k = ffi::from_slice_f32(&k_data, &[1, 1, n_tokens as i32, head_dim]);
+
+        let (packed, norms) = quantize_k_turbo4(&k, &params);
+        let pshape = ffi::array_shape(&packed);
+        assert_eq!(pshape, vec![1_i32, 1, n_tokens as i32, head_dim / 2]);
+
+        let k_hat = dequantize_k_turbo4(&packed, &norms, &params);
+        assert_eq!(ffi::array_dtype(&k_hat), dtype::FLOAT16);
+        let k_hat_f32 = ffi::astype(&k_hat, dtype::FLOAT32);
+        ffi::eval(&k_hat_f32);
+        let bytes = ffi::array_to_raw_bytes(&k_hat_f32);
+        let k_hat_vec: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        for tok in 0..n_tokens {
+            let off = tok * hd_usize;
+            let mut num = 0.0_f32;
+            let mut den = 0.0_f32;
+            for k_i in 0..hd_usize {
+                let diff = k_data[off + k_i] - k_hat_vec[off + k_i];
+                num += diff * diff;
+                den += k_data[off + k_i] * k_data[off + k_i];
+            }
+            let rel = (num / den.max(1e-12)).sqrt();
+            assert!(
+                rel < 0.15,
+                "token {tok}: K-side relative L2 error {rel:.4} exceeds 15% bound"
+            );
+        }
+    }
+
+    /// K-side and V-side packed buffers must differ for the same input —
+    /// confirms the two paths really do use independent rotations rather
+    /// than producing identical results despite different sign vectors.
+    #[test]
+    fn k_and_v_packed_outputs_differ_for_same_input() {
+        let head_dim: i32 = 64;
+        let params = TurboQuantParams::new(head_dim as u32, 0x1234_5678);
+        let v_data: Vec<f32> = (0..head_dim)
+            .map(|i| (i as f32 / head_dim as f32 - 0.5) * 2.0)
+            .collect();
+        let x = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+
+        let (v_packed, _) = quantize_v_turbo4(&x, &params);
+        let (k_packed, _) = quantize_k_turbo4(&x, &params);
+
+        let v_bytes = ffi::array_to_raw_bytes(&v_packed);
+        let k_bytes = ffi::array_to_raw_bytes(&k_packed);
+        assert_eq!(
+            v_bytes.len(),
+            k_bytes.len(),
+            "K and V packed buffers must have the same byte size"
+        );
+        assert_ne!(
+            v_bytes, k_bytes,
+            "K and V packed outputs must differ for the same input — \
+             otherwise K/V noise would be correlated and break attention"
+        );
     }
 
     #[test]

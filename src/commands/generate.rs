@@ -813,6 +813,12 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         KVCacheMode::Turbo4Asym => {
             println!("KV cache mode: fp16+turbo4 (asymmetric Fp16-K + Turbo4-V, ~26% KV savings)");
         }
+        KVCacheMode::Turbo4 => {
+            println!(
+                "KV cache mode: turbo4 (symmetric Turbo4-K + Turbo4-V, ~73% KV savings; \
+                 allowlisted families only — non-allowlisted models fall back to Turbo4Asym)"
+            );
+        }
         KVCacheMode::Fp16 => {}
     }
 
