@@ -60,6 +60,9 @@ pub mod turbo;
 #[cfg(test)]
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
+#[cfg(test)]
+#[path = "cache/sparse_v_tests.rs"]
+mod sparse_v_tests;
 
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
@@ -1754,6 +1757,102 @@ impl KVCache {
             + kp_bytes
             + kn_bytes
             + ck_bytes
+    }
+
+    /// Returns `true` iff this cache holds a packed V (the Turbo4 family)
+    /// and the sparse-V threshold is enabled (see
+    /// [`turbo::sparse_v::is_enabled`]).
+    ///
+    /// Sparse-V is currently supported only for `KVCacheMode::Turbo4Asym`
+    /// and `KVCacheMode::Turbo4Delegated` — symmetric `Turbo4` (K also
+    /// packed) is not yet wired through the split-SDPA path. Callers that
+    /// want to opt into the attention-gated dequant path should check this
+    /// accessor and, if true, use [`Self::sparse_v_attention`] instead of
+    /// the standard [`Self::update_and_fetch`] + `attention()` pair.
+    ///
+    /// Used by: future model attention call sites (integration deferred —
+    /// see `cache/turbo/sparse_v.rs` module docs).
+    pub fn sparse_v_available(&self) -> bool {
+        if !turbo::sparse_v::is_enabled() {
+            return false;
+        }
+        matches!(
+            self.mode,
+            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4Delegated
+        )
+    }
+
+    /// Borrow the packed V indices for sparse-V attention.
+    ///
+    /// Returns `None` when sparse-V is not active (see
+    /// [`Self::sparse_v_available`]) or before the first
+    /// `update_and_fetch` call has populated the V sidecars.
+    ///
+    /// Used by: [`Self::sparse_v_attention`] (and direct callers porting to
+    /// the split-SDPA path before the per-model attention rewrite).
+    pub fn v_packed(&self) -> Option<&MlxArray> {
+        self.v_packed.as_deref()
+    }
+
+    /// Borrow the per-token V norms paired with [`Self::v_packed`].
+    pub fn v_norms(&self) -> Option<&MlxArray> {
+        self.v_norms.as_deref()
+    }
+
+    /// Borrow the cached `TurboQuantParams` (sign vectors + codebook).
+    ///
+    /// Returns `None` until the first Turbo4 update has lazy-initialised
+    /// the params (head_dim is known only at that point).
+    pub fn turbo_params(&self) -> Option<&turbo::TurboQuantParams> {
+        self.turbo_params.as_ref()
+    }
+
+    /// Attention-gated SDPA dispatch: routes to [`turbo::sparse_v::
+    /// attention_sparse_v_turbo4`] when sparse-V is active, otherwise
+    /// returns `None` so the caller can fall back to the standard
+    /// `attention()` path.
+    ///
+    /// **Contract.** This is a *correctness-preserving* graph-level
+    /// scaffold. The current implementation observes the threshold but
+    /// does not yet skip per-position dequant work — that requires the
+    /// fused Metal kernel follow-up. Callers that adopt this path now
+    /// should expect the same speed as the full-dequant baseline; the
+    /// quality, however, will be observable as soon as the threshold is
+    /// non-zero.
+    ///
+    /// # Inputs
+    ///
+    /// - `q`: `[B, Hq, Tq, D]` query tensor
+    /// - `k`: `[B, Hkv, Tk, D]` key tensor (already FP16 — Turbo4Asym
+    ///   keeps K in FP16, Turbo4Delegated returns FP16 from the read path)
+    /// - `scale`: attention scale factor (typically `1 / sqrt(d)`)
+    /// - `mask`: optional additive mask
+    ///
+    /// # Output
+    ///
+    /// `Some([B, Hq, Tq, D])` FP16 attention output when sparse-V was
+    /// applied, `None` otherwise (caller falls back to standard SDPA).
+    ///
+    /// Used by: future model attention call sites that have been ported
+    /// to the split-SDPA path. Standard call sites continue to use
+    /// `cache.update_and_fetch(...)` followed by `attention(...)`.
+    pub fn sparse_v_attention(
+        &self,
+        q: &MlxArray,
+        k: &MlxArray,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> Option<UniquePtr<MlxArray>> {
+        if !self.sparse_v_available() {
+            return None;
+        }
+        let v_packed = self.v_packed()?;
+        let v_norms = self.v_norms()?;
+        let params = self.turbo_params()?;
+        let threshold = turbo::sparse_v::threshold();
+        Some(turbo::sparse_v::attention_sparse_v_turbo4(
+            q, k, v_packed, v_norms, params, scale, mask, threshold,
+        ))
     }
 
     /// Estimated storage bytes per reserved token slot in the backing buffer.

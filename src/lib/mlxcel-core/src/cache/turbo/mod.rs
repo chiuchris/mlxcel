@@ -24,7 +24,8 @@
 //! | `quant`       | B2/B4 (#474, #476) | done | V-side + K-side PolarQuant pipeline |
 //! | `allowlist`   | B4 (#476)   | done     | Per-model symmetric Turbo4 gating    |
 //! | `boundary`    | B6 (#478)   | done     | First/last layer V protection policy |
-//! | (more to come)| B5/B8/B10–B12 | pending  | turbo3 / sparse-V / paged KV     |
+//! | `sparse_v`    | B8 (#480)   | done     | Attention-gated V-dequant scaffold   |
+//! | (more to come)| B5/B10–B12  | pending  | turbo3 / paged KV / docs             |
 //!
 //! # Usage by downstream sub-issues
 //!
@@ -38,6 +39,7 @@ pub mod allowlist;
 pub mod boundary;
 pub mod codebook;
 pub mod quant;
+pub mod sparse_v;
 
 pub use allowlist::{
     is_symmetric_turbo_allowed, symmetric_turbo_warning_message, ALLOWED_SYMMETRIC_TURBO_FAMILIES,
