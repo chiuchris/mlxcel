@@ -28,6 +28,7 @@
 mod detach;
 mod paged;
 mod paged_detach;
+pub mod turbo;
 
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache};
 pub use paged::{

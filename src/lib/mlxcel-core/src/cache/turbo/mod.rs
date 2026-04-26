@@ -1,0 +1,37 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! TurboQuant KV cache compression (epic #458).
+//!
+//! This module is the entry point for all TurboQuant / PolarQuant components
+//! used by the KV cache compression pipeline. Sub-modules are added
+//! incrementally as the sub-issues land:
+//!
+//! | Sub-module    | Sub-issue | Status   | Description                      |
+//! |---------------|-----------|----------|----------------------------------|
+//! | `codebook`    | B1 (#472) | ✓ done   | Lloyd-Max centroid generator     |
+//! | (more to come)| B2–B12    | pending  | Storage, WHT, quantize/dequant   |
+//!
+//! # Usage by downstream sub-issues
+//!
+//! ```rust,ignore
+//! use mlxcel_core::cache::turbo::codebook::optimal_centroids;
+//!
+//! let centroids: Vec<f32> = optimal_centroids(4, 128);
+//! ```
+
+pub mod codebook;
+
+// Re-export the most commonly used entry point for convenience
+pub use codebook::{compute_centroids, nearest_centroid_indices, optimal_centroids};
