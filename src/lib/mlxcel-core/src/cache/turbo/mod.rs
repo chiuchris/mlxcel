@@ -50,3 +50,28 @@ pub use quant::{
     quantize_v_turbo4, turbo4_v_rotate, TurboQuantParams, BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET,
     V_BIT_WIDTH,
 };
+
+/// Default hot-tail threshold for `KVCacheMode::Turbo4Delegated` (issue #479).
+///
+/// When the FP16 hot tail exceeds this many tokens, the oldest
+/// [`DELEGATED_FOLD_BLOCK`]-token block is folded into cold packed storage on
+/// the background re-compression stream. The TurboQuant+ MLX port uses 256
+/// (a multiple of [`BLOCK_SIZE`]=32) which gives ample slack between folds at
+/// the typical 32–256 tokens-per-second decode rate without bloating the hot
+/// buffer footprint past a few hundred KB even on dense models.
+pub const DELEGATED_HOT_THRESHOLD: i32 = 256;
+
+/// Block size (tokens) folded from hot to cold per re-compression step.
+///
+/// Must be a multiple of [`BLOCK_SIZE`] (32) so the resulting cold append is
+/// block-aligned. 128 keeps the per-fold cost bounded (one quantize + one
+/// slice-update for ~64 packed bytes) while limiting the number of folds in
+/// flight per decode burst.
+pub const DELEGATED_FOLD_BLOCK: i32 = 128;
+
+/// Maximum hot-tail capacity (tokens) before the next fold is forced
+/// synchronously. Acts as a safety net so a slow background stream cannot let
+/// the hot buffer grow without bound. Set to 4× [`DELEGATED_HOT_THRESHOLD`]
+/// so a healthy stream never trips it; under contention we synchronize to
+/// preserve the speed gate's invariant that hot reads stay fast.
+pub const DELEGATED_HOT_MAX: i32 = DELEGATED_HOT_THRESHOLD * 4;

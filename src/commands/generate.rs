@@ -819,6 +819,12 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
                  allowlisted families only — non-allowlisted models fall back to Turbo4Asym)"
             );
         }
+        KVCacheMode::Turbo4Delegated => {
+            println!(
+                "KV cache mode: turbo4-delegated (Fp16-K + Turbo4-V with hot/cold split, \
+                 ~26% KV savings + 97-100% FP16 decode speed at long context)"
+            );
+        }
         KVCacheMode::Fp16 => {}
     }
 

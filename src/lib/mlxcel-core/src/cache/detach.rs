@@ -90,6 +90,10 @@ use super::{
 /// can rebuild [`crate::cache::turbo::TurboQuantParams`] without referring
 /// back to the originating `KVCache`.
 /// Turbo4 (symmetric) caches also carry packed-K + per-token K norms.
+/// Turbo4Delegated-mode caches additionally carry the FP16 cold K buffer
+/// (`cold_keys`), the cold/hot split (`cold_offset`), and the configured
+/// hot-tail fold threshold so the adopted cache resumes decoding from the
+/// same hot/cold boundary it left at detach time (issue #479).
 pub struct DetachedKVCache {
     pub(super) keys: Option<UniquePtr<MlxArray>>,
     pub(super) values: Option<UniquePtr<MlxArray>>,
@@ -103,6 +107,9 @@ pub struct DetachedKVCache {
     pub(super) k_packed: Option<UniquePtr<MlxArray>>,
     pub(super) k_norms: Option<UniquePtr<MlxArray>>,
     pub(super) turbo_seed: u32,
+    pub(super) cold_keys: Option<UniquePtr<MlxArray>>,
+    pub(super) cold_offset: i32,
+    pub(super) hot_threshold: i32,
 }
 
 impl DetachedKVCache {
@@ -119,7 +126,7 @@ impl DetachedKVCache {
 
     /// Total byte footprint of the detached tensors (keys + values + INT8
     /// scales + Turbo4Asym v_packed/v_norms + Turbo4 symmetric
-    /// k_packed/k_norms when applicable).
+    /// k_packed/k_norms + Turbo4Delegated cold_keys when applicable).
     pub fn nbytes(&self) -> usize {
         let k = self.keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let v = self.values.as_ref().map_or(0, |a| ffi::array_nbytes(a));
@@ -129,7 +136,8 @@ impl DetachedKVCache {
         let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn + kp + kn
+        let ck = self.cold_keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn + kp + kn + ck
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
@@ -163,6 +171,9 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("has_k_packed", &self.k_packed.is_some())
             .field("has_k_norms", &self.k_norms.is_some())
             .field("turbo_seed", &self.turbo_seed)
+            .field("has_cold_keys", &self.cold_keys.is_some())
+            .field("cold_offset", &self.cold_offset)
+            .field("hot_threshold", &self.hot_threshold)
             .finish()
     }
 }
@@ -239,6 +250,9 @@ impl KVCache {
             k_packed: self.k_packed.take(),
             k_norms: self.k_norms.take(),
             turbo_seed: self.turbo_seed,
+            cold_keys: self.cold_keys.take(),
+            cold_offset: std::mem::replace(&mut self.cold_offset, 0),
+            hot_threshold: self.hot_threshold,
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -274,12 +288,18 @@ impl KVCache {
         self.k_packed = detached.k_packed;
         self.k_norms = detached.k_norms;
         self.turbo_seed = detached.turbo_seed;
+        self.cold_keys = detached.cold_keys;
+        self.cold_offset = detached.cold_offset;
+        self.hot_threshold = detached.hot_threshold;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still
         // work. Detect it from v_packed (or k_packed for symmetric Turbo4)
         // shape: [B, H, T, head_dim/2].
-        if matches!(self.mode, KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4) {
+        if matches!(
+            self.mode,
+            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+        ) {
             let probe = self.v_packed.as_ref().or(self.k_packed.as_ref());
             if let Some(p) = probe {
                 let shape = ffi::array_shape(p);

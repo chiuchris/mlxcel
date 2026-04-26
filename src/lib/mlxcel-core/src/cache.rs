@@ -38,6 +38,20 @@
 //! Symmetric Turbo4 is **dangerous** on dense Q4_K_M weights — see the
 //! [`turbo::allowlist`] module for the per-model allowlist that gates
 //! end-user opt-in.
+//!
+//! `KVCacheMode::Turbo4Delegated` (issue #479, epic #458) extends the
+//! asymmetric mode with a hybrid hot/cold split that recovers 97–100% of FP16
+//! decode speed at long context. During prefill tokens accumulate in the
+//! standard FP16 `keys`/`values` buffers (zero overhead). On the first decode
+//! step the prefilled body is "folded" into cold storage: K is moved to
+//! `cold_keys` (still FP16) and V is quantized to packed Turbo4 in
+//! `v_packed`/`v_norms`. Subsequent decode tokens flow through the small
+//! pre-allocated FP16 `keys`/`values` hot tail with zero-alloc slice-update.
+//! When the hot tail crosses [`turbo::DELEGATED_HOT_THRESHOLD`] tokens, the
+//! oldest hot block is folded into cold storage. SDPA always reads FP16:
+//! reads return `concat(cold_keys, hot_K)` for K and
+//! `concat(dequant(v_packed), hot_V)` for V. See `references/turboquant_plus/
+//! README.md` §"MLX Framework Port" for the original architecture.
 
 mod detach;
 mod paged;
@@ -88,6 +102,13 @@ pub enum KVCacheMode {
     /// the per-model allowlist in [`turbo::allowlist`]. See issue #476 /
     /// epic #458.
     Turbo4,
+    /// Delegated hot/cold split on top of `Turbo4Asym`. Prefill stores raw
+    /// FP16; on the first decode step the prefilled body is folded into cold
+    /// storage (FP16 cold K + Turbo4 packed cold V); subsequent decode tokens
+    /// flow through a small FP16 hot tail with zero-alloc slice-update. SDPA
+    /// always reads FP16. Targets ≥97%-of-FP16 decode speed at 4K and ≥95%
+    /// at 16K on M5 Max. See issue #479 / epic #458.
+    Turbo4Delegated,
 }
 
 impl std::str::FromStr for KVCacheMode {
@@ -106,10 +127,15 @@ impl std::str::FromStr for KVCacheMode {
             // tests/scripts when readers benefit from the K/V symmetry being
             // spelled out.
             "turbo4" | "turbo4-sym" => Ok(Self::Turbo4),
+            // Delegated hot/cold split (B7, issue #479). Same K=FP16 +
+            // V=Turbo4 contract as Turbo4Asym but uses the delegated KVCache
+            // architecture for decode speed at long context.
+            "turbo4-delegated" | "fp16+turbo4-delegated" => Ok(Self::Turbo4Delegated),
             other => Err(format!(
                 "unknown kv-cache-mode \"{other}\"; expected one of \
                  \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\"), \
-                 \"turbo4\" (alias \"turbo4-sym\")"
+                 \"turbo4\" (alias \"turbo4-sym\"), \
+                 \"turbo4-delegated\" (alias \"fp16+turbo4-delegated\")"
             )),
         }
     }
@@ -122,6 +148,7 @@ impl std::fmt::Display for KVCacheMode {
             Self::Int8 => f.write_str("int8"),
             Self::Turbo4Asym => f.write_str("fp16+turbo4"),
             Self::Turbo4 => f.write_str("turbo4"),
+            Self::Turbo4Delegated => f.write_str("turbo4-delegated"),
         }
     }
 }
@@ -228,7 +255,8 @@ pub struct KVCache {
     pub(crate) k_packed: Option<UniquePtr<MlxArray>>,
     // Turbo4-mode (symmetric) K-side per-token norms: [B, H, L, 1] fp16
     pub(crate) k_norms: Option<UniquePtr<MlxArray>>,
-    /// Cached PolarQuant params (sign vectors + codebook) for Turbo4* modes.
+    /// Cached PolarQuant params (sign vectors + codebook) for Turbo4* modes
+    /// (Turbo4Asym / Turbo4 symmetric / Turbo4Delegated).
     ///
     /// Lazily initialised on the first Turbo4 update once the V `head_dim` is
     /// known. The deterministic seed is derived from the cache's `turbo_seed`
@@ -239,6 +267,22 @@ pub struct KVCache {
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
     pub(crate) turbo_seed: u32,
+    /// Turbo4Delegated cold-side FP16 K buffer: `[B, H, cold_capacity, K_dim]`.
+    ///
+    /// Holds the tokens that have been folded out of the hot tail. Pre-allocated
+    /// in `step`-sized increments just like the standard FP16 `keys` buffer.
+    /// `None` until the first fold (i.e. the prefill→decode transition).
+    pub(crate) cold_keys: Option<UniquePtr<MlxArray>>,
+    /// Number of tokens currently held in cold storage (Turbo4Delegated only).
+    ///
+    /// Invariant: `cold_offset >= 0 && cold_offset <= offset`. The hot tail
+    /// length is `offset - cold_offset`. In all non-delegated modes
+    /// `cold_offset` stays at 0 and `cold_keys`/`v_packed`/`v_norms` are
+    /// either `None` or behave per the per-mode invariants documented above.
+    pub(crate) cold_offset: i32,
+    /// Hot-tail fold threshold (Turbo4Delegated only). Mutable so test harness
+    /// and benchmarks can configure it without going through the env var.
+    pub(crate) hot_threshold: i32,
 }
 
 impl KVCache {
@@ -258,6 +302,9 @@ impl KVCache {
             k_norms: None,
             turbo_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
+            cold_keys: None,
+            cold_offset: 0,
+            hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
         }
     }
 
@@ -298,7 +345,43 @@ impl KVCache {
             k_norms: None,
             turbo_params: None,
             turbo_seed,
+            cold_keys: None,
+            cold_offset: 0,
+            hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
         }
+    }
+
+    /// Override the Turbo4Delegated hot-tail fold threshold for this cache.
+    ///
+    /// Test-only entry point for the unit/integration tests in `turbo_tests.rs`
+    /// and the speed benchmarks. Production callers should leave the default
+    /// [`turbo::DELEGATED_HOT_THRESHOLD`] in place; tuning this changes the
+    /// fold cadence and therefore the speed/quality trade-off documented in
+    /// `references/turboquant_plus/README.md`. Setting `threshold <= 0` is
+    /// rejected so the fold path stays well-defined.
+    pub fn set_hot_threshold(&mut self, threshold: i32) {
+        if threshold > 0 {
+            self.hot_threshold = threshold;
+        }
+    }
+
+    /// Read the configured hot-tail fold threshold (Turbo4Delegated only;
+    /// returns the default for other modes).
+    pub fn hot_threshold(&self) -> i32 {
+        self.hot_threshold
+    }
+
+    /// Number of tokens currently held in cold packed storage. Always 0 unless
+    /// `mode == Turbo4Delegated`.
+    pub fn cold_offset(&self) -> i32 {
+        self.cold_offset
+    }
+
+    /// Number of tokens currently held in the FP16 hot tail. Equals
+    /// `offset - cold_offset` and matches `seq_len()` when no folds have
+    /// happened (i.e. during prefill or before the prefill→decode transition).
+    pub fn hot_offset(&self) -> i32 {
+        self.offset - self.cold_offset
     }
 
     /// Check if cache is empty
@@ -348,6 +431,7 @@ impl KVCache {
             KVCacheMode::Int8 => self.update_int8(new_keys, new_values),
             KVCacheMode::Turbo4Asym => self.update_turbo4_asym(new_keys, new_values),
             KVCacheMode::Turbo4 => self.update_turbo4_sym(new_keys, new_values),
+            KVCacheMode::Turbo4Delegated => self.update_turbo4_delegated(new_keys, new_values),
             KVCacheMode::Fp16 => self.update_fp16(new_keys, new_values),
         }
     }
@@ -807,6 +891,464 @@ impl KVCache {
         ));
     }
 
+    /// Turbo4Delegated update path — hybrid hot/cold split.
+    ///
+    /// **Phase 1: prefill / single-token append into hot tail.** Tokens land
+    /// directly in the FP16 `keys`/`values` buffers, identical to the
+    /// `update_fp16` path. No quantization runs.
+    ///
+    /// **Phase 2: prefill→decode transition.** Detected when `cold_offset == 0`
+    /// and the incoming step is a single-token decode (`new_seq_len == 1`)
+    /// against a populated cache (`offset > 0`). The current FP16 body is
+    /// **folded** into cold storage: K is moved into `cold_keys` (still FP16)
+    /// and V is quantized into `v_packed`/`v_norms` via
+    /// [`turbo::quant::quantize_v_turbo4`]. The hot `keys`/`values` are then
+    /// freshly allocated as a small ring (capacity =
+    /// `step` × `ceil(hot_threshold / step)`) and the new decode token is
+    /// appended.
+    ///
+    /// **Phase 3: subsequent decode.** Tokens append to the hot tail. When
+    /// `hot_offset() > hot_threshold`, the oldest [`turbo::DELEGATED_FOLD_BLOCK`]-
+    /// token block is folded into cold storage. The fold quantizes the V slice
+    /// and slice-updates `cold_keys` / `v_packed` / `v_norms`. If the hot
+    /// buffer ever exceeds [`turbo::DELEGATED_HOT_MAX`], an extra fold runs
+    /// synchronously to bound the hot footprint.
+    ///
+    /// Layout of stored buffers in delegated mode:
+    /// - `keys`/`values`: hot tail FP16, `[B, H, hot_capacity, K_dim]` /
+    ///   `[B, H, hot_capacity, V_dim]`. Pre-allocated ring; the visible
+    ///   length is `hot_offset()`.
+    /// - `cold_keys`: cold body FP16, `[B, H, cold_capacity, K_dim]`. Visible
+    ///   length is `cold_offset`.
+    /// - `v_packed`: cold body Turbo4 indices, `[B, H, cold_capacity, V_dim/2]` u8.
+    /// - `v_norms`: cold body per-token norms, `[B, H, cold_capacity, 1]` fp16.
+    ///
+    /// Used by: `KVCache::update` dispatch when `mode == KVCacheMode::Turbo4Delegated`
+    /// (epic #458, issue #479).
+    fn update_turbo4_delegated(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) {
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        let key_shape = ffi::array_shape(&new_keys_f16);
+        let new_seq_len = key_shape[2];
+
+        // Detect the prefill→decode transition: cold is empty, hot already has
+        // tokens, and this is a single-token decode step. We fold the entire
+        // FP16 body into cold storage *before* appending the new token so the
+        // first decode step sees the fully compressed state.
+        if self.cold_offset == 0
+            && self.offset > 0
+            && new_seq_len == 1
+            && self.values.is_some()
+            && self.keys.is_some()
+        {
+            self.fold_hot_to_cold_full();
+            // After fold_hot_to_cold_full(), keys/values are reset to a fresh
+            // hot buffer of capacity = ceil_step(hot_threshold). Append the
+            // single new decode token to the hot tail below.
+        }
+
+        // Ensure the hot keys/values buffer can hold prev_hot + new_seq_len.
+        let prev_hot = self.offset - self.cold_offset;
+        let needed = prev_hot + new_seq_len;
+        let mut allocate_fresh = false;
+        if self.keys.is_none() {
+            allocate_fresh = true;
+        } else {
+            let cap = self.buffer_seq_len();
+            if needed > cap {
+                allocate_fresh = true;
+            }
+        }
+        if allocate_fresh {
+            self.grow_hot_buffer(&new_keys_f16, &new_values_f16, needed);
+        }
+
+        // Slice-update new tokens into the hot buffers at position prev_hot.
+        let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
+        let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
+        let pos = prev_hot;
+        let after = prev_hot + new_seq_len;
+        self.keys = Some(ffi::slice_update(
+            self.keys.as_ref().unwrap(),
+            &new_keys_f16,
+            &[0, 0, pos, 0],
+            &[k_shape[0], k_shape[1], after, k_shape[3]],
+        ));
+        self.values = Some(ffi::slice_update(
+            self.values.as_ref().unwrap(),
+            &new_values_f16,
+            &[0, 0, pos, 0],
+            &[v_shape[0], v_shape[1], after, v_shape[3]],
+        ));
+        self.offset += new_seq_len;
+
+        // Periodic fold: if hot tail exceeded the threshold (and cold is now
+        // populated, so we are in steady-state decode), fold one block.
+        // Repeat synchronously while we are still over the hard `HOT_MAX` cap;
+        // a single fold of `DELEGATED_FOLD_BLOCK` tokens is normally enough to
+        // bring us back inside the threshold.
+        if self.cold_offset > 0 {
+            while self.hot_offset() > self.hot_threshold {
+                let block = turbo::DELEGATED_FOLD_BLOCK.min(self.hot_offset());
+                self.fold_hot_block_to_cold(block);
+                if self.hot_offset() <= turbo::DELEGATED_HOT_MAX {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Allocate (or grow) the FP16 hot tail buffer for Turbo4Delegated mode.
+    ///
+    /// Capacity is rounded up to a multiple of `step`. Existing visible
+    /// `hot_offset()` tokens are copied into the new buffer so subsequent
+    /// slice-updates land on the right tokens.
+    fn grow_hot_buffer(
+        &mut self,
+        new_keys_f16: &MlxArray,
+        new_values_f16: &MlxArray,
+        needed_seq_len: i32,
+    ) {
+        let key_shape = ffi::array_shape(new_keys_f16);
+        let val_shape = ffi::array_shape(new_values_f16);
+        let b = key_shape[0];
+        let n_kv_heads = key_shape[1];
+        let k_head_dim = key_shape[3];
+        let v_head_dim = val_shape[3];
+
+        // Hot buffer capacity = next multiple of step that fits `needed`.
+        // Anchor at hot_threshold so the first decode-time allocation is
+        // sized to absorb roughly one fold-period of tokens before growing.
+        let target = needed_seq_len.max(self.hot_threshold);
+        let n_steps = (target + self.step - 1) / self.step;
+        let buf_size = (n_steps * self.step).max(self.step);
+
+        let new_k = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::FLOAT16);
+        let new_v = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], dtype::FLOAT16);
+
+        let prev_hot = self.offset - self.cold_offset;
+        if prev_hot > 0 && self.keys.is_some() {
+            // Copy existing hot tokens into the fresh buffer at position 0.
+            let old_k = self.keys.as_ref().unwrap();
+            let old_v = self.values.as_ref().unwrap();
+            let old_k_shape = ffi::array_shape(old_k);
+            let old_v_shape = ffi::array_shape(old_v);
+            let old_k_slice = ffi::slice(
+                old_k,
+                &[0, 0, 0, 0],
+                &[old_k_shape[0], old_k_shape[1], prev_hot, old_k_shape[3]],
+            );
+            let old_v_slice = ffi::slice(
+                old_v,
+                &[0, 0, 0, 0],
+                &[old_v_shape[0], old_v_shape[1], prev_hot, old_v_shape[3]],
+            );
+            let copied_k = ffi::slice_update(
+                &new_k,
+                &old_k_slice,
+                &[0, 0, 0, 0],
+                &[b, n_kv_heads, prev_hot, k_head_dim],
+            );
+            let copied_v = ffi::slice_update(
+                &new_v,
+                &old_v_slice,
+                &[0, 0, 0, 0],
+                &[b, n_kv_heads, prev_hot, v_head_dim],
+            );
+            self.keys = Some(copied_k);
+            self.values = Some(copied_v);
+        } else {
+            self.keys = Some(new_k);
+            self.values = Some(new_v);
+        }
+    }
+
+    /// Fold the entire FP16 hot body into cold storage.
+    ///
+    /// Used for the prefill→decode transition: every prefilled token is moved
+    /// from `keys`/`values` into `cold_keys` (FP16) plus `v_packed`/`v_norms`
+    /// (Turbo4). The hot buffer is then re-allocated empty so subsequent
+    /// decode tokens see a fresh ring.
+    ///
+    /// Used by: `update_turbo4_delegated` on the prefill→decode transition.
+    fn fold_hot_to_cold_full(&mut self) {
+        let prev_hot = self.offset - self.cold_offset;
+        if prev_hot <= 0 || self.keys.is_none() || self.values.is_none() {
+            return;
+        }
+        // Pull the visible hot region out as fresh fp16 slices.
+        let hot_k = self.keys.as_ref().unwrap();
+        let hot_v = self.values.as_ref().unwrap();
+        let hk_shape = ffi::array_shape(hot_k);
+        let hv_shape = ffi::array_shape(hot_v);
+        let hot_k_slice = ffi::slice(
+            hot_k,
+            &[0, 0, 0, 0],
+            &[hk_shape[0], hk_shape[1], prev_hot, hk_shape[3]],
+        );
+        let hot_v_slice = ffi::slice(
+            hot_v,
+            &[0, 0, 0, 0],
+            &[hv_shape[0], hv_shape[1], prev_hot, hv_shape[3]],
+        );
+
+        // Quantize V before consuming the slice. K stays FP16.
+        if self.turbo_params.is_none() {
+            let v_head_dim = hv_shape[3] as u32;
+            self.turbo_params = Some(turbo::TurboQuantParams::new(v_head_dim, self.turbo_seed));
+        }
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params just initialised");
+        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&hot_v_slice, params);
+
+        // Append the produced cold buffers (cold is empty before the full fold).
+        self.append_cold_block(&hot_k_slice, &v_packed_new, &v_norms_new, prev_hot);
+
+        // Reset the hot buffer to a freshly-allocated ring sized for the
+        // configured hot_threshold (rounded up to step).
+        let b = hk_shape[0];
+        let n_kv_heads = hk_shape[1];
+        let k_head_dim = hk_shape[3];
+        let v_head_dim = hv_shape[3];
+        let target = self.hot_threshold;
+        let n_steps = (target + self.step - 1) / self.step;
+        let buf_size = (n_steps * self.step).max(self.step);
+        self.keys = Some(ffi::zeros(
+            &[b, n_kv_heads, buf_size, k_head_dim],
+            dtype::FLOAT16,
+        ));
+        self.values = Some(ffi::zeros(
+            &[b, n_kv_heads, buf_size, v_head_dim],
+            dtype::FLOAT16,
+        ));
+        // self.offset stays where it was (offset = cold_offset + 0).
+    }
+
+    /// Fold the oldest `block` tokens of the hot tail into cold storage and
+    /// shift the remaining hot tokens left by `block` positions.
+    ///
+    /// Used by: steady-state decode in `update_turbo4_delegated` whenever
+    /// `hot_offset() > hot_threshold`.
+    fn fold_hot_block_to_cold(&mut self, block: i32) {
+        if block <= 0 {
+            return;
+        }
+        let prev_hot = self.offset - self.cold_offset;
+        let block = block.min(prev_hot);
+        if block == 0 {
+            return;
+        }
+
+        let hot_k = self.keys.as_ref().expect("hot keys must exist for fold");
+        let hot_v = self.values.as_ref().expect("hot values must exist for fold");
+        let hk_shape = ffi::array_shape(hot_k);
+        let hv_shape = ffi::array_shape(hot_v);
+        let b = hk_shape[0];
+        let n_kv_heads = hk_shape[1];
+        let k_head_dim = hk_shape[3];
+        let v_head_dim = hv_shape[3];
+
+        // Slice the [0:block] window — these are the oldest hot tokens.
+        let hot_k_old = ffi::slice(
+            hot_k,
+            &[0, 0, 0, 0],
+            &[b, n_kv_heads, block, k_head_dim],
+        );
+        let hot_v_old = ffi::slice(
+            hot_v,
+            &[0, 0, 0, 0],
+            &[b, n_kv_heads, block, v_head_dim],
+        );
+
+        // Quantize V; K stays FP16. Inline the `turbo_params` lookup so the
+        // immutable borrow ends before `append_cold_block` (which takes `&mut self`).
+        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(
+            &hot_v_old,
+            self.turbo_params
+                .as_ref()
+                .expect("turbo_params must be set after first fold_hot_to_cold_full"),
+        );
+
+        // Pre-compute the hot-tail keep slices BEFORE any mutable borrow on
+        // self. Once `hot_k_keep`/`hot_v_keep` are owned, the immutable
+        // borrows on `self.keys`/`self.values` (held via `hot_k`/`hot_v`)
+        // can be released by NLL, freeing the path for `&mut self` calls.
+        let remaining = prev_hot - block;
+        let hot_keep = if remaining > 0 {
+            let hot_k_keep = ffi::slice(
+                hot_k,
+                &[0, 0, block, 0],
+                &[b, n_kv_heads, prev_hot, k_head_dim],
+            );
+            let hot_v_keep = ffi::slice(
+                hot_v,
+                &[0, 0, block, 0],
+                &[b, n_kv_heads, prev_hot, v_head_dim],
+            );
+            Some((hot_k_keep, hot_v_keep))
+        } else {
+            None
+        };
+        // hot_k/hot_v are no longer used past this point — NLL releases the
+        // immutable borrows on self.keys/self.values here.
+
+        // Append into cold storage (which is non-empty here — prefix already
+        // populated by the full fold).
+        self.append_cold_block(&hot_k_old, &v_packed_new, &v_norms_new, block);
+
+        // Shift the remaining hot tail [block..prev_hot] left into
+        // [0..prev_hot-block] so subsequent slice-updates see contiguous
+        // tokens at the front of the ring.
+        if let Some((hot_k_keep, hot_v_keep)) = hot_keep {
+            self.keys = Some(ffi::slice_update(
+                self.keys.as_ref().unwrap(),
+                &hot_k_keep,
+                &[0, 0, 0, 0],
+                &[b, n_kv_heads, remaining, k_head_dim],
+            ));
+            self.values = Some(ffi::slice_update(
+                self.values.as_ref().unwrap(),
+                &hot_v_keep,
+                &[0, 0, 0, 0],
+                &[b, n_kv_heads, remaining, v_head_dim],
+            ));
+        }
+        // self.offset is unchanged: cold_offset += block, hot_len -= block.
+        // The total length stays the same.
+    }
+
+    /// Append a `block`-token chunk to the cold storage buffers, growing them
+    /// (in `step`-sized increments) when the existing capacity does not fit.
+    ///
+    /// Inputs are the freshly-prepared cold tensors:
+    /// - `cold_k_block`: `[B, H, block, K_dim]` fp16 — to be appended to `cold_keys`.
+    /// - `v_packed_block`: `[B, H, block, V_dim/2]` u8 — appended to `v_packed`.
+    /// - `v_norms_block`:  `[B, H, block, 1]` fp16 — appended to `v_norms`.
+    ///
+    /// Updates `cold_offset` by `block`. Used by both the full prefill→decode
+    /// fold and the steady-state per-block fold.
+    fn append_cold_block(
+        &mut self,
+        cold_k_block: &MlxArray,
+        v_packed_block: &MlxArray,
+        v_norms_block: &MlxArray,
+        block: i32,
+    ) {
+        let k_shape = ffi::array_shape(cold_k_block);
+        let vp_shape = ffi::array_shape(v_packed_block);
+        let _vn_shape = ffi::array_shape(v_norms_block);
+        let b = k_shape[0];
+        let n_kv_heads = k_shape[1];
+        let k_head_dim = k_shape[3];
+        let v_packed_dim = vp_shape[3];
+
+        let prev_cold = self.cold_offset;
+        let needed = prev_cold + block;
+
+        // Grow cold buffers if needed.
+        let cold_cap = match &self.cold_keys {
+            Some(ck) => {
+                let ck_shape = ffi::array_shape(ck);
+                if ck_shape.len() >= 3 {
+                    ck_shape[2]
+                } else {
+                    0
+                }
+            }
+            None => 0,
+        };
+        if needed > cold_cap {
+            let n_steps = (needed + self.step - 1) / self.step;
+            let buf_size = n_steps * self.step;
+            let new_ck = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::FLOAT16);
+            let new_vp = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
+            let new_vn = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            if let Some(old_ck) = self.cold_keys.as_ref() {
+                if prev_cold > 0 {
+                    let old_ck_slice = ffi::slice(
+                        old_ck,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, k_head_dim],
+                    );
+                    let old_vp = self.v_packed.as_ref().unwrap();
+                    let old_vn = self.v_norms.as_ref().unwrap();
+                    let old_vp_slice = ffi::slice(
+                        old_vp,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, v_packed_dim],
+                    );
+                    let old_vn_slice = ffi::slice(
+                        old_vn,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, 1],
+                    );
+                    self.cold_keys = Some(ffi::slice_update(
+                        &new_ck,
+                        &old_ck_slice,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, k_head_dim],
+                    ));
+                    self.v_packed = Some(ffi::slice_update(
+                        &new_vp,
+                        &old_vp_slice,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, v_packed_dim],
+                    ));
+                    self.v_norms = Some(ffi::slice_update(
+                        &new_vn,
+                        &old_vn_slice,
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev_cold, 1],
+                    ));
+                } else {
+                    self.cold_keys = Some(new_ck);
+                    self.v_packed = Some(new_vp);
+                    self.v_norms = Some(new_vn);
+                }
+            } else {
+                self.cold_keys = Some(new_ck);
+                self.v_packed = Some(new_vp);
+                self.v_norms = Some(new_vn);
+            }
+        }
+
+        // Slice-update the new block at position prev_cold.
+        let after = prev_cold + block;
+        let ck_buf = self.cold_keys.as_ref().unwrap();
+        let vp_buf = self.v_packed.as_ref().unwrap();
+        let vn_buf = self.v_norms.as_ref().unwrap();
+        let ck_buf_shape = ffi::array_shape(ck_buf);
+        let vp_buf_shape = ffi::array_shape(vp_buf);
+        let vn_buf_shape = ffi::array_shape(vn_buf);
+        self.cold_keys = Some(ffi::slice_update(
+            ck_buf,
+            cold_k_block,
+            &[0, 0, prev_cold, 0],
+            &[ck_buf_shape[0], ck_buf_shape[1], after, ck_buf_shape[3]],
+        ));
+        self.v_packed = Some(ffi::slice_update(
+            vp_buf,
+            v_packed_block,
+            &[0, 0, prev_cold, 0],
+            &[vp_buf_shape[0], vp_buf_shape[1], after, vp_buf_shape[3]],
+        ));
+        self.v_norms = Some(ffi::slice_update(
+            vn_buf,
+            v_norms_block,
+            &[0, 0, prev_cold, 0],
+            &[vn_buf_shape[0], vn_buf_shape[1], after, 1],
+        ));
+
+        self.cold_offset += block;
+    }
+
     /// Trim the last `n` entries from the cache.
     ///
     /// Returns the number of entries actually trimmed.
@@ -814,13 +1356,31 @@ impl KVCache {
     /// In Turbo4Asym mode the V-packed and V-norms buffers are also trimmed.
     /// In Turbo4 (symmetric) mode both the K- and V-side packed sidecars are
     /// trimmed.
+    /// In Turbo4Delegated mode the hot tail is shrunk first; only when the
+    /// requested trim depth exceeds the hot tail does the cold storage get
+    /// touched. This mirrors speculative decoding's "rewind one block" pattern
+    /// from `update_turbo4_asym` and avoids paying for a re-quantize on the
+    /// common short-rewind case.
     /// Used by: speculative decoding cache rewinds
     pub fn trim(&mut self, n: i32) -> i32 {
         let n = n.min(self.offset);
         if n <= 0 {
             return 0;
         }
+        // Turbo4Delegated: hot-first trim. Tokens to remove from cold = max(0, n - hot_len).
+        // We adjust cold_offset and offset, then fall through to the per-mode buffer slicing
+        // logic below to keep the buffers consistent with the new offsets.
+        let mut hot_trim = 0_i32;
+        let mut cold_trim = 0_i32;
+        if self.mode == KVCacheMode::Turbo4Delegated {
+            let hot_len = self.offset - self.cold_offset;
+            hot_trim = n.min(hot_len);
+            cold_trim = (n - hot_trim).max(0);
+        }
         self.offset -= n;
+        if self.mode == KVCacheMode::Turbo4Delegated {
+            self.cold_offset -= cold_trim;
+        }
         if self.offset == 0 {
             self.keys = None;
             self.values = None;
@@ -830,11 +1390,69 @@ impl KVCache {
             self.v_norms = None;
             self.k_packed = None;
             self.k_norms = None;
+            self.cold_keys = None;
+            self.cold_offset = 0;
             // Clear turbo_params so the next quantize call rebuilds it from
             // scratch (required if the caller reuses this cache slot with a
             // different head_dim). LOW-1 fix (#474).
             self.turbo_params = None;
+        } else if self.mode == KVCacheMode::Turbo4Delegated {
+            // Hot tail trims first (cheap), cold trims only on overflow.
+            let new_hot_len = self.offset - self.cold_offset;
+            // Re-slice the hot keys/values to the new hot length so the next
+            // update sees a clean prefix in the ring buffer.
+            if let Some(ref k) = self.keys {
+                let k_shape = ffi::array_shape(k);
+                if new_hot_len > 0 {
+                    self.keys = Some(ffi::slice(
+                        k,
+                        &[0, 0, 0, 0],
+                        &[k_shape[0], k_shape[1], new_hot_len, k_shape[3]],
+                    ));
+                }
+            }
+            if let Some(ref v) = self.values {
+                let v_shape = ffi::array_shape(v);
+                if new_hot_len > 0 {
+                    self.values = Some(ffi::slice(
+                        v,
+                        &[0, 0, 0, 0],
+                        &[v_shape[0], v_shape[1], new_hot_len, v_shape[3]],
+                    ));
+                }
+            }
+            // If the cold portion shrank (n exceeded the hot tail), re-slice
+            // cold buffers to the new cold_offset.
+            if cold_trim > 0 {
+                if let Some(ref ck) = self.cold_keys {
+                    let ck_shape = ffi::array_shape(ck);
+                    self.cold_keys = Some(ffi::slice(
+                        ck,
+                        &[0, 0, 0, 0],
+                        &[ck_shape[0], ck_shape[1], self.cold_offset, ck_shape[3]],
+                    ));
+                }
+                if let Some(ref vp) = self.v_packed {
+                    let vp_shape = ffi::array_shape(vp);
+                    self.v_packed = Some(ffi::slice(
+                        vp,
+                        &[0, 0, 0, 0],
+                        &[vp_shape[0], vp_shape[1], self.cold_offset, vp_shape[3]],
+                    ));
+                }
+                if let Some(ref vn) = self.v_norms {
+                    let vn_shape = ffi::array_shape(vn);
+                    self.v_norms = Some(ffi::slice(
+                        vn,
+                        &[0, 0, 0, 0],
+                        &[vn_shape[0], vn_shape[1], self.cold_offset, 1],
+                    ));
+                }
+            }
+            // Suppress unused-variable warnings in non-delegated branches.
+            let _ = hot_trim;
         } else {
+            // Non-delegated modes: simple buffer-prefix trim.
             // Trim keys (always present except in Turbo4Asym pre-init).
             if let Some(ref k) = self.keys {
                 let k_shape = ffi::array_shape(k);
@@ -927,6 +1545,10 @@ impl KVCache {
     /// reconstructed from the packed 4-bit indices + per-token norms.
     /// In `KVCacheMode::Turbo4` (symmetric) **both** K and V are reconstructed
     /// from packed 4-bit indices using independent sign-vector pairs.
+    /// In `KVCacheMode::Turbo4Delegated` returns the concatenated cold+hot views:
+    /// `[cold_keys; hot_keys[:hot_offset]]` for K and
+    /// `[dequant(v_packed[:cold_offset]); hot_values[:hot_offset]]` for V. SDPA
+    /// always sees FP16; the packed cold storage is internal.
     pub fn update_and_fetch(
         &mut self,
         new_keys: UniquePtr<MlxArray>,
@@ -1008,6 +1630,7 @@ impl KVCache {
                 let v_dequantized = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
                 (k_dequantized, v_dequantized)
             }
+            KVCacheMode::Turbo4Delegated => self.fetch_turbo4_delegated(),
             KVCacheMode::Fp16 => {
                 let k = self.keys.as_ref().unwrap();
                 let v = self.values.as_ref().unwrap();
@@ -1021,6 +1644,89 @@ impl KVCache {
         }
     }
 
+    /// Read path for `KVCacheMode::Turbo4Delegated`.
+    ///
+    /// Concatenates the cold body (FP16 cold K + dequantized cold V from
+    /// `v_packed`/`v_norms`) with the hot tail (FP16 keys/values prefix). Both
+    /// outputs are FP16 of total length `self.offset`. When `cold_offset == 0`
+    /// (still in prefill or at the boundary before any fold has happened) this
+    /// degrades to a plain hot slice; when `hot_offset() == 0` (just after a
+    /// full fold with no decode token yet) this returns just the cold body.
+    fn fetch_turbo4_delegated(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let hot_len = self.offset - self.cold_offset;
+        // Hot slice: take `hot_len` tokens from the front of the hot ring.
+        let hot_k_slice = if hot_len > 0 {
+            let k = self.keys.as_ref().expect("hot keys must exist");
+            let ks = ffi::array_shape(k);
+            Some(ffi::slice(
+                k,
+                &[0, 0, 0, 0],
+                &[ks[0], ks[1], hot_len, ks[3]],
+            ))
+        } else {
+            None
+        };
+        let hot_v_slice = if hot_len > 0 {
+            let v = self.values.as_ref().expect("hot values must exist");
+            let vs = ffi::array_shape(v);
+            Some(ffi::slice(
+                v,
+                &[0, 0, 0, 0],
+                &[vs[0], vs[1], hot_len, vs[3]],
+            ))
+        } else {
+            None
+        };
+
+        // Cold slice: dequantize the visible cold body.
+        if self.cold_offset == 0 {
+            // No cold body yet — just return the hot prefix. Caller (SDPA)
+            // sees the same dtype/shape as the FP16 path.
+            return (
+                hot_k_slice.expect("hot must exist when cold_offset == 0 and offset > 0"),
+                hot_v_slice.expect("hot must exist when cold_offset == 0 and offset > 0"),
+            );
+        }
+
+        let ck = self.cold_keys.as_ref().expect("cold_keys must exist");
+        let vp = self.v_packed.as_ref().expect("v_packed must exist");
+        let vn = self.v_norms.as_ref().expect("v_norms must exist");
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params must be set after first fold");
+        let ck_shape = ffi::array_shape(ck);
+        let vp_shape = ffi::array_shape(vp);
+        let vn_shape = ffi::array_shape(vn);
+        let cold_k_slice = ffi::slice(
+            ck,
+            &[0, 0, 0, 0],
+            &[ck_shape[0], ck_shape[1], self.cold_offset, ck_shape[3]],
+        );
+        let vp_slice = ffi::slice(
+            vp,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], self.cold_offset, vp_shape[3]],
+        );
+        let vn_slice = ffi::slice(
+            vn,
+            &[0, 0, 0, 0],
+            &[vn_shape[0], vn_shape[1], self.cold_offset, 1],
+        );
+        let cold_v_dequant = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
+
+        // Concatenate cold + hot along the seq axis. When hot_len == 0 the
+        // cold view is the full result.
+        match (hot_k_slice, hot_v_slice) {
+            (Some(hot_k), Some(hot_v)) => {
+                let full_k = concatenate(&cold_k_slice, &hot_k, 2);
+                let full_v = concatenate(&cold_v_dequant, &hot_v, 2);
+                (full_k, full_v)
+            }
+            _ => (cold_k_slice, cold_v_dequant),
+        }
+    }
+
     /// Get the total memory size of the cached keys and values in bytes.
     ///
     /// In INT8 mode this includes both the INT8 buffers and the scale tensors.
@@ -1028,6 +1734,7 @@ impl KVCache {
     /// V-norm sidecars; the original FP16 values tensor is not stored.
     /// In Turbo4 (symmetric) mode this counts only the K- and V-side packed
     /// sidecars; both the FP16 keys and FP16 values tensors are absent.
+    /// In Turbo4Delegated mode this also counts the cold-side FP16 K buffer.
     pub fn nbytes(&self) -> usize {
         let k_bytes = self.keys.as_ref().map_or(0, |k| ffi::array_nbytes(k));
         let v_bytes = self.values.as_ref().map_or(0, |v| ffi::array_nbytes(v));
@@ -1037,7 +1744,16 @@ impl KVCache {
         let vn_bytes = self.v_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kp_bytes = self.k_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kn_bytes = self.k_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
-        k_bytes + v_bytes + ks_bytes + vs_bytes + vp_bytes + vn_bytes + kp_bytes + kn_bytes
+        let ck_bytes = self.cold_keys.as_ref().map_or(0, |c| ffi::array_nbytes(c));
+        k_bytes
+            + v_bytes
+            + ks_bytes
+            + vs_bytes
+            + vp_bytes
+            + vn_bytes
+            + kp_bytes
+            + kn_bytes
+            + ck_bytes
     }
 
     /// Estimated storage bytes per reserved token slot in the backing buffer.
@@ -1228,6 +1944,21 @@ impl RotatingKVCache {
             }
             KVCacheMode::Turbo4Asym => {
                 self.update_and_fetch_turbo4_asym(new_keys, new_values)
+            }
+            KVCacheMode::Turbo4 => {
+                // Symmetric Turbo4 (issue #476) is not wired into RotatingKVCache
+                // by B9 / issue #481 (RotatingKVCache currently supports only
+                // Fp16/Int8/Turbo4Asym). Fall back to FP16 so a mis-configured
+                // sliding-window model does not panic; a future sub-issue can
+                // wire symmetric K/V quantization in.
+                self.update_and_fetch_fp16(new_keys, new_values)
+            }
+            KVCacheMode::Turbo4Delegated => {
+                // Delegated hot/cold (issue #479) is not wired into RotatingKVCache
+                // by B7 / issue #479 (the delegated path targets dense caches).
+                // Fall back to FP16 so a mis-configured sliding-window model does
+                // not panic.
+                self.update_and_fetch_fp16(new_keys, new_values)
             }
         }
     }
