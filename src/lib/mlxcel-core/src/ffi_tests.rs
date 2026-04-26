@@ -1004,7 +1004,10 @@ fn test_wht_matches_h4_reference() {
     let expected = from_slice_f32(&[5.0, -1.0, -2.0, 0.0], &[4]);
     let close = allclose(&y, &expected, 1e-5, 1e-5);
     eval(&close);
-    assert!(item_bool(&close), "wht(H_4 input) must equal hand-computed reference");
+    assert!(
+        item_bool(&close),
+        "wht(H_4 input) must equal hand-computed reference"
+    );
 }
 
 /// FP16 precision sanity: the MLX op preserves dtype when given an FP16

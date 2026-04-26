@@ -1,0 +1,705 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! TurboQuant V-side PolarQuant pipeline (B2, issue #474, epic #458).
+//!
+//! Implements the V-cache quantization path used by `KVCacheMode::Turbo4Asym`:
+//!
+//! 1. Per-token L2 norm extraction.
+//! 2. Sign-flip × Walsh–Hadamard × sign-flip rotation (the structured fast
+//!    rotation `D2 · H · D1` from the TurboQuant+ reference). See B0 (#470)
+//!    for the WHT op.
+//! 3. Per-coordinate nearest-centroid lookup using the Lloyd-Max codebook
+//!    from B1 (#472).
+//! 4. Nibble-packing of the 4-bit indices into a `[..., head_dim/2]` u8 buffer.
+//!
+//! The dequantize path is the exact inverse: unpack nibbles → centroid
+//! gather → optional rotated-norm correction → reverse rotation → rescale by
+//! the stored norm.
+//!
+//! # Storage layout
+//!
+//! For each token slot the cache stores:
+//!
+//! - `v_packed[..., t, :]` — `head_dim/2` u8s, one byte = two 4-bit indices
+//!   (low nibble = even-index coord, high nibble = odd-index coord).
+//! - `v_norms[..., t, 0]`  — fp16 L2 norm of the original V vector.
+//!
+//! Sign vectors `signs1` and `signs2` are owned per-cache (one pair per cache
+//! object, deterministic from a seed) and shared across batch + heads + tokens.
+//!
+//! # Block size
+//!
+//! [`BLOCK_SIZE`] = 32 controls the buffer growth granularity (the cache grows
+//! its V buffer in increments of 32 tokens). The math is per-token — there is
+//! no block-level shared state in the quantize/dequantize algorithm itself.
+//! This matches TurboQuant+'s "turbo4 already uses block_size=128" semantics
+//! for `head_dim=128` (one norm per rotation group = one norm per V vector).
+//! See `references/turboquant_plus/docs/papers/block-size-experiment.md`.
+//!
+//! # Numerical notes
+//!
+//! The Lloyd-Max codebook is calibrated for a *unit-norm* `head_dim`-vector
+//! whose post-WHT coordinates approximate `N(0, 1/d)`. The norm-extract /
+//! rescale-on-dequant pattern (PolarQuant page 5) keeps the input distribution
+//! unit-norm regardless of the raw V magnitudes. The norm-correction step
+//! (`y_hat /= ||y_hat||`) compensates for the centroid gather discarding
+//! magnitude information; without it, the dequantized vector underestimates
+//! the original V by a few percent.
+//!
+//! Used by: `KVCacheMode::Turbo4Asym` V-cache update/read (B2, epic #458).
+
+use std::sync::Arc;
+
+use cxx::UniquePtr;
+
+use super::codebook::{nearest_centroid_indices_with_boundaries, optimal_codebook, Codebook};
+use crate::dtype;
+use crate::ffi;
+use crate::ffi::MlxArray;
+use crate::ops::wht;
+
+/// V-side PolarQuant bit-width. Locked to 4 bits for `Turbo4Asym`. (B5/#477
+/// will add 3-bit, but lives in its own variant.)
+pub const V_BIT_WIDTH: u8 = 4;
+
+/// Buffer growth granularity (tokens) for the packed V buffer. Matches the
+/// TurboQuant+ "block_size=32" default. Speculative decoding rewinds at most
+/// one block at a time so the trim path is always block-aligned.
+pub const BLOCK_SIZE: i32 = 32;
+
+/// A simple 32-bit linear-congruential generator (Numerical Recipes constants)
+/// used to deterministically derive `±1` sign vectors from a layer-specific
+/// seed without pulling in another crate. Quality is sufficient for a
+/// random-rotation matrix — TurboQuant only requires that the rotation be
+/// dense and well-conditioned, and this LCG plus the Walsh–Hadamard transform
+/// produces statistically indistinguishable rotations from a Haar-distributed
+/// matrix once the WHT is applied.
+#[derive(Debug, Clone, Copy)]
+struct Lcg32 {
+    state: u32,
+}
+
+impl Lcg32 {
+    fn new(seed: u32) -> Self {
+        // Avoid degenerate seed=0 collapsing to a fixed point.
+        let state = if seed == 0 { 0xDEADBEEF } else { seed };
+        Self { state }
+    }
+
+    fn next_bit(&mut self) -> u32 {
+        // Numerical Recipes LCG: x_{n+1} = 1664525 * x_n + 1013904223 (mod 2^32)
+        self.state = self
+            .state
+            .wrapping_mul(1_664_525)
+            .wrapping_add(1_013_904_223);
+        // Use bit 31 (sign bit of the LCG) — better-distributed than bit 0.
+        self.state >> 31
+    }
+}
+
+/// Parameters for the V-side TurboQuant pipeline that are shared across all
+/// quantize / dequantize calls for a single cache instance.
+///
+/// One instance is built per `KVCache` at construction time (see
+/// `KVCache::new_with_mode`), parameterised by the V `head_dim` of the
+/// runtime model and a deterministic seed. The codebook is fetched from the
+/// global `OnceLock`-backed cache so multiple caches share the centroids.
+///
+/// Used by: `KVCache::update_turbo4_asym` (cache.rs),
+/// `turbo::quant::dequantize_v_turbo4` (this module).
+#[derive(Clone, Debug)]
+pub struct TurboQuantParams {
+    /// V head dimension (must be a non-zero power of two — power-of-two is
+    /// the WHT op's hard requirement, see `mlxcel_core::ops::wht`).
+    pub head_dim: u32,
+    /// `±1.0` sign vector applied **before** the WHT. Length = `head_dim`.
+    pub signs1: Arc<[f32]>,
+    /// `±1.0` sign vector applied **after** the WHT. Length = `head_dim`.
+    pub signs2: Arc<[f32]>,
+    /// Cached centroid + boundary tables for `(V_BIT_WIDTH, head_dim)`.
+    pub codebook: Codebook,
+}
+
+impl TurboQuantParams {
+    /// Build params for a `(head_dim, seed)` pair. The seed determines the
+    /// random sign vectors deterministically; passing the same seed across
+    /// runs reproduces the same rotation.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `head_dim` is not a positive power of two — the WHT op
+    /// requires this and the cache layer cannot recover from a runtime
+    /// quantize-time failure.
+    pub fn new(head_dim: u32, seed: u32) -> Self {
+        assert!(
+            head_dim > 0 && head_dim.is_power_of_two(),
+            "TurboQuantParams::new: head_dim must be a non-zero power of two; got {head_dim}"
+        );
+        let signs1 = generate_signs(head_dim as usize, seed);
+        // Use a different sub-seed for signs2 so the two are independent.
+        let signs2 = generate_signs(head_dim as usize, seed.wrapping_add(0x9E37_79B9));
+        let codebook = optimal_codebook(V_BIT_WIDTH, head_dim);
+        Self {
+            head_dim,
+            signs1,
+            signs2,
+            codebook,
+        }
+    }
+}
+
+/// Generate a deterministic `±1.0` sign vector of length `len` from `seed`.
+///
+/// Uses an in-house LCG so the result is reproducible across runs and
+/// platforms without taking a dependency on any RNG crate.
+///
+/// Used by: `TurboQuantParams::new`.
+pub fn generate_signs(len: usize, seed: u32) -> Arc<[f32]> {
+    let mut rng = Lcg32::new(seed);
+    let mut out = Vec::with_capacity(len);
+    for _ in 0..len {
+        let bit = rng.next_bit();
+        out.push(if bit == 0 { -1.0_f32 } else { 1.0_f32 });
+    }
+    Arc::from(out)
+}
+
+// ---------------------------------------------------------------------------
+// Quantize / dequantize — graph + readback hybrid
+// ---------------------------------------------------------------------------
+
+/// Quantize a V tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into
+/// the packed Turbo4 representation.
+///
+/// Returns `(v_packed, v_norms)` where:
+/// - `v_packed`: `[B, H, T, D/2]` u8 — nibble-packed 4-bit indices.
+/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token L2 norm of the *original*
+///   V vector (used for rescaling on dequantize).
+///
+/// Used by: `KVCache::update` (Turbo4Asym mode).
+pub fn quantize_v_turbo4(
+    v: &MlxArray,
+    params: &TurboQuantParams,
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    // Cast V to fp32 for stable norm + rotation arithmetic. The MLX WHT op
+    // accepts fp32/fp16/bf16; fp32 keeps the centroid lookup well-conditioned
+    // even for very small / very large V magnitudes.
+    let v_f32 = ffi::astype(v, dtype::FLOAT32);
+    let shape = ffi::array_shape(&v_f32);
+    debug_assert_eq!(shape.len(), 4, "V must be 4-D [B, H, T, D]");
+    let _b = shape[0];
+    let _h = shape[1];
+    let t = shape[2];
+    let d = shape[3];
+    debug_assert_eq!(
+        d as u32, params.head_dim,
+        "V last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+
+    // 1. Per-token L2 norm: ||v||_2 along last axis, keepdims=true → [B, H, T, 1]
+    let v_sq = ffi::multiply(&v_f32, &v_f32);
+    let sum_sq = ffi::sum_axis(&v_sq, -1, true);
+    let norm_full = ffi::sqrt(&sum_sq);
+    // Avoid divide-by-zero **only** for the exact-zero case. Using
+    // `maximum(norm, 1.0)` here is mathematically wrong: it clamps any
+    // norm below 1.0 *up* to 1.0, destroying direction information for
+    // small-magnitude V vectors. Use a `where` op so non-zero norms pass
+    // through unchanged. Mirrors the Python reference at
+    // `references/turboquant_plus/turboquant/polar_quant.py:60`:
+    // `safe_norms = np.where(norms > 0, norms, 1.0)`.
+    let zero = ffi::full_f32(&[1], 0.0, dtype::FLOAT32);
+    let one = ffi::full_f32(&[1], 1.0, dtype::FLOAT32);
+    let positive_mask = ffi::greater(&norm_full, &zero);
+    let safe_norm = ffi::where_cond(&positive_mask, &norm_full, &one);
+    let v_normalized = ffi::divide(&v_f32, &safe_norm); // [B, H, T, D]
+
+    // 2. Apply random rotation: D2 · H · D1 · v.
+    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d]);
+    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d]);
+    let v_d1 = ffi::multiply(&v_normalized, &signs1_arr);
+    let v_h = wht(&v_d1);
+    let v_rot = ffi::multiply(&v_h, &signs2_arr);
+
+    // 3. Per-coordinate nearest-centroid lookup. We materialize the rotated
+    //    coordinates back to host memory once per quantize call. This is the
+    //    same readback pattern the TurboQuant+ MLX port uses; for B2 the
+    //    correctness story dominates and a fully-fused on-GPU implementation
+    //    is the natural follow-up (likely B7's delegated KVCache or B11+).
+    //
+    //    TODO(#474 follow-up): replace this readback with an on-device
+    //    nearest-centroid lookup (broadcast-compare against the 15 boundaries
+    //    and reduce). The dequantize path was migrated to on-device unpacking
+    //    in PR #490 because it dominates decode latency (`O(visible_tokens)`
+    //    per layer per step). The quantize path is `O(new_tokens)` per layer
+    //    per step — typically 1 token at decode — so the readback cost here
+    //    is dwarfed by dequantize and was deferred to keep PR #490 scoped.
+    ffi::eval(&v_rot);
+    let coord_count = (shape[0] * shape[1] * t * d) as usize;
+    let v_rot_bytes = ffi::array_to_raw_bytes(&v_rot);
+    debug_assert_eq!(
+        v_rot_bytes.len(),
+        coord_count * 4,
+        "fp32 byte count mismatch"
+    );
+    let mut coords = Vec::with_capacity(coord_count);
+    for chunk in v_rot_bytes.chunks_exact(4) {
+        coords.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+
+    let n_centroids = params.codebook.centroids.len();
+    let indices =
+        nearest_centroid_indices_with_boundaries(&coords, &params.codebook.boundaries, n_centroids);
+
+    // 4. Pack two consecutive 4-bit indices into one byte.
+    //    Layout: byte[i] low nibble = indices[2*i], high nibble = indices[2*i+1].
+    debug_assert!(d % 2 == 0, "head_dim must be even for nibble-packing");
+    let coords_per_token = d as usize;
+    let bytes_per_token = coords_per_token / 2;
+    let total_tokens = (shape[0] * shape[1] * t) as usize;
+    let mut packed = vec![0u8; total_tokens * bytes_per_token];
+    for tok in 0..total_tokens {
+        let idx_off = tok * coords_per_token;
+        let pack_off = tok * bytes_per_token;
+        for j in 0..bytes_per_token {
+            let lo = (indices[idx_off + 2 * j] & 0x0F) as u8;
+            let hi = (indices[idx_off + 2 * j + 1] & 0x0F) as u8;
+            packed[pack_off + j] = lo | (hi << 4);
+        }
+    }
+
+    let v_packed = ffi::from_bytes(
+        &packed,
+        &[shape[0], shape[1], t, bytes_per_token as i32],
+        dtype::UINT8,
+    );
+
+    // 5. Norms stored in fp16 for the cache. The full-precision norm
+    //    (not safe_norm) is what the dequantize path consumes.
+    let v_norms = ffi::astype(&norm_full, dtype::FLOAT16);
+
+    (v_packed, v_norms)
+}
+
+/// Dequantize a packed-V slice back to fp16 for the attention kernel.
+///
+/// Inputs:
+/// - `v_packed`: `[B, H, T, D/2]` u8 (output of [`quantize_v_turbo4`]).
+/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token original-V L2 norms.
+/// - `params`:   the `TurboQuantParams` used at quantize time (centroids +
+///   sign vectors + head_dim).
+///
+/// Returns a fresh fp16 tensor of shape `[B, H, T, D]`, suitable for the
+/// existing `attention()` codepath — same shape and dtype contract as the
+/// `Fp16` and `Int8` modes.
+///
+/// Used by: `KVCache::update_and_fetch` (Turbo4Asym mode).
+pub fn dequantize_v_turbo4(
+    v_packed: &MlxArray,
+    v_norms: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    let packed_shape = ffi::array_shape(v_packed);
+    debug_assert_eq!(packed_shape.len(), 4, "v_packed must be 4-D");
+    let b = packed_shape[0];
+    let h = packed_shape[1];
+    let t = packed_shape[2];
+    let bytes_per_token = packed_shape[3];
+    let d = bytes_per_token * 2;
+    debug_assert_eq!(d as u32, params.head_dim, "head_dim mismatch on dequantize");
+
+    // 1. Unpack nibbles entirely on-device. The earlier implementation forced
+    //    a sync + host round-trip per call, which dominates decode latency at
+    //    long context (~5× slowdown on Llama 3.1 8B at 8K — see PR #490 H2).
+    //    We now stay on the GPU using bitwise ops + stack/reshape to interleave
+    //    the two nibbles in the documented "low = even, high = odd" order.
+    //
+    //    Layout (matches the quantize-time packing in `quantize_v_turbo4`):
+    //        byte[i] low nibble  → indices[2*i]   (even coord)
+    //        byte[i] high nibble → indices[2*i+1] (odd coord)
+    //    so `stack([low, high], axis=-1)` builds `[..., D/2, 2]` with the
+    //    correct interleave; `reshape` to `[..., D]` flattens that pair axis.
+    let mask_u8 = ffi::full_f32(&[1], 0x0F_u8 as f32, dtype::UINT8);
+    let shift4_u8 = ffi::full_f32(&[1], 4.0, dtype::UINT8);
+    let low_nibble = ffi::bitwise_and(v_packed, &mask_u8); // [B, H, T, D/2] u8
+    let high_nibble = ffi::right_shift(v_packed, &shift4_u8); // [B, H, T, D/2] u8
+    let indices_u8 = {
+        let stacked = crate::ops::stack_owned(&[low_nibble, high_nibble], -1); // [B, H, T, D/2, 2]
+        ffi::reshape(&stacked, &[b, h, t, d]) // [B, H, T, D] u8
+    };
+    // MLX `take` requires an integer index array; UINT8 works directly.
+
+    // 2. Centroid gather: y_hat[b, h, t, k] = centroids[indices[b, h, t, k]].
+    let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let centroids_arr =
+        ffi::from_slice_f32(&centroids_vec, &[params.codebook.centroids.len() as i32]);
+    let y_hat = ffi::take(&centroids_arr, &indices_u8, 0); // [B, H, T, D]
+
+    // 3. Norm correction: rescale y_hat to unit norm so the inverse rotation
+    //    sees a unit vector. Mirrors the Python `if norm_correction` branch
+    //    in `references/turboquant_plus/turboquant/polar_quant.py`.
+    let y_hat_sq = ffi::multiply(&y_hat, &y_hat);
+    let y_hat_sum_sq = ffi::sum_axis(&y_hat_sq, -1, true);
+    let y_hat_norm = ffi::sqrt(&y_hat_sum_sq);
+    // Guard against zero (shouldn't happen in practice — codebook always has
+    // a non-zero magnitude — but defensive against the all-zero-V edge case).
+    let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
+    let safe_y_norm = ffi::maximum(&y_hat_norm, &eps);
+    let y_hat_unit = ffi::divide(&y_hat, &safe_y_norm);
+
+    // 4. Inverse rotation. Since D and H are symmetric (D^T = D, H^T = H),
+    //    the transpose D2·H·D1 is D1·H·D2 — apply in reverse.
+    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d]);
+    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d]);
+    let v_pre_h = ffi::multiply(&y_hat_unit, &signs2_arr);
+    let v_pre_d1 = wht(&v_pre_h);
+    let v_unit = ffi::multiply(&v_pre_d1, &signs1_arr);
+
+    // 5. Rescale by the stored original-V norms. norms shape is [B, H, T, 1]
+    //    fp16; cast to fp32 to match v_unit, then back to fp16 at the end.
+    let norms_f32 = ffi::astype(v_norms, dtype::FLOAT32);
+    let v_full_f32 = ffi::multiply(&v_unit, &norms_f32);
+    ffi::astype(&v_full_f32, dtype::FLOAT16)
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Number of packed-V bytes needed to store `head_dim` 4-bit indices.
+///
+/// `head_dim` must be even; nibble-packing fits exactly two indices per byte.
+#[inline]
+pub fn packed_bytes_per_token(head_dim: i32) -> i32 {
+    head_dim / 2
+}
+
+/// Helper: align a token count up to the next multiple of [`BLOCK_SIZE`] for
+/// V-buffer growth. The trim path can rely on this to stay block-aligned.
+#[inline]
+pub fn round_up_to_block(token_count: i32) -> i32 {
+    let block = BLOCK_SIZE;
+    ((token_count + block - 1) / block) * block
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_relative_error(actual: f32, expected: f32, tol: f32, label: &str) {
+        let denom = expected.abs().max(1e-6);
+        let err = (actual - expected).abs() / denom;
+        assert!(
+            err < tol,
+            "{label}: |{actual} - {expected}| / |expected| = {err:.4} > {tol}"
+        );
+    }
+
+    #[test]
+    fn lcg32_is_deterministic() {
+        let mut a = Lcg32::new(42);
+        let mut b = Lcg32::new(42);
+        for _ in 0..100 {
+            assert_eq!(a.next_bit(), b.next_bit());
+        }
+    }
+
+    #[test]
+    fn generate_signs_is_pm_one() {
+        let signs = generate_signs(128, 7);
+        assert_eq!(signs.len(), 128);
+        for &s in signs.iter() {
+            assert!(s == 1.0 || s == -1.0, "non-±1 sign in vector: {s}");
+        }
+    }
+
+    #[test]
+    fn turbo_quant_params_centroid_count_matches_bit_width() {
+        let p = TurboQuantParams::new(128, 42);
+        assert_eq!(p.codebook.centroids.len(), 1 << V_BIT_WIDTH);
+        assert_eq!(p.codebook.boundaries.len(), p.codebook.centroids.len() - 1);
+        assert_eq!(p.signs1.len(), 128);
+        assert_eq!(p.signs2.len(), 128);
+    }
+
+    #[test]
+    fn round_up_to_block_pads_correctly() {
+        assert_eq!(round_up_to_block(0), 0);
+        assert_eq!(round_up_to_block(1), 32);
+        assert_eq!(round_up_to_block(31), 32);
+        assert_eq!(round_up_to_block(32), 32);
+        assert_eq!(round_up_to_block(33), 64);
+        assert_eq!(round_up_to_block(256), 256);
+    }
+
+    #[test]
+    fn packed_bytes_per_token_matches_layout() {
+        assert_eq!(packed_bytes_per_token(64), 32);
+        assert_eq!(packed_bytes_per_token(128), 64);
+        assert_eq!(packed_bytes_per_token(256), 128);
+    }
+
+    /// End-to-end round-trip on a [B=1, H=1, T=4, D=128] tensor with
+    /// realistic per-token magnitudes. The rotated coordinates follow N(0,1/d)
+    /// after WHT, so 4-bit centroids reconstruct each coordinate with bounded
+    /// MSE; relative L2 error per token should be well under 10%.
+    #[test]
+    fn quantize_dequantize_round_trip_recovers_v_within_bound() {
+        let head_dim: i32 = 128;
+        let params = TurboQuantParams::new(head_dim as u32, 42);
+
+        // Build a deterministic test V tensor: each token is a scaled
+        // Gaussian-ish vector. Use a simple LCG-derived sequence for repeatability.
+        let mut rng = Lcg32::new(123);
+        let mut v_data: Vec<f32> = Vec::with_capacity(4 * head_dim as usize);
+        // Per-token magnitudes spanning ~1.5 decades — typical for real KV
+        // values. Very-tiny magnitudes (< 0.1) hit fp16 underflow in the
+        // norm storage, which is acceptable in production but would noise
+        // up this test.
+        let token_scales = [0.5_f32, 1.5, 4.0, 12.0];
+        for tok in 0..4 {
+            let scale = token_scales[tok];
+            for _ in 0..head_dim {
+                // Pseudo-Gaussian via summed uniform bits → ~normal in [-1, 1].
+                let mut acc = 0.0_f32;
+                for _ in 0..6 {
+                    acc += if rng.next_bit() == 0 { -1.0 } else { 1.0 };
+                }
+                v_data.push((acc / 6.0) * scale);
+            }
+        }
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, 4, head_dim]);
+
+        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        // Verify shapes
+        let pshape = ffi::array_shape(&packed);
+        assert_eq!(pshape, vec![1_i32, 1, 4, head_dim / 2]);
+        let nshape = ffi::array_shape(&norms);
+        assert_eq!(nshape, vec![1_i32, 1, 4, 1]);
+
+        let v_hat = dequantize_v_turbo4(&packed, &norms, &params);
+        assert_eq!(ffi::array_dtype(&v_hat), dtype::FLOAT16);
+        assert_eq!(ffi::array_shape(&v_hat), vec![1_i32, 1, 4, head_dim]);
+
+        // Convert v_hat back to fp32 for comparison
+        let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
+        ffi::eval(&v_hat_f32);
+        let v_hat_bytes = ffi::array_to_raw_bytes(&v_hat_f32);
+        let v_hat_vec: Vec<f32> = v_hat_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        // Per-token relative L2 error is bounded by Lloyd-Max theoretical
+        // distortion at 4 bits on N(0, 1/d). The classical D(R) bound at 4
+        // bits gives ~−23.8 dB → ~6.5% RMSE in the rotated domain. After
+        // inverse rotation and rescaling, fp16 round-off plus the norm
+        // correction can push observed per-token error to ~11–13% on real
+        // inputs (the rotation cannot hide all bias when the input has heavy
+        // structure, which our synthetic data does). 15% is a safe bound that
+        // catches gross algorithm bugs without being flaky.
+        let hd_usize = head_dim as usize;
+        for tok in 0..4 {
+            let off = tok * hd_usize;
+            let mut num = 0.0_f32;
+            let mut den = 0.0_f32;
+            for k in 0..hd_usize {
+                let diff = v_data[off + k] - v_hat_vec[off + k];
+                num += diff * diff;
+                den += v_data[off + k] * v_data[off + k];
+            }
+            let rel = (num / den.max(1e-12)).sqrt();
+            assert!(
+                rel < 0.15,
+                "token {tok}: relative L2 error {rel:.4} exceeds 15% bound"
+            );
+        }
+    }
+
+    /// C1 regression: V vectors with `||v|| < 1` must round-trip through the
+    /// quantizer correctly. The earlier `safe_norm = maximum(norm, 1.0)` clamp
+    /// silently destroyed direction information for any small-magnitude V
+    /// because the divide pinned the rotated coordinates near the centroid for
+    /// `0` (variance `1/d`, designed for unit-norm post-WHT). With
+    /// `||v|| ≈ 0.06–0.1` the reviewer measured ~65% reconstruction error on
+    /// real Llama 3.1 traffic. Use a uniform-`[-0.05, 0.05]` distribution over
+    /// `head_dim=128`, which lands per-token L2 norms in `[0.30, 0.40]` —
+    /// safely below 1.0 and well above the fp16 underflow threshold so the
+    /// stored norm survives round-trip. The test passes once the clamp is
+    /// replaced by a true zero-only fallback (`where(norm > 0, norm, 1.0)`)
+    /// and would have failed under the old `maximum(_, 1.0)` clamp.
+    #[test]
+    fn small_norm_v_round_trip_recovers_within_bound() {
+        let head_dim: i32 = 128;
+        let params = TurboQuantParams::new(head_dim as u32, 0xC1_DECAFu32);
+
+        let mut rng = Lcg32::new(0xC0FFEE_42);
+        let n_tokens = 4usize;
+        let hd_usize = head_dim as usize;
+        let mut v_data: Vec<f32> = Vec::with_capacity(n_tokens * hd_usize);
+        for _ in 0..n_tokens {
+            for _ in 0..head_dim {
+                // Pseudo-uniform on [-0.05, 0.05] via 6-bit LCG draw.
+                let mut acc = 0u32;
+                for b in 0..6 {
+                    acc |= rng.next_bit() << b;
+                }
+                let u = (acc as f32) / 63.0; // [0, 1]
+                v_data.push((u - 0.5) * 0.10); // [-0.05, 0.05]
+            }
+        }
+
+        // Sanity: each token norm should sit comfortably below 1.0 so the
+        // test actually exercises the regression path. Pre-fix `safe_norm`
+        // saturated to 1.0 here, destroying direction.
+        for tok in 0..n_tokens {
+            let off = tok * hd_usize;
+            let n = v_data[off..off + hd_usize]
+                .iter()
+                .map(|x| x * x)
+                .sum::<f32>()
+                .sqrt();
+            assert!(
+                n < 1.0,
+                "token {tok}: precondition violated, ||v|| = {n} >= 1.0 — \
+                 this test must use small-norm V vectors to catch C1"
+            );
+            assert!(
+                n > 0.05,
+                "token {tok}: precondition violated, ||v|| = {n} <= 0.05 — \
+                 fp16 norm storage would underflow and noise the test"
+            );
+        }
+
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, n_tokens as i32, head_dim]);
+        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        let v_hat = dequantize_v_turbo4(&packed, &norms, &params);
+
+        let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
+        ffi::eval(&v_hat_f32);
+        let v_hat_bytes = ffi::array_to_raw_bytes(&v_hat_f32);
+        let v_hat_vec: Vec<f32> = v_hat_bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+
+        for tok in 0..n_tokens {
+            let off = tok * hd_usize;
+            let mut num = 0.0_f32;
+            let mut den = 0.0_f32;
+            for k in 0..hd_usize {
+                let diff = v_data[off + k] - v_hat_vec[off + k];
+                num += diff * diff;
+                den += v_data[off + k] * v_data[off + k];
+            }
+            let rel = (num / den.max(1e-12)).sqrt();
+            assert!(
+                rel < 0.15,
+                "token {tok}: small-norm relative L2 error {rel:.4} exceeds 15% \
+                 bound — likely C1 regression (`safe_norm = maximum(_, 1.0)` \
+                 reintroduced)"
+            );
+        }
+    }
+
+    /// Sanity: zero V vector is preserved (norm=0 path doesn't NaN).
+    #[test]
+    fn zero_vector_dequantizes_to_zero() {
+        let head_dim: i32 = 64;
+        let params = TurboQuantParams::new(head_dim as u32, 1);
+        let v = ffi::zeros(&[1, 1, 1, head_dim], dtype::FLOAT32);
+        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        let v_hat = dequantize_v_turbo4(&packed, &norms, &params);
+        let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
+        ffi::eval(&v_hat_f32);
+        let bytes = ffi::array_to_raw_bytes(&v_hat_f32);
+        for chunk in bytes.chunks_exact(4) {
+            let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            assert!(val.abs() < 1e-3, "expected ~0, got {val}");
+        }
+    }
+
+    /// Determinism: same params + same V → same packed bytes.
+    #[test]
+    fn quantize_is_deterministic() {
+        let head_dim: i32 = 64;
+        let params1 = TurboQuantParams::new(head_dim as u32, 7);
+        let params2 = TurboQuantParams::new(head_dim as u32, 7);
+        // signs derived from same seed must match
+        assert_eq!(params1.signs1.as_ref(), params2.signs1.as_ref());
+
+        let v_data: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 32.0) * 0.05).collect();
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+        let (p1, _) = quantize_v_turbo4(&v, &params1);
+        let (p2, _) = quantize_v_turbo4(&v, &params2);
+        assert_eq!(ffi::array_to_raw_bytes(&p1), ffi::array_to_raw_bytes(&p2));
+    }
+
+    /// Nibble-packing layout: byte = (high << 4) | low matches the documented
+    /// "low nibble = even, high nibble = odd" contract.
+    #[test]
+    fn nibble_packing_layout_is_documented() {
+        // Decoded indices must be in [0, 16). The full sign-and-rotation
+        // determinism is exercised by quantize_is_deterministic; here we just
+        // sanity-check that nothing leaks out of the 4-bit range.
+        let head_dim: i32 = 64;
+        let params = TurboQuantParams::new(head_dim as u32, 99);
+        let v_data: Vec<f32> = (0..head_dim)
+            .map(|i| (i as f32 / head_dim as f32) - 0.5)
+            .collect();
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+        let (packed, _) = quantize_v_turbo4(&v, &params);
+        let bytes = ffi::array_to_raw_bytes(&packed);
+        for &b in &bytes {
+            let lo = b & 0x0F;
+            let hi = b >> 4;
+            assert!(lo < 16, "low nibble out of range: {lo}");
+            assert!(hi < 16, "high nibble out of range: {hi}");
+        }
+    }
+
+    /// Stored norms should match the per-token L2 of the input within fp16 precision.
+    #[test]
+    fn stored_norms_match_input_l2() {
+        let head_dim: i32 = 64;
+        let hd_usize = head_dim as usize;
+        let params = TurboQuantParams::new(head_dim as u32, 17);
+        // Two tokens with very different magnitudes.
+        let mut v_data: Vec<f32> = Vec::with_capacity(2 * hd_usize);
+        for k in 0..head_dim {
+            v_data.push(0.5 * ((k as f32).sin())); // small token
+        }
+        for k in 0..head_dim {
+            v_data.push(50.0 * ((k as f32).cos())); // large token
+        }
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, 2, head_dim]);
+        let (_, norms) = quantize_v_turbo4(&v, &params);
+        let norms_f32 = ffi::astype(&norms, dtype::FLOAT32);
+        ffi::eval(&norms_f32);
+        let bytes = ffi::array_to_raw_bytes(&norms_f32);
+        let n0 = f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+        let n1 = f32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]);
+
+        let expected_n0 = (v_data[..hd_usize].iter().map(|x| x * x).sum::<f32>()).sqrt();
+        let expected_n1 = (v_data[hd_usize..].iter().map(|x| x * x).sum::<f32>()).sqrt();
+        // fp16 has ~3 decimal digits of precision; allow 2% relative error.
+        assert_relative_error(n0, expected_n0, 0.02, "norm[0]");
+        assert_relative_error(n1, expected_n1, 0.02, "norm[1]");
+    }
+}

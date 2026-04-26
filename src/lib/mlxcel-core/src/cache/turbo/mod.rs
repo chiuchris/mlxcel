@@ -21,17 +21,26 @@
 //! | Sub-module    | Sub-issue | Status   | Description                      |
 //! |---------------|-----------|----------|----------------------------------|
 //! | `codebook`    | B1 (#472) | ✓ done   | Lloyd-Max centroid generator     |
-//! | (more to come)| B2–B12    | pending  | Storage, WHT, quantize/dequant   |
+//! | `quant`       | B2 (#474) | ✓ done   | V-side PolarQuant pipeline       |
+//! | (more to come)| B3–B12    | pending  | Quality gates, K-side, paged KV  |
 //!
 //! # Usage by downstream sub-issues
 //!
 //! ```rust,ignore
-//! use mlxcel_core::cache::turbo::codebook::optimal_centroids;
+//! use mlxcel_core::cache::turbo::codebook::optimal_codebook;
 //!
-//! let centroids: Vec<f32> = optimal_centroids(4, 128);
+//! let cb = optimal_codebook(4, 128);
 //! ```
 
 pub mod codebook;
+pub mod quant;
 
-// Re-export the most commonly used entry point for convenience
-pub use codebook::{compute_centroids, nearest_centroid_indices, optimal_centroids};
+// Re-export the most commonly used entry points for convenience
+pub use codebook::{
+    compute_centroids, nearest_centroid_indices, nearest_centroid_indices_with_boundaries,
+    optimal_centroids, optimal_codebook, Codebook,
+};
+pub use quant::{
+    dequantize_v_turbo4, generate_signs, quantize_v_turbo4, TurboQuantParams, BLOCK_SIZE,
+    V_BIT_WIDTH,
+};

@@ -51,6 +51,21 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
     env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
 
+    // Issue #474 / epic #458 follow-up: --kv-cache-mode is parsed but not yet
+    // wired through to the server's per-sequence cache construction. Surface a
+    // clear warning so operators don't assume the flag is silently in effect.
+    // Server-side wiring is tracked by issue #484 (B11) which replaces this
+    // flag with --cache-type-k / --cache-type-v and threads the chosen mode
+    // through ServerStartupConfig → ModelWorker → make_caches().
+    let kv_mode_lc = args.kv_cache_mode.to_ascii_lowercase();
+    if !matches!(kv_mode_lc.as_str(), "fp16" | "float16") {
+        eprintln!(
+            "[mlxcel serve] warning: --kv-cache-mode {} is a no-op on the server \
+             pending issue #484; KV cache mode is fixed at fp16",
+            args.kv_cache_mode
+        );
+    }
+
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
     // baseline bit-exact path.

@@ -156,12 +156,18 @@ pub(crate) struct GenerationOptions {
     /// KV cache quantization mode.
     ///
     /// Controls how accumulated key/value tensors are stored:
-    ///   fp16  — Standard half-precision storage (default, no overhead).
-    ///   int8  — Per-token INT8 absmax quantization; reduces KV cache memory
-    ///           by ~50% at the cost of small quantization error per token.
+    ///   fp16        — Standard half-precision storage (default, no overhead).
+    ///   int8        — Per-token INT8 absmax quantization; reduces KV cache
+    ///                 memory by ~50% at the cost of small quantization error
+    ///                 per token.
+    ///   fp16+turbo4 — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
+    ///                 K side stays FP16; V side uses 4-bit PolarQuant with
+    ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
+    ///                 context with negligible quality loss on Q4_K_M dense
+    ///                 weights (epic #458 / issue #474).
     ///
-    /// INT8 mode is most beneficial for long context generation where KV cache
-    /// becomes the memory bottleneck.
+    /// INT8 and turbo4 modes are most beneficial for long context generation
+    /// where KV cache becomes the memory bottleneck.
     #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     pub(crate) kv_cache_mode: String,
 }
@@ -672,9 +678,25 @@ pub(crate) struct ServeArgs {
     /// KV cache quantization mode.
     ///
     /// Controls how accumulated key/value tensors are stored:
-    ///   fp16  — Standard half-precision storage (default, no overhead).
-    ///   int8  — Per-token INT8 absmax quantization; reduces KV cache memory
-    ///           by ~50% at the cost of small quantization error per token.
+    ///   fp16        — Standard half-precision storage (default, no overhead).
+    ///   int8        — Per-token INT8 absmax quantization; reduces KV cache
+    ///                 memory by ~50% at the cost of small quantization error
+    ///                 per token.
+    ///   fp16+turbo4 — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
+    ///                 K side stays FP16; V side uses 4-bit PolarQuant with
+    ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
+    ///                 context (epic #458 / issue #474).
+    ///
+    /// **Currently a no-op on the server**: `mlxcel serve` parses this flag
+    /// but the value is not yet plumbed through to cache construction in the
+    /// model worker; sessions always run with `fp16`. (`mlxcel-server` does
+    /// not accept this flag at all.)
+    /// This is a pre-existing limitation (also affects `int8`) tracked by
+    /// issue #484 (B11) under epic #458, which will replace `--kv-cache-mode`
+    /// with the llama.cpp-compatible `--cache-type-k` / `--cache-type-v` split
+    /// and wire both code paths through `ServerStartupConfig`. Use
+    /// `mlxcel generate --kv-cache-mode <MODE>` for offline runs in the
+    /// meantime — that path is fully wired (issue #474).
     #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     kv_cache_mode: String,
 

@@ -49,7 +49,57 @@
 //! Used by: TurboQuant KV cache (B2 onward, epic #458)
 
 use std::collections::HashMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+// ---------------------------------------------------------------------------
+// Codebook struct
+// ---------------------------------------------------------------------------
+
+/// Bundled centroids and midpoint boundaries for a single `(bit_width, head_dim)`
+/// pair, with both arrays held as `Arc<[f32]>` for zero-copy sharing across
+/// quantize/dequantize sites.
+///
+/// `boundaries[i] = (centroids[i] + centroids[i+1]) / 2` (length =
+/// `centroids.len() - 1`). Holding both pre-built lets the B2 hot path on the
+/// quantize side amortize the `Vec<f32>` allocation that
+/// [`nearest_centroid_indices`] otherwise rebuilds per call. Centroids are
+/// shared with the dequantize-on-read path inside the cache, which references
+/// them once per layer/forward at minimal overhead.
+///
+/// Used by: TurboQuant V-side quantize/dequantize (B2, epic #458).
+#[derive(Clone, Debug)]
+pub struct Codebook {
+    /// Sorted centroid values for `N(0, 1/d)`. Length = `2^bit_width`.
+    pub centroids: Arc<[f32]>,
+    /// Midpoint boundaries between consecutive centroids. Length =
+    /// `centroids.len() - 1`. Pre-built so callers do not re-allocate per call.
+    pub boundaries: Arc<[f32]>,
+}
+
+impl Codebook {
+    /// Build a [`Codebook`] from raw centroids, deriving boundaries.
+    ///
+    /// `centroids` must be sorted in ascending order. This invariant is
+    /// guaranteed by [`compute_centroids`] and [`optimal_centroids`] by
+    /// construction.
+    pub fn from_centroids(centroids: Arc<[f32]>) -> Self {
+        let boundaries: Vec<f32> = centroids.windows(2).map(|w| (w[0] + w[1]) * 0.5).collect();
+        Self {
+            centroids,
+            boundaries: Arc::from(boundaries),
+        }
+    }
+
+    /// Number of centroids (`= 2^bit_width`).
+    pub fn len(&self) -> usize {
+        self.centroids.len()
+    }
+
+    /// Whether the codebook is empty (always false for valid bit_width >= 1).
+    pub fn is_empty(&self) -> bool {
+        self.centroids.is_empty()
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -109,6 +159,48 @@ pub fn optimal_centroids(bit_width: u8, head_dim: u32) -> Vec<f32> {
         .clone()
 }
 
+/// Optimal codebook (centroids + pre-built boundaries) for a `(bit_width,
+/// head_dim)` pair, cached for zero-allocation reuse on hot paths.
+///
+/// This is the API the B2 V-side quantize loop should call: it returns a
+/// cheap `Arc`-clone on every cache hit (just a refcount bump, no `Vec`
+/// allocation), and avoids rebuilding the midpoint boundaries that
+/// [`nearest_centroid_indices`] would otherwise compute per call.
+///
+/// # Caching
+///
+/// Like [`optimal_centroids`], results are memoized in a process-global
+/// `Mutex<HashMap>` keyed by `(bit_width, head_dim)`. The first call pays the
+/// Lloyd-Max cost; subsequent calls return a clone of the same `Arc<[f32]>`s.
+///
+/// # Panics
+///
+/// Same panic conditions as [`optimal_centroids`].
+///
+/// Used by: TurboQuant V-side quantize/dequantize (B2, epic #458).
+pub fn optimal_codebook(bit_width: u8, head_dim: u32) -> Codebook {
+    assert!(bit_width > 0, "bit_width must be >= 1");
+    assert!(
+        bit_width <= 8,
+        "bit_width must be <= 8 (TurboQuant uses 1–4); got {bit_width}"
+    );
+    assert!(head_dim > 0, "head_dim must be > 0");
+
+    use std::sync::Mutex;
+    type CodebookCache = Mutex<HashMap<(u8, u32), Codebook>>;
+    static TABLE: OnceLock<CodebookCache> = OnceLock::new();
+
+    let map = TABLE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    guard
+        .entry((bit_width, head_dim))
+        .or_insert_with(|| {
+            let centroids: Arc<[f32]> = Arc::from(compute_centroids(bit_width, head_dim));
+            Codebook::from_centroids(centroids)
+        })
+        .clone()
+}
+
 /// Compute centroids without caching. Prefer [`optimal_centroids`] for
 /// production use (which caches results).
 ///
@@ -155,26 +247,49 @@ pub fn compute_centroids(bit_width: u8, head_dim: u32) -> Vec<f32> {
 ///
 /// Returns integer indices in `[0, n_centroids)`.
 ///
-/// Used by: unit tests; B2 quantization path (epic #458)
+/// Used by: unit tests; B2 quantization path (epic #458). On hot paths prefer
+/// [`nearest_centroid_indices_with_boundaries`] (or use the [`Codebook`]
+/// returned by [`optimal_codebook`]) so the midpoint boundary array is only
+/// built once per `(bit_width, head_dim)` instead of per-call.
 pub fn nearest_centroid_indices(values: &[f32], centroids: &[f32]) -> Vec<usize> {
     assert!(!centroids.is_empty(), "centroids must be non-empty");
     let n = centroids.len();
 
     // Build midpoint boundaries: boundaries[i] = (centroids[i] + centroids[i+1]) / 2
-    let boundaries: Vec<f32> = centroids
-        .windows(2)
-        .map(|w| (w[0] + w[1]) * 0.5)
-        .collect();
+    let boundaries: Vec<f32> = centroids.windows(2).map(|w| (w[0] + w[1]) * 0.5).collect();
 
     values
         .iter()
         .map(|&v| {
             // Binary search: find insertion point in sorted boundaries
             // This gives the centroid region index in [0, n)
-            boundaries
-                .partition_point(|&b| b < v)
-                .min(n - 1)
+            boundaries.partition_point(|&b| b < v).min(n - 1)
         })
+        .collect()
+}
+
+/// Like [`nearest_centroid_indices`] but takes pre-built midpoint boundaries.
+///
+/// Use this on hot paths to avoid rebuilding the boundary array per call.
+/// `boundaries.len()` must equal `n_centroids - 1` (i.e., the boundary
+/// invariant established by [`Codebook::from_centroids`]).
+///
+/// Used by: TurboQuant V-side quantize loop (B2, epic #458).
+pub fn nearest_centroid_indices_with_boundaries(
+    values: &[f32],
+    boundaries: &[f32],
+    n_centroids: usize,
+) -> Vec<usize> {
+    assert!(n_centroids > 0, "n_centroids must be > 0");
+    assert_eq!(
+        boundaries.len(),
+        n_centroids - 1,
+        "boundaries.len() must equal n_centroids - 1"
+    );
+    let last_idx = n_centroids - 1;
+    values
+        .iter()
+        .map(|&v| boundaries.partition_point(|&b| b < v).min(last_idx))
         .collect()
 }
 
@@ -219,8 +334,7 @@ fn conditional_centroids(boundaries: &[f64], sigma: f64, n_centroids: usize) -> 
 
     centroids[0] = gaussian_conditional_expectation(sigma, f64::NEG_INFINITY, boundaries[0]);
     for i in 1..n_centroids - 1 {
-        centroids[i] =
-            gaussian_conditional_expectation(sigma, boundaries[i - 1], boundaries[i]);
+        centroids[i] = gaussian_conditional_expectation(sigma, boundaries[i - 1], boundaries[i]);
     }
     centroids[n_centroids - 1] =
         gaussian_conditional_expectation(sigma, boundaries[n_centroids - 2], f64::INFINITY);
@@ -429,11 +543,7 @@ mod tests {
 
     /// Helper: compare two f32 slices at bitwise (byte-level) f32 equality.
     fn assert_centroids_exact(rust: &[f32], expected_bits: &[u32], label: &str) {
-        assert_eq!(
-            rust.len(),
-            expected_bits.len(),
-            "{label}: length mismatch"
-        );
+        assert_eq!(rust.len(), expected_bits.len(), "{label}: length mismatch");
         for (i, (&r, &eb)) in rust.iter().zip(expected_bits.iter()).enumerate() {
             let rb = r.to_bits();
             assert_eq!(
@@ -455,23 +565,31 @@ mod tests {
             f32::from_bits(0x3d67ef9e),
             f32::from_bits(0x3e4147ae),
         ];
-        assert_centroids_exact(&c, &[0xbe4147ae, 0xbd67ef9e, 0x3d67ef9e, 0x3e4147ae], "b=2,d=64");
+        assert_centroids_exact(
+            &c,
+            &[0xbe4147ae, 0xbd67ef9e, 0x3d67ef9e, 0x3e4147ae],
+            "b=2,d=64",
+        );
         let _ = expected; // used by assert_centroids_exact
     }
 
     #[test]
     fn b2_closed_form_d128() {
         let c = compute_centroids(2, 128);
-        assert_centroids_exact(&c, &[0xbe08ab6b, 0xbd2400e7, 0x3d2400e7, 0x3e08ab6b], "b=2,d=128");
+        assert_centroids_exact(
+            &c,
+            &[0xbe08ab6b, 0xbd2400e7, 0x3d2400e7, 0x3e08ab6b],
+            "b=2,d=128",
+        );
     }
 
     #[test]
     fn b2_closed_form_all_dims() {
         // Verify the 2-bit closed form for all head dims in the fixture grid
         let cases: &[(u32, [u32; 4])] = &[
-            (64,  [0xbe4147ae, 0xbd67ef9e, 0x3d67ef9e, 0x3e4147ae]),
-            (80,  [0xbe2cdff9, 0xbd4f732a, 0x3d4f732a, 0x3e2cdff9]),
-            (96,  [0xbe1dcffd, 0xbd3d5ffd, 0x3d3d5ffd, 0x3e1dcffd]),
+            (64, [0xbe4147ae, 0xbd67ef9e, 0x3d67ef9e, 0x3e4147ae]),
+            (80, [0xbe2cdff9, 0xbd4f732a, 0x3d4f732a, 0x3e2cdff9]),
+            (96, [0xbe1dcffd, 0xbd3d5ffd, 0x3d3d5ffd, 0x3e1dcffd]),
             (128, [0xbe08ab6b, 0xbd2400e7, 0x3d2400e7, 0x3e08ab6b]),
             (192, [0xbddf2e37, 0xbd05e887, 0x3d05e887, 0x3ddf2e37]),
             (256, [0xbdc147ae, 0xbce7ef9e, 0x3ce7ef9e, 0x3dc147ae]),
@@ -492,8 +610,8 @@ mod tests {
         let c = compute_centroids(3, 64);
         // Fixture hex: 3_64
         let bits: [u32; 8] = [
-            0xbe89b977, 0xbe2c0532, 0xbdc18987, 0xbcfaf9eb,
-            0x3cfaf9eb, 0x3dc18987, 0x3e2c0532, 0x3e89b977,
+            0xbe89b977, 0xbe2c0532, 0xbdc18987, 0xbcfaf9eb, 0x3cfaf9eb, 0x3dc18987, 0x3e2c0532,
+            0x3e89b977,
         ];
         assert_centroids_exact(&c, &bits, "b=3,d=64");
     }
@@ -502,8 +620,8 @@ mod tests {
     fn b3_d128_vs_fixture() {
         let c = compute_centroids(3, 128);
         let bits: [u32; 8] = [
-            0xbe42c596, 0xbdf34600, 0xbd88d9fa, 0xbcb1778d,
-            0x3cb1778d, 0x3d88d9fa, 0x3df34600, 0x3e42c596,
+            0xbe42c596, 0xbdf34600, 0xbd88d9fa, 0xbcb1778d, 0x3cb1778d, 0x3d88d9fa, 0x3df34600,
+            0x3e42c596,
         ];
         assert_centroids_exact(&c, &bits, "b=3,d=128");
     }
@@ -512,10 +630,9 @@ mod tests {
     fn b4_d64_vs_fixture() {
         let c = compute_centroids(4, 64);
         let bits: [u32; 16] = [
-            0xbeadee42, 0xbe83563b, 0xbe4ce718, 0xbe1eb6fa,
-            0xbdeda172, 0xbda55816, 0xbd4329cb, 0xbc811273,
-            0x3c811273, 0x3d4329cb, 0x3da55816, 0x3deda172,
-            0x3e1eb6fa, 0x3e4ce718, 0x3e83563b, 0x3eadee42,
+            0xbeadee42, 0xbe83563b, 0xbe4ce718, 0xbe1eb6fa, 0xbdeda172, 0xbda55816, 0xbd4329cb,
+            0xbc811273, 0x3c811273, 0x3d4329cb, 0x3da55816, 0x3deda172, 0x3e1eb6fa, 0x3e4ce718,
+            0x3e83563b, 0x3eadee42,
         ];
         assert_centroids_exact(&c, &bits, "b=4,d=64");
     }
@@ -524,10 +641,9 @@ mod tests {
     fn b4_d128_vs_fixture() {
         let c = compute_centroids(4, 128);
         let bits: [u32; 16] = [
-            0xbe75f9a3, 0xbe39bd03, 0xbe10e35b, 0xbde074e1,
-            0xbda807be, 0xbd69d4f4, 0xbd0a0053, 0xbc368915,
-            0x3c368915, 0x3d0a0053, 0x3d69d4f4, 0x3da807be,
-            0x3de074e1, 0x3e10e35b, 0x3e39bd03, 0x3e75f9a3,
+            0xbe75f9a3, 0xbe39bd03, 0xbe10e35b, 0xbde074e1, 0xbda807be, 0xbd69d4f4, 0xbd0a0053,
+            0xbc368915, 0x3c368915, 0x3d0a0053, 0x3d69d4f4, 0x3da807be, 0x3de074e1, 0x3e10e35b,
+            0x3e39bd03, 0x3e75f9a3,
         ];
         assert_centroids_exact(&c, &bits, "b=4,d=128");
     }
@@ -551,9 +667,8 @@ mod tests {
             .unwrap_or_else(|e| panic!("Failed to read fixture {fixture_path}: {e}"));
 
         // Minimal JSON parser — we only need to parse the flat hex-string map
-        let map: std::collections::HashMap<String, Vec<String>> =
-            serde_json::from_str(&content)
-                .unwrap_or_else(|e| panic!("Failed to parse fixture JSON: {e}"));
+        let map: std::collections::HashMap<String, Vec<String>> = serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("Failed to parse fixture JSON: {e}"));
 
         let bit_widths: [u8; 3] = [2, 3, 4];
         let head_dims: [u32; 6] = [64, 80, 96, 128, 192, 256];
@@ -561,16 +676,17 @@ mod tests {
         for &b in &bit_widths {
             for &d in &head_dims {
                 let key = format!("{b}_{d}");
-                let hex_list = map.get(&key).unwrap_or_else(|| {
-                    panic!("Fixture missing key: {key}")
-                });
+                let hex_list = map
+                    .get(&key)
+                    .unwrap_or_else(|| panic!("Fixture missing key: {key}"));
 
                 // Parse hex strings into u32 bit patterns
                 let expected_bits: Vec<u32> = hex_list
                     .iter()
-                    .map(|h| u32::from_str_radix(h, 16).unwrap_or_else(|e| {
-                        panic!("Bad hex in fixture key={key}: '{h}': {e}")
-                    }))
+                    .map(|h| {
+                        u32::from_str_radix(h, 16)
+                            .unwrap_or_else(|e| panic!("Bad hex in fixture key={key}: '{h}': {e}"))
+                    })
                     .collect();
 
                 let rust_centroids = compute_centroids(b, d);
@@ -587,7 +703,8 @@ mod tests {
                 {
                     let rust_bits = rust_val.to_bits();
                     assert_eq!(
-                        rust_bits, exp_bits,
+                        rust_bits,
+                        exp_bits,
                         "{label}[{i}]: byte-for-byte mismatch: \
                          rust=0x{rust_bits:08x} ({rust_val}), \
                          expected=0x{exp_bits:08x} ({})",
@@ -613,7 +730,12 @@ mod tests {
         // A value at the last centroid should map to the last index
         let n = centroids.len();
         let result = nearest_centroid_indices(&[centroids[n - 1]], &centroids);
-        assert_eq!(result, vec![n - 1], "value == centroids[n-1] → index {}", n - 1);
+        assert_eq!(
+            result,
+            vec![n - 1],
+            "value == centroids[n-1] → index {}",
+            n - 1
+        );
 
         // A very negative value should map to index 0
         let result = nearest_centroid_indices(&[-1e6_f32], &centroids);
@@ -638,9 +760,7 @@ mod tests {
     #[test]
     fn nearest_centroid_indices_matches_naive_nearest() {
         let centroids = compute_centroids(4, 128);
-        let test_values: Vec<f32> = (0..20)
-            .map(|i| (i as f32 - 10.0) * 0.02)
-            .collect();
+        let test_values: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) * 0.02).collect();
 
         let result = nearest_centroid_indices(&test_values, &centroids);
 
@@ -649,9 +769,7 @@ mod tests {
             let naive_idx = centroids
                 .iter()
                 .enumerate()
-                .min_by(|(_, a), (_, b)| {
-                    ((*a - v).abs()).partial_cmp(&((*b - v).abs())).unwrap()
-                })
+                .min_by(|(_, a), (_, b)| ((*a - v).abs()).partial_cmp(&((*b - v).abs())).unwrap())
                 .unwrap()
                 .0;
             assert_eq!(
@@ -688,18 +806,16 @@ mod tests {
             for d in [64u32, 128, 256] {
                 let c = compute_centroids(b, d);
                 let n = c.len();
-                let scale = c
-                    .iter()
-                    .map(|v| v.abs())
-                    .fold(0.0_f32, f32::max)
-                    .max(1e-6);
+                let scale = c.iter().map(|v| v.abs()).fold(0.0_f32, f32::max).max(1e-6);
                 for i in 0..n / 2 {
                     let sum = c[i] + c[n - 1 - i];
                     let rel = (sum / scale).abs();
                     assert!(
                         rel < 1e-3,
                         "b={b},d={d}: not antisymmetric at i={i}: {} + {} = {} (rel={rel:.2e})",
-                        c[i], c[n - 1 - i], sum
+                        c[i],
+                        c[n - 1 - i],
+                        sum
                     );
                 }
             }
@@ -711,8 +827,67 @@ mod tests {
         for b in 1u8..=4 {
             for d in [64u32, 128] {
                 let c = compute_centroids(b, d);
-                assert_eq!(c.len(), 1 << b, "b={b},d={d}: expected {} centroids", 1 << b);
+                assert_eq!(
+                    c.len(),
+                    1 << b,
+                    "b={b},d={d}: expected {} centroids",
+                    1 << b
+                );
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Codebook struct
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn codebook_from_centroids_builds_correct_boundaries() {
+        let centroids: Arc<[f32]> = Arc::from(vec![-2.0_f32, -1.0, 1.0, 2.0]);
+        let cb = Codebook::from_centroids(centroids);
+        assert_eq!(cb.boundaries.as_ref(), &[-1.5_f32, 0.0, 1.5]);
+    }
+
+    #[test]
+    fn optimal_codebook_returns_consistent_centroids() {
+        // optimal_codebook should agree with optimal_centroids for the same args
+        for b in 2u8..=4 {
+            for d in [64u32, 128] {
+                let cb = optimal_codebook(b, d);
+                let raw = optimal_centroids(b, d);
+                assert_eq!(
+                    cb.centroids.as_ref(),
+                    raw.as_slice(),
+                    "Codebook centroids must match optimal_centroids for b={b}, d={d}"
+                );
+                assert_eq!(cb.boundaries.len(), cb.centroids.len() - 1);
+            }
+        }
+    }
+
+    #[test]
+    fn optimal_codebook_arc_is_shared() {
+        // Two calls for the same key should hand back the same Arc backing.
+        let cb1 = optimal_codebook(4, 128);
+        let cb2 = optimal_codebook(4, 128);
+        // pointer equality on the Arc<[f32]> backing
+        assert!(
+            Arc::ptr_eq(&cb1.centroids, &cb2.centroids),
+            "optimal_codebook should share Arc storage on cache hits"
+        );
+        assert!(
+            Arc::ptr_eq(&cb1.boundaries, &cb2.boundaries),
+            "boundary Arc must also be shared on cache hits"
+        );
+    }
+
+    #[test]
+    fn nearest_centroid_indices_with_boundaries_matches_naive() {
+        let cb = optimal_codebook(4, 128);
+        let values: Vec<f32> = (0..20).map(|i| (i as f32 - 10.0) * 0.02).collect();
+        let result =
+            nearest_centroid_indices_with_boundaries(&values, &cb.boundaries, cb.centroids.len());
+        let naive = nearest_centroid_indices(&values, &cb.centroids);
+        assert_eq!(result, naive);
     }
 }

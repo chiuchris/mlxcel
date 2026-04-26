@@ -173,18 +173,14 @@ fn synth_heavy_tail(shape: &[i32], seed: u64) -> UniquePtr<MlxArray> {
 
 fn main() {
     println!("=== WHT microbench (issue #470, B0 spike) ===");
-    println!(
-        "fp16 along last axis, MLX hadamard_transform via mlxcel-core::ops::wht\n"
-    );
+    println!("fp16 along last axis, MLX hadamard_transform via mlxcel-core::ops::wht\n");
 
     println!(
         "{:<28} {:>4} {:>14} {:>14} {:>10}",
         "shape", "D", "wht (us)", "noop (us)", "delta us"
     );
     println!("{}", "-".repeat(78));
-    println!(
-        "(noop = `astype(x, dtype_of_x)`; on MLX this is an identity early-return,",
-    );
+    println!("(noop = `astype(x, dtype_of_x)`; on MLX this is an identity early-return,",);
     println!("so `delta` slightly *over*-attributes cost to the WHT — conservative.)");
     println!();
 

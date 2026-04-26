@@ -82,6 +82,10 @@ use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, Seque
 /// directly, so detach/adopt never allocates a new tensor or copies data.
 /// INT8-mode caches carry their per-token scale tensors alongside the INT8
 /// key/value buffers so dequantization behavior is bit-identical after adopt.
+/// Turbo4Asym-mode caches additionally carry the packed-V buffer, the
+/// per-token V norms, and the deterministic Turbo4 seed so the adopted cache
+/// can rebuild [`crate::cache::turbo::TurboQuantParams`] without referring
+/// back to the originating `KVCache`.
 pub struct DetachedKVCache {
     pub(super) keys: Option<UniquePtr<MlxArray>>,
     pub(super) values: Option<UniquePtr<MlxArray>>,
@@ -90,6 +94,9 @@ pub struct DetachedKVCache {
     pub(super) mode: KVCacheMode,
     pub(super) key_scales: Option<UniquePtr<MlxArray>>,
     pub(super) val_scales: Option<UniquePtr<MlxArray>>,
+    pub(super) v_packed: Option<UniquePtr<MlxArray>>,
+    pub(super) v_norms: Option<UniquePtr<MlxArray>>,
+    pub(super) turbo_seed: u32,
 }
 
 impl DetachedKVCache {
@@ -105,13 +112,15 @@ impl DetachedKVCache {
     }
 
     /// Total byte footprint of the detached tensors (keys + values + INT8
-    /// scales when applicable).
+    /// scales + Turbo4Asym v_packed/v_norms when applicable).
     pub fn nbytes(&self) -> usize {
         let k = self.keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let v = self.values.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let ks = self.key_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vs = self.val_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs
+        let vp = self.v_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
@@ -140,6 +149,9 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("has_values", &self.values.is_some())
             .field("has_key_scales", &self.key_scales.is_some())
             .field("has_val_scales", &self.val_scales.is_some())
+            .field("has_v_packed", &self.v_packed.is_some())
+            .field("has_v_norms", &self.v_norms.is_some())
+            .field("turbo_seed", &self.turbo_seed)
             .finish()
     }
 }
@@ -203,7 +215,7 @@ impl KVCache {
     /// Used by: prompt prefix cache detach/adopt (#417), cross-request reuse
     /// handoff inside `CachePool::detach`.
     pub fn clone_handle(&mut self) -> DetachedKVCache {
-        DetachedKVCache {
+        let handle = DetachedKVCache {
             keys: self.keys.take(),
             values: self.values.take(),
             offset: std::mem::replace(&mut self.offset, 0),
@@ -211,7 +223,15 @@ impl KVCache {
             mode: self.mode,
             key_scales: self.key_scales.take(),
             val_scales: self.val_scales.take(),
-        }
+            v_packed: self.v_packed.take(),
+            v_norms: self.v_norms.take(),
+            turbo_seed: self.turbo_seed,
+        };
+        // Clear turbo_params on the source so the next quantize call rebuilds
+        // it from scratch (required if the slot is reused with a different
+        // head_dim after detach). LOW-1 fix (#474).
+        self.turbo_params = None;
+        handle
     }
 
     /// Re-install a previously detached cache into this `KVCache` slot.
@@ -236,6 +256,25 @@ impl KVCache {
         self.mode = detached.mode;
         self.key_scales = detached.key_scales;
         self.val_scales = detached.val_scales;
+        self.v_packed = detached.v_packed;
+        self.v_norms = detached.v_norms;
+        self.turbo_seed = detached.turbo_seed;
+        // turbo_params is rebuilt lazily on the next quantize call, but if we
+        // can already see the V head_dim from v_packed we may as well prebuild
+        // so dequantize-only consumers (which don't go through update_*) still
+        // work. Detect it from v_packed shape: [B, H, T, head_dim/2].
+        if self.mode == KVCacheMode::Turbo4Asym {
+            if let Some(ref vp) = self.v_packed {
+                let shape = ffi::array_shape(vp);
+                if shape.len() == 4 && shape[3] > 0 {
+                    let head_dim = (shape[3] as u32) * 2;
+                    self.turbo_params = Some(super::turbo::TurboQuantParams::new(
+                        head_dim,
+                        self.turbo_seed,
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }

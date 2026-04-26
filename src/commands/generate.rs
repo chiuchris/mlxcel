@@ -806,8 +806,14 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         .kv_cache_mode
         .parse::<KVCacheMode>()
         .map_err(|e| anyhow::anyhow!("{}", e))?;
-    if kv_cache_mode == KVCacheMode::Int8 {
-        println!("KV cache mode: int8 (per-token absmax quantization)");
+    match kv_cache_mode {
+        KVCacheMode::Int8 => {
+            println!("KV cache mode: int8 (per-token absmax quantization)");
+        }
+        KVCacheMode::Turbo4Asym => {
+            println!("KV cache mode: fp16+turbo4 (asymmetric Fp16-K + Turbo4-V, ~26% KV savings)");
+        }
+        KVCacheMode::Fp16 => {}
     }
 
     let (generated_tokens, stats) = if pipeline_requested {
