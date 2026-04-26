@@ -41,6 +41,6 @@ pub use codebook::{
     optimal_centroids, optimal_codebook, Codebook,
 };
 pub use quant::{
-    dequantize_v_turbo4, generate_signs, quantize_v_turbo4, TurboQuantParams, BLOCK_SIZE,
-    V_BIT_WIDTH,
+    dequantize_v_turbo4, generate_signs, quantize_v_turbo4, turbo4_v_rotate, TurboQuantParams,
+    BLOCK_SIZE, V_BIT_WIDTH,
 };

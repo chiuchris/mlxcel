@@ -1,0 +1,523 @@
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+
+The transformer architecture was developed by researchers at Google and described in the seminal 2017 paper Attention Is All You Need. While the original transformer model was designed for sequence-to-sequence tasks like translation, its architecture proved extremely versatile.
+
+Transformers have led to the development of pre-trained systems such as BERT and GPT and facilitated fine-tuned systems outperforming previous best techniques on a wide variety of benchmarks. Further scaling of transformer-based language models has continued to yield strong improvements to NLP benchmarks.
+
+= KV Cache Compression =
+
+Key-value (KV) cache compression is an important technique in transformer inference optimization. As the context length grows, the memory footprint of the KV cache scales linearly with the sequence length, number of attention heads, and head dimension. This can become a significant bottleneck for long-context inference.
+
+Various quantization approaches have been proposed to reduce the memory footprint of KV caches. INT8 quantization stores keys and values in 8-bit integer format, approximately halving the memory requirement at the cost of some quantization error. More aggressive approaches use 4-bit quantization with learned codebooks.
+
+PolarQuant is a technique that leverages the observation that KV cache tensors often have a non-Gaussian distribution with heavy tails and outliers. By applying a structured random rotation (such as a Walsh-Hadamard transform followed by random sign flips) before quantization, the distribution of the rotated coordinates becomes approximately Gaussian, making them easier to compress with a fixed-bit codebook.
+
+The Walsh-Hadamard transform (WHT) is a orthogonal transform that efficiently mixes the coordinates of a vector. For a vector of length 2^k, the WHT can be computed in O(n log n) operations. When combined with random sign vectors (diagonal matrices with plus or minus 1 entries), the resulting random rotation D2 H D1 produces a distribution of coordinates that converges to Gaussian by the central limit theorem.
+
+= Attention Mechanisms =
+
+Attention mechanisms in deep learning are techniques allowing models to focus on relevant parts of the input when producing an output. The basic idea is to give the model the ability to attend to specific parts of the input sequence when generating each part of the output.
+
+Self-attention, also known as intra-attention, is an attention mechanism relating different positions of a single sequence in order to compute a representation of the sequence. Self-attention has been shown to be very useful in machine reading, abstractive summarization, and language model.
+
+Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this. The output of each head is projected into a common space and then concatenated to form the final output.
+
+Grouped-query attention (GQA) is a variant where multiple query heads share the same key and value heads. This reduces the KV cache size proportionally to the number of query heads per group, making it more memory-efficient for long-context inference while maintaining most of the expressiveness of multi-head attention.
+
+= Perplexity Evaluation =
+
+Perplexity is a measurement of how well a probability distribution or probability model predicts a sample. It is commonly used in evaluating language models. A low perplexity indicates the probability distribution is good at predicting the sample.
+
+In the context of language modeling, perplexity is computed as the exponentiated average negative log-likelihood of a sequence. For a sequence of n tokens, the perplexity is exp(-1/n * sum(log P(token_i | context_i))). Lower perplexity values indicate better predictions.
+
+When evaluating KV cache quantization methods, perplexity on a held-out corpus (typically wikitext-2) is used as a proxy for the quality degradation introduced by the quantization. A well-designed quantization scheme should introduce minimal increase in perplexity compared to the full-precision baseline.
+
+The wikitext-2 dataset consists of high-quality Wikipedia articles and is widely used as a benchmark for language model evaluation. Models are typically evaluated in a sliding window fashion, where each window of tokens is processed and the log-probabilities of the non-context tokens are accumulated.
+
+
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+
+The transformer architecture was developed by researchers at Google and described in the seminal 2017 paper Attention Is All You Need. While the original transformer model was designed for sequence-to-sequence tasks like translation, its architecture proved extremely versatile.
+
+Transformers have led to the development of pre-trained systems such as BERT and GPT and facilitated fine-tuned systems outperforming previous best techniques on a wide variety of benchmarks. Further scaling of transformer-based language models has continued to yield strong improvements to NLP benchmarks.
+
+= KV Cache Compression =
+
+Key-value (KV) cache compression is an important technique in transformer inference optimization. As the context length grows, the memory footprint of the KV cache scales linearly with the sequence length, number of attention heads, and head dimension. This can become a significant bottleneck for long-context inference.
+
+Various quantization approaches have been proposed to reduce the memory footprint of KV caches. INT8 quantization stores keys and values in 8-bit integer format, approximately halving the memory requirement at the cost of some quantization error. More aggressive approaches use 4-bit quantization with learned codebooks.
+
+PolarQuant is a technique that leverages the observation that KV cache tensors often have a non-Gaussian distribution with heavy tails and outliers. By applying a structured random rotation (such as a Walsh-Hadamard transform followed by random sign flips) before quantization, the distribution of the rotated coordinates becomes approximately Gaussian, making them easier to compress with a fixed-bit codebook.
+
+The Walsh-Hadamard transform (WHT) is a orthogonal transform that efficiently mixes the coordinates of a vector. For a vector of length 2^k, the WHT can be computed in O(n log n) operations. When combined with random sign vectors (diagonal matrices with plus or minus 1 entries), the resulting random rotation D2 H D1 produces a distribution of coordinates that converges to Gaussian by the central limit theorem.
+
+= Attention Mechanisms =
+
+Attention mechanisms in deep learning are techniques allowing models to focus on relevant parts of the input when producing an output. The basic idea is to give the model the ability to attend to specific parts of the input sequence when generating each part of the output.
+
+Self-attention, also known as intra-attention, is an attention mechanism relating different positions of a single sequence in order to compute a representation of the sequence. Self-attention has been shown to be very useful in machine reading, abstractive summarization, and language model.
+
+Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this. The output of each head is projected into a common space and then concatenated to form the final output.
+
+Grouped-query attention (GQA) is a variant where multiple query heads share the same key and value heads. This reduces the KV cache size proportionally to the number of query heads per group, making it more memory-efficient for long-context inference while maintaining most of the expressiveness of multi-head attention.
+
+= Perplexity Evaluation =
+
+Perplexity is a measurement of how well a probability distribution or probability model predicts a sample. It is commonly used in evaluating language models. A low perplexity indicates the probability distribution is good at predicting the sample.
+
+In the context of language modeling, perplexity is computed as the exponentiated average negative log-likelihood of a sequence. For a sequence of n tokens, the perplexity is exp(-1/n * sum(log P(token_i | context_i))). Lower perplexity values indicate better predictions.
+
+When evaluating KV cache quantization methods, perplexity on a held-out corpus (typically wikitext-2) is used as a proxy for the quality degradation introduced by the quantization. A well-designed quantization scheme should introduce minimal increase in perplexity compared to the full-precision baseline.
+
+The wikitext-2 dataset consists of high-quality Wikipedia articles and is widely used as a benchmark for language model evaluation. Models are typically evaluated in a sliding window fashion, where each window of tokens is processed and the log-probabilities of the non-context tokens are accumulated.
+
+
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+
+The transformer architecture was developed by researchers at Google and described in the seminal 2017 paper Attention Is All You Need. While the original transformer model was designed for sequence-to-sequence tasks like translation, its architecture proved extremely versatile.
+
+Transformers have led to the development of pre-trained systems such as BERT and GPT and facilitated fine-tuned systems outperforming previous best techniques on a wide variety of benchmarks. Further scaling of transformer-based language models has continued to yield strong improvements to NLP benchmarks.
+
+= KV Cache Compression =
+
+Key-value (KV) cache compression is an important technique in transformer inference optimization. As the context length grows, the memory footprint of the KV cache scales linearly with the sequence length, number of attention heads, and head dimension. This can become a significant bottleneck for long-context inference.
+
+Various quantization approaches have been proposed to reduce the memory footprint of KV caches. INT8 quantization stores keys and values in 8-bit integer format, approximately halving the memory requirement at the cost of some quantization error. More aggressive approaches use 4-bit quantization with learned codebooks.
+
+PolarQuant is a technique that leverages the observation that KV cache tensors often have a non-Gaussian distribution with heavy tails and outliers. By applying a structured random rotation (such as a Walsh-Hadamard transform followed by random sign flips) before quantization, the distribution of the rotated coordinates becomes approximately Gaussian, making them easier to compress with a fixed-bit codebook.
+
+The Walsh-Hadamard transform (WHT) is a orthogonal transform that efficiently mixes the coordinates of a vector. For a vector of length 2^k, the WHT can be computed in O(n log n) operations. When combined with random sign vectors (diagonal matrices with plus or minus 1 entries), the resulting random rotation D2 H D1 produces a distribution of coordinates that converges to Gaussian by the central limit theorem.
+
+= Attention Mechanisms =
+
+Attention mechanisms in deep learning are techniques allowing models to focus on relevant parts of the input when producing an output. The basic idea is to give the model the ability to attend to specific parts of the input sequence when generating each part of the output.
+
+Self-attention, also known as intra-attention, is an attention mechanism relating different positions of a single sequence in order to compute a representation of the sequence. Self-attention has been shown to be very useful in machine reading, abstractive summarization, and language model.
+
+Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this. The output of each head is projected into a common space and then concatenated to form the final output.
+
+Grouped-query attention (GQA) is a variant where multiple query heads share the same key and value heads. This reduces the KV cache size proportionally to the number of query heads per group, making it more memory-efficient for long-context inference while maintaining most of the expressiveness of multi-head attention.
+
+= Perplexity Evaluation =
+
+Perplexity is a measurement of how well a probability distribution or probability model predicts a sample. It is commonly used in evaluating language models. A low perplexity indicates the probability distribution is good at predicting the sample.
+
+In the context of language modeling, perplexity is computed as the exponentiated average negative log-likelihood of a sequence. For a sequence of n tokens, the perplexity is exp(-1/n * sum(log P(token_i | context_i))). Lower perplexity values indicate better predictions.
+
+When evaluating KV cache quantization methods, perplexity on a held-out corpus (typically wikitext-2) is used as a proxy for the quality degradation introduced by the quantization. A well-designed quantization scheme should introduce minimal increase in perplexity compared to the full-precision baseline.
+
+The wikitext-2 dataset consists of high-quality Wikipedia articles and is widely used as a benchmark for language model evaluation. Models are typically evaluated in a sliding window fashion, where each window of tokens is processed and the log-probabilities of the non-context tokens are accumulated.
+
+
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+
+The transformer architecture was developed by researchers at Google and described in the seminal 2017 paper Attention Is All You Need. While the original transformer model was designed for sequence-to-sequence tasks like translation, its architecture proved extremely versatile.
+
+Transformers have led to the development of pre-trained systems such as BERT and GPT and facilitated fine-tuned systems outperforming previous best techniques on a wide variety of benchmarks. Further scaling of transformer-based language models has continued to yield strong improvements to NLP benchmarks.
+
+= KV Cache Compression =
+
+Key-value (KV) cache compression is an important technique in transformer inference optimization. As the context length grows, the memory footprint of the KV cache scales linearly with the sequence length, number of attention heads, and head dimension. This can become a significant bottleneck for long-context inference.
+
+Various quantization approaches have been proposed to reduce the memory footprint of KV caches. INT8 quantization stores keys and values in 8-bit integer format, approximately halving the memory requirement at the cost of some quantization error. More aggressive approaches use 4-bit quantization with learned codebooks.
+
+PolarQuant is a technique that leverages the observation that KV cache tensors often have a non-Gaussian distribution with heavy tails and outliers. By applying a structured random rotation (such as a Walsh-Hadamard transform followed by random sign flips) before quantization, the distribution of the rotated coordinates becomes approximately Gaussian, making them easier to compress with a fixed-bit codebook.
+
+The Walsh-Hadamard transform (WHT) is a orthogonal transform that efficiently mixes the coordinates of a vector. For a vector of length 2^k, the WHT can be computed in O(n log n) operations. When combined with random sign vectors (diagonal matrices with plus or minus 1 entries), the resulting random rotation D2 H D1 produces a distribution of coordinates that converges to Gaussian by the central limit theorem.
+
+= Attention Mechanisms =
+
+Attention mechanisms in deep learning are techniques allowing models to focus on relevant parts of the input when producing an output. The basic idea is to give the model the ability to attend to specific parts of the input sequence when generating each part of the output.
+
+Self-attention, also known as intra-attention, is an attention mechanism relating different positions of a single sequence in order to compute a representation of the sequence. Self-attention has been shown to be very useful in machine reading, abstractive summarization, and language model.
+
+Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this. The output of each head is projected into a common space and then concatenated to form the final output.
+
+Grouped-query attention (GQA) is a variant where multiple query heads share the same key and value heads. This reduces the KV cache size proportionally to the number of query heads per group, making it more memory-efficient for long-context inference while maintaining most of the expressiveness of multi-head attention.
+
+= Perplexity Evaluation =
+
+Perplexity is a measurement of how well a probability distribution or probability model predicts a sample. It is commonly used in evaluating language models. A low perplexity indicates the probability distribution is good at predicting the sample.
+
+In the context of language modeling, perplexity is computed as the exponentiated average negative log-likelihood of a sequence. For a sequence of n tokens, the perplexity is exp(-1/n * sum(log P(token_i | context_i))). Lower perplexity values indicate better predictions.
+
+When evaluating KV cache quantization methods, perplexity on a held-out corpus (typically wikitext-2) is used as a proxy for the quality degradation introduced by the quantization. A well-designed quantization scheme should introduce minimal increase in perplexity compared to the full-precision baseline.
+
+The wikitext-2 dataset consists of high-quality Wikipedia articles and is widely used as a benchmark for language model evaluation. Models are typically evaluated in a sliding window fashion, where each window of tokens is processed and the log-probabilities of the non-context tokens are accumulated.
+
+
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+
+The transformer architecture was developed by researchers at Google and described in the seminal 2017 paper Attention Is All You Need. While the original transformer model was designed for sequence-to-sequence tasks like translation, its architecture proved extremely versatile.
+
+Transformers have led to the development of pre-trained systems such as BERT and GPT and facilitated fine-tuned systems outperforming previous best techniques on a wide variety of benchmarks. Further scaling of transformer-based language models has continued to yield strong improvements to NLP benchmarks.
+
+= KV Cache Compression =
+
+Key-value (KV) cache compression is an important technique in transformer inference optimization. As the context length grows, the memory footprint of the KV cache scales linearly with the sequence length, number of attention heads, and head dimension. This can become a significant bottleneck for long-context inference.
+
+Various quantization approaches have been proposed to reduce the memory footprint of KV caches. INT8 quantization stores keys and values in 8-bit integer format, approximately halving the memory requirement at the cost of some quantization error. More aggressive approaches use 4-bit quantization with learned codebooks.
+
+PolarQuant is a technique that leverages the observation that KV cache tensors often have a non-Gaussian distribution with heavy tails and outliers. By applying a structured random rotation (such as a Walsh-Hadamard transform followed by random sign flips) before quantization, the distribution of the rotated coordinates becomes approximately Gaussian, making them easier to compress with a fixed-bit codebook.
+
+The Walsh-Hadamard transform (WHT) is a orthogonal transform that efficiently mixes the coordinates of a vector. For a vector of length 2^k, the WHT can be computed in O(n log n) operations. When combined with random sign vectors (diagonal matrices with plus or minus 1 entries), the resulting random rotation D2 H D1 produces a distribution of coordinates that converges to Gaussian by the central limit theorem.
+
+= Attention Mechanisms =
+
+Attention mechanisms in deep learning are techniques allowing models to focus on relevant parts of the input when producing an output. The basic idea is to give the model the ability to attend to specific parts of the input sequence when generating each part of the output.
+
+Self-attention, also known as intra-attention, is an attention mechanism relating different positions of a single sequence in order to compute a representation of the sequence. Self-attention has been shown to be very useful in machine reading, abstractive summarization, and language model.
+
+Multi-head attention allows the model to jointly attend to information from different representation subspaces at different positions. With a single attention head, averaging inhibits this. The output of each head is projected into a common space and then concatenated to form the final output.
+
+Grouped-query attention (GQA) is a variant where multiple query heads share the same key and value heads. This reduces the KV cache size proportionally to the number of query heads per group, making it more memory-efficient for long-context inference while maintaining most of the expressiveness of multi-head attention.
+
+= Perplexity Evaluation =
+
+Perplexity is a measurement of how well a probability distribution or probability model predicts a sample. It is commonly used in evaluating language models. A low perplexity indicates the probability distribution is good at predicting the sample.
+
+In the context of language modeling, perplexity is computed as the exponentiated average negative log-likelihood of a sequence. For a sequence of n tokens, the perplexity is exp(-1/n * sum(log P(token_i | context_i))). Lower perplexity values indicate better predictions.
+
+When evaluating KV cache quantization methods, perplexity on a held-out corpus (typically wikitext-2) is used as a proxy for the quality degradation introduced by the quantization. A well-designed quantization scheme should introduce minimal increase in perplexity compared to the full-precision baseline.
+
+The wikitext-2 dataset consists of high-quality Wikipedia articles and is widely used as a benchmark for language model evaluation. Models are typically evaluated in a sliding window fashion, where each window of tokens is processed and the log-probabilities of the non-context tokens are accumulated.
+
+
+= History of Computing =
+
+The history of computing is longer than the history of computing hardware and modern computing technology and includes the history of methods intended for pen and paper or for chalk and slate, with or without the aid of tables.
+
+Computing is intimately tied to the representation of numbers. But long before abstractions like the number arose, there were mathematical concepts to serve the purposes of civilization. These concepts include one-to-one correspondence (the basis of counting), comparison to a standard (the basis of measurement), and the 3-4-5 right triangle (the basis of surveying).
+
+The earliest known tool for use in computation is the Sumerian abacus, and it was thought to have been invented in Babylon c. 2700-2300 BCE. Its original style of usage was by lines drawn in sand with pebbles. Abaci of a more modern design are still used as calculation tools today.
+
+In the 5th century BC in ancient India, the grammarian Panini formulated the grammar of Sanskrit in 3,959 rules known as the Ashtadhyayi which was highly systematized and technical. Panini used metarules, transformations, and recursion.
+
+The Antikythera mechanism is believed to be the earliest mechanical analog computer, according to Derek J. de Solla Price. It was designed to calculate astronomical positions. It was discovered in 1901 in the Antikythera wreck off the Greek island of Antikythera, between Kythera and Crete, and has been dated to c. 150 to 100 BC.
+
+= Machine Learning =
+
+Machine learning is a subfield of artificial intelligence, which gives computers the ability to learn without being explicitly programmed. Arthur Samuel, an American IBMer and pioneer in the field of computer gaming and artificial intelligence, coined the term machine learning in 1959 while at IBM.
+
+A subset of machine learning is closely related to computational statistics, which focuses on making predictions using computers; but not all machine learning is statistical learning. The study of mathematical optimization delivers methods, theory and application domains to the field of machine learning.
+
+Machine learning approaches are traditionally divided into three broad categories depending on the nature of the signal or feedback available to the learning system: supervised learning, unsupervised learning, and reinforcement learning.
+
+Deep learning uses multiple layers of artificial neural networks to learn representations of data with multiple levels of abstraction. It has significantly improved the state of the art in speech recognition, visual object recognition, object detection and many other domains such as drug discovery and genomics.
+
+= Natural Language Processing =
+
+Natural language processing (NLP) is a subfield of linguistics, computer science, and artificial intelligence concerned with the interactions between computers and human language, in particular how to program computers to process and analyze large amounts of natural language data.
+
+The goal is a computer capable of understanding the contents of documents, including the contextual nuances of the language within them. The technology can then accurately extract information and insights contained in the documents, as well as categorize and organize the documents themselves.
+
+Challenges in natural language processing frequently involve speech recognition, natural-language understanding, and natural-language generation. Natural language processing has its roots in the 1950s. Already in 1950, Alan Turing published an article titled Computing Machinery and Intelligence which proposed what is now called the Turing test as a criterion of intelligence.
+
+The Georgetown experiment in 1954 involved fully automatic translation of more than sixty Russian sentences into English. The authors claimed that within three to five years, machine translation would be a solved problem. However, real progress was much slower, and after the ALPAC report in 1966, which found that ten-year-long research had failed to fulfill the expectations, funding for machine translation was dramatically reduced.
+
+= Neural Networks =
+
+A neural network is a series of algorithms that endeavors to recognize underlying relationships in a set of data through a process that mimics the way the human brain operates. Neural networks can adapt to changing input so the network generates the best possible result without needing to redesign the output criteria.
+
+The concept of neural networks, which has its roots in artificial intelligence, is swiftly gaining popularity in the development of trading systems. Such systems were once reserved for use only in academia, yet are now quickly becoming more widely used in financial and other industries.
+
+Artificial neural networks (ANNs) are comprised of a node layers, containing an input layer, one or more hidden layers, and an output layer. Each node, or artificial neuron, connects to another and has an associated weight and threshold.
+
+If the output of any individual node is above the specified threshold value, that node is activated, sending data to the next layer of the network. Otherwise, no data is passed along to the next layer of the network by that node.
+
+= Large Language Models =
+
+A large language model (LLM) is a type of language model notable for its ability to achieve general-purpose language generation and other natural language processing tasks such as classification. LLMs acquire these abilities by learning statistical relationships from text documents during a computationally intensive self-supervised and semi-supervised training process.
+
+Large language models are artificial neural networks. The largest and most capable, as of 2023, were built with a transformer-based architecture. Some recent implementations are based on other architectures, such as recurrent neural network variants and Mamba (a state space model).
+
+LLMs can be used for text generation, a form of generative AI, by taking an input text and repeatedly predicting the next token or word. LLMs are usually trained with self-supervised and semi-supervised methods, and the resulting trained model is capable of generating text. Typically a text-in text-out interface is used.
+
+LLMs are increasingly being used as agents and for tasks involving tool use and the planning and execution of multi-step tasks. The LLM is given a user query and a set of tools, for example code execution, file manipulation, internet access and API calls. The LLM interprets the query, executes tasks using the provided tools, and generates a final result.
+
+= Transformer Architecture =
+
+A transformer is a deep learning model that adopts the mechanism of self-attention, differentially weighting the significance of each part of the input data. It is used primarily in the fields of natural language processing (NLP) and computer vision (CV).
+
+Like recurrent neural networks (RNNs), transformers are designed to process sequential input data, such as natural language, with applications towards tasks such as translation and text summarization. However, unlike RNNs, transformers process the entire input all at once. The attention mechanism provides context for any position in the input sequence.
+

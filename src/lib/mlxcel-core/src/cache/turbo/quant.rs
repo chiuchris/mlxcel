@@ -375,6 +375,49 @@ pub fn dequantize_v_turbo4(
 }
 
 // ---------------------------------------------------------------------------
+// Public rotation helper (used by kurtosis sanity tests)
+// ---------------------------------------------------------------------------
+
+/// Apply the TurboQuant `D2 · H · D1` rotation to an arbitrary tensor.
+///
+/// Input `x` must have shape `[..., D]` where `D` matches `params.head_dim`.
+/// The function multiplies by `signs1`, applies the WHT, then multiplies by
+/// `signs2` — the same ordered sequence used inside [`quantize_v_turbo4`].
+///
+/// Returns an FP32 tensor of the same shape as the input.
+///
+/// # Purpose
+///
+/// Exposing this as a standalone function allows the kurtosis sanity test
+/// in `tests/turbo_kv_e2e.rs` to load a real K tensor (or a slice thereof),
+/// apply the rotation, and measure the post-rotation kurtosis without having
+/// to run the full quantize pipeline. This validates the whitening claim
+/// (TurboQuant+ reports kurtosis ~900 → ~2.9 on Qwen3-1.7B K caches) on
+/// actual model weights.
+///
+/// Used by: `tests/turbo_kv_e2e.rs` kurtosis sanity test (issue #475).
+// doc(hidden) keeps this out of the public rustdoc while still being visible
+// to external crates (including the integration test crate).
+#[doc(hidden)]
+pub fn turbo4_v_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let d = *shape.last().expect("turbo4_v_rotate: input must be at least 1-D") as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_v_rotate: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    // Broadcast signs as [1, ..., 1, D] against an arbitrary leading shape.
+    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d as i32]);
+    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d as i32]);
+    // Cast to fp32 for stable numeric behaviour identical to the quantize path.
+    let x_f32 = ffi::astype(x, crate::dtype::FLOAT32);
+    let x_d1 = ffi::multiply(&x_f32, &signs1_arr);
+    let x_h = wht(&x_d1);
+    ffi::multiply(&x_h, &signs2_arr)
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 

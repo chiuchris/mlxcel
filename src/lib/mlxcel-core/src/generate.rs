@@ -1459,6 +1459,109 @@ impl CxxGenerator {
 
         (self.generated_tokens.clone(), stats)
     }
+
+    /// Compute per-token log-likelihoods for each position in `prompt_tokens`,
+    /// without sampling.
+    ///
+    /// Returns `Vec<f32>` of length `prompt_tokens.len() - 1`, where entry `i`
+    /// is `log P(prompt_tokens[i + 1] | prompt_tokens[..=i])` under the model.
+    ///
+    /// This is the building block for offline perplexity evaluation (epic
+    /// #458 / issue #475 — the wikitext-2 PPL gate). Callers chunk the corpus
+    /// into windows of length `≤ context_len` and accumulate `-sum(logprobs) /
+    /// total_target_tokens` across windows; `exp(mean_nll)` is the perplexity.
+    ///
+    /// # KV-cache mode interaction
+    ///
+    /// The caches are reset using the generator's configured `kv_cache_mode`,
+    /// so calling this with a `Turbo4Asym` generator measures perplexity *with*
+    /// the lossy V-cache compression in effect. This is exactly the gate the
+    /// quality test wants: it compares baseline (Fp16) PPL against quantized
+    /// PPL on the same corpus.
+    ///
+    /// # Performance
+    ///
+    /// One forward pass over the entire `prompt_tokens` window, plus an
+    /// `O(seq_len * vocab)` log-softmax + gather. Suitable for tractable
+    /// window sizes (≤ 4 K) and small models. For larger contexts, batching
+    /// many independent windows would be a follow-up; epic #458's gate runs
+    /// 20 windows × 4 K which fits in a single-pass-per-window budget on M-series.
+    ///
+    /// Used by: `tests/turbo_kv_e2e.rs` wikitext-2 PPL harness (issue #475).
+    pub fn evaluate_loglikelihoods<M: LanguageModel>(
+        &mut self,
+        model: &M,
+        prompt_tokens: &[i32],
+    ) -> Vec<f32> {
+        // A perplexity evaluation needs at least one target token (i.e. at
+        // least two input tokens: one context, one prediction target).
+        if prompt_tokens.len() < 2 {
+            return Vec::new();
+        }
+
+        // Reset caches and apply the generator's kv_cache_mode. We use
+        // `reset_with_model` so models with internal sliding/SSM caches are
+        // also cleared — matches the reset behaviour of `generate_*` paths.
+        self.reset_with_model(model);
+        install_default_stream(self.generation_stream.as_ref());
+
+        // Single forward over the full window. We do not pad: tile alignment
+        // is a decode optimisation that complicates the position→target
+        // mapping below, and the perplexity gate runs at modest seq lengths
+        // (≤ 4 K) where the unpadded path is fine.
+        let actual_len = prompt_tokens.len();
+        let input = ffi::from_slice_i32(prompt_tokens, &[1, actual_len as i32]);
+        let logits = model.forward(&input, &mut self.caches, None);
+
+        // logits shape is `[1, T, vocab]`. We need log P(token[i+1] | ...)
+        // for i in 0..T-1, so:
+        //   1. Slice logits to positions [0, T-1) along seq axis.
+        //   2. Apply log_softmax along vocab axis.
+        //   3. Gather the entry at index `prompt_tokens[i + 1]` for each i.
+        let logits_shape = ffi::array_shape(&logits);
+        debug_assert_eq!(logits_shape.len(), 3, "forward must return [B, T, V]");
+        let vocab = logits_shape[2];
+
+        // Slice to context positions [0, T-1).
+        let context_logits = ffi::slice(
+            &logits,
+            &[0, 0, 0],
+            &[1, (actual_len - 1) as i32, vocab],
+        );
+
+        // Cast to fp32 for stable log-softmax. fp16 log_softmax can underflow
+        // on extreme negative logits — fp32 keeps the gather well-conditioned.
+        let context_f32 = ffi::astype(&context_logits, crate::dtype::FLOAT32);
+        let logprobs = ffi::log_softmax(&context_f32, -1);
+
+        // Build target indices: prompt_tokens[1..] reshaped as [1, T-1, 1].
+        let targets: Vec<i32> = prompt_tokens[1..].to_vec();
+        let target_arr = ffi::from_slice_i32(&targets, &[1, (actual_len - 1) as i32, 1]);
+
+        // Gather along the vocab axis: take_along_axis with axis=-1 gives
+        // [1, T-1, 1].
+        let gathered = ffi::take_along_axis(&logprobs, &target_arr, -1);
+
+        // Materialise to host as fp32 bytes and copy out.
+        ffi::eval(&gathered);
+        let bytes = ffi::array_to_raw_bytes(&gathered);
+        debug_assert_eq!(
+            bytes.len(),
+            (actual_len - 1) * 4,
+            "expected {} fp32 bytes, got {}",
+            (actual_len - 1) * 4,
+            bytes.len()
+        );
+        let mut out = Vec::with_capacity(actual_len - 1);
+        for chunk in bytes.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+
+        // Free intermediate tensors before the next call.
+        ffi::clear_memory_cache();
+
+        out
+    }
 }
 
 /// Sample a token from logits (original version)
