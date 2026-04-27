@@ -45,12 +45,18 @@
 //! without any quantization loss on top of the one already introduced by the
 //! live cache.
 
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
+use cxx::UniquePtr;
+
+use crate::ffi;
+use crate::ffi::MlxArray;
+
 use super::detach::{DetachedHandle, DetachedKVCache};
 use super::paged::{PagedBlockId, PagedBlockPool, PagedKvLayout, PagedSequenceState};
-use super::{CachePool, KVCache, SequenceCacheSet, SequenceId, SequenceStateBackend};
+use super::{CachePool, KVCache, KVCacheMode, SequenceCacheSet, SequenceId, SequenceStateBackend};
 
 /// Inert snapshot of a paged-backend sequence, analogous to
 /// [`super::DetachedCacheSet`] for the dense backend.
@@ -82,6 +88,16 @@ pub struct DetachedPagedCacheSet {
     /// `None` after successful adoption so `Drop` can run without triggering
     /// a leak warning.
     pub(super) retained_blocks: Option<Vec<PagedBlockId>>,
+    /// Per-page Turbo4 sidecar tensors lifted out of the originating
+    /// [`PagedBlockPool`] at detach time. Keyed by `PagedBlockId`. Empty for
+    /// `Fp16`/`Int8` cache modes; on adopt the entries are reinstalled into
+    /// the active pool so quantization state survives the round-trip
+    /// bit-identically (issue #482).
+    pub(super) v_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub(super) v_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub(super) k_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub(super) k_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
+    pub(super) cold_keys_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>>,
 }
 
 impl DetachedPagedCacheSet {
@@ -150,11 +166,13 @@ impl DetachedPagedCacheSet {
     }
 
     /// Total byte footprint — sum of dense tensor bytes plus the bytes
-    /// reserved in the paged block pool for this sequence.
+    /// reserved in the paged block pool for this sequence and any per-page
+    /// Turbo4 sidecar tensors carried directly by this set.
     pub fn nbytes(&self) -> usize {
         let dense: usize = self.caches.iter().map(|c| c.nbytes()).sum();
         let paged: usize = self.paged_state.reserved_bytes(&self.paged_layout);
-        dense + paged
+        let sidecars: usize = self.turbo_sidecar_bytes();
+        dense + paged + sidecars
     }
 
     /// Summed bytes of the retained paged blocks only (excluding dense
@@ -164,6 +182,19 @@ impl DetachedPagedCacheSet {
         self.paged_state.reserved_bytes(&self.paged_layout)
     }
 
+    /// Summed bytes of the per-page Turbo4 sidecar tensors carried by this
+    /// set. Always `0` for `Fp16`/`Int8` round-trips.
+    pub fn turbo_sidecar_bytes(&self) -> usize {
+        let sum_map = |m: &HashMap<PagedBlockId, UniquePtr<MlxArray>>| -> usize {
+            m.values().map(|a| ffi::array_nbytes(a)).sum()
+        };
+        sum_map(&self.v_packed_pages)
+            + sum_map(&self.v_norms_pages)
+            + sum_map(&self.k_packed_pages)
+            + sum_map(&self.k_norms_pages)
+            + sum_map(&self.cold_keys_pages)
+    }
+
     /// Number of physical blocks this set pins across all layers.
     pub fn retained_block_count(&self) -> usize {
         self.retained_blocks
@@ -171,18 +202,37 @@ impl DetachedPagedCacheSet {
             .map(|blocks| blocks.len())
             .unwrap_or(0)
     }
+
+    /// Cache mode the set was captured under. Used by adopt to know which
+    /// Turbo4 sidecar pages to reinstall.
+    pub fn cache_mode(&self) -> KVCacheMode {
+        self.paged_layout.cache_mode
+    }
+
+    /// Number of distinct pages carrying any Turbo4 sidecar tensor.
+    pub fn turbo_sidecar_page_count(&self) -> usize {
+        let mut all: std::collections::HashSet<PagedBlockId> = std::collections::HashSet::new();
+        all.extend(self.v_packed_pages.keys());
+        all.extend(self.v_norms_pages.keys());
+        all.extend(self.k_packed_pages.keys());
+        all.extend(self.k_norms_pages.keys());
+        all.extend(self.cold_keys_pages.keys());
+        all.len()
+    }
 }
 
 impl std::fmt::Debug for DetachedPagedCacheSet {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DetachedPagedCacheSet")
             .field("backend", &self.backend)
+            .field("cache_mode", &self.paged_layout.cache_mode)
             .field("num_layers", &self.num_layers())
             .field("seq_len", &self.seq_len())
             .field("prompt_len", &self.prompt_len)
             .field("current_offset", &self.current_offset)
             .field("origin_seq_id", &self.origin_seq_id)
             .field("retained_blocks", &self.retained_block_count())
+            .field("turbo_sidecar_pages", &self.turbo_sidecar_page_count())
             .finish()
     }
 }
@@ -299,6 +349,40 @@ impl CachePool {
             .map(|cache| cache.clone_handle())
             .collect();
 
+        // Lift per-page Turbo4 sidecar tensors out of the pool so the round-
+        // trip captures them losslessly. For non-Turbo4 modes every map stays
+        // empty and the dispatch below is a no-op (#482).
+        let mut v_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        let mut v_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        let mut k_packed_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        let mut k_norms_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        let mut cold_keys_pages: HashMap<PagedBlockId, UniquePtr<MlxArray>> = HashMap::new();
+        if paged_layout.is_turbo_mode() {
+            if let Some(pool) = self.paged_pool.as_mut() {
+                for &block_id in &retained {
+                    if let Some(t) = pool.take_v_packed(block_id) {
+                        v_packed_pages.insert(block_id, t);
+                    }
+                    if let Some(t) = pool.take_v_norms(block_id) {
+                        v_norms_pages.insert(block_id, t);
+                    }
+                    if paged_layout.cache_mode == KVCacheMode::Turbo4 {
+                        if let Some(t) = pool.take_k_packed(block_id) {
+                            k_packed_pages.insert(block_id, t);
+                        }
+                        if let Some(t) = pool.take_k_norms(block_id) {
+                            k_norms_pages.insert(block_id, t);
+                        }
+                    }
+                    if paged_layout.cache_mode == KVCacheMode::Turbo4Delegated {
+                        if let Some(t) = pool.take_cold_keys(block_id) {
+                            cold_keys_pages.insert(block_id, t);
+                        }
+                    }
+                }
+            }
+        }
+
         Some(DetachedPagedCacheSet {
             caches: detached_caches,
             paged_state,
@@ -310,6 +394,11 @@ impl CachePool {
             detached_at: Instant::now(),
             origin_seq_id: sequence.seq_id,
             retained_blocks: Some(retained),
+            v_packed_pages,
+            v_norms_pages,
+            k_packed_pages,
+            k_norms_pages,
+            cold_keys_pages,
         })
     }
 
@@ -406,6 +495,14 @@ impl CachePool {
         let current_offset = detached.current_offset;
         let created_at = detached.created_at;
         let retained_blocks = detached.retained_blocks.take();
+        // Lift the per-page Turbo4 sidecars out of the detached set so we can
+        // reinstall them on the active pool below (#482). For Fp16/Int8
+        // round-trips every map is empty and the work below short-circuits.
+        let v_packed_pages = std::mem::take(&mut detached.v_packed_pages);
+        let v_norms_pages = std::mem::take(&mut detached.v_norms_pages);
+        let k_packed_pages = std::mem::take(&mut detached.k_packed_pages);
+        let k_norms_pages = std::mem::take(&mut detached.k_norms_pages);
+        let cold_keys_pages = std::mem::take(&mut detached.cold_keys_pages);
 
         // Reconstruct dense placeholder caches.
         let mut live_caches: Vec<KVCache> = Vec::with_capacity(caches.len());
@@ -418,7 +515,7 @@ impl CachePool {
         }
 
         let id = SequenceId::from_raw(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let mut entry = SequenceCacheSet::paged(id, paged_layout);
+        let mut entry = SequenceCacheSet::paged(id, paged_layout.clone());
         entry.caches = live_caches;
         entry.paged = Some(paged_state);
         entry.backend = backend;
@@ -426,6 +523,52 @@ impl CachePool {
         entry.current_offset = current_offset;
         entry.created_at = created_at;
         self.active.insert(id, entry);
+
+        // Reinstall the per-page Turbo4 sidecars into the active pool. The
+        // installs are best-effort: if the pool fails to accept a sidecar we
+        // log and continue so adopt does not partially fail with a half-
+        // constructed sequence. The detach-side `take_*` calls already
+        // consumed the originals, so a failure here would otherwise drop
+        // them silently.
+        if paged_layout.is_turbo_mode() {
+            if let Some(pool) = self.paged_pool.as_mut() {
+                for (block_id, t) in v_packed_pages {
+                    if let Err(err) = pool.install_v_packed(block_id, t) {
+                        eprintln!(
+                            "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall v_packed for {block_id}: {err}"
+                        );
+                    }
+                }
+                for (block_id, t) in v_norms_pages {
+                    if let Err(err) = pool.install_v_norms(block_id, t) {
+                        eprintln!(
+                            "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall v_norms for {block_id}: {err}"
+                        );
+                    }
+                }
+                for (block_id, t) in k_packed_pages {
+                    if let Err(err) = pool.install_k_packed(block_id, t) {
+                        eprintln!(
+                            "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall k_packed for {block_id}: {err}"
+                        );
+                    }
+                }
+                for (block_id, t) in k_norms_pages {
+                    if let Err(err) = pool.install_k_norms(block_id, t) {
+                        eprintln!(
+                            "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall k_norms for {block_id}: {err}"
+                        );
+                    }
+                }
+                for (block_id, t) in cold_keys_pages {
+                    if let Err(err) = pool.install_cold_keys(block_id, t) {
+                        eprintln!(
+                            "[mlxcel::cache::paged_detach] adopt_paged: failed to reinstall cold_keys for {block_id}: {err}"
+                        );
+                    }
+                }
+            }
+        }
 
         // Transfer retained pins onto the new active sequence. Each block was
         // pinned twice at detach time (once by the original block_ids vector,

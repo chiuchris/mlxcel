@@ -71,6 +71,9 @@ mod turbo_tests;
 #[cfg(test)]
 #[path = "cache/sparse_v_tests.rs"]
 mod sparse_v_tests;
+#[cfg(test)]
+#[path = "cache/paged_turbo_tests.rs"]
+mod paged_turbo_tests;
 
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
@@ -3596,7 +3599,17 @@ impl CachePool {
     pub fn memory_usage_bytes(&self) -> usize {
         let active_bytes: usize = self.active.values().map(|s| s.nbytes()).sum();
         let parked_bytes: usize = self.detached.values().map(|d| d.nbytes()).sum();
-        active_bytes + parked_bytes
+        // Per-page Turbo4 sidecars in the paged pool are owned by the pool
+        // itself rather than by any individual `SequenceCacheSet`, so they
+        // are not visible to the per-sequence `nbytes()` walk above. Add
+        // them explicitly so admission-control sees the true KV footprint
+        // for paged Turbo4 deployments (#482).
+        let pool_sidecar_bytes: usize = self
+            .paged_pool
+            .as_ref()
+            .map(|pool| pool.turbo_sidecar_bytes())
+            .unwrap_or(0);
+        active_bytes + parked_bytes + pool_sidecar_bytes
     }
 
     pub fn append_paged_tokens(
@@ -3671,6 +3684,23 @@ impl CachePool {
         self.paged_pool
             .as_ref()
             .map(|pool| pool.layout().block_size)
+    }
+
+    /// Read-only access to the underlying [`PagedBlockPool`].
+    ///
+    /// Used by: tests and read-only diagnostics that need to peek at per-page
+    /// Turbo4 sidecar state without going through the higher-level
+    /// `CachePool` API.
+    pub fn paged_pool_ref(&self) -> Option<&PagedBlockPool> {
+        self.paged_pool.as_ref()
+    }
+
+    /// Mutable access to the underlying [`PagedBlockPool`].
+    ///
+    /// Used by: scheduler / model code that installs Turbo4 sidecar pages
+    /// directly on the pool, and by unit tests for the same purpose.
+    pub fn paged_pool_mut(&mut self) -> Option<&mut PagedBlockPool> {
+        self.paged_pool.as_mut()
     }
 
     /// Mirror the visible dense-cache offsets into the paged backend state for
