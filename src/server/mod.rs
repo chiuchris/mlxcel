@@ -40,10 +40,11 @@ pub use chat_template_kwargs::{
     env_fallback_chat_template_kwargs,
 };
 pub use cli_input::{
-    ServerStartupInput, env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
     env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
     env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
-    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget,
+    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, resolve_kv_cache_mode,
 };
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,

@@ -298,6 +298,15 @@ pub struct ServerConfig {
     /// fields is tracked separately in sub-issue #424; for now operators set
     /// the policy via the Rust API or keep the default.
     pub prompt_cache: crate::server::prompt_cache::PromptCacheConfig,
+
+    /// Issue #484 (B11): server-wide KV cache mode.
+    ///
+    /// Resolved from `--cache-type-k`/`--cache-type-v` (llama-server split
+    /// flags) or the legacy `--kv-cache-mode` shorthand.  Defaults to
+    /// `KVCacheMode::Fp16` (bit-exact baseline). The model worker uses this
+    /// when constructing per-sequence `CxxGenerator` instances so that every
+    /// sequence in the batch sees the same KV quantization policy.
+    pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 }
 
 impl Default for ServerConfig {
@@ -343,6 +352,7 @@ impl Default for ServerConfig {
             reasoning_budget: None,
             chat_template_kwargs: None,
             prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
+            kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
         }
     }
 }

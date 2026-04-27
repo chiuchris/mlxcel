@@ -700,33 +700,59 @@ pub(crate) struct ServeArgs {
     #[arg(long, hide = true)]
     _cont_batching: bool,
 
-    /// KV cache quantization mode.
+    /// K-side KV cache quantization type (issue #484 / B11).
     ///
-    /// Controls how accumulated key/value tensors are stored:
-    ///   fp16        — Standard half-precision storage (default, no overhead).
-    ///   int8        — Per-token INT8 absmax quantization; reduces KV cache
-    ///                 memory by ~50% at the cost of small quantization error
-    ///                 per token.
-    ///   fp16+turbo4 — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
-    ///                 K side stays FP16; V side uses 4-bit PolarQuant with
-    ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
-    ///                 context (epic #458 / issue #474).
-    ///   fp16+turbo3 — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
-    ///                 ~5.1× total KV savings at slightly higher
-    ///                 reconstruction error (epic #458 / issue #477).
+    /// Accepted values:
+    ///   fp16             — Standard half-precision storage (default, no overhead).
+    ///   int8             — Per-token INT8 absmax quantization; reduces KV cache
+    ///                      memory by ~50% at the cost of small quantization
+    ///                      error per token.
+    ///   fp16+turbo4      — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
+    ///                      K side stays FP16; V side uses 4-bit PolarQuant
+    ///                      with Walsh–Hadamard rotation. ~26% net KV savings
+    ///                      at long context (epic #458 / issue #474).
+    ///   fp16+turbo3      — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
+    ///                      ~5.1× total KV savings at slightly higher
+    ///                      reconstruction error (epic #458 / issue #477).
+    ///   turbo4           — Symmetric Turbo4-K + Turbo4-V (allowlisted models
+    ///                      only, falls back to turbo4-asym otherwise).
+    ///   turbo4-delegated — Hot/cold split with FP16 hot tail + packed turbo
+    ///                      cold body (epic #458 / issue #479).
     ///
-    /// **Currently a no-op on the server**: `mlxcel serve` parses this flag
-    /// but the value is not yet plumbed through to cache construction in the
-    /// model worker; sessions always run with `fp16`. (`mlxcel-server` does
-    /// not accept this flag at all.)
-    /// This is a pre-existing limitation (also affects `int8`) tracked by
-    /// issue #484 (B11) under epic #458, which will replace `--kv-cache-mode`
-    /// with the llama.cpp-compatible `--cache-type-k` / `--cache-type-v` split
-    /// and wire both code paths through `ServerStartupConfig`. Use
-    /// `mlxcel generate --kv-cache-mode <MODE>` for offline runs in the
-    /// meantime — that path is fully wired (issue #474).
-    #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
-    kv_cache_mode: String,
+    /// When only one of `--cache-type-k`/`--cache-type-v` is specified, the
+    /// other side defaults to `fp16`. Takes precedence over `--kv-cache-mode`
+    /// when both are set (a warning is emitted).
+    ///
+    /// Also read from `LLAMA_ARG_CACHE_TYPE_K`.
+    #[arg(
+        long = "cache-type-k",
+        env = "LLAMA_ARG_CACHE_TYPE_K",
+        value_name = "TYPE"
+    )]
+    cache_type_k: Option<String>,
+
+    /// V-side KV cache quantization type (issue #484 / B11).
+    ///
+    /// Accepted values: `fp16` (default), `int8`, `turbo4`, `turbo4-asym`,
+    /// `turbo4-delegated`. When only one of `--cache-type-k`/`--cache-type-v`
+    /// is specified, the other side defaults to `fp16`. Takes precedence over
+    /// `--kv-cache-mode` when both are set (a warning is emitted).
+    ///
+    /// Also read from `LLAMA_ARG_CACHE_TYPE_V`.
+    #[arg(
+        long = "cache-type-v",
+        env = "LLAMA_ARG_CACHE_TYPE_V",
+        value_name = "TYPE"
+    )]
+    cache_type_v: Option<String>,
+
+    /// KV cache mode shorthand (legacy; prefer --cache-type-k / --cache-type-v).
+    ///
+    /// Sets both K and V to the same mode. Accepted values: `fp16` (default),
+    /// `int8`, `turbo4-asym`, `turbo4`, `turbo4-delegated`. When the split
+    /// flags are also supplied, they win (with a warning).
+    #[arg(long = "kv-cache-mode", value_name = "MODE")]
+    kv_cache_mode: Option<String>,
 
     /// Maximum number of cached post-projection image features per loaded VLM.
     ///

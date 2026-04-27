@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::ServerStartupConfig;
@@ -199,6 +200,34 @@ pub struct ServerStartupInput {
     /// consistently.
     pub chat_template_kwargs: Option<String>,
 
+    // Issue #484 (B11): llama-server-compatible K/V cache type split flags.
+    //
+    // These hold the raw CLI strings from `--cache-type-k` / `--cache-type-v`
+    // (and their env var aliases `LLAMA_ARG_CACHE_TYPE_K` /
+    // `LLAMA_ARG_CACHE_TYPE_V`) before resolution into a `KVCacheMode`.
+    //
+    // The legacy `--kv-cache-mode` shorthand is stored separately as
+    // `kv_cache_mode_legacy`. Resolution priority at
+    // `into_startup_config` time:
+    //
+    //   1. `--cache-type-k` + `--cache-type-v` (split flags) — highest priority.
+    //      A warning is emitted when both the split flags and the legacy flag
+    //      are present; split flags win.
+    //   2. `--kv-cache-mode` (legacy shorthand) — still honored for backward
+    //      compatibility.
+    //   3. Default: `KVCacheMode::Fp16`.
+    //
+    // `None` means "not provided by the CLI or env var for this field".
+    /// Raw string from `--cache-type-k` or `LLAMA_ARG_CACHE_TYPE_K`.
+    /// `None` means the flag was not provided.
+    pub cache_type_k: Option<String>,
+    /// Raw string from `--cache-type-v` or `LLAMA_ARG_CACHE_TYPE_V`.
+    /// `None` means the flag was not provided.
+    pub cache_type_v: Option<String>,
+    /// Raw string from `--kv-cache-mode` (legacy shorthand).
+    /// `None` means the flag was not provided (= default FP16).
+    pub kv_cache_mode_legacy: Option<String>,
+
     // Issue #424: prompt-prefix KV cache knobs.
     // Each field stores the raw CLI/env value before normalization into
     // `PromptCacheConfig`. `None` on the `Option`-typed fields means "not
@@ -272,6 +301,15 @@ impl ServerStartupInput {
             self.prompt_cache_ttl_seconds,
             self.prompt_cache_min_prefix,
         );
+
+        // Issue #484 (B11): resolve the effective KV cache mode from split flags,
+        // legacy shorthand, or the default (FP16).
+        let kv_cache_mode = resolve_kv_cache_mode(
+            self.cache_type_k.as_deref(),
+            self.cache_type_v.as_deref(),
+            self.kv_cache_mode_legacy.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("KV cache mode error: {e}"))?;
 
         Ok(ServerStartupConfig {
             model_path: self.model_path,
@@ -349,7 +387,130 @@ impl ServerStartupInput {
             reasoning_budget,
             chat_template_kwargs,
             prompt_cache,
+            kv_cache_mode,
         })
+    }
+}
+
+// ── Issue #484 (B11) — KV cache type split flags ─────────────────────────────
+
+/// Supported K/V combinations and their corresponding `KVCacheMode`.
+///
+/// | K      | V                 | Mode              |
+/// |--------|-------------------|-------------------|
+/// | fp16   | fp16              | `Fp16`            |
+/// | int8   | int8              | `Int8`            |
+/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`   |
+/// | turbo4 | turbo4            | `Turbo4`          |
+/// | fp16   | turbo4-delegated  | `Turbo4Delegated` |
+///
+/// Any other combination returns an error with a description of valid pairs.
+pub fn resolve_kv_cache_mode(
+    cache_type_k: Option<&str>,
+    cache_type_v: Option<&str>,
+    kv_cache_mode_legacy: Option<&str>,
+) -> Result<KVCacheMode, String> {
+    let have_split = cache_type_k.is_some() || cache_type_v.is_some();
+    let have_legacy = kv_cache_mode_legacy.is_some();
+
+    if have_split && have_legacy {
+        tracing::warn!(
+            "--cache-type-k/--cache-type-v and --kv-cache-mode are both set; \
+             --cache-type-k/--cache-type-v take precedence (use one or the other)"
+        );
+    }
+
+    if have_split {
+        // Resolve each side, defaulting the unspecified side to fp16.
+        let k_str = cache_type_k.unwrap_or("fp16");
+        let v_str = cache_type_v.unwrap_or("fp16");
+
+        let k_mode = k_str
+            .parse::<KVCacheMode>()
+            .map_err(|_| format!("unrecognised --cache-type-k value \"{k_str}\""))?;
+        let v_mode = v_str
+            .parse::<KVCacheMode>()
+            .map_err(|_| format!("unrecognised --cache-type-v value \"{v_str}\""))?;
+
+        return map_kv_modes_to_cache_mode(k_mode, v_mode);
+    }
+
+    if let Some(legacy) = kv_cache_mode_legacy {
+        return legacy
+            .parse::<KVCacheMode>()
+            .map_err(|_| format!("unrecognised --kv-cache-mode value \"{legacy}\""));
+    }
+
+    // Default: FP16 (bit-exact baseline).
+    Ok(KVCacheMode::Fp16)
+}
+
+/// Map a (K-mode, V-mode) pair to the combined `KVCacheMode`.
+///
+/// Not all combinations are supported. Returns an error with a human-readable
+/// message when the pair is unsupported.
+fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheMode, String> {
+    use KVCacheMode::{Fp16, Int8, Turbo4, Turbo4Asym, Turbo4Delegated};
+    match (k, v) {
+        (Fp16, Fp16) => Ok(Fp16),
+        (Int8, Int8) => Ok(Int8),
+        // Asymmetric: FP16 K + Turbo4 V → Turbo4Asym (covers turbo4-asym input on V side)
+        (Fp16, Turbo4Asym) | (Fp16, Turbo4) => Ok(Turbo4Asym),
+        // Symmetric: Turbo4 K + Turbo4 V → Turbo4 (allowlist-gated inside mlxcel-core)
+        (Turbo4, Turbo4) => Ok(Turbo4),
+        // Delegated hot/cold: FP16 K + Turbo4Delegated V → Turbo4Delegated
+        (Fp16, Turbo4Delegated) => Ok(Turbo4Delegated),
+        // Anything else is unsupported.
+        (k, v) => Err(format!(
+            "unsupported --cache-type-k={k} / --cache-type-v={v} combination; \
+             supported pairs:\n  \
+             fp16   / fp16              -> fp16 (default)\n  \
+             int8   / int8              -> int8\n  \
+             fp16   / turbo4            -> fp16+turbo4 (Turbo4Asym)\n  \
+             fp16   / turbo4-asym       -> fp16+turbo4 (Turbo4Asym)\n  \
+             turbo4 / turbo4            -> turbo4 (symmetric, allowlist-gated)\n  \
+             fp16   / turbo4-delegated  -> turbo4-delegated"
+        )),
+    }
+}
+
+/// Apply `LLAMA_ARG_CACHE_TYPE_K` env var fallback to the raw
+/// `--cache-type-k` CLI value (issue #484).
+///
+/// Precedence: CLI flag beats env var. When the CLI flag was not provided
+/// (value is `None`) and the env var is set, the env var value is applied.
+/// When both are present, the CLI value is kept and an INFO log is emitted.
+pub fn env_fallback_cache_type_k(value: &mut Option<String>) {
+    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_K", "cache-type-k");
+}
+
+/// Apply `LLAMA_ARG_CACHE_TYPE_V` env var fallback to the raw
+/// `--cache-type-v` CLI value (issue #484).
+///
+/// Precedence: CLI flag beats env var.  When the CLI flag was not provided
+/// (value is `None`) and the env var is set, the env var value is applied.
+/// When both are present, the CLI value is kept and an INFO log is emitted.
+pub fn env_fallback_cache_type_v(value: &mut Option<String>) {
+    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v");
+}
+
+/// Shared helper: if `value` is `None` and the named env var is set, fill
+/// `value` from the env var. If `value` is `Some` (CLI was set) and the env
+/// var is also present, log an INFO and keep the CLI value.
+fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
+    if value.is_some() {
+        if std::env::var_os(key).is_some() {
+            tracing::info!(
+                "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
+            );
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var(key) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            *value = Some(trimmed);
+        }
     }
 }
 

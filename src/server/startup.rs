@@ -232,6 +232,19 @@ pub struct ServerStartupConfig {
     /// The default is [`super::prompt_cache::PromptCacheConfig::default`]
     /// (enabled, 2 GiB cap, 1024 entries, 3600 s TTL, 32 token min).
     pub prompt_cache: super::prompt_cache::PromptCacheConfig,
+
+    /// Issue #484 (B11): resolved KV cache mode for per-sequence cache
+    /// construction.
+    ///
+    /// Resolved from `--cache-type-k`/`--cache-type-v` (split flags,
+    /// `LLAMA_ARG_CACHE_TYPE_K`/`LLAMA_ARG_CACHE_TYPE_V` env vars) or the
+    /// legacy `--kv-cache-mode` shorthand.  Defaults to `KVCacheMode::Fp16`
+    /// (bit-exact baseline, no quantization).
+    ///
+    /// The split flags take precedence over the legacy shorthand. When only
+    /// one of K or V is specified, the unspecified side defaults to `fp16`.
+    /// Unsupported K/V combinations are rejected at startup.
+    pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 }
 
 impl Default for ServerStartupConfig {
@@ -312,6 +325,7 @@ impl Default for ServerStartupConfig {
             reasoning_budget: None,
             chat_template_kwargs: None,
             prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
+            kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
         }
     }
 }
@@ -469,6 +483,9 @@ pub(super) fn build_server_config(
         // Issue #424: wire the CLI/env-resolved policy through instead of
         // always using the compiled-in default.
         prompt_cache: startup.prompt_cache.clone(),
+        // Issue #484 (B11): wire the resolved KV cache mode through so the
+        // model worker can apply it when constructing per-sequence generators.
+        kv_cache_mode: startup.kv_cache_mode,
     }
 }
 

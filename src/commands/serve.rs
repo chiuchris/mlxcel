@@ -20,7 +20,8 @@
 //! on schema and routing.
 
 use mlxcel::server::{
-    ServerStartupInput, env_fallback_chat_template_kwargs, env_fallback_lang_bias,
+    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    env_fallback_chat_template_kwargs, env_fallback_lang_bias,
     env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
     env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
     env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
@@ -50,21 +51,12 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
     env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
     env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
-
-    // Issue #474 / epic #458 follow-up: --kv-cache-mode is parsed but not yet
-    // wired through to the server's per-sequence cache construction. Surface a
-    // clear warning so operators don't assume the flag is silently in effect.
-    // Server-side wiring is tracked by issue #484 (B11) which replaces this
-    // flag with --cache-type-k / --cache-type-v and threads the chosen mode
-    // through ServerStartupConfig → ModelWorker → make_caches().
-    let kv_mode_lc = args.kv_cache_mode.to_ascii_lowercase();
-    if !matches!(kv_mode_lc.as_str(), "fp16" | "float16") {
-        eprintln!(
-            "[mlxcel serve] warning: --kv-cache-mode {} is a no-op on the server \
-             pending issue #484; KV cache mode is fixed at fp16",
-            args.kv_cache_mode
-        );
-    }
+    // Issue #484 (B11): env-var fallbacks for KV cache type split flags.
+    // The clap `env = "..."` attribute already reads these env vars; the
+    // explicit calls below maintain the warn-on-conflict pattern used by
+    // other LLAMA_ARG_* pairs.
+    env_fallback_cache_type_k(&mut args.cache_type_k);
+    env_fallback_cache_type_v(&mut args.cache_type_v);
 
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
@@ -157,6 +149,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         prompt_cache_max_entries: args.prompt_cache_max_entries,
         prompt_cache_ttl_seconds: args.prompt_cache_ttl,
         prompt_cache_min_prefix: args.prompt_cache_min_prefix,
+        // Issue #484 (B11): KV cache type split flags already resolved via
+        // env-var fallbacks (and clap `env = "..."`) above.
+        cache_type_k: args.cache_type_k,
+        cache_type_v: args.cache_type_v,
+        kv_cache_mode_legacy: args.kv_cache_mode,
     })
 }
 

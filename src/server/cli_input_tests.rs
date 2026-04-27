@@ -15,7 +15,10 @@
 use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
-use super::{ServerStartupInput, resolve_compat_toggle, resolve_prefill_chunk_size, resolve_seed};
+use super::{
+    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    resolve_compat_toggle, resolve_kv_cache_mode, resolve_prefill_chunk_size, resolve_seed,
+};
 use crate::lang_bias::LangBiasCliArgs;
 
 // Global mutex to serialize all tests that mutate env vars via `EnvGuard`.
@@ -116,6 +119,10 @@ fn sample_input() -> ServerStartupInput {
         prompt_cache_max_entries: None,
         prompt_cache_ttl_seconds: None,
         prompt_cache_min_prefix: None,
+        // Issue #484 (B11): KV cache type split flags — default to None (FP16).
+        cache_type_k: None,
+        cache_type_v: None,
+        kv_cache_mode_legacy: None,
     }
 }
 
@@ -839,4 +846,265 @@ fn prompt_cache_e2e_cli_capacity_bytes_flows_to_startup_config() {
 
     let startup = input.into_startup_config().expect("valid input");
     assert_eq!(startup.prompt_cache.capacity_bytes, 134_217_728);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #484 (B11) — resolve_kv_cache_mode tests
+//
+// These tests cover the K/V-to-KVCacheMode mapping logic: all supported pairs,
+// unsupported combinations, and legacy/split flag interaction.
+// ─────────────────────────────────────────────────────────────────────────────
+
+use mlxcel_core::cache::KVCacheMode;
+
+/// Default (no flags) → FP16.
+#[test]
+fn kv_cache_mode_default_is_fp16() {
+    let mode = resolve_kv_cache_mode(None, None, None).expect("default must succeed");
+    assert_eq!(mode, KVCacheMode::Fp16);
+}
+
+/// Both sides fp16 → Fp16.
+#[test]
+fn kv_cache_mode_fp16_fp16_maps_to_fp16() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Fp16);
+}
+
+/// Both sides int8 → Int8.
+#[test]
+fn kv_cache_mode_int8_int8_maps_to_int8() {
+    let mode = resolve_kv_cache_mode(Some("int8"), Some("int8"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Int8);
+}
+
+/// K=fp16, V=turbo4 → Turbo4Asym.
+#[test]
+fn kv_cache_mode_fp16_turbo4_maps_to_turbo4asym() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Turbo4Asym);
+}
+
+/// K=fp16, V=turbo4-asym (explicit alias) → Turbo4Asym.
+#[test]
+fn kv_cache_mode_fp16_turbo4_asym_maps_to_turbo4asym() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-asym"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Turbo4Asym);
+}
+
+/// K=turbo4, V=turbo4 → Turbo4 (symmetric, allowlist-gated at runtime).
+#[test]
+fn kv_cache_mode_turbo4_turbo4_maps_to_turbo4() {
+    let mode = resolve_kv_cache_mode(Some("turbo4"), Some("turbo4"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Turbo4);
+}
+
+/// K=fp16, V=turbo4-delegated → Turbo4Delegated.
+#[test]
+fn kv_cache_mode_fp16_turbo4_delegated_maps_to_delegated() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo4-delegated"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Turbo4Delegated);
+}
+
+/// Unspecified K defaults to fp16 — K=None + V=turbo4 → Turbo4Asym.
+#[test]
+fn kv_cache_mode_k_defaults_to_fp16_when_unset() {
+    let mode = resolve_kv_cache_mode(None, Some("turbo4"), None).unwrap();
+    assert_eq!(mode, KVCacheMode::Turbo4Asym);
+}
+
+/// Unspecified V defaults to fp16 — K=None + V=None → Fp16.
+#[test]
+fn kv_cache_mode_v_defaults_to_fp16_when_unset() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), None, None).unwrap();
+    assert_eq!(mode, KVCacheMode::Fp16);
+}
+
+/// Unsupported combination — K=int8, V=turbo4 → error.
+#[test]
+fn kv_cache_mode_int8_turbo4_is_unsupported() {
+    let err = resolve_kv_cache_mode(Some("int8"), Some("turbo4"), None)
+        .expect_err("int8/turbo4 must be rejected");
+    assert!(
+        err.contains("unsupported"),
+        "error must mention 'unsupported', got: {err}"
+    );
+    assert!(
+        err.contains("supported pairs"),
+        "error must list supported pairs, got: {err}"
+    );
+}
+
+/// Unsupported combination — K=turbo4, V=fp16 → error.
+#[test]
+fn kv_cache_mode_turbo4_fp16_is_unsupported() {
+    let err = resolve_kv_cache_mode(Some("turbo4"), Some("fp16"), None)
+        .expect_err("turbo4/fp16 must be rejected");
+    assert!(err.contains("unsupported"));
+}
+
+/// Unknown K string → error mentioning the bad value.
+#[test]
+fn kv_cache_mode_unknown_k_string_errors() {
+    let err = resolve_kv_cache_mode(Some("bfloat16"), Some("fp16"), None)
+        .expect_err("unrecognised K must be rejected");
+    assert!(
+        err.contains("bfloat16"),
+        "error must name the bad value, got: {err}"
+    );
+}
+
+/// Unknown V string → error mentioning the bad value.
+#[test]
+fn kv_cache_mode_unknown_v_string_errors() {
+    let err = resolve_kv_cache_mode(Some("fp16"), Some("bf16"), None)
+        .expect_err("unrecognised V must be rejected");
+    assert!(
+        err.contains("bf16"),
+        "error must name the bad value, got: {err}"
+    );
+}
+
+/// Legacy --kv-cache-mode shorthand sets the mode when split flags are absent.
+#[test]
+fn kv_cache_mode_legacy_flag_sets_mode() {
+    let mode =
+        resolve_kv_cache_mode(None, None, Some("fp16+turbo4")).expect("legacy flag must work");
+    assert_eq!(mode, KVCacheMode::Turbo4Asym);
+}
+
+/// Legacy --kv-cache-mode=int8 shorthand sets Int8.
+#[test]
+fn kv_cache_mode_legacy_int8_sets_int8() {
+    let mode = resolve_kv_cache_mode(None, None, Some("int8")).expect("legacy int8 must work");
+    assert_eq!(mode, KVCacheMode::Int8);
+}
+
+/// Split flags win over legacy when both are provided.
+#[test]
+fn kv_cache_mode_split_flags_take_precedence_over_legacy() {
+    // split says fp16/fp16 (Fp16), legacy says int8 — split wins
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16"), Some("int8")).unwrap();
+    assert_eq!(
+        mode,
+        KVCacheMode::Fp16,
+        "split flags must win over legacy --kv-cache-mode"
+    );
+}
+
+/// Unknown legacy value → clear error.
+#[test]
+fn kv_cache_mode_legacy_unknown_value_errors() {
+    let err = resolve_kv_cache_mode(None, None, Some("unknown-mode"))
+        .expect_err("unknown legacy mode must fail");
+    assert!(
+        err.contains("unknown-mode"),
+        "error must name the bad value, got: {err}"
+    );
+}
+
+/// Integration: split flags flow through `into_startup_config` to
+/// `ServerStartupConfig.kv_cache_mode`.
+#[test]
+fn into_startup_config_kv_cache_mode_from_split_flags() {
+    let mut input = sample_input();
+    input.cache_type_k = Some("fp16".to_string());
+    input.cache_type_v = Some("turbo4".to_string());
+
+    let startup = input
+        .into_startup_config()
+        .expect("fp16+turbo4 is a supported pair");
+    assert_eq!(startup.kv_cache_mode, KVCacheMode::Turbo4Asym);
+}
+
+/// Integration: legacy flag flows through `into_startup_config`.
+#[test]
+fn into_startup_config_kv_cache_mode_from_legacy_flag() {
+    let mut input = sample_input();
+    input.kv_cache_mode_legacy = Some("int8".to_string());
+
+    let startup = input.into_startup_config().expect("int8 legacy mode valid");
+    assert_eq!(startup.kv_cache_mode, KVCacheMode::Int8);
+}
+
+/// Integration: default (no flags) → FP16 in the startup config.
+#[test]
+fn into_startup_config_kv_cache_mode_default_is_fp16() {
+    let startup = sample_input()
+        .into_startup_config()
+        .expect("default input is valid");
+    assert_eq!(startup.kv_cache_mode, KVCacheMode::Fp16);
+}
+
+/// Integration: unsupported pair propagated as an error.
+#[test]
+fn into_startup_config_kv_cache_mode_unsupported_pair_errors() {
+    let mut input = sample_input();
+    input.cache_type_k = Some("int8".to_string());
+    input.cache_type_v = Some("turbo4".to_string());
+
+    let err = input
+        .into_startup_config()
+        .expect_err("int8/turbo4 must fail");
+    let msg = format!("{err:#}");
+    assert!(msg.contains("KV cache mode error") || msg.contains("unsupported"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #484 (B11) — env-var fallback tests for LLAMA_ARG_CACHE_TYPE_K/V
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `LLAMA_ARG_CACHE_TYPE_K` is applied when the CLI flag is absent.
+#[test]
+fn cache_type_k_env_var_applied_when_cli_absent() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_TYPE_K", "int8");
+
+    let mut value: Option<String> = None;
+    env_fallback_cache_type_k(&mut value);
+    assert_eq!(value.as_deref(), Some("int8"));
+}
+
+/// CLI `--cache-type-k` wins over `LLAMA_ARG_CACHE_TYPE_K`.
+#[test]
+fn cache_type_k_cli_wins_over_env() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_TYPE_K", "int8");
+
+    let mut value: Option<String> = Some("fp16".to_string());
+    env_fallback_cache_type_k(&mut value);
+    assert_eq!(value.as_deref(), Some("fp16"), "CLI must win");
+}
+
+/// `LLAMA_ARG_CACHE_TYPE_V` is applied when the CLI flag is absent.
+#[test]
+fn cache_type_v_env_var_applied_when_cli_absent() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_TYPE_V", "turbo4");
+
+    let mut value: Option<String> = None;
+    env_fallback_cache_type_v(&mut value);
+    assert_eq!(value.as_deref(), Some("turbo4"));
+}
+
+/// CLI `--cache-type-v` wins over `LLAMA_ARG_CACHE_TYPE_V`.
+#[test]
+fn cache_type_v_cli_wins_over_env() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_TYPE_V", "turbo4");
+
+    let mut value: Option<String> = Some("fp16".to_string());
+    env_fallback_cache_type_v(&mut value);
+    assert_eq!(value.as_deref(), Some("fp16"), "CLI must win");
+}
+
+/// Empty env var string is not applied (treated as absent).
+#[test]
+fn cache_type_k_empty_env_var_is_ignored() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_CACHE_TYPE_K", "   ");
+
+    let mut value: Option<String> = None;
+    env_fallback_cache_type_k(&mut value);
+    assert!(value.is_none(), "whitespace-only env var must not be applied");
 }
