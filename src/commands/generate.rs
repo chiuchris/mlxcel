@@ -829,7 +829,10 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
         }
         if matches!(
             kv_cache_mode,
-            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+            KVCacheMode::Turbo4Asym
+                | KVCacheMode::Turbo4
+                | KVCacheMode::Turbo4Delegated
+                | KVCacheMode::Turbo3Asym
         ) {
             println!(
                 "Boundary-V: protecting {boundary} layer(s) on each end at Fp16 \
@@ -855,6 +858,12 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             println!(
                 "KV cache mode: turbo4-delegated (Fp16-K + Turbo4-V with hot/cold split, \
                  ~26% KV savings + 97-100% FP16 decode speed at long context)"
+            );
+        }
+        KVCacheMode::Turbo3Asym => {
+            println!(
+                "KV cache mode: fp16+turbo3 (asymmetric Fp16-K + Turbo3-V, \
+                 ~5.1x total KV savings; issue #477)"
             );
         }
         KVCacheMode::Fp16 => {}

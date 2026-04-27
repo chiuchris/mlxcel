@@ -22,10 +22,12 @@
 //! |---------------|-------------|----------|--------------------------------------|
 //! | `codebook`    | B1 (#472)   | done     | Lloyd-Max centroid generator         |
 //! | `quant`       | B2/B4 (#474, #476) | done | V-side + K-side PolarQuant pipeline |
+//! | `pack3`       | B5 (#477)   | done     | 3-bit pack/unpack helpers (24-bit grouping) |
+//! | `quant3`      | B5 (#477)   | done     | 3-bit V-side PolarQuant pipeline (asymmetric only) |
 //! | `allowlist`   | B4 (#476)   | done     | Per-model symmetric Turbo4 gating    |
 //! | `boundary`    | B6 (#478)   | done     | First/last layer V protection policy |
 //! | `sparse_v`    | B8 (#480)   | done     | Attention-gated V-dequant scaffold   |
-//! | (more to come)| B5/B10–B12  | pending  | turbo3 / paged KV / docs             |
+//! | (more to come)| B10–B12     | pending  | paged KV / docs / turbo2             |
 //!
 //! # Usage by downstream sub-issues
 //!
@@ -38,7 +40,9 @@
 pub mod allowlist;
 pub mod boundary;
 pub mod codebook;
+pub mod pack3;
 pub mod quant;
+pub mod quant3;
 pub mod sparse_v;
 
 pub use allowlist::{

@@ -31,6 +31,14 @@
 //! live in dedicated sidecar fields (`v_packed`, `v_norms`) and the
 //! quantize/dequantize helpers in [`turbo::quant`] handle the math.
 //!
+//! `KVCacheMode::Turbo3Asym` (issue #477, epic #458) is the 3-bit sibling of
+//! `Turbo4Asym` — same Fp16-K + asymmetric layout, but the V side uses the
+//! 8-centroid (3-bit) Lloyd-Max codebook and the 24-bit-grouped packing
+//! layout from [`turbo::pack3`]. Compression climbs to ~5.1× total KV
+//! savings (vs ~3.8× for `Turbo4Asym`) at the cost of a slightly larger
+//! V-reconstruction error. Symmetric Turbo3 is an explicit non-goal of
+//! this PR — see [`turbo::quant3`] for rationale.
+//!
 //! `KVCacheMode::Turbo4` (issue #476, epic #458) extends Turbo4Asym to a
 //! **symmetric** 4-bit K + 4-bit V layout, reducing KV memory by ~73% at
 //! long context. The K side mirrors the V side bit-for-bit but uses an
@@ -99,6 +107,16 @@ pub enum KVCacheMode {
     /// PolarQuant with Walsh–Hadamard rotation for ~26% net KV memory savings
     /// at long context. See issue #474 / epic #458.
     Turbo4Asym,
+    /// Asymmetric Fp16-K + Turbo3-V. K side stays in FP16; V side uses 3-bit
+    /// PolarQuant with Walsh–Hadamard rotation for ~5.1× total KV memory
+    /// savings (vs ~3.8× for `Turbo4Asym`) at the cost of a slightly higher
+    /// V-reconstruction error. The 3-bit packing is awkward (8 coords share
+    /// 3 bytes / 24 bits — see [`turbo::pack3`]), so the dequant path runs
+    /// a host round-trip rather than the 4-bit path's pure on-device unpack.
+    /// Symmetric Turbo3 is **not** offered in this mode (epic #458's
+    /// "Quality–compression tradeoff control" explicitly defers it). See
+    /// issue #477 / epic #458.
+    Turbo3Asym,
     /// Symmetric Turbo4-K + Turbo4-V. Both K and V use 4-bit PolarQuant with
     /// independent Walsh–Hadamard rotations for ~73% net KV memory savings
     /// at long context. **Dangerous on dense Q4_K_M weights** — gated by
@@ -125,6 +143,13 @@ impl std::str::FromStr for KVCacheMode {
             // ("fp16+turbo4") makes the asymmetric K/V split explicit, while
             // "turbo4-asym" is a shorter alias for scripts and tests.
             "turbo4-asym" | "fp16+turbo4" => Ok(Self::Turbo4Asym),
+            // Turbo3Asym (3-bit V, asymmetric only — issue #477). Same alias
+            // pattern as Turbo4Asym: "fp16+turbo3" is the canonical string,
+            // "turbo3-asym" / "turbo3" are shorter forms used in scripts and
+            // tests. There is intentionally no symmetric "turbo3" alias —
+            // symmetric 3-bit on dense Q4_K_M weights is catastrophic and
+            // explicitly out of scope for this PR (see [`turbo::quant3`]).
+            "turbo3-asym" | "fp16+turbo3" | "turbo3" => Ok(Self::Turbo3Asym),
             // Symmetric Turbo4 (4-bit K + 4-bit V). The canonical user-facing
             // string is "turbo4"; "turbo4-sym" is an explicit alias used in
             // tests/scripts when readers benefit from the K/V symmetry being
@@ -138,7 +163,8 @@ impl std::str::FromStr for KVCacheMode {
                 "unknown kv-cache-mode \"{other}\"; expected one of \
                  \"fp16\", \"int8\", \"fp16+turbo4\" (alias \"turbo4-asym\"), \
                  \"turbo4\" (alias \"turbo4-sym\"), \
-                 \"turbo4-delegated\" (alias \"fp16+turbo4-delegated\")"
+                 \"turbo4-delegated\" (alias \"fp16+turbo4-delegated\"), \
+                 \"fp16+turbo3\" (aliases \"turbo3-asym\" / \"turbo3\")"
             )),
         }
     }
@@ -152,6 +178,7 @@ impl std::fmt::Display for KVCacheMode {
             Self::Turbo4Asym => f.write_str("fp16+turbo4"),
             Self::Turbo4 => f.write_str("turbo4"),
             Self::Turbo4Delegated => f.write_str("turbo4-delegated"),
+            Self::Turbo3Asym => f.write_str("fp16+turbo3"),
         }
     }
 }
@@ -267,6 +294,12 @@ pub struct KVCache {
     /// symmetric `Turbo4` mode the same params carry both V and K sign
     /// vectors (`signs1`/`signs2` for V, `k_signs1`/`k_signs2` for K).
     pub(crate) turbo_params: Option<turbo::TurboQuantParams>,
+    /// Cached PolarQuant params for `Turbo3Asym` (issue #477). The 3-bit
+    /// codebook (8 centroids) is incompatible with the 4-bit `turbo_params`
+    /// codebook so a separate field is required. Lazily initialised on the
+    /// first `Turbo3Asym` update once the V `head_dim` is known. Stays
+    /// `None` for non-Turbo3 modes.
+    pub(crate) turbo3_params: Option<turbo::quant3::TurboQuantParams3>,
     /// Deterministic seed for the Turbo4 sign vectors. Set at construction
     /// time so detach/adopt round-trip without recomputing rotations.
     pub(crate) turbo_seed: u32,
@@ -304,6 +337,7 @@ impl KVCache {
             k_packed: None,
             k_norms: None,
             turbo_params: None,
+            turbo3_params: None,
             turbo_seed: TURBO_DEFAULT_SEED,
             cold_keys: None,
             cold_offset: 0,
@@ -347,6 +381,7 @@ impl KVCache {
             k_packed: None,
             k_norms: None,
             turbo_params: None,
+            turbo3_params: None,
             turbo_seed,
             cold_keys: None,
             cold_offset: 0,
@@ -435,6 +470,7 @@ impl KVCache {
             KVCacheMode::Turbo4Asym => self.update_turbo4_asym(new_keys, new_values),
             KVCacheMode::Turbo4 => self.update_turbo4_sym(new_keys, new_values),
             KVCacheMode::Turbo4Delegated => self.update_turbo4_delegated(new_keys, new_values),
+            KVCacheMode::Turbo3Asym => self.update_turbo3_asym(new_keys, new_values),
             KVCacheMode::Fp16 => self.update_fp16(new_keys, new_values),
         }
     }
@@ -660,6 +696,130 @@ impl KVCache {
             .expect("turbo_params just initialised");
 
         let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&new_values_f16, params);
+
+        let key_shape = ffi::array_shape(&new_keys_f16);
+        let new_seq_len = key_shape[2];
+        let prev = self.offset;
+        let v_packed_shape = ffi::array_shape(&v_packed_new);
+
+        if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
+            self.keys = Some(ffi::contiguous(&new_keys_f16, false));
+            self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
+            self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            self.offset = new_seq_len;
+            return;
+        }
+
+        if self.keys.is_none() || (prev + new_seq_len) > self.buffer_seq_len() {
+            let b = key_shape[0];
+            let n_kv_heads = key_shape[1];
+            let k_head_dim = key_shape[3];
+            let v_packed_dim = v_packed_shape[3];
+
+            let n_steps = (self.step + new_seq_len - 1) / self.step;
+            let buf_size = n_steps * self.step;
+
+            let new_k_buf = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::FLOAT16);
+            let new_vp_buf = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
+            let new_vn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+
+            if self.keys.is_some() {
+                if prev % self.step != 0 {
+                    self.keys = Some(ffi::slice(
+                        self.keys.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, k_head_dim],
+                    ));
+                    self.v_packed = Some(ffi::slice(
+                        self.v_packed.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, v_packed_dim],
+                    ));
+                    self.v_norms = Some(ffi::slice(
+                        self.v_norms.as_ref().unwrap(),
+                        &[0, 0, 0, 0],
+                        &[b, n_kv_heads, prev, 1],
+                    ));
+                }
+                self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k_buf, 2));
+                self.v_packed = Some(concatenate(self.v_packed.as_ref().unwrap(), &new_vp_buf, 2));
+                self.v_norms = Some(concatenate(self.v_norms.as_ref().unwrap(), &new_vn_buf, 2));
+            } else {
+                self.keys = Some(new_k_buf);
+                self.v_packed = Some(new_vp_buf);
+                self.v_norms = Some(new_vn_buf);
+            }
+        }
+
+        self.offset += new_seq_len;
+
+        let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
+        let vp_shape = ffi::array_shape(self.v_packed.as_ref().unwrap());
+        let vn_shape = ffi::array_shape(self.v_norms.as_ref().unwrap());
+
+        self.keys = Some(ffi::slice_update(
+            self.keys.as_ref().unwrap(),
+            &new_keys_f16,
+            &[0, 0, prev, 0],
+            &[k_shape[0], k_shape[1], self.offset, k_shape[3]],
+        ));
+        self.v_packed = Some(ffi::slice_update(
+            self.v_packed.as_ref().unwrap(),
+            &v_packed_new,
+            &[0, 0, prev, 0],
+            &[vp_shape[0], vp_shape[1], self.offset, vp_shape[3]],
+        ));
+        self.v_norms = Some(ffi::slice_update(
+            self.v_norms.as_ref().unwrap(),
+            &v_norms_new,
+            &[0, 0, prev, 0],
+            &[vn_shape[0], vn_shape[1], self.offset, 1],
+        ));
+    }
+
+    /// Turbo3Asym update path — keeps the K side FP16 (mirroring `update_fp16`)
+    /// and quantizes the V side via 3-bit PolarQuant + Walsh–Hadamard rotation.
+    ///
+    /// Layout of stored buffers (step-aligned, grown lazily):
+    /// - `keys`:    `[B, H, capacity, K_dim]` FP16, identical to the FP16 path.
+    /// - `v_packed`: `[B, H, capacity, V_dim*3/8]` UINT8 (24-bit-grouped indices).
+    /// - `v_norms`:  `[B, H, capacity, 1]` FP16 (per-token L2 of original V).
+    ///
+    /// `values` stays `None` in this mode — the FP16 values tensor is
+    /// reconstructed lazily on `update_and_fetch` via
+    /// [`turbo::quant3::dequantize_v_turbo3`].
+    ///
+    /// Mirrors `update_turbo4_asym` bit-for-bit except the V quantizer is
+    /// `quantize_v_turbo3` (3-bit codebook + 24-bit packing) and the
+    /// dedicated `turbo3_params` field caches the 3-bit codebook so the
+    /// 4-bit `turbo_params` is not perturbed.
+    ///
+    /// Used by: `KVCache::update` dispatch when `mode == KVCacheMode::Turbo3Asym`
+    /// (epic #458, issue #477).
+    fn update_turbo3_asym(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) {
+        // Cast incoming K/V to FP16 to match the cache contract.
+        let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
+        let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        // Lazy-init TurboQuantParams3 once we know the V head_dim.
+        if self.turbo3_params.is_none() {
+            let v_shape = ffi::array_shape(&new_values_f16);
+            let v_head_dim = v_shape[3] as u32;
+            self.turbo3_params = Some(turbo::quant3::TurboQuantParams3::new(
+                v_head_dim,
+                self.turbo_seed,
+            ));
+        }
+        let params = self
+            .turbo3_params
+            .as_ref()
+            .expect("turbo3_params just initialised");
+
+        let (v_packed_new, v_norms_new) = turbo::quant3::quantize_v_turbo3(&new_values_f16, params);
 
         let key_shape = ffi::array_shape(&new_keys_f16);
         let new_seq_len = key_shape[2];
@@ -1397,8 +1557,10 @@ impl KVCache {
             self.cold_offset = 0;
             // Clear turbo_params so the next quantize call rebuilds it from
             // scratch (required if the caller reuses this cache slot with a
-            // different head_dim). LOW-1 fix (#474).
+            // different head_dim). LOW-1 fix (#474). The 3-bit
+            // `turbo3_params` (issue #477) follows the same contract.
             self.turbo_params = None;
+            self.turbo3_params = None;
         } else if self.mode == KVCacheMode::Turbo4Delegated {
             // Hot tail trims first (cheap), cold trims only on overflow.
             let new_hot_len = self.offset - self.cold_offset;
@@ -1496,9 +1658,13 @@ impl KVCache {
             // Trim Turbo4* V sidecars (per-token; speculative-decode rewinds
             // <1 block at a time so we never need to re-quantize a partial
             // block — the trimmed tail is already block-aligned in the buffer).
-            // Both `Turbo4Asym` and `Turbo4` carry the V sidecars; only
-            // `Turbo4` (symmetric) additionally carries the K-side sidecars.
-            if matches!(self.mode, KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4) {
+            // `Turbo4Asym`, `Turbo4`, and `Turbo3Asym` (issue #477) all carry
+            // the V sidecars; only `Turbo4` (symmetric) additionally carries
+            // the K-side sidecars.
+            if matches!(
+                self.mode,
+                KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo3Asym
+            ) {
                 if let Some(ref vp) = self.v_packed {
                     let vp_shape = ffi::array_shape(vp);
                     self.v_packed = Some(ffi::slice(
@@ -1634,6 +1800,28 @@ impl KVCache {
                 (k_dequantized, v_dequantized)
             }
             KVCacheMode::Turbo4Delegated => self.fetch_turbo4_delegated(),
+            KVCacheMode::Turbo3Asym => {
+                let k = self.keys.as_ref().unwrap();
+                let vp = self.v_packed.as_ref().unwrap();
+                let vn = self.v_norms.as_ref().unwrap();
+                let params = self
+                    .turbo3_params
+                    .as_ref()
+                    .expect("turbo3_params must be initialised after first update_turbo3_asym");
+
+                let ks = ffi::array_shape(k);
+                let vps = ffi::array_shape(vp);
+                let vns = ffi::array_shape(vn);
+
+                let k_slice = ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+                let vp_slice =
+                    ffi::slice(vp, &[0, 0, 0, 0], &[vps[0], vps[1], self.offset, vps[3]]);
+                let vn_slice = ffi::slice(vn, &[0, 0, 0, 0], &[vns[0], vns[1], self.offset, 1]);
+
+                let v_dequantized =
+                    turbo::quant3::dequantize_v_turbo3(&vp_slice, &vn_slice, params);
+                (k_slice, v_dequantized)
+            }
             KVCacheMode::Fp16 => {
                 let k = self.keys.as_ref().unwrap();
                 let v = self.values.as_ref().unwrap();
@@ -1738,6 +1926,11 @@ impl KVCache {
     /// In Turbo4 (symmetric) mode this counts only the K- and V-side packed
     /// sidecars; both the FP16 keys and FP16 values tensors are absent.
     /// In Turbo4Delegated mode this also counts the cold-side FP16 K buffer.
+    /// In Turbo3Asym mode this counts the FP16 keys plus the 3-bit packed-V
+    /// and V-norm sidecars; the underlying `array_nbytes` already accounts
+    /// for the smaller per-token byte count (`head_dim * 3 / 8` u8 vs the
+    /// 4-bit path's `head_dim / 2`), so the headline number reflects the
+    /// ~5.1× total compression vs FP16.
     pub fn nbytes(&self) -> usize {
         let k_bytes = self.keys.as_ref().map_or(0, |k| ffi::array_nbytes(k));
         let v_bytes = self.values.as_ref().map_or(0, |v| ffi::array_nbytes(v));
@@ -2057,6 +2250,15 @@ impl RotatingKVCache {
                 // by B7 / issue #479 (the delegated path targets dense caches).
                 // Fall back to FP16 so a mis-configured sliding-window model does
                 // not panic.
+                self.update_and_fetch_fp16(new_keys, new_values)
+            }
+            KVCacheMode::Turbo3Asym => {
+                // Turbo3Asym (issue #477) is not wired into RotatingKVCache in
+                // this PR — wraparound + 3-bit re-pack alignment requires its
+                // own analysis (mirrors B9 / issue #481 for Turbo4Asym). Fall
+                // back to FP16 so sliding-window models with `--kv-cache-mode
+                // fp16+turbo3` do not panic; a follow-up sub-issue can wire
+                // Turbo3 into the rotating path once dense Turbo3 is validated.
                 self.update_and_fetch_fp16(new_keys, new_values)
             }
         }

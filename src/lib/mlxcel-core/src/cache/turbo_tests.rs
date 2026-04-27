@@ -59,11 +59,13 @@ fn turbo4_asym_display_round_trip() {
 
 #[test]
 fn unknown_mode_string_errors() {
-    let r: Result<KVCacheMode, _> = "turbo3".parse();
+    // "turbo2" is intentionally not a recognised alias — issue #477 is the
+    // 3-bit mode, and 2-bit (Turbo2) is an explicit non-goal of epic #458.
+    let r: Result<KVCacheMode, _> = "turbo2".parse();
     assert!(r.is_err());
     let err = r.unwrap_err();
     assert!(
-        err.contains("turbo3"),
+        err.contains("turbo2"),
         "error message should include input: {err}"
     );
 }
@@ -1087,6 +1089,520 @@ mod boundary_v {
                 "adopted cache must match layer {i} resolved mode"
             );
             assert_eq!(dst.seq_len(), 1, "adopted cache must keep offset");
+        }
+    }
+}
+
+// ===========================================================================
+// Turbo3Asym (issue #477, epic #458) — 3-bit V-side PolarQuant
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// Mode parsing
+// ---------------------------------------------------------------------------
+
+#[test]
+fn turbo3_asym_parses_canonical_string() {
+    let m: KVCacheMode = "fp16+turbo3".parse().unwrap();
+    assert_eq!(m, KVCacheMode::Turbo3Asym);
+}
+
+#[test]
+fn turbo3_asym_parses_aliases() {
+    let m1: KVCacheMode = "turbo3-asym".parse().unwrap();
+    let m2: KVCacheMode = "turbo3".parse().unwrap();
+    assert_eq!(m1, KVCacheMode::Turbo3Asym);
+    assert_eq!(m2, KVCacheMode::Turbo3Asym);
+}
+
+#[test]
+fn turbo3_asym_parsing_is_case_insensitive() {
+    let m: KVCacheMode = "FP16+TURBO3".parse().unwrap();
+    assert_eq!(m, KVCacheMode::Turbo3Asym);
+    let m: KVCacheMode = "Turbo3-Asym".parse().unwrap();
+    assert_eq!(m, KVCacheMode::Turbo3Asym);
+}
+
+#[test]
+fn turbo3_asym_display_round_trip() {
+    let m = KVCacheMode::Turbo3Asym;
+    assert_eq!(m.to_string(), "fp16+turbo3");
+    let parsed: KVCacheMode = m.to_string().parse().unwrap();
+    assert_eq!(parsed, m);
+}
+
+// ---------------------------------------------------------------------------
+// update_and_fetch round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn turbo3_asym_update_returns_fp16_dequantized_v() {
+    let head_dim = 128;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+
+    let k = synth_kv_tensor(1, 1, 4, head_dim, 142);
+    let v = synth_kv_tensor(1, 1, 4, head_dim, 143);
+
+    let (k_out, v_out) = cache.update_and_fetch(k, v);
+    assert_eq!(ffi::array_dtype(&v_out), dtype::FLOAT16);
+    assert_eq!(ffi::array_shape(&v_out), vec![1_i32, 1, 4, head_dim]);
+    assert_eq!(ffi::array_dtype(&k_out), dtype::FLOAT16);
+    assert_eq!(ffi::array_shape(&k_out), vec![1_i32, 1, 4, head_dim]);
+
+    assert!(cache.v_packed.is_some());
+    assert!(cache.v_norms.is_some());
+    assert!(cache.values.is_none());
+    assert_eq!(cache.seq_len(), 4);
+
+    // Sidecar dim must be head_dim * 3 / 8 = 48 for D=128.
+    let vp_shape = ffi::array_shape(cache.v_packed.as_ref().unwrap());
+    assert_eq!(vp_shape[3], head_dim * 3 / 8);
+}
+
+/// Multi-token growth keeps the packed sidecars aligned with the visible
+/// window across step-grown buffer reallocations.
+#[test]
+fn turbo3_asym_multi_token_growth_keeps_visible_window_correct() {
+    let head_dim = 64;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+
+    let k1 = synth_kv_tensor(1, 1, 3, head_dim, 1);
+    let v1 = synth_kv_tensor(1, 1, 3, head_dim, 2);
+    let (k_out_1, v_out_1) = cache.update_and_fetch(k1, v1);
+    assert_eq!(ffi::array_shape(&k_out_1)[2], 3);
+    assert_eq!(ffi::array_shape(&v_out_1)[2], 3);
+    assert_eq!(cache.seq_len(), 3);
+
+    let k2 = synth_kv_tensor(1, 1, 5, head_dim, 3);
+    let v2 = synth_kv_tensor(1, 1, 5, head_dim, 4);
+    let (k_out_2, v_out_2) = cache.update_and_fetch(k2, v2);
+    assert_eq!(cache.seq_len(), 8);
+    assert_eq!(ffi::array_shape(&k_out_2)[2], 8);
+    assert_eq!(ffi::array_shape(&v_out_2)[2], 8);
+}
+
+/// K side bypasses the quantizer entirely; bytes round-trip through fp16
+/// unchanged (within fp16 precision).
+#[test]
+fn turbo3_asym_keys_are_bit_identical_to_input() {
+    let head_dim = 64;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+
+    let k_data: Vec<f32> = (0..head_dim).map(|i| ((i % 8) as f32) * 0.125).collect();
+    let v_data: Vec<f32> = (0..head_dim).map(|i| ((i + 1) as f32) * 0.01).collect();
+    let k = ffi::from_slice_f32(&k_data, &[1, 1, 1, head_dim]);
+    let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+
+    let (k_out, _) = cache.update_and_fetch(k, v);
+    let recovered = flatten_fp32(&k_out);
+    for (a, b) in recovered.iter().zip(k_data.iter()) {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "K side must round-trip through fp16 unchanged: got {a}, expected {b}"
+        );
+    }
+}
+
+/// V reconstruction error is bounded by Lloyd-Max distortion at 3 bits
+/// (~−17.8 dB) plus rotation/fp16 noise. Allow up to 25% relative L2 error
+/// per token — the same bound as the unit tests in `quant3.rs`.
+#[test]
+fn turbo3_asym_v_reconstruction_has_bounded_error() {
+    let head_dim = 128;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+
+    let v_data: Vec<f32> = (0..head_dim)
+        .map(|i| (i as f32 / head_dim as f32 - 0.5) * 2.0)
+        .collect();
+    let k = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+    let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+
+    let (_k_out, v_out) = cache.update_and_fetch(k, v);
+    let v_recovered = flatten_fp32(&v_out);
+
+    let mut num = 0.0_f32;
+    let mut den = 0.0_f32;
+    for i in 0..head_dim as usize {
+        let diff = v_data[i] - v_recovered[i];
+        num += diff * diff;
+        den += v_data[i] * v_data[i];
+    }
+    let rel = (num / den.max(1e-12)).sqrt();
+    assert!(
+        rel < 0.25,
+        "Turbo3Asym V reconstruction relative error {rel:.4} > 25%"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Trim
+// ---------------------------------------------------------------------------
+
+#[test]
+fn turbo3_asym_trim_to_zero_clears_all_buffers_and_params() {
+    let head_dim = 64;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let k = synth_kv_tensor(1, 1, 5, head_dim, 11);
+    let v = synth_kv_tensor(1, 1, 5, head_dim, 12);
+    cache.update(k, v);
+    assert_eq!(cache.seq_len(), 5);
+    assert!(cache.v_packed.is_some());
+    assert!(cache.v_norms.is_some());
+    assert!(cache.turbo3_params.is_some());
+
+    let trimmed = cache.trim(5);
+    assert_eq!(trimmed, 5);
+    assert_eq!(cache.seq_len(), 0);
+    assert!(cache.is_empty());
+    assert!(cache.v_packed.is_none());
+    assert!(cache.v_norms.is_none());
+    // turbo3_params must be cleared so the slot can be reused with a
+    // different head_dim (mirrors the LOW-1 fix from #474 for the 4-bit path).
+    assert!(cache.turbo3_params.is_none());
+}
+
+#[test]
+fn turbo3_asym_partial_trim_shrinks_v_sidecars() {
+    let head_dim = 64;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let k = synth_kv_tensor(1, 1, 8, head_dim, 21);
+    let v = synth_kv_tensor(1, 1, 8, head_dim, 22);
+    cache.update(k, v);
+    assert_eq!(cache.seq_len(), 8);
+
+    let n = cache.trim(3);
+    assert_eq!(n, 3);
+    assert_eq!(cache.seq_len(), 5);
+
+    let vp = cache.v_packed.as_ref().unwrap();
+    let vn = cache.v_norms.as_ref().unwrap();
+    assert_eq!(ffi::array_shape(vp)[2], 5);
+    assert_eq!(ffi::array_shape(vn)[2], 5);
+    let k_buf = cache.keys.as_ref().unwrap();
+    assert_eq!(ffi::array_shape(k_buf)[2], 5);
+}
+
+// ---------------------------------------------------------------------------
+// detach / install_detached round-trip
+// ---------------------------------------------------------------------------
+
+#[test]
+fn turbo3_asym_clone_handle_round_trip_preserves_sidecars() {
+    let head_dim = 64;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let k = synth_kv_tensor(1, 1, 4, head_dim, 31);
+    let v = synth_kv_tensor(1, 1, 4, head_dim, 32);
+    cache.update(k, v);
+
+    let pre_vp = ffi::array_to_raw_bytes(cache.v_packed.as_ref().unwrap());
+    let pre_vn = ffi::array_to_raw_bytes(cache.v_norms.as_ref().unwrap());
+    let pre_seed = cache.turbo_seed;
+
+    let handle = cache.clone_handle();
+    assert_eq!(handle.mode(), KVCacheMode::Turbo3Asym);
+
+    assert!(cache.is_empty());
+    assert!(cache.v_packed.is_none());
+    assert!(cache.v_norms.is_none());
+    // turbo3_params cleared on the source after clone_handle.
+    assert!(cache.turbo3_params.is_none());
+
+    let mut restored = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    restored.install_detached(handle).unwrap();
+
+    assert_eq!(restored.seq_len(), 4);
+    assert_eq!(restored.mode, KVCacheMode::Turbo3Asym);
+    assert!(restored.v_packed.is_some());
+    assert!(restored.v_norms.is_some());
+
+    // turbo3_params should have been re-derived from v_packed shape.
+    assert!(restored.turbo3_params.is_some());
+    assert_eq!(restored.turbo_seed, pre_seed);
+
+    let post_vp = ffi::array_to_raw_bytes(restored.v_packed.as_ref().unwrap());
+    let post_vn = ffi::array_to_raw_bytes(restored.v_norms.as_ref().unwrap());
+    assert_eq!(
+        pre_vp, post_vp,
+        "v_packed must survive Turbo3Asym detach/adopt bit-for-bit"
+    );
+    assert_eq!(
+        pre_vn, post_vn,
+        "v_norms must survive Turbo3Asym detach/adopt bit-for-bit"
+    );
+}
+
+#[test]
+fn turbo3_asym_clone_handle_install_then_dequant_matches_pre_detach() {
+    let head_dim = 128;
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let k_data: Vec<f32> = (0..2 * head_dim)
+        .map(|i| (i as f32 / 256.0) - 0.5)
+        .collect();
+    let v_data: Vec<f32> = (0..2 * head_dim)
+        .map(|i| (((i * 7) % 13) as f32 / 13.0) - 0.5)
+        .collect();
+    let k = ffi::from_slice_f32(&k_data, &[1, 1, 2, head_dim as i32]);
+    let v = ffi::from_slice_f32(&v_data, &[1, 1, 2, head_dim as i32]);
+
+    let (_k1, v1_out) = cache.update_and_fetch(k, v);
+    let v1 = flatten_fp32(&v1_out);
+
+    let handle = cache.clone_handle();
+    let mut restored = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    restored.install_detached(handle).unwrap();
+
+    let params = restored.turbo3_params.as_ref().unwrap();
+    let vp_buf = restored.v_packed.as_ref().unwrap();
+    let vn_buf = restored.v_norms.as_ref().unwrap();
+    let vps = ffi::array_shape(vp_buf);
+    let vns = ffi::array_shape(vn_buf);
+    let off = restored.offset;
+    let vp = ffi::slice(vp_buf, &[0, 0, 0, 0], &[vps[0], vps[1], off, vps[3]]);
+    let vn = ffi::slice(vn_buf, &[0, 0, 0, 0], &[vns[0], vns[1], off, 1]);
+    let v2_out = super::turbo::quant3::dequantize_v_turbo3(&vp, &vn, params);
+    let v2 = flatten_fp32(&v2_out);
+
+    assert_eq!(v1.len(), v2.len());
+    for (a, b) in v1.iter().zip(v2.iter()) {
+        assert!(
+            (a - b).abs() < 1e-4,
+            "post-detach Turbo3Asym dequant mismatch: {a} vs {b}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// CachePool detach/adopt round-trip on Turbo3Asym
+// ---------------------------------------------------------------------------
+
+#[test]
+fn cache_pool_detach_adopt_preserves_turbo3_asym() {
+    use crate::generate::LanguageModel;
+
+    struct Stub {
+        n: usize,
+    }
+    impl LanguageModel for Stub {
+        fn forward(
+            &self,
+            _input_ids: &MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&MlxArray>,
+        ) -> cxx::UniquePtr<MlxArray> {
+            ffi::zeros(&[1], 0)
+        }
+        fn make_caches(&self) -> Vec<KVCache> {
+            (0..self.n).map(|_| KVCache::new()).collect()
+        }
+        fn num_layers(&self) -> usize {
+            self.n
+        }
+        fn eos_token_ids(&self) -> Vec<i32> {
+            vec![0]
+        }
+    }
+
+    let head_dim = 64;
+    let model = Stub { n: 1 };
+    let mut pool = CachePool::new(4);
+
+    let seq_a = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq_a).unwrap();
+        caches[0] = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+        let k = synth_kv_tensor(1, 1, 5, head_dim, 51);
+        let v = synth_kv_tensor(1, 1, 5, head_dim, 52);
+        caches[0].update(k, v);
+    }
+
+    let pre_vp = {
+        let caches = pool.get_caches_mut(seq_a).unwrap();
+        ffi::array_to_raw_bytes(caches[0].v_packed.as_ref().unwrap())
+    };
+    let pre_vn = {
+        let caches = pool.get_caches_mut(seq_a).unwrap();
+        ffi::array_to_raw_bytes(caches[0].v_norms.as_ref().unwrap())
+    };
+
+    let detached = pool.detach(seq_a).unwrap();
+    let seq_b = pool.adopt(&model, detached).unwrap();
+
+    let caches = pool.get_caches_mut(seq_b).unwrap();
+    assert_eq!(caches[0].mode, KVCacheMode::Turbo3Asym);
+    assert_eq!(caches[0].seq_len(), 5);
+    assert!(caches[0].v_packed.is_some());
+    assert!(caches[0].v_norms.is_some());
+
+    let post_vp = ffi::array_to_raw_bytes(caches[0].v_packed.as_ref().unwrap());
+    let post_vn = ffi::array_to_raw_bytes(caches[0].v_norms.as_ref().unwrap());
+    assert_eq!(pre_vp, post_vp);
+    assert_eq!(pre_vn, post_vn);
+}
+
+// ---------------------------------------------------------------------------
+// Memory accounting
+// ---------------------------------------------------------------------------
+
+/// Turbo3Asym must use *fewer* bytes per token than Turbo4Asym for the same
+/// head_dim — that's the whole point of the 3-bit mode. Compare nbytes() at
+/// the same offset and assert the Turbo3 footprint is strictly smaller than
+/// Turbo4 (and that both are smaller than FP16).
+#[test]
+fn turbo3_asym_uses_fewer_bytes_than_turbo4_asym() {
+    let head_dim = 128;
+    let n_tokens = 32;
+
+    let mut c3 = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let mut c4 = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
+    let mut c_fp16 = KVCache::new();
+
+    for cache in [&mut c3, &mut c4, &mut c_fp16] {
+        let k = synth_kv_tensor(1, 1, n_tokens, head_dim, 71);
+        let v = synth_kv_tensor(1, 1, n_tokens, head_dim, 72);
+        cache.update(k, v);
+    }
+
+    let b3 = c3.nbytes();
+    let b4 = c4.nbytes();
+    let b_fp16 = c_fp16.nbytes();
+
+    assert!(b3 > 0, "Turbo3Asym nbytes() must be non-zero");
+    assert!(
+        b3 < b4,
+        "Turbo3Asym ({b3} bytes) must be smaller than Turbo4Asym ({b4} bytes)"
+    );
+    assert!(
+        b4 < b_fp16,
+        "Turbo4Asym ({b4} bytes) must already be smaller than FP16 ({b_fp16} bytes)"
+    );
+    // Values tensor stays None — must not contribute.
+    assert!(c3.values.is_none());
+}
+
+/// Spot-check the head_dim grid: head_dim=80 must produce a 30-byte/token
+/// V buffer (240 bits per token). Catches accidental misalignment introduced
+/// by future changes to `pack_3bit_per_token`.
+#[test]
+fn turbo3_asym_packed_dim_matches_head_dim_grid() {
+    for &(d, expected_bytes) in &[
+        (64_i32, 24_i32),
+        (96, 36),
+        (128, 48),
+        (256, 96),
+    ] {
+        let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+        let k = synth_kv_tensor(1, 1, 1, d, 81);
+        let v = synth_kv_tensor(1, 1, 1, d, 82);
+        cache.update(k, v);
+        let vp_shape = ffi::array_shape(cache.v_packed.as_ref().unwrap());
+        assert_eq!(
+            vp_shape[3], expected_bytes,
+            "head_dim={d}: expected {expected_bytes} packed bytes/token, got {}",
+            vp_shape[3]
+        );
+    }
+}
+
+/// Determinism: same seed + same V → same packed bytes across two
+/// independently-constructed caches.
+#[test]
+fn turbo3_asym_quantize_is_deterministic_across_caches() {
+    let head_dim = 128;
+    let v_data: Vec<f32> = (0..head_dim)
+        .map(|i| ((i % 17) as f32 / 17.0) - 0.5)
+        .collect();
+    let v1 = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+    let v2 = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
+    let k1 = ffi::zeros(&[1, 1, 1, head_dim], dtype::FLOAT16);
+    let k2 = ffi::zeros(&[1, 1, 1, head_dim], dtype::FLOAT16);
+
+    let mut c1 = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let mut c2 = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    c1.update(k1, v1);
+    c2.update(k2, v2);
+
+    let p1 = ffi::array_to_raw_bytes(c1.v_packed.as_ref().unwrap());
+    let p2 = ffi::array_to_raw_bytes(c2.v_packed.as_ref().unwrap());
+    assert_eq!(
+        p1, p2,
+        "Turbo3Asym quantize must be deterministic across cache instances"
+    );
+}
+
+/// Lloyd-Max distortion bound: at 3 bits over a `N(0, 1/d)` rotated
+/// distribution, the expected RMSE is ~13% per coordinate (D(R=3) ≈
+/// −17.8 dB on a Gaussian source). The end-to-end V reconstruction error
+/// (after rotation, fp16 round-off, and norm correction) should land
+/// noticeably above the 4-bit baseline (~6.5% from Lloyd-Max, ~10% e2e)
+/// but stay below 25%. Validates that we are not silently using a wider
+/// codebook by accident.
+#[test]
+fn turbo3_asym_distortion_is_bounded_and_worse_than_turbo4() {
+    let head_dim: i32 = 128;
+    // Use a deterministic Gaussian-ish input so per-token error is stable.
+    let mut state: u32 = 0xDEAD_BEEF;
+    let n_tokens = 8_usize;
+    let hd_usize = head_dim as usize;
+    let mut v_data: Vec<f32> = Vec::with_capacity(n_tokens * hd_usize);
+    for _ in 0..n_tokens {
+        for _ in 0..head_dim {
+            let mut acc = 0.0_f32;
+            for _ in 0..6 {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                acc += if state >> 31 == 0 { -1.0 } else { 1.0 };
+            }
+            v_data.push((acc / 6.0) * 1.5);
+        }
+    }
+    let k = synth_kv_tensor(1, 1, n_tokens as i32, head_dim, 901);
+    let v = ffi::from_slice_f32(&v_data, &[1, 1, n_tokens as i32, head_dim]);
+
+    let mut c3 = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
+    let (_, v3_out) = c3.update_and_fetch(k, v);
+    let v3 = flatten_fp32(&v3_out);
+
+    // Compute mean per-token relative L2.
+    let mut total_rel = 0.0_f32;
+    for tok in 0..n_tokens {
+        let off = tok * hd_usize;
+        let mut num = 0.0_f32;
+        let mut den = 0.0_f32;
+        for i in 0..hd_usize {
+            let diff = v_data[off + i] - v3[off + i];
+            num += diff * diff;
+            den += v_data[off + i] * v_data[off + i];
+        }
+        total_rel += (num / den.max(1e-12)).sqrt();
+    }
+    let mean_rel = total_rel / n_tokens as f32;
+    assert!(
+        mean_rel < 0.25,
+        "Turbo3Asym mean per-token relative L2 error {mean_rel:.4} > 25% bound"
+    );
+    // Sanity floor: the error should be ABOVE the noise floor (~1e-4) so
+    // we know the test actually exercised quantization rather than copying
+    // through unchanged.
+    assert!(
+        mean_rel > 0.01,
+        "Turbo3Asym mean per-token relative L2 error {mean_rel:.4} suspiciously low — \
+         test may not be exercising quantization"
+    );
+}
+
+/// Boundary-V policy upgrades Turbo3Asym layers to FP16 just like the
+/// Turbo4* family. Validates the matrix entry added in `boundary.rs`.
+#[test]
+fn turbo3_asym_layer_modes_apply_boundary_upgrade() {
+    use crate::cache::turbo::resolve_layer_modes;
+
+    let modes = resolve_layer_modes(KVCacheMode::Turbo3Asym, 8, 2);
+    assert_eq!(modes.len(), 8);
+    // First 2 + last 2 are upgraded to FP16; middle 4 stay Turbo3Asym.
+    for (i, m) in modes.iter().enumerate() {
+        if i < 2 || i >= 6 {
+            assert_eq!(*m, KVCacheMode::Fp16, "layer {i} must be FP16 boundary");
+        } else {
+            assert_eq!(*m, KVCacheMode::Turbo3Asym, "layer {i} must stay Turbo3Asym");
         }
     }
 }

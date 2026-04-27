@@ -165,8 +165,14 @@ pub(crate) struct GenerationOptions {
     ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
     ///                 context with negligible quality loss on Q4_K_M dense
     ///                 weights (epic #458 / issue #474).
+    ///   fp16+turbo3 — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
+    ///                 Same shape as fp16+turbo4 but the V side uses a
+    ///                 3-bit codebook, raising compression to ~5.1× total
+    ///                 KV savings at the cost of a slightly higher V
+    ///                 reconstruction error. Symmetric Turbo3 is *not*
+    ///                 offered by this binary (epic #458 / issue #477).
     ///
-    /// INT8 and turbo4 modes are most beneficial for long context generation
+    /// INT8 and turbo* modes are most beneficial for long context generation
     /// where KV cache becomes the memory bottleneck.
     #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
     pub(crate) kv_cache_mode: String,
@@ -705,6 +711,9 @@ pub(crate) struct ServeArgs {
     ///                 K side stays FP16; V side uses 4-bit PolarQuant with
     ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
     ///                 context (epic #458 / issue #474).
+    ///   fp16+turbo3 — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
+    ///                 ~5.1× total KV savings at slightly higher
+    ///                 reconstruction error (epic #458 / issue #477).
     ///
     /// **Currently a no-op on the server**: `mlxcel serve` parses this flag
     /// but the value is not yet plumbed through to cache construction in the

@@ -94,6 +94,10 @@ use super::{
 /// (`cold_keys`), the cold/hot split (`cold_offset`), and the configured
 /// hot-tail fold threshold so the adopted cache resumes decoding from the
 /// same hot/cold boundary it left at detach time (issue #479).
+/// Turbo3Asym-mode caches use the same `(keys, v_packed, v_norms)` triple
+/// as `Turbo4Asym` but the V buffer carries the 24-bit-grouped 3-bit indices
+/// (issue #477). The `mode` field on the handle preserves the bit-width
+/// distinction so adopt rebuilds the right `TurboQuantParams3` instance.
 pub struct DetachedKVCache {
     pub(super) keys: Option<UniquePtr<MlxArray>>,
     pub(super) values: Option<UniquePtr<MlxArray>>,
@@ -256,8 +260,10 @@ impl KVCache {
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
-        // head_dim after detach). LOW-1 fix (#474).
+        // head_dim after detach). LOW-1 fix (#474). The 3-bit
+        // `turbo3_params` (issue #477) follows the same contract.
         self.turbo_params = None;
+        self.turbo3_params = None;
         handle
     }
 
@@ -306,6 +312,22 @@ impl KVCache {
                 if shape.len() == 4 && shape[3] > 0 {
                     let head_dim = (shape[3] as u32) * 2;
                     self.turbo_params = Some(super::turbo::TurboQuantParams::new(
+                        head_dim,
+                        self.turbo_seed,
+                    ));
+                }
+            }
+        }
+        // Turbo3Asym (issue #477): rebuild the 3-bit params from v_packed
+        // shape. Inverse of `head_dim * 3 / 8`: head_dim = packed_dim * 8 / 3.
+        // Mirrors the Turbo4 prebuild above so dequantize-only consumers see
+        // a ready-to-go cache after install.
+        if self.mode == KVCacheMode::Turbo3Asym {
+            if let Some(p) = self.v_packed.as_ref() {
+                let shape = ffi::array_shape(p);
+                if shape.len() == 4 && shape[3] > 0 {
+                    let head_dim = (shape[3] as u32) * 8 / 3;
+                    self.turbo3_params = Some(super::turbo::quant3::TurboQuantParams3::new(
                         head_dim,
                         self.turbo_seed,
                     ));

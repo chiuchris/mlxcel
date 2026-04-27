@@ -164,7 +164,8 @@ pub fn boundary_mode_for(nominal: KVCacheMode) -> KVCacheMode {
     match nominal {
         KVCacheMode::Turbo4Asym
         | KVCacheMode::Turbo4
-        | KVCacheMode::Turbo4Delegated => KVCacheMode::Fp16,
+        | KVCacheMode::Turbo4Delegated
+        | KVCacheMode::Turbo3Asym => KVCacheMode::Fp16,
         // Non-turbo modes have no boundary upgrade path — return the
         // nominal mode unchanged.
         KVCacheMode::Fp16 | KVCacheMode::Int8 => nominal,
