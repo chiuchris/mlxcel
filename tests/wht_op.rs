@@ -26,9 +26,9 @@
 //! Runs unconditionally: no model weights or external network needed.
 
 use mlxcel_core::{
-    self, allclose, array_dtype, array_shape, astype, dtype, eval, from_slice_f32, item_bool,
-    item_f32, mean_all, multiply, random_key, random_normal, square, subtract, sum_all, wht,
-    MlxArray, UniquePtr,
+    self, MlxArray, UniquePtr, allclose, array_dtype, array_shape, astype, dtype, eval,
+    from_slice_f32, item_bool, item_f32, mean_all, multiply, random_key, random_normal, square,
+    subtract, sum_all, wht,
 };
 
 /// Shape `[B, H, T, head_dim]` is what the cache-compression call site will

@@ -543,10 +543,7 @@ struct ServerArgs {
     /// `int8`, `turbo4-asym`, `turbo4`, `turbo4-delegated`.  When
     /// `--cache-type-k` or `--cache-type-v` are also supplied, the split
     /// flags win and this flag is ignored (with a warning).
-    #[arg(
-        long = "kv-cache-mode",
-        value_name = "MODE"
-    )]
+    #[arg(long = "kv-cache-mode", value_name = "MODE")]
     kv_cache_mode: Option<String>,
 
     // llama-server compatibility arguments (accepted but ignored).

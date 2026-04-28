@@ -451,7 +451,7 @@ mod tests {
         ffi::eval(&v_hat_f32);
         let bytes = ffi::array_to_raw_bytes(&v_hat_f32);
         for chunk in bytes.chunks_exact(4) {
-            let val = f32::from_le_bytes([c0(chunk)]);
+            let val = f32::from_le_bytes(c0(chunk));
             assert!(val.abs() < 1e-3, "expected ~0, got {val}");
         }
     }

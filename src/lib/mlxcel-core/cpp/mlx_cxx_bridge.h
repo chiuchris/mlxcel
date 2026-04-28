@@ -1541,6 +1541,19 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     bool use_metal4
 );
 
+// Issue #505 — Fused Sparse-V SDPA Metal kernel launcher.
+// Wraps `mlxcel::turbo::sparse_v_weighted_sum` so the cxx bridge can expose it
+// via the `turbo_sparse_v_weighted_sum` FFI symbol. Implementation lives in
+// `src/lib/mlx-cpp/turbo/sparse_v_sdpa.cpp`.
+std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
+    const MlxArray& attn_weights,
+    const MlxArray& v_packed,
+    const MlxArray& v_norms,
+    const MlxArray& codebook,
+    int32_t dim,
+    int32_t n_rep,
+    float threshold);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

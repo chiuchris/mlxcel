@@ -135,13 +135,24 @@ impl Attention {
         q = mlxcel_core::fast_rope(&q, self.rope_dims, false, self.rope_base, 1.0, offset);
         k = mlxcel_core::fast_rope(&k, self.rope_dims, false, self.rope_base, 1.0, offset);
 
-        // Update KV cache and get sliced views
-        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
-
-        // Scaled dot-product attention
-        let attn_out = if l > 1 && mask.is_none() {
+        // Issue #505: Try the fused sparse-V SDPA path for the decode case
+        // (l == 1) when the cache is in a Turbo4Asym/Turbo4Delegated mode
+        // and `MLXCEL_SPARSE_V_THRESHOLD > 0`. Skipped on prefill (l > 1)
+        // because the per-token skip only wins at long context — and
+        // prefill builds the cache from scratch, so there's nothing to
+        // skip yet.
+        let attn_out = if l == 1 && cache.sparse_v_available() {
+            // The helper consumes k/v, fills the packed cache, and runs
+            // the fused kernel (or graph fallback). When `sparse_v_available`
+            // is true the helper always returns Some.
+            cache
+                .update_and_sparse_v_attention(&q, k, v, self.scale, mask)
+                .expect("update_and_sparse_v_attention returned None despite sparse_v_available")
+        } else if l > 1 && mask.is_none() {
+            let (cache_k, cache_v) = cache.update_and_fetch(k, v);
             mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)
         } else {
+            let (cache_k, cache_v) = cache.update_and_fetch(k, v);
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(

@@ -1946,6 +1946,42 @@ mod ffi {
         fn quantize_weights_biases(w: &MlxArray, group_size: i32, bits: i32)
             -> UniquePtr<MlxArray>;
 
+        // -------------------------------------------------------------------
+        // Issue #505 — Fused Sparse-V SDPA Metal kernel.
+        // -------------------------------------------------------------------
+        /// Fused-skip Sparse-V weighted sum (Turbo4Asym KV cache, issue #505).
+        ///
+        /// Runs a Metal kernel that computes
+        ///   `out[b, h, q, d] = Σ_t attn_weights[b, h, q, t] * V_dq[b, h, t, d]`
+        /// while *skipping per-thread* the inner-loop work for tokens whose
+        /// attention weight ≤ `threshold`. The output is *unrotated* — the
+        /// caller must apply the inverse `signs1 · WHT · signs2` Turbo4
+        /// rotation to produce the final FP16 attention output.
+        ///
+        /// Inputs (caller must pre-flatten):
+        /// - `attn_weights`: `[B*Hq, Tq, Tk]` FP32 — post-softmax weights.
+        /// - `v_packed`:     `[B*Hkv, Tk, D/2]` UINT8 — nibble-packed indices.
+        /// - `v_norms`:      `[B*Hkv, Tk]` FP16 — per-token V L2 norms.
+        /// - `codebook`:     `[16]` FP32 — Lloyd-Max centroids.
+        /// - `dim`: head dimension `D`.
+        /// - `n_rep`: `Hq / Hkv` (1 for non-grouped attention).
+        /// - `threshold`: alive cutoff. `0.0` disables skipping.
+        ///
+        /// Output: `[B*Hq, Tq, D]` FP32.
+        ///
+        /// Metal-only — fails to link on non-macOS targets. Callers are
+        /// expected to gate via `KVCache::sparse_v_attention`, which only
+        /// dispatches when on macOS + Turbo4Asym + threshold > 0.
+        fn turbo_sparse_v_weighted_sum(
+            attn_weights: &MlxArray,
+            v_packed: &MlxArray,
+            v_norms: &MlxArray,
+            codebook: &MlxArray,
+            dim: i32,
+            n_rep: i32,
+            threshold: f32,
+        ) -> UniquePtr<MlxArray>;
+
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()
         type MlxLoadedWeights;

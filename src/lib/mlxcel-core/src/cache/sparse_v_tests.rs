@@ -355,6 +355,21 @@ fn sparse_v_available_returns_false_for_int8_mode() {
 }
 
 #[test]
+fn sparse_v_available_returns_false_for_turbo4_delegated() {
+    // Turbo4Delegated splits the visible token range across cold-packed V
+    // and hot-FP16 V. The current `sparse_v_attention` dispatcher only
+    // handles a contiguous `0..self.offset` range, so delegated mode must
+    // report `sparse_v_available == false` until the hot+cold composition
+    // pass lands. Regression guard for issue #505 narrowing.
+    let _guard = SparseVThresholdGuard::set("1e-6");
+    let cache = super::KVCache::new_with_mode(super::KVCacheMode::Turbo4Delegated);
+    assert!(
+        !cache.sparse_v_available(),
+        "Turbo4Delegated must opt out of sparse-V until hot+cold composition lands"
+    );
+}
+
+#[test]
 fn sparse_v_attention_via_cache_matches_full_dequant_at_threshold_zero() {
     // End-to-end: build a Turbo4Asym cache, push K/V through, then call
     // `cache.sparse_v_attention` and compare with the full-dequant
@@ -384,14 +399,37 @@ fn sparse_v_attention_via_cache_matches_full_dequant_at_threshold_zero() {
     let q = ffi::astype(&synth_tensor(&[b, hq, 1, head_dim], 55), dtype::FLOAT16);
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
 
+    // The raw `v_packed`/`v_norms` accessors return the full pre-allocated
+    // buffer, including capacity beyond `self.offset`. `k_cached` from
+    // `update_and_fetch` is already sliced to the visible range, so we must
+    // slice the V sidecars to match — otherwise the matmul `attn @ V`
+    // mismatches Tk on the two sides. `KVCache::sparse_v_attention` does the
+    // same slicing internally; here we mirror it because the test calls the
+    // standalone `attention_sparse_v_turbo4` to control the threshold
+    // explicitly.
+    let v_packed_full = cache.v_packed().unwrap();
+    let v_norms_full = cache.v_norms().unwrap();
+    let vp_shape = ffi::array_shape(v_packed_full);
+    let vn_shape = ffi::array_shape(v_norms_full);
+    let v_packed_visible = ffi::slice(
+        v_packed_full,
+        &[0, 0, 0, 0],
+        &[vp_shape[0], vp_shape[1], tk, vp_shape[3]],
+    );
+    let v_norms_visible = ffi::slice(
+        v_norms_full,
+        &[0, 0, 0, 0],
+        &[vn_shape[0], vn_shape[1], tk, 1],
+    );
+
     // Use the explicit-zero entry point so the test does not depend on the
     // env-var-cached threshold (which the OnceLock may have fixed earlier
     // in the test binary's life).
     let sparse_zero = sparse_v::attention_sparse_v_turbo4(
         &q,
         &k_cached,
-        cache.v_packed().unwrap(),
-        cache.v_norms().unwrap(),
+        &v_packed_visible,
+        &v_norms_visible,
         cache.turbo_params().unwrap(),
         scale,
         None,
@@ -400,8 +438,8 @@ fn sparse_v_attention_via_cache_matches_full_dequant_at_threshold_zero() {
     let full = full_dequant_attention(
         &q,
         &k_cached,
-        cache.v_packed().unwrap(),
-        cache.v_norms().unwrap(),
+        &v_packed_visible,
+        &v_norms_visible,
         cache.turbo_params().unwrap(),
         scale,
     );
@@ -493,4 +531,120 @@ fn sparse_v_attention_threshold_default_keeps_quality() {
         rms < 5e-3,
         "sparse-V (threshold=1e-6) vs full-dequant RMS = {rms}; expected < 5e-3"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Issue #505 — fused Metal kernel correctness equivalence
+// ---------------------------------------------------------------------------
+
+/// Kernel-vs-graph numerical equivalence at threshold=0.
+///
+/// The fused Metal kernel must produce output within FP16 round-off of the
+/// graph-level reference path when no skipping is active. Larger thresholds
+/// are tested implicitly by the existing `sparse_v_attention_threshold_*`
+/// tests because the kernel path is preferred when it is enabled.
+#[cfg(target_os = "macos")]
+#[test]
+fn sparse_v_kernel_threshold_zero_matches_graph() {
+    let head_dim: i32 = 64; // power-of-2; the kernel only supports those.
+    let b: i32 = 1;
+    let hq: i32 = 2;
+    let hkv: i32 = 2;
+    let tq: i32 = 1; // decode-shape: kernel hot path
+    let tk: i32 = 16;
+
+    let q = ffi::astype(&synth_tensor(&[b, hq, tq, head_dim], 1500), dtype::FLOAT16);
+    let k = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 1600), dtype::FLOAT16);
+    let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 1700), dtype::FLOAT16);
+
+    let params = TurboQuantParams::new(head_dim as u32, 0xFEED_C0DE);
+    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let kernel_out = sparse_v::attention_sparse_v_turbo4_fused(
+        &q, &k, &v_packed, &v_norms, &params, scale, None, /*threshold=*/ 0.0,
+    );
+    let kernel_out = kernel_out.expect(
+        "fused kernel returned None on macOS — the kernel_enabled() gate or \
+         power-of-2 head_dim check rejected an input that should be valid",
+    );
+    let graph_out = sparse_v::attention_sparse_v_turbo4(
+        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
+    );
+
+    let rms = rms_diff(&flatten_fp32(&kernel_out), &flatten_fp32(&graph_out));
+    // FP32 → FP16 round-trips through the codebook lookup + WHT can shift
+    // each element by ~2^-10 ≈ 1e-3 in worst case; 5e-3 RMS is the
+    // documented FP16 tolerance for sparse-V correctness gates.
+    assert!(
+        rms < 5e-3,
+        "kernel vs graph RMS = {rms}; expected < 5e-3 (FP16 round-off bound)"
+    );
+}
+
+/// Kernel-vs-graph numerical equivalence with grouped attention (n_rep > 1).
+///
+/// The kernel handles `Hq / Hkv = NRep` via a template parameter; this test
+/// covers the `NRep = 2` case (Llama 3.1 8B uses NRep = 4 in practice; the
+/// test uses 2 to keep the synthesized cache small).
+#[cfg(target_os = "macos")]
+#[test]
+fn sparse_v_kernel_grouped_matches_graph() {
+    let head_dim: i32 = 64;
+    let b: i32 = 1;
+    let hq: i32 = 4;
+    let hkv: i32 = 2;
+    let tq: i32 = 1;
+    let tk: i32 = 8;
+
+    let q = ffi::astype(&synth_tensor(&[b, hq, tq, head_dim], 1800), dtype::FLOAT16);
+    let k = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 1900), dtype::FLOAT16);
+    let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 2000), dtype::FLOAT16);
+
+    let params = TurboQuantParams::new(head_dim as u32, 0xC0DE_BABE);
+    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+
+    let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    let kernel_out = sparse_v::attention_sparse_v_turbo4_fused(
+        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
+    );
+    let kernel_out = kernel_out.expect("kernel returned None on grouped attention case");
+    let graph_out = sparse_v::attention_sparse_v_turbo4(
+        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
+    );
+    let rms = rms_diff(&flatten_fp32(&kernel_out), &flatten_fp32(&graph_out));
+    assert!(
+        rms < 5e-3,
+        "kernel grouped vs graph RMS = {rms}; expected < 5e-3"
+    );
+}
+
+// NOTE: A `sparse_v_kernel_rejects_non_power_of_two_head_dim` test was
+// considered but is unreachable: `TurboQuantParams::new` (cache/turbo/quant.rs)
+// asserts `head_dim.is_power_of_two()` and panics before any caller can
+// reach `attention_sparse_v_turbo4_fused`. The kernel function keeps a
+// defensive `is_power_of_two()` check anyway so a future caller that
+// constructs params some other way still falls through to the graph path,
+// but the contract is enforced upstream and there is no legitimate way to
+// observe the kernel-side rejection from a test.
+
+/// Kernel-enable gate sanity. On macOS the default is on; on other targets
+/// it is off regardless of the env var.
+#[test]
+fn sparse_v_kernel_enabled_default_macos() {
+    let enabled = sparse_v::kernel_enabled();
+    if cfg!(target_os = "macos") {
+        // Default to ON unless explicitly disabled via env var.
+        let env = std::env::var(sparse_v::KERNEL_ENV_VAR).ok();
+        match env.as_deref() {
+            Some("0") | Some("false") | Some("off") | Some("no") => {
+                assert!(!enabled, "expected kernel disabled when env says false");
+            }
+            _ => {
+                assert!(enabled, "expected kernel enabled by default on macOS");
+            }
+        }
+    } else {
+        assert!(!enabled, "kernel must be off on non-macOS targets");
+    }
 }

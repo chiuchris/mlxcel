@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Sparse-V dequant — attention-gated V-side dequantization (B8, issue #480,
-//! epic #458).
+//! Sparse-V dequant — attention-gated V-side dequantization (issues #498,
+//! #505, epic #458).
 //!
 //! At long context the post-softmax attention distribution is sparse: most
 //! KV positions receive a near-zero attention weight. The TurboQuant+ paper
@@ -22,41 +22,24 @@
 //! Skipping them on a fused Metal kernel yields `+22.8 %` decode at 32 K
 //! with no measurable PPL change.
 //!
-//! This Rust module is the **graph-level scaffolding** for that
-//! optimization. Path (a) — a fused Metal kernel that does
-//! `(scores → softmax → mask → on-demand V dequant → weighted sum)` in one
-//! pass — is the production speed path the paper validates and is **out of
-//! scope for this PR**: it requires Metal sources under `src/lib/mlx-cpp/`
-//! and a MLX upstream kernel addition. See "Limitations" below.
+//! This module provides two execution paths for the sparse-V optimization:
 //!
-//! What this module ships:
+//! 1. **Graph-level reference path** (issue #498, [`attention_sparse_v_turbo4`]).
+//!    Computes attention scores, builds an alive mask, dequantizes V in full,
+//!    zeros dead rows, then runs `attn @ V_masked`. The V dequant kernel still
+//!    runs over the complete `[B, H, T, D]` tensor — this path is
+//!    correctness-only and does not deliver the `+22.8 %` throughput benefit.
+//! 2. **Fused Metal kernel path** (issue #505, [`attention_sparse_v_turbo4_fused`]).
+//!    Dispatches the JIT-compiled `turbo_sparse_v_weighted_sum` Metal kernel,
+//!    which does the per-thread `if (attn_weight <= threshold) continue;` skip
+//!    inside the SDPA inner loop. This is the production speed path validated
+//!    in the paper. Active by default on macOS when
+//!    `MLXCEL_SPARSE_V_THRESHOLD > 0`. Falls back to path (1) automatically
+//!    for non-power-of-2 `head_dim` values (Gemma 4's 192-dim heads). Use
+//!    `MLXCEL_SPARSE_V_KERNEL=0` to force the graph fallback for A/B testing.
 //!
-//! 1. Threshold and enablement helpers driven by `MLXCEL_SPARSE_V_THRESHOLD`
-//!    (default `1e-6`, set to `0.0` to disable).
-//! 2. [`compute_alive_mask`] — given attention scores, build the per-(KV
-//!    head, KV token) "alive" mask. Aggregates across the Q axis (any
-//!    Q-position with `attn > threshold` keeps the KV slot alive) and across
-//!    Q-head groups for grouped attention (any Q head in the group keeps it
-//!    alive, the same way SDPA's `repeat_kv` works).
-//! 3. [`attention_sparse_v_turbo4`] — split-SDPA reference path: compute
-//!    scores in FP32, threshold, dequantize V (full path), zero out dead
-//!    rows, then `attn @ V_masked`. Numerically equivalent to the full
-//!    Turbo4 dequant path within FP16 round-off when `threshold = 0`.
-//!
-//! What this module does **not** ship:
-//!
-//! - **Per-position lazy dequant.** The graph-level `where(alive, V_dq, 0)`
-//!   still pays the full V dequant cost; the dequant kernel runs over the
-//!   complete `[B, H, T, D]` tensor regardless of the mask. The actual speed
-//!   gate (`+15 %` decode at 32 K) requires the fused Metal kernel — the
-//!   `continue` in the unrolled inner loop, exactly as the paper describes
-//!   in §3.1.
-//! - **Integration into model attention call sites.** Every model file calls
-//!   `cache.update_and_fetch(...)` then `attention(q, k, v, ...)`. Wiring
-//!   sparse-V through that contract requires either (i) a new attention API
-//!   that accepts `(q, k, v_packed, v_norms, params, ...)` and is opted into
-//!   per cache mode, or (ii) intercepting the cache return type to lazy-V.
-//!   Both are large surface-area changes deferred to a follow-up sub-issue.
+//! The kernel sources live under `src/lib/mlx-cpp/turbo/` and use MLX's
+//! runtime `mlx::core::fast::metal_kernel` JIT path.
 //!
 //! # Design rationale: graph-level vs Metal kernel
 //!
@@ -68,19 +51,15 @@
 //! `dequant(...)` for every position because MLX evaluates both branches
 //! eagerly. The skip can only happen inside the Metal kernel where the
 //! `if (attn_weight < 1e-6f) continue;` predicate gates a single thread's
-//! work.
+//! work. Issue #498 established the graph scaffold and correctness gate;
+//! issue #505 landed the fused kernel that delivers the actual throughput
+//! benefit.
 //!
-//! Therefore this module's split-SDPA path is **correctness-only**: it
-//! observes the threshold, masks out dead rows so they contribute zero to
-//! the output, and validates that the masked attention output matches the
-//! full attention output to FP16 precision. The PPL quality gate (`B3`,
-//! issue #475) will thus pass with the threshold enabled because every
-//! "skipped" position has near-zero contribution anyway. The speed gate
-//! (`+15 %` at 32 K) is **deferred to the Metal kernel follow-up**.
-//!
-//! Used by: `KVCache::update_and_fetch` (Turbo4Asym, Turbo4Delegated modes)
-//! when `sparse_v::is_enabled()` is `true`. (Integration TBD per the
-//! "What this module does not ship" note above.)
+//! Used by: `KVCache::update_and_fetch` (Turbo4Asym mode) when
+//! `sparse_v::is_enabled()` is `true`. `Turbo4Delegated` is intentionally
+//! excluded from `sparse_v_available()` because that mode splits the
+//! visible token range across cold-packed V and hot-FP16 V; wiring sparse-V
+//! through that split requires a hot+cold composition pass and is deferred.
 
 use std::sync::OnceLock;
 
@@ -141,6 +120,43 @@ pub fn threshold() -> f32 {
 /// A/B comparisons and bisecting regressions.
 pub fn is_enabled() -> bool {
     threshold() > 0.0
+}
+
+/// Environment variable that disables the fused Metal kernel path even when
+/// sparse-V is otherwise enabled. Useful for A/B testing the kernel against
+/// the graph reference, or for falling back when the kernel is suspected of
+/// numerical regression on a new MLX version. Default: kernel is used.
+///
+/// - Unset / any value other than the false literals below: kernel ON.
+/// - `0`, `false`, `off`, `no`: kernel OFF (graph fallback).
+pub const KERNEL_ENV_VAR: &str = "MLXCEL_SPARSE_V_KERNEL";
+
+/// Cached kernel-enable flag (resolved on first read of [`KERNEL_ENV_VAR`]).
+static KERNEL_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` iff the fused Metal kernel path is allowed at runtime.
+///
+/// The kernel itself only links and dispatches on `target_os = "macos"`; on
+/// other platforms this returns `false` unconditionally. On macOS the env var
+/// gate gives a runtime kill switch for A/B testing without recompiling.
+///
+/// Used by: [`attention_sparse_v_turbo4`] (kernel preference) and the
+/// kernel-vs-graph correctness test in `sparse_v_tests.rs`.
+pub fn kernel_enabled() -> bool {
+    if !cfg!(target_os = "macos") {
+        // On non-Apple builds the cxx FFI symbol may be present (the bridge
+        // compiles on Linux/CUDA via MLX upstream's no-op Metal stubs) but
+        // dispatching the JIT kernel without a Metal device hangs. Force the
+        // graph fallback there.
+        return false;
+    }
+    *KERNEL_ENABLED.get_or_init(|| match std::env::var(KERNEL_ENV_VAR) {
+        Ok(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    })
 }
 
 /// Compute the per-(KV head, KV token) "alive" mask from attention scores.
@@ -359,6 +375,133 @@ pub fn attention_sparse_v_turbo4(
     // the standard SDPA contract.
     let out_f32 = ffi::matmul(&attn_weights, &v_for_q);
     ffi::astype(&out_f32, dtype::FLOAT16)
+}
+
+/// Fused-skip Sparse-V SDPA path (issue #505).
+///
+/// Drops the explicit `dequantize_v_turbo4` step in favour of the fused
+/// Metal kernel `turbo_sparse_v_weighted_sum`, which does the per-thread
+/// `if (attn_weight <= threshold) continue;` skip in the unrolled SDPA
+/// inner loop. The kernel returns the *unrotated* per-head weighted sum
+/// `Σ_t attn[t] · y_hat_unit[t] · norms[t]`; this function applies the
+/// inverse Turbo4 rotation (`signs1 · WHT · signs2 ·`) outside, on the
+/// smaller `[B, Hq, Tq, D]` output. That moves the rotation cost from
+/// `O(B · Hkv · Tk · D log D)` (graph path) to `O(B · Hq · Tq · D log D)`
+/// (kernel path), a Tk-vs-Tq factor — the source of the long-context speedup.
+///
+/// # Inputs / outputs
+///
+/// Identical contract to [`attention_sparse_v_turbo4`].
+///
+/// # Platform gating
+///
+/// Returns `None` when [`kernel_enabled`] is `false` (non-macOS or
+/// `MLXCEL_SPARSE_V_KERNEL=0`). Callers should fall back to
+/// [`attention_sparse_v_turbo4`] in that case.
+///
+/// Used by: [`KVCache::sparse_v_attention`] (issue #505).
+pub fn attention_sparse_v_turbo4_fused(
+    q: &MlxArray,
+    k: &MlxArray,
+    v_packed: &MlxArray,
+    v_norms: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    threshold_value: f32,
+) -> Option<UniquePtr<MlxArray>> {
+    if !kernel_enabled() {
+        return None;
+    }
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(k);
+    debug_assert_eq!(q_shape.len(), 4, "q must be 4-D [B, Hq, Tq, D]");
+    debug_assert_eq!(k_shape.len(), 4, "k must be 4-D [B, Hkv, Tk, D]");
+    let b = q_shape[0];
+    let hq = q_shape[1];
+    let tq = q_shape[2];
+    let head_dim = q_shape[3];
+    let kv_heads = k_shape[1];
+    let tk = k_shape[2];
+    debug_assert!(kv_heads > 0, "Hkv must be positive");
+    debug_assert!(
+        hq % kv_heads == 0,
+        "Hq ({hq}) must be a multiple of Hkv ({kv_heads})"
+    );
+    let n_rep = hq / kv_heads;
+
+    // Kernel-friendly precondition: head_dim must be a power of 2 (the
+    // threadgroup-memory tree reduction in the kernel halves stride per
+    // round, so non-power-of-2 D would over-/under-shoot). All production
+    // text models use head_dim ∈ {64, 128, 192, 256} — the 192 case (Gemma
+    // 4) is the lone non-power-of-2 outlier in the field; for that we fall
+    // back to the graph path.
+    if !(head_dim as u32).is_power_of_two() {
+        return None;
+    }
+
+    // 1. Compute attention scores via the standard graph path. We keep this
+    //    in MLX so the score matrix benefits from steel-attention SDPA and
+    //    NAX-accelerated matmul where available; the kernel's job is only
+    //    the V-side weighted-sum + sparse-V skip.
+    //
+    //    Repeat KV heads to match Q heads. Identical to the graph path's
+    //    `k_for_q` construction in `attention_sparse_v_turbo4`.
+    let k_for_q = if n_rep == 1 {
+        ffi::contiguous(k, false)
+    } else {
+        let kt = k_shape[2];
+        let kd = k_shape[3];
+        let k_exp = ffi::expand_dims(k, 2);
+        let k_tiled = ffi::broadcast_to(&k_exp, &[b, kv_heads, n_rep, kt, kd]);
+        ffi::reshape(&k_tiled, &[b, hq, kt, kd])
+    };
+
+    let k_for_q_t = ffi::transpose_axes(&k_for_q, &[0, 1, 3, 2]);
+    let q_f32 = ffi::astype(q, dtype::FLOAT32);
+    let k_t_f32 = ffi::astype(&k_for_q_t, dtype::FLOAT32);
+    let qk = ffi::matmul(&q_f32, &k_t_f32);
+    let scale_arr = ffi::full_f32(&[1], scale, dtype::FLOAT32);
+    let mut scores = ffi::multiply(&qk, &scale_arr);
+    if let Some(m) = mask {
+        let m_f32 = ffi::astype(m, dtype::FLOAT32);
+        scores = ffi::add(&scores, &m_f32);
+    }
+    let attn_weights = ffi::softmax_precise(&scores, -1); // [B, Hq, Tq, Tk] f32
+
+    // 2. Pre-flatten the kernel inputs. The kernel expects (B*Hq, Tq, Tk),
+    //    (B*Hkv, Tk, D/2), (B*Hkv, Tk), and a 1-D codebook.
+    let bhq = b * hq;
+    let bhkv = b * kv_heads;
+    let attn_flat = ffi::reshape(&attn_weights, &[bhq, tq, tk]);
+    let v_packed_flat = ffi::reshape(v_packed, &[bhkv, tk, head_dim / 2]);
+    // v_norms graph shape is `[B, Hkv, Tk, 1]`. The kernel expects
+    // `[B*Hkv, Tk]` — drop the trailing axis and flatten the first two.
+    let v_norms_flat = ffi::reshape(v_norms, &[bhkv, tk]);
+    let codebook_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let codebook_arr = ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
+
+    // 3. Dispatch the fused-skip kernel.
+    let out_pre_flat = ffi::turbo_sparse_v_weighted_sum(
+        &attn_flat,
+        &v_packed_flat,
+        &v_norms_flat,
+        &codebook_arr,
+        head_dim,
+        n_rep,
+        threshold_value,
+    );
+
+    // 4. Reshape back to [B, Hq, Tq, D] and apply the inverse Turbo4
+    //    rotation: out = signs1 * WHT(signs2 * out_pre).
+    let out_pre = ffi::reshape(&out_pre_flat, &[b, hq, tq, head_dim]);
+    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, head_dim]);
+    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, head_dim]);
+    let pre_h = ffi::multiply(&out_pre, &signs2_arr);
+    let post_h = crate::ops::wht(&pre_h);
+    let post_d1 = ffi::multiply(&post_h, &signs1_arr);
+
+    Some(ffi::astype(&post_d1, dtype::FLOAT16))
 }
 
 #[cfg(test)]

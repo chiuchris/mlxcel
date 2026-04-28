@@ -1106,5 +1106,8 @@ fn cache_type_k_empty_env_var_is_ignored() {
 
     let mut value: Option<String> = None;
     env_fallback_cache_type_k(&mut value);
-    assert!(value.is_none(), "whitespace-only env var must not be applied");
+    assert!(
+        value.is_none(),
+        "whitespace-only env var must not be applied"
+    );
 }

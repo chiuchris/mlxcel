@@ -2,6 +2,7 @@
 // Direct C++ bridge implementation for MLX via cxx
 
 #include "mlx_cxx_bridge.h"
+#include "sparse_v_sdpa.h"  // Issue #505: fused Sparse-V SDPA kernel.
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
 #include "mlx/compile.h"
@@ -5683,6 +5684,28 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     return std::make_unique<MlxArray>(mlx::core::fast::scaled_dot_product_attention(
         q.inner, k.inner, v.inner, scale, mask_mode, mask_opt
     ));
+}
+
+// Issue #505 — Fused Sparse-V SDPA Metal kernel launcher. Implementation in
+// `src/lib/mlx-cpp/turbo/sparse_v_sdpa.cpp`; we forward the call here so the
+// new symbol shows up in the cxx-bridge ABI without bloating the bridge .cpp.
+std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
+    const MlxArray& attn_weights,
+    const MlxArray& v_packed,
+    const MlxArray& v_norms,
+    const MlxArray& codebook,
+    int32_t dim,
+    int32_t n_rep,
+    float threshold) {
+    auto out = mlxcel::turbo::sparse_v_weighted_sum(
+        attn_weights.inner,
+        v_packed.inner,
+        v_norms.inner,
+        codebook.inner,
+        dim,
+        n_rep,
+        threshold);
+    return std::make_unique<MlxArray>(std::move(out));
 }
 
 std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {

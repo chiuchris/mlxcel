@@ -1959,12 +1959,18 @@ impl KVCache {
     /// and the sparse-V threshold is enabled (see
     /// [`turbo::sparse_v::is_enabled`]).
     ///
-    /// Sparse-V is currently supported only for `KVCacheMode::Turbo4Asym`
-    /// and `KVCacheMode::Turbo4Delegated` — symmetric `Turbo4` (K also
-    /// packed) is not yet wired through the split-SDPA path. Callers that
-    /// want to opt into the attention-gated dequant path should check this
-    /// accessor and, if true, use [`Self::sparse_v_attention`] instead of
-    /// the standard [`Self::update_and_fetch`] + `attention()` pair.
+    /// Sparse-V is currently supported only for `KVCacheMode::Turbo4Asym`.
+    /// `Turbo4Delegated` is *not* yet wired through `sparse_v_attention`
+    /// because that mode splits the visible token range across cold packed
+    /// V (`v_packed[0..cold_offset]`) and hot FP16 V (`hot_values[..]`),
+    /// while the current dispatcher in [`Self::sparse_v_attention`] slices a
+    /// single contiguous `0..self.offset` range. Wiring delegated mode
+    /// through sparse-V requires a hot+cold composition pass and is
+    /// deferred to a follow-up issue. Symmetric `Turbo4` (K also packed) is
+    /// also not yet wired through the split-SDPA path. Callers that want to
+    /// opt into the attention-gated dequant path should check this accessor
+    /// and, if true, use [`Self::sparse_v_attention`] instead of the
+    /// standard [`Self::update_and_fetch`] + `attention()` pair.
     ///
     /// Used by: future model attention call sites (integration deferred —
     /// see `cache/turbo/sparse_v.rs` module docs).
@@ -1972,10 +1978,7 @@ impl KVCache {
         if !turbo::sparse_v::is_enabled() {
             return false;
         }
-        matches!(
-            self.mode,
-            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4Delegated
-        )
+        matches!(self.mode, KVCacheMode::Turbo4Asym)
     }
 
     /// Borrow the packed V indices for sparse-V attention.
@@ -2032,6 +2035,58 @@ impl KVCache {
     /// Used by: future model attention call sites that have been ported
     /// to the split-SDPA path. Standard call sites continue to use
     /// `cache.update_and_fetch(...)` followed by `attention(...)`.
+    /// Combined update + sparse-V attention dispatch (issue #505).
+    ///
+    /// The standard `update_and_fetch + attention()` pair pays the full V
+    /// dequant cost inside `update_and_fetch` even when sparse-V is enabled.
+    /// This method side-steps that by:
+    ///
+    /// 1. Calling [`Self::update`] to fill the packed buffers (no V dequant).
+    /// 2. Reading the K side (FP16 for `Turbo4Asym`).
+    /// 3. Dispatching [`Self::sparse_v_attention`] directly with the packed
+    ///    V buffers — the fused Metal kernel does the per-thread dequant +
+    ///    skip in one pass.
+    ///
+    /// Returns:
+    /// - `Some(attn_out)` when sparse-V is active and the kernel/graph path
+    ///   handled the dispatch. The caller uses this output and skips the
+    ///   standard `attention()` call.
+    /// - `None` when sparse-V is *not* active. The caller falls back to
+    ///   `update_and_fetch + attention()`.
+    ///
+    /// The Q tensor must already have RoPE / Q-norm applied; the caller is
+    /// responsible for that, just as with the standard path.
+    ///
+    /// Used by: per-model attention call sites (Llama 3, Qwen 3, etc.)
+    /// when the cache is in `Turbo4Asym` mode and
+    /// `MLXCEL_SPARSE_V_THRESHOLD > 0`. `Turbo4Delegated` integration is
+    /// deferred — see [`Self::sparse_v_available`].
+    pub fn update_and_sparse_v_attention(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> Option<UniquePtr<MlxArray>> {
+        if !self.sparse_v_available() {
+            return None;
+        }
+        // Fill the packed buffers; this also advances `self.offset`.
+        self.update(new_keys, new_values);
+
+        // For Turbo4Asym K stays FP16 in `self.keys` and the visible token
+        // range is contiguous (`0..self.offset`). Slice it directly.
+        // (`Turbo4` symmetric mode would need a packed K dequant here, and
+        // `Turbo4Delegated` would need a hot+cold composition; both are
+        // excluded from `sparse_v_available()`.)
+        let k_buf = self.keys.as_ref()?;
+        let ks = ffi::array_shape(k_buf);
+        let k_slice = ffi::slice(k_buf, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+
+        self.sparse_v_attention(q, &k_slice, scale, mask)
+    }
+
     pub fn sparse_v_attention(
         &self,
         q: &MlxArray,
@@ -2042,12 +2097,59 @@ impl KVCache {
         if !self.sparse_v_available() {
             return None;
         }
-        let v_packed = self.v_packed()?;
-        let v_norms = self.v_norms()?;
+        let v_packed_buf = self.v_packed()?;
+        let v_norms_buf = self.v_norms()?;
         let params = self.turbo_params()?;
         let threshold = turbo::sparse_v::threshold();
+
+        // Slice the packed V buffers down to the visible token range. The
+        // raw `v_packed`/`v_norms` accessors return the full buffer, which
+        // includes pre-allocated capacity beyond `self.offset`. Without the
+        // slice the kernel would sweep `Tk = buffer_seq_len`, paying for
+        // dead capacity slots and producing wrong contributions.
+        //
+        // For Turbo4Asym the packed shapes are:
+        //   v_packed: [B, H, capacity, D/2] u8
+        //   v_norms:  [B, H, capacity, 1]   f16
+        // We slice axis 2 (the token axis) to [0, self.offset).
+        let vp_shape = ffi::array_shape(v_packed_buf);
+        let vn_shape = ffi::array_shape(v_norms_buf);
+        let v_packed_owned = ffi::slice(
+            v_packed_buf,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], self.offset, vp_shape[3]],
+        );
+        let v_norms_owned = ffi::slice(
+            v_norms_buf,
+            &[0, 0, 0, 0],
+            &[vn_shape[0], vn_shape[1], self.offset, 1],
+        );
+
+        // Prefer the fused Metal kernel path (issue #505) when available.
+        // Falls through to the graph-level reference path on non-macOS, when
+        // the kernel is disabled via `MLXCEL_SPARSE_V_KERNEL=0`, or when the
+        // model uses a non-power-of-2 head_dim (Gemma 4 192-dim heads).
+        if let Some(out) = turbo::sparse_v::attention_sparse_v_turbo4_fused(
+            q,
+            k,
+            &v_packed_owned,
+            &v_norms_owned,
+            params,
+            scale,
+            mask,
+            threshold,
+        ) {
+            return Some(out);
+        }
         Some(turbo::sparse_v::attention_sparse_v_turbo4(
-            q, k, v_packed, v_norms, params, scale, mask, threshold,
+            q,
+            k,
+            &v_packed_owned,
+            &v_norms_owned,
+            params,
+            scale,
+            mask,
+            threshold,
         ))
     }
 
