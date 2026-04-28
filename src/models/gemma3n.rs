@@ -493,13 +493,46 @@ impl Gemma3nAttention {
                 self.window_size,
             )
         } else {
-            // Single token or explicit mask
+            // Single token or explicit mask path. If the caller supplied a
+            // windowed mask and this layer is a sliding-window layer, the
+            // mask is shaped `(q_len, window_size)` post-PR-#513 cap. Plain
+            // `KVCache` returns full-length K/V, so we must slice K/V to
+            // match the capped mask, mirroring `causal_attention` internals.
+            let k_shape = mlxcel_core::array_shape(&keys);
+            let k_len = k_shape[2];
+            let (k_used, v_used) = if self.window_size > 0 && k_len > self.window_size {
+                let v_shape = mlxcel_core::array_shape(&values);
+                let start = k_len - self.window_size;
+                (
+                    Some(mlxcel_core::slice(
+                        &keys,
+                        &[0, 0, start, 0],
+                        &[k_shape[0], k_shape[1], k_len, k_shape[3]],
+                    )),
+                    Some(mlxcel_core::slice(
+                        &values,
+                        &[0, 0, start, 0],
+                        &[v_shape[0], v_shape[1], k_len, v_shape[3]],
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            let k_ref: &MlxArray = k_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| keys.as_ref().unwrap());
+            let v_ref: &MlxArray = v_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| values.as_ref().unwrap());
+
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
                     &queries,
-                    &keys,
-                    &values,
+                    k_ref,
+                    v_ref,
                     self.scale,
                     mask_ptr,
                     0.0,

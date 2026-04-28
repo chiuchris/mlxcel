@@ -120,31 +120,93 @@ pub fn create_causal_bool_mask(size: i32, offset: i32) -> UniquePtr<MlxArray> {
 }
 
 /// Create a causal attention mask with sliding window.
-/// Used by: Gemma2, Gemma3, Gemma4, Qwen3, Ministral and other windowed-attention callers
+/// Used by: Gemma2, Gemma3, Gemma3n, Gemma4, Qwen3, Ministral and other windowed-attention callers
 ///
 /// # Arguments
 /// * `size` - Size of the query sequence
-/// * `offset` - Offset for KV cache
+/// * `offset` - Offset for KV cache (tokens already in the cache before this call)
 /// * `window` - Sliding window size (None for full attention)
 ///
 /// # Returns
-/// Mask with sliding window constraint applied
+/// Mask with sliding window constraint applied, shaped `(size, T_k)` where
+/// `T_k = min(size + offset, window)`.
+///
+/// ## Shape semantics when `size + offset > window`
+///
+/// A `RotatingKVCache` with `max_size = window` returns at most `window` K tokens
+/// (the most recent ones).  The mask must match this T_k dimension so that
+/// `mx::fast::scaled_dot_product_attention` can broadcast it against the score
+/// tensor `(B, H, T_q, T_k)`.
+///
+/// When `total_len (= size + offset) > window`, the mask is produced as if we
+/// took the last `window` columns of the full `(size, total_len)` causal mask.
+/// Cache slot `k_cache` corresponds to logical key position
+/// `k_cache + (total_len - window)`, and query row `q` corresponds to logical
+/// query position `q + offset`. The causal condition is
+/// `q_logical >= k_logical`:
+///
+/// ```text
+/// q + offset >= k_cache + (total_len - window)
+/// q + offset >= k_cache + (size + offset - window)
+/// q         >= k_cache + (size - window)
+/// ```
+///
+/// Hence the `tril` diagonal offset is `-(size - window) = window - size`,
+/// independent of `offset`. The resulting mask shape is `(size, window)`,
+/// matching the RotatingKVCache output and allowing broadcast to
+/// `(B, H, size, window)`.
+///
+/// ## Why the window upper-bound term is elided in the capped path
+///
+/// In the full-length path the `triu` enforces `q <= k + window - 1`.  In the
+/// capped path the column range is already restricted to the window; the upper
+/// bound is always satisfied, so `triu` is omitted.
 pub fn create_causal_mask_with_window(
     size: i32,
     offset: i32,
     window: Option<i32>,
 ) -> UniquePtr<MlxArray> {
-    let total_len = size + offset;
+    let uncapped_len = size + offset;
+
+    // When a window is specified and the K sequence would exceed the window
+    // (i.e. RotatingKVCache returns fewer than `uncapped_len` tokens), cap the
+    // mask width so it matches the actual K dimension returned by the cache.
+    //
+    // Example: size=4096, offset=0, window=1024
+    //   uncapped_len = 4096, which is > 1024.
+    //   The cache returns K of shape (B, H, 1024, D).
+    //   The score tensor is (B, H, 4096, 1024).
+    //   A mask of (4096, 4096) cannot broadcast to (1, 8, 4096, 1024) — SIGABRT.
+    //   Fix: produce mask of (4096, 1024) using adjusted tril offset.
+    let (total_len, tril_offset) = if let Some(w) = window {
+        if uncapped_len > w {
+            // Cap: take the last `w` columns of the full (size, uncapped_len) mask.
+            // Cache slot k_c holds logical key position k_c + (uncapped_len - w);
+            // query row q holds logical query position q + offset. The causal
+            // condition q + offset >= k_c + (uncapped_len - w) simplifies to
+            // q >= k_c + (size - w), so the tril diagonal offset is
+            // -(size - w) = w - size — independent of `offset`.
+            (w, w - size)
+        } else {
+            (uncapped_len, offset)
+        }
+    } else {
+        (uncapped_len, offset)
+    };
 
     // Create lower triangular mask (1 = attend, 0 = mask)
     let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
-    let mut mask = ffi::tril(&ones, offset);
+    let mut mask = ffi::tril(&ones, tril_offset);
 
-    // Apply sliding window if specified
+    // Apply sliding window upper-bound only when the mask is NOT capped.
+    // In the capped path the column range is already the window; the upper
+    // bound (q <= k + window - 1) is trivially satisfied.
     if let Some(w) = window {
-        // Create upper bound mask (window positions before diagonal)
-        let upper_mask = ffi::triu(&ones, offset - w + 1);
-        mask = ffi::multiply(&mask, &upper_mask);
+        if uncapped_len <= w {
+            // Non-capped path: enforce window upper bound.
+            let upper_mask = ffi::triu(&ones, offset - w + 1);
+            mask = ffi::multiply(&mask, &upper_mask);
+        }
     }
 
     // Convert to attention mask format: where mask=1 -> 0, where mask=0 -> -inf
@@ -160,18 +222,35 @@ pub fn create_causal_mask_with_window(
 /// Used by: same as `create_causal_mask_with_window` (experimental path)
 ///
 /// Returns a bool mask where `true` means "allowed attention".
+/// Shape is `(size, min(size + offset, window))` when window is specified.
+/// See `create_causal_mask_with_window` for the shape-capping rationale.
 pub fn create_causal_bool_mask_with_window(
     size: i32,
     offset: i32,
     window: Option<i32>,
 ) -> UniquePtr<MlxArray> {
-    let total_len = size + offset;
+    let uncapped_len = size + offset;
+
+    let (total_len, tril_offset) = if let Some(w) = window {
+        if uncapped_len > w {
+            // See `create_causal_mask_with_window` for the derivation:
+            // tril diagonal offset is `w - size`, independent of `offset`.
+            (w, w - size)
+        } else {
+            (uncapped_len, offset)
+        }
+    } else {
+        (uncapped_len, offset)
+    };
+
     let ones = ffi::ones(&[size, total_len], dtype::FLOAT32);
-    let mut mask = ffi::tril(&ones, offset);
+    let mut mask = ffi::tril(&ones, tril_offset);
 
     if let Some(w) = window {
-        let upper_mask = ffi::triu(&ones, offset - w + 1);
-        mask = ffi::multiply(&mask, &upper_mask);
+        if uncapped_len <= w {
+            let upper_mask = ffi::triu(&ones, offset - w + 1);
+            mask = ffi::multiply(&mask, &upper_mask);
+        }
     }
 
     let zeros = ffi::zeros(&[size, total_len], dtype::FLOAT32);
@@ -627,5 +706,81 @@ mod tests {
         assert_eq!(shape, vec![8, 8]);
         let ref_shape = ffi::array_shape(&ref_mask);
         assert_eq!(ref_shape, vec![8, 8]);
+    }
+
+    // --- Sliding window mask shape regression tests (issue #507) -------------
+
+    /// Gemma3-4B trigger: seq_len=4096, window=1024, offset=0.
+    ///
+    /// Before the fix the mask had shape (4096, 4096).  MLX SDPA falls back to
+    /// software when head_dim=256 (not in the Metal fast-kernel list) and its
+    /// fallback tried to broadcast (4096, 4096) against score (B, H, 4096, 1024)
+    /// → SIGABRT.  After the fix the mask must be (4096, 1024).
+    #[test]
+    fn test_sliding_window_mask_shape_capped_when_seq_exceeds_window() {
+        let mask = create_causal_mask_with_window(4096, 0, Some(1024));
+        let shape = ffi::array_shape(&mask);
+        // Must be (T_q=4096, T_k=min(4096+0, 1024)=1024), NOT (4096, 4096).
+        assert_eq!(
+            shape,
+            vec![4096, 1024],
+            "mask shape must match RotatingKVCache output (4096, 1024); \
+             got {shape:?} — broadcast mismatch against score (B,H,4096,1024) would SIGABRT"
+        );
+    }
+
+    /// When seq_len < window the mask must retain its full (T_q, T_q+offset)
+    /// shape — no spurious capping.
+    #[test]
+    fn test_sliding_window_mask_shape_uncapped_when_seq_within_window() {
+        // seq=512, offset=0, window=1024: total=512 < 1024 → no cap
+        let mask = create_causal_mask_with_window(512, 0, Some(1024));
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(shape, vec![512, 512]);
+    }
+
+    /// When total_len exactly equals window the mask must NOT be capped.
+    #[test]
+    fn test_sliding_window_mask_shape_at_window_boundary() {
+        // seq=512, offset=512, window=1024: total=1024 == window → no cap
+        let mask = create_causal_mask_with_window(512, 512, Some(1024));
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(shape, vec![512, 1024]);
+    }
+
+    /// In the capped path, queries below the cache start horizon must be fully
+    /// masked (-inf).  For seq=4, window=2, offset=0:
+    ///   cache holds last 2 of the 4 input tokens (positions 2..3).
+    ///   q=0 and q=1 cannot attend to any cached key → all -inf.
+    ///   q=2 attends to k=0 (input pos 2≥input pos 2). → row 2, col 0 = 0.
+    ///   q=3 attends to k=0,1 (input 3≥2, 3≥3). → row 3, cols 0 and 1 = 0.
+    #[test]
+    fn test_sliding_window_mask_values_when_capped() {
+        // Produce (4, 2) mask: rows=T_q, cols=T_k=window=2
+        let mask = create_causal_mask_with_window(4, 0, Some(2));
+        let shape = ffi::array_shape(&mask);
+        assert_eq!(shape, vec![4, 2]);
+
+        // Extract values (the mask is additive: 0.0 = attend, -inf = block)
+        let row0_col0 = ffi::item_f32(&ffi::slice(&mask, &[0, 0], &[1, 1]));
+        let row1_col0 = ffi::item_f32(&ffi::slice(&mask, &[1, 0], &[2, 1]));
+        let row2_col0 = ffi::item_f32(&ffi::slice(&mask, &[2, 0], &[3, 1]));
+        let row3_col0 = ffi::item_f32(&ffi::slice(&mask, &[3, 0], &[4, 1]));
+        let row3_col1 = ffi::item_f32(&ffi::slice(&mask, &[3, 1], &[4, 2]));
+
+        // q=0,1 cannot see any cache key (cache starts at input pos 2)
+        assert!(
+            row0_col0.is_infinite() && row0_col0 < 0.0,
+            "row0_col0 should be -inf, got {row0_col0}"
+        );
+        assert!(
+            row1_col0.is_infinite() && row1_col0 < 0.0,
+            "row1_col0 should be -inf, got {row1_col0}"
+        );
+        // q=2 attends to cache-k=0 (input pos 2 ≥ input pos 2)
+        assert_eq!(row2_col0, 0.0, "row2_col0 should be 0.0 (attend)");
+        // q=3 attends to both cache keys
+        assert_eq!(row3_col0, 0.0, "row3_col0 should be 0.0 (attend)");
+        assert_eq!(row3_col1, 0.0, "row3_col1 should be 0.0 (attend)");
     }
 }

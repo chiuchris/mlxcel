@@ -2133,7 +2133,34 @@ pub fn causal_attention(
     }
 
     if softcap > 0.0 || window_size > 0 {
-        let offset = (k_len - q_len).max(0);
+        // When the window is exceeded, slice K/V to the last `window_size`
+        // slots so they line up with the (q_len, window_size)-shaped mask
+        // produced by `create_causal_mask_with_window`. Production callers
+        // backed by `RotatingKVCache` already deliver K/V truncated to
+        // `max_size = window_size`; this branch keeps the wrapper
+        // self-consistent for any other caller (and for our own unit tests).
+        let (k_used, v_used, effective_k_len) = if needs_window_mask {
+            let k_shape = ffi::array_shape(k);
+            let v_shape = ffi::array_shape(v);
+            let start = k_len - window_size;
+            let k_sliced = ffi::slice(
+                k,
+                &[0, 0, start, 0],
+                &[k_shape[0], k_shape[1], k_len, k_shape[3]],
+            );
+            let v_sliced = ffi::slice(
+                v,
+                &[0, 0, start, 0],
+                &[v_shape[0], v_shape[1], k_len, v_shape[3]],
+            );
+            (Some(k_sliced), Some(v_sliced), window_size)
+        } else {
+            (None, None, k_len)
+        };
+        let k_ref: &MlxArray = k_used.as_deref().unwrap_or(k);
+        let v_ref: &MlxArray = v_used.as_deref().unwrap_or(v);
+
+        let offset = (effective_k_len - q_len).max(0);
         let mask = if softcap == 0.0 && use_bool_causal_mask_path() {
             if window_size > 0 {
                 utils::create_causal_bool_mask_with_window(q_len, offset, Some(window_size))
@@ -2147,8 +2174,8 @@ pub fn causal_attention(
         };
         return layers::attention(
             q,
-            k,
-            v,
+            k_ref,
+            v_ref,
             scale,
             Some(mask.as_ref().unwrap()),
             softcap,

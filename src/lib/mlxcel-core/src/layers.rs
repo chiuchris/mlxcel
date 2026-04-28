@@ -2609,11 +2609,18 @@ mod tests {
         let window_size = 2_i32; // k_len > window, mask is required.
 
         let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        // After PR #513, `create_causal_mask_with_window` caps T_k to
+        // `window_size` when `q_len + offset > window`. The explicit-mask
+        // reference must therefore receive K/V sliced to the last
+        // `window_size` slots so its score tensor lines up with the mask —
+        // this mirrors what `causal_attention` now does internally.
         let mask = crate::utils::create_causal_mask_with_window(1, 3, Some(window_size));
+        let k_sliced = crate::slice(&k, &[0, 0, 4 - window_size, 0], &[1, 1, 4, 4]);
+        let v_sliced = crate::slice(&v, &[0, 0, 4 - window_size, 0], &[1, 1, 4, 4]);
         let out_masked = attention(
             &q,
-            &k,
-            &v,
+            &k_sliced,
+            &v_sliced,
             scale,
             Some(mask.as_ref().unwrap()),
             0.0,
@@ -2653,14 +2660,24 @@ mod tests {
             &[1, 1, 5, 4],
         );
         let scale = 0.5_f32;
-        let window_size = 2_i32;
+        // Use window_size=3 (not 2) so the post-PR-#513 cap path produces a
+        // non-degenerate mask: with q_len=3, window=3, tril_offset = w - size
+        // = 0, so q=0 attends to k=0. With window=2 the row-0 mask is fully
+        // masked, which produces NaN under the now-correct semantics (a
+        // query whose logical position predates every cache key).
+        let window_size = 3_i32;
 
         let out = crate::causal_attention(&q, &k, &v, scale, 0.0, window_size);
+        // See note in `causal_attention_single_query_window_respects_mask_when_needed`:
+        // the explicit-mask reference must slice K/V to the last `window_size`
+        // slots to line up with the post-cap mask shape `(q_len, window_size)`.
         let mask_f = crate::utils::create_causal_mask_with_window(3, 2, Some(window_size));
+        let k_sliced = crate::slice(&k, &[0, 0, 5 - window_size, 0], &[1, 1, 5, 4]);
+        let v_sliced = crate::slice(&v, &[0, 0, 5 - window_size, 0], &[1, 1, 5, 4]);
         let out_ref = attention(
             &q,
-            &k,
-            &v,
+            &k_sliced,
+            &v_sliced,
             scale,
             Some(mask_f.as_ref().unwrap()),
             0.0,

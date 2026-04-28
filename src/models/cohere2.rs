@@ -178,13 +178,46 @@ impl Cohere2Attention {
 
         // Scaled dot-product attention
         let attn_out = if l > 1 {
-            // Prefill: use mask
+            // Prefill: use mask. If a windowed mask was supplied for a
+            // sliding-window layer, post-PR-#513 it is shaped
+            // `(l, window_size)` (capped). Plain `KVCache` returns
+            // full-length K/V, so slice K/V to the last `window_size` slots
+            // here, mirroring `causal_attention`'s internal slicing.
+            let k_shape = mlxcel_core::array_shape(&cache_k);
+            let k_len = k_shape[2];
+            let (k_used, v_used) = if self.window_size > 0 && k_len > self.window_size {
+                let v_shape = mlxcel_core::array_shape(&cache_v);
+                let start = k_len - self.window_size;
+                (
+                    Some(mlxcel_core::slice(
+                        &cache_k,
+                        &[0, 0, start, 0],
+                        &[k_shape[0], k_shape[1], k_len, k_shape[3]],
+                    )),
+                    Some(mlxcel_core::slice(
+                        &cache_v,
+                        &[0, 0, start, 0],
+                        &[v_shape[0], v_shape[1], k_len, v_shape[3]],
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            let k_ref: &MlxArray = k_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| cache_k.as_ref().unwrap());
+            let v_ref: &MlxArray = v_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| cache_v.as_ref().unwrap());
+
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
                     &q,
-                    &cache_k,
-                    &cache_v,
+                    k_ref,
+                    v_ref,
                     self.scale,
                     mask_ptr,
                     0.0,
@@ -192,7 +225,7 @@ impl Cohere2Attention {
                 )
             }
         } else {
-            // Single token: use causal SDPA
+            // Single token: use causal SDPA (slices internally when needed)
             mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, self.window_size)
         };
 

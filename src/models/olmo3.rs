@@ -158,6 +158,9 @@ pub struct OLMo3Attention {
     pub rope_dims: i32,
     pub rope_base: f32,
     pub is_sliding: bool,
+    /// Sliding-window size for sliding layers (0 for full-attention layers).
+    /// Used to slice K/V to match the post-PR-#513 capped sliding mask.
+    pub window_size: i32,
 }
 
 impl OLMo3Attention {
@@ -202,11 +205,43 @@ impl OLMo3Attention {
 
         // Scaled dot-product attention
         let attn_out = if l > 1 && mask.is_some() {
-            // Prefill with mask
+            // Prefill with mask. If this is a sliding layer the windowed
+            // mask is capped to `(l, window_size)` post-PR-#513. Plain
+            // `KVCache` returns full-length K/V, so slice K/V to the last
+            // `window_size` slots to match the mask.
+            let k_shape = mlxcel_core::array_shape(&cache_k);
+            let k_len = k_shape[2];
+            let (k_used, v_used) = if self.window_size > 0 && k_len > self.window_size {
+                let v_shape = mlxcel_core::array_shape(&cache_v);
+                let start = k_len - self.window_size;
+                (
+                    Some(mlxcel_core::slice(
+                        &cache_k,
+                        &[0, 0, start, 0],
+                        &[k_shape[0], k_shape[1], k_len, k_shape[3]],
+                    )),
+                    Some(mlxcel_core::slice(
+                        &cache_v,
+                        &[0, 0, start, 0],
+                        &[v_shape[0], v_shape[1], k_len, v_shape[3]],
+                    )),
+                )
+            } else {
+                (None, None)
+            };
+            let k_ref: &MlxArray = k_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| cache_k.as_ref().unwrap());
+            let v_ref: &MlxArray = v_used
+                .as_ref()
+                .map(|p| p.as_ref().unwrap())
+                .unwrap_or_else(|| cache_v.as_ref().unwrap());
+
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
-                    &q, &cache_k, &cache_v, self.scale, mask_ptr, 0.0, 0,
+                    &q, k_ref, v_ref, self.scale, mask_ptr, 0.0, 0,
                 )
             }
         } else if l > 1 {
@@ -267,6 +302,11 @@ impl OLMo3Attention {
             rope_dims: head_dim,
             rope_base: args.rope_theta,
             is_sliding,
+            window_size: if is_sliding {
+                args.sliding_window as i32
+            } else {
+                0
+            },
         })
     }
 }
