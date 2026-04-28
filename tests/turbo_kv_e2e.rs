@@ -43,7 +43,7 @@
 //! without the required model checkouts. Run each gate individually:
 //!
 //! ```text
-//! # PPL + NIAH gate for Qwen2.5-1.5B
+//! # PPL + NIAH gate for Qwen2.5-1.5B (base variant — see note in Prerequisite section)
 //! cargo test --test turbo_kv_e2e --release -- --ignored test_qwen25_15b_quality_gate --nocapture
 //!
 //! # PPL + NIAH gate for Llama-3.1-8B
@@ -64,10 +64,16 @@
 //! Download one or more of the following into `models/`:
 //!
 //! ```text
-//! ./target/release/mlxcel download mlx-community/Qwen2.5-1.5B-Instruct-4bit
+//! ./target/release/mlxcel download mlx-community/Qwen2.5-1.5B-4bit
 //! ./target/release/mlxcel download mlx-community/Meta-Llama-3.1-8B-Instruct-4bit
 //! ./target/release/mlxcel download mlx-community/gemma-3-4b-it-4bit
 //! ```
+//!
+//! Note: The B3 Qwen2.5-1.5B fixture uses the **base** (non-instruct) variant
+//! `Qwen2.5-1.5B-4bit`. The instruct variant collapses on raw wikitext without
+//! the chat template (`<|im_start|>user\n...<|im_end|>`), producing PPL ≈ 2×10⁷
+//! and NIAH=0/12 (see issue #506). This gate measures TurboQuant compression
+//! quality, not chat performance, so the base model is the correct fixture.
 //!
 //! # VLM gates
 //!
@@ -552,12 +558,24 @@ fn run_quality_gate(model_dir_name: &str) -> Option<(f64, f64, usize, usize)> {
 // Per-model test functions
 // ---------------------------------------------------------------------------
 
+// B3 fixture: use the BASE (non-instruct) variant of Qwen2.5-1.5B.
+//
+// The instruct-tuned `Qwen2.5-1.5B-Instruct-4bit` collapses on raw wikitext
+// without the chat template, producing PPL ≈ 2×10⁷ and NIAH=0/12 — values
+// six orders of magnitude off a healthy ~10–15 baseline (see issue #506 and
+// issue #493 comment). The relative turbo4asym gate would still pass in that
+// case (both fp16 and turbo degenerate together), making the test a
+// meaningless noise check rather than a real quality signal.
+//
+// `Qwen2.5-1.5B-4bit` (base model) produces healthy absolute PPL on raw
+// wikitext and is the correct fixture for a TurboQuant compression gate.
+// Download: ./target/release/mlxcel download mlx-community/Qwen2.5-1.5B-4bit
 #[test]
-#[ignore = "requires Qwen2.5-1.5B-Instruct-4bit weights — \
+#[ignore = "requires Qwen2.5-1.5B-4bit weights (base, non-instruct variant) — \
             run with --release -- --ignored test_qwen25_15b_quality_gate --nocapture"]
 fn test_qwen25_15b_quality_gate() {
     let Some((ppl_fp16, ppl_turbo, niah_baseline, niah_turbo)) =
-        run_quality_gate("Qwen2.5-1.5B-Instruct-4bit")
+        run_quality_gate("Qwen2.5-1.5B-4bit")
     else {
         return; // model absent — soft skip
     };
@@ -793,6 +811,8 @@ fn test_rotation_kurtosis_sanity() {
         "gemma3n-e4b-bf16",
         "Qwen2.5-7B-Instruct-4bit",
         "qwen2.5-7b-4bit",
+        // base model used by B3 quality gate since issue #506
+        "Qwen2.5-1.5B-4bit",
         "Qwen2.5-1.5B-Instruct-4bit",
         "Meta-Llama-3.1-8B-Instruct-4bit",
         "gemma-3-4b-it-4bit",
