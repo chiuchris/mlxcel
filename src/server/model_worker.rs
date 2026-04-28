@@ -77,6 +77,13 @@ pub(crate) struct WorkerSchedulerConfig {
     /// scheduler can adopt detached prefixes on cache hits and donate-back
     /// finished sequences (epic #416 / issue #421).
     pub prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+    /// Issue #484 (B11) / #508: server-wide KV cache quantization mode.
+    ///
+    /// Defaults to [`mlxcel_core::cache::KVCacheMode::Fp16`] (bit-exact
+    /// baseline). When a Turbo4 variant is configured, the scheduler
+    /// applies it to each new sequence's per-layer cache and picks the
+    /// Turbo4-aware paged layout (#482).
+    pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -257,7 +264,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         .with_vision_cache_size(sched_config.vision_cache_size)
         .with_token_bias(token_bias)
         .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
-        .with_prompt_cache(sched_config.prompt_cache);
+        .with_prompt_cache(sched_config.prompt_cache)
+        .with_kv_cache_mode(sched_config.kv_cache_mode);
         scheduler.run();
     })
 }

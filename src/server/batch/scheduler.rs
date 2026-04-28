@@ -33,7 +33,7 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use mlxcel_core::cache::{
-    CachePool, DetachedCacheSet, PagedKvLayout, SequenceId, SequenceStateBackend,
+    CachePool, DetachedCacheSet, KVCacheMode, PagedKvLayout, SequenceId, SequenceStateBackend,
     SequenceStateLayout,
 };
 use mlxcel_core::generate::{
@@ -156,6 +156,18 @@ pub struct BatchScheduler {
     max_batch_prefill: usize,
     /// Decode-time sequence-state backend used by this scheduler.
     decode_storage_backend: DecodeStorageBackend,
+
+    /// Server-wide KV cache quantization mode (issue #484 / #508).
+    ///
+    /// When non-Fp16 the scheduler upgrades each newly-allocated sequence's
+    /// per-layer `KVCache` to the configured mode (with Boundary-V policy
+    /// applied for Turbo4 modes) immediately after `model.make_caches()`
+    /// returns its default Fp16 caches. For paged decode this also picks
+    /// the Turbo4-aware [`PagedKvLayout`] constructor so the per-page sidecar
+    /// budget is reserved.
+    ///
+    /// Defaults to [`KVCacheMode::Fp16`] (bit-exact baseline).
+    kv_cache_mode: KVCacheMode,
 
     // -- Vision feature cache --
     /// Per-model vision feature cache bundle. Contains LRU caches for
@@ -315,7 +327,26 @@ impl BatchScheduler {
             thinking_token_ids: None,
             prompt_cache: None,
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
+            kv_cache_mode: KVCacheMode::Fp16,
         }
+    }
+
+    /// Attach the server-wide KV cache quantization mode (issue #484 / #508).
+    ///
+    /// When `mode == KVCacheMode::Fp16` this builder is a no-op — every new
+    /// sequence keeps the default Fp16 caches and the paged layout uses
+    /// `PagedKvLayout::uniform`. For Turbo4 modes (`Turbo4Asym`, `Turbo4`,
+    /// `Turbo4Delegated`) the scheduler additionally picks
+    /// [`PagedKvLayout::uniform_with_mode`] so per-page sidecars are
+    /// reserved, preserving the cross-tenant isolation contract from #482.
+    pub fn with_kv_cache_mode(mut self, mode: KVCacheMode) -> Self {
+        self.kv_cache_mode = mode;
+        self
+    }
+
+    /// Returns the server-wide KV cache quantization mode (for tests).
+    pub fn kv_cache_mode(&self) -> KVCacheMode {
+        self.kv_cache_mode
     }
 
     /// Replace the default vision feature cache with one sized per the server
@@ -709,8 +740,48 @@ impl BatchScheduler {
         let seq_id = self
             .cache_pool
             .allocate_with_layout(&self.model, layout_override)?;
+        // Issue #484 / #508: apply the configured KV cache mode (with
+        // Boundary-V policy for Turbo4 modes) to the freshly allocated
+        // per-layer caches. `model.make_caches()` always returns Fp16
+        // caches; this step upgrades them to the requested mode while
+        // keeping boundary layers at FP16 quality. No-op when the
+        // configured mode is `Fp16`.
+        self.apply_kv_cache_mode_to(seq_id);
         self.model.prepare_sequence_state(seq_id);
         Ok(seq_id)
+    }
+
+    /// Apply the configured `kv_cache_mode` to every per-layer cache of
+    /// `seq_id` (with the Boundary-V upgrade for Turbo4 modes).
+    ///
+    /// No-op for `KVCacheMode::Fp16` — the cache pool already returns
+    /// FP16 caches from `model.make_caches()`. For Turbo4 modes the
+    /// per-layer mode is resolved via
+    /// [`mlxcel_core::cache::turbo::resolve_layer_modes`] so boundary
+    /// layers stay FP16 (issue #478) for quality.
+    ///
+    /// Used by: [`Self::allocate_sequence_state`] (#508).
+    fn apply_kv_cache_mode_to(&mut self, seq_id: SequenceId) {
+        let nominal = self.kv_cache_mode;
+        if nominal == KVCacheMode::Fp16 {
+            return;
+        }
+        let Some(caches) = self.cache_pool.get_caches_mut(seq_id) else {
+            return;
+        };
+        if caches.is_empty() {
+            // Model-owned / paged sequences without dense placeholder
+            // caches — nothing to upgrade. The model's own decode path
+            // is responsible for honoring the configured mode.
+            return;
+        }
+        let n_layers = caches.len();
+        let requested = mlxcel_core::cache::turbo::boundary_v_layers_from_env();
+        let layer_modes =
+            mlxcel_core::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
+        for (cache, mode) in caches.iter_mut().zip(layer_modes.into_iter()) {
+            cache.mode = mode;
+        }
     }
 
     fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
@@ -719,13 +790,52 @@ impl BatchScheduler {
         }
 
         let num_layers = self.model.num_layers();
-        let paged_layout = PagedKvLayout::uniform(
-            num_layers,
-            DEFAULT_PAGED_BLOCK_SIZE,
-            DEFAULT_PAGED_BLOCK_SIZE,
-        )
-        .expect("valid paged decode layout");
+        // Issue #508: when a Turbo4 cache mode is configured, build a
+        // packed-aware paged layout (PR #502 / issue #482) so per-page
+        // sidecar accounting and detach/adopt round-trip work correctly.
+        // Fp16/Int8 keep the historical `PagedKvLayout::uniform` path —
+        // bit-identical to pre-#508.
+        let paged_layout = if Self::is_turbo_mode(self.kv_cache_mode) {
+            // The actual per-token packed sidecar size depends on the
+            // model's V head_dim, which is not known to the scheduler
+            // at construction time (the dense `KVCache::update_turbo4_*`
+            // path lazily allocates the right shape on first write).
+            // We charge a per-block budget equal to `DEFAULT_PAGED_BLOCK_SIZE`
+            // as a placeholder so the layout passes the
+            // `bytes % block_size == 0` validation in
+            // [`PagedKvLayout::new_with_mode`]; the runtime
+            // `turbo_sidecars.nbytes()` reports the true footprint via
+            // `CachePool::memory_usage_bytes`.
+            let sidecar_bytes_per_block = DEFAULT_PAGED_BLOCK_SIZE;
+            PagedKvLayout::uniform_with_mode(
+                num_layers,
+                DEFAULT_PAGED_BLOCK_SIZE,
+                DEFAULT_PAGED_BLOCK_SIZE,
+                self.kv_cache_mode,
+                sidecar_bytes_per_block,
+            )
+            .expect("valid paged Turbo4 decode layout")
+        } else {
+            PagedKvLayout::uniform(
+                num_layers,
+                DEFAULT_PAGED_BLOCK_SIZE,
+                DEFAULT_PAGED_BLOCK_SIZE,
+            )
+            .expect("valid paged decode layout")
+        };
         Some(SequenceStateLayout::paged_kv_cache(paged_layout))
+    }
+
+    /// Whether the supplied KV cache mode requires Turbo4-aware paged
+    /// layout (per-page sidecar storage on `PagedBlockPool`).
+    ///
+    /// Used by: scheduler dispatch for sequence allocation (#508).
+    #[inline]
+    fn is_turbo_mode(mode: KVCacheMode) -> bool {
+        matches!(
+            mode,
+            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+        )
     }
 
     fn sync_sequence_storage(&mut self, seq_id: SequenceId) {

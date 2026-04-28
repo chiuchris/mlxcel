@@ -908,3 +908,77 @@ fn test_merge_all_empty() {
         "merge of all-empty inputs with no pending work must be Idle"
     );
 }
+
+// -------------------------------------------------------------------
+// Issue #508 — Server scheduler dispatch on PagedKvLayout::cache_mode
+// -------------------------------------------------------------------
+
+/// Reproduce the `is_turbo_mode` classification policy from
+/// [`super::BatchScheduler::is_turbo_mode`] without constructing a real
+/// `BatchScheduler` (which requires a model). The function is a single
+/// `matches!`, so reproducing it here lets us assert the variant set
+/// without exposing the inherent method.
+fn is_turbo_mode_policy(mode: mlxcel_core::cache::KVCacheMode) -> bool {
+    use mlxcel_core::cache::KVCacheMode;
+    matches!(
+        mode,
+        KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+    )
+}
+
+#[test]
+fn is_turbo_mode_classifies_turbo4_variants() {
+    use mlxcel_core::cache::KVCacheMode;
+    assert!(is_turbo_mode_policy(KVCacheMode::Turbo4Asym));
+    assert!(is_turbo_mode_policy(KVCacheMode::Turbo4));
+    assert!(is_turbo_mode_policy(KVCacheMode::Turbo4Delegated));
+}
+
+#[test]
+fn is_turbo_mode_excludes_fp16_int8_and_turbo3_today() {
+    use mlxcel_core::cache::KVCacheMode;
+    // Fp16 / Int8 must take the historical `PagedKvLayout::uniform` path
+    // (no per-page sidecar accounting). Bit-identical to pre-#508.
+    assert!(!is_turbo_mode_policy(KVCacheMode::Fp16));
+    assert!(!is_turbo_mode_policy(KVCacheMode::Int8));
+    // Turbo3Asym is a valid `KVCacheMode` (issue #477) but the paged
+    // data plane does not yet support per-page 3-bit sidecars; the
+    // dispatch intentionally falls through to `PagedKvLayout::uniform`
+    // so callers that pair `--kv-cache-mode fp16+turbo3` with paged
+    // decode get the dense-fallback path. When paged Turbo3 lands,
+    // this assertion can flip.
+    assert!(!is_turbo_mode_policy(KVCacheMode::Turbo3Asym));
+}
+
+/// Smoke-test the exact arguments the scheduler passes to
+/// `PagedKvLayout::uniform_with_mode` in
+/// [`super::BatchScheduler::sequence_state_layout_override`].
+///
+/// This guards against regressions where a future code edit makes the
+/// sidecar budget violate the `bytes % block_size == 0` invariant —
+/// previously seen with `DEFAULT_PAGED_BLOCK_SIZE / 2`, which panics
+/// the `.expect("valid paged Turbo4 decode layout")` at runtime as
+/// soon as the first paged Turbo4 sequence is allocated.
+#[test]
+fn scheduler_paged_turbo_layout_arguments_are_valid() {
+    use mlxcel_core::cache::{KVCacheMode, PagedKvLayout};
+    // Same constants as the scheduler's `sequence_state_layout_override`.
+    const DEFAULT_PAGED_BLOCK_SIZE: usize = 32;
+    let sidecar_bytes_per_block = DEFAULT_PAGED_BLOCK_SIZE;
+    for mode in [
+        KVCacheMode::Turbo4Asym,
+        KVCacheMode::Turbo4,
+        KVCacheMode::Turbo4Delegated,
+    ] {
+        PagedKvLayout::uniform_with_mode(
+            /* num_layers = */ 4,
+            DEFAULT_PAGED_BLOCK_SIZE,
+            DEFAULT_PAGED_BLOCK_SIZE,
+            mode,
+            sidecar_bytes_per_block,
+        )
+        .unwrap_or_else(|err| {
+            panic!("scheduler-default Turbo4 paged layout must be valid for {mode:?}: {err}")
+        });
+    }
+}

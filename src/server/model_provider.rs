@@ -185,6 +185,7 @@ impl ModelProvider {
                 config.lang_bias_config.clone(),
                 config.reasoning_budget,
                 prompt_cache_store,
+                config.kv_cache_mode,
                 batch_metrics,
                 batch_observability,
             )
@@ -321,6 +322,7 @@ impl ModelProvider {
             lang_bias_config,
             reasoning_budget,
             None,
+            mlxcel_core::cache::KVCacheMode::Fp16,
             batch_metrics,
             batch_observability,
         )
@@ -348,6 +350,7 @@ impl ModelProvider {
         lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        kv_cache_mode: mlxcel_core::cache::KVCacheMode,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -378,6 +381,7 @@ impl ModelProvider {
             lang_bias_config,
             reasoning_budget,
             prompt_cache: prompt_cache_store.clone(),
+            kv_cache_mode,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -445,6 +449,7 @@ impl ModelProvider {
             lang_bias_config: None,
             reasoning_budget: None,
             prompt_cache: None,
+            kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
