@@ -55,7 +55,7 @@
 //! issue #505 landed the fused kernel that delivers the actual throughput
 //! benefit.
 //!
-//! Used by: `KVCache::update_and_fetch` (Turbo4Asym mode) when
+//! Used by: `KVCache::update_and_sparse_v_attention` (Turbo4Asym mode) when
 //! `sparse_v::is_enabled()` is `true`. `Turbo4Delegated` is intentionally
 //! excluded from `sparse_v_available()` because that mode splits the
 //! visible token range across cold-packed V and hot-FP16 V; wiring sparse-V

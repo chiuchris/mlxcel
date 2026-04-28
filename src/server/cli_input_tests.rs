@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::{Mutex, OnceLock};
 
 use super::{
-    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
+    DecodeStorageBackend, ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
     resolve_compat_toggle, resolve_kv_cache_mode, resolve_prefill_chunk_size, resolve_seed,
 };
 use crate::lang_bias::LangBiasCliArgs;
@@ -59,6 +59,7 @@ fn sample_input() -> ServerStartupInput {
         preemption_policy: "longest-first".to_string(),
         no_batch: false,
         max_batch_prefill: 1,
+        decode_storage_backend: None,
         chat_template: Some("{{ prompt }}".to_string()),
         chat_template_file: Some(PathBuf::from("chat.jinja")),
         slots: true,
@@ -1034,6 +1035,18 @@ fn into_startup_config_kv_cache_mode_default_is_fp16() {
         .into_startup_config()
         .expect("default input is valid");
     assert_eq!(startup.kv_cache_mode, KVCacheMode::Fp16);
+}
+
+#[test]
+fn into_startup_config_propagates_decode_storage_backend() {
+    let mut input = sample_input();
+    input.decode_storage_backend = Some(DecodeStorageBackend::Paged);
+
+    let startup = input.into_startup_config().expect("paged backend is valid");
+    assert_eq!(
+        startup.decode_storage_backend,
+        Some(DecodeStorageBackend::Paged)
+    );
 }
 
 /// Integration: unsupported pair propagated as an error.

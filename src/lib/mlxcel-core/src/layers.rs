@@ -730,6 +730,11 @@ impl FusedQKVLinear {
     }
 
     /// Load and concatenate separate q/k/v weights with explicit quantization mode.
+    ///
+    /// Used by: Llama3, Qwen2/Qwen2.5, Phi3-style fused attention wrappers.
+    /// Preserves both quantization `biases` and true linear `bias` tensors
+    /// when present; Qwen2-family checkpoints require q/k/v linear bias for
+    /// sane logits.
     pub fn from_weights_separate_with_mode(
         weights: &crate::weights::WeightMap,
         prefix: &str,
@@ -817,6 +822,23 @@ impl FusedQKVLinear {
                 }
             };
 
+            let qkv_bias = {
+                let q_b = weights.get(&format!("{}.bias", q_prefix));
+                let k_b = weights.get(&format!("{}.bias", k_prefix));
+                let v_b = weights.get(&format!("{}.bias", v_prefix));
+                match (q_b, k_b, v_b) {
+                    (Some(qb), Some(kb), Some(vb)) => {
+                        let ptrs: &[*const MlxArray] = &[
+                            qb.as_ref().unwrap() as *const MlxArray,
+                            kb.as_ref().unwrap() as *const MlxArray,
+                            vb.as_ref().unwrap() as *const MlxArray,
+                        ];
+                        Some(unsafe { ffi::concatenate(ptrs, 0) })
+                    }
+                    _ => None,
+                }
+            };
+
             let qweight = QuantizedWeight {
                 weight: qkv_weight,
                 scales: qkv_scales,
@@ -827,7 +849,7 @@ impl FusedQKVLinear {
             };
             UnifiedLinear::Quantized {
                 weight: qweight,
-                bias: None,
+                bias: qkv_bias,
             }
         } else {
             // Non-quantized path: concatenate weight tensors along axis 0.
@@ -2395,6 +2417,63 @@ pub fn compiled_gelu_mlp_fp16(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn insert_quantized_qkv_projection(
+        weights: &mut crate::weights::WeightMap,
+        prefix: &str,
+        out_dim: i32,
+    ) {
+        use crate::dtype;
+
+        weights.insert(
+            format!("{prefix}.weight"),
+            ffi::zeros(&[out_dim, 8], dtype::UINT32),
+        );
+        weights.insert(
+            format!("{prefix}.scales"),
+            ffi::zeros(&[out_dim, 1], dtype::FLOAT16),
+        );
+        weights.insert(
+            format!("{prefix}.biases"),
+            ffi::zeros(&[out_dim, 1], dtype::FLOAT16),
+        );
+        weights.insert(
+            format!("{prefix}.bias"),
+            ffi::zeros(&[out_dim], dtype::FLOAT16),
+        );
+    }
+
+    #[test]
+    fn fused_qkv_quantized_preserves_linear_bias() {
+        let mut weights = crate::weights::WeightMap::new();
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.q_proj", 8);
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.k_proj", 4);
+        insert_quantized_qkv_projection(&mut weights, "model.layers.0.self_attn.v_proj", 4);
+
+        let fused = FusedQKVLinear::from_weights_separate(
+            &weights,
+            "model.layers.0.self_attn",
+            64,
+            4,
+            2,
+            1,
+            4,
+        )
+        .expect("valid fused QKV weights");
+
+        match fused.qkv_proj {
+            UnifiedLinear::Quantized { weight, bias } => {
+                let bias = bias.expect("Qwen2-style q/k/v linear bias must be preserved");
+                assert_eq!(ffi::array_shape(&bias).as_slice(), &[16]);
+
+                let quant_biases = weight
+                    .biases
+                    .expect("quantization biases should still be preserved");
+                assert_eq!(ffi::array_shape(&quant_biases).as_slice(), &[16, 1]);
+            }
+            UnifiedLinear::Regular(_) => panic!("expected quantized fused QKV"),
+        }
+    }
 
     /// Verify that `metal4_attention` falls back correctly on all hardware.
     ///

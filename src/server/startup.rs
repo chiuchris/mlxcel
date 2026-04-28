@@ -100,6 +100,9 @@ pub struct ServerStartupConfig {
     pub no_batch: bool,
     /// Maximum number of pending requests to batch together for prefill (default: 1).
     pub max_batch_prefill: usize,
+    /// Decode-time storage backend requested by the CLI. `None` preserves the
+    /// legacy `MLXCEL_SERVER_DECODE_STORAGE` env-var fallback.
+    pub decode_storage_backend: Option<crate::server::DecodeStorageBackend>,
 
     // Warmup
     pub warmup: bool,
@@ -272,6 +275,7 @@ impl Default for ServerStartupConfig {
             preemption_policy: "longest-first".to_string(),
             no_batch: false,
             max_batch_prefill: 1,
+            decode_storage_backend: None,
             chat_template: None,
             chat_template_file: None,
             enable_slots: true,
@@ -467,7 +471,9 @@ pub(super) fn build_server_config(
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
         no_batch: startup.no_batch,
         max_batch_prefill: startup.max_batch_prefill.max(1),
-        decode_storage_backend: resolve_decode_storage_backend(),
+        decode_storage_backend: startup
+            .decode_storage_backend
+            .unwrap_or_else(resolve_decode_storage_backend),
         pipeline_parallel_runtime: startup.pp_layers.as_ref().map(|layers| {
             PipelineParallelRuntimeConfig::InProcess {
                 layers: layers.clone(),

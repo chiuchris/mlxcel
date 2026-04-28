@@ -754,6 +754,14 @@ pub(crate) struct ServeArgs {
     #[arg(long = "kv-cache-mode", value_name = "MODE")]
     kv_cache_mode: Option<String>,
 
+    /// Decode storage backend for continuous batching.
+    ///
+    /// Accepted values: `auto`, `dense`, `paged`. When omitted, the server
+    /// uses `MLXCEL_SERVER_DECODE_STORAGE` if set, otherwise automatic
+    /// selection.
+    #[arg(long = "decode-storage-backend", value_name = "BACKEND")]
+    decode_storage_backend: Option<mlxcel::server::DecodeStorageBackend>,
+
     /// Maximum number of cached post-projection image features per loaded VLM.
     ///
     /// Multi-turn conversations that revisit the same image can reuse cached

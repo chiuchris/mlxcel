@@ -470,6 +470,17 @@ fn resolve_decode_storage_backend_defaults_to_auto() {
 }
 
 #[test]
+fn build_server_config_uses_cli_decode_storage_backend() {
+    let startup = ServerStartupConfig {
+        decode_storage_backend: Some(DecodeStorageBackend::Paged),
+        ..ServerStartupConfig::default()
+    };
+
+    let config = build_server_config(&startup, None);
+    assert_eq!(config.decode_storage_backend, DecodeStorageBackend::Paged);
+}
+
+#[test]
 fn resolve_tensor_parallel_runtime_support_allows_server_batching_for_llama() {
     let dir = temp_path("tp-llama-batching");
     std::fs::write(

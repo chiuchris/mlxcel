@@ -104,6 +104,8 @@ const PPL_CHUNK_LEN: usize = 4096;
 
 /// Relative PPL increase gate: (ppl_turbo - ppl_fp16) / ppl_fp16 ≤ PPL_GATE_REL.
 const PPL_GATE_REL: f64 = 0.01; // 1.0%
+const QWEN25_15B_BASE_PPL_MIN: f64 = 5.0;
+const QWEN25_15B_BASE_PPL_MAX: f64 = 30.0;
 
 /// Needle string used in NIAH harness.
 const NIAH_NEEDLE: &str = "cantaloupe";
@@ -581,6 +583,17 @@ fn test_qwen25_15b_quality_gate() {
     };
 
     let rel = (ppl_turbo - ppl_fp16) / ppl_fp16;
+    assert!(
+        (QWEN25_15B_BASE_PPL_MIN..=QWEN25_15B_BASE_PPL_MAX).contains(&ppl_fp16),
+        "Qwen2.5-1.5B base fp16 PPL {ppl_fp16:.4} is outside the healthy raw-wikitext \
+         range [{QWEN25_15B_BASE_PPL_MIN:.1}, {QWEN25_15B_BASE_PPL_MAX:.1}]. \
+         This gate exists to catch the degenerate instruct-fixture behavior from issue #506."
+    );
+    assert!(
+        niah_baseline > 0,
+        "Qwen2.5-1.5B base baseline NIAH must be non-zero; got {niah_baseline}. \
+         This gate should not pass on a collapsed raw-text fixture."
+    );
     assert!(
         rel <= PPL_GATE_REL,
         "Qwen2.5-1.5B PPL regression {:.4}% > {:.1}% gate \

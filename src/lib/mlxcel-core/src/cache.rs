@@ -1987,8 +1987,7 @@ impl KVCache {
     /// [`Self::sparse_v_available`]) or before the first
     /// `update_and_fetch` call has populated the V sidecars.
     ///
-    /// Used by: [`Self::sparse_v_attention`] (and direct callers porting to
-    /// the split-SDPA path before the per-model attention rewrite).
+    /// Used by: [`Self::sparse_v_attention`].
     pub fn v_packed(&self) -> Option<&MlxArray> {
         self.v_packed.as_deref()
     }
@@ -2006,18 +2005,18 @@ impl KVCache {
         self.turbo_params.as_ref()
     }
 
-    /// Attention-gated SDPA dispatch: routes to [`turbo::sparse_v::
-    /// attention_sparse_v_turbo4`] when sparse-V is active, otherwise
-    /// returns `None` so the caller can fall back to the standard
+    /// Attention-gated SDPA dispatch: routes to the fused Sparse-V Metal
+    /// kernel when available, otherwise falls back to the graph reference
+    /// [`turbo::sparse_v::attention_sparse_v_turbo4`] path. Returns `None`
+    /// when sparse-V is inactive so the caller can use the standard
     /// `attention()` path.
     ///
-    /// **Contract.** This is a *correctness-preserving* graph-level
-    /// scaffold. The current implementation observes the threshold but
-    /// does not yet skip per-position dequant work — that requires the
-    /// fused Metal kernel follow-up. Callers that adopt this path now
-    /// should expect the same speed as the full-dequant baseline; the
-    /// quality, however, will be observable as soon as the threshold is
-    /// non-zero.
+    /// **Contract.** This preserves the full-dequant attention result within
+    /// FP16 round-off at `threshold=0`. At positive thresholds, positions with
+    /// attention weight below the configured cutoff are skipped. On macOS with
+    /// a supported power-of-two head dimension the skip happens inside the
+    /// fused Metal kernel; elsewhere the graph fallback remains a correctness
+    /// reference and still pays full V dequant cost.
     ///
     /// # Inputs
     ///

@@ -546,6 +546,14 @@ struct ServerArgs {
     #[arg(long = "kv-cache-mode", value_name = "MODE")]
     kv_cache_mode: Option<String>,
 
+    /// Decode storage backend for continuous batching.
+    ///
+    /// Accepted values: `auto`, `dense`, `paged`. When omitted, the server
+    /// uses `MLXCEL_SERVER_DECODE_STORAGE` if set, otherwise automatic
+    /// selection.
+    #[arg(long = "decode-storage-backend", value_name = "BACKEND")]
+    decode_storage_backend: Option<mlxcel::server::DecodeStorageBackend>,
+
     // llama-server compatibility arguments (accepted but ignored).
     /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
     #[arg(long, hide = true)]
@@ -852,6 +860,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         enable_preemption: args.enable_preemption,
         preemption_policy: args.preemption_policy,
         max_batch_prefill: args.max_batch_prefill,
+        decode_storage_backend: args.decode_storage_backend,
         chat_template: args.chat_template,
         chat_template_file: args.chat_template_file,
         slots: args.slots,

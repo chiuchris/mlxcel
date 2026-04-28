@@ -95,6 +95,7 @@ fn sample_args() -> crate::ServeArgs {
         cache_type_k: None,
         cache_type_v: None,
         kv_cache_mode: None,
+        decode_storage_backend: None,
         vision_cache_size: 20,
         enable_elastic_pp: false,
         elastic_pp_drain_timeout: 120,
@@ -128,6 +129,19 @@ fn build_startup_input_preserves_edge_flags_for_normalization() {
     assert_eq!(
         input.dry_sequence_breakers,
         vec!["\n".to_string(), "\t".to_string()]
+    );
+    assert_eq!(input.decode_storage_backend, None);
+}
+
+#[test]
+fn build_startup_input_propagates_decode_storage_backend() {
+    let mut args = sample_args();
+    args.decode_storage_backend = Some(mlxcel::server::DecodeStorageBackend::Paged);
+
+    let input = build_startup_input(args).expect("resolve");
+    assert_eq!(
+        input.decode_storage_backend,
+        Some(mlxcel::server::DecodeStorageBackend::Paged)
     );
 }
 
