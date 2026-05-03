@@ -584,7 +584,9 @@ fn rotating_turbo4_wraparound_overwrites_oldest_slot() {
     // Write one more token — this lands on physical slot 0, overwriting the
     // very first token.
     let new_k = synth_kv_tensor(1, 1, 1, head_dim, 31337);
-    let new_v_data: Vec<f32> = (0..head_dim).map(|i| (i as f32 / head_dim as f32) - 0.5).collect();
+    let new_v_data: Vec<f32> = (0..head_dim)
+        .map(|i| (i as f32 / head_dim as f32) - 0.5)
+        .collect();
     let new_v = ffi::from_slice_f32(&new_v_data, &[1, 1, 1, head_dim]);
 
     let (_k_out, v_out) = cache.update_and_fetch(new_k, new_v);
@@ -632,8 +634,9 @@ fn rotating_turbo4_wraparound_preserves_other_block_data() {
     let mut cache = RotatingKVCache::new_with_mode(max_size, KVCacheMode::Turbo4Asym);
 
     // Write a sentinel token at slot 31 (last token in block 0).
-    let sentinel_data: Vec<f32> =
-        (0..head_dim).map(|i| (i as f32 / head_dim as f32) - 0.25).collect();
+    let sentinel_data: Vec<f32> = (0..head_dim)
+        .map(|i| (i as f32 / head_dim as f32) - 0.25)
+        .collect();
     let sentinel_v = ffi::from_slice_f32(&sentinel_data, &[1, 1, 1, head_dim]);
     let sentinel_k = synth_kv_tensor(1, 1, 1, head_dim, 999);
 
@@ -737,11 +740,8 @@ fn rotating_turbo4_clone_handle_round_trip_preserves_sidecars() {
     assert!(cache.v_norms.is_none());
     assert_eq!(cache.get_offset(), 0);
 
-    let mut restored = RotatingKVCache::new_with_mode_and_seed(
-        max_size,
-        KVCacheMode::Turbo4Asym,
-        pre_seed,
-    );
+    let mut restored =
+        RotatingKVCache::new_with_mode_and_seed(max_size, KVCacheMode::Turbo4Asym, pre_seed);
     restored.install_detached(handle).unwrap();
 
     assert_eq!(restored.get_offset(), pre_idx_offset);
@@ -754,8 +754,14 @@ fn rotating_turbo4_clone_handle_round_trip_preserves_sidecars() {
 
     let post_vp = ffi::array_to_raw_bytes(restored.v_packed.as_ref().unwrap());
     let post_vn = ffi::array_to_raw_bytes(restored.v_norms.as_ref().unwrap());
-    assert_eq!(pre_vp, post_vp, "v_packed must survive detach/adopt bit-for-bit");
-    assert_eq!(pre_vn, post_vn, "v_norms must survive detach/adopt bit-for-bit");
+    assert_eq!(
+        pre_vp, post_vp,
+        "v_packed must survive detach/adopt bit-for-bit"
+    );
+    assert_eq!(
+        pre_vn, post_vn,
+        "v_norms must survive detach/adopt bit-for-bit"
+    );
 }
 
 /// `idx` and `offset` must round-trip across detach/adopt so wraparound
@@ -812,7 +818,10 @@ fn rotating_install_detached_rejects_non_empty_target() {
 
     let handle = a.clone_handle();
     let err = b.install_detached(handle).unwrap_err();
-    assert!(err.contains("not empty"), "expected non-empty error, got: {err}");
+    assert!(
+        err.contains("not empty"),
+        "expected non-empty error, got: {err}"
+    );
 }
 
 /// LOW-1 parity with `KVCache`: `clone_handle` clears `turbo_params` on the
@@ -949,11 +958,7 @@ mod boundary_v {
         // Build the per-layer modes that the generator would produce.
         let modes = resolve_layer_modes(KVCacheMode::Turbo4Asym, n_layers, 2);
 
-        let mut caches: Vec<KVCache> = modes
-            .iter()
-            .copied()
-            .map(KVCache::new_with_mode)
-            .collect();
+        let mut caches: Vec<KVCache> = modes.iter().copied().map(KVCache::new_with_mode).collect();
 
         // Push one token per cache so the storage paths actually fire.
         for (i, cache) in caches.iter_mut().enumerate() {
@@ -1484,12 +1489,7 @@ fn turbo3_asym_uses_fewer_bytes_than_turbo4_asym() {
 /// by future changes to `pack_3bit_per_token`.
 #[test]
 fn turbo3_asym_packed_dim_matches_head_dim_grid() {
-    for &(d, expected_bytes) in &[
-        (64_i32, 24_i32),
-        (96, 36),
-        (128, 48),
-        (256, 96),
-    ] {
+    for &(d, expected_bytes) in &[(64_i32, 24_i32), (96, 36), (128, 48), (256, 96)] {
         let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
         let k = synth_kv_tensor(1, 1, 1, d, 81);
         let v = synth_kv_tensor(1, 1, 1, d, 82);
@@ -1602,7 +1602,11 @@ fn turbo3_asym_layer_modes_apply_boundary_upgrade() {
         if i < 2 || i >= 6 {
             assert_eq!(*m, KVCacheMode::Fp16, "layer {i} must be FP16 boundary");
         } else {
-            assert_eq!(*m, KVCacheMode::Turbo3Asym, "layer {i} must stay Turbo3Asym");
+            assert_eq!(
+                *m,
+                KVCacheMode::Turbo3Asym,
+                "layer {i} must stay Turbo3Asym"
+            );
         }
     }
 }

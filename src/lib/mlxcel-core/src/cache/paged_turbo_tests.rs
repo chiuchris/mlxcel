@@ -158,9 +158,8 @@ fn layout_requires_sidecar_per_layer_for_turbo_modes() {
 
 #[test]
 fn layout_sidecar_must_be_block_size_multiple() {
-    let err =
-        PagedKvLayout::new_with_mode(4, vec![64, 64], KVCacheMode::Turbo4Asym, vec![16, 7])
-            .unwrap_err();
+    let err = PagedKvLayout::new_with_mode(4, vec![64, 64], KVCacheMode::Turbo4Asym, vec![16, 7])
+        .unwrap_err();
     assert!(err.contains("multiple of block_size"), "{err}");
 }
 
@@ -376,16 +375,10 @@ fn detach_adopt_round_trip_turbo4_asym_preserves_sidecars() {
     let pool_ref = pool.paged_pool_mut().unwrap();
     for &block_id in &block_ids {
         pool_ref
-            .install_v_packed(
-                block_id,
-                dummy_array(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]),
-            )
+            .install_v_packed(block_id, dummy_array(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]))
             .unwrap();
         pool_ref
-            .install_v_norms(
-                block_id,
-                dummy_array(&[0.5, 0.5, 0.5, 0.5], &[1, 1, 4, 1]),
-            )
+            .install_v_norms(block_id, dummy_array(&[0.5, 0.5, 0.5, 0.5], &[1, 1, 4, 1]))
             .unwrap();
     }
 

@@ -1947,9 +1947,10 @@ mod ffi {
             -> UniquePtr<MlxArray>;
 
         // -------------------------------------------------------------------
-        // Issue #505 — Fused Sparse-V SDPA Metal kernel.
+        // Issue #505 / #520 — Fused Sparse-V SDPA Metal kernel.
         // -------------------------------------------------------------------
-        /// Fused-skip Sparse-V weighted sum (Turbo4Asym KV cache, issue #505).
+        /// Fused-skip Sparse-V weighted sum (Turbo4Asym KV cache, issue #505;
+        /// optimized in #520).
         ///
         /// Runs a Metal kernel that computes
         ///   `out[b, h, q, d] = Σ_t attn_weights[b, h, q, t] * V_dq[b, h, t, d]`
@@ -1961,7 +1962,13 @@ mod ffi {
         /// Inputs (caller must pre-flatten):
         /// - `attn_weights`: `[B*Hq, Tq, Tk]` FP32 — post-softmax weights.
         /// - `v_packed`:     `[B*Hkv, Tk, D/2]` UINT8 — nibble-packed indices.
-        /// - `v_norms`:      `[B*Hkv, Tk]` FP16 — per-token V L2 norms.
+        /// - `v_rescale`:    `[B*Hkv, Tk]` FP16 — precomputed per-token
+        ///   rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (issue #520). The
+        ///   previous kernel implementation re-derived this on-GPU per token
+        ///   via a `log2(Dim) + 2`-barrier threadgroup tree reduction; that
+        ///   reduction dominated decode latency on M5 Max at 4 K context
+        ///   for `turbo4-asym` (PR #519 A/B). Precomputing eliminates the
+        ///   threadgroup barriers from the kernel hot path.
         /// - `codebook`:     `[16]` FP32 — Lloyd-Max centroids.
         /// - `dim`: head dimension `D`.
         /// - `n_rep`: `Hq / Hkv` (1 for non-grouped attention).
@@ -1975,7 +1982,7 @@ mod ffi {
         fn turbo_sparse_v_weighted_sum(
             attn_weights: &MlxArray,
             v_packed: &MlxArray,
-            v_norms: &MlxArray,
+            v_rescale: &MlxArray,
             codebook: &MlxArray,
             dim: i32,
             n_rep: i32,

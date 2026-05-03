@@ -21,11 +21,11 @@
 // "weighted-sum-then-rotate" half of attention with per-thread skipping when
 // the post-softmax attention weight falls below a threshold:
 //
-//     out_pre[b, h, k] = Σ_t attn_weights[b, h, t]                       \
-//                          * y_hat_unit[t, k]                            \
-//                          * v_norms[t]
-//             where the inner loop short-circuits when
-//             attn_weights[b, h, t] < threshold.
+//     out_pre[b, h, k] = Σ_t attn_weights[b, h, t]
+//                          * y_hat[t, k] * v_rescale[t]
+//             where v_rescale[t] = norm[t] / max(|y_hat[t]|, 1e-10)
+//             (precomputed at quantize time; issue #520) and the inner
+//             loop short-circuits when attn_weights[b, h, t] < threshold.
 //
 // The caller (`mlxcel-core/cpp/mlx_cxx_bridge.cpp`) computes the FP32
 // attention scores → softmax pre-stage and then applies the inverse rotation
@@ -45,7 +45,11 @@ namespace mlxcel::turbo {
 // Inputs:
 // - `attn_weights`: `[B*Hq, Tq, Tk]` FP32 — pre-flattened post-softmax weights.
 // - `v_packed`:     `[B*Hkv, Tk, D/2]` UINT8 — nibble-packed Turbo4 V indices.
-// - `v_norms`:      `[B*Hkv, Tk]` FP16 — per-token V L2 norms.
+// - `v_rescale`:    `[B*Hkv, Tk]` FP16 — precomputed per-token rescale factor
+//   `norm[t] / max(|y_hat[t]|, 1e-10)`. Issue #520 promoted this from an
+//   in-kernel threadgroup tree reduction to a one-time host-side precompute
+//   at quantize time; eliminates `log2(Dim) + 2` per-token threadgroup
+//   barriers and the kernel `tg_y_hat[Dim]` shared scratch.
 // - `codebook`:     `[16]` FP32 — Lloyd-Max centroids (4-bit).
 //
 // Template parameters (passed to the kernel as `int` template args):
@@ -64,7 +68,7 @@ namespace mlxcel::turbo {
 mlx::core::array sparse_v_weighted_sum(
     const mlx::core::array& attn_weights, // [B*Hq, Tq, Tk] f32
     const mlx::core::array& v_packed,      // [B*Hkv, Tk, D/2] u8
-    const mlx::core::array& v_norms,       // [B*Hkv, Tk] f16
+    const mlx::core::array& v_rescale,     // [B*Hkv, Tk] f16 (issue #520)
     const mlx::core::array& codebook,      // [16] f32
     int dim,
     int n_rep,

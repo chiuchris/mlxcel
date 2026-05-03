@@ -628,11 +628,8 @@ impl CxxGenerator {
     /// — every layer's cache uses `kv_cache_mode` unchanged.
     pub fn new_with_kv_mode(num_layers: usize, kv_cache_mode: KVCacheMode) -> Self {
         let requested = crate::cache::turbo::boundary_v_layers_from_env();
-        let layer_modes = crate::cache::turbo::resolve_layer_modes(
-            kv_cache_mode,
-            num_layers,
-            requested,
-        );
+        let layer_modes =
+            crate::cache::turbo::resolve_layer_modes(kv_cache_mode, num_layers, requested);
         Self {
             caches: layer_modes
                 .into_iter()
@@ -762,8 +759,7 @@ impl CxxGenerator {
         }
         let n_layers = self.caches.len();
         let requested = crate::cache::turbo::boundary_v_layers_from_env();
-        let layer_modes =
-            crate::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
+        let layer_modes = crate::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
         for (cache, mode) in self.caches.iter_mut().zip(layer_modes.into_iter()) {
             cache.mode = mode;
         }
@@ -1567,11 +1563,7 @@ impl CxxGenerator {
         let vocab = logits_shape[2];
 
         // Slice to context positions [0, T-1).
-        let context_logits = ffi::slice(
-            &logits,
-            &[0, 0, 0],
-            &[1, (actual_len - 1) as i32, vocab],
-        );
+        let context_logits = ffi::slice(&logits, &[0, 0, 0], &[1, (actual_len - 1) as i32, vocab]);
 
         // Cast to fp32 for stable log-softmax. fp16 log_softmax can underflow
         // on extreme negative logits — fp32 keeps the gather well-conditioned.

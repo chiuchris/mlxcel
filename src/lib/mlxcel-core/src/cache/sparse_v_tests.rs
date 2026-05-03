@@ -249,7 +249,7 @@ fn sparse_v_attention_threshold_zero_matches_full_dequant() {
     let v_f16 = ffi::astype(&v_f32, dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xC0FFEE);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, _v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let sparse_out = sparse_v::attention_sparse_v_turbo4(
@@ -288,7 +288,7 @@ fn sparse_v_attention_threshold_one_zeros_output() {
     let v_f16 = ffi::astype(&v_f32, dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xDECAFBAD);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, _v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let out = sparse_v::attention_sparse_v_turbo4(
@@ -318,12 +318,11 @@ fn sparse_v_attention_with_grouped_heads() {
     let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 900), dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xBEEFFACE);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, _v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
-    let sparse_out = sparse_v::attention_sparse_v_turbo4(
-        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
-    );
+    let sparse_out =
+        sparse_v::attention_sparse_v_turbo4(&q, &k, &v_packed, &v_norms, &params, scale, None, 0.0);
     let full_out = full_dequant_attention(&q, &k, &v_packed, &v_norms, &params, scale);
     let rms = rms_diff(&flatten_fp32(&sparse_out), &flatten_fp32(&full_out));
     assert!(
@@ -391,10 +390,16 @@ fn sparse_v_attention_via_cache_matches_full_dequant_at_threshold_zero() {
     let mut cache = super::KVCache::new_with_mode(super::KVCacheMode::Turbo4Asym);
     let (k_cached, _v_cached) = cache.update_and_fetch(k_in, v_in);
 
-    assert!(cache.sparse_v_available(), "cache should report sparse_v_available");
+    assert!(
+        cache.sparse_v_available(),
+        "cache should report sparse_v_available"
+    );
     assert!(cache.v_packed().is_some(), "v_packed must be populated");
     assert!(cache.v_norms().is_some(), "v_norms must be populated");
-    assert!(cache.turbo_params().is_some(), "turbo_params must be populated");
+    assert!(
+        cache.turbo_params().is_some(),
+        "turbo_params must be populated"
+    );
 
     let q = ffi::astype(&synth_tensor(&[b, hq, 1, head_dim], 55), dtype::FLOAT16);
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
@@ -511,7 +516,7 @@ fn sparse_v_attention_threshold_default_keeps_quality() {
     let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 1300), dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xFEED_FACE);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, _v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let sparse_out = sparse_v::attention_sparse_v_turbo4(
@@ -558,19 +563,22 @@ fn sparse_v_kernel_threshold_zero_matches_graph() {
     let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 1700), dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xFEED_C0DE);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
+    // Issue #520: the fused kernel now consumes the precomputed `v_rescale`
+    // sidecar instead of `v_norms`. The graph fallback still consumes
+    // `v_norms`. Both paths must produce identical output within FP16
+    // round-off — that is the parity bound this test enforces.
     let kernel_out = sparse_v::attention_sparse_v_turbo4_fused(
-        &q, &k, &v_packed, &v_norms, &params, scale, None, /*threshold=*/ 0.0,
+        &q, &k, &v_packed, &v_rescale, &params, scale, None, /*threshold=*/ 0.0,
     );
     let kernel_out = kernel_out.expect(
         "fused kernel returned None on macOS — the kernel_enabled() gate or \
          power-of-2 head_dim check rejected an input that should be valid",
     );
-    let graph_out = sparse_v::attention_sparse_v_turbo4(
-        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
-    );
+    let graph_out =
+        sparse_v::attention_sparse_v_turbo4(&q, &k, &v_packed, &v_norms, &params, scale, None, 0.0);
 
     let rms = rms_diff(&flatten_fp32(&kernel_out), &flatten_fp32(&graph_out));
     // FP32 → FP16 round-trips through the codebook lookup + WHT can shift
@@ -602,16 +610,15 @@ fn sparse_v_kernel_grouped_matches_graph() {
     let v_f16 = ffi::astype(&synth_tensor(&[b, hkv, tk, head_dim], 2000), dtype::FLOAT16);
 
     let params = TurboQuantParams::new(head_dim as u32, 0xC0DE_BABE);
-    let (v_packed, v_norms) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
+    let (v_packed, v_norms, v_rescale) = turbo::quant::quantize_v_turbo4(&v_f16, &params);
 
     let scale = 1.0_f32 / (head_dim as f32).sqrt();
     let kernel_out = sparse_v::attention_sparse_v_turbo4_fused(
-        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
+        &q, &k, &v_packed, &v_rescale, &params, scale, None, 0.0,
     );
     let kernel_out = kernel_out.expect("kernel returned None on grouped attention case");
-    let graph_out = sparse_v::attention_sparse_v_turbo4(
-        &q, &k, &v_packed, &v_norms, &params, scale, None, 0.0,
-    );
+    let graph_out =
+        sparse_v::attention_sparse_v_turbo4(&q, &k, &v_packed, &v_norms, &params, scale, None, 0.0);
     let rms = rms_diff(&flatten_fp32(&kernel_out), &flatten_fp32(&graph_out));
     assert!(
         rms < 5e-3,

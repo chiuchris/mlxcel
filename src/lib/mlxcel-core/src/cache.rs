@@ -64,16 +64,16 @@
 mod detach;
 mod paged;
 mod paged_detach;
+#[cfg(test)]
+#[path = "cache/paged_turbo_tests.rs"]
+mod paged_turbo_tests;
+#[cfg(test)]
+#[path = "cache/sparse_v_tests.rs"]
+mod sparse_v_tests;
 pub mod turbo;
 #[cfg(test)]
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
-#[cfg(test)]
-#[path = "cache/sparse_v_tests.rs"]
-mod sparse_v_tests;
-#[cfg(test)]
-#[path = "cache/paged_turbo_tests.rs"]
-mod paged_turbo_tests;
 
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
@@ -284,6 +284,14 @@ pub struct KVCache {
     pub(crate) v_packed: Option<UniquePtr<MlxArray>>,
     // Turbo4Asym/Turbo4-mode V-side per-token norms: [B, H, L, 1] fp16
     pub(crate) v_norms: Option<UniquePtr<MlxArray>>,
+    // Turbo4-V precomputed kernel rescale `norm[t] / |y_hat[t]|` (issue #520).
+    // Same `[B, H, L, 1]` fp16 shape as `v_norms` and slice/concat/trimmed
+    // lockstep with it. Populated only on Turbo4Asym / Turbo4 / Turbo4Delegated
+    // updates — Turbo3Asym leaves this `None` because the 3-bit V kernel does
+    // not exist. Consumed by `attention_sparse_v_turbo4_fused` to skip the
+    // per-cache-token threadgroup tree reduction that previously dominated
+    // decode latency at 4 K context (PR #519 A/B; issue #520).
+    pub(crate) v_rescale: Option<UniquePtr<MlxArray>>,
     // Turbo4-mode (symmetric) K-side packed indices: [B, H, L, head_dim/2] u8
     pub(crate) k_packed: Option<UniquePtr<MlxArray>>,
     // Turbo4-mode (symmetric) K-side per-token norms: [B, H, L, 1] fp16
@@ -337,6 +345,7 @@ impl KVCache {
             val_scales: None,
             v_packed: None,
             v_norms: None,
+            v_rescale: None,
             k_packed: None,
             k_norms: None,
             turbo_params: None,
@@ -381,6 +390,7 @@ impl KVCache {
             val_scales: None,
             v_packed: None,
             v_norms: None,
+            v_rescale: None,
             k_packed: None,
             k_norms: None,
             turbo_params: None,
@@ -698,7 +708,8 @@ impl KVCache {
             .as_ref()
             .expect("turbo_params just initialised");
 
-        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&new_values_f16, params);
+        let (v_packed_new, v_norms_new, v_rescale_new) =
+            turbo::quant::quantize_v_turbo4(&new_values_f16, params);
 
         let key_shape = ffi::array_shape(&new_keys_f16);
         let new_seq_len = key_shape[2];
@@ -709,6 +720,7 @@ impl KVCache {
             self.keys = Some(ffi::contiguous(&new_keys_f16, false));
             self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
             self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            self.v_rescale = Some(ffi::contiguous(&v_rescale_new, false));
             self.offset = new_seq_len;
             return;
         }
@@ -725,6 +737,7 @@ impl KVCache {
             let new_k_buf = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::FLOAT16);
             let new_vp_buf = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
             let new_vn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            let new_vr_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
 
             if self.keys.is_some() {
                 if prev % self.step != 0 {
@@ -743,14 +756,23 @@ impl KVCache {
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev, 1],
                     ));
+                    if let Some(ref vr) = self.v_rescale {
+                        self.v_rescale =
+                            Some(ffi::slice(vr, &[0, 0, 0, 0], &[b, n_kv_heads, prev, 1]));
+                    }
                 }
                 self.keys = Some(concatenate(self.keys.as_ref().unwrap(), &new_k_buf, 2));
                 self.v_packed = Some(concatenate(self.v_packed.as_ref().unwrap(), &new_vp_buf, 2));
                 self.v_norms = Some(concatenate(self.v_norms.as_ref().unwrap(), &new_vn_buf, 2));
+                self.v_rescale = match self.v_rescale.as_ref() {
+                    Some(vr) => Some(concatenate(vr, &new_vr_buf, 2)),
+                    None => Some(new_vr_buf),
+                };
             } else {
                 self.keys = Some(new_k_buf);
                 self.v_packed = Some(new_vp_buf);
                 self.v_norms = Some(new_vn_buf);
+                self.v_rescale = Some(new_vr_buf);
             }
         }
 
@@ -777,6 +799,17 @@ impl KVCache {
             &v_norms_new,
             &[0, 0, prev, 0],
             &[vn_shape[0], vn_shape[1], self.offset, 1],
+        ));
+        let vr_buf = self
+            .v_rescale
+            .as_ref()
+            .expect("v_rescale lockstep with v_norms");
+        let vr_shape = ffi::array_shape(vr_buf);
+        self.v_rescale = Some(ffi::slice_update(
+            vr_buf,
+            &v_rescale_new,
+            &[0, 0, prev, 0],
+            &[vr_shape[0], vr_shape[1], self.offset, 1],
         ));
     }
 
@@ -958,7 +991,8 @@ impl KVCache {
             .expect("turbo_params just initialised");
 
         let (k_packed_new, k_norms_new) = turbo::quant::quantize_k_turbo4(&new_keys_f16, params);
-        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&new_values_f16, params);
+        let (v_packed_new, v_norms_new, v_rescale_new) =
+            turbo::quant::quantize_v_turbo4(&new_values_f16, params);
 
         let key_shape = ffi::array_shape(&new_keys_f16);
         let new_seq_len = key_shape[2];
@@ -971,6 +1005,7 @@ impl KVCache {
             self.k_norms = Some(ffi::contiguous(&k_norms_new, false));
             self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
             self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            self.v_rescale = Some(ffi::contiguous(&v_rescale_new, false));
             self.offset = new_seq_len;
             return;
         }
@@ -988,6 +1023,7 @@ impl KVCache {
             let new_kn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
             let new_vp_buf = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
             let new_vn_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            let new_vr_buf = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
 
             if self.k_packed.is_some() {
                 if prev % self.step != 0 {
@@ -1011,16 +1047,25 @@ impl KVCache {
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev, 1],
                     ));
+                    if let Some(ref vr) = self.v_rescale {
+                        self.v_rescale =
+                            Some(ffi::slice(vr, &[0, 0, 0, 0], &[b, n_kv_heads, prev, 1]));
+                    }
                 }
                 self.k_packed = Some(concatenate(self.k_packed.as_ref().unwrap(), &new_kp_buf, 2));
                 self.k_norms = Some(concatenate(self.k_norms.as_ref().unwrap(), &new_kn_buf, 2));
                 self.v_packed = Some(concatenate(self.v_packed.as_ref().unwrap(), &new_vp_buf, 2));
                 self.v_norms = Some(concatenate(self.v_norms.as_ref().unwrap(), &new_vn_buf, 2));
+                self.v_rescale = match self.v_rescale.as_ref() {
+                    Some(vr) => Some(concatenate(vr, &new_vr_buf, 2)),
+                    None => Some(new_vr_buf),
+                };
             } else {
                 self.k_packed = Some(new_kp_buf);
                 self.k_norms = Some(new_kn_buf);
                 self.v_packed = Some(new_vp_buf);
                 self.v_norms = Some(new_vn_buf);
+                self.v_rescale = Some(new_vr_buf);
             }
         }
 
@@ -1054,6 +1099,17 @@ impl KVCache {
             &v_norms_new,
             &[0, 0, prev, 0],
             &[vn_shape[0], vn_shape[1], self.offset, 1],
+        ));
+        let vr_buf = self
+            .v_rescale
+            .as_ref()
+            .expect("v_rescale lockstep with v_norms");
+        let vr_shape = ffi::array_shape(vr_buf);
+        self.v_rescale = Some(ffi::slice_update(
+            vr_buf,
+            &v_rescale_new,
+            &[0, 0, prev, 0],
+            &[vr_shape[0], vr_shape[1], self.offset, 1],
         ));
     }
 
@@ -1272,10 +1328,17 @@ impl KVCache {
             .turbo_params
             .as_ref()
             .expect("turbo_params just initialised");
-        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(&hot_v_slice, params);
+        let (v_packed_new, v_norms_new, v_rescale_new) =
+            turbo::quant::quantize_v_turbo4(&hot_v_slice, params);
 
         // Append the produced cold buffers (cold is empty before the full fold).
-        self.append_cold_block(&hot_k_slice, &v_packed_new, &v_norms_new, prev_hot);
+        self.append_cold_block(
+            &hot_k_slice,
+            &v_packed_new,
+            &v_norms_new,
+            &v_rescale_new,
+            prev_hot,
+        );
 
         // Reset the hot buffer to a freshly-allocated ring sized for the
         // configured hot_threshold (rounded up to step).
@@ -1313,7 +1376,10 @@ impl KVCache {
         }
 
         let hot_k = self.keys.as_ref().expect("hot keys must exist for fold");
-        let hot_v = self.values.as_ref().expect("hot values must exist for fold");
+        let hot_v = self
+            .values
+            .as_ref()
+            .expect("hot values must exist for fold");
         let hk_shape = ffi::array_shape(hot_k);
         let hv_shape = ffi::array_shape(hot_v);
         let b = hk_shape[0];
@@ -1322,20 +1388,12 @@ impl KVCache {
         let v_head_dim = hv_shape[3];
 
         // Slice the [0:block] window — these are the oldest hot tokens.
-        let hot_k_old = ffi::slice(
-            hot_k,
-            &[0, 0, 0, 0],
-            &[b, n_kv_heads, block, k_head_dim],
-        );
-        let hot_v_old = ffi::slice(
-            hot_v,
-            &[0, 0, 0, 0],
-            &[b, n_kv_heads, block, v_head_dim],
-        );
+        let hot_k_old = ffi::slice(hot_k, &[0, 0, 0, 0], &[b, n_kv_heads, block, k_head_dim]);
+        let hot_v_old = ffi::slice(hot_v, &[0, 0, 0, 0], &[b, n_kv_heads, block, v_head_dim]);
 
         // Quantize V; K stays FP16. Inline the `turbo_params` lookup so the
         // immutable borrow ends before `append_cold_block` (which takes `&mut self`).
-        let (v_packed_new, v_norms_new) = turbo::quant::quantize_v_turbo4(
+        let (v_packed_new, v_norms_new, v_rescale_new) = turbo::quant::quantize_v_turbo4(
             &hot_v_old,
             self.turbo_params
                 .as_ref()
@@ -1367,7 +1425,13 @@ impl KVCache {
 
         // Append into cold storage (which is non-empty here — prefix already
         // populated by the full fold).
-        self.append_cold_block(&hot_k_old, &v_packed_new, &v_norms_new, block);
+        self.append_cold_block(
+            &hot_k_old,
+            &v_packed_new,
+            &v_norms_new,
+            &v_rescale_new,
+            block,
+        );
 
         // Shift the remaining hot tail [block..prev_hot] left into
         // [0..prev_hot-block] so subsequent slice-updates see contiguous
@@ -1395,8 +1459,10 @@ impl KVCache {
     ///
     /// Inputs are the freshly-prepared cold tensors:
     /// - `cold_k_block`: `[B, H, block, K_dim]` fp16 — to be appended to `cold_keys`.
-    /// - `v_packed_block`: `[B, H, block, V_dim/2]` u8 — appended to `v_packed`.
-    /// - `v_norms_block`:  `[B, H, block, 1]` fp16 — appended to `v_norms`.
+    /// - `v_packed_block`:  `[B, H, block, V_dim/2]` u8   — appended to `v_packed`.
+    /// - `v_norms_block`:   `[B, H, block, 1]`      fp16  — appended to `v_norms`.
+    /// - `v_rescale_block`: `[B, H, block, 1]`      fp16  — appended to `v_rescale`
+    ///   (issue #520; precomputed Sparse-V kernel rescale, lockstep with `v_norms`).
     ///
     /// Updates `cold_offset` by `block`. Used by both the full prefill→decode
     /// fold and the steady-state per-block fold.
@@ -1405,6 +1471,7 @@ impl KVCache {
         cold_k_block: &MlxArray,
         v_packed_block: &MlxArray,
         v_norms_block: &MlxArray,
+        v_rescale_block: &MlxArray,
         block: i32,
     ) {
         let k_shape = ffi::array_shape(cold_k_block);
@@ -1436,6 +1503,7 @@ impl KVCache {
             let new_ck = ffi::zeros(&[b, n_kv_heads, buf_size, k_head_dim], dtype::FLOAT16);
             let new_vp = ffi::zeros(&[b, n_kv_heads, buf_size, v_packed_dim], dtype::UINT8);
             let new_vn = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
+            let new_vr = ffi::zeros(&[b, n_kv_heads, buf_size, 1], dtype::FLOAT16);
             if let Some(old_ck) = self.cold_keys.as_ref() {
                 if prev_cold > 0 {
                     let old_ck_slice = ffi::slice(
@@ -1450,11 +1518,12 @@ impl KVCache {
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev_cold, v_packed_dim],
                     );
-                    let old_vn_slice = ffi::slice(
-                        old_vn,
-                        &[0, 0, 0, 0],
-                        &[b, n_kv_heads, prev_cold, 1],
-                    );
+                    let old_vn_slice =
+                        ffi::slice(old_vn, &[0, 0, 0, 0], &[b, n_kv_heads, prev_cold, 1]);
+                    let old_vr_slice = self
+                        .v_rescale
+                        .as_ref()
+                        .map(|vr| ffi::slice(vr, &[0, 0, 0, 0], &[b, n_kv_heads, prev_cold, 1]));
                     self.cold_keys = Some(ffi::slice_update(
                         &new_ck,
                         &old_ck_slice,
@@ -1473,15 +1542,26 @@ impl KVCache {
                         &[0, 0, 0, 0],
                         &[b, n_kv_heads, prev_cold, 1],
                     ));
+                    self.v_rescale = Some(match old_vr_slice {
+                        Some(s) => ffi::slice_update(
+                            &new_vr,
+                            &s,
+                            &[0, 0, 0, 0],
+                            &[b, n_kv_heads, prev_cold, 1],
+                        ),
+                        None => new_vr,
+                    });
                 } else {
                     self.cold_keys = Some(new_ck);
                     self.v_packed = Some(new_vp);
                     self.v_norms = Some(new_vn);
+                    self.v_rescale = Some(new_vr);
                 }
             } else {
                 self.cold_keys = Some(new_ck);
                 self.v_packed = Some(new_vp);
                 self.v_norms = Some(new_vn);
+                self.v_rescale = Some(new_vr);
             }
         }
 
@@ -1510,6 +1590,17 @@ impl KVCache {
             v_norms_block,
             &[0, 0, prev_cold, 0],
             &[vn_buf_shape[0], vn_buf_shape[1], after, 1],
+        ));
+        let vr_buf = self
+            .v_rescale
+            .as_ref()
+            .expect("v_rescale lockstep with v_norms in append_cold_block");
+        let vr_buf_shape = ffi::array_shape(vr_buf);
+        self.v_rescale = Some(ffi::slice_update(
+            vr_buf,
+            v_rescale_block,
+            &[0, 0, prev_cold, 0],
+            &[vr_buf_shape[0], vr_buf_shape[1], after, 1],
         ));
 
         self.cold_offset += block;
@@ -1554,6 +1645,7 @@ impl KVCache {
             self.val_scales = None;
             self.v_packed = None;
             self.v_norms = None;
+            self.v_rescale = None;
             self.k_packed = None;
             self.k_norms = None;
             self.cold_keys = None;
@@ -1614,6 +1706,14 @@ impl KVCache {
                         vn,
                         &[0, 0, 0, 0],
                         &[vn_shape[0], vn_shape[1], self.cold_offset, 1],
+                    ));
+                }
+                if let Some(ref vr) = self.v_rescale {
+                    let vr_shape = ffi::array_shape(vr);
+                    self.v_rescale = Some(ffi::slice(
+                        vr,
+                        &[0, 0, 0, 0],
+                        &[vr_shape[0], vr_shape[1], self.cold_offset, 1],
                     ));
                 }
             }
@@ -1682,6 +1782,17 @@ impl KVCache {
                         vn,
                         &[0, 0, 0, 0],
                         &[vn_shape[0], vn_shape[1], self.offset, 1],
+                    ));
+                }
+                // v_rescale (issue #520): tracks v_norms lockstep. Turbo3Asym
+                // never populates v_rescale (3-bit V kernel does not exist),
+                // so the `if let Some(...)` guard handles that case.
+                if let Some(ref vr) = self.v_rescale {
+                    let vr_shape = ffi::array_shape(vr);
+                    self.v_rescale = Some(ffi::slice(
+                        vr,
+                        &[0, 0, 0, 0],
+                        &[vr_shape[0], vr_shape[1], self.offset, 1],
                     ));
                 }
             }
@@ -1941,6 +2052,7 @@ impl KVCache {
         let vs_bytes = self.val_scales.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let vp_bytes = self.v_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let vn_bytes = self.v_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
+        let vr_bytes = self.v_rescale.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kp_bytes = self.k_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kn_bytes = self.k_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let ck_bytes = self.cold_keys.as_ref().map_or(0, |c| ffi::array_nbytes(c));
@@ -1950,6 +2062,7 @@ impl KVCache {
             + vs_bytes
             + vp_bytes
             + vn_bytes
+            + vr_bytes
             + kp_bytes
             + kn_bytes
             + ck_bytes
@@ -1995,6 +2108,17 @@ impl KVCache {
     /// Borrow the per-token V norms paired with [`Self::v_packed`].
     pub fn v_norms(&self) -> Option<&MlxArray> {
         self.v_norms.as_deref()
+    }
+
+    /// Borrow the per-token V Sparse-V kernel rescale paired with
+    /// [`Self::v_packed`] (issue #520).
+    ///
+    /// Stores `norm[t] / max(|y_hat[t]|, 1e-10)` in fp16 — the exact value the
+    /// fused kernel previously derived per-token via a threadgroup tree
+    /// reduction. Populated by Turbo4Asym / Turbo4 / Turbo4Delegated update
+    /// paths; `None` for non-Turbo4 modes.
+    pub fn v_rescale(&self) -> Option<&MlxArray> {
+        self.v_rescale.as_deref()
     }
 
     /// Borrow the cached `TurboQuantParams` (sign vectors + codebook).
@@ -2098,21 +2222,24 @@ impl KVCache {
         }
         let v_packed_buf = self.v_packed()?;
         let v_norms_buf = self.v_norms()?;
+        let v_rescale_buf = self.v_rescale()?;
         let params = self.turbo_params()?;
         let threshold = turbo::sparse_v::threshold();
 
         // Slice the packed V buffers down to the visible token range. The
-        // raw `v_packed`/`v_norms` accessors return the full buffer, which
-        // includes pre-allocated capacity beyond `self.offset`. Without the
-        // slice the kernel would sweep `Tk = buffer_seq_len`, paying for
-        // dead capacity slots and producing wrong contributions.
+        // raw `v_packed`/`v_norms`/`v_rescale` accessors return the full
+        // buffer, which includes pre-allocated capacity beyond `self.offset`.
+        // Without the slice the kernel would sweep `Tk = buffer_seq_len`,
+        // paying for dead capacity slots and producing wrong contributions.
         //
         // For Turbo4Asym the packed shapes are:
-        //   v_packed: [B, H, capacity, D/2] u8
-        //   v_norms:  [B, H, capacity, 1]   f16
+        //   v_packed:  [B, H, capacity, D/2] u8
+        //   v_norms:   [B, H, capacity, 1]   f16
+        //   v_rescale: [B, H, capacity, 1]   f16  (issue #520)
         // We slice axis 2 (the token axis) to [0, self.offset).
         let vp_shape = ffi::array_shape(v_packed_buf);
         let vn_shape = ffi::array_shape(v_norms_buf);
+        let vr_shape = ffi::array_shape(v_rescale_buf);
         let v_packed_owned = ffi::slice(
             v_packed_buf,
             &[0, 0, 0, 0],
@@ -2123,16 +2250,27 @@ impl KVCache {
             &[0, 0, 0, 0],
             &[vn_shape[0], vn_shape[1], self.offset, 1],
         );
+        let v_rescale_owned = ffi::slice(
+            v_rescale_buf,
+            &[0, 0, 0, 0],
+            &[vr_shape[0], vr_shape[1], self.offset, 1],
+        );
 
-        // Prefer the fused Metal kernel path (issue #505) when available.
-        // Falls through to the graph-level reference path on non-macOS, when
-        // the kernel is disabled via `MLXCEL_SPARSE_V_KERNEL=0`, or when the
-        // model uses a non-power-of-2 head_dim (Gemma 4 192-dim heads).
+        // Prefer the fused Metal kernel path (issue #505 + #520) when
+        // available. Falls through to the graph-level reference path on
+        // non-macOS, when the kernel is disabled via
+        // `MLXCEL_SPARSE_V_KERNEL=0`, or when the model uses a non-power-of-2
+        // head_dim (Gemma 4 192-dim heads).
+        //
+        // The fused kernel reads the precomputed `v_rescale` (norm/|y_hat|)
+        // directly, eliminating the per-token threadgroup tree reduction
+        // that previously dominated decode latency on M5 Max at 4 K context
+        // (issue #520). The graph fallback continues to use `v_norms` only.
         if let Some(out) = turbo::sparse_v::attention_sparse_v_turbo4_fused(
             q,
             k,
             &v_packed_owned,
-            &v_norms_owned,
+            &v_rescale_owned,
             params,
             scale,
             mask,
@@ -2236,6 +2374,10 @@ pub struct RotatingKVCache {
     pub(crate) v_packed: Option<UniquePtr<MlxArray>>,
     /// Turbo4Asym-mode V-side per-token norms: `[B, H, max_size, 1]` fp16.
     pub(crate) v_norms: Option<UniquePtr<MlxArray>>,
+    /// Turbo4-V precomputed Sparse-V kernel rescale `norm[t] / |y_hat[t]|`
+    /// (issue #520). Same shape and lockstep lifecycle as `v_norms`. See the
+    /// dense `KVCache::v_rescale` docs for the rationale.
+    pub(crate) v_rescale: Option<UniquePtr<MlxArray>>,
     /// Cached PolarQuant params (sign vectors + codebook) for Turbo4Asym.
     /// Lazily initialised on the first Turbo4 update once V `head_dim` is
     /// known; deterministic given `turbo_seed` so detach/adopt round-trips
@@ -2295,6 +2437,7 @@ impl RotatingKVCache {
             val_scales: None,
             v_packed: None,
             v_norms: None,
+            v_rescale: None,
             turbo_params: None,
             turbo_seed,
         }
@@ -2338,9 +2481,7 @@ impl RotatingKVCache {
                 // if mis-configured. A future sub-issue can wire INT8 in.
                 self.update_and_fetch_fp16(new_keys, new_values)
             }
-            KVCacheMode::Turbo4Asym => {
-                self.update_and_fetch_turbo4_asym(new_keys, new_values)
-            }
+            KVCacheMode::Turbo4Asym => self.update_and_fetch_turbo4_asym(new_keys, new_values),
             KVCacheMode::Turbo4 => {
                 // Symmetric Turbo4 (issue #476) is not wired into RotatingKVCache
                 // by B9 / issue #481 (RotatingKVCache currently supports only
@@ -2618,13 +2759,19 @@ impl RotatingKVCache {
             .turbo_params
             .as_ref()
             .expect("turbo_params just initialised");
-        let (v_packed_new, v_norms_new) =
+        let (v_packed_new, v_norms_new, v_rescale_new) =
             turbo::quant::quantize_v_turbo4(&new_values_f16, params);
 
         if new_seq_len > 1 {
-            self.update_turbo4_concat(new_keys_f16, v_packed_new, v_norms_new, new_seq_len)
+            self.update_turbo4_concat(
+                new_keys_f16,
+                v_packed_new,
+                v_norms_new,
+                v_rescale_new,
+                new_seq_len,
+            )
         } else {
-            self.update_turbo4_in_place(new_keys_f16, v_packed_new, v_norms_new)
+            self.update_turbo4_in_place(new_keys_f16, v_packed_new, v_norms_new, v_rescale_new)
         }
     }
 
@@ -2636,6 +2783,7 @@ impl RotatingKVCache {
         new_keys_f16: UniquePtr<MlxArray>,
         v_packed_new: UniquePtr<MlxArray>,
         v_norms_new: UniquePtr<MlxArray>,
+        v_rescale_new: UniquePtr<MlxArray>,
         new_seq_len: i32,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         // First update: just install (Same shape semantics as Fp16 path.)
@@ -2645,6 +2793,7 @@ impl RotatingKVCache {
             self.keys = Some(ffi::contiguous(&new_keys_f16, false));
             self.v_packed = Some(ffi::contiguous(&v_packed_new, false));
             self.v_norms = Some(ffi::contiguous(&v_norms_new, false));
+            self.v_rescale = Some(ffi::contiguous(&v_rescale_new, false));
             // Build fp16 V output by dequantizing the packed slice we just stored.
             let params = self
                 .turbo_params
@@ -2662,6 +2811,10 @@ impl RotatingKVCache {
         let concat_k = concatenate(self.keys.as_ref().unwrap(), &new_keys_f16, 2);
         let concat_vp = concatenate(self.v_packed.as_ref().unwrap(), &v_packed_new, 2);
         let concat_vn = concatenate(self.v_norms.as_ref().unwrap(), &v_norms_new, 2);
+        let concat_vr = match self.v_rescale.as_ref() {
+            Some(vr) => concatenate(vr, &v_rescale_new, 2),
+            None => ffi::contiguous(&v_rescale_new, false),
+        };
 
         let total_len = current_seq_len + new_seq_len;
         self.offset += new_seq_len;
@@ -2686,10 +2839,16 @@ impl RotatingKVCache {
                 &[0, 0, start, 0],
                 &[i32::MAX, i32::MAX, total_len, i32::MAX],
             );
+            let vr = ffi::slice(
+                &concat_vr,
+                &[0, 0, start, 0],
+                &[i32::MAX, i32::MAX, total_len, i32::MAX],
+            );
             self.idx = self.max_size;
             self.keys = Some(ffi::contiguous(&k, false));
             self.v_packed = Some(ffi::contiguous(&vp, false));
             self.v_norms = Some(ffi::contiguous(&vn, false));
+            self.v_rescale = Some(ffi::contiguous(&vr, false));
             let params = self
                 .turbo_params
                 .as_ref()
@@ -2701,12 +2860,12 @@ impl RotatingKVCache {
             self.keys = Some(ffi::contiguous(&concat_k, false));
             self.v_packed = Some(ffi::contiguous(&concat_vp, false));
             self.v_norms = Some(ffi::contiguous(&concat_vn, false));
+            self.v_rescale = Some(ffi::contiguous(&concat_vr, false));
             let params = self
                 .turbo_params
                 .as_ref()
                 .expect("turbo_params populated by caller");
-            let v_out =
-                turbo::quant::dequantize_v_turbo4(&concat_vp, &concat_vn, params);
+            let v_out = turbo::quant::dequantize_v_turbo4(&concat_vp, &concat_vn, params);
             (concat_k, v_out)
         }
     }
@@ -2721,6 +2880,7 @@ impl RotatingKVCache {
         new_keys_f16: UniquePtr<MlxArray>,
         v_packed_new: UniquePtr<MlxArray>,
         v_norms_new: UniquePtr<MlxArray>,
+        v_rescale_new: UniquePtr<MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         // First-call init mirrors the FP16 path: pre-allocate the ring buffer.
         if self.keys.is_none() {
@@ -2735,11 +2895,9 @@ impl RotatingKVCache {
                 &[batch, heads, self.max_size, head_dim],
                 ffi::array_dtype(&new_keys_f16),
             );
-            let vp_zeros = ffi::zeros(
-                &[batch, heads, self.max_size, v_packed_dim],
-                dtype::UINT8,
-            );
+            let vp_zeros = ffi::zeros(&[batch, heads, self.max_size, v_packed_dim], dtype::UINT8);
             let vn_zeros = ffi::zeros(&[batch, heads, self.max_size, 1], dtype::FLOAT16);
+            let vr_zeros = ffi::zeros(&[batch, heads, self.max_size, 1], dtype::FLOAT16);
 
             let k = ffi::slice_update(
                 &k_zeros,
@@ -2759,12 +2917,19 @@ impl RotatingKVCache {
                 &[0, 0, 0, 0],
                 &[batch, heads, 1, 1],
             );
+            let vr = ffi::slice_update(
+                &vr_zeros,
+                &v_rescale_new,
+                &[0, 0, 0, 0],
+                &[batch, heads, 1, 1],
+            );
 
             self.offset = 1;
             self.idx = 1;
             self.keys = Some(ffi::contiguous(&k, false));
             self.v_packed = Some(ffi::contiguous(&vp, false));
             self.v_norms = Some(ffi::contiguous(&vn, false));
+            self.v_rescale = Some(ffi::contiguous(&vr, false));
 
             // Build the FP16 V view from the single packed token.
             let params = self
@@ -2781,6 +2946,10 @@ impl RotatingKVCache {
         let mut k_buffer = self.keys.take().unwrap();
         let mut vp_buffer = self.v_packed.take().unwrap();
         let mut vn_buffer = self.v_norms.take().unwrap();
+        let mut vr_buffer = self
+            .v_rescale
+            .take()
+            .expect("v_rescale lockstep with v_norms in rotating cache");
 
         let shape = ffi::array_shape(&k_buffer);
         let batch = shape[0];
@@ -2800,14 +2969,13 @@ impl RotatingKVCache {
                     &[batch, heads, grow_by, head_dim],
                     ffi::array_dtype(&new_keys_f16),
                 );
-                let vp_zeros = ffi::zeros(
-                    &[batch, heads, grow_by, v_packed_dim],
-                    dtype::UINT8,
-                );
+                let vp_zeros = ffi::zeros(&[batch, heads, grow_by, v_packed_dim], dtype::UINT8);
                 let vn_zeros = ffi::zeros(&[batch, heads, grow_by, 1], dtype::FLOAT16);
+                let vr_zeros = ffi::zeros(&[batch, heads, grow_by, 1], dtype::FLOAT16);
                 k_buffer = concatenate(&k_buffer, &k_zeros, 2);
                 vp_buffer = concatenate(&vp_buffer, &vp_zeros, 2);
                 vn_buffer = concatenate(&vn_buffer, &vn_zeros, 2);
+                vr_buffer = concatenate(&vr_buffer, &vr_zeros, 2);
             }
         }
 
@@ -2836,6 +3004,12 @@ impl RotatingKVCache {
             &[0, 0, pos, 0],
             &[batch, heads, pos + 1, 1],
         );
+        let vr_buffer = ffi::slice_update(
+            &vr_buffer,
+            &v_rescale_new,
+            &[0, 0, pos, 0],
+            &[batch, heads, pos + 1, 1],
+        );
 
         self.offset += 1;
         self.idx += 1;
@@ -2847,11 +3021,7 @@ impl RotatingKVCache {
             .expect("turbo_params populated by caller");
         let result = if self.offset < self.max_size {
             let visible = self.offset;
-            let k_out = ffi::slice(
-                &k_buffer,
-                &[0, 0, 0, 0],
-                &[batch, heads, visible, head_dim],
-            );
+            let k_out = ffi::slice(&k_buffer, &[0, 0, 0, 0], &[batch, heads, visible, head_dim]);
             let vp_view = ffi::slice(
                 &vp_buffer,
                 &[0, 0, 0, 0],
@@ -2870,6 +3040,7 @@ impl RotatingKVCache {
         self.keys = Some(k_buffer);
         self.v_packed = Some(vp_buffer);
         self.v_norms = Some(vn_buffer);
+        self.v_rescale = Some(vr_buffer);
         result
     }
 

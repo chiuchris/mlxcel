@@ -241,12 +241,36 @@ pub fn generate_signs(len: usize, seed: u32) -> Arc<[f32]> {
 /// `signs1` / `signs2` must have length `params.head_dim`. The packed result
 /// is shape `[B, H, T, D/2]` u8 (low nibble = even coord, high nibble = odd
 /// coord); the norm tensor is shape `[B, H, T, 1]` fp16.
+///
+/// # Returns (issue #520, fused Sparse-V kernel rescale precompute)
+///
+/// `(v_packed, v_norms, v_rescale)` where the third element is a precomputed
+/// per-token rescale factor:
+///
+/// `v_rescale[b, h, t, 0] = norm[b, h, t] / max(|y_hat[b, h, t]|, 1e-10)`
+///
+/// where `|y_hat[b, h, t]| = sqrt(Σ_d codebook[indices[b, h, t, d]]²)` is the
+/// L2 norm of the centroid-gathered (pre-rotation) reconstruction. This value
+/// is identical to the inner `tg_norm[0] = vn / yh_safe` quantity computed
+/// per token by the previous fused kernel via a threadgroup tree reduction
+/// over `Dim` threads. Precomputing it at quantize time eliminates the
+/// per-cache-token threadgroup reduction (and its `log2(Dim) + 2` barrier
+/// chain) from the kernel hot path — see issue #520 for measurements.
+///
+/// V-side callers store `v_rescale` alongside `v_packed` / `v_norms` so the
+/// fused kernel (`turbo::sparse_v::attention_sparse_v_turbo4_fused`) can read
+/// it directly without recomputing. K-side callers discard the third element
+/// — K-side dequant has no kernel hot path that benefits from the precompute.
 fn quantize_into_packed(
     x: &MlxArray,
     params: &TurboQuantParams,
     signs1: &[f32],
     signs2: &[f32],
-) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+) -> (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+) {
     // Cast input to fp32 for stable norm + rotation arithmetic. The MLX WHT
     // op accepts fp32/fp16/bf16; fp32 keeps the centroid lookup
     // well-conditioned even for very small / very large magnitudes.
@@ -356,22 +380,86 @@ fn quantize_into_packed(
     //    (not safe_norm) is what the dequantize path consumes.
     let v_norms = ffi::astype(&norm_full, dtype::FLOAT16);
 
-    (v_packed, v_norms)
+    // 6. Precompute the per-token rescale factor `norm[t] / max(|y_hat|, eps)`
+    //    consumed by the fused Sparse-V kernel (issue #520). The previous
+    //    kernel implementation derived this on-GPU per token via a
+    //    `log2(Dim) + 2`-barrier threadgroup tree reduction, which dominated
+    //    decode latency on M5 Max at 4 K context for `turbo4-asym` (the kernel
+    //    was 2.0× slower than the graph fallback in PR #519's A/B). Because
+    //    `|y_hat|` is a pure function of the packed indices and the codebook
+    //    — both fixed at quantize time — we can compute it once here on the
+    //    host and store the resulting fp16 scalar alongside `v_norms`.
+    //
+    //    Algorithm (per token t):
+    //      sum_sq = Σ_d codebook[indices[t, d]]²
+    //      y_hat_norm = sqrt(sum_sq)
+    //      y_hat_safe = max(y_hat_norm, 1e-10)        (matches kernel guard)
+    //      rescale[t] = norm_full[t] / y_hat_safe
+    //
+    //    The 1e-10 guard mirrors the kernel-side `1e-10f` in
+    //    `sparse_v_sdpa.cpp` and the graph dequant's `eps` in
+    //    `dequantize_from_packed`, so kernel and graph paths see numerically
+    //    identical rescale values.
+    //
+    //    Since `norm_full` is still pending GPU evaluation at this point, we
+    //    materialize it back to host bytes alongside the rotated coordinates
+    //    we already read above. fp32 keeps the divide well-conditioned for
+    //    very small / very large magnitudes; the final cast to fp16 matches
+    //    the storage dtype.
+    ffi::eval(&norm_full);
+    let norm_bytes = ffi::array_to_raw_bytes(&norm_full);
+    debug_assert_eq!(
+        norm_bytes.len(),
+        total_tokens * 4,
+        "fp32 norm byte count mismatch"
+    );
+    let centroids = params.codebook.centroids.as_ref();
+    let mut rescale = vec![0.0_f32; total_tokens];
+    for (tok, slot) in rescale.iter_mut().enumerate() {
+        let idx_off = tok * coords_per_token;
+        let mut sum_sq = 0.0_f32;
+        for d_i in 0..coords_per_token {
+            let c = centroids[indices[idx_off + d_i] as usize];
+            sum_sq += c * c;
+        }
+        let y_hat_norm = sum_sq.sqrt();
+        let y_hat_safe = y_hat_norm.max(1e-10);
+        let norm_off = tok * 4;
+        let n_t = f32::from_le_bytes([
+            norm_bytes[norm_off],
+            norm_bytes[norm_off + 1],
+            norm_bytes[norm_off + 2],
+            norm_bytes[norm_off + 3],
+        ]);
+        *slot = n_t / y_hat_safe;
+    }
+    let v_rescale_f32 = ffi::from_slice_f32(&rescale, &[shape[0], shape[1], t, 1]);
+    let v_rescale = ffi::astype(&v_rescale_f32, dtype::FLOAT16);
+
+    (v_packed, v_norms, v_rescale)
 }
 
 /// Quantize a V tensor of shape `[B, H, T, D]` (D == `params.head_dim`) into
 /// the packed Turbo4 representation.
 ///
-/// Returns `(v_packed, v_norms)` where:
-/// - `v_packed`: `[B, H, T, D/2]` u8 — nibble-packed 4-bit indices.
-/// - `v_norms`:  `[B, H, T, 1]` fp16 — per-token L2 norm of the *original*
-///   V vector (used for rescaling on dequantize).
+/// Returns `(v_packed, v_norms, v_rescale)` where:
+/// - `v_packed`:  `[B, H, T, D/2]` u8  — nibble-packed 4-bit indices.
+/// - `v_norms`:   `[B, H, T, 1]`   fp16 — per-token L2 norm of the *original*
+///   V vector (used for rescaling on the graph dequantize path).
+/// - `v_rescale`: `[B, H, T, 1]`   fp16 — precomputed `norm[t] / |y_hat[t]|`
+///   used by the fused Sparse-V kernel (issue #520) to skip the per-token
+///   threadgroup tree reduction. See [`quantize_into_packed`] for details.
 ///
-/// Used by: `KVCache::update` (Turbo4Asym mode, Turbo4 mode).
+/// Used by: `KVCache::update` (Turbo4Asym mode, Turbo4 mode, Turbo4Delegated
+/// mode), `KVCache::sparse_v_attention` (consumes `v_rescale`).
 pub fn quantize_v_turbo4(
     v: &MlxArray,
     params: &TurboQuantParams,
-) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+) -> (
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+    UniquePtr<MlxArray>,
+) {
     quantize_into_packed(v, params, &params.signs1, &params.signs2)
 }
 
@@ -380,9 +468,12 @@ pub fn quantize_v_turbo4(
 /// resulting indices are statistically independent from any V-side
 /// quantization noise.
 ///
-/// Returns `(k_packed, k_norms)` analogous to [`quantize_v_turbo4`]. Storage
-/// layout matches the V-side path bit-for-bit, so the cache layer can reuse
-/// the same packing/unpacking helpers.
+/// Returns `(k_packed, k_norms)` analogous to [`quantize_v_turbo4`] but
+/// without the K-side rescale precompute — the symmetric-Turbo4 K-side has
+/// no analogue of the fused V-side kernel today (issue #476's K dequant runs
+/// on the standard graph path), so the precompute would be wasted work.
+/// Storage layout otherwise matches the V-side path bit-for-bit, so the cache
+/// layer can reuse the same packing/unpacking helpers.
 ///
 /// Used by: `KVCache::update` (Turbo4 symmetric mode, issue #476, epic
 /// #458).
@@ -390,7 +481,9 @@ pub fn quantize_k_turbo4(
     k: &MlxArray,
     params: &TurboQuantParams,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
-    quantize_into_packed(k, params, &params.k_signs1, &params.k_signs2)
+    let (k_packed, k_norms, _k_rescale) =
+        quantize_into_packed(k, params, &params.k_signs1, &params.k_signs2);
+    (k_packed, k_norms)
 }
 
 /// Shared core for [`dequantize_v_turbo4`] and [`dequantize_k_turbo4`].
@@ -552,7 +645,9 @@ pub fn dequantize_k_turbo4(
 #[doc(hidden)]
 pub fn turbo4_v_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<MlxArray> {
     let shape = ffi::array_shape(x);
-    let d = *shape.last().expect("turbo4_v_rotate: input must be at least 1-D") as usize;
+    let d = *shape
+        .last()
+        .expect("turbo4_v_rotate: input must be at least 1-D") as usize;
     assert_eq!(
         d, params.head_dim as usize,
         "turbo4_v_rotate: last dim ({d}) must match TurboQuantParams head_dim ({})",
@@ -723,7 +818,7 @@ mod tests {
             .collect();
         let x = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
 
-        let (v_packed, _) = quantize_v_turbo4(&x, &params);
+        let (v_packed, _, _) = quantize_v_turbo4(&x, &params);
         let (k_packed, _) = quantize_k_turbo4(&x, &params);
 
         let v_bytes = ffi::array_to_raw_bytes(&v_packed);
@@ -788,7 +883,7 @@ mod tests {
         }
         let v = ffi::from_slice_f32(&v_data, &[1, 1, 4, head_dim]);
 
-        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        let (packed, norms, _rescale) = quantize_v_turbo4(&v, &params);
         // Verify shapes
         let pshape = ffi::array_shape(&packed);
         assert_eq!(pshape, vec![1_i32, 1, 4, head_dim / 2]);
@@ -890,7 +985,7 @@ mod tests {
         }
 
         let v = ffi::from_slice_f32(&v_data, &[1, 1, n_tokens as i32, head_dim]);
-        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        let (packed, norms, _rescale) = quantize_v_turbo4(&v, &params);
         let v_hat = dequantize_v_turbo4(&packed, &norms, &params);
 
         let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
@@ -926,7 +1021,7 @@ mod tests {
         let head_dim: i32 = 64;
         let params = TurboQuantParams::new(head_dim as u32, 1);
         let v = ffi::zeros(&[1, 1, 1, head_dim], dtype::FLOAT32);
-        let (packed, norms) = quantize_v_turbo4(&v, &params);
+        let (packed, norms, _rescale) = quantize_v_turbo4(&v, &params);
         let v_hat = dequantize_v_turbo4(&packed, &norms, &params);
         let v_hat_f32 = ffi::astype(&v_hat, dtype::FLOAT32);
         ffi::eval(&v_hat_f32);
@@ -948,8 +1043,8 @@ mod tests {
 
         let v_data: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 32.0) * 0.05).collect();
         let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
-        let (p1, _) = quantize_v_turbo4(&v, &params1);
-        let (p2, _) = quantize_v_turbo4(&v, &params2);
+        let (p1, _, _) = quantize_v_turbo4(&v, &params1);
+        let (p2, _, _) = quantize_v_turbo4(&v, &params2);
         assert_eq!(ffi::array_to_raw_bytes(&p1), ffi::array_to_raw_bytes(&p2));
     }
 
@@ -966,7 +1061,7 @@ mod tests {
             .map(|i| (i as f32 / head_dim as f32) - 0.5)
             .collect();
         let v = ffi::from_slice_f32(&v_data, &[1, 1, 1, head_dim]);
-        let (packed, _) = quantize_v_turbo4(&v, &params);
+        let (packed, _, _) = quantize_v_turbo4(&v, &params);
         let bytes = ffi::array_to_raw_bytes(&packed);
         for &b in &bytes {
             let lo = b & 0x0F;
@@ -991,7 +1086,7 @@ mod tests {
             v_data.push(50.0 * ((k as f32).cos())); // large token
         }
         let v = ffi::from_slice_f32(&v_data, &[1, 1, 2, head_dim]);
-        let (_, norms) = quantize_v_turbo4(&v, &params);
+        let (_, norms, _) = quantize_v_turbo4(&v, &params);
         let norms_f32 = ffi::astype(&norms, dtype::FLOAT32);
         ffi::eval(&norms_f32);
         let bytes = ffi::array_to_raw_bytes(&norms_f32);

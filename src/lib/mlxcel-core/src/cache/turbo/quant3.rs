@@ -208,14 +208,15 @@ pub fn quantize_v_turbo3(
         1 << V_BIT_WIDTH_3,
         "Turbo3 codebook must have 8 centroids; got {n_centroids}"
     );
-    let indices_usize = nearest_centroid_indices_with_boundaries(
-        &coords,
-        &params.codebook.boundaries,
-        n_centroids,
-    );
+    let indices_usize =
+        nearest_centroid_indices_with_boundaries(&coords, &params.codebook.boundaries, n_centroids);
 
     // 4. Cast indices to u8 (each is in 0..8, fits trivially) and 24-bit-pack.
-    debug_assert_eq!(d % 8, 0, "head_dim must be a multiple of 8 for 3-bit packing");
+    debug_assert_eq!(
+        d % 8,
+        0,
+        "head_dim must be a multiple of 8 for 3-bit packing"
+    );
     let total_tokens = (shape[0] * shape[1] * t) as usize;
     let mut indices_u8 = Vec::with_capacity(indices_usize.len());
     for &idx in &indices_usize {

@@ -331,8 +331,7 @@ pub fn attention_sparse_v_turbo4(
     // Build alive mask if threshold > 0. When threshold == 0 every position
     // is alive and we skip the mask construction (zero overhead beyond the
     // explicit dequant + matmul).
-    let v_dequant =
-        super::quant::dequantize_v_turbo4(v_packed, v_norms, params); // [B, Hkv, Tk, D] f16
+    let v_dequant = super::quant::dequantize_v_turbo4(v_packed, v_norms, params); // [B, Hkv, Tk, D] f16
 
     let v_for_q = if threshold_value > 0.0 {
         let alive = compute_alive_mask(&attn_weights, kv_heads, threshold_value);
@@ -377,7 +376,7 @@ pub fn attention_sparse_v_turbo4(
     ffi::astype(&out_f32, dtype::FLOAT16)
 }
 
-/// Fused-skip Sparse-V SDPA path (issue #505).
+/// Fused-skip Sparse-V SDPA path (issue #505, optimized by issue #520).
 ///
 /// Drops the explicit `dequantize_v_turbo4` step in favour of the fused
 /// Metal kernel `turbo_sparse_v_weighted_sum`, which does the per-thread
@@ -389,22 +388,41 @@ pub fn attention_sparse_v_turbo4(
 /// `O(B · Hkv · Tk · D log D)` (graph path) to `O(B · Hq · Tq · D log D)`
 /// (kernel path), a Tk-vs-Tq factor — the source of the long-context speedup.
 ///
-/// # Inputs / outputs
+/// # Inputs
 ///
-/// Identical contract to [`attention_sparse_v_turbo4`].
+/// - `q`: `[B, Hq, Tq, D]` query tensor (FP16 or FP32).
+/// - `k`: `[B, Hkv, Tk, D]` key tensor (FP16) — Turbo4Asym keeps K in FP16.
+/// - `v_packed`: `[B, Hkv, Tk, D/2]` u8 — packed V indices.
+/// - `v_rescale`: `[B, Hkv, Tk, 1]` FP16 — precomputed per-token kernel
+///   rescale `norm[t] / max(|y_hat[t]|, 1e-10)`. Issue #520 moved this
+///   computation from a per-token threadgroup tree reduction inside the
+///   kernel to a one-time host-side precompute at quantize time. The
+///   value matches the kernel's previous on-the-fly `vn / yh_safe` exactly,
+///   so the kernel output is bit-for-bit unchanged within FP16 round-off.
+/// - `params`: `TurboQuantParams` used at quantize time (centroids + sign
+///   vectors + head_dim).
+/// - `scale`: attention scale (`1 / sqrt(D)` typically).
+/// - `mask`: optional additive attention mask.
+/// - `threshold_value`: alive cutoff. `0.0` disables skipping.
+///
+/// # Output
+///
+/// `Some([B, Hq, Tq, D])` FP16 attention output, identical shape and dtype
+/// contract to [`attention_sparse_v_turbo4`].
 ///
 /// # Platform gating
 ///
 /// Returns `None` when [`kernel_enabled`] is `false` (non-macOS or
 /// `MLXCEL_SPARSE_V_KERNEL=0`). Callers should fall back to
-/// [`attention_sparse_v_turbo4`] in that case.
+/// [`attention_sparse_v_turbo4`] (which still consumes `v_norms`) in that
+/// case.
 ///
 /// Used by: [`KVCache::sparse_v_attention`] (issue #505).
 pub fn attention_sparse_v_turbo4_fused(
     q: &MlxArray,
     k: &MlxArray,
     v_packed: &MlxArray,
-    v_norms: &MlxArray,
+    v_rescale: &MlxArray,
     params: &TurboQuantParams,
     scale: f32,
     mask: Option<&MlxArray>,
@@ -475,9 +493,11 @@ pub fn attention_sparse_v_turbo4_fused(
     let bhkv = b * kv_heads;
     let attn_flat = ffi::reshape(&attn_weights, &[bhq, tq, tk]);
     let v_packed_flat = ffi::reshape(v_packed, &[bhkv, tk, head_dim / 2]);
-    // v_norms graph shape is `[B, Hkv, Tk, 1]`. The kernel expects
+    // v_rescale graph shape is `[B, Hkv, Tk, 1]`. The kernel expects
     // `[B*Hkv, Tk]` — drop the trailing axis and flatten the first two.
-    let v_norms_flat = ffi::reshape(v_norms, &[bhkv, tk]);
+    // (Same memory layout as the previous `v_norms` plumbing; only the
+    // semantic content changed — see issue #520.)
+    let v_rescale_flat = ffi::reshape(v_rescale, &[bhkv, tk]);
     let codebook_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
     let codebook_arr = ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
 
@@ -485,7 +505,7 @@ pub fn attention_sparse_v_turbo4_fused(
     let out_pre_flat = ffi::turbo_sparse_v_weighted_sum(
         &attn_flat,
         &v_packed_flat,
-        &v_norms_flat,
+        &v_rescale_flat,
         &codebook_arr,
         head_dim,
         n_rep,

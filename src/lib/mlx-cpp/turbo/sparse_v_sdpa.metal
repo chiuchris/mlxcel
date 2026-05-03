@@ -13,7 +13,7 @@
 // limitations under the License.
 //
 // Reference Metal source for the fused Sparse-V SDPA weighted-sum kernel
-// (issue #505).
+// (issue #505; rescale precompute landed in #520).
 //
 // This file is a faithful copy of the source string embedded in
 // `sparse_v_sdpa.cpp`. Keeping it as a standalone .metal file makes it
@@ -36,7 +36,10 @@
 //
 // Inputs (per launch):
 //   weights     — [B*Hq, Tq, Tk] f32  : post-softmax attention weights
-//   norms       — [B*Hkv, Tk]    f16  : per-token V L2 norms
+//   rescale     — [B*Hkv, Tk]    f16  : precomputed `norm[t] / |y_hat[t]|`
+//                                       (issue #520; replaced the previous
+//                                       `norms` input + in-kernel tree
+//                                       reduction)
 //   packed      — [B*Hkv, Tk, D/2] u8 : nibble-packed V indices (2 per byte)
 //   codebook    — [16]           f32  : Lloyd-Max centroids
 //
@@ -49,11 +52,18 @@
 //   thread_position_in_grid.z = n        (0..B*Hq)  (one threadgroup per B*Hq)
 //   threadgroup size           = (Dim, 1, 1)
 //
-// Grouped attention: Hkv = Hq / NRep. The Q-head index is `n % Hq`, then
-// `bh_kv = (n / Hq) * Hkv + (n % Hq) / NRep`. This handles the case where
-// the caller pre-flattens `B*Hq` while the V-side data is laid out as
-// `B*Hkv`. Per-thread compute proceeds dim-by-dim over D, sweeping all Tq
-// tokens (RepeatCount) and accumulating the unrotated weighted sum.
+// Grouped attention: Hkv = Hq / NRep. The per-`n` Hkv slot is `n / NRep`.
+// Per-thread compute proceeds dim-by-dim over D, sweeping all Tq tokens
+// (RepeatCount) and accumulating the unrotated weighted sum.
+//
+// Issue #520 kernel-body change summary:
+//   - Removed `tg_y_hat[Dim]` shared scratch and `tg_norm[1]` broadcast.
+//   - Removed the `log2(Dim)`-step threadgroup tree reduction over `code²`.
+//   - Removed the `if (tg_d == 0) compute rescale; barrier; broadcast` chain.
+//   - Replaced with a single per-token `(float)rescale[t]` load. Each
+//     thread reads the same scalar; Apple's L1 / per-threadgroup cache
+//     coalesces the broadcast.
+// The kernel output is bit-for-bit unchanged within FP16 round-off.
 
 kernel void sparse_v_weighted_sum_kernel_reference(
     /* dummy declaration kept here so the file is syntactically a kernel

@@ -60,9 +60,8 @@ pub use codebook::{
     optimal_centroids, optimal_codebook, Codebook,
 };
 pub use quant::{
-    dequantize_k_turbo4, dequantize_v_turbo4, generate_signs, quantize_k_turbo4,
-    quantize_v_turbo4, turbo4_v_rotate, TurboQuantParams, BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET,
-    V_BIT_WIDTH,
+    dequantize_k_turbo4, dequantize_v_turbo4, generate_signs, quantize_k_turbo4, quantize_v_turbo4,
+    turbo4_v_rotate, TurboQuantParams, BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET, V_BIT_WIDTH,
 };
 
 /// Default hot-tail threshold for `KVCacheMode::Turbo4Delegated` (issue #479).

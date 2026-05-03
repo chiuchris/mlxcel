@@ -1541,14 +1541,20 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
     bool use_metal4
 );
 
-// Issue #505 — Fused Sparse-V SDPA Metal kernel launcher.
+// Issue #505 / #520 — Fused Sparse-V SDPA Metal kernel launcher.
 // Wraps `mlxcel::turbo::sparse_v_weighted_sum` so the cxx bridge can expose it
 // via the `turbo_sparse_v_weighted_sum` FFI symbol. Implementation lives in
 // `src/lib/mlx-cpp/turbo/sparse_v_sdpa.cpp`.
+//
+// `v_rescale` (4th argument) carries the precomputed per-token rescale
+// `norm[t] / |y_hat[t]|` introduced in issue #520. The previous kernel
+// computed this scalar per token via a threadgroup tree reduction; the
+// precompute moves that work to quantize time and removes the per-token
+// threadgroup barrier chain that dominated decode latency on M5 Max.
 std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
     const MlxArray& attn_weights,
     const MlxArray& v_packed,
-    const MlxArray& v_norms,
+    const MlxArray& v_rescale,
     const MlxArray& codebook,
     int32_t dim,
     int32_t n_rep,

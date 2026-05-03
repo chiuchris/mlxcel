@@ -108,6 +108,10 @@ pub struct DetachedKVCache {
     pub(super) val_scales: Option<UniquePtr<MlxArray>>,
     pub(super) v_packed: Option<UniquePtr<MlxArray>>,
     pub(super) v_norms: Option<UniquePtr<MlxArray>>,
+    /// Turbo4-V Sparse-V kernel rescale sidecar (issue #520). Lockstep with
+    /// `v_norms`; round-trips through detach/adopt so paged + prefix-cache
+    /// reuse paths preserve the precomputed rescale.
+    pub(super) v_rescale: Option<UniquePtr<MlxArray>>,
     pub(super) k_packed: Option<UniquePtr<MlxArray>>,
     pub(super) k_norms: Option<UniquePtr<MlxArray>>,
     pub(super) turbo_seed: u32,
@@ -138,10 +142,11 @@ impl DetachedKVCache {
         let vs = self.val_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vp = self.v_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        let vr = self.v_rescale.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kp = self.k_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let kn = self.k_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let ck = self.cold_keys.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn + kp + kn + ck
+        k + v + ks + vs + vp + vn + vr + kp + kn + ck
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
@@ -172,6 +177,7 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("has_val_scales", &self.val_scales.is_some())
             .field("has_v_packed", &self.v_packed.is_some())
             .field("has_v_norms", &self.v_norms.is_some())
+            .field("has_v_rescale", &self.v_rescale.is_some())
             .field("has_k_packed", &self.k_packed.is_some())
             .field("has_k_norms", &self.k_norms.is_some())
             .field("turbo_seed", &self.turbo_seed)
@@ -251,6 +257,7 @@ impl KVCache {
             val_scales: self.val_scales.take(),
             v_packed: self.v_packed.take(),
             v_norms: self.v_norms.take(),
+            v_rescale: self.v_rescale.take(),
             k_packed: self.k_packed.take(),
             k_norms: self.k_norms.take(),
             turbo_seed: self.turbo_seed,
@@ -291,6 +298,7 @@ impl KVCache {
         self.val_scales = detached.val_scales;
         self.v_packed = detached.v_packed;
         self.v_norms = detached.v_norms;
+        self.v_rescale = detached.v_rescale;
         self.k_packed = detached.k_packed;
         self.k_norms = detached.k_norms;
         self.turbo_seed = detached.turbo_seed;
@@ -368,6 +376,8 @@ pub struct DetachedRotatingKVCache {
     pub(super) val_scales: Option<UniquePtr<MlxArray>>,
     pub(super) v_packed: Option<UniquePtr<MlxArray>>,
     pub(super) v_norms: Option<UniquePtr<MlxArray>>,
+    /// Sparse-V rescale sidecar (issue #520) for rotating Turbo4Asym caches.
+    pub(super) v_rescale: Option<UniquePtr<MlxArray>>,
     pub(super) turbo_seed: u32,
 }
 
@@ -395,7 +405,8 @@ impl DetachedRotatingKVCache {
         let vs = self.val_scales.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vp = self.v_packed.as_ref().map_or(0, |a| ffi::array_nbytes(a));
         let vn = self.v_norms.as_ref().map_or(0, |a| ffi::array_nbytes(a));
-        k + v + ks + vs + vp + vn
+        let vr = self.v_rescale.as_ref().map_or(0, |a| ffi::array_nbytes(a));
+        k + v + ks + vs + vp + vn + vr
     }
 
     /// Whether the detached handle carries no data (all tensors were `None`).
@@ -416,6 +427,7 @@ impl std::fmt::Debug for DetachedRotatingKVCache {
             .field("has_values", &self.values.is_some())
             .field("has_v_packed", &self.v_packed.is_some())
             .field("has_v_norms", &self.v_norms.is_some())
+            .field("has_v_rescale", &self.v_rescale.is_some())
             .field("turbo_seed", &self.turbo_seed)
             .finish()
     }
@@ -447,6 +459,7 @@ impl RotatingKVCache {
             val_scales: self.val_scales.take(),
             v_packed: self.v_packed.take(),
             v_norms: self.v_norms.take(),
+            v_rescale: self.v_rescale.take(),
             turbo_seed: self.turbo_seed,
         };
         // Mirror `KVCache::clone_handle` (LOW-1 from #474): clear cached
@@ -466,14 +479,9 @@ impl RotatingKVCache {
     /// Block alignment: the adopted state is bit-identical to the source's,
     /// including `idx`. Because per-token Turbo4 quantization is independent
     /// across slots, no alignment-recovery work is needed at install time.
-    pub fn install_detached(
-        &mut self,
-        detached: DetachedRotatingKVCache,
-    ) -> Result<(), String> {
+    pub fn install_detached(&mut self, detached: DetachedRotatingKVCache) -> Result<(), String> {
         if !self.is_empty() {
-            return Err(
-                "RotatingKVCache::install_detached: target cache is not empty".into(),
-            );
+            return Err("RotatingKVCache::install_detached: target cache is not empty".into());
         }
         self.keys = detached.keys;
         self.values = detached.values;
@@ -486,6 +494,7 @@ impl RotatingKVCache {
         self.val_scales = detached.val_scales;
         self.v_packed = detached.v_packed;
         self.v_norms = detached.v_norms;
+        self.v_rescale = detached.v_rescale;
         self.turbo_seed = detached.turbo_seed;
         // Pre-build turbo_params from v_packed shape if available so the
         // first dequantize-only consumer doesn't need to wait for an update

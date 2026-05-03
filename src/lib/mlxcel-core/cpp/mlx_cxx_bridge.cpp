@@ -5692,7 +5692,7 @@ std::unique_ptr<MlxArray> fused_metal4_attention(
 std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
     const MlxArray& attn_weights,
     const MlxArray& v_packed,
-    const MlxArray& v_norms,
+    const MlxArray& v_rescale,
     const MlxArray& codebook,
     int32_t dim,
     int32_t n_rep,
@@ -5700,7 +5700,7 @@ std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
     auto out = mlxcel::turbo::sparse_v_weighted_sum(
         attn_weights.inner,
         v_packed.inner,
-        v_norms.inner,
+        v_rescale.inner,
         codebook.inner,
         dim,
         n_rep,

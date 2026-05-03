@@ -36,45 +36,57 @@ namespace {
 //
 // IMPORTANT: per-thread skipping is the WHOLE point of this kernel. The
 // `if (any_alive == 0) continue;` block is what produces the speedup at long
-// context — every skipped token saves the codebook gather, norm fetch, sqrt-
-// reduction, and (D × RepeatCount) accumulator updates that the graph-level
+// context — every skipped token saves the codebook gather, rescale fetch,
+// and (D × RepeatCount) accumulator updates that the graph-level
 // `where(alive, V_dq, 0)` path still pays.
+//
+// Issue #520 — precomputed rescale.
+//
+// The previous implementation derived `|y_hat[t]| = sqrt(Σ_d codebook[idx]²)`
+// per token via a `log2(Dim) + 2`-barrier threadgroup tree reduction over a
+// `tg_y_hat[Dim]` shared scratch buffer. On M5 Max at 4 K decode for
+// `turbo4-asym` this reduction dominated decode latency: ~9 barriers per
+// cache token × 4 K tokens × 32 layers × ~32 threadgroups produced tens of
+// millions of `threadgroup_barrier` calls per decode step, making the kernel
+// 2.0× slower than the graph fallback (PR #519 A/B).
+//
+// Because `|y_hat|` is a pure function of the packed indices (themselves
+// fixed at quantize time), the entire rescale `rescale[t] = norm[t] / |y_hat[t]|`
+// is now precomputed on the host inside `quantize_into_packed` and stored
+// alongside the packed buffer. The kernel reads the scalar once per live
+// token via a single fp16 load — no threadgroup memory, no barriers.
 //
 // Layout contract:
 //   weights_shape = [B*Hq, Tq, Tk]   f32
-//   norms_shape   = [B*Hkv, Tk]      f16
-//   packed_shape  = [B*Hkv, Tk, D/2] u8 (low/high nibble = even/odd dim)
-//   threshold     = [1]              f32 (alive cutoff scalar passed as array)
-//   codebook      = [16]             f32 (Lloyd-Max centroids, 4-bit)
-//   out_shape     = [B*Hq, Tq, D]    f32 (unrotated weighted sum)
+//   rescale_shape = [B*Hkv, Tk]      f16  (precomputed `norm/|y_hat|`)
+//   packed_shape  = [B*Hkv, Tk, D/2] u8   (low/high nibble = even/odd dim)
+//   threshold     = [1]              f32  (alive cutoff scalar passed as array)
+//   codebook      = [16]             f32  (Lloyd-Max centroids, 4-bit)
+//   out_shape     = [B*Hq, Tq, D]    f32  (unrotated weighted sum)
 //
 // The caller applies the inverse Turbo4 rotation (`signs1 * WHT * signs2 *`)
 // to the [B, Hq, Tq, D] output, so the per-cache-token rotation cost is
 // eliminated.
 //
-// Threadgroup layout: (Dim, 1, 1). One threadgroup per (B*Hq) slot. Threads
-// share `tg_y_hat` (D floats) so a per-token `|y_hat|` reduction can be done
-// in lockstep without a host round-trip.
+// Threadgroup layout: (Dim, 1, 1). One threadgroup per (B*Hq) slot. The
+// per-token `rescale` is small (one fp16 per token) and identical across
+// all `Dim` threads in a threadgroup — Apple's L1 / per-threadgroup cache
+// coalesces the broadcast load with no further effort.
 constexpr const char* SPARSE_V_WEIGHTED_SUM_SOURCE = R"(
     auto d = thread_position_in_grid.x;
     auto n = thread_position_in_grid.z;
-    auto tg_d = thread_position_in_threadgroup.x;
 
     // Decode `n` into (batch * Hq) and infer the matching Hkv slot. We pass
     // the layout sizes via the input shapes; `weights_shape` is
-    // [B*Hq, Tq, Tk], `norms_shape` is [B*Hkv, Tk]. From these we recover
+    // [B*Hq, Tq, Tk], `rescale_shape` is [B*Hkv, Tk]. From these we recover
     // B*Hq and B*Hkv directly without needing extra constants.
     auto bhq = n;                              // 0 .. B*Hq-1
     auto t_count = (uint)weights_shape[2];     // Tk
-    auto bhkv_count = (uint)norms_shape[0];    // B*Hkv
-    auto bhq_count = (uint)weights_shape[0];   // B*Hq
+    auto bhkv_count = (uint)rescale_shape[0];  // B*Hkv
 
-    // Grouped attention: NRep = Hq / Hkv. To map B*Hq → B*Hkv we need the
-    // (b, hq) decomposition. Hq = bhq_count * Hkv / bhq_count = NRep * Hkv,
-    // so Hq = (bhq_count / bhkv_count) * NRep — but more usefully, we know
-    // Hq = bhq_count / B and Hkv = bhkv_count / B. NRep is given as a
-    // template constant. Since bhq_count / NRep == bhkv_count holds for
-    // valid inputs, the per-`n` Hkv slot is `n / NRep`.
+    // Grouped attention: NRep = Hq / Hkv. NRep is given as a template
+    // constant. Since bhq_count / NRep == bhkv_count holds for valid
+    // inputs, the per-`n` Hkv slot is `n / NRep`.
     uint nrep_u = (uint)NRep;
     uint bhkv = bhq / nrep_u;
     if (bhkv >= bhkv_count) {
@@ -82,7 +94,7 @@ constexpr const char* SPARSE_V_WEIGHTED_SUM_SOURCE = R"(
     }
 
     auto wt = weights + bhq * (uint)RepeatCount * t_count; // [Tq, Tk]
-    auto nm = norms + bhkv * t_count;                       // [Tk]
+    auto rs = rescale + bhkv * t_count;                     // [Tk] f16 (issue #520)
     auto pk = packed + bhkv * t_count * (uint)(Dim / 2);    // [Tk, D/2]
 
     // Thresholds passed as a 1-element array so MLX accepts them as a regular
@@ -101,18 +113,13 @@ constexpr const char* SPARSE_V_WEIGHTED_SUM_SOURCE = R"(
     uint byte_idx = (uint)d >> 1u;
     uint nibble_shift = ((uint)d & 1u) * 4u;
 
-    // Threadgroup-shared buffer used to compute `|y_hat[t]|` per token via a
-    // simple parallel reduction. Each thread writes its `code²` into
-    // `tg_y_hat[d]`, then a barrier + tree reduction folds the sum into
-    // tg_y_hat[0]. Size is `Dim` (template constant, ≤ 1024 for typical
-    // head_dim values).
-    threadgroup float tg_y_hat[Dim];
-    threadgroup float tg_norm[1];
-
-    // Sweep over T tokens. Each token: check if it's alive on at least one
-    // Q slot, then look up the centroid for `(t, d)`, cooperatively reduce
-    // |y_hat[t]| across the threadgroup, multiply by per-token norm and
-    // (1 / |y_hat|), and gate by per-Q attention weight.
+    // Sweep over T tokens. Each token: check aliveness, look up the
+    // centroid for `(t, d)`, multiply by the precomputed per-token rescale,
+    // and gate by per-Q attention weight.
+    //
+    // No threadgroup memory and no barriers in the inner loop — this is the
+    // entire point of issue #520. The previous tree-reduction body lived
+    // here; see git history for the pre-#520 form.
     for (uint t = 0; t < t_count; t++) {
         // Aliveness check: scan RepeatCount Q slots and short-circuit if all
         // are below threshold for this (b, h, t). For RepeatCount=1 (decode
@@ -127,17 +134,16 @@ constexpr const char* SPARSE_V_WEIGHTED_SUM_SOURCE = R"(
             }
         }
         if (!any_alive) {
-            // Per-thread skip — the speed gate of this kernel. We MUST also
-            // synchronize the threadgroup memory we are about to read in the
-            // next live iteration, but the next iteration starts with each
-            // thread writing `tg_y_hat[d]` and then a barrier, so there is
-            // no stale-read hazard from skipping the unpack/gather steps.
+            // Per-thread skip — the speed gate of this kernel. With #520's
+            // precomputed rescale there is no in-flight threadgroup state to
+            // synchronize against, so the skip is a clean continue without
+            // any cross-thread divergence concerns.
             continue;
         }
 
         // Unpack nibble for this (t, d). Byte offset = byte_idx, nibble
         // selected by nibble_shift (0 for even d, 4 for odd d). Out-of-Dim
-        // threads (d >= Dim) write a benign 0 contribution — the `d < Dim`
+        // threads (d >= Dim) compute a benign 0 contribution — the `d < Dim`
         // bounds gate at the bottom prevents stray output writes.
         float code = 0.0f;
         if (d < (uint)Dim) {
@@ -146,36 +152,13 @@ constexpr const char* SPARSE_V_WEIGHTED_SUM_SOURCE = R"(
             code = codebook[idx];
         }
 
-        // Cooperative |y_hat[t]| reduction across threadgroup. Each thread
-        // contributes its `code²`. Tree reduction folds the per-d squares
-        // into `tg_y_hat[0]`. Threadgroup size is exactly `Dim` so the
-        // reduction unrolls cleanly (Dim is a template constant).
-        tg_y_hat[tg_d] = code * code;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Tree reduction with stride halving. Every iteration halves the
-        // active thread count; threads above `stride` are idle.
-        for (uint stride = (uint)Dim >> 1; stride > 0; stride >>= 1) {
-            if (tg_d < stride) {
-                tg_y_hat[tg_d] += tg_y_hat[tg_d + stride];
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-        }
-
-        // Thread 0 computes the per-token rescale factor:
-        //   rescale = (1 / max(|y_hat|, eps)) * v_norms[t]
-        // and broadcasts it via `tg_norm[0]`. eps matches the graph path's
-        // 1e-10 guard (see `dequantize_from_packed`).
-        if (tg_d == 0) {
-            float yh_sumsq = tg_y_hat[0];
-            float yh_norm = sqrt(yh_sumsq);
-            float yh_safe = max(yh_norm, 1e-10f);
-            float vn = (float)nm[t];
-            tg_norm[0] = vn / yh_safe;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        float scaled = code * tg_norm[0];
+        // Per-token rescale `norm[t] / max(|y_hat[t]|, 1e-10)` was computed
+        // on the host at quantize time (issue #520). Each thread loads the
+        // same fp16 scalar; Apple's L1 / per-threadgroup cache coalesces the
+        // broadcast so the bandwidth cost is effectively one read per
+        // threadgroup per token.
+        float rescale_t = (float)rs[t];
+        float scaled = code * rescale_t;
 
         // Accumulate into each Q slot's running sum, gated by its weight.
         // Per-r aliveness check: even if any_alive=true above, only
@@ -216,7 +199,12 @@ struct SparseVKernelHolder {
         std::call_once(init_flag, [this] {
             kernel = mlx::core::fast::metal_kernel(
                 "mlxcel_sparse_v_weighted_sum",
-                {"weights", "norms", "packed", "threshold", "codebook"},
+                // Input names — must match the launcher's `inputs` vector
+                // order in `sparse_v_weighted_sum`. `rescale` (issue #520) is
+                // the precomputed `norm[t] / |y_hat[t]|` fp16 sidecar that
+                // replaced the in-kernel `norms` + threadgroup tree
+                // reduction.
+                {"weights", "rescale", "packed", "threshold", "codebook"},
                 {"out"},
                 std::string(SPARSE_V_WEIGHTED_SUM_SOURCE));
         });
@@ -234,7 +222,7 @@ inline SparseVKernelHolder& get_sparse_v_kernel() {
 mlx::core::array sparse_v_weighted_sum(
     const mlx::core::array& attn_weights,
     const mlx::core::array& v_packed,
-    const mlx::core::array& v_norms,
+    const mlx::core::array& v_rescale,
     const mlx::core::array& codebook,
     int dim,
     int n_rep,
@@ -263,9 +251,11 @@ mlx::core::array sparse_v_weighted_sum(
     auto threshold_arr = mlx::core::full(
         mlx::core::Shape{1}, threshold, mlx::core::float32);
 
+    // Input order MUST match the buffer-name vector in `metal_kernel(...)`
+    // below: {"weights", "rescale", "packed", "threshold", "codebook"}.
     std::vector<mlx::core::array> inputs = {
         attn_weights,   // [B*Hq, Tq, Tk]    f32
-        v_norms,        // [B*Hkv, Tk]       f16
+        v_rescale,      // [B*Hkv, Tk]       f16  (issue #520 precompute)
         v_packed,       // [B*Hkv, Tk, D/2]  u8
         threshold_arr,  // [1]               f32
         codebook,       // [16]              f32
