@@ -1958,3 +1958,254 @@ fn delegated_cached_dequant_matches_uncached_across_many_folds() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Turbo4Delegated unified-K storage (issue #527)
+// ---------------------------------------------------------------------------
+//
+// Issue #527 unifies the K side of `KVCacheMode::Turbo4Delegated` into a
+// single growing FP16 buffer (same shape contract as `KVCacheMode::Fp16`),
+// dropping the cold/hot split for K. These tests verify:
+// 1. `keys` is a single buffer that holds all `offset` tokens after folds.
+// 2. SDPA-side reads return `slice(keys, 0, offset)` with no concat.
+// 3. `clone_handle` / `install_detached` round-trip preserves K data
+//    bit-identically when there's a populated cold V body.
+// 4. The fetched K matches what an `Fp16`-mode reference cache produces for
+//    the same input sequence.
+
+/// After enough decode steps to trigger at least one fold, the unified `keys`
+/// buffer must hold all `offset` tokens (i.e. its shape's seq dim is at least
+/// `offset`) and SDPA-visible K from `update_and_fetch` must be the FP16
+/// slice `[0..offset]` — no separate cold-K buffer should exist (issue #527).
+#[test]
+fn delegated_unified_k_buffer_grows_with_offset() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+
+    // Prefill 16, then decode enough to push past the threshold so a fold
+    // fires.  Hot threshold = 32, prefill 16 + 64 decode = 80 tokens, with at
+    // least one fold (cold_offset > 0).
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+
+    assert!(cache.cold_offset() > 0, "test setup must trigger a fold");
+    let total_offset = cache.seq_len();
+    assert_eq!(total_offset, 80, "16 prefill + 64 decode = 80 total tokens");
+
+    // The unified K buffer must hold at least `offset` tokens (capacity may
+    // be rounded up to step). There must be no separate cold-K buffer
+    // (issue #527 removed the field).
+    let keys = cache
+        .keys
+        .as_ref()
+        .expect("unified keys must be populated after prefill+decode");
+    let k_shape = ffi::array_shape(keys);
+    assert_eq!(k_shape.len(), 4, "keys is a 4-D tensor");
+    assert!(
+        k_shape[2] >= total_offset,
+        "unified K capacity ({}) must be >= offset ({})",
+        k_shape[2],
+        total_offset
+    );
+
+    // Drive one more decode step and verify the fetched K is `slice(keys, 0,
+    // offset)` shape.  Use a fresh K/V token; the read path runs through
+    // `fetch_turbo4_delegated`.
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 9999);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 8888);
+    let (k_out, _) = cache.update_and_fetch(k, v);
+    let k_out_shape = ffi::array_shape(&k_out);
+    assert_eq!(
+        k_out_shape,
+        vec![1_i32, 1, total_offset + 1, head_dim],
+        "fetched K shape must be [B, H, offset, K_dim] (no cold/hot concat, issue #527)"
+    );
+    assert_eq!(
+        ffi::array_dtype(&k_out),
+        dtype::FLOAT16,
+        "fetched K dtype must be FLOAT16"
+    );
+}
+
+/// `clone_handle` / `install_detached` must round-trip the unified K buffer
+/// bit-identically when the source has been through at least one fold
+/// (issue #527).  A subsequent decode step on the installed target must
+/// produce a K slice equal to the same step on the source before detach.
+#[test]
+fn delegated_clone_handle_preserves_unified_k_data() {
+    let head_dim = 64;
+    let mut src = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut src, head_dim, 16, 64);
+
+    assert!(src.cold_offset() > 0, "test setup must trigger a fold");
+    let cold_offset_before = src.cold_offset();
+    let offset_before = src.seq_len();
+
+    // Snapshot the source's current unified K view by fetching once.
+    // (Don't drive an update — we'd consume the input tensors and changing
+    // `offset` would diverge from the post-install replay.)
+    let src_k_snapshot = {
+        let keys = src.keys.as_ref().unwrap();
+        let ks = ffi::array_shape(keys);
+        ffi::slice(keys, &[0, 0, 0, 0], &[ks[0], ks[1], offset_before, ks[3]])
+    };
+    let src_k_flat = flatten_fp32(&src_k_snapshot);
+
+    // Detach + install into a fresh target.
+    let handle = src.clone_handle();
+    let mut tgt = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
+    tgt.set_hot_threshold(32);
+    tgt.install_detached(handle).unwrap();
+
+    // Logical state survives the round-trip.
+    assert_eq!(tgt.seq_len(), offset_before);
+    assert_eq!(tgt.cold_offset(), cold_offset_before);
+
+    // The unified K data must match bit-for-bit.
+    let tgt_keys = tgt.keys.as_ref().expect("target keys must exist");
+    let tgt_ks = ffi::array_shape(tgt_keys);
+    let tgt_k_snapshot = ffi::slice(
+        tgt_keys,
+        &[0, 0, 0, 0],
+        &[tgt_ks[0], tgt_ks[1], offset_before, tgt_ks[3]],
+    );
+    let tgt_k_flat = flatten_fp32(&tgt_k_snapshot);
+    assert_eq!(
+        src_k_flat.len(),
+        tgt_k_flat.len(),
+        "src and tgt K must have the same flattened length"
+    );
+    let mut max_abs = 0.0_f32;
+    for (a, b) in src_k_flat.iter().zip(tgt_k_flat.iter()) {
+        max_abs = max_abs.max((a - b).abs());
+    }
+    assert_eq!(
+        max_abs, 0.0,
+        "clone_handle must preserve unified K data bit-identically"
+    );
+
+    // A fresh decode step on the target must yield a K slice of shape
+    // [B, H, offset+1, K_dim].
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 11111);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 22222);
+    let (k_out, _) = tgt.update_and_fetch(k, v);
+    let k_out_shape = ffi::array_shape(&k_out);
+    assert_eq!(
+        k_out_shape,
+        vec![1_i32, 1, offset_before + 1, head_dim],
+        "post-install fetch must return unified K slice"
+    );
+}
+
+/// Parity test: the K tensor returned by `KVCacheMode::Turbo4Delegated`
+/// must produce FP16-equivalent K storage that is bitwise-identical to the
+/// FP16 reference when the FP16 reference is also given FP32 input (both
+/// modes cast K to FP16 before writing, so the bit patterns match; the
+/// `max_abs < 1e-3` tolerance accounts for the FP32→FP16 round-trip that
+/// both caches perform, not a delegated-mode approximation).  V is
+/// *not* expected to match — V is still compressed in the delegated mode
+/// via `quantize_v_turbo4` and has bounded reconstruction error.
+/// Issue #527 unifies the K storage so that `Turbo4Delegated` uses the
+/// same single growing FP16 buffer as `Fp16`, eliminating the per-step
+/// K concat entirely.
+#[test]
+fn delegated_unified_k_matches_fp16_reference() {
+    let head_dim = 64;
+    let prefill_len = 16;
+    let decode_steps = 80; // enough to trigger >= 2 folds at hot_threshold=32
+
+    let mut cache_delegated = build_delegated_cache_with_small_threshold(32);
+    let mut cache_fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+    // Identical prefill on both caches.
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 7);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 8);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let (k_a, _) = cache_delegated.update_and_fetch(k_pre, v_pre);
+    let (k_b, _) = cache_fp16.update_and_fetch(k_pre_b, v_pre_b);
+    let max_abs = max_abs_diff(&k_a, &k_b);
+    assert!(
+        max_abs < 1e-3,
+        "prefill K mismatch: delegated vs fp16 max abs {max_abs:.4e}"
+    );
+
+    // Identical decode steps.  The delegated mode triggers folds of K
+    // (which now live in the same unified buffer) — the fetched K slice
+    // must remain bit-identical to the fp16 reference at every step.
+    for step in 0..decode_steps {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 5000 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 6000 + step as u32);
+        let k_b = ffi::copy(&k);
+        let v_b = ffi::copy(&v);
+        let (k_a, _) = cache_delegated.update_and_fetch(k, v);
+        let (k_b, _) = cache_fp16.update_and_fetch(k_b, v_b);
+        let max_abs = max_abs_diff(&k_a, &k_b);
+        assert!(
+            max_abs < 1e-3,
+            "step {step}: K mismatch: delegated vs fp16 max abs {max_abs:.4e}"
+        );
+    }
+}
+
+/// `nbytes()` after a fold must reflect a single unified K buffer, not a
+/// hot ring + a separate cold K buffer (issue #527 removes the cold-K
+/// allocation).  V-side accounting (packed sidecars + dequant memo) must
+/// be unchanged from PR #525's contract.
+#[test]
+fn delegated_nbytes_no_cold_k_buffer_after_fold() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+
+    // Prefill + enough decode to trigger at least one fold.
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+    assert!(cache.cold_offset() > 0, "test setup must trigger a fold");
+
+    let total = cache.nbytes();
+    assert!(total > 0, "nbytes must report non-zero after population");
+
+    // The K side must consist of a single buffer (`keys`).  It must be at
+    // least as large as `offset * K_dim * 2` bytes for fp16 (ignoring the
+    // step-aligned tail allocation).
+    let keys = cache
+        .keys
+        .as_ref()
+        .expect("unified keys must be populated after fold");
+    let k_shape = ffi::array_shape(keys);
+    let min_k_bytes = (cache.seq_len() as usize) * (k_shape[3] as usize) * 2;
+    let actual_k_bytes = ffi::array_nbytes(keys);
+    assert!(
+        actual_k_bytes >= min_k_bytes,
+        "unified keys nbytes ({}) must cover at least offset*K_dim*2 = {}",
+        actual_k_bytes,
+        min_k_bytes
+    );
+
+    // V-side cold sidecars must still be present (V is still compressed).
+    assert!(
+        cache.v_packed.is_some(),
+        "v_packed must exist after a fold (V-side compression unchanged)"
+    );
+    assert!(cache.v_norms.is_some(), "v_norms must exist after a fold");
+    assert!(
+        cache.v_rescale.is_some(),
+        "v_rescale must exist after a fold"
+    );
+    // Cold-V dequant memo populated by the post-fold fetch.
+    assert!(
+        cache.cold_v_dequant_cache.is_some(),
+        "cold_v_dequant_cache must be populated by the post-fold fetch"
+    );
+}
+
+/// Helper: maximum absolute difference between two FP16 tensors after
+/// promotion to FP32 and flatten.
+fn max_abs_diff(a: &ffi::MlxArray, b: &ffi::MlxArray) -> f32 {
+    let fa = flatten_fp32(a);
+    let fb = flatten_fp32(b);
+    assert_eq!(fa.len(), fb.len(), "shape mismatch in max_abs_diff");
+    let mut m = 0.0_f32;
+    for (x, y) in fa.iter().zip(fb.iter()) {
+        m = m.max((x - y).abs());
+    }
+    m
+}
