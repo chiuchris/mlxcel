@@ -1610,3 +1610,351 @@ fn turbo3_asym_layer_modes_apply_boundary_upgrade() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Turbo4Delegated cold-V dequant memo (issue #521)
+// ---------------------------------------------------------------------------
+//
+// The decode-time fetch path memoizes the dequantized cold V tensor across
+// decode steps because the cold body is append-only between folds. These
+// tests cover:
+// 1. Memo is populated after a fold and reused across subsequent decode steps.
+// 2. Memo is invalidated when a fold advances `cold_offset`.
+// 3. Memo is invalidated when `trim` shrinks `cold_offset`.
+// 4. Decode output is bit-identical to the uncached reference across many
+//    steps, so caching does not silently corrupt the V dequant.
+
+/// Build a Turbo4Delegated cache with a small hot threshold so folds are
+/// triggered after a handful of decode steps. The threshold is rounded up to
+/// `BLOCK_SIZE` (32) inside the cache, so 32 is the minimum that keeps the
+/// fold-block alignment invariant.
+fn build_delegated_cache_with_small_threshold(hot_threshold: i32) -> KVCache {
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
+    cache.set_hot_threshold(hot_threshold);
+    cache
+}
+
+/// Helper: prefill the cache with a multi-token chunk, then run a fixed number
+/// of single-token decode steps. Returns the final fetched V tensor (flat
+/// fp32 view) for the parity comparison below.
+fn delegated_decode_run(cache: &mut KVCache, head_dim: i32, prefill_len: i32, decode_steps: i32) {
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 7);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 8);
+    let _ = cache.update_and_fetch(k_pre, v_pre);
+    for step in 0..decode_steps {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 100 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 200 + step as u32);
+        let _ = cache.update_and_fetch(k, v);
+    }
+}
+
+/// After enough decode steps to trigger at least one fold, the cold-V dequant
+/// memo must be populated and tagged with the current `cold_offset`. This
+/// verifies the cache-fill code path actually runs.
+#[test]
+fn delegated_cold_v_dequant_cache_populates_after_first_fold() {
+    let head_dim = 64;
+    // Hot threshold = 32 → first fold after 32+1 hot tokens.
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+
+    // Prefill 16, then decode enough to push past the threshold.
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+
+    assert!(
+        cache.cold_offset() > 0,
+        "test setup must trigger at least one fold (got cold_offset = {})",
+        cache.cold_offset()
+    );
+    assert!(
+        cache.cold_v_dequant_cache.is_some(),
+        "cold_v_dequant_cache must be populated after a fold-triggered fetch"
+    );
+    assert_eq!(
+        cache.cold_v_dequant_cached_offset,
+        cache.cold_offset(),
+        "cached offset must match current cold_offset"
+    );
+}
+
+/// A new fold (advancing `cold_offset`) must invalidate the memo so the next
+/// fetch rebuilds at the new `cold_offset`. Validates `append_cold_block`'s
+/// `invalidate_cold_v_dequant_cache` call.
+#[test]
+fn delegated_fold_advances_cached_offset_after_next_fetch() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+
+    let cold_offset_before = cache.cold_offset();
+    let cached_offset_before = cache.cold_v_dequant_cached_offset;
+    assert_eq!(cached_offset_before, cold_offset_before);
+
+    // Run more decode steps so a second fold fires. After that fold, the
+    // cache should be invalidated; the next fetch repopulates it at the new
+    // `cold_offset`.
+    for step in 0..64 {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 1000 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 2000 + step as u32);
+        let _ = cache.update_and_fetch(k, v);
+    }
+
+    let cold_offset_after = cache.cold_offset();
+    assert!(
+        cold_offset_after > cold_offset_before,
+        "second decode burst must trigger another fold (before {cold_offset_before}, \
+         after {cold_offset_after})"
+    );
+    assert_eq!(
+        cache.cold_v_dequant_cached_offset, cold_offset_after,
+        "cache offset must track new cold_offset after the post-fold fetch"
+    );
+}
+
+/// `trim` that shrinks `cold_offset` must invalidate the memo. We trim more
+/// than the hot tail so the cold body shrinks too, then check that the cache
+/// is gone.
+#[test]
+fn delegated_trim_into_cold_body_invalidates_dequant_cache() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+    assert!(cache.cold_v_dequant_cache.is_some());
+    let cold_before = cache.cold_offset();
+    let hot_before = cache.seq_len() - cold_before;
+    assert!(cold_before > 0 && hot_before >= 0);
+
+    // Trim more than hot_len so cold_offset shrinks.
+    let n = hot_before + 4;
+    let trimmed = cache.trim(n);
+    assert_eq!(trimmed, n);
+    assert!(
+        cache.cold_offset() < cold_before,
+        "cold_offset must shrink for the test to exercise the cold-trim invalidation path"
+    );
+    assert!(
+        cache.cold_v_dequant_cache.is_none(),
+        "trim that shrinks cold_offset must invalidate the dequant memo"
+    );
+    assert_eq!(cache.cold_v_dequant_cached_offset, 0);
+}
+
+/// `trim(seq_len())` (full reset) must drop the memo too. This exercises the
+/// `self.offset == 0` branch of `KVCache::trim`.
+#[test]
+fn delegated_full_trim_clears_dequant_cache() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+    assert!(cache.cold_v_dequant_cache.is_some());
+
+    let total = cache.seq_len();
+    let trimmed = cache.trim(total);
+    assert_eq!(trimmed, total);
+    assert_eq!(cache.seq_len(), 0);
+    assert!(cache.is_empty());
+    assert!(
+        cache.cold_v_dequant_cache.is_none(),
+        "full trim must clear the cold-V dequant memo"
+    );
+    assert_eq!(cache.cold_v_dequant_cached_offset, 0);
+}
+
+/// Parity test: the fetched V tensor must match between (a) a Turbo4Delegated
+/// cache that uses the per-step memoized dequant and (b) a freshly-built
+/// reference cache that replays the same updates and produces the same
+/// fetch on its first (cache-miss) call.
+///
+/// Concretely: build two identical caches and feed them the same prefill +
+/// decode sequence. After many decode steps, snapshot the live cache's
+/// fetched V, then forcibly invalidate its memo and refetch. The cached and
+/// freshly-recomputed dequant must be bit-for-bit identical because the cold
+/// body data has not changed and `dequantize_v_turbo4` is deterministic.
+#[test]
+fn delegated_cached_dequant_matches_uncached_recompute() {
+    let head_dim = 64;
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut cache, head_dim, 16, 64);
+
+    // The cache must actually be exercising the post-fold path for this test
+    // to be meaningful.
+    assert!(cache.cold_offset() > 0, "test must trigger a fold");
+    assert!(cache.cold_v_dequant_cache.is_some());
+
+    // Capture the V tensor produced by the (cached) fetch path. We can't
+    // call `fetch_turbo4_delegated` directly (private), so we drive a
+    // dummy update_and_fetch with a single token at the same length and
+    // immediately trim it back. That re-runs the read path through the
+    // memo. Use a separate "probe" cache instead so the live cache is left
+    // unchanged.
+    //
+    // Approach: snapshot the V output from the next decode step (which uses
+    // the memo), then manually invalidate the memo and replay the SAME
+    // step's read by reverse-engineering the path: trim the just-pushed
+    // token, drop the memo, and fetch again. Easier: create two caches
+    // populated identically up to the same point, fetch from one (memoed)
+    // and from the other (fresh), and compare.
+
+    let mut cache_a = build_delegated_cache_with_small_threshold(32);
+    let mut cache_b = build_delegated_cache_with_small_threshold(32);
+    delegated_decode_run(&mut cache_a, head_dim, 16, 64);
+    delegated_decode_run(&mut cache_b, head_dim, 16, 64);
+
+    // Run one more step on each, with the SAME k/v. This drives both caches
+    // through `fetch_turbo4_delegated` once more.
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 9999);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 9998);
+    // Use ffi::copy because update_and_fetch consumes the inputs.
+    let k2 = ffi::copy(&k);
+    let v2 = ffi::copy(&v);
+    let (_, v_a) = cache_a.update_and_fetch(k, v);
+
+    // Force a cache miss on cache_b by clearing its memo. The cold buffers
+    // are unchanged, so the rebuilt dequant must be the same.
+    cache_b.cold_v_dequant_cache = None;
+    cache_b.cold_v_dequant_cached_offset = 0;
+    let (_, v_b) = cache_b.update_and_fetch(k2, v2);
+
+    let flat_a = flatten_fp32(&v_a);
+    let flat_b = flatten_fp32(&v_b);
+    assert_eq!(
+        flat_a.len(),
+        flat_b.len(),
+        "memoed and recomputed fetches must produce the same shape"
+    );
+    let mut max_abs = 0.0_f32;
+    let mut max_rel = 0.0_f32;
+    for (a, b) in flat_a.iter().zip(flat_b.iter()) {
+        let abs = (a - b).abs();
+        max_abs = max_abs.max(abs);
+        let denom = a.abs().max(1e-6);
+        max_rel = max_rel.max(abs / denom);
+    }
+    // Both paths run the same `dequantize_v_turbo4` graph on identical
+    // inputs; expect bit-identity. Allow a tiny epsilon for any reorder
+    // induced by graph construction order — but in practice this should be
+    // exactly zero.
+    assert!(
+        max_abs < 1e-3,
+        "memoed vs recomputed cold-V mismatch (max abs {max_abs:.4e}, max rel {max_rel:.4e})"
+    );
+}
+
+/// `clone_handle` on a Turbo4Delegated cache that has a populated cold-V
+/// dequant memo must clear the memo on the source so the reused slot starts
+/// clean. The installed target must rebuild the memo lazily on the first
+/// decode fetch after install, not inherit stale state from the source.
+///
+/// Exercises the `clone_handle` memo-clear path added in issue #521:
+/// `self.cold_v_dequant_cache = None; self.cold_v_dequant_cached_offset = 0;`
+#[test]
+fn delegated_clone_handle_clears_memo_and_target_rebuilds_fresh() {
+    let head_dim = 64;
+    let mut src = build_delegated_cache_with_small_threshold(32);
+
+    // Populate the source with enough tokens to trigger at least one fold,
+    // which ensures `cold_v_dequant_cache` is populated before detach.
+    delegated_decode_run(&mut src, head_dim, 16, 64);
+    assert!(
+        src.cold_v_dequant_cache.is_some(),
+        "test setup: memo must be populated before clone_handle"
+    );
+    let cold_offset_before = src.cold_offset();
+    assert!(
+        cold_offset_before > 0,
+        "test setup: cold body must be non-empty"
+    );
+
+    // Detach: source must be cleared (empty and memo dropped).
+    let handle = src.clone_handle();
+    assert!(src.is_empty(), "source must be empty after clone_handle");
+    assert!(
+        src.cold_v_dequant_cache.is_none(),
+        "clone_handle must clear cold_v_dequant_cache on source"
+    );
+    assert_eq!(
+        src.cold_v_dequant_cached_offset, 0,
+        "clone_handle must reset cold_v_dequant_cached_offset to 0 on source"
+    );
+
+    // Install into a fresh target.  The target is empty so install succeeds.
+    let mut tgt = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
+    tgt.set_hot_threshold(32);
+    tgt.install_detached(handle).unwrap();
+
+    // Immediately after install the memo fields must be absent — the install
+    // path does not pre-populate the memo, so it starts as a cache miss.
+    assert!(
+        tgt.cold_v_dequant_cache.is_none(),
+        "memo must be absent immediately after install_detached"
+    );
+    assert_eq!(tgt.cold_v_dequant_cached_offset, 0);
+    assert_eq!(
+        tgt.cold_offset(),
+        cold_offset_before,
+        "installed cache must have the same cold_offset as the detached handle"
+    );
+
+    // Drive one more decode step so the fetch path runs through the
+    // `ensure_cold_v_dequant_cache` fill path.  After that call the memo must
+    // be populated and tagged with the current `cold_offset`.
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 8888);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 7777);
+    let _ = tgt.update_and_fetch(k, v);
+
+    assert!(
+        tgt.cold_v_dequant_cache.is_some(),
+        "memo must be rebuilt on first fetch after install_detached"
+    );
+    assert_eq!(
+        tgt.cold_v_dequant_cached_offset,
+        tgt.cold_offset(),
+        "rebuilt memo must be tagged with the current cold_offset"
+    );
+}
+
+/// Multi-step parity: across many decode steps that span at least three
+/// folds, the cached and uncached fetch paths must agree at every step.
+/// This is the strongest guarantee that the cache invalidation hooks are
+/// firing in lockstep with cold-body mutations.
+#[test]
+fn delegated_cached_dequant_matches_uncached_across_many_folds() {
+    let head_dim = 64;
+    let prefill_len = 8;
+    let total_steps = 200; // enough to trigger several folds with threshold=32
+
+    let mut cache_memo = build_delegated_cache_with_small_threshold(32);
+    let mut cache_no_memo = build_delegated_cache_with_small_threshold(32);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 7);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 8);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_memo.update_and_fetch(k_pre, v_pre);
+    let _ = cache_no_memo.update_and_fetch(k_pre_b, v_pre_b);
+
+    for step in 0..total_steps {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 5000 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 6000 + step as u32);
+        let k_b = ffi::copy(&k);
+        let v_b = ffi::copy(&v);
+
+        let (_, v_memo) = cache_memo.update_and_fetch(k, v);
+
+        // Force the no-memo cache to recompute on every step.
+        cache_no_memo.cold_v_dequant_cache = None;
+        cache_no_memo.cold_v_dequant_cached_offset = 0;
+        let (_, v_fresh) = cache_no_memo.update_and_fetch(k_b, v_b);
+
+        let flat_memo = flatten_fp32(&v_memo);
+        let flat_fresh = flatten_fp32(&v_fresh);
+        assert_eq!(flat_memo.len(), flat_fresh.len(), "step {step}: shape");
+        let mut max_abs = 0.0_f32;
+        for (a, b) in flat_memo.iter().zip(flat_fresh.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        assert!(
+            max_abs < 1e-3,
+            "step {step}: memoed vs recomputed mismatch max abs {max_abs:.4e}"
+        );
+    }
+}
