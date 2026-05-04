@@ -36,10 +36,12 @@ set(CMAKE_CXX_STANDARD 20)
 # directories so a parent CMakeLists.txt can pick this up via
 # add_subdirectory(turbo).
 set(MLXCEL_TURBO_KERNEL_HEADERS
-    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.h)
+    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.h
+    ${CMAKE_CURRENT_SOURCE_DIR}/turbo4_delegated_sdpa.h)
 
 set(MLXCEL_TURBO_KERNEL_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/turbo4_delegated_sdpa.cpp)
 
 set(MLXCEL_TURBO_KERNEL_METAL_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sparse_v_sdpa.metal)

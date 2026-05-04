@@ -3,6 +3,7 @@
 
 #include "mlx_cxx_bridge.h"
 #include "sparse_v_sdpa.h"  // Issue #505: fused Sparse-V SDPA kernel.
+#include "turbo4_delegated_sdpa.h"  // Issue #528: fused Turbo4Delegated SDPA kernel.
 #include "mlx/ops.h"
 #include "mlx/transforms.h"
 #include "mlx/compile.h"
@@ -5701,6 +5702,31 @@ std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
         attn_weights.inner,
         v_packed.inner,
         v_rescale.inner,
+        codebook.inner,
+        dim,
+        n_rep,
+        threshold);
+    return std::make_unique<MlxArray>(std::move(out));
+}
+
+// Issue #528 — Fused Turbo4Delegated cold-V weighted-sum kernel launcher.
+// Implementation in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp`; we
+// forward the call here so the new symbol shows up in the cxx-bridge ABI
+// without bloating the bridge .cpp. The unrotated cold weighted sum returned
+// here is paired with a host-side hot V matmul; the dequantised cold V never
+// materialises in global memory (the whole point of issue #528).
+std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
+    const MlxArray& attn_weights_cold,
+    const MlxArray& v_packed_cold,
+    const MlxArray& v_rescale_cold,
+    const MlxArray& codebook,
+    int32_t dim,
+    int32_t n_rep,
+    float threshold) {
+    auto out = mlxcel::turbo::turbo4_delegated_cold_weighted_sum(
+        attn_weights_cold.inner,
+        v_packed_cold.inner,
+        v_rescale_cold.inner,
         codebook.inner,
         dim,
         n_rep,

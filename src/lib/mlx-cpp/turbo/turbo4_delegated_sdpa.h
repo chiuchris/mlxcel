@@ -1,0 +1,100 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#pragma once
+
+// Fused dequant + SDPA Metal kernel launcher for `KVCacheMode::Turbo4Delegated`
+// (issue #528, follow-up to issue #527's K-side unification).
+//
+// The Turbo4Delegated cache stores V in two regions:
+// - cold body — `[B, H_kv, T_cold, D/2]` u8 packed Turbo4 indices plus
+//   `[B, H_kv, T_cold, 1]` fp16 per-token kernel rescale (`norm/|y_hat|`,
+//   issue #520).
+// - hot ring — `[B, H_kv, T_hot, D]` fp16 plain V tokens (no rotation).
+//
+// Pre-#528 the read path materialised the full FP16 cold body (via
+// `dequantize_v_turbo4` plus a memo from PR #525) and then ran a graph-level
+// `concatenate(cold_v_dequant, hot_v, axis=2)` plus standard SDPA. The memo
+// alone consumed `[B, H_kv, cold_offset, D]` fp16 of working set, undoing the
+// 4-bit V compression that defines the mode. Issue #528 retires that memo.
+//
+// `turbo4_delegated_sdpa_cold_weighted_sum` mirrors the Sparse-V kernel
+// `sparse_v_weighted_sum` (issue #505 / #520) — runtime-JIT-compiled via
+// `mlx::core::fast::metal_kernel`, identical input layout, identical
+// "unrotated weighted sum" output contract. The host caller composes:
+//
+//     out = signs1 · WHT(signs2 · cold_pre) + attn_hot @ hot_v
+//
+// where `cold_pre` is what this launcher returns. The packed cold V is read
+// directly inside the kernel; the dequantised cold V is **never** written to
+// global memory. That is the whole point of issue #528.
+//
+// The hot-side weighted sum (`attn_hot @ hot_v`) is kept in the host MLX
+// graph (single small matmul, T_hot ≤ DELEGATED_HOT_MAX = 1024) — the per-
+// step cost is negligible and using MLX's matmul keeps the steel-attention /
+// NAX paths active.
+//
+// MLX C++ symbols touched (re-validate on every MLX commit bump per
+// CLAUDE.md): `mlx::core::fast::metal_kernel`, `mlx::core::full`,
+// `mlx::core::Shape`, `mlx::core::float32`.
+//
+// Used by: `cpp/mlx_cxx_bridge.cpp::turbo4_delegated_cold_weighted_sum`.
+
+#include <mlx/array.h>
+
+namespace mlxcel::turbo {
+
+// Run the fused-skip Metal kernel on the cold V body and return the unrotated
+// per-coordinate weighted sum.
+//
+// Inputs:
+// - `attn_weights_cold`: `[B*Hq, Tq, T_cold]` FP32 — pre-flattened
+//   post-softmax weights restricted to the cold range. The caller is
+//   responsible for slicing the full-cache softmax output to the first
+//   `T_cold` columns.
+// - `v_packed_cold`:     `[B*Hkv, T_cold, D/2]` UINT8 — nibble-packed Turbo4
+//   V indices for the cold body.
+// - `v_rescale_cold`:    `[B*Hkv, T_cold]` FP16 — precomputed per-token
+//   rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (issue #520).
+// - `codebook`:          `[16]` FP32 — Lloyd-Max centroids (4-bit).
+//
+// Template parameters (passed to the kernel as `int` template args):
+// - `Dim`: head dimension `D` (must equal `2 * v_packed.shape[-1]`).
+// - `RepeatCount`: `Tq` — number of Q tokens the threadgroup handles.
+// - `NRep`: `Hq / Hkv` — Q-head replication factor for grouped attention.
+//
+// Scalar parameters:
+// - `threshold`: alive cutoff. Any `attn_weight <= threshold` is skipped.
+//   `0.0` disables skipping. The Turbo4Delegated decode path on the host
+//   side currently passes whatever `MLXCEL_SPARSE_V_THRESHOLD` resolves to
+//   (default `1e-6` if unset, matching the Turbo4Asym sparse-V kernel) —
+//   the threshold is shared between the Turbo4Delegated cold-V kernel and
+//   the Turbo4Asym sparse-V kernel via the same env var. Set the env var
+//   to `0` (or `0.0`) to disable per-token skipping on this path while
+//   still exercising the fused dequant.
+//
+// Output:
+// - `out_cold_pre`: `[B*Hq, Tq, D]` FP32 — unrotated weighted sum of the
+//   cold V tokens. The host caller applies the `signs1 · WHT · signs2`
+//   inverse rotation to produce the rotated cold contribution.
+mlx::core::array turbo4_delegated_cold_weighted_sum(
+    const mlx::core::array& attn_weights_cold,  // [B*Hq, Tq, T_cold] f32
+    const mlx::core::array& v_packed_cold,      // [B*Hkv, T_cold, D/2] u8
+    const mlx::core::array& v_rescale_cold,     // [B*Hkv, T_cold] f16 (#520)
+    const mlx::core::array& codebook,           // [16] f32
+    int dim,
+    int n_rep,
+    float threshold);
+
+} // namespace mlxcel::turbo

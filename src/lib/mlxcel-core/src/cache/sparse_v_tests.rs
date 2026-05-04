@@ -655,3 +655,29 @@ fn sparse_v_kernel_enabled_default_macos() {
         assert!(!enabled, "kernel must be off on non-macOS targets");
     }
 }
+
+/// Turbo4Delegated fused-kernel opt-in gate sanity.
+///
+/// `turbo4_delegated_fused_enabled()` defaults to **off** (unlike the sparse-V
+/// kernel which defaults to on). It only returns `true` when
+/// `MLXCEL_TURBO4_DELEGATED_FUSED` is set to one of the truthy literals.
+/// This mirrors the `sparse_v_kernel_enabled_default_macos` test for the
+/// existing Turbo4Asym kernel gate.
+#[test]
+fn turbo4_delegated_fused_enabled_default_off() {
+    let enabled = sparse_v::turbo4_delegated_fused_enabled();
+    // Read the actual env var so the test is correct whether or not the caller
+    // set it (e.g. in CI with MLXCEL_TURBO4_DELEGATED_FUSED=1 for bench runs).
+    let env = std::env::var(sparse_v::TURBO4_DELEGATED_FUSED_ENV_VAR).ok();
+    match env.as_deref() {
+        Some("1") | Some("true") | Some("on") | Some("yes") => {
+            assert!(enabled, "expected fused path enabled when env says truthy");
+        }
+        _ => {
+            assert!(
+                !enabled,
+                "expected fused path off by default (MLXCEL_TURBO4_DELEGATED_FUSED unset or falsy)"
+            );
+        }
+    }
+}

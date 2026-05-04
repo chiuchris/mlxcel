@@ -338,36 +338,6 @@ pub struct KVCache {
     /// Hot-tail fold threshold (Turbo4Delegated only). Mutable so test harness
     /// and benchmarks can configure it without going through the env var.
     pub(crate) hot_threshold: i32,
-    /// Memoized dequantized cold V tensor (Turbo4Delegated only, issue #521).
-    ///
-    /// Shape: `[B, H, cold_offset, V_dim]` fp16 — equivalent to the on-the-fly
-    /// `dequantize_v_turbo4(v_packed[:cold_offset], v_norms[:cold_offset], params)`
-    /// graph that `fetch_turbo4_delegated` previously rebuilt on every decode
-    /// step. The cold body is append-only between folds (mutated only by
-    /// [`Self::append_cold_block`] via the steady-state `fold_hot_block_to_cold`
-    /// or the prefill→decode `fold_hot_to_cold_full`) and shrinks only via
-    /// [`Self::trim`], so the dequantized result is a pure function of the
-    /// `(v_packed, v_norms, params)` snapshot at `cold_offset`.
-    /// Caching it converts per-step decode dequant cost from O(cold_offset) to
-    /// O(1) on cache hits — folds happen every `DELEGATED_FOLD_BLOCK` (=128)
-    /// decode steps, so cache hits dominate at 4K/16K context.
-    ///
-    /// Invalidation contract:
-    /// - Cleared in [`Self::append_cold_block`] *after* `cold_offset` advances
-    ///   (a new fold has changed the cold body).
-    /// - Cleared in [`Self::trim`] when `cold_offset` shrinks (cold tokens
-    ///   were rewound) or when the entire cache empties.
-    /// - Cleared on detach/install round-trip so the post-install side
-    ///   recomputes lazily; the cache is regeneratable so we do not bother
-    ///   shipping it across handles.
-    ///
-    /// `None` until the first decode step after a fold has populated cold
-    /// storage. See `cold_v_dequant_cached_offset` for the matching guard.
-    pub(crate) cold_v_dequant_cache: Option<UniquePtr<MlxArray>>,
-    /// `cold_offset` value at the moment `cold_v_dequant_cache` was populated
-    /// (issue #521). The cache is only reused when this matches the current
-    /// `cold_offset`; any divergence forces a recompute.
-    pub(crate) cold_v_dequant_cached_offset: i32,
 }
 
 impl KVCache {
@@ -391,8 +361,6 @@ impl KVCache {
             turbo_seed: TURBO_DEFAULT_SEED,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
-            cold_v_dequant_cache: None,
-            cold_v_dequant_cached_offset: 0,
         }
     }
 
@@ -437,8 +405,6 @@ impl KVCache {
             turbo_seed,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
-            cold_v_dequant_cache: None,
-            cold_v_dequant_cached_offset: 0,
         }
     }
 
@@ -1646,9 +1612,9 @@ impl KVCache {
         ));
 
         self.cold_offset += block;
-        // Cold body changed (a fold just appended): drop the dequant memo so
-        // the next fetch rebuilds it for the new `cold_offset`. Issue #521.
-        self.invalidate_cold_v_dequant_cache();
+        // Issue #528 retired the `cold_v_dequant_cache` memo: the fused
+        // kernel reads packed cold V directly, so the cold body changing has
+        // no host-side cached state to invalidate.
     }
 
     /// Trim the last `n` entries from the cache.
@@ -1700,9 +1666,7 @@ impl KVCache {
             // `turbo3_params` (issue #477) follows the same contract.
             self.turbo_params = None;
             self.turbo3_params = None;
-            // Drop the cold-V dequant memo (issue #521): cold buffers were
-            // just released, so the memo is stale.
-            self.invalidate_cold_v_dequant_cache();
+            // Issue #528 retired the cold-V dequant memo — nothing to drop.
         } else if self.mode == KVCacheMode::Turbo4Delegated {
             // Issue #527: K is unified — slice `keys` to `self.offset` like
             // `Fp16` mode. V hot ring trims to the new hot length first; cold
@@ -1756,9 +1720,8 @@ impl KVCache {
                         &[vr_shape[0], vr_shape[1], self.cold_offset, 1],
                     ));
                 }
-                // Cold V body shrunk: drop the cold-V dequant memo so the next
-                // fetch rebuilds at the new (smaller) `cold_offset`. Issue #521.
-                self.invalidate_cold_v_dequant_cache();
+                // Issue #528 retired the cold-V dequant memo — nothing to
+                // drop when the cold V body shrinks.
             }
             // Suppress unused-variable warnings in non-delegated branches.
             let _ = hot_trim;
@@ -1993,7 +1956,8 @@ impl KVCache {
         }
     }
 
-    /// Read path for `KVCacheMode::Turbo4Delegated` (issue #527: K unified).
+    /// Read path for `KVCacheMode::Turbo4Delegated` (issue #527: K unified;
+    /// issue #528: cold-V dequant memo retired).
     ///
     /// K is a single unified FP16 buffer (issue #527) — returns
     /// `slice(keys, 0, offset)`, identical to `KVCacheMode::Fp16`. No
@@ -2007,15 +1971,16 @@ impl KVCache {
     /// `hot_offset() == 0` (just after a full fold with no decode token yet)
     /// this returns just the dequantized cold V body.
     ///
-    /// **Per-step cost (issue #521).** The dequantized cold V is memoized in
-    /// [`Self::cold_v_dequant_cache`] keyed by the `cold_offset` snapshot so
-    /// the per-step cost is O(1) cold-V work between folds. The fold path
-    /// ([`Self::append_cold_block`] / [`Self::trim`]) is responsible for
-    /// invalidating the memo. Without this memo every decode step rebuilt
-    /// the full O(`cold_offset`) WHT-based dequant graph — at 4K context with
-    /// `DELEGATED_HOT_THRESHOLD = 256` and `DELEGATED_FOLD_BLOCK = 128`, that
-    /// dropped throughput to ~0.27× FP16 (PR #519). Folding cadence is once
-    /// per `DELEGATED_FOLD_BLOCK` decode steps, so cache hits dominate.
+    /// **Per-step cost (issue #528).** This fallback rebuilds the full
+    /// `dequantize_v_turbo4(v_packed[:cold_offset], v_norms[:cold_offset])`
+    /// graph on every call — the PR-#525 `cold_v_dequant_cache` memo was
+    /// retired by issue #528 because the fused kernel path
+    /// ([`Self::update_and_turbo4_delegated_attention`]) reads packed cold V
+    /// directly without ever materialising the FP16 cold V tensor. This
+    /// fallback is now only reached on the prefill-shaped path (multi-token
+    /// `update_and_fetch`) or when callers have not been ported to the
+    /// fused-attention API; on the decode hot path the fused kernel is the
+    /// only consumer.
     fn fetch_turbo4_delegated(&mut self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         // K side (issue #527): unified buffer — same path as FP16 mode.
         let k = self.keys.as_ref().expect("unified keys must exist");
@@ -2046,54 +2011,10 @@ impl KVCache {
             );
         }
 
-        // Cold V dequant: reuse the memoized result when the cold body has
-        // not changed since the last fetch. The fold paths (and `trim`) are
-        // responsible for invalidating the memo when `cold_offset` advances
-        // or rewinds.
-        self.ensure_cold_v_dequant_cache();
-
-        // Build a fresh `UniquePtr<MlxArray>` referencing the cached cold-V
-        // dequant. A full-coverage `slice` is detected by `mlx::core::slice`
-        // (see ops.cpp) and short-circuits to returning the original array
-        // by value, so the copy constructor on `mlx::core::array` performs a
-        // shallow refcount bump on the underlying `ArrayDesc`. No new graph
-        // node, no kernel launch.
-        let cached = self
-            .cold_v_dequant_cache
-            .as_ref()
-            .expect("cold_v_dequant_cache populated by ensure_cold_v_dequant_cache");
-        let cs = ffi::array_shape(cached);
-        let cold_v_dequant = ffi::slice(cached, &[0, 0, 0, 0], &cs);
-
-        // V side: concatenate cold + hot. K is already a unified slice.
-        let full_v = match hot_v_slice {
-            Some(hot_v) => concatenate(&cold_v_dequant, &hot_v, 2),
-            None => cold_v_dequant,
-        };
-        (k_slice, full_v)
-    }
-
-    /// Populate [`Self::cold_v_dequant_cache`] for the current `cold_offset`
-    /// if the memo is missing or stale.
-    ///
-    /// The memo is "stale" when `cold_v_dequant_cached_offset != cold_offset`,
-    /// which can only happen after `append_cold_block` (cold_offset grew
-    /// because of a fold) or `trim` (cold_offset shrunk). Both paths clear
-    /// the cache field directly, so the in-method comparison is a defensive
-    /// double-check rather than the primary invalidation mechanism — keeping
-    /// the contract symmetric makes it harder to silently regress.
-    ///
-    /// Used by: [`Self::fetch_turbo4_delegated`].
-    fn ensure_cold_v_dequant_cache(&mut self) {
-        debug_assert!(
-            self.cold_offset > 0,
-            "ensure called only when cold body exists"
-        );
-        let needs_rebuild = self.cold_v_dequant_cache.is_none()
-            || self.cold_v_dequant_cached_offset != self.cold_offset;
-        if !needs_rebuild {
-            return;
-        }
+        // Cold V dequant: rebuild from packed every call (issue #528 retired
+        // the memo). On the fused-attention decode path the kernel reads
+        // `v_packed` directly — this fallback only runs for prefill-shaped
+        // calls and unported call sites.
         let vp = self.v_packed.as_ref().expect("v_packed must exist");
         let vn = self.v_norms.as_ref().expect("v_norms must exist");
         let params = self
@@ -2112,23 +2033,14 @@ impl KVCache {
             &[0, 0, 0, 0],
             &[vn_shape[0], vn_shape[1], self.cold_offset, 1],
         );
-        let dequant = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
-        self.cold_v_dequant_cache = Some(dequant);
-        self.cold_v_dequant_cached_offset = self.cold_offset;
-    }
+        let cold_v_dequant = turbo::quant::dequantize_v_turbo4(&vp_slice, &vn_slice, params);
 
-    /// Invalidate the cold-V dequant memo (issue #521).
-    ///
-    /// Called whenever the cold body data changes — i.e. after
-    /// [`Self::append_cold_block`] grows it via a fold, or [`Self::trim`]
-    /// shrinks/clears it. The next [`Self::fetch_turbo4_delegated`] will
-    /// rebuild the dequant lazily.
-    ///
-    /// Used by: [`Self::append_cold_block`], [`Self::trim`], [`Self::clone_handle`].
-    #[inline]
-    fn invalidate_cold_v_dequant_cache(&mut self) {
-        self.cold_v_dequant_cache = None;
-        self.cold_v_dequant_cached_offset = 0;
+        // V side: concatenate cold + hot. K is already a unified slice.
+        let full_v = match hot_v_slice {
+            Some(hot_v) => concatenate(&cold_v_dequant, &hot_v, 2),
+            None => cold_v_dequant,
+        };
+        (k_slice, full_v)
     }
 
     /// Get the total memory size of the cached keys and values in bytes.
@@ -2138,14 +2050,14 @@ impl KVCache {
     /// V-norm sidecars; the original FP16 values tensor is not stored.
     /// In Turbo4 (symmetric) mode this counts only the K- and V-side packed
     /// sidecars; both the FP16 keys and FP16 values tensors are absent.
-    /// In Turbo4Delegated mode (issue #527: K unified) this counts the unified
-    /// FP16 K buffer (under `keys`, identical footprint to `Fp16` mode), the
-    /// FP16 V hot ring (under `values`), the packed cold V sidecars
-    /// (`v_packed`/`v_norms`/`v_rescale`), and — when populated — the cold-V
-    /// dequant memo (issue #521): a per-cache FP16 buffer of the same
-    /// `[B, H, cold_offset, V_dim]` shape as the uncompressed V, used to
-    /// amortize per-step decode dequant cost across folds. There is no
-    /// separate cold-K buffer (issue #527 removed it).
+    /// In Turbo4Delegated mode (issue #527: K unified; issue #528: cold-V
+    /// dequant memo retired) this counts the unified FP16 K buffer (under
+    /// `keys`, identical footprint to `Fp16` mode), the FP16 V hot ring
+    /// (under `values`), and the packed cold V sidecars
+    /// (`v_packed`/`v_norms`/`v_rescale`). There is no separate cold-K
+    /// buffer (issue #527 removed it) and no FP16 cold-V working set (issue
+    /// #528 replaced the PR-#525 memo with a fused kernel that reads packed
+    /// cold V directly).
     /// In Turbo3Asym mode this counts the FP16 keys plus the 3-bit packed-V
     /// and V-norm sidecars; the underlying `array_nbytes` already accounts
     /// for the smaller per-token byte count (`head_dim * 3 / 8` u8 vs the
@@ -2161,14 +2073,9 @@ impl KVCache {
         let vr_bytes = self.v_rescale.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kp_bytes = self.k_packed.as_ref().map_or(0, |v| ffi::array_nbytes(v));
         let kn_bytes = self.k_norms.as_ref().map_or(0, |v| ffi::array_nbytes(v));
-        // Cold-V dequant memo (issue #521): same FP16 footprint as the
-        // dequantized cold V body. Counted here so accounting reflects the
-        // steady-state working set of `KVCacheMode::Turbo4Delegated` decode
-        // rather than just the stored compressed form.
-        let cv_bytes = self
-            .cold_v_dequant_cache
-            .as_ref()
-            .map_or(0, |c| ffi::array_nbytes(c));
+        // Issue #528 retired the PR-#525 `cold_v_dequant_cache` memo: the
+        // fused kernel reads packed cold V directly so there is no longer a
+        // FP16 cold-V working set to count here.
         k_bytes
             + v_bytes
             + ks_bytes
@@ -2178,7 +2085,6 @@ impl KVCache {
             + vr_bytes
             + kp_bytes
             + kn_bytes
-            + cv_bytes
     }
 
     /// Returns `true` iff this cache holds a packed V (the Turbo4 family)
@@ -2401,6 +2307,244 @@ impl KVCache {
             mask,
             threshold,
         ))
+    }
+
+    /// Returns `true` iff this cache is in `KVCacheMode::Turbo4Delegated` mode
+    /// and the fused dequant + SDPA decode path (issue #528) is reachable.
+    ///
+    /// The fused kernel is Apple-Silicon-only (the runtime JIT requires Metal)
+    /// and supports the Turbo4Delegated mode regardless of whether
+    /// `MLXCEL_SPARSE_V_THRESHOLD` is set — the threshold is an additional
+    /// per-token skip optimisation, not a gate. Callers that want the kernel
+    /// path should check this accessor and, if true, use
+    /// [`Self::update_and_turbo4_delegated_attention`] in place of the
+    /// standard [`Self::update_and_fetch`] + `attention()` pair.
+    ///
+    /// Used by: per-model attention call sites that have been ported to the
+    /// fused-kernel path. Standard call sites continue to use
+    /// `cache.update_and_fetch(...)` followed by `attention(...)`.
+    pub fn turbo4_delegated_available(&self) -> bool {
+        self.mode == KVCacheMode::Turbo4Delegated
+    }
+
+    /// Combined update + Turbo4Delegated attention dispatch (issue #528).
+    ///
+    /// The standard `update_and_fetch + attention()` pair pays the full
+    /// `dequantize_v_turbo4(v_packed[:cold_offset])` graph cost on every
+    /// decode step, plus a `concat(cold_v_dequant, hot_v, axis=2)` that
+    /// scales with `cold_offset`. Pre-#528 the PR-#525 memo amortised the
+    /// dequant across folds at the cost of a `[B, Hkv, cold_offset, V_dim]`
+    /// FP16 working set per layer per sequence. Issue #528 replaces both
+    /// with a fused Metal kernel that reads packed cold V directly:
+    ///
+    /// 1. [`Self::update`] fills the unified K buffer, the V hot ring, and
+    ///    (when `hot_offset > hot_threshold`) the packed cold V sidecars.
+    /// 2. [`turbo::sparse_v::attention_turbo4_delegated_fused`] runs Q·K
+    ///    against the unified K, softmax, the fused cold-V kernel for the
+    ///    cold contribution, a small host matmul for the hot contribution,
+    ///    and sums the two.
+    ///
+    /// When the fused kernel is gated off (non-macOS, non-power-of-2 head
+    /// dim, or `MLXCEL_SPARSE_V_KERNEL=0`) this function falls through to a
+    /// graph-only reference path inside the same call: it dequantises the
+    /// cold V tokens transiently (no memo retention — the V-budget guard in
+    /// [`crate::cache::turbo_tests::delegated_per_token_v_budget_after_issue_528`]
+    /// continues to pass) and runs standard SDPA on the resulting FP16
+    /// `[B, Hkv, T_total, D]` V tensor. Either way the cache state after the
+    /// call is identical to the kernel-path state.
+    ///
+    /// **Panics.** This function is intended for callers that have already
+    /// verified [`Self::turbo4_delegated_available`] returns `true`. It panics
+    /// otherwise — that is a programming error.
+    ///
+    /// The Q tensor must already have RoPE / Q-norm applied; the caller is
+    /// responsible for that, just as with the standard path.
+    ///
+    /// Used by: per-model attention call sites (Llama 3, Qwen 3, etc.) when
+    /// the cache is in `Turbo4Delegated` mode and the model has opted into
+    /// the fused path via [`turbo::sparse_v::turbo4_delegated_fused_enabled`].
+    pub fn update_and_turbo4_delegated_attention(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        assert!(
+            self.turbo4_delegated_available(),
+            "update_and_turbo4_delegated_attention called on a cache that is not in \
+             Turbo4Delegated mode (mode={:?})",
+            self.mode
+        );
+        // Fill the unified K buffer + V hot ring (and possibly fold hot V
+        // into cold packed storage). After this call `self.offset` and
+        // `self.cold_offset` are up to date.
+        self.update(new_keys, new_values);
+
+        let cold_offset = self.cold_offset;
+        let hot_offset = self.offset - cold_offset;
+        debug_assert!(
+            hot_offset >= 0,
+            "hot_offset must be non-negative (offset={}, cold_offset={cold_offset})",
+            self.offset
+        );
+
+        // turbo_params is initialised lazily on the first fold (inside
+        // `update_turbo4_delegated`). Before the first fold (cold_offset == 0)
+        // the kernel is not dispatched on the cold side but the rotation /
+        // codebook references are still part of the call signature. Eagerly
+        // initialise params here so we can pass them down without juggling
+        // mutable borrows below; subsequent folds will reuse this instance.
+        if self.turbo_params.is_none() {
+            // Use the new_values head_dim we just stored. After `update` the
+            // unified K head_dim equals the V head_dim only on Turbo4
+            // (symmetric); for delegated the K and V head_dims may differ in
+            // principle, so probe V from the hot ring or packed sidecars.
+            let head_dim_u32 = self
+                .values
+                .as_ref()
+                .map(|v| ffi::array_shape(v)[3] as u32)
+                .or_else(|| {
+                    self.v_packed
+                        .as_ref()
+                        .map(|vp| (ffi::array_shape(vp)[3] as u32) * 2)
+                })
+                .expect("either hot V ring or v_packed must exist after first update");
+            self.turbo_params =
+                Some(turbo::TurboQuantParams::new(head_dim_u32, self.turbo_seed));
+        }
+
+        // Slice the unified K buffer down to the visible token range
+        // [0, offset). Same shape contract as `KVCacheMode::Fp16` (issue #527).
+        let k_buf = self
+            .keys
+            .as_ref()
+            .expect("unified keys must exist after update on Turbo4Delegated");
+        let ks = ffi::array_shape(k_buf);
+        let k_slice = ffi::slice(k_buf, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+
+        // Slice the cold V packed sidecars down to [0, cold_offset). When
+        // `cold_offset == 0` we skip these — the fused kernel only sweeps
+        // the cold range, so empty cold means the kernel call is skipped on
+        // the host side.
+        let v_packed_owned = if cold_offset > 0 {
+            let vp = self
+                .v_packed
+                .as_ref()
+                .expect("v_packed must exist when cold_offset > 0");
+            let vp_shape = ffi::array_shape(vp);
+            Some(ffi::slice(
+                vp,
+                &[0, 0, 0, 0],
+                &[vp_shape[0], vp_shape[1], cold_offset, vp_shape[3]],
+            ))
+        } else {
+            None
+        };
+        let v_rescale_owned = if cold_offset > 0 {
+            let vr = self
+                .v_rescale
+                .as_ref()
+                .expect("v_rescale must exist when cold_offset > 0");
+            let vr_shape = ffi::array_shape(vr);
+            Some(ffi::slice(
+                vr,
+                &[0, 0, 0, 0],
+                &[vr_shape[0], vr_shape[1], cold_offset, 1],
+            ))
+        } else {
+            None
+        };
+
+        // Slice the V hot ring down to [0, hot_offset).
+        let hot_v_owned = if hot_offset > 0 {
+            let hv = self
+                .values
+                .as_ref()
+                .expect("hot values must exist when hot_offset > 0");
+            let hv_shape = ffi::array_shape(hv);
+            Some(ffi::slice(
+                hv,
+                &[0, 0, 0, 0],
+                &[hv_shape[0], hv_shape[1], hot_offset, hv_shape[3]],
+            ))
+        } else {
+            None
+        };
+
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params eagerly initialised above");
+
+        let threshold = turbo::sparse_v::threshold();
+        let v_packed_ref = v_packed_owned.as_deref();
+        let v_rescale_ref = v_rescale_owned.as_deref();
+        let hot_v_ref = hot_v_owned.as_deref();
+
+        if let Some(out) = turbo::sparse_v::attention_turbo4_delegated_fused(
+            q,
+            &k_slice,
+            v_packed_ref,
+            v_rescale_ref,
+            hot_v_ref,
+            params,
+            cold_offset,
+            hot_offset,
+            scale,
+            mask,
+            threshold,
+        ) {
+            return out;
+        }
+
+        // Fused kernel rejected the dispatch (non-macOS, non-power-of-2
+        // head_dim, or `MLXCEL_SPARSE_V_KERNEL=0`). Cache state is already up
+        // to date from the `self.update(...)` above, so we run the same graph
+        // SDPA reference path the legacy `update_and_fetch + attention()`
+        // pair would produce. The transient FP16 cold V dequant materialised
+        // here is thrown away as soon as the SDPA call finishes — no memo is
+        // retained.
+        self.delegated_graph_attention(q, scale, mask)
+    }
+
+    /// Graph-only Turbo4Delegated attention reference (issue #528 fallback).
+    ///
+    /// Computes attention against the **already-updated** Turbo4Delegated cache
+    /// using the legacy compositional path:
+    ///
+    /// 1. [`Self::fetch_turbo4_delegated`] returns the unified K slice and a
+    ///    fresh `concat(cold_v_dequant, hot_v, axis=2)` FP16 V tensor. The
+    ///    cold dequant is materialised transiently for this call and not
+    ///    retained anywhere on `self` — the V-budget guard
+    ///    (`delegated_per_token_v_budget_after_issue_528`) continues to pass.
+    /// 2. [`crate::layers::attention`] runs SDPA against that K/V pair with
+    ///    the supplied scale and optional additive mask.
+    ///
+    /// Bit-equivalent (within FP16 round-off) to running
+    /// `let (k, v) = cache.update_and_fetch(...); attention(&q, &k, &v, ...)`
+    /// after a `cache.update(...)` has already been applied.
+    ///
+    /// Used by: [`Self::update_and_turbo4_delegated_attention`] when the
+    /// fused Metal kernel is gated off, and by tests that need to verify the
+    /// graph-fallback path without manipulating
+    /// `MLXCEL_SPARSE_V_KERNEL` (which is cached in a `OnceLock` and cannot
+    /// be flipped between cargo-test cases reliably).
+    pub fn delegated_graph_attention(
+        &mut self,
+        q: &MlxArray,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        assert!(
+            self.turbo4_delegated_available(),
+            "delegated_graph_attention called on a cache that is not in \
+             Turbo4Delegated mode (mode={:?})",
+            self.mode
+        );
+        let (k_full, v_full) = self.fetch_turbo4_delegated();
+        crate::layers::attention(q, &k_full, &v_full, scale, mask, 0.0, 0)
     }
 
     /// Estimated storage bytes per reserved token slot in the backing buffer.

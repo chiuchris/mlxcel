@@ -141,6 +141,16 @@ impl Attention {
         // because the per-token skip only wins at long context — and
         // prefill builds the cache from scratch, so there's nothing to
         // skip yet.
+        // Issue #528: Turbo4Delegated fused dequant + SDPA kernel is opt-in
+        // via `MLXCEL_TURBO4_DELEGATED_FUSED=1`. See `models/llama3.rs` for
+        // the rationale — the kernel preserves the 4-bit V-memory budget
+        // but its host pipeline is slower than steel attention SDPA on M5
+        // Max at the gate contexts. Default route stays on
+        // `update_and_fetch` + `attention()`. The opt-in flag is parsed once
+        // and cached in a `OnceLock<bool>` — see
+        // `mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_fused_enabled`.
+        let use_fused_delegated =
+            mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_fused_enabled();
         let attn_out = if l == 1 && cache.sparse_v_available() {
             // The helper consumes k/v, fills the packed cache, and runs
             // the fused kernel (or graph fallback). When `sparse_v_available`
@@ -148,6 +158,11 @@ impl Attention {
             cache
                 .update_and_sparse_v_attention(&q, k, v, self.scale, mask)
                 .expect("update_and_sparse_v_attention returned None despite sparse_v_available")
+        } else if l == 1 && use_fused_delegated && cache.turbo4_delegated_available() {
+            // The helper always produces an attention output: it routes
+            // through the fused Metal kernel when available and falls
+            // through to the graph-only reference path otherwise.
+            cache.update_and_turbo4_delegated_attention(&q, k, v, self.scale, mask)
         } else if l > 1 && mask.is_none() {
             let (cache_k, cache_v) = cache.update_and_fetch(k, v);
             mlxcel_core::causal_attention(&q, &cache_k, &cache_v, self.scale, 0.0, 0)

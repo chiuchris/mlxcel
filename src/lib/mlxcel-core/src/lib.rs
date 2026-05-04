@@ -1989,6 +1989,55 @@ mod ffi {
             threshold: f32,
         ) -> UniquePtr<MlxArray>;
 
+        // -------------------------------------------------------------------
+        // Issue #528 — Fused Turbo4Delegated cold-V weighted-sum kernel.
+        // -------------------------------------------------------------------
+        /// Fused Turbo4Delegated cold-V weighted sum (issue #528).
+        ///
+        /// Runs a Metal kernel that computes
+        ///   `out_cold[b, h, q, d] = Σ_t attn_cold[b, h, q, t] * V_dq[b, h, t, d]`
+        /// over the cold token range, reading the packed Turbo4 V indices
+        /// directly. The dequantised cold V never materialises in global
+        /// memory; that is the point of issue #528 (replaces the PR-#525
+        /// `cold_v_dequant_cache` memo + per-step `concat(cold_v, hot_v)`).
+        ///
+        /// The output is unrotated — the caller must apply the inverse
+        /// `signs1 · WHT · signs2` Turbo4 rotation to produce the rotated
+        /// cold contribution, then add the hot-V matmul `attn_hot @ hot_v`
+        /// to get the final FP16 SDPA output.
+        ///
+        /// Inputs (caller must pre-flatten):
+        /// - `attn_weights_cold`: `[B*Hq, Tq, T_cold]` FP32 — post-softmax
+        ///   weights restricted to the cold range. The caller slices the
+        ///   full softmax output to the first `T_cold` columns.
+        /// - `v_packed_cold`:     `[B*Hkv, T_cold, D/2]` UINT8 — nibble-
+        ///   packed Turbo4 indices for the cold body.
+        /// - `v_rescale_cold`:    `[B*Hkv, T_cold]` FP16 — precomputed
+        ///   per-token rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (same
+        ///   semantic content as the Sparse-V kernel rescale, issue #520).
+        /// - `codebook`:          `[16]` FP32 — Lloyd-Max centroids.
+        /// - `dim`: head dimension `D`.
+        /// - `n_rep`: `Hq / Hkv` (1 for non-grouped attention).
+        /// - `threshold`: alive cutoff for sparse-V skipping. `0.0` runs the
+        ///   full cold sweep without skipping (default for the
+        ///   Turbo4Delegated decode path; gated on
+        ///   `--turbo-sparse-v-threshold`).
+        ///
+        /// Output: `[B*Hq, Tq, D]` FP32 — unrotated cold weighted sum.
+        ///
+        /// Metal-only — fails to link on non-macOS targets. Callers are
+        /// expected to gate via `KVCache::update_and_turbo4_delegated_attention`,
+        /// which only dispatches when on macOS + Turbo4Delegated.
+        fn turbo4_delegated_cold_weighted_sum(
+            attn_weights_cold: &MlxArray,
+            v_packed_cold: &MlxArray,
+            v_rescale_cold: &MlxArray,
+            codebook: &MlxArray,
+            dim: i32,
+            n_rep: i32,
+            threshold: f32,
+        ) -> UniquePtr<MlxArray>;
+
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()
         type MlxLoadedWeights;

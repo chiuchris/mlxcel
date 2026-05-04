@@ -159,6 +159,45 @@ pub fn kernel_enabled() -> bool {
     })
 }
 
+/// Environment variable that opts callers into the fused Turbo4Delegated
+/// dequant + SDPA kernel path (issue #528). Default: kernel path is **off**;
+/// callers route through the legacy `update_and_fetch + attention()` pair
+/// until follow-up work brings the fused pipeline inside the steel-attention
+/// envelope on M5 Max at the gate contexts.
+///
+/// - Unset / any value other than the truthy literals below: kernel OFF.
+/// - `1`, `true`, `on`, `yes` (any ASCII case): kernel ON.
+pub const TURBO4_DELEGATED_FUSED_ENV_VAR: &str = "MLXCEL_TURBO4_DELEGATED_FUSED";
+
+/// Cached opt-in flag for the Turbo4Delegated fused kernel path (resolved on
+/// first read of [`TURBO4_DELEGATED_FUSED_ENV_VAR`]).
+static TURBO4_DELEGATED_FUSED_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` iff the caller has opted into the fused Turbo4Delegated
+/// dequant + SDPA kernel path via [`TURBO4_DELEGATED_FUSED_ENV_VAR`].
+///
+/// Mirrors the [`kernel_enabled`] caching pattern: the env var is parsed once
+/// per process and cached in a `OnceLock<bool>` so per-token, per-layer
+/// attention forwards pay only an atomic load instead of an env-table lookup
+/// (`std::env::var` allocates a fresh `String` and takes a process-wide lock,
+/// which is ~3,200 calls/sec/sequence on a 32-layer model — see the security
+/// review on PR #530).
+///
+/// Used by: per-model attention call sites (Llama 3, Qwen 3, ...) that want
+/// to opt into [`KVCache::update_and_turbo4_delegated_attention`] over the
+/// standard `update_and_fetch + attention()` pair.
+pub fn turbo4_delegated_fused_enabled() -> bool {
+    *TURBO4_DELEGATED_FUSED_ENABLED.get_or_init(|| {
+        match std::env::var(TURBO4_DELEGATED_FUSED_ENV_VAR) {
+            Ok(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            ),
+            Err(_) => false,
+        }
+    })
+}
+
 /// Compute the per-(KV head, KV token) "alive" mask from attention scores.
 ///
 /// # Inputs
@@ -524,6 +563,243 @@ pub fn attention_sparse_v_turbo4_fused(
     Some(ffi::astype(&post_d1, dtype::FLOAT16))
 }
 
+/// Fused dequant + SDPA path for `KVCacheMode::Turbo4Delegated` (issue #528).
+///
+/// The Turbo4Delegated cache stores V in two regions: a packed cold body
+/// (`[B, Hkv, T_cold, D/2]` u8 + `[B, Hkv, T_cold, 1]` fp16 rescale) and an
+/// FP16 hot ring (`[B, Hkv, T_hot, D]`). Pre-#528 the read path materialised
+/// the full FP16 cold body via `dequantize_v_turbo4` (memoised by PR #525)
+/// and ran a graph-level `concat(cold_v_dequant, hot_v, axis=2)` plus
+/// standard SDPA. The memo's working set was `[B, Hkv, cold_offset, D]` fp16
+/// — at 4K context that is 50–100 MB per layer per sequence and undoes the
+/// 4-bit V compression that defines the mode.
+///
+/// This function replaces that path. Steps:
+///
+/// 1. Compute attention scores `Q · K^T` against the unified K (length
+///    `T_total = T_cold + T_hot`), apply the optional mask, run softmax to
+///    get `attn` of shape `[B, Hq, Tq, T_total]`.
+/// 2. Slice `attn` into the cold range `[..., :T_cold]` and the hot range
+///    `[..., T_cold:]`.
+/// 3. **Cold contribution**: dispatch the fused kernel
+///    [`ffi::turbo4_delegated_cold_weighted_sum`] which reads the packed cold
+///    V directly. Returns the *unrotated* cold weighted sum
+///    `[B*Hq, Tq, D]` fp32. Apply the inverse Turbo4 rotation
+///    `signs1 · WHT(signs2 · ·)` on the host to produce the rotated cold
+///    contribution `[B, Hq, Tq, D]` fp32.
+/// 4. **Hot contribution**: standard MLX matmul `attn_hot @ hot_v`, using
+///    the unrotated FP16 hot V. The host graph keeps this on the steel
+///    attention / NAX matmul path so the small T_hot batch (≤ 1024 tokens at
+///    `DELEGATED_HOT_MAX`) stays cheap.
+/// 5. Sum the two contributions and cast to FP16.
+///
+/// At no point does the dequantised cold V exist as a tensor in global
+/// memory. The dequant is computed inside the kernel into thread-local
+/// registers and consumed by the weighted sum in the same dispatch — that
+/// is the whole point of issue #528.
+///
+/// # Inputs
+///
+/// - `q`: `[B, Hq, Tq, D]` query tensor (FP16 or FP32). Must already have
+///   RoPE / Q-norm applied (matches the standard attention call contract).
+/// - `unified_k`: `[B, Hkv, T_total, D]` FP16 — the full unified K buffer
+///   (issue #527 unified the K side, dropping the cold/hot split for K).
+/// - `v_packed`: `[B, Hkv, T_cold, D/2]` u8 — packed cold V indices. May be
+///   empty (`T_cold == 0`) on the very first decode step before any fold.
+/// - `v_rescale`: `[B, Hkv, T_cold, 1]` FP16 — precomputed per-token kernel
+///   rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (issue #520). Same lockstep
+///   shape as the Turbo4Asym path.
+/// - `hot_v`: `[B, Hkv, T_hot, D]` FP16 — plain FP16 hot V tokens. May be
+///   empty (`T_hot == 0`) immediately after a full fold.
+/// - `params`: `TurboQuantParams` used at quantize time (V-side sign vectors
+///   + codebook).
+/// - `scale`: attention scale (`1 / sqrt(D)` typically).
+/// - `mask`: optional additive attention mask.
+/// - `threshold_value`: alive cutoff for the cold-V kernel skipping (gated
+///   on `--turbo-sparse-v-threshold`). `0.0` runs the full cold sweep
+///   without skipping. Inert hot tokens are unaffected — the hot matmul
+///   does not participate in the threshold path.
+///
+/// # Output
+///
+/// `Some([B, Hq, Tq, D])` FP16 attention output, or `None` when the kernel
+/// path is gated off (non-macOS, non-power-of-2 head dim, or
+/// `MLXCEL_SPARSE_V_KERNEL=0`). Callers should fall back to
+/// [`KVCache::update_and_fetch`] + `attention()` in that case.
+///
+/// Used by: `KVCache::update_and_turbo4_delegated_attention` (issue #528).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_turbo4_delegated_fused(
+    q: &MlxArray,
+    unified_k: &MlxArray,
+    v_packed: Option<&MlxArray>,
+    v_rescale: Option<&MlxArray>,
+    hot_v: Option<&MlxArray>,
+    params: &TurboQuantParams,
+    cold_offset: i32,
+    hot_offset: i32,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    threshold_value: f32,
+) -> Option<UniquePtr<MlxArray>> {
+    if !kernel_enabled() {
+        return None;
+    }
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(unified_k);
+    debug_assert_eq!(q_shape.len(), 4, "q must be 4-D [B, Hq, Tq, D]");
+    debug_assert_eq!(k_shape.len(), 4, "unified_k must be 4-D [B, Hkv, T_total, D]");
+    let b = q_shape[0];
+    let hq = q_shape[1];
+    let tq = q_shape[2];
+    let head_dim = q_shape[3];
+    let kv_heads = k_shape[1];
+    let t_total = k_shape[2];
+    debug_assert!(kv_heads > 0, "Hkv must be positive");
+    debug_assert!(
+        hq % kv_heads == 0,
+        "Hq ({hq}) must be a multiple of Hkv ({kv_heads})"
+    );
+    let n_rep = hq / kv_heads;
+    debug_assert_eq!(
+        t_total,
+        cold_offset + hot_offset,
+        "unified_k length ({t_total}) must equal cold_offset ({cold_offset}) + hot_offset ({hot_offset})"
+    );
+
+    // Kernel-friendly precondition: head_dim must be a power of 2. All
+    // production text models use head_dim ∈ {64, 128, 192, 256}; the 192
+    // case (Gemma 4) is the lone non-power-of-2 outlier. For that we fall
+    // back to the graph path (caller uses `update_and_fetch`).
+    if !(head_dim as u32).is_power_of_two() {
+        return None;
+    }
+
+    // 1. Compute attention scores via the standard graph path. The unified K
+    //    buffer is FP16; we cast to FP32 for a stable softmax. Repeat KV
+    //    heads to match Q heads (grouped attention).
+    let k_for_q = if n_rep == 1 {
+        ffi::contiguous(unified_k, false)
+    } else {
+        let kt = k_shape[2];
+        let kd = k_shape[3];
+        let k_exp = ffi::expand_dims(unified_k, 2);
+        let k_tiled = ffi::broadcast_to(&k_exp, &[b, kv_heads, n_rep, kt, kd]);
+        ffi::reshape(&k_tiled, &[b, hq, kt, kd])
+    };
+    let k_for_q_t = ffi::transpose_axes(&k_for_q, &[0, 1, 3, 2]);
+    let q_f32 = ffi::astype(q, dtype::FLOAT32);
+    let k_t_f32 = ffi::astype(&k_for_q_t, dtype::FLOAT32);
+    let qk = ffi::matmul(&q_f32, &k_t_f32);
+    let scale_arr = ffi::full_f32(&[1], scale, dtype::FLOAT32);
+    let mut scores = ffi::multiply(&qk, &scale_arr);
+    if let Some(m) = mask {
+        let m_f32 = ffi::astype(m, dtype::FLOAT32);
+        scores = ffi::add(&scores, &m_f32);
+    }
+    // Single softmax over the full T_total range so the cold and hot
+    // contributions stay normalised against the same denominator. Slicing
+    // softmax outputs into cold/hot halves preserves bit-equivalence with a
+    // dense `attn @ V_full` computation.
+    let attn_full = ffi::softmax_precise(&scores, -1); // [B, Hq, Tq, T_total] f32
+
+    // 2. Cold and hot contributions. Each may be empty depending on cache
+    //    state (cold is empty pre-fold; hot is empty immediately after a
+    //    full fold).
+    let bhq = b * hq;
+    let bhkv = b * kv_heads;
+
+    let cold_contrib_pre_rotate = if cold_offset > 0 {
+        let v_packed = v_packed.expect("v_packed must exist when cold_offset > 0");
+        let v_rescale = v_rescale.expect("v_rescale must exist when cold_offset > 0");
+
+        // Slice the cold range out of the full attention. attn_full shape:
+        // [B, Hq, Tq, T_total]. We need [B, Hq, Tq, T_cold].
+        let attn_cold = ffi::slice(
+            &attn_full,
+            &[0, 0, 0, 0],
+            &[b, hq, tq, cold_offset],
+        );
+        let attn_cold_flat = ffi::reshape(&attn_cold, &[bhq, tq, cold_offset]);
+        // v_packed graph shape: [B, Hkv, T_cold, D/2]; flatten to
+        // [B*Hkv, T_cold, D/2].
+        let v_packed_flat = ffi::reshape(v_packed, &[bhkv, cold_offset, head_dim / 2]);
+        // v_rescale graph shape: [B, Hkv, T_cold, 1]; drop the trailing axis
+        // and flatten to [B*Hkv, T_cold].
+        let v_rescale_flat = ffi::reshape(v_rescale, &[bhkv, cold_offset]);
+        let codebook_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+        let codebook_arr =
+            ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
+
+        let out_cold_pre_flat = ffi::turbo4_delegated_cold_weighted_sum(
+            &attn_cold_flat,
+            &v_packed_flat,
+            &v_rescale_flat,
+            &codebook_arr,
+            head_dim,
+            n_rep,
+            threshold_value,
+        );
+        let out_cold_pre = ffi::reshape(&out_cold_pre_flat, &[b, hq, tq, head_dim]);
+        // Apply inverse Turbo4 rotation `signs1 · WHT(signs2 · ·)` on the
+        // small `[B, Hq, Tq, D]` output. This is the exact rotation
+        // `dequantize_v_turbo4` applies per-token; doing it once on the
+        // weighted sum is mathematically equivalent (linearity) and runs
+        // O(Hq · Tq · D log D) instead of O(Hkv · T_cold · D log D).
+        let signs1_arr =
+            ffi::from_slice_f32(&params.signs1, &[1, 1, 1, head_dim]);
+        let signs2_arr =
+            ffi::from_slice_f32(&params.signs2, &[1, 1, 1, head_dim]);
+        let pre_h = ffi::multiply(&out_cold_pre, &signs2_arr);
+        let post_h = crate::ops::wht(&pre_h);
+        let post_d1 = ffi::multiply(&post_h, &signs1_arr);
+        Some(post_d1)
+    } else {
+        None
+    };
+
+    let hot_contrib = if hot_offset > 0 {
+        let hot_v = hot_v.expect("hot_v must exist when hot_offset > 0");
+        // Slice the hot range out of the full attention. attn_full shape:
+        // [B, Hq, Tq, T_total]; hot range is [..., cold_offset:].
+        let attn_hot = ffi::slice(
+            &attn_full,
+            &[0, 0, 0, cold_offset],
+            &[b, hq, tq, t_total],
+        );
+        // Repeat hot V along Hkv → Hq for grouped attention. attn_hot is
+        // [B, Hq, Tq, T_hot]; hot_v is [B, Hkv, T_hot, D]. After the repeat
+        // we get [B, Hq, T_hot, D] for the matmul.
+        let hot_v_for_q = if n_rep == 1 {
+            ffi::contiguous(hot_v, false)
+        } else {
+            let hv_exp = ffi::expand_dims(hot_v, 2);
+            let hv_tiled = ffi::broadcast_to(&hv_exp, &[b, kv_heads, n_rep, hot_offset, head_dim]);
+            ffi::reshape(&hv_tiled, &[b, hq, hot_offset, head_dim])
+        };
+        let hot_v_f32 = ffi::astype(&hot_v_for_q, dtype::FLOAT32);
+        // matmul([B, Hq, Tq, T_hot], [B, Hq, T_hot, D]) = [B, Hq, Tq, D] f32.
+        Some(ffi::matmul(&attn_hot, &hot_v_f32))
+    } else {
+        None
+    };
+
+    // 3. Sum cold and hot contributions. Both are FP32; cast to FP16 at the
+    //    end to match the public attention contract.
+    let combined = match (cold_contrib_pre_rotate, hot_contrib) {
+        (Some(c), Some(h)) => ffi::add(&c, &h),
+        (Some(c), None) => c,
+        (None, Some(h)) => h,
+        (None, None) => {
+            // Empty cache (offset == 0). Should not occur in practice: a
+            // decode step always sees at least the just-appended token. We
+            // return zeros of the right shape for total safety.
+            ffi::zeros(&[b, hq, tq, head_dim], dtype::FLOAT32)
+        }
+    };
+    Some(ffi::astype(&combined, dtype::FLOAT16))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -554,5 +830,37 @@ mod tests {
     #[test]
     fn default_threshold_value() {
         assert_eq!(DEFAULT_THRESHOLD, 1e-6);
+    }
+
+    /// Turbo4Delegated fused-kernel env-var parsing — truthy / falsy / unset.
+    ///
+    /// Same OnceLock caveat as `threshold_default_when_unset`: we cannot
+    /// poke the global `TURBO4_DELEGATED_FUSED_ENABLED` OnceLock from a test
+    /// because other tests may have already populated it. We exercise the
+    /// parse closure inline instead.
+    #[test]
+    fn turbo4_delegated_fused_parse_logic() {
+        let parse = |s: &str| -> bool {
+            matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        };
+        // Truthy values
+        assert!(parse("1"));
+        assert!(parse("true"));
+        assert!(parse("True"));
+        assert!(parse("TRUE"));
+        assert!(parse("on"));
+        assert!(parse("ON"));
+        assert!(parse("yes"));
+        assert!(parse("YES"));
+        // Falsy / unrecognised → default off
+        assert!(!parse("0"));
+        assert!(!parse("false"));
+        assert!(!parse("off"));
+        assert!(!parse("no"));
+        assert!(!parse(""));
+        assert!(!parse("enabled"));
     }
 }

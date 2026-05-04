@@ -1560,6 +1560,26 @@ std::unique_ptr<MlxArray> turbo_sparse_v_weighted_sum(
     int32_t n_rep,
     float threshold);
 
+// Issue #528 — Fused Turbo4Delegated cold-V weighted-sum kernel launcher.
+// Wraps `mlxcel::turbo::turbo4_delegated_cold_weighted_sum` so the cxx bridge
+// can expose it via the `turbo4_delegated_cold_weighted_sum` FFI symbol.
+// Implementation lives in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp`.
+//
+// The kernel returns the unrotated weighted sum of the cold V tokens. The
+// host caller applies the inverse Turbo4 rotation to that result and adds
+// the hot-V matmul contribution to produce the final FP16 SDPA output. The
+// dequantised cold V never materialises in global memory — that property is
+// the reason this kernel exists (vs. the pre-#528 path which built an FP16
+// `cold_v_dequant` memo plus a per-step concat with hot V).
+std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
+    const MlxArray& attn_weights_cold,
+    const MlxArray& v_packed_cold,
+    const MlxArray& v_rescale_cold,
+    const MlxArray& codebook,
+    int32_t dim,
+    int32_t n_rep,
+    float threshold);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

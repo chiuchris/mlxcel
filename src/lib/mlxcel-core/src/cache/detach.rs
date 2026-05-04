@@ -271,12 +271,8 @@ impl KVCache {
         // `turbo3_params` (issue #477) follows the same contract.
         self.turbo_params = None;
         self.turbo3_params = None;
-        // Drop the cold-V dequant memo (issue #521): the cold buffers it
-        // referenced have just been moved into the detached handle, so the
-        // memo is stale on the source and a new sequence reusing the slot
-        // must rebuild it lazily on the first decode-side fetch.
-        self.cold_v_dequant_cache = None;
-        self.cold_v_dequant_cached_offset = 0;
+        // Issue #528 retired the cold-V dequant memo — nothing to drop on
+        // the source.
         handle
     }
 
