@@ -280,51 +280,124 @@ constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
     // -------------------------------------------------------------------------
     // Pass 1: per-Q max + sum_exp scan over the full T_total score range.
     //
-    // We restrict this to thread 0 of each threadgroup because the work is
-    // small (T_total reads, a handful of FLOPs per token) and serializing it
-    // avoids the threadgroup tree-reduction barriers that issue #520 spent
-    // significant effort to eliminate from the cold-V kernel. With a single
-    // threadgroup-memory broadcast at the end the other D-1 threads spin at a
-    // single barrier rather than participating in a multi-stage reduction.
-    // For the typical decode case (Tq=1, T_total=4K) this is ~4K reads and
-    // ~4K float ops per threadgroup — well below the kernel-launch overhead.
+    // History: PR #532 ran this entire pass on thread 0 only and parked the
+    // other D-1 threads at a single barrier, citing issue #520 as precedent
+    // for avoiding threadgroup tree-reduction barriers. That assumption held
+    // on M1 Ultra at parity contexts but failed by 6×–25× on M5 Max (PR
+    // #533) because the M5 Max GPU has higher thread occupancy and each
+    // idle thread now costs more in opportunity terms than the barrier
+    // chain itself. Issue #534 inverts the choice for this kernel: split
+    // both Pass 1a (max) and Pass 1b (sum_exp) across all D threads with a
+    // tree reduction. With D=128 and T_total=16K each thread reads 128
+    // positions instead of 16K — a 128× cut in per-thread serial work.
+    //
+    // Why issue #520's pattern still applies to `sparse_v_sdpa.cpp`: that
+    // kernel does no pre-pass; it only does a single accumulation loop with
+    // per-thread skip. There is no cross-thread dependency in that loop, so
+    // there is no barrier to eliminate. Here we have an explicit reduction.
+    //
+    // Tree-reduction barriers cost ~10–50ns each on Apple Silicon. For
+    // D=128 the depth is log2(128)=7 barriers per pass × 2 passes ×
+    // RepeatCount ≈ 56 barriers per kernel launch for RepeatCount=4 — about
+    // 1.7μs total, negligible against the multi-millisecond per-step cost.
+    //
+    // The numerical-stability guards are unchanged: still subtract max
+    // before exp, still pin a degenerate `mx` of -inf to 0 and a degenerate
+    // `sm` of 0 to 1, but applied after the reduction at the broadcast
+    // point.
     // -------------------------------------------------------------------------
     threadgroup float tg_max[RepeatCount];
     threadgroup float tg_sum[RepeatCount];
+    // `tg_alive_cutoff[r]` is the score-space equivalent of the sparse-V
+    // threshold: `score > max + log(threshold * sum_exp)` iff the normalised
+    // attention weight is `> threshold`. Pass 2 uses it to reject dead cold
+    // tokens before paying the exp + dequant cost. When threshold is disabled
+    // (`0.0`) the cutoff is `-inf` and Pass 2 falls back to the exact full
+    // sweep.
+    threadgroup float tg_alive_cutoff[RepeatCount];
+    // Scratch buffer for the per-r tree reduction. Sized at the threadgroup
+    // width (Dim, since the launcher uses tg_x = Dim for the production
+    // power-of-2 head dims). Reused across Pass 1a and Pass 1b within each
+    // r iteration. 4 bytes × 256 = 1KB worst case for D=256, well under the
+    // 32KB threadgroup-memory budget.
+    threadgroup float tg_red[Dim];
 
-    if (d == 0u) {
-        for (int r = 0; r < RepeatCount; r++) {
-            // First pass for this r: max over T_total.
-            float mx = -INFINITY;
-            for (uint t = 0; t < t_total; t++) {
-                float s = sc_base[r * t_total + t];
-                if (s > mx) {
-                    mx = s;
+    for (int r = 0; r < RepeatCount; r++) {
+        // -------- Pass 1a: parallel max over T_total. --------
+        float local_max = -INFINITY;
+        for (uint t = d; t < t_total; t += (uint)Dim) {
+            float s = sc_base[r * t_total + t];
+            if (s > local_max) {
+                local_max = s;
+            }
+        }
+        tg_red[d] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Tree reduction across the D threads. Dim is a power of 2 for all
+        // production models the launcher gates on, so this halving loop
+        // terminates cleanly with stride=1 → 0.
+        for (uint stride = (uint)Dim >> 1u; stride > 0u; stride >>= 1u) {
+            if (d < stride) {
+                float other = tg_red[d + stride];
+                if (other > tg_red[d]) {
+                    tg_red[d] = other;
                 }
             }
-            // If every score is -inf (all positions masked out — this can
-            // happen with a maliciously empty mask region but not in any
-            // production prompt), pin max to 0 to avoid `exp(-inf - -inf) = nan`.
-            if (!isfinite(mx)) {
-                mx = 0.0f;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        // tg_red[0] now holds the per-r max. Apply the -inf guard at the
+        // broadcast point so all threads see the same `mx` for Pass 1b.
+        float mx = tg_red[0];
+        if (!isfinite(mx)) {
+            mx = 0.0f;
+        }
+
+        // -------- Pass 1b: parallel sum_exp over T_total. --------
+        float local_sum = 0.0f;
+        for (uint t = d; t < t_total; t += (uint)Dim) {
+            float s = sc_base[r * t_total + t];
+            local_sum += metal::fast::exp(s - mx);
+        }
+        // Reuse `tg_red` for the sum reduction. The previous max-reduction
+        // result has already been read into the per-thread `mx` above, so
+        // overwriting the buffer is safe after the next barrier.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        tg_red[d] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint stride = (uint)Dim >> 1u; stride > 0u; stride >>= 1u) {
+            if (d < stride) {
+                tg_red[d] = tg_red[d] + tg_red[d + stride];
             }
-            // Second pass: sum_exp.
-            float sm = 0.0f;
-            for (uint t = 0; t < t_total; t++) {
-                float s = sc_base[r * t_total + t];
-                sm += metal::fast::exp(s - mx);
-            }
-            // Guard against a degenerate sum of zero (all scores were -inf
-            // pre-clamp). Set to 1 so the per-token attn becomes 0 and the
-            // output is a clean zero rather than a NaN.
-            if (!(sm > 0.0f) || !isfinite(sm)) {
-                sm = 1.0f;
-            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float sm = tg_red[0];
+        // Same degenerate-sum guard as the prior single-thread design: if
+        // every score was -inf (so every exp(score - mx) underflowed to 0
+        // or produced NaN), pin sum to 1 so per-token attn comes out 0
+        // instead of NaN.
+        if (!(sm > 0.0f) || !isfinite(sm)) {
+            sm = 1.0f;
+        }
+
+        // Publish to the per-r broadcast slots. Only thread 0 needs to
+        // write; the trailing barrier guarantees all threads see the
+        // final values before Pass 2 reads them.
+        if (d == 0u) {
             tg_max[r] = mx;
             tg_sum[r] = sm;
+            float cutoff = -INFINITY;
+            if (thresh > 0.0f && isfinite(thresh)) {
+                float thresh_sum = thresh * sm;
+                if (thresh_sum > 0.0f && isfinite(thresh_sum)) {
+                    cutoff = mx + metal::fast::log(thresh_sum);
+                }
+            }
+            tg_alive_cutoff[r] = cutoff;
         }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // -------------------------------------------------------------------------
     // Pass 2: cold + hot weighted-sum into per-thread accumulators.
@@ -340,6 +413,14 @@ constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
         acc_cold[r] = 0.0f;
         acc_hot[r] = 0.0f;
     }
+    float max_vals[RepeatCount];
+    float sum_vals[RepeatCount];
+    float cutoff_vals[RepeatCount];
+    for (int r = 0; r < RepeatCount; r++) {
+        max_vals[r] = tg_max[r];
+        sum_vals[r] = tg_sum[r];
+        cutoff_vals[r] = tg_alive_cutoff[r];
+    }
 
     // Per-dim packed-byte coordinates for the cold V dequant.
     uint byte_idx = (uint)d >> 1u;
@@ -350,39 +431,80 @@ constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
     // threshold for every Q slot, skip the dequant + rescale + accumulate
     // work entirely. We compare `exp_score > thresh * sum_exp` instead of
     // the equivalent `exp_score / sum_exp > thresh` to avoid a divide in the
-    // hot path — `sum_exp` is loop-invariant per r.
-    for (uint t = 0; t < t_cold; t++) {
-        bool any_alive = false;
-        // Cache the per-r exp(score - max) so we don't recompute it inside
-        // the accumulation phase. RepeatCount is a template constant, so
-        // this register array is sized at compile time.
-        float exp_scores[RepeatCount];
-        for (int r = 0; r < RepeatCount; r++) {
-            float s = sc_base[r * t_total + t];
-            float es = metal::fast::exp(s - tg_max[r]);
-            exp_scores[r] = es;
-            if (es > thresh * tg_sum[r]) {
-                any_alive = true;
+    // hot path — `sum_exp` is loop-invariant per r. Issue #534 follow-up:
+    // make that comparison in score-space first so fully-dead tokens also
+    // avoid the exp calls.
+    bool threshold_enabled = thresh > 0.0f && isfinite(thresh);
+    if (threshold_enabled) {
+        for (uint t = 0; t < t_cold; t++) {
+            bool any_alive = false;
+            // Cache the per-r score and exp(score - max) so we don't
+            // recompute them inside the accumulation phase. RepeatCount is
+            // a template constant, so these register arrays are sized at
+            // compile time.
+            float scores_local[RepeatCount];
+            float exp_scores[RepeatCount];
+            for (int r = 0; r < RepeatCount; r++) {
+                float s = sc_base[r * t_total + t];
+                scores_local[r] = s;
+                if (s > cutoff_vals[r]) {
+                    any_alive = true;
+                }
+            }
+            if (!any_alive) {
+                continue;
+            }
+            for (int r = 0; r < RepeatCount; r++) {
+                exp_scores[r] = metal::fast::exp(scores_local[r] - max_vals[r]);
+            }
+
+            // Decode the per-(t, d) cold V centroid. Out-of-Dim threads
+            // (d >= Dim) compute a benign 0 contribution; the bottom write
+            // gate suppresses stray output.
+            float code = 0.0f;
+            if (d < (uint)Dim) {
+                uint pb = (uint)pk[t * (uint)(Dim / 2) + byte_idx];
+                uint idx = (pb >> nibble_shift) & 0x0Fu;
+                code = codebook[idx];
+            }
+            float rescale_t = (float)rs[t];
+            float scaled = code * rescale_t;
+
+            for (int r = 0; r < RepeatCount; r++) {
+                acc_cold[r] += exp_scores[r] * scaled;
             }
         }
-        if (!any_alive) {
-            continue;
-        }
+    } else {
+        for (uint t = 0; t < t_cold; t++) {
+            bool any_alive = false;
+            float exp_scores[RepeatCount];
+            for (int r = 0; r < RepeatCount; r++) {
+                float s = sc_base[r * t_total + t];
+                float es = metal::fast::exp(s - max_vals[r]);
+                exp_scores[r] = es;
+                if (es > 0.0f) {
+                    any_alive = true;
+                }
+            }
+            if (!any_alive) {
+                continue;
+            }
 
-        // Decode the per-(t, d) cold V centroid. Out-of-Dim threads
-        // (d >= Dim) compute a benign 0 contribution; the bottom write gate
-        // suppresses stray output.
-        float code = 0.0f;
-        if (d < (uint)Dim) {
-            uint pb = (uint)pk[t * (uint)(Dim / 2) + byte_idx];
-            uint idx = (pb >> nibble_shift) & 0x0Fu;
-            code = codebook[idx];
-        }
-        float rescale_t = (float)rs[t];
-        float scaled = code * rescale_t;
+            // Decode the per-(t, d) cold V centroid. Out-of-Dim threads
+            // (d >= Dim) compute a benign 0 contribution; the bottom write
+            // gate suppresses stray output.
+            float code = 0.0f;
+            if (d < (uint)Dim) {
+                uint pb = (uint)pk[t * (uint)(Dim / 2) + byte_idx];
+                uint idx = (pb >> nibble_shift) & 0x0Fu;
+                code = codebook[idx];
+            }
+            float rescale_t = (float)rs[t];
+            float scaled = code * rescale_t;
 
-        for (int r = 0; r < RepeatCount; r++) {
-            acc_cold[r] += exp_scores[r] * scaled;
+            for (int r = 0; r < RepeatCount; r++) {
+                acc_cold[r] += exp_scores[r] * scaled;
+            }
         }
     }
 
@@ -394,7 +516,7 @@ constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
         float exp_scores[RepeatCount];
         for (int r = 0; r < RepeatCount; r++) {
             float s = sc_base[r * t_total + t_cold + t];
-            exp_scores[r] = metal::fast::exp(s - tg_max[r]);
+            exp_scores[r] = metal::fast::exp(s - max_vals[r]);
         }
         float hv_d = 0.0f;
         if (d < (uint)Dim) {
@@ -417,7 +539,7 @@ constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
     // -------------------------------------------------------------------------
     if (d < (uint)Dim) {
         for (int r = 0; r < RepeatCount; r++) {
-            float inv_sum = 1.0f / tg_sum[r];
+            float inv_sum = 1.0f / sum_vals[r];
             uint out_idx = (bhq * (uint)RepeatCount + (uint)r) * (uint)Dim + d;
             out_cold_pre[out_idx] = acc_cold[r] * inv_sum;
             out_hot[out_idx]      = acc_hot[r]  * inv_sum;
