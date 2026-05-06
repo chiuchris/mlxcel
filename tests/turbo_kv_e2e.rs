@@ -75,9 +75,28 @@
 //! and NIAH=0/12 (see issue #506). This gate measures TurboQuant compression
 //! quality, not chat performance, so the base model is the correct fixture.
 //!
-//! # VLM gates
+//! # VLM gates (issue #510)
 //!
-//! VLM quality gates are tracked as a follow-up to this issue.
+//! VLM gates run a smaller PPL+NIAH harness on text-only inputs because the
+//! prefill cost on a vision-aware checkpoint is dominated by the decoder, not
+//! the vision tower; reusing the existing wikitext fixture keeps the
+//! comparison directly aligned with the text-model gate. A separate
+//! image-token kurtosis sanity test then exercises the actual vision path
+//! (image + text prompt) and measures the K-side kurtosis at image-token
+//! positions before and after the WHT rotation. See the docstrings on
+//! [`run_vlm_quality_gate`] and [`test_vlm_image_token_kurtosis`] for the
+//! exact harness sizing and gate thresholds.
+//!
+//! ```text
+//! # PPL + NIAH gate for Qwen2-VL-2B (text-only path)
+//! cargo test --test turbo_kv_e2e --release -- --ignored test_qwen2_vl_2b_quality_gate --nocapture
+//!
+//! # PPL + NIAH gate for Aya-Vision-8B (text-only path)
+//! cargo test --test turbo_kv_e2e --release -- --ignored test_aya_vision_8b_quality_gate --nocapture
+//!
+//! # Image-token K-side kurtosis pre/post WHT rotation
+//! cargo test --test turbo_kv_e2e --release -- --ignored test_vlm_image_token_kurtosis --nocapture
+//! ```
 
 mod common;
 use common::repo_model_dir;
@@ -87,10 +106,14 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use mlxcel::{CxxGenerator, LanguageModel, SamplingConfig, load_model};
+use mlxcel::vlm_runtime::{prepare_and_compute_vlm_embeddings, prepared_embedding_refs};
+use mlxcel::{CxxGenerator, LanguageModel, LoadedModel, SamplingConfig, load_model};
 use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::cache::turbo::{TurboQuantParams, turbo4_v_rotate};
-use mlxcel_core::{eval, from_slice_f32, item_f32, mean_all, multiply, square, subtract};
+use mlxcel_core::{
+    array_shape, array_to_raw_bytes, astype, dtype, eval, from_slice_f32, item_f32, mean_all,
+    multiply, square, subtract,
+};
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -872,5 +895,510 @@ fn test_rotation_kurtosis_sanity() {
         kurt_after < 5.0,
         "post-rotation kurtosis {kurt_after:.4} ≥ 5.0 — rotation did not whiten the \
          distribution as expected (model: {model_name}, pre-rotation: {kurt_before:.4})"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VLM (multimodal) quality gates — issue #510
+// ---------------------------------------------------------------------------
+
+// VLM-specific PPL sizing.
+//
+// We deliberately keep the VLM PPL pass smaller than the text-model gate:
+// vision-aware checkpoints carry a heavier prefill graph (mRoPE for Qwen-VL,
+// 4D image-aware attention masks for Aya/Gemma-style VLMs), so per-chunk
+// throughput is roughly half of an architecturally-matched text checkpoint.
+// 6 chunks × 2048 tokens (≈12K target tokens per mode) is enough for the
+// relative PPL gate to be statistically meaningful while keeping wall-clock
+// for one model to ~5 minutes on M1 Ultra. Text-only gates remain at the
+// original 20×4K sizing.
+const VLM_PPL_CHUNKS: usize = 6;
+const VLM_PPL_CHUNK_LEN: usize = 2048;
+
+/// 4K-context NIAH grid only — VLMs typically advertise much longer context
+/// but the 8K cells at the text gate added ~2× wall-clock without changing
+/// the gate outcome on the text models, so we trim them for the VLM pass.
+static VLM_NIAH_CELLS: &[NiahCell] = NIAH_4K_CELLS;
+
+/// Resolve the model's image-token id across the supported VLM families.
+///
+/// Standard `VisionModule`-backed VLMs (Aya Vision, Gemma3, Llama4, LLaVA)
+/// and Gemma3n expose this via `image_token_block_info()`. Qwen-VL families
+/// (Qwen2-VL, Qwen2.5-VL, Qwen3-VL, Qwen3.5-VLM) expose it on the
+/// `QwenVlmPromptInfo`. Returns `None` for VLM families that don't surface
+/// either accessor (e.g. Phi3-V, Phi4-MM, Molmo) — the kurtosis test
+/// soft-skips in that case.
+fn vlm_image_token_id(model: &LoadedModel) -> Option<i32> {
+    if let Some(info) = model.image_token_block_info() {
+        return Some(info.image_token_id);
+    }
+    if let Some(info) = model.qwen_vl_prompt_info() {
+        return Some(info.image_token_id);
+    }
+    None
+}
+
+/// Smaller PPL pass for VLM gates. Otherwise identical to [`compute_ppl`].
+fn compute_vlm_ppl(
+    model: &impl LanguageModel,
+    tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
+    kv_mode: KVCacheMode,
+) -> (f64, usize) {
+    let corpus_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("wikitext2_excerpt.txt");
+
+    let corpus = fs::read_to_string(&corpus_path)
+        .unwrap_or_else(|e| panic!("wikitext2 corpus missing at {:?}: {e}", corpus_path));
+
+    let all_ids = tokenizer.encode(&corpus, false).expect("tokenize corpus");
+    let all_ids_i32: Vec<i32> = all_ids.iter().map(|&id| id as i32).collect();
+
+    let num_layers = model.num_layers();
+    let mut generator = CxxGenerator::new_with_kv_mode(num_layers, kv_mode);
+
+    let mut total_nll = 0.0_f64;
+    let mut total_target_tokens = 0_usize;
+
+    let max_chunks = VLM_PPL_CHUNKS.min(all_ids_i32.len() / VLM_PPL_CHUNK_LEN);
+    for chunk_idx in 0..max_chunks {
+        let start = chunk_idx * VLM_PPL_CHUNK_LEN;
+        let end = start + VLM_PPL_CHUNK_LEN;
+        let window = &all_ids_i32[start..end];
+
+        let logprobs = generator.evaluate_loglikelihoods(model, window);
+        debug_assert_eq!(logprobs.len(), window.len() - 1);
+
+        let chunk_nll: f64 = logprobs.iter().map(|&lp| -(lp as f64)).sum();
+        total_nll += chunk_nll;
+        total_target_tokens += logprobs.len();
+    }
+
+    if total_target_tokens == 0 {
+        panic!("No target tokens evaluated — corpus too short or no chunks processed");
+    }
+
+    let mean_nll = total_nll / total_target_tokens as f64;
+    let ppl = mean_nll.exp();
+    (ppl, total_target_tokens)
+}
+
+/// Run the VLM PPL + NIAH quality gate on the text-only path.
+///
+/// Returns `Some((ppl_fp16, ppl_turbo, niah_baseline, niah_turbo))` when the
+/// model directory is present, `None` for soft-skip.
+fn run_vlm_quality_gate(model_dir_name: &str) -> Option<(f64, f64, usize, usize)> {
+    let model_dir = repo_model_dir(model_dir_name);
+    if !model_dir.exists() {
+        eprintln!(
+            "Skipping {model_dir_name}: model directory not found at {}.\n\
+             Fetch with: ./target/release/mlxcel download mlx-community/{model_dir_name}",
+            model_dir.display()
+        );
+        return None;
+    }
+
+    eprintln!("\n=== VLM quality gate (text-only path): {model_dir_name} ===");
+
+    let (model, tokenizer) = load_model(&model_dir).expect("load model");
+    if !model.is_vlm() {
+        eprintln!(
+            "Skipping {model_dir_name}: not a VLM checkpoint (text-only loaders should use \
+             the standard text gate)."
+        );
+        return None;
+    }
+
+    eprintln!("[{model_dir_name}] computing fp16 baseline PPL...");
+    let t0 = Instant::now();
+    let (ppl_fp16, n_tokens) = compute_vlm_ppl(&model, &tokenizer, KVCacheMode::Fp16);
+    let fp16_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    let ppl_eval_tps_fp16 = n_tokens as f64 / (fp16_ms / 1000.0).max(1e-9);
+    eprintln!("[{model_dir_name}][fp16] PPL={ppl_fp16:.4} ({n_tokens} tokens, {fp16_ms:.0}ms)");
+    record_speed_row(
+        model_dir_name,
+        "fp16",
+        VLM_PPL_CHUNK_LEN,
+        ppl_eval_tps_fp16,
+        fp16_ms,
+    );
+
+    eprintln!("[{model_dir_name}] computing turbo4asym PPL...");
+    let t1 = Instant::now();
+    let (ppl_turbo, _) = compute_vlm_ppl(&model, &tokenizer, KVCacheMode::Turbo4Asym);
+    let turbo_ms = t1.elapsed().as_secs_f64() * 1000.0;
+    let ppl_eval_tps_turbo = n_tokens as f64 / (turbo_ms / 1000.0).max(1e-9);
+    eprintln!("[{model_dir_name}][turbo4asym] PPL={ppl_turbo:.4} ({turbo_ms:.0}ms)");
+    record_speed_row(
+        model_dir_name,
+        "turbo4asym",
+        VLM_PPL_CHUNK_LEN,
+        ppl_eval_tps_turbo,
+        turbo_ms,
+    );
+
+    let rel_ppl = (ppl_turbo - ppl_fp16) / ppl_fp16;
+    eprintln!(
+        "[{model_dir_name}] PPL relative increase: {:.4}% (gate: ≤{:.1}%)",
+        rel_ppl * 100.0,
+        PPL_GATE_REL * 100.0
+    );
+
+    eprintln!("[{model_dir_name}] NIAH fp16 (4K cells)...");
+    let niah_baseline = run_niah(
+        &model,
+        &tokenizer,
+        KVCacheMode::Fp16,
+        VLM_NIAH_CELLS,
+        model_dir_name,
+        "fp16",
+    );
+    eprintln!("[{model_dir_name}] NIAH turbo4asym (4K cells)...");
+    let niah_turbo = run_niah(
+        &model,
+        &tokenizer,
+        KVCacheMode::Turbo4Asym,
+        VLM_NIAH_CELLS,
+        model_dir_name,
+        "turbo4asym",
+    );
+
+    let total_cells = VLM_NIAH_CELLS.len();
+    eprintln!(
+        "[{model_dir_name}] NIAH: baseline={niah_baseline}/{total_cells} \
+         turbo={niah_turbo}/{total_cells}"
+    );
+
+    Some((ppl_fp16, ppl_turbo, niah_baseline, niah_turbo))
+}
+
+/// Convert an `MlxArray` of arbitrary float dtype to a flat `Vec<f32>`.
+///
+/// Used by the image-token kurtosis path to read out a slice of the K cache
+/// after one prefill pass on an image+text prompt. We always cast to FP32
+/// before extracting bytes so the kurtosis math runs in a single, predictable
+/// dtype regardless of the cache's underlying storage (FP16 / BF16 / FP32).
+fn array_to_f32_vec(arr: &mlxcel_core::MlxArray) -> Vec<f32> {
+    eval(arr);
+    let arr_f32 = astype(arr, dtype::FLOAT32);
+    eval(&arr_f32);
+    array_to_raw_bytes(&arr_f32)
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect()
+}
+
+/// Locate the **contiguous** image-token span in `prompt_tokens`.
+///
+/// Returns `(start, len)` where `prompt_tokens[start..start+len]` is the
+/// inclusive run of `image_token_id`, or `None` if no image tokens are
+/// present. For all VLM families currently shipped in mlxcel that expose an
+/// `image_token_id`, the runtime inserts image tokens as a contiguous block
+/// — so we assert that and bail loudly if the prompt ever turns out to
+/// interleave them.
+fn find_image_token_span(prompt_tokens: &[i32], image_token_id: i32) -> Option<(usize, usize)> {
+    let first = prompt_tokens.iter().position(|&t| t == image_token_id)?;
+    let last = prompt_tokens.iter().rposition(|&t| t == image_token_id)?;
+    let span_len = last - first + 1;
+    let actual_count = prompt_tokens[first..=last]
+        .iter()
+        .filter(|&&t| t == image_token_id)
+        .count();
+    assert_eq!(
+        actual_count, span_len,
+        "image tokens are not contiguous in the prompt — this kurtosis helper assumes \
+         a single contiguous image block (got {actual_count} image tokens across a \
+         span of {span_len} positions)",
+    );
+    Some((first, span_len))
+}
+
+/// One end-to-end image-token K-side kurtosis measurement on a real VLM.
+///
+/// Builds an image+text prompt against `model_dir_name`, runs prefill once
+/// through `model.forward_with_embeddings()` with FP16 KV cache, detaches the
+/// layer-0 K tensor, slices the rows that correspond to image tokens, and
+/// returns the non-excess kurtosis pre- and post-WHT rotation along with the
+/// number of image-token positions sampled.
+///
+/// Used by: [`test_vlm_image_token_kurtosis`]
+fn measure_vlm_image_token_kurtosis(model_dir_name: &str) -> Option<(f64, f64, usize)> {
+    let model_dir = repo_model_dir(model_dir_name);
+    if !model_dir.exists() {
+        eprintln!(
+            "  {model_dir_name}: directory not found at {}, skipping",
+            model_dir.display()
+        );
+        return None;
+    }
+
+    eprintln!("  loading {model_dir_name}...");
+    let (model, tokenizer) = load_model(&model_dir).ok()?;
+    if !model.is_vlm() {
+        eprintln!("  {model_dir_name}: not a VLM checkpoint, skipping");
+        return None;
+    }
+    let image_token_id = vlm_image_token_id(&model)?;
+    eprintln!("  {model_dir_name}: image_token_id={image_token_id}");
+
+    let image_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("test_image.png");
+    let image = image::open(&image_path).expect("load test image fixture");
+
+    // Use a short, deliberately bland text prompt — we want the image tokens
+    // to dominate the cache rows we slice, not the text.
+    let prompt_text = "Describe this image briefly.";
+    let mut prompt_tokens: Vec<i32> = tokenizer
+        .encode(prompt_text, true)
+        .expect("tokenize VLM prompt")
+        .iter()
+        .map(|&id| id as i32)
+        .collect();
+
+    let prepared = prepare_and_compute_vlm_embeddings(
+        &model,
+        &mut prompt_tokens,
+        prompt_text,
+        std::slice::from_ref(&image),
+        |text, add_special| {
+            tokenizer
+                .encode(text, add_special)
+                .unwrap_or_default()
+                .iter()
+                .map(|&t| t as i32)
+                .collect()
+        },
+    )
+    .ok()
+    .flatten()?;
+
+    let Some((image_start, image_len)) = find_image_token_span(&prompt_tokens, image_token_id)
+    else {
+        eprintln!(
+            "  {model_dir_name}: no image tokens after VLM preparation — \
+             the prompt template likely did not insert any (image_token_id={image_token_id})"
+        );
+        return None;
+    };
+    eprintln!(
+        "  {model_dir_name}: prompt has {} tokens with image span [{image_start}..{}) \
+         ({image_len} image tokens)",
+        prompt_tokens.len(),
+        image_start + image_len
+    );
+
+    let (inputs_embeds, mask) =
+        prepared_embedding_refs(&prepared.embeddings).expect("prepared embeddings missing");
+
+    let num_layers = model.num_layers();
+    let mut generator = CxxGenerator::new_with_kv_mode(num_layers, KVCacheMode::Fp16);
+
+    let input_ids_arr =
+        mlxcel_core::from_slice_i32(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
+
+    // Single prefill pass populates `caches[layer]` with FP16 K (and V).
+    let logits = model.forward_with_embeddings(
+        &input_ids_arr,
+        Some(inputs_embeds),
+        generator.caches_mut(),
+        mask,
+    );
+    eval(&logits);
+
+    let detached = generator.caches_mut()[0].clone_handle();
+    let k_full = detached.keys()?;
+    let k_shape = array_shape(k_full);
+    if k_shape.len() != 4 {
+        eprintln!(
+            "  {model_dir_name}: unexpected K cache shape {k_shape:?} \
+             (expected 4-D [B, H, T, D])"
+        );
+        return None;
+    }
+    let (b, h, _t, head_dim) = (k_shape[0], k_shape[1], k_shape[2], k_shape[3]);
+    let stop_t = (image_start + image_len) as i32;
+    let k_image = mlxcel_core::slice(
+        k_full,
+        &[0, 0, image_start as i32, 0],
+        &[b, h, stop_t, head_dim],
+    );
+    eval(&k_image);
+
+    // Kurtosis pre-rotation over the image-only slice.
+    let k_image_f32 = array_to_f32_vec(&k_image);
+    let kurt_before = non_excess_kurtosis(&k_image_f32);
+
+    // Apply the same WHT + sign rotation the runtime would use, then measure
+    // post-rotation kurtosis. `turbo4_v_rotate` requires the last dim to
+    // match `TurboQuantParams::head_dim`, so we build params with the cache's
+    // own head_dim (a power-of-two ≤256 on every VLM we ship today).
+    let params = TurboQuantParams::new(head_dim as u32, 0xAB_CD_12_34);
+    let rotated = turbo4_v_rotate(&k_image, &params);
+    eval(&rotated);
+    let rotated_f32 = array_to_f32_vec(&rotated);
+    let kurt_after = non_excess_kurtosis(&rotated_f32);
+
+    Some((kurt_before, kurt_after, image_len))
+}
+
+/// VLM image-token K-side kurtosis sanity test (issue #510).
+///
+/// Issue #475 establishes that the WHT + sign-flip rotation drops K-side
+/// kurtosis on **text** activations (TurboQuant+ paper reports ~900 → ~2.9
+/// on Qwen3-1.7B). This test repeats the measurement on the **image-token**
+/// slice of the K cache for every locally-cached VLM checkpoint to confirm
+/// the rotation behaves the same way on visually-derived activations.
+///
+/// Pre-conditions are intentionally loose: the test soft-skips if no VLM
+/// checkpoint with a discoverable `image_token_id` is present.
+///
+/// # Gates
+///
+/// - `kurt_after < kurt_before` — rotation must not *increase* heavy-tailedness.
+/// - `kurt_after < kurt_before * 0.5` **OR** `kurt_after < 4.0` —
+///   rotation must drop kurtosis by ≥50%, OR land within the near-Gaussian
+///   regime (Gaussian = 3.0 exactly, +1 slack for sample-noise on the small
+///   image-token slice). The OR-floor handles VLM families like Pixtral
+///   whose image-token K embeddings are already close to Gaussian
+///   pre-rotation (measured ~5.3 on M1 Ultra with 4096-token image grid),
+///   leaving the rotation no headroom for a 50% drop while still moving
+///   the slice closer to Gaussian.
+#[test]
+#[ignore = "requires at least one VLM checkpoint locally — \
+            run with --release -- --ignored test_vlm_image_token_kurtosis --nocapture"]
+fn test_vlm_image_token_kurtosis() {
+    // Order matters: smaller checkpoints first so the soft-skip walk is fast
+    // when only the larger ones are available; aya-vision-8b and gemma-4-e4b
+    // are both healthy 4-bit VLM fixtures shipped during the #517 follow-up.
+    let candidates = [
+        "qwen2-vl-2b-4bit",
+        "qwen2.5-vl-3b-4bit",
+        "aya-vision-8b",
+        "gemma-4-e4b-it-4bit",
+        "gemma3-4b-4bit",
+        "phi-3.5-vision-4bit",
+        "pixtral-12b-4bit",
+    ];
+
+    let mut results: Vec<(String, f64, f64, usize)> = Vec::new();
+    for name in &candidates {
+        if let Some((before, after, image_len)) = measure_vlm_image_token_kurtosis(name) {
+            eprintln!(
+                "  [{name}] image-token K kurtosis: before={before:.4} \
+                 after={after:.4} (image_tokens={image_len})"
+            );
+            results.push((name.to_string(), before, after, image_len));
+        }
+    }
+
+    if results.is_empty() {
+        eprintln!(
+            "Skipping test_vlm_image_token_kurtosis: no VLM checkpoint with a \
+             discoverable image_token_id was found locally."
+        );
+        return;
+    }
+
+    eprintln!("\n  Summary: VLM image-token K-side kurtosis pre/post WHT rotation (issue #510)");
+    for (model_name, kurt_before, kurt_after, image_tokens) in &results {
+        eprintln!(
+            "    {model_name:<24} n={image_tokens:<5} before={kurt_before:>10.4} → after={kurt_after:>8.4} \
+             ({:.1}% of original)",
+            kurt_after / kurt_before * 100.0
+        );
+    }
+
+    // Gate every collected measurement so any VLM family that regresses is
+    // surfaced rather than masked by a healthier sibling.
+    for (model_name, kurt_before, kurt_after, _) in &results {
+        assert!(
+            kurt_before.is_finite() && kurt_after.is_finite(),
+            "kurtosis must be finite (model={model_name}, \
+             before={kurt_before}, after={kurt_after})"
+        );
+        assert!(
+            kurt_after < kurt_before,
+            "VLM image-token K rotation should not *increase* kurtosis: \
+             before={kurt_before:.4} after={kurt_after:.4} (model={model_name})"
+        );
+        let drop_ratio = kurt_after / kurt_before;
+        let near_gaussian = *kurt_after < 4.0;
+        assert!(
+            drop_ratio < 0.5 || near_gaussian,
+            "VLM image-token K rotation only reduced kurtosis from {kurt_before:.4} to \
+             {kurt_after:.4} ({:.1}% of original); expected ≤50% drop OR post-rotation \
+             < 4.0 (model={model_name})",
+            drop_ratio * 100.0,
+        );
+    }
+}
+
+/// VLM Turbo4Asym B3 quality gate — Qwen2-VL 2B, text-only path (issue #510).
+///
+/// Surrogate for the Qwen2.5-VL 3B fixture suggested in #510: same Qwen-VL
+/// architecture (insert/expand image tokens via mRoPE-aware runtime) at a
+/// smaller size that loads under typical M1 Ultra dev RAM. Gates the relative
+/// PPL increase ≤ [`PPL_GATE_REL`] and NIAH retrieval not regressing.
+#[test]
+#[ignore = "requires qwen2-vl-2b-4bit weights — \
+            run with --release -- --ignored test_qwen2_vl_2b_quality_gate --nocapture"]
+fn test_qwen2_vl_2b_quality_gate() {
+    let Some((ppl_fp16, ppl_turbo, niah_baseline, niah_turbo)) =
+        run_vlm_quality_gate("qwen2-vl-2b-4bit")
+    else {
+        return;
+    };
+
+    let rel = (ppl_turbo - ppl_fp16) / ppl_fp16;
+    assert!(
+        ppl_fp16.is_finite() && ppl_fp16 > 0.0,
+        "qwen2-vl-2b fp16 PPL must be finite and positive; got {ppl_fp16}"
+    );
+    assert!(
+        rel <= PPL_GATE_REL,
+        "Qwen2-VL-2B PPL regression {:.4}% > {:.1}% gate \
+         (fp16={ppl_fp16:.4}, turbo={ppl_turbo:.4})",
+        rel * 100.0,
+        PPL_GATE_REL * 100.0
+    );
+    assert!(
+        niah_turbo >= niah_baseline,
+        "Qwen2-VL-2B NIAH turbo ({niah_turbo}) dropped below baseline ({niah_baseline})"
+    );
+}
+
+/// VLM Turbo4Asym B3 quality gate — Aya-Vision 8B, text-only path (issue #510).
+///
+/// Aya-Vision is a Cohere2-decoder + SigLIP vision tower checkpoint (the
+/// "Standard" VLM family in `LoadedModel::vlm_runtime`). Together with
+/// Qwen2-VL 2B this satisfies the "at least 2 VLM models" criterion in #510.
+#[test]
+#[ignore = "requires aya-vision-8b weights — \
+            run with --release -- --ignored test_aya_vision_8b_quality_gate --nocapture"]
+fn test_aya_vision_8b_quality_gate() {
+    let Some((ppl_fp16, ppl_turbo, niah_baseline, niah_turbo)) =
+        run_vlm_quality_gate("aya-vision-8b")
+    else {
+        return;
+    };
+
+    let rel = (ppl_turbo - ppl_fp16) / ppl_fp16;
+    assert!(
+        ppl_fp16.is_finite() && ppl_fp16 > 0.0,
+        "aya-vision-8b fp16 PPL must be finite and positive; got {ppl_fp16}"
+    );
+    assert!(
+        rel <= PPL_GATE_REL,
+        "Aya-Vision-8B PPL regression {:.4}% > {:.1}% gate \
+         (fp16={ppl_fp16:.4}, turbo={ppl_turbo:.4})",
+        rel * 100.0,
+        PPL_GATE_REL * 100.0
+    );
+    assert!(
+        niah_turbo >= niah_baseline,
+        "Aya-Vision-8B NIAH turbo ({niah_turbo}) dropped below baseline ({niah_baseline})"
     );
 }
