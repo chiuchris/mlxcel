@@ -2411,8 +2411,7 @@ impl KVCache {
                         .map(|vp| (ffi::array_shape(vp)[3] as u32) * 2)
                 })
                 .expect("either hot V ring or v_packed must exist after first update");
-            self.turbo_params =
-                Some(turbo::TurboQuantParams::new(head_dim_u32, self.turbo_seed));
+            self.turbo_params = Some(turbo::TurboQuantParams::new(head_dim_u32, self.turbo_seed));
         }
 
         // Slice the unified K buffer down to the visible token range
@@ -2483,6 +2482,33 @@ impl KVCache {
         let v_rescale_ref = v_rescale_owned.as_deref();
         let hot_v_ref = hot_v_owned.as_deref();
 
+        // Issue #531 — Prefer the steel-attention-envelope kernel when
+        // available. It collapses softmax + cold-V dequant + hot-V accum into
+        // a single Metal dispatch, eliminating the per-step FFI / dispatch
+        // overhead of the host composition path. The cold-only kernel from
+        // #528 remains as a fallback for the same correctness contract.
+        if let Some(out) = turbo::sparse_v::attention_turbo4_delegated_steel(
+            q,
+            &k_slice,
+            v_packed_ref,
+            v_rescale_ref,
+            hot_v_ref,
+            params,
+            cold_offset,
+            hot_offset,
+            scale,
+            mask,
+            threshold,
+        ) {
+            return out;
+        }
+
+        // Steel envelope unavailable (non-macOS, non-power-of-2 head_dim, or
+        // `MLXCEL_SPARSE_V_KERNEL=0`). Try the cold-only fused composition
+        // (issue #528) before falling all the way back to the graph SDPA.
+        // The cold-only path keeps the V-budget guarantee and is still
+        // measurably faster than the full graph fallback for some
+        // configurations.
         if let Some(out) = turbo::sparse_v::attention_turbo4_delegated_fused(
             q,
             &k_slice,
@@ -2499,13 +2525,12 @@ impl KVCache {
             return out;
         }
 
-        // Fused kernel rejected the dispatch (non-macOS, non-power-of-2
-        // head_dim, or `MLXCEL_SPARSE_V_KERNEL=0`). Cache state is already up
-        // to date from the `self.update(...)` above, so we run the same graph
-        // SDPA reference path the legacy `update_and_fetch + attention()`
-        // pair would produce. The transient FP16 cold V dequant materialised
-        // here is thrown away as soon as the SDPA call finishes — no memo is
-        // retained.
+        // All fused kernel paths rejected the dispatch. Cache state is
+        // already up to date from the `self.update(...)` above, so we run the
+        // same graph SDPA reference path the legacy `update_and_fetch +
+        // attention()` pair would produce. The transient FP16 cold V dequant
+        // materialised here is thrown away as soon as the SDPA call finishes
+        // — no memo is retained.
         self.delegated_graph_attention(q, scale, mask)
     }
 

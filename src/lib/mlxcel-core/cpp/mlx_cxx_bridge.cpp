@@ -5734,6 +5734,39 @@ std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
     return std::make_unique<MlxArray>(std::move(out));
 }
 
+// Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA bridge.
+// Wraps the launcher in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp` and
+// repackages the std::vector<mlx::core::array> return into the `cxx`-friendly
+// `Turbo4DelegatedSteelOutputs` struct (cxx does not directly model multiple
+// return values, but it does model unique_ptr<struct>).
+std::unique_ptr<Turbo4DelegatedSteelOutputs> turbo4_delegated_steel_sdpa(
+    const MlxArray& scores,
+    const MlxArray& cold_packed,
+    const MlxArray& cold_rescale,
+    const MlxArray& hot_v,
+    const MlxArray& codebook,
+    int32_t dim,
+    int32_t n_rep,
+    int32_t cold_offset,
+    int32_t hot_offset,
+    float threshold) {
+    auto outs = mlxcel::turbo::turbo4_delegated_steel_sdpa(
+        scores.inner,
+        cold_packed.inner,
+        cold_rescale.inner,
+        hot_v.inner,
+        codebook.inner,
+        dim,
+        n_rep,
+        cold_offset,
+        hot_offset,
+        threshold);
+    auto wrapper = std::make_unique<Turbo4DelegatedSteelOutputs>();
+    wrapper->out_cold_pre = std::make_unique<MlxArray>(std::move(outs[0]));
+    wrapper->out_hot      = std::make_unique<MlxArray>(std::move(outs[1]));
+    return wrapper;
+}
+
 std::unique_ptr<MlxLoadedWeights> mlx_load_safetensors(rust::Str path) {
     std::string path_str(path.data(), path.size());
     auto [weights_map, metadata] = mlx::core::load_safetensors(path_str);
@@ -5760,6 +5793,20 @@ rust::String loaded_weights_name(const MlxLoadedWeights& w, size_t index) {
 
 std::unique_ptr<MlxArray> loaded_weights_take(MlxLoadedWeights& w, size_t index) {
     return std::move(w.arrays.at(index));
+}
+
+// Issue #531 — steel SDPA output takers. The cxx bridge does not directly
+// model destructuring a struct returned over the FFI boundary; we expose two
+// simple `move-out` accessors that the Rust caller invokes once each. After
+// both calls the struct's `unique_ptr` slots are empty (a second call would
+// return a null `unique_ptr`, which is harmless because the Rust side drops
+// the struct after the second take).
+std::unique_ptr<MlxArray> steel_outputs_take_cold(Turbo4DelegatedSteelOutputs& o) {
+    return std::move(o.out_cold_pre);
+}
+
+std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o) {
+    return std::move(o.out_hot);
 }
 
 } // namespace mlx_cxx

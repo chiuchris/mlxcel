@@ -1997,9 +1997,8 @@ fn delegated_fused_kernel_matches_reference_over_200_steps() {
         // on macOS with a power-of-2 head_dim the Metal kernel handles the
         // dispatch; otherwise the same call falls through to the graph path.
         let q_for_fused = ffi::copy(&q);
-        let out_fused = cache_fused.update_and_turbo4_delegated_attention(
-            &q_for_fused, k_a, v_a, scale, None,
-        );
+        let out_fused =
+            cache_fused.update_and_turbo4_delegated_attention(&q_for_fused, k_a, v_a, scale, None);
         // Reference path.
         let out_ref = delegated_reference_attention(&mut cache_ref, &q, k_b, v_b, scale);
 
@@ -2041,6 +2040,344 @@ fn delegated_fused_kernel_matches_reference_over_200_steps() {
     eprintln!(
         "delegated_fused_kernel_matches_reference: max RMS over {total_steps} steps = \
          {max_rms:.4e}; folds crossed = {steps_with_fold}"
+    );
+}
+
+/// Steel-envelope vs cold-only fused composition parity (issue #531).
+///
+/// `update_and_turbo4_delegated_attention` first tries the steel-envelope
+/// kernel (issue #531, single Metal dispatch covering softmax + cold-V dequant
+/// + hot-V accumulate). On the same hardware where the cold-only fused
+/// composition path (issue #528) already produces correct output, the
+/// steel-envelope path must produce numerically equivalent output (within
+/// FP16 round-off) — both paths funnel through the same MLX softmax algebra
+/// and the same Turbo4 inverse rotation; the only difference is whether the
+/// post-Q·K work runs as one Metal dispatch or as a host-graph composition.
+///
+/// This is a **direct** comparison: we drive two caches with identical
+/// inputs, call the steel-envelope path on one and the cold-only fused path
+/// on the other, and require RMS < 5e-3. This guards against the failure
+/// mode where both paths individually pass against the
+/// `delegated_reference_attention` baseline (which uses graph-level dense
+/// V dequant) but disagree with each other due to a softmax-merge bug
+/// inside the steel kernel.
+///
+/// The 200-step length and `hot_threshold = 32` cadence match
+/// `delegated_fused_kernel_matches_reference_over_200_steps` so this test
+/// also crosses at least two fold boundaries.
+#[cfg(target_os = "macos")]
+#[test]
+fn delegated_steel_envelope_matches_cold_only_fused_over_200_steps() {
+    let head_dim = 64;
+    let prefill_len = 8;
+    let total_steps = 200;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Cache A: drives `update_and_turbo4_delegated_attention`, which prefers
+    // the steel-envelope kernel on macOS + power-of-2 head_dim (issue #531
+    // wiring in `cache::update_and_turbo4_delegated_attention`).
+    let mut cache_steel = build_delegated_cache_with_small_threshold(32);
+    // Cache B: drives the cold-only fused composition (issue #528) directly
+    // by calling `attention_turbo4_delegated_fused` after `update`. Bypasses
+    // the wrapper so the steel envelope is not selected.
+    let mut cache_cold_only = build_delegated_cache_with_small_threshold(32);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 7);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 8);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_steel.update_and_fetch(k_pre, v_pre);
+    let _ = cache_cold_only.update_and_fetch(k_pre_b, v_pre_b);
+
+    let mut max_rms = 0.0_f32;
+    let mut steps_with_fold = 0;
+    let mut prev_cold_offset = cache_steel.cold_offset();
+
+    for step in 0..total_steps {
+        let k_a = synth_kv_tensor(1, 1, 1, head_dim, 5000 + step as u32);
+        let v_a = synth_kv_tensor(1, 1, 1, head_dim, 6000 + step as u32);
+        let k_b = ffi::copy(&k_a);
+        let v_b = ffi::copy(&v_a);
+        let q = synth_kv_tensor(1, 1, 1, head_dim, 9000 + step as u32);
+
+        // Steel-envelope path (default after issue #531).
+        let q_for_steel = ffi::copy(&q);
+        let out_steel =
+            cache_steel.update_and_turbo4_delegated_attention(&q_for_steel, k_a, v_a, scale, None);
+
+        // Cold-only fused composition path. We replicate the relevant slice
+        // of `update_and_turbo4_delegated_attention` so the cold-only fused
+        // helper sees the same per-token snapshot the wrapper would have
+        // built. The wrapper code path is mirrored verbatim from `cache.rs`
+        // (commit 5d95adb on this branch) modulo the steel-envelope try
+        // that we explicitly skip.
+        cache_cold_only.update(k_b, v_b);
+        let cold_offset = cache_cold_only.cold_offset();
+        let hot_offset = cache_cold_only.seq_len() - cold_offset;
+
+        // Eagerly resolve turbo_params just like the wrapper does. We poke
+        // the cache through one no-op `delegated_graph_attention` call so
+        // turbo_params is populated; that call is otherwise harmless for
+        // this comparison since we throw away its output.
+        let _ = cache_cold_only.delegated_graph_attention(&q, scale, None);
+        // (The `delegated_graph_attention` mutated nothing on the cache —
+        // it only reads. After it returns, turbo_params is set if it was
+        // unset, and v_packed/v_rescale/values are still in sync.)
+
+        // Slice the kernel inputs out of the (now-updated) cache, mirroring
+        // the wrapper's slicing logic.
+        let k_buf = cache_cold_only
+            .keys
+            .as_ref()
+            .expect("unified keys must exist after update on Turbo4Delegated");
+        let ks = ffi::array_shape(k_buf);
+        let k_slice = ffi::slice(
+            k_buf,
+            &[0, 0, 0, 0],
+            &[ks[0], ks[1], cache_cold_only.seq_len(), ks[3]],
+        );
+        let v_packed_owned = if cold_offset > 0 {
+            let vp = cache_cold_only
+                .v_packed
+                .as_ref()
+                .expect("v_packed must exist when cold_offset > 0");
+            let vp_shape = ffi::array_shape(vp);
+            Some(ffi::slice(
+                vp,
+                &[0, 0, 0, 0],
+                &[vp_shape[0], vp_shape[1], cold_offset, vp_shape[3]],
+            ))
+        } else {
+            None
+        };
+        let v_rescale_owned = if cold_offset > 0 {
+            let vr = cache_cold_only
+                .v_rescale
+                .as_ref()
+                .expect("v_rescale must exist when cold_offset > 0");
+            let vr_shape = ffi::array_shape(vr);
+            Some(ffi::slice(
+                vr,
+                &[0, 0, 0, 0],
+                &[vr_shape[0], vr_shape[1], cold_offset, 1],
+            ))
+        } else {
+            None
+        };
+        let hot_v_owned = if hot_offset > 0 {
+            let hv = cache_cold_only
+                .values
+                .as_ref()
+                .expect("hot values must exist when hot_offset > 0");
+            let hv_shape = ffi::array_shape(hv);
+            Some(ffi::slice(
+                hv,
+                &[0, 0, 0, 0],
+                &[hv_shape[0], hv_shape[1], hot_offset, hv_shape[3]],
+            ))
+        } else {
+            None
+        };
+        let params = cache_cold_only
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params populated after delegated_graph_attention");
+        let threshold = crate::cache::turbo::sparse_v::threshold();
+
+        let out_cold_only = crate::cache::turbo::sparse_v::attention_turbo4_delegated_fused(
+            &q,
+            &k_slice,
+            v_packed_owned.as_deref(),
+            v_rescale_owned.as_deref(),
+            hot_v_owned.as_deref(),
+            params,
+            cold_offset,
+            hot_offset,
+            scale,
+            None,
+            threshold,
+        )
+        .expect("cold-only fused path must dispatch on macOS + pow-of-2 head_dim");
+
+        // Compare steel vs cold-only output element-by-element.
+        let flat_a = flatten_fp32(&out_steel);
+        let flat_b = flatten_fp32(&out_cold_only);
+        assert_eq!(flat_a.len(), flat_b.len(), "step {step}: shape mismatch");
+        let mut sum_sq = 0.0_f64;
+        for (x, y) in flat_a.iter().zip(flat_b.iter()) {
+            let d = (x - y) as f64;
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / flat_a.len() as f64).sqrt() as f32;
+        if rms > max_rms {
+            max_rms = rms;
+        }
+        if cache_steel.cold_offset() != prev_cold_offset {
+            steps_with_fold += 1;
+            prev_cold_offset = cache_steel.cold_offset();
+        }
+        assert!(
+            rms < 5e-3,
+            "step {step}: steel vs cold-only RMS {rms:.4e} exceeds 5e-3 \
+             (cold_offset={cold_offset}, hot_offset={hot_offset})",
+        );
+    }
+
+    assert!(
+        steps_with_fold >= 2,
+        "test must cross at least two fold boundaries; only saw {steps_with_fold}"
+    );
+    eprintln!(
+        "delegated_steel_envelope_matches_cold_only_fused: max RMS over {total_steps} steps = \
+         {max_rms:.4e}; folds crossed = {steps_with_fold}"
+    );
+}
+
+/// Steel-envelope grouped-attention + additive-mask parity (issue #531).
+///
+/// The 200-step parity tests above use `Hkv = Hq = 1` (no grouping) and no
+/// additive mask. Production decode call sites in `models/llama3.rs` and
+/// `models/qwen3.rs` use `Hq = n_rep * Hkv` with `n_rep ∈ {2, 4, 8}` and may
+/// pass a non-trivial mask (causal or attention-sink). This test exercises
+/// both: `Hkv = 2`, `Hq = 4` (n_rep = 2), an additive causal mask with
+/// `-inf` in the upper triangle, and a single-token decode tail driven
+/// against a manually-built reference.
+///
+/// We use a 24-step decode after a 16-token prefill so the test crosses
+/// exactly one fold boundary at `hot_threshold = 32` (16 + 16 = 32 →
+/// fold on step 17). Both pre-fold (only hot) and post-fold (cold + hot)
+/// states are exercised.
+#[cfg(target_os = "macos")]
+#[test]
+fn delegated_steel_envelope_grouped_attention_with_mask_parity() {
+    let head_dim = 64;
+    let kv_heads = 2_i32;
+    let n_rep = 2_i32;
+    let q_heads = kv_heads * n_rep; // 4
+    let prefill_len = 16;
+    let total_steps = 24;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut cache_steel = build_delegated_cache_with_small_threshold(32);
+    let mut cache_ref = build_delegated_cache_with_small_threshold(32);
+
+    let k_pre = synth_kv_tensor(1, kv_heads, prefill_len, head_dim, 11);
+    let v_pre = synth_kv_tensor(1, kv_heads, prefill_len, head_dim, 12);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_steel.update_and_fetch(k_pre, v_pre);
+    let _ = cache_ref.update_and_fetch(k_pre_b, v_pre_b);
+
+    let mut max_rms = 0.0_f32;
+
+    for step in 0..total_steps {
+        let k_a = synth_kv_tensor(1, kv_heads, 1, head_dim, 7000 + step as u32);
+        let v_a = synth_kv_tensor(1, kv_heads, 1, head_dim, 8000 + step as u32);
+        let k_b = ffi::copy(&k_a);
+        let v_b = ffi::copy(&v_a);
+        // Q has Hq = q_heads (grouped attention).
+        let q = synth_kv_tensor(1, q_heads, 1, head_dim, 9500 + step as u32);
+
+        // Build an additive mask of shape `[1, 1, 1, T_total]`. T_total grows
+        // as the cache grows. Use an attention-sink-like mask: -inf on every
+        // 4th position (so some scores are masked out) and 0 elsewhere. This
+        // exercises the kernel's softmax stability across `-inf` entries
+        // without relying on a full causal mask (which is degenerate for
+        // single-token decode anyway).
+        let t_total_after = cache_steel.seq_len() + 1;
+        let mut mask_data = vec![0.0_f32; t_total_after as usize];
+        for (i, m) in mask_data.iter_mut().enumerate() {
+            if i % 4 == 0 && i + 1 < t_total_after as usize {
+                // -inf except on the latest token (which the decode step is
+                // about to add — keep it alive so the softmax denominator is
+                // never structurally zero).
+                *m = f32::NEG_INFINITY;
+            }
+        }
+        let mask_a = ffi::from_slice_f32(&mask_data, &[1, 1, 1, t_total_after]);
+        let mask_b = ffi::copy(&mask_a);
+
+        let q_for_steel = ffi::copy(&q);
+        let out_steel = cache_steel.update_and_turbo4_delegated_attention(
+            &q_for_steel,
+            k_a,
+            v_a,
+            scale,
+            Some(&mask_a),
+        );
+
+        // Reference: drive `cache_ref` through update_and_fetch + manual SDPA
+        // including the additive mask.
+        let (cache_k, cache_v) = cache_ref.update_and_fetch(k_b, v_b);
+        let q_shape = ffi::array_shape(&q);
+        let k_shape = ffi::array_shape(&cache_k);
+        let b = q_shape[0];
+        let hq = q_shape[1];
+        let hkv = k_shape[1];
+        let nrep = hq / hkv;
+        let kt = k_shape[2];
+        let kd = k_shape[3];
+        let vd = ffi::array_shape(&cache_v)[3];
+        let k_for_q = if nrep == 1 {
+            ffi::contiguous(&cache_k, false)
+        } else {
+            let k_exp = ffi::expand_dims(&cache_k, 2);
+            let k_tiled = ffi::broadcast_to(&k_exp, &[b, hkv, nrep, kt, kd]);
+            ffi::reshape(&k_tiled, &[b, hq, kt, kd])
+        };
+        let v_for_q = if nrep == 1 {
+            ffi::contiguous(&cache_v, false)
+        } else {
+            let v_exp = ffi::expand_dims(&cache_v, 2);
+            let v_tiled = ffi::broadcast_to(&v_exp, &[b, hkv, nrep, kt, vd]);
+            ffi::reshape(&v_tiled, &[b, hq, kt, vd])
+        };
+        let k_t = ffi::transpose_axes(&k_for_q, &[0, 1, 3, 2]);
+        let q_f32 = ffi::astype(&q, dtype::FLOAT32);
+        let k_t_f32 = ffi::astype(&k_t, dtype::FLOAT32);
+        let v_f32 = ffi::astype(&v_for_q, dtype::FLOAT32);
+        let qk = ffi::matmul(&q_f32, &k_t_f32);
+        let scale_arr = ffi::full_f32(&[1], scale, dtype::FLOAT32);
+        let mut scores = ffi::multiply(&qk, &scale_arr);
+        let m_f32 = ffi::astype(&mask_b, dtype::FLOAT32);
+        scores = ffi::add(&scores, &m_f32);
+        let attn = ffi::softmax_precise(&scores, -1);
+        let out_f32 = ffi::matmul(&attn, &v_f32);
+        let out_ref = ffi::astype(&out_f32, dtype::FLOAT16);
+
+        let flat_a = flatten_fp32(&out_steel);
+        let flat_b = flatten_fp32(&out_ref);
+        assert_eq!(flat_a.len(), flat_b.len(), "step {step}: shape mismatch");
+        let mut sum_sq = 0.0_f64;
+        for (x, y) in flat_a.iter().zip(flat_b.iter()) {
+            let d = (x - y) as f64;
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / flat_a.len() as f64).sqrt() as f32;
+        if rms > max_rms {
+            max_rms = rms;
+        }
+        assert!(
+            rms < 5e-3,
+            "step {step}: grouped+masked steel vs reference RMS {rms:.4e} exceeds 5e-3 \
+             (cold_offset={}, hot_offset={})",
+            cache_steel.cold_offset(),
+            cache_steel.seq_len() - cache_steel.cold_offset()
+        );
+    }
+
+    eprintln!(
+        "delegated_steel_envelope_grouped_attention_with_mask: max RMS over \
+         {total_steps} steps (Hkv={kv_heads}, Hq={q_heads}, n_rep={n_rep}) = \
+         {max_rms:.4e}"
+    );
+
+    // Verify the test actually crossed at least one fold so cold and hot are
+    // both non-zero by the end.
+    assert!(
+        cache_steel.cold_offset() > 0,
+        "test must trigger at least one fold; got cold_offset={}",
+        cache_steel.cold_offset()
     );
 }
 
@@ -2097,11 +2434,7 @@ fn delegated_graph_fallback_matches_reference_attention() {
         // kernel-path wrapper would have produced — no state divergence.
         let q_for_fallback = ffi::copy(&q);
         cache_fallback.update(k_a, v_a);
-        let out_fallback = cache_fallback.delegated_graph_attention(
-            &q_for_fallback,
-            scale,
-            None,
-        );
+        let out_fallback = cache_fallback.delegated_graph_attention(&q_for_fallback, scale, None);
 
         // Reference: legacy `update_and_fetch + manual SDPA` on a
         // separately-driven cache. Identical input sequence so the cache

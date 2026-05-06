@@ -1580,6 +1580,43 @@ std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
     int32_t n_rep,
     float threshold);
 
+// Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA launcher.
+// Wraps `mlxcel::turbo::turbo4_delegated_steel_sdpa`. Returns a pair of MLX
+// arrays (`out_cold_pre`, `out_hot`) that the host sums after applying the
+// linear inverse Turbo4 rotation to the cold output. The pair is exposed
+// through cxx as a struct so the FFI surface stays inside the cxx-supported
+// type set (cxx does not directly model multiple return values).
+//
+// `cold_packed` and `cold_rescale` may be 1-token zero placeholders when
+// `cold_offset == 0` (MLX's `metal_kernel` rejects buffers with any zero-shape
+// axis). Same for `hot_v` when `hot_offset == 0`. The host launcher in
+// `mlxcel-core/src/cache/turbo/sparse_v.rs::attention_turbo4_delegated_steel`
+// substitutes these placeholders and the kernel takes the empty-range
+// early-out via the explicit `cold_offset` / `hot_offset` scalar inputs.
+struct Turbo4DelegatedSteelOutputs {
+    std::unique_ptr<MlxArray> out_cold_pre;  // [B*Hq, Tq, D] f32, unrotated
+    std::unique_ptr<MlxArray> out_hot;       // [B*Hq, Tq, D] f32, hot weighted sum
+};
+
+std::unique_ptr<Turbo4DelegatedSteelOutputs> turbo4_delegated_steel_sdpa(
+    const MlxArray& scores,         // [B*Hq, Tq, T_total]   f32
+    const MlxArray& cold_packed,    // [B*Hkv, T_cold, D/2]  u8
+    const MlxArray& cold_rescale,   // [B*Hkv, T_cold]       f16
+    const MlxArray& hot_v,          // [B*Hkv, T_hot, D]     f16
+    const MlxArray& codebook,       // [16]                  f32
+    int32_t dim,
+    int32_t n_rep,
+    int32_t cold_offset,
+    int32_t hot_offset,
+    float threshold);
+
+// Move out the cold/hot tensors from a steel-SDPA outputs struct. The cxx
+// bridge does not directly model "destructure a struct returned by FFI", so we
+// expose two takers that the Rust side calls before dropping the struct.
+// After both are taken, the struct is empty.
+std::unique_ptr<MlxArray> steel_outputs_take_cold(Turbo4DelegatedSteelOutputs& o);
+std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o);
+
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.
 struct MlxLoadedWeights {

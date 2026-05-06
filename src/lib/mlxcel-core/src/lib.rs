@@ -2038,6 +2038,76 @@ mod ffi {
             threshold: f32,
         ) -> UniquePtr<MlxArray>;
 
+        // Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA
+        // kernel launcher. One Metal dispatch performs the entire post-Q·K
+        // SDPA inline (numerically stable softmax over T_total + cold-V
+        // dequant + hot-V accumulation), returning two FP32 outputs that
+        // share the same softmax denominator:
+        //
+        // - `out_cold_pre`: `[B*Hq, Tq, D]` unrotated cold weighted sum. The
+        //   host applies `signs1·WHT(signs2·)` to produce the rotated cold
+        //   contribution.
+        // - `out_hot`:      `[B*Hq, Tq, D]` hot weighted sum (unrotated; hot V
+        //   is plain FP16 without a quantize-time rotation).
+        //
+        // The host sums the rotated cold contribution and the hot
+        // contribution and casts to FP16. Bit-equivalent (within FP16
+        // round-off) to the reference path
+        // `softmax(Q·K^T·scale + mask) @ V_full` because the rotation is
+        // linear and the kernel uses one shared softmax denominator.
+        //
+        // Inputs:
+        // - `scores`:        `[B*Hq, Tq, T_total]` FP32 — pre-computed
+        //   `Q·K^T * scale` with the additive mask already added (causal
+        //   positions carry `-inf` so they contribute zero post-softmax).
+        // - `cold_packed`:   `[B*Hkv, T_cold, D/2]` UINT8 — nibble-packed
+        //   cold V indices, or a 1-token zero placeholder when `T_cold == 0`
+        //   (MLX `metal_kernel` rejects zero-shape buffers).
+        // - `cold_rescale`:  `[B*Hkv, T_cold]` FP16 — precomputed per-token
+        //   cold-V rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (issue #520).
+        // - `hot_v`:         `[B*Hkv, T_hot, D]` FP16 — plain FP16 hot V, or
+        //   a 1-token zero placeholder when `T_hot == 0`.
+        // - `codebook`:      `[16]` FP32 — Lloyd-Max centroids.
+        // - `dim`:           head dimension `D` (must be a power of 2).
+        // - `n_rep`:         `Hq / Hkv` (1 for non-grouped attention).
+        // - `cold_offset`:   `T_cold` — number of cold tokens to sweep.
+        //   Pass `0` to skip the cold loop entirely; the kernel reads no
+        //   data from `cold_packed` / `cold_rescale` in that case (the
+        //   placeholder buffers above are never dereferenced).
+        // - `hot_offset`:    `T_hot` — number of hot tokens to sweep. Pass
+        //   `0` to skip the hot loop.
+        // - `threshold`:     alive cutoff for cold-V skipping. The kernel
+        //   compares `exp(score - max) > threshold * sum_exp` (equivalent to
+        //   `attn > threshold`). Hot tokens are never skipped.
+        //
+        // Metal-only — fails to link on non-macOS targets. Callers gate via
+        // [`KVCache::update_and_turbo4_delegated_attention`] which only
+        // dispatches the kernel on macOS + Turbo4Delegated + power-of-2 D.
+        type Turbo4DelegatedSteelOutputs;
+
+        fn turbo4_delegated_steel_sdpa(
+            scores: &MlxArray,
+            cold_packed: &MlxArray,
+            cold_rescale: &MlxArray,
+            hot_v: &MlxArray,
+            codebook: &MlxArray,
+            dim: i32,
+            n_rep: i32,
+            cold_offset: i32,
+            hot_offset: i32,
+            threshold: f32,
+        ) -> UniquePtr<Turbo4DelegatedSteelOutputs>;
+
+        /// Take (move out) the unrotated cold weighted sum from a steel SDPA
+        /// outputs struct. After this call the struct's `out_cold_pre` slot
+        /// is empty; calling again returns a null UniquePtr.
+        fn steel_outputs_take_cold(o: Pin<&mut Turbo4DelegatedSteelOutputs>)
+            -> UniquePtr<MlxArray>;
+
+        /// Take (move out) the hot weighted sum from a steel SDPA outputs
+        /// struct. After this call the struct's `out_hot` slot is empty.
+        fn steel_outputs_take_hot(o: Pin<&mut Turbo4DelegatedSteelOutputs>) -> UniquePtr<MlxArray>;
+
         // Native safetensors loading (MLX-managed mmap, lazy arrays).
         /// Opaque holder for weights loaded via MLX's native load_safetensors()
         type MlxLoadedWeights;

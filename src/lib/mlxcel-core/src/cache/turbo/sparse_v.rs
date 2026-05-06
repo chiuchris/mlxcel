@@ -648,7 +648,11 @@ pub fn attention_turbo4_delegated_fused(
     let q_shape = ffi::array_shape(q);
     let k_shape = ffi::array_shape(unified_k);
     debug_assert_eq!(q_shape.len(), 4, "q must be 4-D [B, Hq, Tq, D]");
-    debug_assert_eq!(k_shape.len(), 4, "unified_k must be 4-D [B, Hkv, T_total, D]");
+    debug_assert_eq!(
+        k_shape.len(),
+        4,
+        "unified_k must be 4-D [B, Hkv, T_total, D]"
+    );
     let b = q_shape[0];
     let hq = q_shape[1];
     let tq = q_shape[2];
@@ -715,11 +719,7 @@ pub fn attention_turbo4_delegated_fused(
 
         // Slice the cold range out of the full attention. attn_full shape:
         // [B, Hq, Tq, T_total]. We need [B, Hq, Tq, T_cold].
-        let attn_cold = ffi::slice(
-            &attn_full,
-            &[0, 0, 0, 0],
-            &[b, hq, tq, cold_offset],
-        );
+        let attn_cold = ffi::slice(&attn_full, &[0, 0, 0, 0], &[b, hq, tq, cold_offset]);
         let attn_cold_flat = ffi::reshape(&attn_cold, &[bhq, tq, cold_offset]);
         // v_packed graph shape: [B, Hkv, T_cold, D/2]; flatten to
         // [B*Hkv, T_cold, D/2].
@@ -728,8 +728,7 @@ pub fn attention_turbo4_delegated_fused(
         // and flatten to [B*Hkv, T_cold].
         let v_rescale_flat = ffi::reshape(v_rescale, &[bhkv, cold_offset]);
         let codebook_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
-        let codebook_arr =
-            ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
+        let codebook_arr = ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
 
         let out_cold_pre_flat = ffi::turbo4_delegated_cold_weighted_sum(
             &attn_cold_flat,
@@ -746,10 +745,8 @@ pub fn attention_turbo4_delegated_fused(
         // `dequantize_v_turbo4` applies per-token; doing it once on the
         // weighted sum is mathematically equivalent (linearity) and runs
         // O(Hq · Tq · D log D) instead of O(Hkv · T_cold · D log D).
-        let signs1_arr =
-            ffi::from_slice_f32(&params.signs1, &[1, 1, 1, head_dim]);
-        let signs2_arr =
-            ffi::from_slice_f32(&params.signs2, &[1, 1, 1, head_dim]);
+        let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, head_dim]);
+        let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, head_dim]);
         let pre_h = ffi::multiply(&out_cold_pre, &signs2_arr);
         let post_h = crate::ops::wht(&pre_h);
         let post_d1 = ffi::multiply(&post_h, &signs1_arr);
@@ -762,11 +759,7 @@ pub fn attention_turbo4_delegated_fused(
         let hot_v = hot_v.expect("hot_v must exist when hot_offset > 0");
         // Slice the hot range out of the full attention. attn_full shape:
         // [B, Hq, Tq, T_total]; hot range is [..., cold_offset:].
-        let attn_hot = ffi::slice(
-            &attn_full,
-            &[0, 0, 0, cold_offset],
-            &[b, hq, tq, t_total],
-        );
+        let attn_hot = ffi::slice(&attn_full, &[0, 0, 0, cold_offset], &[b, hq, tq, t_total]);
         // Repeat hot V along Hkv → Hq for grouped attention. attn_hot is
         // [B, Hq, Tq, T_hot]; hot_v is [B, Hkv, T_hot, D]. After the repeat
         // we get [B, Hq, T_hot, D] for the matmul.
@@ -797,6 +790,208 @@ pub fn attention_turbo4_delegated_fused(
             ffi::zeros(&[b, hq, tq, head_dim], dtype::FLOAT32)
         }
     };
+    Some(ffi::astype(&combined, dtype::FLOAT16))
+}
+
+/// Steel-attention-envelope fused dequant + SDPA path for
+/// `KVCacheMode::Turbo4Delegated` (issue #531).
+///
+/// Compresses the post-Q·K SDPA pipeline of [`attention_turbo4_delegated_fused`]
+/// from ~14 MLX dispatches into ~5: one Q·K matmul, one steel-envelope kernel
+/// dispatch (covering softmax + cold-V dequant + hot-V accumulate), one host
+/// rotation (signs2 mul → WHT → signs1 mul = 3 small dispatches counted as one
+/// because they operate on `[B, Hq, Tq, D]` not on cache state), and one cast
+/// to FP16. The kernel returns two FP32 buffers — the unrotated cold weighted
+/// sum and the hot weighted sum, both already divided by the shared softmax
+/// denominator. Adding the rotated cold contribution to the hot contribution
+/// is mathematically equivalent to a dense `softmax(scores) @ V_full`.
+///
+/// # Inputs
+///
+/// Same shape and semantics as [`attention_turbo4_delegated_fused`]; see that
+/// function's docstring for the full contract.
+///
+/// # Output
+///
+/// `Some([B, Hq, Tq, D])` FP16 attention output, or `None` when the kernel
+/// path is gated off (non-macOS, non-power-of-2 head dim, or
+/// `MLXCEL_SPARSE_V_KERNEL=0`). Callers should fall back to
+/// [`attention_turbo4_delegated_fused`] (which still routes through the
+/// post-#528 cold-only kernel + host composition) or to
+/// [`KVCache::delegated_graph_attention`] in that case.
+///
+/// # Numerical equivalence
+///
+/// The kernel performs a 2-pass online softmax (pass 1: per-Q `max + sum_exp`
+/// scan over T_total; pass 2: re-read scores during cold + hot accumulation,
+/// computing `exp(score - max)` inline and dividing by the cached `sum_exp`).
+/// Both cold and hot accumulators share the same `sum_exp` denominator, so
+/// adding them after rotation produces the same value (within FP16 round-off)
+/// as the dense `softmax(scores) @ concat(V_cold_dequant, V_hot)` reference.
+/// The 200-step parity test
+/// [`crate::cache::turbo_tests::delegated_fused_kernel_matches_reference_over_200_steps`]
+/// verifies RMS < 5e-3 across at least two fold boundaries.
+///
+/// Used by: [`KVCache::update_and_turbo4_delegated_attention`] when the steel
+/// envelope is preferred (issue #531).
+#[allow(clippy::too_many_arguments)]
+pub fn attention_turbo4_delegated_steel(
+    q: &MlxArray,
+    unified_k: &MlxArray,
+    v_packed: Option<&MlxArray>,
+    v_rescale: Option<&MlxArray>,
+    hot_v: Option<&MlxArray>,
+    params: &TurboQuantParams,
+    cold_offset: i32,
+    hot_offset: i32,
+    scale: f32,
+    mask: Option<&MlxArray>,
+    threshold_value: f32,
+) -> Option<UniquePtr<MlxArray>> {
+    if !kernel_enabled() {
+        return None;
+    }
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(unified_k);
+    debug_assert_eq!(q_shape.len(), 4, "q must be 4-D [B, Hq, Tq, D]");
+    debug_assert_eq!(
+        k_shape.len(),
+        4,
+        "unified_k must be 4-D [B, Hkv, T_total, D]"
+    );
+    let b = q_shape[0];
+    let hq = q_shape[1];
+    let tq = q_shape[2];
+    let head_dim = q_shape[3];
+    let kv_heads = k_shape[1];
+    let t_total = k_shape[2];
+    debug_assert!(kv_heads > 0, "Hkv must be positive");
+    debug_assert!(
+        hq % kv_heads == 0,
+        "Hq ({hq}) must be a multiple of Hkv ({kv_heads})"
+    );
+    let n_rep = hq / kv_heads;
+    debug_assert_eq!(
+        t_total,
+        cold_offset + hot_offset,
+        "unified_k length ({t_total}) must equal cold_offset ({cold_offset}) + hot_offset ({hot_offset})"
+    );
+
+    // Precondition: head_dim is a power of 2. Same gating as the cold-only
+    // path — Gemma 4's 192-dim heads fall back to the graph composition.
+    if !(head_dim as u32).is_power_of_two() {
+        return None;
+    }
+
+    // Both ranges empty would imply a decode step with no context, which is
+    // structurally impossible after `KVCache::update`. Guard defensively.
+    if cold_offset == 0 && hot_offset == 0 {
+        return None;
+    }
+
+    // 1. Compute attention scores Q·K^T·scale + mask via the standard graph
+    //    path. We keep the matmul in MLX so it benefits from steel attention /
+    //    NAX-accelerated GEMM; the kernel's job is the post-Q·K work.
+    let k_for_q = if n_rep == 1 {
+        ffi::contiguous(unified_k, false)
+    } else {
+        let kt = k_shape[2];
+        let kd = k_shape[3];
+        let k_exp = ffi::expand_dims(unified_k, 2);
+        let k_tiled = ffi::broadcast_to(&k_exp, &[b, kv_heads, n_rep, kt, kd]);
+        ffi::reshape(&k_tiled, &[b, hq, kt, kd])
+    };
+    let k_for_q_t = ffi::transpose_axes(&k_for_q, &[0, 1, 3, 2]);
+    let q_f32 = ffi::astype(q, dtype::FLOAT32);
+    let k_t_f32 = ffi::astype(&k_for_q_t, dtype::FLOAT32);
+    let qk = ffi::matmul(&q_f32, &k_t_f32);
+    let scale_arr = ffi::full_f32(&[1], scale, dtype::FLOAT32);
+    let mut scores = ffi::multiply(&qk, &scale_arr);
+    if let Some(m) = mask {
+        let m_f32 = ffi::astype(m, dtype::FLOAT32);
+        scores = ffi::add(&scores, &m_f32);
+    }
+
+    // 2. Pre-flatten the kernel inputs and prepare zero placeholders for any
+    //    empty range. MLX `metal_kernel` rejects buffers with a zero-size
+    //    axis, so we substitute a 1-token zero buffer of the right dtype and
+    //    pass `cold_offset == 0` / `hot_offset == 0` as scalar inputs; the
+    //    kernel's loop bounds short-circuit before touching the placeholder
+    //    memory.
+    let bhq = b * hq;
+    let bhkv = b * kv_heads;
+    let scores_flat = ffi::reshape(&scores, &[bhq, tq, t_total]);
+
+    let cold_packed_arr;
+    let cold_rescale_arr;
+    if cold_offset > 0 {
+        let vp = v_packed.expect("v_packed must exist when cold_offset > 0");
+        let vr = v_rescale.expect("v_rescale must exist when cold_offset > 0");
+        cold_packed_arr = ffi::reshape(vp, &[bhkv, cold_offset, head_dim / 2]);
+        cold_rescale_arr = ffi::reshape(vr, &[bhkv, cold_offset]);
+    } else {
+        // Placeholder buffers for the empty-cold case. Their content is
+        // never read because the kernel's `for t in 0..t_cold` loop runs zero
+        // iterations, but MLX still requires a non-zero-shape array as input.
+        cold_packed_arr = ffi::zeros(&[bhkv, 1, head_dim / 2], dtype::UINT8);
+        cold_rescale_arr = ffi::zeros(&[bhkv, 1], dtype::FLOAT16);
+    }
+
+    let hot_v_arr = if hot_offset > 0 {
+        let hv = hot_v.expect("hot_v must exist when hot_offset > 0");
+        ffi::reshape(hv, &[bhkv, hot_offset, head_dim])
+    } else {
+        // Same placeholder rationale as cold above.
+        ffi::zeros(&[bhkv, 1, head_dim], dtype::FLOAT16)
+    };
+
+    let codebook_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let codebook_arr = ffi::from_slice_f32(&codebook_vec, &[codebook_vec.len() as i32]);
+
+    // 3. Dispatch the steel-envelope kernel. Returns two FP32 outputs through
+    //    a UniquePtr<Turbo4DelegatedSteelOutputs> wrapper struct (cxx does
+    //    not directly model multiple return values).
+    let mut steel_outs = ffi::turbo4_delegated_steel_sdpa(
+        &scores_flat,
+        &cold_packed_arr,
+        &cold_rescale_arr,
+        &hot_v_arr,
+        &codebook_arr,
+        head_dim,
+        n_rep,
+        cold_offset,
+        hot_offset,
+        threshold_value,
+    );
+    // Take ownership of both output tensors out of the wrapper struct. After
+    // both calls the wrapper's slots are empty; the wrapper drop is a no-op.
+    let out_cold_pre_flat = ffi::steel_outputs_take_cold(steel_outs.pin_mut());
+    let out_hot_flat = ffi::steel_outputs_take_hot(steel_outs.pin_mut());
+
+    // 4. Reshape the per-(B*Hq, Tq) outputs back to [B, Hq, Tq, D] and apply
+    //    the inverse Turbo4 rotation `signs1 · WHT(signs2 · ·)` to the cold
+    //    contribution only. Hot V is FP16 plain (no quantize-time rotation),
+    //    so it is added to the rotated cold output directly.
+    let out_cold_pre = ffi::reshape(&out_cold_pre_flat, &[b, hq, tq, head_dim]);
+    let out_hot = ffi::reshape(&out_hot_flat, &[b, hq, tq, head_dim]);
+
+    let combined = if cold_offset > 0 {
+        let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, head_dim]);
+        let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, head_dim]);
+        let pre_h = ffi::multiply(&out_cold_pre, &signs2_arr);
+        let post_h = crate::ops::wht(&pre_h);
+        let cold_rotated = ffi::multiply(&post_h, &signs1_arr);
+        if hot_offset > 0 {
+            ffi::add(&cold_rotated, &out_hot)
+        } else {
+            cold_rotated
+        }
+    } else {
+        // cold_offset == 0: out_cold_pre is all zeros (kernel's cold loop ran
+        // zero iterations); skip the rotation and use hot directly.
+        out_hot
+    };
+
     Some(ffi::astype(&combined, dtype::FLOAT16))
 }
 

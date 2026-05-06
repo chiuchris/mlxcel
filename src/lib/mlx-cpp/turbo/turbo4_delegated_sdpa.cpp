@@ -187,6 +187,271 @@ inline Turbo4DelegatedKernelHolder& get_turbo4_delegated_kernel() {
     return holder;
 }
 
+} // namespace (cold-only kernel internals; #528)
+
+namespace {  // anonymous namespace for issue #531 steel-envelope kernel internals
+
+// =============================================================================
+// Issue #531 — Steel-attention-envelope fused SDPA kernel for Turbo4Delegated.
+// =============================================================================
+//
+// The cold-V weighted-sum kernel above (#528) fixed the V-memory budget by
+// reading packed 4-bit cold V directly inside the kernel. But the host-side
+// composition in `attention_turbo4_delegated_fused` still issues 14+ MLX
+// dispatches per decode step (Q·K, scale, mask add, softmax, slice cold,
+// kernel, signs2 mul, WHT, signs1 mul, slice hot, hot repeat, hot matmul,
+// add, cast to fp16). On M5 Max at 4K decode that pipeline runs at 18.90
+// tok/s vs 101.76 tok/s for the FP16 baseline (0.186× FP16) — the FFI +
+// per-dispatch overhead is the dominant cost.
+//
+// This kernel collapses the post-Q·K work into a single Metal dispatch:
+//   softmax(scores) → cold-V dequant + accum → hot-V accum → per-Q normalise
+//
+// Q·K stays on the host because (a) MLX's matmul is steel-attention /
+// NAX-accelerated and we do not want to reproduce a generic GEMM inside a
+// JIT'd kernel; (b) the matmul is a single dispatch, so it does not
+// contribute to the per-step dispatch count we are trying to reduce.
+//
+// Numerical stability: a 2-pass softmax over the full T_total range. Pass 1
+// scans `scores[bhq, r, :]` for the per-(B*Hq, Tq) max and sum_exp; pass 2
+// re-reads scores during cold + hot accumulation, computing `exp(score - max)`
+// inline and dividing by the cached `sum_exp` at write time. Re-computing
+// `exp` per accumulation step is cheap on Apple Silicon (fast::exp is single
+// digit cycles), and avoids storing per-token `exp_score` in threadgroup
+// memory (which would blow the 32KB budget at T_total ≥ 4096).
+//
+// Algorithmic contract (must stay numerically equivalent to the host
+// composition this replaces — tracked by
+// `delegated_fused_kernel_matches_reference_over_200_steps`):
+//   for each token t in [0, T_cold):
+//     // softmax-normalised attention weight for Q slot r
+//     attn[r, t] = exp(scores[bhq, r, t] - max[r]) / sum_exp[r]
+//     if attn[r, t] <= threshold for all r in [0, Tq): skip token (per-thread)
+//     code   = codebook[unpack_nibble(packed[b, t, d])]
+//     scaled = code * cold_rescale[b, t]
+//     out_cold_pre[b, q, d] += attn[q, t] * scaled
+//   for each token t in [0, T_hot):
+//     attn[r, t] = exp(scores[bhq, r, T_cold + t] - max[r]) / sum_exp[r]
+//     out_hot[b, q, d] += attn[q, t] * hot_v[b, t, d]
+//
+// Edge cases:
+// - `T_cold == 0`: the cold loop is a no-op; `out_cold_pre` is all zeros.
+//   The host's `signs1 · WHT(signs2 · 0)` is also zero, preserving the
+//   "hot only" semantics. We still pass a 1-token zero placeholder for
+//   `cold_packed` / `cold_rescale` because MLX `metal_kernel` rejects empty
+//   inputs.
+// - `T_hot == 0`: the hot loop is a no-op; `out_hot` is all zeros. This is
+//   the immediately-post-fold case.
+// - Both zero: the host guards against this by skipping the kernel call
+//   entirely (no decode step ever sees zero context after `update`).
+constexpr const char* TURBO4_DELEGATED_STEEL_SDPA_SOURCE = R"(
+    auto d = thread_position_in_grid.x;
+    auto n = thread_position_in_grid.z;
+
+    // n indexes (batch * Hq). Recover the matching Hkv slot via the grouped
+    // attention NRep template constant (Hq / Hkv).
+    auto bhq = n;
+    auto t_total = (uint)scores_shape[2];        // T_total
+    auto t_cold = (uint)cold_offset[0];          // T_cold (passed as 1-elem buffer)
+    auto t_hot = (uint)hot_offset[0];            // T_hot
+    auto bhkv_count_cold = (uint)cold_rescale_shape[0]; // B*Hkv (cold side)
+    auto bhkv_count_hot = (uint)hot_v_shape[0];         // B*Hkv (hot side)
+
+    uint nrep_u = (uint)NRep;
+    uint bhkv = bhq / nrep_u;
+    if (bhkv >= bhkv_count_cold && bhkv_count_cold > 0u) {
+        bhkv = 0;
+    }
+    if (bhkv >= bhkv_count_hot && bhkv_count_hot > 0u) {
+        bhkv = 0;
+    }
+
+    // scores layout: [B*Hq, Tq, T_total] f32. Per-Q slice base.
+    auto sc_base = scores + bhq * (uint)RepeatCount * t_total;
+    // cold_rescale layout: [B*Hkv, T_cold] f16.
+    auto rs = cold_rescale + bhkv * t_cold;
+    // cold_packed layout: [B*Hkv, T_cold, D/2] u8.
+    auto pk = cold_packed + bhkv * t_cold * (uint)(Dim / 2);
+    // hot_v layout: [B*Hkv, T_hot, D] f16.
+    auto hv = hot_v + bhkv * t_hot * (uint)Dim;
+
+    float thresh = threshold[0];
+
+    // -------------------------------------------------------------------------
+    // Pass 1: per-Q max + sum_exp scan over the full T_total score range.
+    //
+    // We restrict this to thread 0 of each threadgroup because the work is
+    // small (T_total reads, a handful of FLOPs per token) and serializing it
+    // avoids the threadgroup tree-reduction barriers that issue #520 spent
+    // significant effort to eliminate from the cold-V kernel. With a single
+    // threadgroup-memory broadcast at the end the other D-1 threads spin at a
+    // single barrier rather than participating in a multi-stage reduction.
+    // For the typical decode case (Tq=1, T_total=4K) this is ~4K reads and
+    // ~4K float ops per threadgroup — well below the kernel-launch overhead.
+    // -------------------------------------------------------------------------
+    threadgroup float tg_max[RepeatCount];
+    threadgroup float tg_sum[RepeatCount];
+
+    if (d == 0u) {
+        for (int r = 0; r < RepeatCount; r++) {
+            // First pass for this r: max over T_total.
+            float mx = -INFINITY;
+            for (uint t = 0; t < t_total; t++) {
+                float s = sc_base[r * t_total + t];
+                if (s > mx) {
+                    mx = s;
+                }
+            }
+            // If every score is -inf (all positions masked out — this can
+            // happen with a maliciously empty mask region but not in any
+            // production prompt), pin max to 0 to avoid `exp(-inf - -inf) = nan`.
+            if (!isfinite(mx)) {
+                mx = 0.0f;
+            }
+            // Second pass: sum_exp.
+            float sm = 0.0f;
+            for (uint t = 0; t < t_total; t++) {
+                float s = sc_base[r * t_total + t];
+                sm += metal::fast::exp(s - mx);
+            }
+            // Guard against a degenerate sum of zero (all scores were -inf
+            // pre-clamp). Set to 1 so the per-token attn becomes 0 and the
+            // output is a clean zero rather than a NaN.
+            if (!(sm > 0.0f) || !isfinite(sm)) {
+                sm = 1.0f;
+            }
+            tg_max[r] = mx;
+            tg_sum[r] = sm;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // -------------------------------------------------------------------------
+    // Pass 2: cold + hot weighted-sum into per-thread accumulators.
+    //
+    // Each thread owns output dim `d`. The accumulators `acc_cold[r]` and
+    // `acc_hot[r]` collect `Σ_t attn[r, t] · V_*[t, d]` for the cold and hot
+    // ranges respectively. The host applies the inverse Turbo4 rotation to
+    // the cold output and adds the hot output before casting to FP16.
+    // -------------------------------------------------------------------------
+    float acc_cold[RepeatCount];
+    float acc_hot[RepeatCount];
+    for (int r = 0; r < RepeatCount; r++) {
+        acc_cold[r] = 0.0f;
+        acc_hot[r] = 0.0f;
+    }
+
+    // Per-dim packed-byte coordinates for the cold V dequant.
+    uint byte_idx = (uint)d >> 1u;
+    uint nibble_shift = ((uint)d & 1u) * 4u;
+
+    // Cold loop. Mirror the alive-skip discipline of the cold-only kernel
+    // (issue #528): if the post-softmax weight for this token is below the
+    // threshold for every Q slot, skip the dequant + rescale + accumulate
+    // work entirely. We compare `exp_score > thresh * sum_exp` instead of
+    // the equivalent `exp_score / sum_exp > thresh` to avoid a divide in the
+    // hot path — `sum_exp` is loop-invariant per r.
+    for (uint t = 0; t < t_cold; t++) {
+        bool any_alive = false;
+        // Cache the per-r exp(score - max) so we don't recompute it inside
+        // the accumulation phase. RepeatCount is a template constant, so
+        // this register array is sized at compile time.
+        float exp_scores[RepeatCount];
+        for (int r = 0; r < RepeatCount; r++) {
+            float s = sc_base[r * t_total + t];
+            float es = metal::fast::exp(s - tg_max[r]);
+            exp_scores[r] = es;
+            if (es > thresh * tg_sum[r]) {
+                any_alive = true;
+            }
+        }
+        if (!any_alive) {
+            continue;
+        }
+
+        // Decode the per-(t, d) cold V centroid. Out-of-Dim threads
+        // (d >= Dim) compute a benign 0 contribution; the bottom write gate
+        // suppresses stray output.
+        float code = 0.0f;
+        if (d < (uint)Dim) {
+            uint pb = (uint)pk[t * (uint)(Dim / 2) + byte_idx];
+            uint idx = (pb >> nibble_shift) & 0x0Fu;
+            code = codebook[idx];
+        }
+        float rescale_t = (float)rs[t];
+        float scaled = code * rescale_t;
+
+        for (int r = 0; r < RepeatCount; r++) {
+            acc_cold[r] += exp_scores[r] * scaled;
+        }
+    }
+
+    // Hot loop. No threshold gating — hot tokens are recent and almost
+    // always alive, so the per-thread skip would not pay back its branch
+    // cost. The hot V is FP16 plain (no rotation) so we read it directly.
+    for (uint t = 0; t < t_hot; t++) {
+        // Hot scores live at offset `t_cold + t` in the score row.
+        float exp_scores[RepeatCount];
+        for (int r = 0; r < RepeatCount; r++) {
+            float s = sc_base[r * t_total + t_cold + t];
+            exp_scores[r] = metal::fast::exp(s - tg_max[r]);
+        }
+        float hv_d = 0.0f;
+        if (d < (uint)Dim) {
+            hv_d = (float)hv[t * (uint)Dim + d];
+        }
+        for (int r = 0; r < RepeatCount; r++) {
+            acc_hot[r] += exp_scores[r] * hv_d;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Normalise by sum_exp and write to the two output buffers.
+    //
+    // Both outputs share the same per-Q sum_exp denominator. The host then
+    // computes `final = signs1 · WHT(signs2 · out_cold_pre) + out_hot` and
+    // casts to FP16. Bit-equivalence with `softmax(scores) @ V_full` requires
+    // (linearity of WHT) that the rotation distributes across the sum — which
+    // it does, because hot V is unrotated and the rotation is only the
+    // inverse of the cold V quantize-time rotation.
+    // -------------------------------------------------------------------------
+    if (d < (uint)Dim) {
+        for (int r = 0; r < RepeatCount; r++) {
+            float inv_sum = 1.0f / tg_sum[r];
+            uint out_idx = (bhq * (uint)RepeatCount + (uint)r) * (uint)Dim + d;
+            out_cold_pre[out_idx] = acc_cold[r] * inv_sum;
+            out_hot[out_idx]      = acc_hot[r]  * inv_sum;
+        }
+    }
+)";
+
+// Thread-safe lazy-initialised holder for the steel-envelope kernel. Same
+// `std::call_once` pattern as the cold-only kernel above so concurrent
+// first-use from `tokio::task::spawn_blocking` workers is safe.
+struct Turbo4DelegatedSteelKernelHolder {
+    std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+    std::once_flag init_flag;
+
+    mlx::core::fast::CustomKernelFunction& get() {
+        std::call_once(init_flag, [this] {
+            kernel = mlx::core::fast::metal_kernel(
+                "mlxcel_turbo4_delegated_steel_sdpa",
+                // Input names — must match the launcher's `inputs` vector
+                // order in `turbo4_delegated_steel_sdpa`.
+                {"scores", "cold_packed", "cold_rescale", "hot_v",
+                 "codebook", "threshold", "cold_offset", "hot_offset"},
+                {"out_cold_pre", "out_hot"},
+                std::string(TURBO4_DELEGATED_STEEL_SDPA_SOURCE));
+        });
+        return *kernel;
+    }
+};
+
+inline Turbo4DelegatedSteelKernelHolder& get_turbo4_delegated_steel_kernel() {
+    static Turbo4DelegatedSteelKernelHolder holder;
+    return holder;
+}
+
 } // namespace
 
 mlx::core::array turbo4_delegated_cold_weighted_sum(
@@ -248,6 +513,103 @@ mlx::core::array turbo4_delegated_cold_weighted_sum(
         {});
 
     return results[0];
+}
+
+// =============================================================================
+// Issue #531 — Steel-attention-envelope fused SDPA launcher.
+// =============================================================================
+//
+// Wraps the JIT-compiled `mlxcel_turbo4_delegated_steel_sdpa` kernel. The
+// caller is responsible for slicing the cache state down to the visible
+// (cold + hot) range, computing the FP32 `Q·K * scale + mask` score matrix on
+// the host (one MLX matmul that benefits from steel attention / NAX), and
+// applying the linear inverse Turbo4 rotation to the cold output.
+//
+// `cold_packed` and `cold_rescale` may be passed as a single-token zero-shape
+// placeholder when `cold_offset == 0`; MLX `metal_kernel` rejects buffers with
+// any zero-shape axis, so the host-side launcher in
+// `mlxcel-core/src/cache/turbo/sparse_v.rs` substitutes 1-token zero buffers
+// in that case (the kernel then takes the `t_cold == 0` early-out via the
+// loop bound). Same convention applies to `hot_v` when `hot_offset == 0`.
+std::vector<mlx::core::array> turbo4_delegated_steel_sdpa(
+    const mlx::core::array& scores,
+    const mlx::core::array& cold_packed,
+    const mlx::core::array& cold_rescale,
+    const mlx::core::array& hot_v,
+    const mlx::core::array& codebook,
+    int dim,
+    int n_rep,
+    int cold_offset,
+    int hot_offset,
+    float threshold) {
+    using mlx::core::Dtype;
+    using mlx::core::Shape;
+    using mlx::core::fast::TemplateArg;
+
+    auto& s_shape = scores.shape();
+    int bhq = s_shape[0];
+    int tq = s_shape[1];
+
+    auto& kernel = get_turbo4_delegated_steel_kernel().get();
+
+    std::vector<std::pair<std::string, TemplateArg>> template_args = {
+        {"Dim", dim},
+        {"RepeatCount", tq},
+        {"NRep", n_rep},
+    };
+
+    // Pack scalars as 1-element arrays. metal_kernel accepts only `array`
+    // inputs (TemplateArg covers int/bool/Dtype but not float; ScalarArg is
+    // for the precompiled-kernel path, not metal_kernel).
+    auto threshold_arr = mlx::core::full(
+        mlx::core::Shape{1}, threshold, mlx::core::float32);
+    auto cold_offset_arr = mlx::core::full(
+        mlx::core::Shape{1}, cold_offset, mlx::core::int32);
+    auto hot_offset_arr = mlx::core::full(
+        mlx::core::Shape{1}, hot_offset, mlx::core::int32);
+
+    // Input order MUST match the buffer-name vector in `metal_kernel(...)`:
+    // {"scores", "cold_packed", "cold_rescale", "hot_v", "codebook",
+    //  "threshold", "cold_offset", "hot_offset"}.
+    std::vector<mlx::core::array> inputs = {
+        scores,           // [B*Hq, Tq, T_total]   f32
+        cold_packed,      // [B*Hkv, T_cold, D/2]  u8 (or 1-token placeholder)
+        cold_rescale,     // [B*Hkv, T_cold]       f16
+        hot_v,            // [B*Hkv, T_hot, D]     f16
+        codebook,         // [16]                  f32
+        threshold_arr,    // [1]                   f32
+        cold_offset_arr,  // [1]                   i32
+        hot_offset_arr,   // [1]                   i32
+    };
+    std::vector<Shape> output_shapes = {
+        Shape{bhq, tq, dim},  // out_cold_pre
+        Shape{bhq, tq, dim},  // out_hot
+    };
+    std::vector<Dtype> output_dtypes = {
+        mlx::core::float32,  // out_cold_pre
+        mlx::core::float32,  // out_hot
+    };
+
+    // Threadgroup: (Dim, 1, 1). Grid: (Dim, 1, B*Hq). Same as the cold-only
+    // launcher — D threads cooperate via threadgroup memory for the
+    // per-(B*Hq) softmax max+sum scan, then accumulate a per-thread output
+    // dim into registers.
+    int tg_x = dim;
+    if (tg_x > 1024) {
+        tg_x = 1024;
+    }
+    auto results = kernel(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(dim, 1, bhq),   // grid
+        std::make_tuple(tg_x, 1, 1),    // threadgroup
+        template_args,
+        std::nullopt,
+        false,
+        {});
+
+    return results;
 }
 
 } // namespace mlxcel::turbo

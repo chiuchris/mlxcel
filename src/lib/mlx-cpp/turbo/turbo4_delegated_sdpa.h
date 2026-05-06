@@ -49,9 +49,12 @@
 // CLAUDE.md): `mlx::core::fast::metal_kernel`, `mlx::core::full`,
 // `mlx::core::Shape`, `mlx::core::float32`.
 //
-// Used by: `cpp/mlx_cxx_bridge.cpp::turbo4_delegated_cold_weighted_sum`.
+// Used by: `cpp/mlx_cxx_bridge.cpp::turbo4_delegated_cold_weighted_sum`,
+//          `cpp/mlx_cxx_bridge.cpp::turbo4_delegated_steel_sdpa` (issue #531).
 
 #include <mlx/array.h>
+
+#include <vector>
 
 namespace mlxcel::turbo {
 
@@ -95,6 +98,68 @@ mlx::core::array turbo4_delegated_cold_weighted_sum(
     const mlx::core::array& codebook,           // [16] f32
     int dim,
     int n_rep,
+    float threshold);
+
+// Run the steel-attention-envelope fused SDPA kernel for Turbo4Delegated
+// (issue #531). One Metal dispatch performs the entire post-Q·K SDPA inline:
+// numerically stable softmax over the full (cold + hot) score range, cold-V
+// dequant + weighted-sum from packed 4-bit storage, hot-V FP16 weighted-sum,
+// and per-Q normalisation. The kernel returns two FP32 buffers; the host
+// applies the linear `signs1 · WHT(signs2 · ·)` inverse Turbo4 rotation to the
+// cold contribution and adds the hot contribution before casting to FP16.
+//
+// Why the rotation stays on the host (matches `sparse_v_weighted_sum`):
+// the rotation is linear, so applying it to the small `[B, Hq, Tq, D]` output
+// is mathematically identical to applying it per V-token, but runs once per
+// decode step instead of `T_cold` times. Doing the WHT inside the kernel
+// would require `log2(Dim)` extra threadgroup barriers per (B*Hq) per call —
+// that defeats the point of pulling cold + hot into one dispatch.
+//
+// Inputs:
+// - `scores`:        `[B*Hq, Tq, T_total]` FP32 — `Q·K^T * scale` with the
+//   optional additive mask already added (causal positions carry `-inf` so
+//   they contribute zero post-softmax). The host pre-computes this via the
+//   standard MLX matmul so steel attention / NAX accelerated matmul stays
+//   on the Q·K side; the kernel handles only the post-Q·K work.
+// - `cold_packed`:   `[B*Hkv, T_cold, D/2]` UINT8 — nibble-packed cold V
+//   indices. May be empty (`T_cold == 0`) pre-fold; in that case pass a
+//   zero-shaped placeholder.
+// - `cold_rescale`:  `[B*Hkv, T_cold]` FP16 — precomputed per-token cold-V
+//   rescale `norm[t] / max(|y_hat[t]|, 1e-10)` (issue #520).
+// - `hot_v`:         `[B*Hkv, T_hot, D]` FP16 — plain FP16 hot V tokens. May
+//   be empty (`T_hot == 0`) immediately after a fold.
+// - `codebook`:      `[16]` FP32 — Lloyd-Max centroids.
+// - `threshold`:     `[1]` FP32 — alive cutoff (compared against the
+//   normalised post-softmax weight `exp(score - max) / sum`). `0.0` disables
+//   skipping. Hot tokens are never skipped.
+//
+// Template parameters:
+// - `Dim`: head dimension `D` (must be a power of 2 and equal to
+//   `2 * cold_packed.shape[-1]` when `T_cold > 0`).
+// - `RepeatCount`: `Tq` — Q tokens per threadgroup.
+// - `NRep`: `Hq / Hkv`.
+//
+// Outputs (returned as a 2-element vector, in this order):
+// - [0] `out_cold_pre`: `[B*Hq, Tq, D]` FP32 — unrotated cold weighted sum,
+//   already divided by the softmax denominator. The host applies
+//   `signs1 · WHT(signs2 · ·)` to produce the rotated cold contribution.
+// - [1] `out_hot`:      `[B*Hq, Tq, D]` FP32 — hot weighted sum, already
+//   divided by the same softmax denominator.
+//
+// The host sums `WHT_rotate(out_cold_pre) + out_hot` and casts to FP16. Both
+// outputs share the same softmax denominator (single-pass numerical stability
+// derived from a per-Q max + sum scan over the full T_total range) so the
+// addition is bit-equivalent to a dense `softmax(scores) @ V_full`.
+std::vector<mlx::core::array> turbo4_delegated_steel_sdpa(
+    const mlx::core::array& scores,         // [B*Hq, Tq, T_total] f32
+    const mlx::core::array& cold_packed,    // [B*Hkv, T_cold, D/2] u8
+    const mlx::core::array& cold_rescale,   // [B*Hkv, T_cold]      f16
+    const mlx::core::array& hot_v,          // [B*Hkv, T_hot, D]    f16
+    const mlx::core::array& codebook,       // [16]                 f32
+    int dim,
+    int n_rep,
+    int cold_offset,
+    int hot_offset,
     float threshold);
 
 } // namespace mlxcel::turbo
