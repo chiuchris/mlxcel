@@ -37,6 +37,8 @@
 //! let cb = optimal_codebook(4, 128);
 //! ```
 
+use std::sync::OnceLock;
+
 pub mod allowlist;
 pub mod boundary;
 pub mod codebook;
@@ -88,3 +90,29 @@ pub const DELEGATED_FOLD_BLOCK: i32 = 128;
 /// so a healthy stream never trips it; under contention we synchronize to
 /// preserve the speed gate's invariant that hot reads stay fast.
 pub const DELEGATED_HOT_MAX: i32 = DELEGATED_HOT_THRESHOLD * 4;
+
+/// Environment variable that opts `KVCacheMode::Turbo4Delegated` into the
+/// TurboQuant+ delegated-style decode path.
+///
+/// When enabled, the cache still builds packed cold V sidecars, but it keeps a
+/// unified FP16 V buffer and routes decode attention through native SDPA. This
+/// trades the compressed-only memory target for a speed reference path that
+/// mirrors `references/turboquant_plus`' delegated KVCache architecture.
+pub const DELEGATED_FP16_FAST_PATH_ENV: &str = "MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH";
+
+static DELEGATED_FP16_FAST_PATH_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Returns `true` iff Turbo4Delegated caches should keep unified FP16 V for
+/// native-SDPA decode while maintaining packed sidecars for measurement and
+/// later memory recovery work.
+pub fn delegated_fp16_fast_path_enabled() -> bool {
+    *DELEGATED_FP16_FAST_PATH_ENABLED.get_or_init(|| {
+        match std::env::var(DELEGATED_FP16_FAST_PATH_ENV) {
+            Ok(s) => matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            ),
+            Err(_) => false,
+        }
+    })
+}

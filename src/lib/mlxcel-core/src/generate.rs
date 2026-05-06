@@ -696,6 +696,22 @@ impl CxxGenerator {
         }
     }
 
+    /// Build optional Turbo4Delegated FP16 fast-path sidecars before decode.
+    ///
+    /// `max_tokens <= 1` is a prefill-only generation from the cache's point
+    /// of view, so skip compaction and keep prefill probes isolated.
+    ///
+    /// Used by: streaming and stats generation paths immediately after the
+    /// first sampled token is materialized or scheduled.
+    fn compact_turbo4_delegated_fp16_sidecars_before_decode(&mut self, max_tokens: usize) {
+        if max_tokens <= 1 {
+            return;
+        }
+        for cache in &mut self.caches {
+            cache.compact_turbo4_delegated_fp16_sidecars_for_decode();
+        }
+    }
+
     /// Reset generator state
     ///
     /// Must call `reset_with_model` instead when the model uses internal caches
@@ -878,6 +894,7 @@ impl CxxGenerator {
         // Sample first token (logits already sliced to last real position when padded)
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::async_eval(&y);
+        self.compact_turbo4_delegated_fp16_sidecars_before_decode(max_tokens);
 
         // Main generation loop - matches Python exactly:
         // 1. Start next step computation
@@ -1134,6 +1151,7 @@ impl CxxGenerator {
 
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::async_eval(&y);
+        self.compact_turbo4_delegated_fp16_sidecars_before_decode(max_tokens);
 
         // Decode loop — identical to standard generation (no embeddings needed)
         let mut n = 0;
@@ -1264,6 +1282,7 @@ impl CxxGenerator {
         model.after_prefill();
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::eval(&y);
+        self.compact_turbo4_delegated_fp16_sidecars_before_decode(max_tokens);
         let prefill_time = prefill_start.elapsed();
         ffi::clear_memory_cache();
 
@@ -1412,6 +1431,7 @@ impl CxxGenerator {
         // Sample first token and force sync to measure prefill accurately
         let (mut y, mut _logprobs) = sample_token_optimized(&logits, sampling, &token_history);
         ffi::eval(&y);
+        self.compact_turbo4_delegated_fp16_sidecars_before_decode(max_tokens);
         let prefill_time = prefill_start.elapsed();
 
         // Clear intermediate tensors from prefill to free memory

@@ -95,7 +95,9 @@ use super::{
 /// the V-side cold/hot split state (`cold_offset`), and the configured
 /// hot-V fold threshold so the adopted cache resumes decoding from the same
 /// V cold/hot boundary it left at detach time. There is no separate
-/// `cold_keys` field — K is unified.
+/// `cold_keys` field — K is unified. When the opt-in FP16 fast path is active,
+/// the detached `values` tensor is the unified FP16 V buffer rather than a hot
+/// ring; `delegated_fp16_fast_path` preserves that interpretation on adopt.
 /// Turbo3Asym-mode caches use the same `(keys, v_packed, v_norms)` triple
 /// as `Turbo4Asym` but the V buffer carries the 24-bit-grouped 3-bit indices
 /// (issue #477). The `mode` field on the handle preserves the bit-width
@@ -119,6 +121,7 @@ pub struct DetachedKVCache {
     pub(super) turbo_seed: u32,
     pub(super) cold_offset: i32,
     pub(super) hot_threshold: i32,
+    pub(super) delegated_fp16_fast_path: bool,
 }
 
 impl DetachedKVCache {
@@ -185,6 +188,7 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("turbo_seed", &self.turbo_seed)
             .field("cold_offset", &self.cold_offset)
             .field("hot_threshold", &self.hot_threshold)
+            .field("delegated_fp16_fast_path", &self.delegated_fp16_fast_path)
             .finish()
     }
 }
@@ -264,6 +268,7 @@ impl KVCache {
             turbo_seed: self.turbo_seed,
             cold_offset: std::mem::replace(&mut self.cold_offset, 0),
             hot_threshold: self.hot_threshold,
+            delegated_fp16_fast_path: self.delegated_fp16_fast_path,
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -306,6 +311,7 @@ impl KVCache {
         self.turbo_seed = detached.turbo_seed;
         self.cold_offset = detached.cold_offset;
         self.hot_threshold = detached.hot_threshold;
+        self.delegated_fp16_fast_path = detached.delegated_fp16_fast_path;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still

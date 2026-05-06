@@ -784,6 +784,21 @@ impl BatchScheduler {
         }
     }
 
+    /// Build optional Turbo4Delegated FP16 fast-path sidecars before a
+    /// sequence enters decode.
+    ///
+    /// `finish_prefill` has already emitted the first token; when that token
+    /// also satisfies `max_tokens` or EOS, the sequence never decodes and this
+    /// helper is intentionally not called.
+    fn compact_turbo4_delegated_fp16_sidecars_for_sequence(&mut self, seq_id: SequenceId) {
+        let Some(caches) = self.cache_pool.get_caches_mut(seq_id) else {
+            return;
+        };
+        for cache in caches {
+            cache.compact_turbo4_delegated_fp16_sidecars_for_decode();
+        }
+    }
+
     fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
         if self.decode_storage_backend != DecodeStorageBackend::Paged {
             return None;
@@ -1927,6 +1942,8 @@ impl BatchScheduler {
             self.release_sequence_caches(seq.seq_id);
             return;
         }
+
+        self.compact_turbo4_delegated_fp16_sidecars_for_sequence(seq.seq_id);
 
         if let Err(err) = seq.state.transition_to(SequenceState::Decoding) {
             tracing::error!("State transition error: {err}");

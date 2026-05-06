@@ -67,6 +67,13 @@
 //! cost vs FP16 mode (~7 ms/step at 4 K context, issue #527). See
 //! `references/turboquant_plus/README.md` §"MLX Framework Port" for the
 //! original architecture.
+//!
+//! Setting `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1` switches this mode to a
+//! delegated FP16 working-set variant: packed cold V sidecars are still built,
+//! but `values` remains a unified FP16 V buffer and attention reads it through
+//! the native SDPA path. This mirrors TurboQuant+'s delegated KVCache speed
+//! path and is intended as an opt-in performance comparison, not the default
+//! compressed-only memory target.
 
 mod detach;
 mod paged;
@@ -139,6 +146,8 @@ pub enum KVCacheMode {
     /// flow through a small FP16 hot tail with zero-alloc slice-update. SDPA
     /// always reads FP16. Targets ≥97%-of-FP16 decode speed at 4K and ≥95%
     /// at 16K on M5 Max. See issue #479 / epic #458.
+    /// `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1` keeps an FP16 V working set
+    /// for native-SDPA decode while still maintaining packed sidecars.
     Turbo4Delegated,
 }
 
@@ -338,6 +347,12 @@ pub struct KVCache {
     /// Hot-tail fold threshold (Turbo4Delegated only). Mutable so test harness
     /// and benchmarks can configure it without going through the env var.
     pub(crate) hot_threshold: i32,
+    /// Opt-in TurboQuant+ delegated-style path for `Turbo4Delegated`.
+    ///
+    /// When true, `values` is a unified FP16 V buffer rather than a hot ring.
+    /// Packed cold V sidecars still advance with `cold_offset`, but decode
+    /// attention reads the FP16 V slice through native SDPA.
+    pub(crate) delegated_fp16_fast_path: bool,
 }
 
 impl KVCache {
@@ -361,6 +376,7 @@ impl KVCache {
             turbo_seed: TURBO_DEFAULT_SEED,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
+            delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
         }
     }
 
@@ -405,6 +421,7 @@ impl KVCache {
             turbo_seed,
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
+            delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
         }
     }
 
@@ -439,6 +456,32 @@ impl KVCache {
     /// happened (i.e. during prefill or before the prefill→decode transition).
     pub fn hot_offset(&self) -> i32 {
         self.offset - self.cold_offset
+    }
+
+    /// Pre-build Turbo4Delegated FP16 fast-path packed V sidecars after
+    /// prefill and before the first decode forward.
+    ///
+    /// The FP16 fast path keeps `values` as a unified V buffer for SDPA, so
+    /// packed cold sidecars are not required to answer decode attention.
+    /// Building the initial `[0, offset)` sidecar outside the decode step
+    /// moves the large TurboQuant+ style compaction cost out of the token
+    /// timing critical path while preserving the measurement / recovery
+    /// sidecars maintained by `Turbo4Delegated`.
+    ///
+    /// Returns `true` only when a fold was actually performed.
+    ///
+    /// Used by: generator prefill→decode handoff paths and server batch
+    /// scheduler `finish_prefill`.
+    pub fn compact_turbo4_delegated_fp16_sidecars_for_decode(&mut self) -> bool {
+        if self.mode != KVCacheMode::Turbo4Delegated || !self.delegated_fp16_fast_path {
+            return false;
+        }
+        if self.offset <= 0 || self.cold_offset > 0 || self.values.is_none() {
+            return false;
+        }
+
+        self.fold_unified_v_range_to_cold(0, self.offset);
+        true
     }
 
     /// Check if cache is empty
@@ -1151,6 +1194,9 @@ impl KVCache {
     ///   No cold/hot split for K.
     /// - `values`: V hot ring FP16, `[B, H, v_hot_capacity, V_dim]`.
     ///   Visible length is `hot_offset() = offset - cold_offset`.
+    ///   In the opt-in FP16 fast path this same field is a unified FP16 V
+    ///   buffer with visible length `offset`; the packed sidecars are retained
+    ///   but are not read by attention.
     /// - `v_packed`: cold V Turbo4 indices, `[B, H, cold_capacity, V_dim/2]` u8.
     /// - `v_norms`: cold V per-token norms, `[B, H, cold_capacity, 1]` fp16.
     ///
@@ -1163,6 +1209,11 @@ impl KVCache {
     ) {
         let new_keys_f16 = ffi::astype(&new_keys, dtype::FLOAT16);
         let new_values_f16 = ffi::astype(&new_values, dtype::FLOAT16);
+
+        if self.delegated_fp16_fast_path {
+            self.update_turbo4_delegated_fp16_fast_path(&new_keys_f16, &new_values_f16);
+            return;
+        }
 
         let key_shape = ffi::array_shape(&new_keys_f16);
         let new_seq_len = key_shape[2];
@@ -1236,6 +1287,61 @@ impl KVCache {
                 if self.hot_offset() <= turbo::DELEGATED_HOT_MAX {
                     break;
                 }
+            }
+        }
+    }
+
+    /// Turbo4Delegated FP16 working-set variant.
+    ///
+    /// This mirrors TurboQuant+'s delegated KVCache optimization: the packed V
+    /// sidecars are maintained for measurement / future memory recovery, but
+    /// decode attention reads a unified FP16 V buffer through native SDPA. The
+    /// default Turbo4Delegated path below remains compressed-only for cold V.
+    ///
+    /// Used by: `update_turbo4_delegated` when
+    /// `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1`.
+    fn update_turbo4_delegated_fp16_fast_path(
+        &mut self,
+        new_keys_f16: &MlxArray,
+        new_values_f16: &MlxArray,
+    ) {
+        let key_shape = ffi::array_shape(new_keys_f16);
+        let new_seq_len = key_shape[2];
+        let prev_offset = self.offset;
+        let needed = prev_offset + new_seq_len;
+
+        if self.keys.is_none() || needed > self.k_buffer_seq_len() {
+            self.grow_unified_k_buffer(new_keys_f16, needed);
+        }
+        if self.values.is_none() || needed > self.v_hot_buffer_seq_len() {
+            self.grow_unified_v_buffer(new_values_f16, needed);
+        }
+
+        let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
+        let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
+        self.keys = Some(ffi::slice_update(
+            self.keys.as_ref().unwrap(),
+            new_keys_f16,
+            &[0, 0, prev_offset, 0],
+            &[k_shape[0], k_shape[1], needed, k_shape[3]],
+        ));
+        self.values = Some(ffi::slice_update(
+            self.values.as_ref().unwrap(),
+            new_values_f16,
+            &[0, 0, prev_offset, 0],
+            &[v_shape[0], v_shape[1], needed, v_shape[3]],
+        ));
+        self.offset = needed;
+
+        if self.cold_offset == 0 && prev_offset > 0 && new_seq_len == 1 {
+            self.fold_unified_v_range_to_cold(0, prev_offset);
+        }
+
+        while self.cold_offset > 0 && self.hot_offset() > self.hot_threshold {
+            let block = turbo::DELEGATED_FOLD_BLOCK.min(self.hot_offset());
+            self.fold_unified_v_range_to_cold(self.cold_offset, block);
+            if self.hot_offset() <= turbo::DELEGATED_HOT_MAX {
+                break;
             }
         }
     }
@@ -1347,6 +1453,40 @@ impl KVCache {
                 &old_v_slice,
                 &[0, 0, 0, 0],
                 &[b, n_kv_heads, prev_hot, v_head_dim],
+            ));
+        } else {
+            self.values = Some(new_v);
+        }
+    }
+
+    /// Allocate (or grow) the unified FP16 V buffer used by the opt-in
+    /// Turbo4Delegated fast path.
+    ///
+    /// Used by: `update_turbo4_delegated_fp16_fast_path`.
+    fn grow_unified_v_buffer(&mut self, new_values_f16: &MlxArray, needed_seq_len: i32) {
+        let val_shape = ffi::array_shape(new_values_f16);
+        let b = val_shape[0];
+        let n_kv_heads = val_shape[1];
+        let v_head_dim = val_shape[3];
+
+        let n_steps = (needed_seq_len + self.step - 1) / self.step;
+        let buf_size = (n_steps * self.step).max(self.step);
+
+        let new_v = ffi::zeros(&[b, n_kv_heads, buf_size, v_head_dim], dtype::FLOAT16);
+        let prev = self.offset;
+        if prev > 0 && self.values.is_some() {
+            let old_v = self.values.as_ref().unwrap();
+            let old_v_shape = ffi::array_shape(old_v);
+            let old_v_slice = ffi::slice(
+                old_v,
+                &[0, 0, 0, 0],
+                &[old_v_shape[0], old_v_shape[1], prev, old_v_shape[3]],
+            );
+            self.values = Some(ffi::slice_update(
+                &new_v,
+                &old_v_slice,
+                &[0, 0, 0, 0],
+                &[b, n_kv_heads, prev, v_head_dim],
             ));
         } else {
             self.values = Some(new_v);
@@ -1491,6 +1631,54 @@ impl KVCache {
         // self.offset is unchanged: cold_offset += block, hot_len -= block.
         // The total length stays the same. K side is unaffected — `keys`
         // already holds all `offset` tokens at FP16 (issue #527).
+    }
+
+    /// Fold an absolute `[start, start + block)` window from the unified FP16
+    /// V buffer into packed cold V sidecars without dropping the FP16 source.
+    ///
+    /// Used by: `update_turbo4_delegated_fp16_fast_path`.
+    fn fold_unified_v_range_to_cold(&mut self, start: i32, block: i32) {
+        if block <= 0 {
+            return;
+        }
+        debug_assert_eq!(
+            start, self.cold_offset,
+            "unified V folds must append exactly at the cold boundary"
+        );
+
+        let values = self
+            .values
+            .as_ref()
+            .expect("unified values must exist for FP16 fast-path fold");
+        let v_shape = ffi::array_shape(values);
+        let b = v_shape[0];
+        let n_kv_heads = v_shape[1];
+        let v_head_dim = v_shape[3];
+        let end = (start + block).min(self.offset);
+        if end <= start {
+            return;
+        }
+        let block = end - start;
+        let v_slice = ffi::slice(
+            values,
+            &[0, 0, start, 0],
+            &[b, n_kv_heads, end, v_head_dim],
+        );
+
+        if self.turbo_params.is_none() {
+            self.turbo_params = Some(turbo::TurboQuantParams::new(
+                v_head_dim as u32,
+                self.turbo_seed,
+            ));
+        }
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params just initialised");
+        let (v_packed_new, v_norms_new, v_rescale_new) =
+            turbo::quant::quantize_v_turbo4(&v_slice, params);
+
+        self.append_cold_block(&v_packed_new, &v_norms_new, &v_rescale_new, block);
     }
 
     /// Append a `block`-token chunk to the cold V storage buffers, growing
@@ -1683,11 +1871,16 @@ impl KVCache {
             }
             if let Some(ref v) = self.values {
                 let v_shape = ffi::array_shape(v);
-                if new_hot_len > 0 {
+                let visible_v_len = if self.delegated_fp16_fast_path {
+                    self.offset
+                } else {
+                    new_hot_len
+                };
+                if visible_v_len > 0 {
                     self.values = Some(ffi::slice(
                         v,
                         &[0, 0, 0, 0],
-                        &[v_shape[0], v_shape[1], new_hot_len, v_shape[3]],
+                        &[v_shape[0], v_shape[1], visible_v_len, v_shape[3]],
                     ));
                 }
             }
@@ -1838,7 +2031,9 @@ impl KVCache {
     /// `slice(keys, 0, offset)` for K (no concat — same shape contract as
     /// `Fp16` mode) and
     /// `[dequant(v_packed[:cold_offset]); hot_values[:hot_offset]]` for V.
-    /// SDPA always sees FP16; the packed cold V storage is internal.
+    /// SDPA always sees FP16; the packed cold V storage is internal. With
+    /// `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1`, V is already a unified FP16
+    /// working set and this returns `slice(values, 0, offset)`.
     pub fn update_and_fetch(
         &mut self,
         new_keys: UniquePtr<MlxArray>,
@@ -1981,11 +2176,25 @@ impl KVCache {
     /// `update_and_fetch`) or when callers have not been ported to the
     /// fused-attention API; on the decode hot path the fused kernel is the
     /// only consumer.
+    ///
+    /// With `delegated_fp16_fast_path`, `values` is a unified FP16 V buffer.
+    /// In that mode this read path returns `slice(values, 0, offset)` and never
+    /// materializes cold V from packed sidecars.
     fn fetch_turbo4_delegated(&mut self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         // K side (issue #527): unified buffer — same path as FP16 mode.
         let k = self.keys.as_ref().expect("unified keys must exist");
         let ks = ffi::array_shape(k);
         let k_slice = ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
+
+        if self.delegated_fp16_fast_path {
+            let v = self
+                .values
+                .as_ref()
+                .expect("unified values must exist in Turbo4Delegated FP16 fast path");
+            let vs = ffi::array_shape(v);
+            let v_slice = ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]);
+            return (k_slice, v_slice);
+        }
 
         // V side: packed cold body + FP16 hot ring. Hot slice takes `hot_len`
         // tokens from the front of the hot ring.
@@ -2057,7 +2266,9 @@ impl KVCache {
     /// (`v_packed`/`v_norms`/`v_rescale`). There is no separate cold-K
     /// buffer (issue #527 removed it) and no FP16 cold-V working set (issue
     /// #528 replaced the PR-#525 memo with a fused kernel that reads packed
-    /// cold V directly).
+    /// cold V directly). When `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1`,
+    /// `values` is instead a unified FP16 V working set and `nbytes()` counts
+    /// both that buffer and the packed sidecars by design.
     /// In Turbo3Asym mode this counts the FP16 keys plus the 3-bit packed-V
     /// and V-norm sidecars; the underlying `array_nbytes` already accounts
     /// for the smaller per-token byte count (`head_dim * 3 / 8` u8 vs the
@@ -2381,6 +2592,10 @@ impl KVCache {
         // into cold packed storage). After this call `self.offset` and
         // `self.cold_offset` are up to date.
         self.update(new_keys, new_values);
+
+        if self.delegated_fp16_fast_path {
+            return self.delegated_graph_attention(q, scale, mask);
+        }
 
         let cold_offset = self.cold_offset;
         let hot_offset = self.offset - cold_offset;

@@ -1834,6 +1834,155 @@ fn delegated_unified_k_matches_fp16_reference() {
     }
 }
 
+/// Opt-in FP16 fast path: Turbo4Delegated should still maintain packed cold V
+/// sidecars, but fetches must return the unified FP16 V buffer rather than
+/// dequantizing packed cold V every step. This is the local analogue of the
+/// TurboQuant+ delegated KVCache architecture.
+#[test]
+fn delegated_fp16_fast_path_keeps_unified_v_and_sidecars() {
+    let head_dim = 64;
+    let prefill_len = 16;
+    let decode_steps = 80;
+
+    let mut cache_fast = build_delegated_cache_with_small_threshold(32);
+    cache_fast.delegated_fp16_fast_path = true;
+    let mut cache_fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 7);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 8);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let (_, v_fast) = cache_fast.update_and_fetch(k_pre, v_pre);
+    let (_, v_ref) = cache_fp16.update_and_fetch(k_pre_b, v_pre_b);
+    assert!(
+        max_abs_diff(&v_fast, &v_ref) < 1e-3,
+        "prefill V must match FP16 exactly in delegated FP16 fast path"
+    );
+
+    for step in 0..decode_steps {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 5000 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 6000 + step as u32);
+        let k_b = ffi::copy(&k);
+        let v_b = ffi::copy(&v);
+        let (_, v_fast) = cache_fast.update_and_fetch(k, v);
+        let (_, v_ref) = cache_fp16.update_and_fetch(k_b, v_b);
+        let max_abs = max_abs_diff(&v_fast, &v_ref);
+        assert!(
+            max_abs < 1e-3,
+            "step {step}: fast-path V must match FP16 reference; max abs {max_abs:.4e}"
+        );
+    }
+
+    assert!(
+        cache_fast.cold_offset() > 0,
+        "fast path must still advance packed cold V sidecars"
+    );
+    assert!(
+        cache_fast.v_packed.is_some() && cache_fast.v_norms.is_some(),
+        "fast path must keep packed V sidecars for measurement / recovery"
+    );
+    let values = cache_fast
+        .values
+        .as_ref()
+        .expect("fast path keeps unified FP16 V buffer");
+    let v_shape = ffi::array_shape(values);
+    assert!(
+        v_shape[2] >= cache_fast.seq_len(),
+        "fast-path values buffer is unified V, so capacity {} must cover offset {}",
+        v_shape[2],
+        cache_fast.seq_len()
+    );
+}
+
+/// The pre-decode compaction hook should fold the prefill body into packed
+/// sidecars once, without changing the FP16 V read path used by attention.
+#[test]
+fn delegated_fp16_fast_path_predecode_compaction_folds_prefill_once() {
+    let head_dim = 64;
+    let prefill_len = 16;
+
+    let mut cache_fast = build_delegated_cache_with_small_threshold(32);
+    cache_fast.delegated_fp16_fast_path = true;
+    let mut cache_fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 17);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 18);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_fast.update_and_fetch(k_pre, v_pre);
+    let _ = cache_fp16.update_and_fetch(k_pre_b, v_pre_b);
+
+    assert_eq!(
+        cache_fast.cold_offset(),
+        0,
+        "prefill alone must not compact sidecars before the handoff hook"
+    );
+    assert!(
+        cache_fast.compact_turbo4_delegated_fp16_sidecars_for_decode(),
+        "first pre-decode compaction must fold the prefill body"
+    );
+    assert_eq!(cache_fast.cold_offset(), prefill_len);
+    assert_eq!(cache_fast.hot_offset(), 0);
+    assert!(
+        cache_fast.v_packed.is_some() && cache_fast.v_norms.is_some(),
+        "compaction must materialize packed V sidecars"
+    );
+    assert!(
+        !cache_fast.compact_turbo4_delegated_fp16_sidecars_for_decode(),
+        "compaction must be idempotent once cold sidecars exist"
+    );
+
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 7000);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 8000);
+    let k_b = ffi::copy(&k);
+    let v_b = ffi::copy(&v);
+    let (k_fast, v_fast) = cache_fast.update_and_fetch(k, v);
+    let (k_ref, v_ref) = cache_fp16.update_and_fetch(k_b, v_b);
+    assert!(
+        max_abs_diff(&k_fast, &k_ref) < 1e-3,
+        "pre-compacted fast-path K must still match FP16"
+    );
+    assert!(
+        max_abs_diff(&v_fast, &v_ref) < 1e-3,
+        "pre-compacted fast-path V must still read unified FP16"
+    );
+    assert_eq!(cache_fast.cold_offset(), prefill_len);
+    assert_eq!(cache_fast.hot_offset(), 1);
+}
+
+/// Detach/adopt must preserve whether `values` is a hot ring or a unified FP16
+/// V buffer. Otherwise an adopted fast-path cache would interpret unified V as
+/// hot-only V and return the wrong prefix.
+#[test]
+fn delegated_fp16_fast_path_survives_detach_adopt() {
+    let head_dim = 64;
+    let mut src = build_delegated_cache_with_small_threshold(32);
+    src.delegated_fp16_fast_path = true;
+    delegated_decode_run(&mut src, head_dim, 16, 64);
+
+    assert!(src.delegated_fp16_fast_path);
+    assert!(src.cold_offset() > 0, "test setup must trigger sidecar folds");
+
+    let handle = src.clone_handle();
+    let mut tgt = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
+    tgt.install_detached(handle).unwrap();
+
+    assert!(
+        tgt.delegated_fp16_fast_path,
+        "install_detached must preserve FP16 fast-path interpretation"
+    );
+    let (k_out, v_out) = tgt.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 11111),
+        synth_kv_tensor(1, 1, 1, head_dim, 22222),
+    );
+    assert_eq!(ffi::array_shape(&k_out)[2], tgt.seq_len());
+    assert_eq!(
+        ffi::array_shape(&v_out)[2],
+        tgt.seq_len(),
+        "adopted fast-path cache must fetch full unified V, not only hot tail"
+    );
+}
+
 /// `nbytes()` after a fold must reflect a single unified K buffer, not a
 /// hot ring + a separate cold K buffer (issue #527 removes the cold-K
 /// allocation).  V-side accounting (packed sidecars + dequant memo) must
