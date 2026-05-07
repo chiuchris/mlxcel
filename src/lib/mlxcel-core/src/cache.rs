@@ -353,6 +353,9 @@ pub struct KVCache {
     /// Packed cold V sidecars still advance with `cold_offset`, but decode
     /// attention reads the FP16 V slice through native SDPA.
     pub(crate) delegated_fp16_fast_path: bool,
+    /// Packed sidecar maintenance cadence for the opt-in delegated FP16 fast
+    /// path. Ignored unless `delegated_fp16_fast_path` is true.
+    pub(crate) delegated_fp16_sidecar_policy: turbo::DelegatedFp16SidecarPolicy,
 }
 
 impl KVCache {
@@ -377,6 +380,7 @@ impl KVCache {
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
+            delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
         }
     }
 
@@ -422,6 +426,7 @@ impl KVCache {
             cold_offset: 0,
             hot_threshold: turbo::DELEGATED_HOT_THRESHOLD,
             delegated_fp16_fast_path: turbo::delegated_fp16_fast_path_enabled(),
+            delegated_fp16_sidecar_policy: turbo::delegated_fp16_sidecar_policy(),
         }
     }
 
@@ -458,30 +463,41 @@ impl KVCache {
         self.offset - self.cold_offset
     }
 
-    /// Pre-build Turbo4Delegated FP16 fast-path packed V sidecars after
-    /// prefill and before the first decode forward.
+    /// Build all missing Turbo4Delegated FP16 fast-path packed V sidecars.
     ///
     /// The FP16 fast path keeps `values` as a unified V buffer for SDPA, so
-    /// packed cold sidecars are not required to answer decode attention.
-    /// Building the initial `[0, offset)` sidecar outside the decode step
-    /// moves the large TurboQuant+ style compaction cost out of the token
-    /// timing critical path while preserving the measurement / recovery
-    /// sidecars maintained by `Turbo4Delegated`.
+    /// packed cold sidecars are not required to answer decode attention. This
+    /// method exists for explicit preservation paths: pre-decode handoff under
+    /// the conservative policy, detach / prompt-cache donation under the lazy
+    /// policy, and future memory recovery hooks.
     ///
     /// Returns `true` only when a fold was actually performed.
+    ///
+    /// Used by: [`Self::compact_turbo4_delegated_fp16_sidecars_for_decode`]
+    /// and [`Self::clone_handle`].
+    pub fn compact_turbo4_delegated_fp16_sidecars(&mut self) -> bool {
+        if self.mode != KVCacheMode::Turbo4Delegated || !self.delegated_fp16_fast_path {
+            return false;
+        }
+        if self.offset <= self.cold_offset || self.values.is_none() {
+            return false;
+        }
+
+        self.fold_unified_v_range_to_cold(self.cold_offset, self.offset - self.cold_offset);
+        true
+    }
+
+    /// Pre-build Turbo4Delegated FP16 fast-path packed V sidecars after
+    /// prefill and before the first decode forward when the sidecar policy is
+    /// `predecode`.
     ///
     /// Used by: generator prefill→decode handoff paths and server batch
     /// scheduler `finish_prefill`.
     pub fn compact_turbo4_delegated_fp16_sidecars_for_decode(&mut self) -> bool {
-        if self.mode != KVCacheMode::Turbo4Delegated || !self.delegated_fp16_fast_path {
+        if self.delegated_fp16_sidecar_policy != turbo::DelegatedFp16SidecarPolicy::Predecode {
             return false;
         }
-        if self.offset <= 0 || self.cold_offset > 0 || self.values.is_none() {
-            return false;
-        }
-
-        self.fold_unified_v_range_to_cold(0, self.offset);
-        true
+        self.compact_turbo4_delegated_fp16_sidecars()
     }
 
     /// Check if cache is empty
@@ -1333,15 +1349,17 @@ impl KVCache {
         ));
         self.offset = needed;
 
-        if self.cold_offset == 0 && prev_offset > 0 && new_seq_len == 1 {
-            self.fold_unified_v_range_to_cold(0, prev_offset);
-        }
+        if self.delegated_fp16_sidecar_policy == turbo::DelegatedFp16SidecarPolicy::Predecode {
+            if self.cold_offset == 0 && prev_offset > 0 && new_seq_len == 1 {
+                self.fold_unified_v_range_to_cold(0, prev_offset);
+            }
 
-        while self.cold_offset > 0 && self.hot_offset() > self.hot_threshold {
-            let block = turbo::DELEGATED_FOLD_BLOCK.min(self.hot_offset());
-            self.fold_unified_v_range_to_cold(self.cold_offset, block);
-            if self.hot_offset() <= turbo::DELEGATED_HOT_MAX {
-                break;
+            while self.cold_offset > 0 && self.hot_offset() > self.hot_threshold {
+                let block = turbo::DELEGATED_FOLD_BLOCK.min(self.hot_offset());
+                self.fold_unified_v_range_to_cold(self.cold_offset, block);
+                if self.hot_offset() <= turbo::DELEGATED_HOT_MAX {
+                    break;
+                }
             }
         }
     }

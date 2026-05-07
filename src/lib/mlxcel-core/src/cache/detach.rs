@@ -97,7 +97,8 @@ use super::{
 /// V cold/hot boundary it left at detach time. There is no separate
 /// `cold_keys` field — K is unified. When the opt-in FP16 fast path is active,
 /// the detached `values` tensor is the unified FP16 V buffer rather than a hot
-/// ring; `delegated_fp16_fast_path` preserves that interpretation on adopt.
+/// ring; `delegated_fp16_fast_path` preserves that interpretation on adopt and
+/// `delegated_fp16_sidecar_policy` preserves the foreground compaction policy.
 /// Turbo3Asym-mode caches use the same `(keys, v_packed, v_norms)` triple
 /// as `Turbo4Asym` but the V buffer carries the 24-bit-grouped 3-bit indices
 /// (issue #477). The `mode` field on the handle preserves the bit-width
@@ -122,6 +123,7 @@ pub struct DetachedKVCache {
     pub(super) cold_offset: i32,
     pub(super) hot_threshold: i32,
     pub(super) delegated_fp16_fast_path: bool,
+    pub(super) delegated_fp16_sidecar_policy: super::turbo::DelegatedFp16SidecarPolicy,
 }
 
 impl DetachedKVCache {
@@ -189,6 +191,10 @@ impl std::fmt::Debug for DetachedKVCache {
             .field("cold_offset", &self.cold_offset)
             .field("hot_threshold", &self.hot_threshold)
             .field("delegated_fp16_fast_path", &self.delegated_fp16_fast_path)
+            .field(
+                "delegated_fp16_sidecar_policy",
+                &self.delegated_fp16_sidecar_policy,
+            )
             .finish()
     }
 }
@@ -247,11 +253,16 @@ impl KVCache {
     /// `offset == 0`) but retains its quantization mode and step size so it
     /// can be reused for a new sequence. The returned `DetachedKVCache`
     /// carries the original tensors unchanged — including INT8 scale buffers
-    /// when `mode == Int8` — so adopt is a zero-copy operation.
+    /// when `mode == Int8` — so adopt is a zero-copy operation. For the
+    /// delegated FP16 fast path this first compacts any missing packed V
+    /// sidecars so lazy generation can skip foreground folds without donating
+    /// a sidecar-incomplete prompt-cache entry.
     ///
     /// Used by: prompt prefix cache detach/adopt (#417), cross-request reuse
     /// handoff inside `CachePool::detach`.
     pub fn clone_handle(&mut self) -> DetachedKVCache {
+        self.compact_turbo4_delegated_fp16_sidecars();
+
         let handle = DetachedKVCache {
             keys: self.keys.take(),
             values: self.values.take(),
@@ -269,6 +280,7 @@ impl KVCache {
             cold_offset: std::mem::replace(&mut self.cold_offset, 0),
             hot_threshold: self.hot_threshold,
             delegated_fp16_fast_path: self.delegated_fp16_fast_path,
+            delegated_fp16_sidecar_policy: self.delegated_fp16_sidecar_policy,
         };
         // Clear turbo_params on the source so the next quantize call rebuilds
         // it from scratch (required if the slot is reused with a different
@@ -312,6 +324,7 @@ impl KVCache {
         self.cold_offset = detached.cold_offset;
         self.hot_threshold = detached.hot_threshold;
         self.delegated_fp16_fast_path = detached.delegated_fp16_fast_path;
+        self.delegated_fp16_sidecar_policy = detached.delegated_fp16_sidecar_policy;
         // turbo_params is rebuilt lazily on the next quantize call, but if we
         // can already see the V head_dim from v_packed we may as well prebuild
         // so dequantize-only consumers (which don't go through update_*) still

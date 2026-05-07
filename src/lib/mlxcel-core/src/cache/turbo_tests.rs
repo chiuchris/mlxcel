@@ -1950,6 +1950,110 @@ fn delegated_fp16_fast_path_predecode_compaction_folds_prefill_once() {
     assert_eq!(cache_fast.hot_offset(), 1);
 }
 
+#[test]
+fn delegated_fp16_sidecar_policy_parses_values() {
+    assert_eq!(
+        turbo::parse_delegated_fp16_sidecar_policy("predecode"),
+        Some(turbo::DelegatedFp16SidecarPolicy::Predecode)
+    );
+    assert_eq!(
+        turbo::parse_delegated_fp16_sidecar_policy("eager"),
+        Some(turbo::DelegatedFp16SidecarPolicy::Predecode)
+    );
+    assert_eq!(
+        turbo::parse_delegated_fp16_sidecar_policy("lazy"),
+        Some(turbo::DelegatedFp16SidecarPolicy::Lazy)
+    );
+    assert_eq!(
+        turbo::parse_delegated_fp16_sidecar_policy("on-demand"),
+        Some(turbo::DelegatedFp16SidecarPolicy::Lazy)
+    );
+    assert_eq!(turbo::parse_delegated_fp16_sidecar_policy("bogus"), None);
+}
+
+/// Lazy sidecar policy keeps decode on the unified FP16 K/V hot path and avoids
+/// foreground packed sidecar work until a preservation path explicitly detaches
+/// the cache.
+#[test]
+fn delegated_fp16_lazy_sidecars_skip_decode_and_compact_on_detach() {
+    let head_dim = 64;
+    let prefill_len = 16;
+    let decode_steps = 80;
+
+    let mut cache_fast = build_delegated_cache_with_small_threshold(32);
+    cache_fast.delegated_fp16_fast_path = true;
+    cache_fast.delegated_fp16_sidecar_policy = turbo::DelegatedFp16SidecarPolicy::Lazy;
+    let mut cache_fp16 = KVCache::new_with_mode(KVCacheMode::Fp16);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 27);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 28);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let (_, v_fast) = cache_fast.update_and_fetch(k_pre, v_pre);
+    let (_, v_ref) = cache_fp16.update_and_fetch(k_pre_b, v_pre_b);
+    assert!(max_abs_diff(&v_fast, &v_ref) < 1e-3);
+    assert!(
+        !cache_fast.compact_turbo4_delegated_fp16_sidecars_for_decode(),
+        "lazy policy must not predecode-compact through the generation hook"
+    );
+
+    for step in 0..decode_steps {
+        let k = synth_kv_tensor(1, 1, 1, head_dim, 9000 + step as u32);
+        let v = synth_kv_tensor(1, 1, 1, head_dim, 10000 + step as u32);
+        let k_b = ffi::copy(&k);
+        let v_b = ffi::copy(&v);
+        let (_, v_fast) = cache_fast.update_and_fetch(k, v);
+        let (_, v_ref) = cache_fp16.update_and_fetch(k_b, v_b);
+        assert!(
+            max_abs_diff(&v_fast, &v_ref) < 1e-3,
+            "step {step}: lazy fast-path V must match FP16 reference"
+        );
+    }
+
+    let seq_len = cache_fast.seq_len();
+    assert_eq!(
+        cache_fast.cold_offset(),
+        0,
+        "lazy policy must skip foreground decode sidecar folds"
+    );
+    assert!(
+        cache_fast.v_packed.is_none() && cache_fast.v_norms.is_none(),
+        "lazy policy should not allocate packed sidecars before preservation"
+    );
+
+    let handle = cache_fast.clone_handle();
+    assert_eq!(
+        handle.cold_offset, seq_len,
+        "detach must compact all missing sidecars before donation"
+    );
+    assert!(
+        handle.v_packed.is_some() && handle.v_norms.is_some(),
+        "detached lazy fast-path cache must carry packed sidecars"
+    );
+    assert_eq!(
+        handle.delegated_fp16_sidecar_policy,
+        turbo::DelegatedFp16SidecarPolicy::Lazy
+    );
+
+    let mut tgt = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
+    tgt.install_detached(handle).unwrap();
+    assert_eq!(
+        tgt.delegated_fp16_sidecar_policy,
+        turbo::DelegatedFp16SidecarPolicy::Lazy
+    );
+    let old_cold = tgt.cold_offset();
+    let (_, v_out) = tgt.update_and_fetch(
+        synth_kv_tensor(1, 1, 1, head_dim, 11111),
+        synth_kv_tensor(1, 1, 1, head_dim, 22222),
+    );
+    assert_eq!(ffi::array_shape(&v_out)[2], tgt.seq_len());
+    assert_eq!(
+        tgt.cold_offset(),
+        old_cold,
+        "adopted lazy cache must not resume foreground sidecar folds"
+    );
+}
+
 /// Detach/adopt must preserve whether `values` is a hot ring or a unified FP16
 /// V buffer. Otherwise an adopted fast-path cache would interpret unified V as
 /// hot-only V and return the wrong prefix.
@@ -1970,6 +2074,11 @@ fn delegated_fp16_fast_path_survives_detach_adopt() {
     assert!(
         tgt.delegated_fp16_fast_path,
         "install_detached must preserve FP16 fast-path interpretation"
+    );
+    assert_eq!(
+        tgt.delegated_fp16_sidecar_policy,
+        turbo::DelegatedFp16SidecarPolicy::Predecode,
+        "install_detached must preserve FP16 sidecar policy"
     );
     let (k_out, v_out) = tgt.update_and_fetch(
         synth_kv_tensor(1, 1, 1, head_dim, 11111),

@@ -102,6 +102,33 @@ pub const DELEGATED_FP16_FAST_PATH_ENV: &str = "MLXCEL_TURBO4_DELEGATED_FP16_FAS
 
 static DELEGATED_FP16_FAST_PATH_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// Packed sidecar maintenance policy for the opt-in delegated FP16 fast path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DelegatedFp16SidecarPolicy {
+    /// Build the initial sidecars in the prefill->decode handoff and keep
+    /// folding hot-tail blocks during decode. This is the conservative
+    /// default because packed sidecars stay close to the visible offset.
+    #[default]
+    Predecode,
+    /// Do not build packed sidecars on the foreground generation path. Missing
+    /// sidecars are compacted only by explicit preservation paths such as
+    /// detach / prompt-cache donation.
+    Lazy,
+}
+
+/// Environment variable controlling packed sidecar maintenance for
+/// `MLXCEL_TURBO4_DELEGATED_FP16_FAST_PATH=1`.
+///
+/// Accepted values:
+/// - `predecode` / `eager` (default): compact before decode and periodically
+///   during decode.
+/// - `lazy` / `on-demand`: skip foreground generation compaction and compact
+///   only when a preservation path explicitly asks for sidecars.
+pub const DELEGATED_FP16_SIDECAR_POLICY_ENV: &str =
+    "MLXCEL_TURBO4_DELEGATED_FP16_SIDECARS";
+
+static DELEGATED_FP16_SIDECAR_POLICY: OnceLock<DelegatedFp16SidecarPolicy> = OnceLock::new();
+
 /// Returns `true` iff Turbo4Delegated caches should keep unified FP16 V for
 /// native-SDPA decode while maintaining packed sidecars for measurement and
 /// later memory recovery work.
@@ -114,5 +141,27 @@ pub fn delegated_fp16_fast_path_enabled() -> bool {
             ),
             Err(_) => false,
         }
+    })
+}
+
+/// Parse the delegated FP16 sidecar policy env var value.
+pub fn parse_delegated_fp16_sidecar_policy(value: &str) -> Option<DelegatedFp16SidecarPolicy> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "predecode" | "pre-decode" | "eager" => {
+            Some(DelegatedFp16SidecarPolicy::Predecode)
+        }
+        "lazy" | "on-demand" | "ondemand" => Some(DelegatedFp16SidecarPolicy::Lazy),
+        _ => None,
+    }
+}
+
+/// Returns the packed sidecar maintenance policy for delegated FP16 fast-path
+/// caches. Unknown env values fall back to the conservative predecode policy.
+pub fn delegated_fp16_sidecar_policy() -> DelegatedFp16SidecarPolicy {
+    *DELEGATED_FP16_SIDECAR_POLICY.get_or_init(|| {
+        std::env::var(DELEGATED_FP16_SIDECAR_POLICY_ENV)
+            .ok()
+            .and_then(|s| parse_delegated_fp16_sidecar_policy(&s))
+            .unwrap_or_default()
     })
 }
