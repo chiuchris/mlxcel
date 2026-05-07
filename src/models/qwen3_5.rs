@@ -980,21 +980,30 @@ impl Qwen35Model {
         let batch = ids_shape[0];
         let seq_len = ids_shape[1];
 
-        let has_stored = { self.position_ids.borrow().is_some() };
-        let has_deltas = { self.rope_deltas.borrow().is_some() };
-
-        let position_ids = if has_stored && cache_offset == 0 {
-            self.position_ids.borrow_mut().take()
-        } else if has_deltas {
-            let delta = { self.rope_deltas.borrow().unwrap_or(0) };
-            let offset = cache_offset + delta;
-            let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
-            let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
-            let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
-            let pos = mlxcel_core::expand_dims(&pos, 0);
-            Some(mlxcel_core::broadcast_to(&pos, &[3, batch, seq_len]))
-        } else {
-            None
+        // Compute position_ids with sufficiency check for chunked prefill.
+        // This matches upstream mlx-vlm PR #1048 (commit 1bf7742): the cached
+        // _position_ids entry is reusable when shape[-1] >= cache_offset + seq_length,
+        // not only when cache_offset == 0.  During chunked prefill (cache_offset > 0)
+        // the stored array is sliced to the needed window rather than recomputed.
+        let position_ids = {
+            let stored = self.position_ids.borrow();
+            if let Some(ref stored_pos) = *stored {
+                let pos_shape = mlxcel_core::array_shape(stored_pos);
+                // Sufficient when the stored tensor covers [cache_offset, cache_offset+seq_len)
+                if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
+                    Some(mlxcel_core::slice(
+                        stored_pos,
+                        &[0, 0, cache_offset],
+                        &[pos_shape[0], pos_shape[1], cache_offset + seq_len],
+                    ))
+                } else {
+                    // Stored ids no longer cover this window; fall back to delta-based compute.
+                    self.compute_decode_position_ids(batch, seq_len, cache_offset)
+                }
+            } else {
+                // No stored position_ids; use delta-based compute when rope_deltas is set.
+                self.compute_decode_position_ids(batch, seq_len, cache_offset)
+            }
         };
 
         self.forward_internal(input_ids, input_embeddings, caches, position_ids.as_deref())
@@ -1108,6 +1117,27 @@ impl Qwen35Model {
         *self.rope_deltas.borrow_mut() = Some(rope_deltas);
     }
 
+    /// Compute position_ids for decode steps using rope_deltas.
+    ///
+    /// Returns `Some([3, batch, seq_len])` when `rope_deltas` is set (VLM decode path),
+    /// or `None` for text-only models where fast_rope handles positioning internally.
+    // Used by: forward_with_mrope_state
+    fn compute_decode_position_ids(
+        &self,
+        batch: i32,
+        seq_len: i32,
+        cache_offset: i32,
+    ) -> Option<UniquePtr<MlxArray>> {
+        let delta = *self.rope_deltas.borrow();
+        let delta = delta?;
+        let offset = cache_offset + delta;
+        let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
+        let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
+        let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
+        let pos = mlxcel_core::expand_dims(&pos, 0);
+        Some(mlxcel_core::broadcast_to(&pos, &[3, batch, seq_len]))
+    }
+
     /// Get token embeddings (used by VLM wrapper)
     pub fn get_embed_tokens(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
         self.embed_tokens.forward(input_ids)
@@ -1116,8 +1146,8 @@ impl Qwen35Model {
     /// Forward pass with VLM support
     ///
     /// Position IDs handling (for MRoPE VLM):
-    /// - Prefill (cache_offset == 0, stored position_ids): use stored position_ids, then clear
-    /// - Decode (cache_offset > 0, has rope_deltas): compute sequential position_ids with offset
+    /// - Prefill / chunked-prefill (stored position_ids cover this chunk): slice cached ids
+    /// - Decode (cache_offset + seq_len beyond stored range, has rope_deltas): compute with offset
     /// - Text-only (no rope_deltas): position_ids = None, uses fast_rope
     pub fn forward_impl(
         &self,

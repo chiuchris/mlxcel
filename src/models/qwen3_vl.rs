@@ -702,19 +702,19 @@ impl Qwen3VLModel {
         let position_ids = {
             let stored = self.position_ids.borrow();
             if let Some(ref stored_pos) = *stored {
-                if cache_offset == 0 {
-                    mlxcel_core::copy(stored_pos)
+                // Sufficiency check: reuse cached entry when it covers the needed range,
+                // including during chunked prefill where cache_offset > 0.
+                // This matches upstream mlx-vlm PR #1048 (commit 1bf7742) which relaxed
+                // the equality guard to shape[-1] >= cache_offset + seq_length.
+                let pos_shape = mlxcel_core::array_shape(stored_pos);
+                if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
+                    mlxcel_core::slice(
+                        stored_pos,
+                        &[0, 0, cache_offset],
+                        &[pos_shape[0], pos_shape[1], cache_offset + seq_len],
+                    )
                 } else {
-                    let pos_shape = mlxcel_core::array_shape(stored_pos);
-                    if pos_shape.len() == 3 && cache_offset < pos_shape[2] {
-                        mlxcel_core::slice(
-                            stored_pos,
-                            &[0, 0, cache_offset],
-                            &[pos_shape[0], pos_shape[1], cache_offset + seq_len],
-                        )
-                    } else {
-                        self.compute_decode_position_ids(batch, seq_len, cache_offset)
-                    }
+                    self.compute_decode_position_ids(batch, seq_len, cache_offset)
                 }
             } else if cache_offset > 0 {
                 self.compute_decode_position_ids(batch, seq_len, cache_offset)

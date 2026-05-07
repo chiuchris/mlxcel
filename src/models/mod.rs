@@ -320,3 +320,7 @@ mod llama4_helpers_tests;
 #[cfg(test)]
 #[path = "sanitize_tests.rs"]
 mod sanitize_tests;
+
+#[cfg(test)]
+#[path = "qwen_vl_position_tests.rs"]
+mod qwen_vl_position_tests;
