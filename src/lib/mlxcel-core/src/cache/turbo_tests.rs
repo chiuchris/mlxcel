@@ -1950,6 +1950,55 @@ fn delegated_fp16_fast_path_predecode_compaction_folds_prefill_once() {
     assert_eq!(cache_fast.hot_offset(), 1);
 }
 
+/// The compressed packed-V path should also move the initial full prefill fold
+/// into the prefill->decode handoff. Unlike the FP16 fast path, this is not a
+/// sidecar-only operation: the FP16 hot V body is consumed and cold V remains
+/// only in packed storage before the first single-token decode update.
+#[test]
+fn delegated_compressed_predecode_compaction_folds_prefill_once() {
+    let head_dim = 64;
+    let prefill_len = 16;
+
+    let mut cache = build_delegated_cache_with_small_threshold(32);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 37);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 38);
+    let _ = cache.update_and_fetch(k_pre, v_pre);
+
+    assert_eq!(
+        cache.cold_offset(),
+        0,
+        "prefill alone must not fold compressed delegated V"
+    );
+    assert_eq!(cache.hot_offset(), prefill_len);
+    assert!(
+        cache.prepare_turbo4_delegated_for_decode(),
+        "pre-decode handoff must fold the prefill hot V body"
+    );
+    assert_eq!(cache.cold_offset(), prefill_len);
+    assert_eq!(cache.hot_offset(), 0);
+    assert!(
+        cache.v_packed.is_some() && cache.v_norms.is_some() && cache.v_rescale.is_some(),
+        "compressed handoff must materialize packed V sidecars"
+    );
+    assert!(
+        !cache.prepare_turbo4_delegated_for_decode(),
+        "handoff fold must be idempotent once cold V is populated"
+    );
+
+    let k = synth_kv_tensor(1, 1, 1, head_dim, 9000);
+    let v = synth_kv_tensor(1, 1, 1, head_dim, 10000);
+    let (_k_full, v_full) = cache.update_and_fetch(k, v);
+    assert_eq!(cache.cold_offset(), prefill_len);
+    assert_eq!(cache.hot_offset(), 1);
+    assert_eq!(cache.seq_len(), prefill_len + 1);
+    assert_eq!(
+        ffi::array_shape(&v_full)[2],
+        prefill_len + 1,
+        "fetch after predecode fold must expose cold packed V plus the new hot token"
+    );
+}
+
 #[test]
 fn delegated_fp16_sidecar_policy_parses_values() {
     assert_eq!(

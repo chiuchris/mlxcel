@@ -500,6 +500,41 @@ impl KVCache {
         self.compact_turbo4_delegated_fp16_sidecars()
     }
 
+    /// Prepare Turbo4Delegated cache state before the first decode forward.
+    ///
+    /// In the compressed packed-V path this moves the initial prefill body
+    /// fold out of the first single-token decode `update()`: V is quantized
+    /// into cold packed sidecars immediately after prefill, the FP16 hot ring
+    /// is reset empty, and the first decode step only appends its new token.
+    /// Cold V therefore remains compressed for attention; the one-time fold
+    /// is simply charged to the prefill->decode handoff instead of decode.
+    ///
+    /// In the opt-in FP16 working-set path, this preserves the existing
+    /// sidecar-policy behavior: `predecode` folds packed sidecars here while
+    /// `lazy` skips foreground compaction.
+    ///
+    /// Returns `true` only when a fold was performed.
+    ///
+    /// Used by: generator prefill->decode handoff paths and server batch
+    /// scheduler `finish_prefill`.
+    pub fn prepare_turbo4_delegated_for_decode(&mut self) -> bool {
+        if self.mode != KVCacheMode::Turbo4Delegated {
+            return false;
+        }
+        if self.delegated_fp16_fast_path {
+            return self.compact_turbo4_delegated_fp16_sidecars_for_decode();
+        }
+        if self.cold_offset == 0
+            && self.offset > 0
+            && self.values.is_some()
+            && self.keys.is_some()
+        {
+            self.fold_hot_to_cold_full();
+            return true;
+        }
+        false
+    }
+
     /// Check if cache is empty
     pub fn is_empty(&self) -> bool {
         // Symmetric Turbo4 has no `keys` buffer (K is packed into
