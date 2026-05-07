@@ -990,11 +990,22 @@ impl Qwen35Model {
         // Issue #540: the MRoPE entry is resolved per `SequenceId` so a row
         // that just finished a VL prefill cannot poison a subsequent
         // text-only sequence's decode delta.
+        //
+        // Issue #541 (upstream mlx-vlm PR #1040, commit 58e2435): also validate
+        // pos_shape[1] == batch before reusing, matching the upstream Python check:
+        //   self._position_ids.shape[1] == batch_size
+        //   and self._position_ids.shape[-1] >= cache_offset + seq_length
+        // Without this, a sequential request with a different batch_size would
+        // silently reuse stale position IDs and crash on broadcast_shapes.
         let position_ids = self.mrope_state.with_entry(seq_id, |entry| {
             if let Some(ref stored_pos) = entry.position_ids {
                 let pos_shape = mlxcel_core::array_shape(stored_pos);
                 // Sufficient when the stored tensor covers [cache_offset, cache_offset+seq_len)
-                if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
+                // and has the same batch dimension as the current request.
+                if pos_shape.len() == 3
+                    && pos_shape[1] == batch
+                    && pos_shape[2] >= cache_offset + seq_len
+                {
                     return Some(mlxcel_core::slice(
                         stored_pos,
                         &[0, 0, cache_offset],

@@ -644,8 +644,15 @@ impl Qwen2VLModel {
                 // including during chunked prefill where cache_offset > 0.
                 // This matches upstream mlx-vlm PR #1048 (commit 1bf7742) which relaxed
                 // the equality guard to shape[-1] >= cache_offset + seq_length.
+                //
+                // Issue #541 (upstream mlx-vlm PR #1040, commit 58e2435): also validate
+                // pos_shape[1] == batch so sequential requests with different batch_sizes
+                // do not reuse stale position IDs and crash on broadcast_shapes.
                 let pos_shape = mlxcel_core::array_shape(stored_pos);
-                if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
+                if pos_shape.len() == 3
+                    && pos_shape[1] == batch
+                    && pos_shape[2] >= cache_offset + seq_len
+                {
                     return mlxcel_core::slice(
                         stored_pos,
                         &[0, 0, cache_offset],

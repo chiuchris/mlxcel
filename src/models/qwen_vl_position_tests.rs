@@ -12,31 +12,49 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Regression tests for chunked-prefill MRoPE position-IDs shape check (issue #539).
+//! Regression tests for chunked-prefill MRoPE position-IDs shape check (issues #539, #541).
 //!
-//! These tests verify that the sufficiency check (`shape[-1] >= cache_offset + seq_len`)
-//! correctly replaces the old strict-equality guard, allowing cached position_ids to be
-//! reused across chunked-prefill passes without panicking on shape mismatch.
+//! These tests verify:
+//! - Issue #539: the sufficiency check (`shape[-1] >= cache_offset + seq_len`) correctly
+//!   replaces the old strict-equality guard, allowing cached position_ids to be reused
+//!   across chunked-prefill passes without panicking on shape mismatch.
+//! - Issue #541: the batch-size check (`shape[1] == batch_size`) is validated alongside
+//!   the seq-length check, so sequential requests with different batch_sizes do not reuse
+//!   stale position IDs and crash on broadcast_shapes.
+
+/// Helper: build a synthetic [3, batch, total_len] position_ids tensor holding values 0..total_len.
+fn make_position_ids_with_batch(
+    batch: i32,
+    total_len: i32,
+) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+    let pos = mlxcel_core::arange_i32(0, total_len, 1);
+    let pos = mlxcel_core::reshape(&pos, &[1, total_len]);
+    let pos = mlxcel_core::broadcast_to(&pos, &[1, batch, total_len]);
+    mlxcel_core::broadcast_to(&pos, &[3, batch, total_len])
+}
 
 /// Helper: build a synthetic [3, 1, total_len] position_ids tensor holding values 0..total_len.
 fn make_position_ids(total_len: i32) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
-    let pos = mlxcel_core::arange_i32(0, total_len, 1);
-    let pos = mlxcel_core::reshape(&pos, &[1, total_len]);
-    let pos = mlxcel_core::broadcast_to(&pos, &[1, 1, total_len]);
-    mlxcel_core::broadcast_to(&pos, &[3, 1, total_len])
+    make_position_ids_with_batch(1, total_len)
 }
 
 /// Emulates the shape-check and slice logic from all Qwen VL text-model
-/// `forward_with_mrope_state` / `forward_impl` functions after issue #539 fix.
+/// `forward_with_mrope_state` / `forward_impl` functions after issues #539 and #541.
 ///
-/// Returns `Some(sliced_ids)` when the cached tensor is sufficient, `None` otherwise.
+/// Returns `Some(sliced_ids)` when the cached tensor is sufficient (matching both batch
+/// dimension and seq-length range), `None` otherwise.
 fn try_reuse_position_ids(
     stored_pos: &mlxcel_core::MlxArray,
+    batch: i32,
     cache_offset: i32,
     seq_len: i32,
 ) -> Option<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>> {
     let pos_shape = mlxcel_core::array_shape(stored_pos);
-    if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
+    // Issue #541: validate batch dimension (pos_shape[1]) in addition to seq-length
+    // sufficiency (pos_shape[2] >= cache_offset + seq_len), matching upstream Python:
+    //   self._position_ids.shape[1] == batch_size
+    //   and self._position_ids.shape[-1] >= cache_offset + seq_length
+    if pos_shape.len() == 3 && pos_shape[1] == batch && pos_shape[2] >= cache_offset + seq_len {
         Some(mlxcel_core::slice(
             stored_pos,
             &[0, 0, cache_offset],
@@ -52,9 +70,9 @@ fn try_reuse_position_ids(
 #[test]
 #[ignore = "requires serial MLX execution"]
 fn sufficiency_check_accepts_exact_boundary() {
-    // total_len = 20, chunk [0, 20) → cache_offset=0, seq_len=20
+    // total_len = 20, chunk [0, 20) → cache_offset=0, seq_len=20, batch=1
     let stored = make_position_ids(20);
-    let result = try_reuse_position_ids(&stored, 0, 20);
+    let result = try_reuse_position_ids(&stored, 1, 0, 20);
     assert!(
         result.is_some(),
         "Should reuse when shape[-1] == cache_offset + seq_len (exact boundary)"
@@ -77,9 +95,9 @@ fn sufficiency_check_accepts_exact_boundary() {
 #[ignore = "requires serial MLX execution"]
 fn sufficiency_check_accepts_chunked_prefill_with_nonzero_cache_offset() {
     // Simulate: full prefill position_ids = [3, 1, 20], sent in two 10-token chunks.
-    // Second chunk: cache_offset=10, seq_len=10
+    // Second chunk: cache_offset=10, seq_len=10, batch=1
     let stored = make_position_ids(20);
-    let result = try_reuse_position_ids(&stored, 10, 10);
+    let result = try_reuse_position_ids(&stored, 1, 10, 10);
     assert!(
         result.is_some(),
         "Should reuse when shape[-1]=20 >= cache_offset(10) + seq_len(10)=20"
@@ -106,7 +124,7 @@ fn chunked_prefill_slice_contains_correct_position_values() {
     let stored = make_position_ids(20);
 
     for (cache_offset, seq_len) in [(0i32, 8i32), (8, 8), (16, 4)] {
-        let result = try_reuse_position_ids(&stored, cache_offset, seq_len);
+        let result = try_reuse_position_ids(&stored, 1, cache_offset, seq_len);
         assert!(
             result.is_some(),
             "Should reuse chunk cache_offset={cache_offset} seq_len={seq_len}"
@@ -145,7 +163,7 @@ fn chunked_prefill_slice_contains_correct_position_values() {
 fn sufficiency_check_rejects_when_cached_ids_exhausted() {
     // Stored covers [0, 20). During decode at cache_offset=50, seq_len=1: not sufficient.
     let stored = make_position_ids(20);
-    let result = try_reuse_position_ids(&stored, 50, 1);
+    let result = try_reuse_position_ids(&stored, 1, 50, 1);
     assert!(
         result.is_none(),
         "Should NOT reuse when shape[-1]=20 < cache_offset(50) + seq_len(1)=51"
@@ -175,10 +193,87 @@ fn old_strict_equality_guard_would_reject_second_chunk() {
 
     // New (fixed) condition: `pos_shape[2] >= cache_offset + seq_len`
     let pos_shape = mlxcel_core::array_shape(&stored);
-    let new_guard_passes = pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len;
+    let new_guard_passes =
+        pos_shape.len() == 3 && pos_shape[1] == 1 && pos_shape[2] >= cache_offset + seq_len;
     assert!(
         new_guard_passes,
         "New sufficiency guard must accept cache_offset={cache_offset} seq_len={seq_len} shape[-1]={}",
         pos_shape[2]
+    );
+}
+
+/// Verify that a cached [3, 1, 8] position_ids tensor is REJECTED when the next request
+/// has batch_size=2 (issue #541 regression guard).
+///
+/// This covers the upstream mlx-vlm PR #1040 fix: sequential requests with different
+/// batch_sizes must not reuse stale position IDs, which would produce wrong RoPE
+/// cos/sin tensors and crash on broadcast_shapes.
+#[test]
+#[ignore = "requires serial MLX execution"]
+fn batch_size_mismatch_rejects_cached_position_ids() {
+    // Request 1: batch_size=1, prompt_len=8 → caches [3, 1, 8] position_ids.
+    let stored = make_position_ids_with_batch(1, 8);
+
+    // Request 2: batch_size=2, seq_len=4, cache_offset=0 → must NOT reuse the [3, 1, 8] cache.
+    let result = try_reuse_position_ids(&stored, 2, 0, 4);
+    assert!(
+        result.is_none(),
+        "Should NOT reuse cached [3, 1, 8] position_ids for batch_size=2 request (shape[1]=1 != 2)"
+    );
+}
+
+/// Verify that the batch-size check does NOT break the common single-batch path:
+/// a [3, 1, 8] cache is still accepted for a subsequent single-batch request that
+/// fits within the seq-length range.
+#[test]
+#[ignore = "requires serial MLX execution"]
+fn same_batch_size_still_accepted_with_sufficient_seq_len() {
+    // Request 1: batch_size=1, prompt_len=8 → caches [3, 1, 8] position_ids.
+    let stored = make_position_ids_with_batch(1, 8);
+
+    // Request 2: batch_size=1, seq_len=4, cache_offset=0 → must reuse (seq sufficient).
+    let result = try_reuse_position_ids(&stored, 1, 0, 4);
+    assert!(
+        result.is_some(),
+        "Should reuse [3, 1, 8] for batch_size=1 seq_len=4 (shape[1]=1 matches, shape[2]=8 >= 4)"
+    );
+    let sliced = result.unwrap();
+    mlxcel_core::eval(&sliced);
+    let shape = mlxcel_core::array_shape(&sliced);
+    assert_eq!(
+        shape,
+        vec![3, 1, 4],
+        "Sliced ids should have shape [3, 1, 4]"
+    );
+}
+
+/// Verify that a [3, 2, 8] batch-2 cache is correctly accepted for a batch-2 request.
+#[test]
+#[ignore = "requires serial MLX execution"]
+fn batch_two_cache_accepted_for_matching_batch_two_request() {
+    // Prefill with batch_size=2, prompt_len=8 → caches [3, 2, 8] position_ids.
+    let stored = make_position_ids_with_batch(2, 8);
+
+    // Next request: same batch_size=2, seq_len=1 (decode step), cache_offset=8.
+    // shape[-1]=8 < cache_offset(8)+seq_len(1)=9 → not sufficient, must recompute.
+    let result_decode = try_reuse_position_ids(&stored, 2, 8, 1);
+    assert!(
+        result_decode.is_none(),
+        "Should NOT reuse [3, 2, 8] when shape[-1]=8 < cache_offset(8)+seq_len(1)=9"
+    );
+
+    // Decode step within the prefill window (cache_offset=4, seq_len=4 → exactly covers).
+    let result_within = try_reuse_position_ids(&stored, 2, 4, 4);
+    assert!(
+        result_within.is_some(),
+        "Should reuse [3, 2, 8] for batch_size=2 cache_offset=4 seq_len=4 (8 >= 4+4)"
+    );
+    let sliced = result_within.unwrap();
+    mlxcel_core::eval(&sliced);
+    let shape = mlxcel_core::array_shape(&sliced);
+    assert_eq!(
+        shape,
+        vec![3, 2, 4],
+        "Sliced ids should have shape [3, 2, 4]"
     );
 }
