@@ -152,6 +152,60 @@ impl LoadedModel {
         Some(qwen_runtime(self.vlm_runtime()?)?.input_embeddings(input_ids, pixel_values, grid_thw))
     }
 
+    /// Bind any pending MRoPE state (the per-row deltas just set by a Qwen
+    /// VL `get_input_embeddings` pass) to a specific server sequence id so
+    /// the cached scalar can no longer leak across requests (issue #540).
+    ///
+    /// This is a no-op for non-Qwen-VL models. The caller passes the id
+    /// the scheduler already allocated for this request — the VLM runtime
+    /// then transfers the fallback slot's MRoPE state into its
+    /// per-`SequenceId` map.
+    pub fn bind_qwen_vl_mrope_state_to_sequence(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        if let Some(runtime) = self.vlm_runtime()
+            && let Some(qwen) = qwen_runtime(runtime)
+        {
+            qwen.bind_mrope_state_to_sequence(seq_id);
+        }
+    }
+
+    /// Take the per-sequence MRoPE entry under `seq_id` out of the
+    /// underlying Qwen VL text model. Used by the server preemption
+    /// path so the entry survives the eviction (which releases the old
+    /// sequence id) and can be reinstalled under the freshly allocated
+    /// id (issue #540 follow-up).
+    ///
+    /// Returns an empty snapshot for non-Qwen-VL models or when no
+    /// entry exists for `seq_id`.
+    pub fn take_qwen_vl_mrope_entry(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+    ) -> qwen_vl::QwenVlMRopeSnapshot {
+        if let Some(runtime) = self.vlm_runtime()
+            && let Some(qwen) = qwen_runtime(runtime)
+        {
+            return qwen.take_mrope_entry_for_sequence(seq_id);
+        }
+        qwen_vl::QwenVlMRopeSnapshot(None)
+    }
+
+    /// Re-install a previously taken Qwen VL MRoPE entry under
+    /// `seq_id`. No-op for non-Qwen-VL models or when the snapshot is
+    /// empty.
+    pub fn install_qwen_vl_mrope_entry(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        snapshot: qwen_vl::QwenVlMRopeSnapshot,
+    ) {
+        if snapshot.is_empty() {
+            return;
+        }
+        if let Some(runtime) = self.vlm_runtime()
+            && let Some(qwen) = qwen_runtime(runtime)
+        {
+            qwen.install_mrope_entry_for_sequence(seq_id, snapshot);
+        }
+    }
+
     pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
         image_token_block_info_from_runtime(self.vlm_runtime()?)
     }

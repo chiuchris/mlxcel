@@ -19,6 +19,8 @@
 
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
+use mlxcel_core::cache::SequenceId;
+use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -187,6 +189,93 @@ impl LanguageModel for Qwen35VLModel {
     ) -> UniquePtr<MlxArray> {
         self.text_model
             .forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        // Issue #540: forward through the underlying Qwen3.5 model's
+        // seq-id-aware path so the per-sequence MRoPE entry resolves
+        // for this specific request.
+        mlxcel_core::generate::LanguageModel::forward_with_sequence_id(
+            &self.text_model,
+            input_ids,
+            seq_id,
+            caches,
+            mask,
+        )
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        mlxcel_core::generate::LanguageModel::forward_with_embeddings_and_sequence_id(
+            &self.text_model,
+            input_ids,
+            input_embeddings,
+            seq_id,
+            caches,
+            mask,
+        )
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        mlxcel_core::generate::LanguageModel::release_sequence_state_by_id(
+            &self.text_model,
+            seq_id,
+        );
+    }
+
+    /// Issue #540: forward `seq_ids` to the underlying Qwen3.5 model so
+    /// each row's MRoPE state resolves correctly in mixed VL+text
+    /// batches. `Qwen35Model::forward_batched_with_context_and_ids`
+    /// already implements per-row dispatch and the batched-prefill fast
+    /// path, so we forward straight through.
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        mlxcel_core::generate::LanguageModel::forward_batched_with_context_and_ids(
+            &self.text_model,
+            input_ids,
+            seq_ids,
+            batch_caches,
+            mask,
+            context,
+        )
+    }
+
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        mlxcel_core::generate::LanguageModel::prepare_sequence_state(&self.text_model, seq_id);
+    }
+
+    fn sequence_state_layout(&self) -> mlxcel_core::cache::SequenceStateLayout {
+        mlxcel_core::generate::LanguageModel::sequence_state_layout(&self.text_model)
+    }
+
+    fn supports_batching(&self) -> bool {
+        mlxcel_core::generate::LanguageModel::supports_batching(&self.text_model)
+    }
+
+    fn supports_batched_prefill(&self) -> bool {
+        mlxcel_core::generate::LanguageModel::supports_batched_prefill(&self.text_model)
+    }
+
+    fn supports_paged_decode_backend(&self) -> bool {
+        mlxcel_core::generate::LanguageModel::supports_paged_decode_backend(&self.text_model)
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {

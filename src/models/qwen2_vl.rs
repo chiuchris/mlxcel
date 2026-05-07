@@ -20,11 +20,12 @@
 //! Used by: Qwen2-VL
 //! Reference: references/mlx-vlm/mlx_vlm/models/qwen2_vl/language.py
 
+use crate::models::qwen_mrope_state::MRopeState;
+use mlxcel_core::cache::SequenceId;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
-use std::cell::RefCell;
 
 // Config.
 #[derive(Debug, Clone, Deserialize)]
@@ -503,9 +504,10 @@ pub struct Qwen2VLModel {
     norm: RMSNorm,
     lm_head: UnifiedLinear,
     _config: Qwen2VLConfig,
-    /// Cached MRoPE state across prefill/decode
-    rope_deltas: RefCell<Option<i32>>,
-    position_ids: RefCell<Option<UniquePtr<MlxArray>>>,
+    /// Per-sequence MRoPE state (issue #540 / mlx-vlm PR #1095). Each row
+    /// in a server batch needs its own delta — the legacy fallback slot
+    /// preserves CLI/single-row behavior when no `SequenceId` is plumbed.
+    mrope_state: MRopeState,
 }
 
 impl Qwen2VLModel {
@@ -538,21 +540,68 @@ impl Qwen2VLModel {
             norm,
             lm_head,
             _config: config.clone(),
-            rope_deltas: RefCell::new(None),
-            position_ids: RefCell::new(None),
+            mrope_state: MRopeState::new(),
         })
     }
 
-    /// Set MRoPE state after vision processing
+    /// Set MRoPE state for the legacy/non-server caller. Used by the CLI
+    /// generate path and by the vision wrapper when a `SequenceId` is not
+    /// (yet) available.
     pub fn set_mrope_state(&self, position_ids: UniquePtr<MlxArray>, rope_deltas: i32) {
-        *self.position_ids.borrow_mut() = Some(position_ids);
-        *self.rope_deltas.borrow_mut() = Some(rope_deltas);
+        self.mrope_state.set_fallback(position_ids, rope_deltas);
     }
 
-    /// Clear MRoPE state (for new image/video)
+    /// Set MRoPE state for a specific server-side sequence so the cached
+    /// per-sequence delta no longer leaks across requests (issue #540).
+    pub fn set_mrope_state_for_sequence(
+        &self,
+        seq_id: SequenceId,
+        position_ids: UniquePtr<MlxArray>,
+        rope_deltas: i32,
+    ) {
+        self.mrope_state
+            .set_for_sequence(seq_id, position_ids, rope_deltas);
+    }
+
+    /// Clear the legacy/fallback MRoPE state (for new image/video).
     pub fn clear_mrope_state(&self) {
-        *self.position_ids.borrow_mut() = None;
-        *self.rope_deltas.borrow_mut() = None;
+        self.mrope_state.clear_fallback();
+    }
+
+    /// Drop a server sequence's MRoPE entry so the per-sequence map
+    /// does not grow without bound across requests.
+    pub fn release_mrope_sequence(&self, seq_id: SequenceId) {
+        self.mrope_state.release_sequence(seq_id);
+    }
+
+    /// Move whatever the fallback slot holds into the per-sequence map
+    /// under `seq_id`. Called by the scheduler right after the vision
+    /// wrapper's `get_input_embeddings` has populated the fallback slot,
+    /// so subsequent decode steps for this sequence resolve the MRoPE
+    /// state by id instead of by leaky scalar (issue #540).
+    pub fn bind_mrope_state_to_sequence(&self, seq_id: SequenceId) {
+        self.mrope_state.bind_fallback_to_sequence(seq_id);
+    }
+
+    /// Remove and return the per-sequence MRoPE entry under `seq_id`
+    /// without dropping the contained position-id tensor. Used by the
+    /// server preemption path so the entry can survive an evict-and-
+    /// reallocate cycle (issue #540 follow-up).
+    pub(crate) fn take_mrope_entry(
+        &self,
+        seq_id: SequenceId,
+    ) -> Option<crate::models::qwen_mrope_state::MRopeEntry> {
+        self.mrope_state.take_for_sequence(seq_id)
+    }
+
+    /// Re-install a previously taken MRoPE entry under a (possibly new)
+    /// `seq_id`. Used to rebind state across preemption.
+    pub(crate) fn install_mrope_entry(
+        &self,
+        seq_id: SequenceId,
+        entry: crate::models::qwen_mrope_state::MRopeEntry,
+    ) {
+        self.mrope_state.bind_for_sequence(seq_id, entry);
     }
 
     /// Forward pass
@@ -562,6 +611,19 @@ impl Qwen2VLModel {
         input_embeddings: Option<&MlxArray>,
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_for_sequence(input_ids, input_embeddings, caches, mask, None)
+    }
+
+    /// Internal forward path that takes an optional `SequenceId` so the
+    /// cached MRoPE state is resolved per row.
+    pub(crate) fn forward_for_sequence(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
     ) -> UniquePtr<MlxArray> {
         let mut h = if let Some(embeds) = input_embeddings {
             mlxcel_core::copy(embeds)
@@ -574,10 +636,9 @@ impl Qwen2VLModel {
         let seq_len = ids_shape[1];
         let cache_offset = caches[0].offset;
 
-        // Compute position_ids
-        let position_ids = {
-            let stored = self.position_ids.borrow();
-            if let Some(ref stored_pos) = *stored {
+        // Compute position_ids using this sequence's MRoPE entry.
+        let position_ids = self.mrope_state.with_entry(seq_id, |entry| {
+            if let Some(ref stored_pos) = entry.position_ids {
                 // Use stored position_ids (from prefill with images).
                 // Sufficiency check: reuse cached entry when it covers the needed range,
                 // including during chunked prefill where cache_offset > 0.
@@ -585,27 +646,37 @@ impl Qwen2VLModel {
                 // the equality guard to shape[-1] >= cache_offset + seq_length.
                 let pos_shape = mlxcel_core::array_shape(stored_pos);
                 if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
-                    mlxcel_core::slice(
+                    return mlxcel_core::slice(
                         stored_pos,
                         &[0, 0, cache_offset],
                         &[pos_shape[0], pos_shape[1], cache_offset + seq_len],
-                    )
-                } else {
-                    // Fall back to delta-based position computation
-                    self.compute_decode_position_ids(batch, seq_len, cache_offset)
+                    );
                 }
+                // Fall back to delta-based position computation
+                Self::compute_position_ids_with_delta(
+                    entry.rope_deltas.unwrap_or(0),
+                    batch,
+                    seq_len,
+                    cache_offset,
+                )
             } else if cache_offset > 0 {
-                // Decode without stored positions (text-only after first forward)
-                self.compute_decode_position_ids(batch, seq_len, cache_offset)
+                // Decode without stored positions: use this sequence's
+                // delta if any, otherwise zero (text-only).
+                Self::compute_position_ids_with_delta(
+                    entry.rope_deltas.unwrap_or(0),
+                    batch,
+                    seq_len,
+                    cache_offset,
+                )
             } else {
-                // Text-only prefill: standard sequential positions
+                // Text-only prefill: standard sequential positions.
                 let pos = mlxcel_core::arange_i32(0, seq_len, 1);
                 let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
                 let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
                 let pos = mlxcel_core::expand_dims(&pos, 0);
                 mlxcel_core::broadcast_to(&pos, &[3, batch, seq_len])
             }
-        };
+        });
 
         // Create causal mask if needed
         let auto_mask;
@@ -624,16 +695,15 @@ impl Qwen2VLModel {
         self.lm_head.forward(&h)
     }
 
-    /// Compute position_ids for decode steps using rope_deltas
-    fn compute_decode_position_ids(
-        &self,
+    /// Compute `[3, batch, seq_len]` position ids by adding `delta` to a
+    /// sequential range starting at `cache_offset`.
+    fn compute_position_ids_with_delta(
+        delta: i32,
         batch: i32,
         seq_len: i32,
         cache_offset: i32,
     ) -> UniquePtr<MlxArray> {
-        let delta = self.rope_deltas.borrow().unwrap_or(0);
         let offset = cache_offset + delta;
-
         let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
         let pos = mlxcel_core::reshape(&pos, &[1, seq_len]);
         let pos = mlxcel_core::broadcast_to(&pos, &[batch, seq_len]);
@@ -669,6 +739,31 @@ impl mlxcel_core::generate::LanguageModel for Qwen2VLModel {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         self.forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_for_sequence(input_ids, None, caches, mask, seq_id)
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_for_sequence(input_ids, input_embeddings, caches, mask, seq_id)
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.release_mrope_sequence(seq_id);
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {

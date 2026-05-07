@@ -18,6 +18,9 @@
 
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
+use crate::multimodal::qwen_vl::forward_batched_with_seq_ids_dispatch;
+use mlxcel_core::cache::SequenceId;
+use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -197,6 +200,59 @@ impl LanguageModel for Qwen2VLModel {
     ) -> UniquePtr<MlxArray> {
         self.text_model
             .forward_impl(input_ids, input_embeddings, caches, mask)
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        // Issue #540: route through the per-sequence MRoPE path so the
+        // cached scalar delta cannot leak across requests.
+        self.text_model
+            .forward_for_sequence(input_ids, None, caches, mask, seq_id)
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_for_sequence(input_ids, input_embeddings, caches, mask, seq_id)
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.text_model.release_mrope_sequence(seq_id);
+    }
+
+    /// Issue #540: per-row batched dispatch with seq_ids so each row's
+    /// MRoPE state resolves correctly in mixed VL+text batches. The
+    /// trait default discards `seq_ids` and falls through to
+    /// `forward_batched`, which loops calling `forward()` without ids;
+    /// that path silently produces wrong attention positions for VL
+    /// rows in a batch.
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        forward_batched_with_seq_ids_dispatch(
+            &self.text_model,
+            input_ids,
+            seq_ids,
+            batch_caches,
+            mask,
+            context,
+        )
     }
 
     fn embed_tokens(&self, input_ids: &MlxArray) -> Option<UniquePtr<MlxArray>> {

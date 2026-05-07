@@ -1019,6 +1019,18 @@ impl BatchScheduler {
             }
         };
 
+        // Issue #540 / mlx-vlm PR #1095: per-sequence MRoPE alignment.
+        //
+        // The Qwen VL families compute the MRoPE position-id tensor and
+        // `rope_deltas` scalar inside `prepare_request_vlm_embeddings`
+        // (it runs the vision encoder and writes the result to the text
+        // model's fallback slot). Without binding that state to *this*
+        // sequence id, the next text-only request's decode step would
+        // pick up the previous VL row's delta and produce wrong
+        // attention positions. Bind unconditionally for Qwen VL models;
+        // the call is a no-op for everything else.
+        self.model.bind_qwen_vl_mrope_state_to_sequence(seq_id);
+
         let decode_state = StreamingDecodeState::new(&self.tokenizer, &prompt_tokens);
 
         // Issue #409: resolve the effective thinking-token budget for this
@@ -1989,6 +2001,18 @@ impl BatchScheduler {
                 victim.generated_tokens.len()
             );
 
+            // Issue #540 follow-up: when the victim is a VL request the
+            // text model holds a per-sequence MRoPE entry under the old
+            // seq id. `release_sequence_caches` below would drop it, but
+            // `prepare_request_vlm_embeddings` does NOT re-run on
+            // re-prefill so the entry would never be rebuilt under the
+            // new id. Take the entry out *before* the release so we can
+            // rebind it under the freshly allocated id below.
+            //
+            // For non-Qwen-VL models / text-only requests this returns
+            // an empty snapshot and the rebind is a no-op.
+            let mrope_snapshot = self.model.take_qwen_vl_mrope_entry(victim.seq_id);
+
             // Release its KV cache
             self.release_sequence_caches(victim.seq_id);
 
@@ -2011,6 +2035,12 @@ impl BatchScheduler {
             match self.allocate_sequence_state() {
                 Ok(new_id) => {
                     victim.seq_id = new_id;
+                    // Re-install the previously-saved MRoPE entry under
+                    // the new seq id so re-prefill resolves the same
+                    // per-row delta the original prefill computed
+                    // (issue #540 follow-up).
+                    self.model
+                        .install_qwen_vl_mrope_entry(new_id, mrope_snapshot);
                     if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
                         tracing::error!("Eviction state transition error: {err}");
                         self.release_sequence_caches(new_id);
@@ -2025,6 +2055,10 @@ impl BatchScheduler {
                     let _ = victim.response_tx.send(GenerateEvent::Error(format!(
                         "Preemption re-queue failed: {err}"
                     )));
+                    // The MRoPE snapshot is dropped here; the request is
+                    // about to error out so the entry has no further
+                    // consumer.
+                    drop(mrope_snapshot);
                     return true; // Slot is still freed
                 }
             }

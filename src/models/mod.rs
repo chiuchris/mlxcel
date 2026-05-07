@@ -20,6 +20,7 @@ mod detection;
 mod gemma3n_helpers;
 mod llama4_helpers;
 mod model_owned;
+pub(crate) mod qwen_mrope_state;
 mod sanitize;
 
 // Shared modules

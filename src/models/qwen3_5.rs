@@ -30,6 +30,7 @@ use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
 use crate::models::gated_delta::{GatedDeltaCache, RMSNormGated, gated_delta_update};
 use crate::models::model_owned::ModelOwnedSequenceState;
+use crate::models::qwen_mrope_state::MRopeState;
 use crate::models::qwen3_next::{
     MLP, Quantization, Qwen3NextAttention, Qwen3NextCache, Qwen3NextConfig, SparseMoeBlock,
 };
@@ -41,7 +42,6 @@ use mlxcel_core::utils::{create_causal_mask, silu, stack_arrays};
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr, concatenate};
 use serde::Deserialize;
-use std::cell::RefCell;
 use std::path::Path;
 
 // Configuration.
@@ -793,10 +793,10 @@ pub struct Qwen35Model {
     pub(crate) config: Qwen35Config,
     /// Internal and per-sequence mixed cache state.
     sequence_state: ModelOwnedSequenceState<Qwen3NextCache>,
-    /// MRoPE position_ids for VLM [3, batch, seq_len]
-    position_ids: RefCell<Option<UniquePtr<MlxArray>>>,
-    /// Rope deltas for token generation after VLM prefill
-    rope_deltas: RefCell<Option<i32>>,
+    /// Per-sequence MRoPE state (issue #540 / mlx-vlm PR #1095). Each row
+    /// in a server batch needs its own delta — the legacy fallback slot
+    /// preserves CLI/single-row behavior when no `SequenceId` is plumbed.
+    mrope_state: MRopeState,
 }
 
 impl Qwen35Model {
@@ -957,7 +957,7 @@ impl Qwen35Model {
             seq_id,
             || self.make_internal_caches(),
             |sequence_caches| {
-                self.forward_with_mrope_state(input_ids, input_embeddings, sequence_caches)
+                self.forward_with_mrope_state(input_ids, input_embeddings, sequence_caches, seq_id)
             },
         )
     }
@@ -967,6 +967,7 @@ impl Qwen35Model {
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
         caches: &mut [Qwen3NextCache],
+        seq_id: Option<SequenceId>,
     ) -> UniquePtr<MlxArray> {
         let cache_offset = caches
             .iter()
@@ -985,26 +986,38 @@ impl Qwen35Model {
         // _position_ids entry is reusable when shape[-1] >= cache_offset + seq_length,
         // not only when cache_offset == 0.  During chunked prefill (cache_offset > 0)
         // the stored array is sliced to the needed window rather than recomputed.
-        let position_ids = {
-            let stored = self.position_ids.borrow();
-            if let Some(ref stored_pos) = *stored {
+        //
+        // Issue #540: the MRoPE entry is resolved per `SequenceId` so a row
+        // that just finished a VL prefill cannot poison a subsequent
+        // text-only sequence's decode delta.
+        let position_ids = self.mrope_state.with_entry(seq_id, |entry| {
+            if let Some(ref stored_pos) = entry.position_ids {
                 let pos_shape = mlxcel_core::array_shape(stored_pos);
                 // Sufficient when the stored tensor covers [cache_offset, cache_offset+seq_len)
                 if pos_shape.len() == 3 && pos_shape[2] >= cache_offset + seq_len {
-                    Some(mlxcel_core::slice(
+                    return Some(mlxcel_core::slice(
                         stored_pos,
                         &[0, 0, cache_offset],
                         &[pos_shape[0], pos_shape[1], cache_offset + seq_len],
-                    ))
-                } else {
-                    // Stored ids no longer cover this window; fall back to delta-based compute.
-                    self.compute_decode_position_ids(batch, seq_len, cache_offset)
+                    ));
                 }
+                // Stored ids no longer cover this window; fall back to delta-based compute.
+                Self::compute_decode_position_ids_with_delta(
+                    entry.rope_deltas,
+                    batch,
+                    seq_len,
+                    cache_offset,
+                )
             } else {
                 // No stored position_ids; use delta-based compute when rope_deltas is set.
-                self.compute_decode_position_ids(batch, seq_len, cache_offset)
+                Self::compute_decode_position_ids_with_delta(
+                    entry.rope_deltas,
+                    batch,
+                    seq_len,
+                    cache_offset,
+                )
             }
-        };
+        });
 
         self.forward_internal(input_ids, input_embeddings, caches, position_ids.as_deref())
     }
@@ -1106,29 +1119,78 @@ impl Qwen35Model {
             lm_head,
             config: config_clone,
             sequence_state: ModelOwnedSequenceState::new(internal_caches),
-            position_ids: RefCell::new(None),
-            rope_deltas: RefCell::new(None),
+            mrope_state: MRopeState::new(),
         })
     }
 
-    /// Set MRoPE state after vision processing (called by VLM wrapper)
+    /// Set MRoPE state for the legacy/non-server caller. Used by the CLI
+    /// generate path and by the vision wrapper when a `SequenceId` is not
+    /// (yet) available.
     pub fn set_mrope_state(&self, position_ids: UniquePtr<MlxArray>, rope_deltas: i32) {
-        *self.position_ids.borrow_mut() = Some(position_ids);
-        *self.rope_deltas.borrow_mut() = Some(rope_deltas);
+        self.mrope_state.set_fallback(position_ids, rope_deltas);
     }
 
-    /// Compute position_ids for decode steps using rope_deltas.
-    ///
-    /// Returns `Some([3, batch, seq_len])` when `rope_deltas` is set (VLM decode path),
-    /// or `None` for text-only models where fast_rope handles positioning internally.
-    // Used by: forward_with_mrope_state
-    fn compute_decode_position_ids(
+    /// Set MRoPE state for a specific server-side sequence so the cached
+    /// per-sequence delta no longer leaks across requests (issue #540).
+    pub fn set_mrope_state_for_sequence(
         &self,
+        seq_id: SequenceId,
+        position_ids: UniquePtr<MlxArray>,
+        rope_deltas: i32,
+    ) {
+        self.mrope_state
+            .set_for_sequence(seq_id, position_ids, rope_deltas);
+    }
+
+    /// Drop a server sequence's MRoPE entry so the per-sequence map
+    /// does not grow without bound across requests.
+    pub fn release_mrope_sequence(&self, seq_id: SequenceId) {
+        self.mrope_state.release_sequence(seq_id);
+    }
+
+    /// Move whatever the fallback slot holds into the per-sequence map
+    /// under `seq_id`. Called by the scheduler right after the vision
+    /// wrapper's `get_input_embeddings` has populated the fallback slot,
+    /// so subsequent decode steps for this sequence resolve the MRoPE
+    /// state by id instead of by leaky scalar (issue #540).
+    pub fn bind_mrope_state_to_sequence(&self, seq_id: SequenceId) {
+        self.mrope_state.bind_fallback_to_sequence(seq_id);
+    }
+
+    /// Remove and return the per-sequence MRoPE entry under `seq_id`
+    /// without dropping the contained position-id tensor. Used by the
+    /// server preemption path so the entry can survive an evict-and-
+    /// reallocate cycle (issue #540 follow-up).
+    pub(crate) fn take_mrope_entry(
+        &self,
+        seq_id: SequenceId,
+    ) -> Option<crate::models::qwen_mrope_state::MRopeEntry> {
+        self.mrope_state.take_for_sequence(seq_id)
+    }
+
+    /// Re-install a previously taken MRoPE entry under a (possibly new)
+    /// `seq_id`. Used to rebind state across preemption.
+    pub(crate) fn install_mrope_entry(
+        &self,
+        seq_id: SequenceId,
+        entry: crate::models::qwen_mrope_state::MRopeEntry,
+    ) {
+        self.mrope_state.bind_for_sequence(seq_id, entry);
+    }
+
+    /// Compute position_ids for decode steps using a per-row `rope_delta`.
+    ///
+    /// Returns `Some([3, batch, seq_len])` when `delta` is provided (VLM decode
+    /// path), or `None` for text-only models where fast_rope handles positioning
+    /// internally. Issue #540 makes this static so the caller passes the
+    /// per-`SequenceId` delta resolved through `MRopeState::with_entry`.
+    // Used by: forward_with_mrope_state
+    fn compute_decode_position_ids_with_delta(
+        delta: Option<i32>,
         batch: i32,
         seq_len: i32,
         cache_offset: i32,
     ) -> Option<UniquePtr<MlxArray>> {
-        let delta = *self.rope_deltas.borrow();
         let delta = delta?;
         let offset = cache_offset + delta;
         let pos = mlxcel_core::arange_i32(offset, offset + seq_len, 1);
@@ -1686,7 +1748,10 @@ impl LanguageModel for Qwen35Model {
     }
 
     fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
-        self.sequence_state.release_sequence_state(seq_id)
+        self.sequence_state.release_sequence_state(seq_id);
+        // Issue #540: drop the per-sequence MRoPE entry alongside the
+        // cache state so the map cannot grow as sequences cycle through.
+        self.release_mrope_sequence(seq_id);
     }
 
     fn forward_with_sequence_id(
