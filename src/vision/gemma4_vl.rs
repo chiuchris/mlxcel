@@ -20,6 +20,9 @@ use super::feature_cache::{CacheKey, SingleArrayFeatures, VisionFeatureCache};
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
 use crate::audio;
+use crate::multimodal::batched_dispatch::forward_batched_with_seq_ids_dispatch;
+use mlxcel_core::cache::{SequenceId, SequenceStateLayout};
+use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::{KVCache, UnifiedLinear};
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -363,16 +366,54 @@ impl LanguageModel for Gemma4VLModel {
         caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
+        // No `seq_id` plumbed through (legacy CLI / direct VLM call).
+        // Route to the text model's fallback `internal` cache slot.
+        self.forward_with_embeddings_and_sequence_id(
+            input_ids,
+            input_embeddings,
+            None,
+            caches,
+            mask,
+        )
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model
+            .forward_with_sequence_id(input_ids, seq_id, caches, mask)
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
         if let Some(embeds) = input_embeddings {
+            // VLM prefill path. The scheduler runs VLM prefill
+            // sequentially (see `scheduler.rs`: any sequence with
+            // `vlm_embeddings.is_some()` falls back to per-row prefill),
+            // so only one consumer touches `cached_per_layer_inputs` at
+            // a time. The `take()` empties the cell so a stale entry
+            // cannot leak into the next request.
             let per_layer_inputs = self.cached_per_layer_inputs.borrow_mut().take();
-            self.text_model.forward_with_inputs(
+            self.text_model.forward_with_inputs_and_sequence_id(
                 input_ids,
                 Some(embeds),
                 per_layer_inputs.as_ref().and_then(|arr| arr.as_ref()),
                 mask,
+                seq_id,
             )
         } else {
-            self.text_model.forward(input_ids, caches, mask)
+            self.text_model
+                .forward_with_sequence_id(input_ids, seq_id, caches, mask)
         }
     }
 
@@ -380,8 +421,24 @@ impl LanguageModel for Gemma4VLModel {
         Some(self.text_model.input_embeddings(input_ids))
     }
 
+    /// Empty external caches: the text wrapper owns all cache state
+    /// internally and resolves it per `SequenceId`. The matching layout
+    /// descriptor is [`SequenceStateLayout::model_owned`] returned by
+    /// [`Self::sequence_state_layout`].
     fn make_caches(&self) -> Vec<KVCache> {
         self.text_model.make_caches()
+    }
+
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        self.text_model.sequence_state_layout()
+    }
+
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.text_model.prepare_sequence_state(seq_id);
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.text_model.release_sequence_state_by_id(seq_id);
     }
 
     fn num_layers(&self) -> usize {
@@ -396,7 +453,35 @@ impl LanguageModel for Gemma4VLModel {
         false
     }
 
+    /// Issue #542: Gemma 4 supports batched decode now that the inner
+    /// [`crate::models::Gemma4Wrapper`] uses per-`SequenceId` cache
+    /// isolation via `ModelOwnedSequenceState<Cache>`. The
+    /// `forward_batched_with_context_and_ids` override below routes each
+    /// row through `forward_with_sequence_id` so per-sequence cache state
+    /// resolves correctly even with mixed prompt lengths.
     fn supports_batching(&self) -> bool {
-        false
+        true
+    }
+
+    /// Issue #542: per-row batched dispatch with seq_ids so each row of a
+    /// mixed-length batch reaches the text model's seq-aware forward path
+    /// independently. Mirrors the Qwen VL fix in PR #558 and shares the
+    /// same helper (`multimodal::batched_dispatch`).
+    fn forward_batched_with_context_and_ids(
+        &self,
+        input_ids: &MlxArray,
+        seq_ids: Option<&[SequenceId]>,
+        batch_caches: &mut [&mut [KVCache]],
+        mask: Option<&MlxArray>,
+        context: Option<&DecodeBatchContext>,
+    ) -> UniquePtr<MlxArray> {
+        forward_batched_with_seq_ids_dispatch(
+            &self.text_model,
+            input_ids,
+            seq_ids,
+            batch_caches,
+            mask,
+            context,
+        )
     }
 }

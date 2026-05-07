@@ -27,7 +27,9 @@
 use crate::distributed::pipeline::LayerFilter;
 use crate::distributed::pipeline::StageExecutionOutput;
 use crate::distributed::pipeline::partial_loading::filter_weight_map;
+use crate::models::model_owned::ModelOwnedSequenceState;
 use crate::models::switch_layers::{SwitchLinear, gather_sort};
+use mlxcel_core::cache::{SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{
     FusedQKVLinear, KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear,
@@ -39,7 +41,6 @@ use mlxcel_core::utils::{
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::{Deserialize, Serialize};
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -2326,9 +2327,27 @@ impl Gemma4StageModel {
     }
 }
 
+/// Wrapper for [`Gemma4Model`] that implements [`LanguageModel`] with
+/// per-`SequenceId` cache isolation so the server scheduler can run
+/// mixed-length batches correctly (issue #542).
+///
+/// Gemma 4's `Cache` enum (`KVCache | RotatingKVCache`) is a sliding-
+/// window-aware cache that the model owns internally — it cannot be
+/// wired to scheduler-managed `&mut [KVCache]` slices the way standard
+/// transformer text models can. Instead, the wrapper opts into the
+/// `SequenceStateBackend::ModelOwned` layout and stores a per-sequence
+/// `Vec<Cache>` keyed on [`SequenceId`] in [`ModelOwnedSequenceState`].
+/// `forward_with_sequence_id` resolves the right slot per row, and a
+/// fallback `internal` slot preserves the legacy single-row CLI / VLM-
+/// prefill path that does not plumb a `SequenceId`.
+///
+/// This mirrors the approach Gemma 3 (issue analogous, see `gemma3.rs`)
+/// already uses; that family has been running batched decode in
+/// production this way since its own enable-batching change. Gemma 4
+/// inherits the same correctness guarantees here.
 pub struct Gemma4Wrapper {
     model: Gemma4Model,
-    caches: RefCell<Vec<Cache>>,
+    sequence_state: ModelOwnedSequenceState<Cache>,
 }
 
 impl Gemma4Wrapper {
@@ -2336,12 +2355,21 @@ impl Gemma4Wrapper {
         let caches = model.make_caches();
         Self {
             model,
-            caches: RefCell::new(caches),
+            sequence_state: ModelOwnedSequenceState::new(caches),
         }
     }
 
-    fn reset_caches(&self) {
-        *self.caches.borrow_mut() = self.model.make_caches();
+    /// Reset the wrapper's fallback cache slot (the `internal` slot used
+    /// by the CLI / single-row VLM-prefill path) to a fresh, empty set
+    /// of caches. Per-sequence cache slots in
+    /// [`ModelOwnedSequenceState`] are unaffected — those are owned by
+    /// the scheduler and dropped via `release_sequence_state_by_id`.
+    ///
+    /// Used by: legacy CLI generate path (`mlxcel generate`) when starting
+    /// a fresh request that does not flow through the server scheduler.
+    pub fn reset_caches(&self) {
+        self.sequence_state
+            .replace_internal(self.model.make_caches());
     }
 
     pub(crate) fn input_embeddings(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
@@ -2372,20 +2400,35 @@ impl Gemma4Wrapper {
         }
     }
 
-    pub(crate) fn forward_with_inputs(
+    /// VLM-prefill / VLM-step path: forward with optional pre-merged
+    /// input embeddings and per-layer-inputs, routing to the per-
+    /// `SequenceId` cache slot when one is provided (the scheduler
+    /// allocates a `SequenceId` for every server-side VLM request) and
+    /// to the wrapper's fallback `internal` slot when `seq_id` is `None`
+    /// (CLI generate path / single-row tests).
+    ///
+    /// Used by: [`crate::vision::Gemma4VLModel::forward_with_embeddings_and_sequence_id`]
+    /// for VLM prefill and decode.
+    pub(crate) fn forward_with_inputs_and_sequence_id(
         &self,
         input_ids: &MlxArray,
         input_embeddings: Option<&MlxArray>,
         per_layer_inputs: Option<&MlxArray>,
         mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches_and_embeddings(
-            input_ids,
-            input_embeddings,
-            &mut caches,
-            mask,
-            per_layer_inputs,
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_with_caches_and_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    per_layer_inputs,
+                )
+            },
         )
     }
 
@@ -2416,9 +2459,9 @@ impl LanguageModel for Gemma4Wrapper {
         _caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model
-            .forward_with_caches_and_embeddings(input_ids, None, &mut caches, mask, None)
+        // No `seq_id` plumbed through (legacy CLI / single-row tests).
+        // Route to the fallback `internal` slot.
+        self.forward_with_sequence_id(input_ids, None, _caches, mask)
     }
 
     fn forward_with_embeddings(
@@ -2428,13 +2471,57 @@ impl LanguageModel for Gemma4Wrapper {
         _caches: &mut [KVCache],
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
-        let mut caches = self.caches.borrow_mut();
-        self.model.forward_with_caches_and_embeddings(
+        self.forward_with_embeddings_and_sequence_id(
             input_ids,
             input_embeddings,
-            &mut caches,
-            mask,
             None,
+            _caches,
+            mask,
+        )
+    }
+
+    fn forward_with_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_with_caches_and_embeddings(
+                    input_ids,
+                    None,
+                    sequence_caches,
+                    mask,
+                    None,
+                )
+            },
+        )
+    }
+
+    fn forward_with_embeddings_and_sequence_id(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        _caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_with_caches_and_embeddings(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    None,
+                )
+            },
         )
     }
 
@@ -2442,11 +2529,26 @@ impl LanguageModel for Gemma4Wrapper {
         Some(self.input_embeddings(input_ids))
     }
 
+    /// Empty external caches: the wrapper owns all cache state internally
+    /// and resolves it per `SequenceId` via [`ModelOwnedSequenceState`].
+    /// The matching layout descriptor is
+    /// [`SequenceStateLayout::model_owned`] returned by
+    /// [`Self::sequence_state_layout`].
     fn make_caches(&self) -> Vec<KVCache> {
-        self.reset_caches();
-        (0..self.model.text_model.layers.len())
-            .map(|_| KVCache::new())
-            .collect()
+        Vec::new()
+    }
+
+    fn sequence_state_layout(&self) -> SequenceStateLayout {
+        SequenceStateLayout::model_owned(self.model.text_model.layers.len())
+    }
+
+    fn prepare_sequence_state(&self, seq_id: SequenceId) {
+        self.sequence_state
+            .prepare_sequence_state(seq_id, self.model.make_caches());
+    }
+
+    fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        self.sequence_state.release_sequence_state(seq_id);
     }
 
     fn num_layers(&self) -> usize {
@@ -2457,8 +2559,14 @@ impl LanguageModel for Gemma4Wrapper {
         self.model.eos_token_ids.clone()
     }
 
+    /// Issue #542: Gemma 4 supports batched decode now that
+    /// [`ModelOwnedSequenceState`] isolates per-`SequenceId` cache state.
+    /// The vision wrapper's `forward_batched_with_context_and_ids`
+    /// override (in `vision::Gemma4VLModel`) routes each row through
+    /// [`Self::forward_with_sequence_id`] which resolves to a distinct
+    /// per-sequence `Vec<Cache>` — no shared-RefCell leakage across rows.
     fn supports_batching(&self) -> bool {
-        false
+        true
     }
 
     fn supports_padded_prefill(&self) -> bool {

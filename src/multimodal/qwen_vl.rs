@@ -21,10 +21,8 @@
 use crate::models::qwen_mrope_state::MRopeEntry;
 use crate::vision;
 use crate::vision::feature_cache::{CacheKey, ModelVisionCaches};
+use mlxcel_core::MlxArray;
 use mlxcel_core::cache::SequenceId;
-use mlxcel_core::generate::{DecodeBatchContext, LanguageModel};
-use mlxcel_core::layers::KVCache;
-use mlxcel_core::{MlxArray, UniquePtr};
 
 #[derive(Clone, Copy)]
 pub struct QwenVlmPromptInfo<'a> {
@@ -119,64 +117,15 @@ pub trait QwenVlRuntime {
     // straight to its text model's batched-with-ids method.
 }
 
-/// Per-row batched dispatch helper: loops over each row of `input_ids`
-/// and calls `text_model.forward_with_sequence_id` with the
-/// corresponding `seq_ids[i]`. Drives every Qwen VL wrapper whose text
-/// model does not already implement a batched-with-ids fast path.
+/// Per-row batched dispatch helper. Re-exported for backwards
+/// compatibility with the Qwen VL wrappers that imported this symbol
+/// when the helper lived in this module (PR #558). The implementation
+/// now lives in [`super::batched_dispatch`] so Gemma 4 (issue #542) and
+/// the Qwen VL families share a single source of truth — see the
+/// duplication report flagged on PR #560 (M-2).
 ///
-/// When `seq_ids` is `None`, this falls back to the model's default
-/// `forward_batched_with_context` so non-server callers keep their
-/// existing behavior (issue #540).
-///
-/// Used by: Qwen2VLModel, Qwen25VLModel, Qwen3VLModel, Qwen3VLMoeModel
-/// (vision wrappers); not used by Qwen35VLModel which forwards directly
-/// to `Qwen35Model::forward_batched_with_context_and_ids`.
-pub fn forward_batched_with_seq_ids_dispatch<M: LanguageModel + ?Sized>(
-    text_model: &M,
-    input_ids: &MlxArray,
-    seq_ids: Option<&[SequenceId]>,
-    batch_caches: &mut [&mut [KVCache]],
-    mask: Option<&MlxArray>,
-    context: Option<&DecodeBatchContext>,
-) -> UniquePtr<MlxArray> {
-    let Some(seq_ids) = seq_ids else {
-        return text_model.forward_batched_with_context(input_ids, batch_caches, mask, context);
-    };
-
-    let b = batch_caches.len();
-    if b == 0 {
-        return mlxcel_core::zeros(&[0, 1, 1], mlxcel_core::dtype::FLOAT32);
-    }
-
-    let shape = mlxcel_core::array_shape(input_ids);
-    let row_len = if shape.len() >= 2 { shape[1] } else { 1 };
-
-    if b == 1 {
-        return text_model.forward_with_sequence_id(
-            input_ids,
-            seq_ids.first().copied(),
-            batch_caches[0],
-            mask,
-        );
-    }
-
-    // Per-row dispatch: slice input_ids row-by-row and forward each row
-    // with its own seq_id so the per-sequence MRoPE entry resolves.
-    let token_0 = mlxcel_core::slice(input_ids, &[0, 0], &[1, row_len]);
-    let mut result = text_model.forward_with_sequence_id(
-        &token_0,
-        seq_ids.first().copied(),
-        batch_caches[0],
-        None,
-    );
-    for (i, caches) in batch_caches.iter_mut().enumerate().skip(1) {
-        let token_i = mlxcel_core::slice(input_ids, &[i as i32, 0], &[i as i32 + 1, row_len]);
-        let logits_i =
-            text_model.forward_with_sequence_id(&token_i, seq_ids.get(i).copied(), caches, None);
-        result = mlxcel_core::concatenate(&result, &logits_i, 0);
-    }
-    result
-}
+/// Used by: Qwen2VLModel, Qwen25VLModel, Qwen3VLModel, Qwen3VLMoeModel.
+pub use super::batched_dispatch::forward_batched_with_seq_ids_dispatch;
 
 /// Per-row dispatch shared by every Qwen VL wrapper whose text model
 /// uses the default `forward_batched_with_context_and_ids` trait impl

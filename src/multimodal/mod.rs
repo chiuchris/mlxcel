@@ -19,6 +19,10 @@
 //! expansion, and prepared-embedding plumbing reusable across frontends.
 //!
 //! Modules:
+//! - `batched_dispatch`: shared per-row batched dispatch helper used by every
+//!   vision wrapper that needs `forward_batched_with_context_and_ids` to route
+//!   each row through `forward_with_sequence_id` (PR #558 / issue #542).
+//! - `gemma4_vl`: Gemma 4 mixed-length batching helpers (issue #542)
 //! - `phi4mm_prompt`: Phi4MM `<|image_N|>` normalization and audio guard
 //! - `phi4_siglip_prompt`: Phi4-SigLIP `<image>` placeholder handling
 //! - `minicpmo_prompt`: MiniCPM-o image placeholder expansion and bounds
@@ -28,6 +32,8 @@
 //! - `vlm_prompt`: generic image-token block expansion
 //! - `vlm_runtime`: image preprocessing and embedding preparation shared by CLI/server
 
+pub mod batched_dispatch;
+pub mod gemma4_vl;
 pub mod minicpmo_prompt;
 pub mod moondream3_prompt;
 pub mod phi3v_prompt;
