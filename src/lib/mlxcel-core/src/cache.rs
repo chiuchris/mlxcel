@@ -3926,6 +3926,33 @@ impl ChunkedKVCache {
 /// This keeps per-sequence offsets, query lengths, visible KV lengths, and
 /// window sizes in a kernel-friendly representation instead of relying on
 /// scalar `cache.offset` assumptions inside batched model code.
+///
+/// # Invariant
+///
+/// All four `Vec<i32>` fields **must** have the same length, equal to the
+/// active batch size. This holds even when the batch is uniform (e.g. every
+/// sequence has the same offset) — there is no scalar fast-path that
+/// collapses the per-row state to a single value. This invariant exists for
+/// two reasons:
+///
+/// 1. Downstream kernel and graph code (paged decode, fused RoPE, padded
+///    SDPA) indexes per batch row directly. A scalar fallback would break
+///    those callers silently.
+/// 2. It mirrors the upstream `mlx-vlm` PR #1110 fix pattern (issue #544 in
+///    this repo) for `BatchTurboQuantKVCache`. There, an "init-time scalar
+///    fast-path when all `left_padding` entries are equal" caused
+///    `extend()` and `filter()` to crash later when the batch composition
+///    changed mid-decode and the still-scalar `offset` was passed to
+///    `mx.concatenate`. Rust's static typing prevents the literal Python
+///    crash, but the *semantic* hazard — code that assumes uniform batches
+///    and silently degrades when composition changes — is what the
+///    `extend` / `filter` / `assert_consistent` helpers below guard
+///    against.
+///
+/// Use [`assert_consistent`](Self::assert_consistent) at debug time when
+/// constructing instances directly via the public fields to catch any
+/// future regression that re-introduces a uniformity-collapsing
+/// optimization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BatchedAttentionMetadata {
     pub rope_offsets: Vec<i32>,
@@ -3936,6 +3963,10 @@ pub struct BatchedAttentionMetadata {
 
 impl BatchedAttentionMetadata {
     /// Build heterogeneous per-sequence metadata from standard KV caches.
+    ///
+    /// Always emits per-row `Vec<i32>` arrays of length `caches.len()`,
+    /// even when every cache has the same offset. See the struct-level docs
+    /// for the rationale (issue #544 / upstream `mlx-vlm` PR #1110).
     pub fn from_kv_caches(
         caches: &[&mut KVCache],
         query_lens: &[i32],
@@ -3979,6 +4010,14 @@ impl BatchedAttentionMetadata {
     }
 
     /// Build uniform metadata for full-attention batched decode/prefill paths.
+    ///
+    /// Despite the "uniform" name, this still produces full per-row
+    /// `Vec<i32>` arrays of length `caches.len()`. The "uniform" refers
+    /// only to the caller-supplied `query_len` and `window_size` being the
+    /// same for every batch row; per-row offsets are still read from each
+    /// cache. **Do not** add a scalar fast-path here — see the
+    /// [`BatchedAttentionMetadata`] struct-level docs (issue #544) for
+    /// why.
     pub fn uniform_kv_caches(
         caches: &[&mut KVCache],
         query_len: i32,
@@ -3995,6 +4034,125 @@ impl BatchedAttentionMetadata {
 
     pub fn is_empty(&self) -> bool {
         self.rope_offsets.is_empty()
+    }
+
+    /// Verify the invariant that all per-row vectors have the same length.
+    ///
+    /// Returns `Ok(())` when the four `Vec<i32>` fields agree on a single
+    /// batch size, and an error message identifying the mismatched lengths
+    /// otherwise. The struct fields are public for kernel-friendly slice
+    /// access, so any code path that constructs a metadata instance
+    /// directly (rather than going through [`Self::from_kv_caches`] or
+    /// [`Self::uniform_kv_caches`]) should call this method in debug
+    /// builds.
+    ///
+    /// This mirrors the upstream `mlx-vlm` PR #1110 (issue #544) pattern of
+    /// keeping per-row offset state shape-stable across batch grow / shrink
+    /// transitions. See the struct-level docs for the full rationale.
+    ///
+    /// Used by: [`Self::extend`], [`Self::filter_in_place`], and any model
+    /// code that constructs metadata via direct field assignment.
+    pub fn assert_consistent(&self) -> Result<(), String> {
+        let n = self.rope_offsets.len();
+        if self.query_lens.len() != n {
+            return Err(format!(
+                "BatchedAttentionMetadata: query_lens length {} differs from rope_offsets length {n}",
+                self.query_lens.len()
+            ));
+        }
+        if self.kv_lens.len() != n {
+            return Err(format!(
+                "BatchedAttentionMetadata: kv_lens length {} differs from rope_offsets length {n}",
+                self.kv_lens.len()
+            ));
+        }
+        if self.window_sizes.len() != n {
+            return Err(format!(
+                "BatchedAttentionMetadata: window_sizes length {} differs from rope_offsets length {n}",
+                self.window_sizes.len()
+            ));
+        }
+        Ok(())
+    }
+
+    /// Extend the metadata with another batch's per-row state, preserving
+    /// the per-row vector shape.
+    ///
+    /// This is the mlxcel analogue of upstream `mlx-vlm` PR #1110's
+    /// `BatchTurboQuantKVCache.extend()` (issue #544): when the batch
+    /// scheduler grows the active batch by adopting one or more newly
+    /// prefilled sequences, the resulting metadata must remain a per-row
+    /// `Vec<i32>` even when both halves were uniform. The Python upstream
+    /// crash mode — `mx.concatenate([scalar_int, mx_array])` — is
+    /// statically impossible in Rust because the field type is already
+    /// `Vec<i32>`, but this method centralises the merge so callers do not
+    /// reach for ad-hoc `extend_from_slice` calls that could miss one of
+    /// the four parallel vectors.
+    ///
+    /// Used by: future scheduler paths that compose two batches' attention
+    /// metadata before a fused decode call. The current decode path
+    /// rebuilds metadata from scratch on every step via
+    /// [`Self::from_kv_caches`], which already preserves the invariant; this
+    /// helper is provided as a stable seam for upcoming continuous-batching
+    /// fusion work and as a regression target for issue #544.
+    pub fn extend(&mut self, other: &Self) -> Result<(), String> {
+        self.assert_consistent()?;
+        other.assert_consistent()?;
+        self.rope_offsets.extend_from_slice(&other.rope_offsets);
+        self.query_lens.extend_from_slice(&other.query_lens);
+        self.kv_lens.extend_from_slice(&other.kv_lens);
+        self.window_sizes.extend_from_slice(&other.window_sizes);
+        Ok(())
+    }
+
+    /// Drop rows not in `indices`, preserving the per-row vector shape.
+    ///
+    /// The mlxcel analogue of upstream `mlx-vlm` PR #1110's
+    /// `BatchTurboQuantKVCache.filter()` (issue #544). Indexing is
+    /// position-based: `indices[k] = i` means "row `i` of the current
+    /// batch becomes row `k` of the filtered batch".
+    ///
+    /// Errors if any index is out of range or duplicated, or if the
+    /// per-row vectors are not already consistent (the latter would mean
+    /// somebody bypassed the public constructors and produced an
+    /// inconsistent state).
+    ///
+    /// Used by: regression coverage for batch-shrink transitions
+    /// (issue #544); not yet wired into the live decode path because the
+    /// scheduler currently rebuilds metadata each step rather than
+    /// filtering in place. Provided as a stable seam for upcoming
+    /// continuous-batching fusion work.
+    pub fn filter_in_place(&mut self, indices: &[usize]) -> Result<(), String> {
+        self.assert_consistent()?;
+        let n = self.rope_offsets.len();
+        // Reject out-of-range and duplicate indices up front so the merge
+        // cannot leave the four parallel vectors in inconsistent partial
+        // states on error.
+        let mut seen = vec![false; n];
+        for &i in indices {
+            if i >= n {
+                return Err(format!(
+                    "BatchedAttentionMetadata::filter_in_place: index {i} out of range for batch size {n}"
+                ));
+            }
+            if seen[i] {
+                return Err(format!(
+                    "BatchedAttentionMetadata::filter_in_place: duplicate index {i}"
+                ));
+            }
+            seen[i] = true;
+        }
+
+        let new_rope_offsets: Vec<i32> = indices.iter().map(|&i| self.rope_offsets[i]).collect();
+        let new_query_lens: Vec<i32> = indices.iter().map(|&i| self.query_lens[i]).collect();
+        let new_kv_lens: Vec<i32> = indices.iter().map(|&i| self.kv_lens[i]).collect();
+        let new_window_sizes: Vec<i32> = indices.iter().map(|&i| self.window_sizes[i]).collect();
+
+        self.rope_offsets = new_rope_offsets;
+        self.query_lens = new_query_lens;
+        self.kv_lens = new_kv_lens;
+        self.window_sizes = new_window_sizes;
+        Ok(())
     }
 }
 
@@ -5366,5 +5524,269 @@ mod tests {
         };
 
         assert!(PagedDecodeMetadata::from_attention_metadata(&metadata, 0).is_err());
+    }
+
+    // -----------------------------------------------------------------
+    // Issue #544 regression coverage — TurboQuant continuous-batching
+    // batch-grow / batch-shrink mid-decode.
+    //
+    // These tests mirror upstream `mlx-vlm` PR #1110's
+    // `test_turboquant.py` additions for `BatchTurboQuantKVCache.extend`
+    // / `filter`, applied to mlxcel's per-row metadata struct. The
+    // upstream Python crash mode (`mx.concatenate([scalar_int, mx_array])`)
+    // is statically impossible in Rust because every per-row field is
+    // typed `Vec<i32>`, but the *semantic* hazard — code that assumes a
+    // uniform batch and silently degrades when composition changes — is
+    // what these tests guard against.
+    //
+    // Each Rust test corresponds to one Python upstream test:
+    //   - test_batch_turboquant_extend_supports_uniform_single_item_offsets
+    //     -> batched_metadata_extend_uniform_single_item_offsets
+    //   - test_batch_turboquant_extend_supports_empty_uniform_offsets
+    //     -> batched_metadata_extend_empty_uniform_offsets
+    //   - test_batch_turboquant_filter_supports_uniform_single_item_offsets
+    //     -> batched_metadata_filter_uniform_single_item_offsets
+    //   - test_batch_turboquant_extend_pads_shorter_uniform_batch
+    //     -> batched_metadata_extend_grow_then_shrink_preserves_per_row_state
+    // -----------------------------------------------------------------
+
+    /// Two single-sequence caches with uniform offsets (the upstream
+    /// "scalar fast-path" trigger condition) extend correctly into a
+    /// 2-row batch with per-row offset arrays of length 2.
+    #[test]
+    fn batched_metadata_extend_uniform_single_item_offsets() {
+        let mut cache_a = KVCache::new();
+        cache_a.offset = 3;
+        let mut cache_b = KVCache::new();
+        cache_b.offset = 3;
+
+        let mut first = {
+            let caches = vec![&mut cache_a];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0]).unwrap()
+        };
+        let second = {
+            let caches = vec![&mut cache_b];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0]).unwrap()
+        };
+
+        // Trigger condition: both halves are individually "uniform" (every
+        // row has offset 3). Extending must produce a per-row batch of
+        // size 2, mirroring upstream `assert first.offset.tolist() == [3, 3]`.
+        first.extend(&second).unwrap();
+
+        assert_eq!(first.rope_offsets, vec![3, 3]);
+        assert_eq!(first.query_lens, vec![1, 1]);
+        assert_eq!(first.kv_lens, vec![4, 4]);
+        assert_eq!(first.window_sizes, vec![0, 0]);
+        assert_eq!(first.len(), 2);
+        first.assert_consistent().unwrap();
+    }
+
+    /// Two empty single-sequence metadata objects (the upstream
+    /// "scalar fast-path with empty offsets" trigger condition) extend
+    /// correctly into a 2-row batch.
+    #[test]
+    fn batched_metadata_extend_empty_uniform_offsets() {
+        let mut cache_a = KVCache::new();
+        cache_a.offset = 0;
+        let mut cache_b = KVCache::new();
+        cache_b.offset = 0;
+
+        let mut first = {
+            let caches = vec![&mut cache_a];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[0], &[0]).unwrap()
+        };
+        let second = {
+            let caches = vec![&mut cache_b];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[0], &[0]).unwrap()
+        };
+
+        first.extend(&second).unwrap();
+
+        assert_eq!(first.rope_offsets, vec![0, 0]);
+        assert_eq!(first.kv_lens, vec![0, 0]);
+        assert_eq!(first.len(), 2);
+        first.assert_consistent().unwrap();
+    }
+
+    /// `filter_in_place` over a uniform single-item batch keeps the per-row
+    /// vector shape and selects the correct row.
+    #[test]
+    fn batched_metadata_filter_uniform_single_item_offsets() {
+        let mut cache = KVCache::new();
+        cache.offset = 3;
+
+        let mut metadata = {
+            let caches = vec![&mut cache];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[1], &[0]).unwrap()
+        };
+
+        // Identity filter on a single-row batch.
+        metadata.filter_in_place(&[0]).unwrap();
+        assert_eq!(metadata.rope_offsets, vec![3]);
+        assert_eq!(metadata.kv_lens, vec![4]);
+        assert_eq!(metadata.len(), 1);
+        metadata.assert_consistent().unwrap();
+    }
+
+    /// End-to-end batch grow + shrink sequence: start with one sequence,
+    /// admit a second mid-decode (extend), then evict the first
+    /// (filter_in_place). Per-row offsets must remain coherent throughout.
+    /// This is the strongest unit-level regression for issue #544.
+    #[test]
+    fn batched_metadata_extend_grow_then_shrink_preserves_per_row_state() {
+        let mut cache_a = KVCache::new();
+        cache_a.offset = 5; // ongoing decode at position 5
+        let mut cache_b = KVCache::new();
+        cache_b.offset = 3; // freshly prefilled at position 3
+
+        // Round 1: only cache_a in the batch.
+        let mut metadata = {
+            let caches = vec![&mut cache_a];
+            BatchedAttentionMetadata::uniform_kv_caches(&caches, 1, 0).unwrap()
+        };
+        assert_eq!(metadata.rope_offsets, vec![5]);
+        assert_eq!(metadata.kv_lens, vec![6]);
+
+        // Mid-decode admission of cache_b: extend metadata with the new
+        // sequence's per-row state.
+        let new_metadata = {
+            let caches = vec![&mut cache_b];
+            BatchedAttentionMetadata::uniform_kv_caches(&caches, 1, 0).unwrap()
+        };
+        metadata.extend(&new_metadata).unwrap();
+
+        // Per-row vectors must reflect both sequences' actual offsets.
+        // This is the core property: even when the second batch was
+        // "uniform" by itself (one row), extension preserves per-row
+        // shape rather than collapsing to a scalar fast-path.
+        assert_eq!(metadata.rope_offsets, vec![5, 3]);
+        assert_eq!(metadata.kv_lens, vec![6, 4]);
+        assert_eq!(metadata.len(), 2);
+        metadata.assert_consistent().unwrap();
+
+        // Mid-decode eviction of cache_a: filter to keep only row 1.
+        // After this, the batch is "uniform" again (single row), but
+        // the per-row vector shape must still hold.
+        metadata.filter_in_place(&[1]).unwrap();
+        assert_eq!(metadata.rope_offsets, vec![3]);
+        assert_eq!(metadata.kv_lens, vec![4]);
+        assert_eq!(metadata.len(), 1);
+        metadata.assert_consistent().unwrap();
+    }
+
+    /// `extend` rejects metadata with mismatched per-row vector lengths,
+    /// catching any regression that re-introduces a uniformity-collapsing
+    /// optimization through a public field assignment.
+    #[test]
+    fn batched_metadata_extend_rejects_inconsistent_input() {
+        let mut left = BatchedAttentionMetadata {
+            rope_offsets: vec![0],
+            query_lens: vec![1],
+            kv_lens: vec![1],
+            window_sizes: vec![0],
+        };
+        let inconsistent_right = BatchedAttentionMetadata {
+            rope_offsets: vec![0, 0],
+            query_lens: vec![1], // length 1 instead of 2 — bug
+            kv_lens: vec![1, 1],
+            window_sizes: vec![0, 0],
+        };
+
+        let err = left.extend(&inconsistent_right).unwrap_err();
+        assert!(
+            err.contains("query_lens"),
+            "extend must reject mismatched per-row vectors: {err}"
+        );
+
+        // The left side must remain unchanged on error.
+        assert_eq!(left.rope_offsets, vec![0]);
+        assert_eq!(left.kv_lens, vec![1]);
+        left.assert_consistent().unwrap();
+    }
+
+    /// `filter_in_place` rejects out-of-range and duplicate indices and
+    /// preserves the original state on error.
+    #[test]
+    fn batched_metadata_filter_rejects_invalid_indices() {
+        let original = BatchedAttentionMetadata {
+            rope_offsets: vec![1, 2, 3],
+            query_lens: vec![1, 1, 1],
+            kv_lens: vec![2, 3, 4],
+            window_sizes: vec![0, 0, 0],
+        };
+
+        let mut m = original.clone();
+        let err = m.filter_in_place(&[0, 5]).unwrap_err();
+        assert!(err.contains("out of range"), "expected range error: {err}");
+        assert_eq!(m, original, "filter must not partially mutate on error");
+
+        let mut m = original.clone();
+        let err = m.filter_in_place(&[0, 0]).unwrap_err();
+        assert!(err.contains("duplicate"), "expected duplicate error: {err}");
+        assert_eq!(m, original, "filter must not partially mutate on error");
+    }
+
+    /// `assert_consistent` fails when per-row vectors disagree on length,
+    /// even though all four fields are public. This protects future
+    /// callers from constructing inconsistent metadata via direct field
+    /// assignment — the upstream `mlx-vlm` PR #1110 hazard pattern in
+    /// disguise.
+    #[test]
+    fn batched_metadata_assert_consistent_catches_field_skew() {
+        let m = BatchedAttentionMetadata {
+            rope_offsets: vec![0, 1],
+            query_lens: vec![1], // inconsistent
+            kv_lens: vec![1, 2],
+            window_sizes: vec![0, 0],
+        };
+        let err = m.assert_consistent().unwrap_err();
+        assert!(
+            err.contains("query_lens"),
+            "expected query_lens error: {err}"
+        );
+
+        let m = BatchedAttentionMetadata {
+            rope_offsets: vec![0, 1],
+            query_lens: vec![1, 1],
+            kv_lens: vec![1], // inconsistent
+            window_sizes: vec![0, 0],
+        };
+        let err = m.assert_consistent().unwrap_err();
+        assert!(err.contains("kv_lens"), "expected kv_lens error: {err}");
+
+        let m = BatchedAttentionMetadata {
+            rope_offsets: vec![0, 1],
+            query_lens: vec![1, 1],
+            kv_lens: vec![1, 2],
+            window_sizes: vec![0], // inconsistent
+        };
+        let err = m.assert_consistent().unwrap_err();
+        assert!(
+            err.contains("window_sizes"),
+            "expected window_sizes error: {err}"
+        );
+    }
+
+    /// Integration coverage: build metadata from caches that include a
+    /// `Turbo4Asym`-mode KVCache alongside an `Fp16` KVCache. Their
+    /// scalar `cache.offset` semantics are identical, so the per-row
+    /// metadata stays correct across modes — the property that makes
+    /// the upstream Python crash impossible to reach in mlxcel's
+    /// architecture (issue #544).
+    #[test]
+    fn batched_metadata_handles_mixed_mode_caches() {
+        let mut fp16_cache = KVCache::new();
+        fp16_cache.offset = 7;
+        let mut turbo_cache = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
+        turbo_cache.offset = 11;
+
+        let caches = vec![&mut fp16_cache, &mut turbo_cache];
+        let metadata = BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 1], &[0, 0]).unwrap();
+
+        assert_eq!(metadata.rope_offsets, vec![7, 11]);
+        assert_eq!(metadata.kv_lens, vec![8, 12]);
+        assert_eq!(metadata.len(), 2);
+        metadata.assert_consistent().unwrap();
     }
 }

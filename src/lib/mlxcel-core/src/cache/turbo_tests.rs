@@ -3152,3 +3152,261 @@ fn delegated_per_token_v_budget_after_issue_528() {
         visible_buffer_sum + memo_size_if_reintroduced,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Issue #544 regression — TurboQuant continuous batching, batch grow / shrink
+// mid-decode.
+//
+// These tests use real `KVCache::update_and_fetch` calls in `Turbo4Asym`
+// mode and drive `BatchedAttentionMetadata` through the same
+// extend / filter shape transitions that would happen in the scheduler
+// when a sequence is admitted into or evicted from an active batch.
+//
+// The acceptance criterion in issue #544 is: the per-row decode output is
+// equivalent (RMS within tolerance) to running the same prompts
+// sequentially. We approximate that at the unit-test level by asserting
+// that the dequantized V tensor returned by `update_and_fetch` for each
+// sequence is bit-identical between the "in a batched composition that
+// changes mid-decode" path and the "sequence run on its own" path. Each
+// per-sequence cache is independent (mlxcel's continuous-batching
+// architecture stores caches per-sequence; see
+// `mlxcel_core::cache::CachePool` and the per-sequence forward in
+// `forward_split_attention`), so there is no cross-row interference at the
+// cache layer — what we are validating is that the orchestration
+// (metadata extend / filter, plus per-sequence quantize/dequantize round
+// trips) preserves that property.
+// ---------------------------------------------------------------------------
+
+/// Compute root-mean-square error between two flattened float32 buffers.
+/// Returns `None` for empty inputs.
+fn rms_error(reference: &[f32], actual: &[f32]) -> Option<f32> {
+    if reference.is_empty() || reference.len() != actual.len() {
+        return None;
+    }
+    let mut sum_sq = 0.0_f32;
+    for (r, a) in reference.iter().zip(actual.iter()) {
+        let d = r - a;
+        sum_sq += d * d;
+    }
+    Some((sum_sq / reference.len() as f32).sqrt())
+}
+
+/// Run a single sequence's prefill+decode trace through a fresh
+/// Turbo4Asym KV cache and return the dequantized V tensor for each step.
+///
+/// This is the "sequential reference" used by the
+/// continuous-batching equivalence test below.
+fn turbo4_asym_sequential_decode_trace(
+    head_dim: i32,
+    prompt_len: i32,
+    decode_steps: i32,
+    seed: u32,
+) -> Vec<Vec<f32>> {
+    let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
+    let mut traces: Vec<Vec<f32>> = Vec::with_capacity(decode_steps as usize + 1);
+
+    // Prefill (`prompt_len` tokens at once). Capture the dequantized V
+    // tensor so the test can compare it with the batched version.
+    let k_prefill = synth_kv_tensor(1, 1, prompt_len, head_dim, seed);
+    let v_prefill = synth_kv_tensor(1, 1, prompt_len, head_dim, seed.wrapping_add(1));
+    let (_k_out, v_out) = cache.update_and_fetch(k_prefill, v_prefill);
+    traces.push(flatten_fp32(&v_out));
+
+    // Decode (one token per step).
+    for step in 0..decode_steps {
+        let token_seed = seed.wrapping_add(2 + step as u32 * 2);
+        let k_step = synth_kv_tensor(1, 1, 1, head_dim, token_seed);
+        let v_step = synth_kv_tensor(1, 1, 1, head_dim, token_seed.wrapping_add(1));
+        let (_k_out, v_out) = cache.update_and_fetch(k_step, v_step);
+        traces.push(flatten_fp32(&v_out));
+    }
+
+    traces
+}
+
+/// Issue #544 acceptance criterion (unit-level): a continuous-batching
+/// scenario where the batch composition changes mid-decode produces decode
+/// output equivalent (RMS within tolerance) to running the same prompts
+/// sequentially.
+///
+/// Scenario:
+///   1. Sequence A starts decode alone (batch = [A]).
+///   2. Sequence B is admitted mid-decode (batch = [A, B]).
+///   3. Sequence A finishes; B continues alone (batch = [B]).
+///
+/// At each step the test runs `KVCache::update_and_fetch` on each active
+/// per-sequence cache and rebuilds `BatchedAttentionMetadata` from the
+/// current cache offsets. The dequantized V output for each
+/// (sequence, step) pair must be bit-identical to the same step of a
+/// fresh-cache sequential run, because per-sequence caches do not share
+/// state.
+#[test]
+fn turbo4_asym_continuous_batching_grow_shrink_matches_sequential() {
+    let head_dim: i32 = 64;
+    let seq_a_seed: u32 = 0xA1A1_A1A1;
+    let seq_b_seed: u32 = 0xB2B2_B2B2;
+    let prompt_len_a: i32 = 4;
+    let prompt_len_b: i32 = 3;
+    // Decode plan:
+    //   step 0: A only (batch = [A]).
+    //   step 1: A, B both decode (batch = [A, B]) — B prefilled with
+    //           `prompt_len_b` tokens before this step.
+    //   step 2: A, B both decode (batch = [A, B]).
+    //   step 3: A only (B finished after step 2, batch = [A]).
+    // A runs decode_steps_a = 4 single-token steps total (one before
+    // admission, two during, one after). B runs decode_steps_b = 2 (both
+    // during the joint phase).
+    let decode_steps_a: i32 = 4;
+    let decode_steps_b: i32 = 2;
+
+    // Sequential reference traces (one fresh cache per sequence).
+    let ref_a =
+        turbo4_asym_sequential_decode_trace(head_dim, prompt_len_a, decode_steps_a, seq_a_seed);
+    let ref_b =
+        turbo4_asym_sequential_decode_trace(head_dim, prompt_len_b, decode_steps_b, seq_b_seed);
+
+    // Batched run: independent per-sequence caches, metadata rebuilt on
+    // every step from the *current* batch composition.
+    let mut cache_a = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
+    let mut cache_b = KVCache::new_with_mode(KVCacheMode::Turbo4Asym);
+
+    // Phase 1: prefill A alone — batch = [A].
+    let k_a_prefill = synth_kv_tensor(1, 1, prompt_len_a, head_dim, seq_a_seed);
+    let v_a_prefill = synth_kv_tensor(1, 1, prompt_len_a, head_dim, seq_a_seed.wrapping_add(1));
+    let (_k_out, v_out_a) = cache_a.update_and_fetch(k_a_prefill, v_a_prefill);
+    let batched_a_step0 = flatten_fp32(&v_out_a);
+
+    // Verify metadata is per-row [A].
+    {
+        let caches = vec![&mut cache_a];
+        let metadata = BatchedAttentionMetadata::uniform_kv_caches(&caches, 1, 0).unwrap();
+        assert_eq!(metadata.rope_offsets, vec![prompt_len_a]);
+        assert_eq!(metadata.kv_lens, vec![prompt_len_a + 1]);
+        metadata.assert_consistent().unwrap();
+    }
+
+    // Phase 2: A's first solo decode step. Still batch = [A].
+    let token_seed_a_0 = seq_a_seed.wrapping_add(2);
+    let k_a_t0 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_0);
+    let v_a_t0 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_0.wrapping_add(1));
+    let (_k_out, v_out_a) = cache_a.update_and_fetch(k_a_t0, v_a_t0);
+    let batched_a_step1 = flatten_fp32(&v_out_a);
+
+    // Phase 3: admit B. Prefill B, then run a joint decode step. batch = [A, B].
+    let k_b_prefill = synth_kv_tensor(1, 1, prompt_len_b, head_dim, seq_b_seed);
+    let v_b_prefill = synth_kv_tensor(1, 1, prompt_len_b, head_dim, seq_b_seed.wrapping_add(1));
+    let (_k_out, v_out_b) = cache_b.update_and_fetch(k_b_prefill, v_b_prefill);
+    let batched_b_step0 = flatten_fp32(&v_out_b);
+
+    // Build heterogeneous metadata for the [A, B] composition.
+    {
+        let caches = vec![&mut cache_a, &mut cache_b];
+        let metadata = BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 1], &[0, 0]).unwrap();
+        assert_eq!(
+            metadata.rope_offsets,
+            vec![prompt_len_a + 1, prompt_len_b],
+            "batch grow must keep per-row offsets correct (issue #544)"
+        );
+        assert_eq!(metadata.kv_lens, vec![prompt_len_a + 2, prompt_len_b + 1]);
+        metadata.assert_consistent().unwrap();
+    }
+
+    // Joint decode step: A's 2nd decode token + B's 1st decode token.
+    let token_seed_a_1 = seq_a_seed.wrapping_add(4);
+    let k_a_t1 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_1);
+    let v_a_t1 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_1.wrapping_add(1));
+    let (_k_out, v_out_a) = cache_a.update_and_fetch(k_a_t1, v_a_t1);
+    let batched_a_step2 = flatten_fp32(&v_out_a);
+
+    let token_seed_b_0 = seq_b_seed.wrapping_add(2);
+    let k_b_t0 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_b_0);
+    let v_b_t0 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_b_0.wrapping_add(1));
+    let (_k_out, v_out_b) = cache_b.update_and_fetch(k_b_t0, v_b_t0);
+    let batched_b_step1 = flatten_fp32(&v_out_b);
+
+    // Phase 4: another joint decode step. Still batch = [A, B].
+    let token_seed_a_2 = seq_a_seed.wrapping_add(6);
+    let k_a_t2 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_2);
+    let v_a_t2 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_2.wrapping_add(1));
+    let (_k_out, v_out_a) = cache_a.update_and_fetch(k_a_t2, v_a_t2);
+    let batched_a_step3 = flatten_fp32(&v_out_a);
+
+    let token_seed_b_1 = seq_b_seed.wrapping_add(4);
+    let k_b_t1 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_b_1);
+    let v_b_t1 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_b_1.wrapping_add(1));
+    let (_k_out, v_out_b) = cache_b.update_and_fetch(k_b_t1, v_b_t1);
+    let batched_b_step2 = flatten_fp32(&v_out_b);
+
+    // Phase 5: B finishes (filter); A continues alone. batch = [A].
+    {
+        let mut metadata = {
+            let caches = vec![&mut cache_a, &mut cache_b];
+            BatchedAttentionMetadata::from_kv_caches(&caches, &[1, 1], &[0, 0]).unwrap()
+        };
+        // Filter to keep only row 0 (A). After this, the per-row vectors
+        // must shrink to length 1 — but never collapse to a scalar.
+        metadata.filter_in_place(&[0]).unwrap();
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata.rope_offsets, vec![prompt_len_a + 3]);
+        metadata.assert_consistent().unwrap();
+    }
+
+    // A's final solo decode step.
+    let token_seed_a_3 = seq_a_seed.wrapping_add(8);
+    let k_a_t3 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_3);
+    let v_a_t3 = synth_kv_tensor(1, 1, 1, head_dim, token_seed_a_3.wrapping_add(1));
+    let (_k_out, v_out_a) = cache_a.update_and_fetch(k_a_t3, v_a_t3);
+    let batched_a_step4 = flatten_fp32(&v_out_a);
+
+    // Equivalence checks. Per-sequence caches are independent, so the
+    // batched and sequential dequantized V tensors must be bit-identical
+    // (RMS == 0). The assertion uses `< 1e-6` to allow for any
+    // floating-point reorder noise from MLX kernel scheduling, well
+    // below the Turbo4 quantization error budget.
+    //
+    // The `kv_visible_len` for each step is `prompt_len + step_count`,
+    // so we slice the V output to compare only the visible window.
+    let tol: f32 = 1e-6;
+
+    // Sequence A trace: ref_a[i] corresponds to V output after the i-th
+    // update (i=0 is prefill, i=1..decode_steps_a are decode tokens).
+    let visible = |t: i32| -> usize { (t * head_dim) as usize };
+
+    let kv_a_lens = [
+        prompt_len_a,
+        prompt_len_a + 1,
+        prompt_len_a + 2,
+        prompt_len_a + 3,
+        prompt_len_a + 4,
+    ];
+    let batched_a = [
+        &batched_a_step0,
+        &batched_a_step1,
+        &batched_a_step2,
+        &batched_a_step3,
+        &batched_a_step4,
+    ];
+    for (i, (batched, kv_len)) in batched_a.iter().zip(kv_a_lens.iter()).enumerate() {
+        let n = visible(*kv_len);
+        let bs = &batched[..n];
+        let rs = &ref_a[i][..n];
+        let rms = rms_error(rs, bs).unwrap();
+        assert!(
+            rms < tol,
+            "sequence A step {i}: batched-vs-sequential RMS {rms:e} exceeds {tol:e}"
+        );
+    }
+
+    let kv_b_lens = [prompt_len_b, prompt_len_b + 1, prompt_len_b + 2];
+    let batched_b = [&batched_b_step0, &batched_b_step1, &batched_b_step2];
+    for (i, (batched, kv_len)) in batched_b.iter().zip(kv_b_lens.iter()).enumerate() {
+        let n = visible(*kv_len);
+        let bs = &batched[..n];
+        let rs = &ref_b[i][..n];
+        let rms = rms_error(rs, bs).unwrap();
+        assert!(
+            rms < tol,
+            "sequence B step {i}: batched-vs-sequential RMS {rms:e} exceeds {tol:e}"
+        );
+    }
+}
