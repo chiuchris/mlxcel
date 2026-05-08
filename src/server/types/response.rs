@@ -369,6 +369,27 @@ pub struct HealthResponse {
     pub batch: Option<BatchStatusInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub observability: Option<crate::server::batch::ObservabilitySnapshot>,
+    /// Effective context window size in tokens.
+    ///
+    /// Reports the configured `--ctx-size` value. When the server was started
+    /// without an explicit `--ctx-size` override this is 0, which means the
+    /// model's own `max_position_embeddings` applies. Monitoring tools may use
+    /// this as a hint; `0` should be treated as "model default / unknown".
+    ///
+    /// Present only when the model is loaded.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<usize>,
+    /// Name of the active tool-call parser, or `null` when the loaded chat
+    /// template does not support tool calls.
+    ///
+    /// mlxcel's parser is output-format auto-detection (tries Hermes, Gemma 4,
+    /// Mistral Nemo, Functionary, Llama 3, Command-R, and others in sequence).
+    /// The field is always present once a model is loaded so that monitoring
+    /// tools can distinguish "template does not support tools" (`null`) from
+    /// "field missing because model has not finished loading" (field absent).
+    ///
+    /// Present only when the model is loaded.
+    pub tool_call_parser: Option<String>,
 }
 
 /// Batch status included in the health check response.

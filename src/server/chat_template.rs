@@ -182,6 +182,34 @@ impl ChatTemplateProcessor {
         out
     }
 
+    /// Return whether the template uses the `tools` variable, without caching.
+    ///
+    /// Uses a conservative string-based heuristic so it can be called from
+    /// contexts where only a shared reference is available (e.g. the `/health`
+    /// route handler, which holds `Arc<ChatTemplateProcessor>`).
+    ///
+    /// Returns `true` when the template source contains well-known tool-related
+    /// markers.  May produce both false-negatives and (rarely) false-positives —
+    /// e.g., when both `tools` and `function` appear in unrelated parts of the
+    /// template such as comments.  Use `supports_tools()` for ground-truth
+    /// introspection when `&mut self` is available.
+    ///
+    /// Used by: routes/health
+    pub fn supports_tools_hint(&self) -> bool {
+        self.template_mentions_tools()
+    }
+
+    /// Conservative string-based heuristic for whether the Jinja template
+    /// references the `tools` variable.  Shared between [`supports_tools_hint`]
+    /// (cheap, `&self`) and [`compute_supports_tools`] (used as a fallback
+    /// when the render-comparison probe errors out).
+    fn template_mentions_tools(&self) -> bool {
+        self.template.contains("for tool in tools")
+            || self.template.contains("tools | tojson")
+            || self.template.contains("tools|tojson")
+            || (self.template.contains("tools") && self.template.contains("function"))
+    }
+
     /// Check if the template uses the `tools` variable.
     ///
     /// Returns true when the template produces different output when `tools`
@@ -223,10 +251,7 @@ impl ChatTemplateProcessor {
             (Ok(with), Ok(without)) => with != without,
             _ => {
                 // Rendering failed — fall back to string heuristic
-                self.template.contains("for tool in tools")
-                    || self.template.contains("tools | tojson")
-                    || self.template.contains("tools|tojson")
-                    || (self.template.contains("tools") && self.template.contains("function"))
+                self.template_mentions_tools()
             }
         }
     }
