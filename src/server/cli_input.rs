@@ -22,6 +22,7 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
+use mlxcel_core::cache::{BatchKvQuantConfig, DEFAULT_KV_GROUP_SIZE, KvQuantScheme};
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::chat_template_kwargs::resolve_server_default_kwargs;
@@ -258,6 +259,37 @@ pub struct ServerStartupInput {
     /// for caching. `None` means "use the compiled-in default (32)".
     /// Also accepts `MLXCEL_PROMPT_CACHE_MIN_PREFIX`.
     pub prompt_cache_min_prefix: Option<usize>,
+
+    // Issue #545: continuous-batching KV quantization knobs.
+    //
+    // These mirror the upstream `mlx-vlm` PR #1030 server CLI flags. The
+    // raw fields are kept here in [`ServerStartupInput`] form so binaries
+    // can wire any of: clap argument, llama-server compat env var, or
+    // direct programmatic construction. They are normalised into a
+    // [`mlxcel_core::cache::BatchKvQuantConfig`] inside
+    // [`ServerStartupInput::into_startup_config`] so the rest of the
+    // server (scheduler, model worker, regression tests) sees a single
+    // resolved object.
+    /// `--kv-bits` value. `0` (default) disables KV cache quantization
+    /// in the continuous-batching path. Valid values for the
+    /// `--kv-quant-scheme uniform` scheme are `4` and `8`; for
+    /// `--kv-quant-scheme turboquant`, `4` is the only accepted value.
+    pub kv_bits: i32,
+    /// `--kv-group-size` value (channel-group size for the `uniform`
+    /// scheme). Defaults to
+    /// [`mlxcel_core::cache::DEFAULT_KV_GROUP_SIZE`] (`64`). Ignored when
+    /// `--kv-quant-scheme turboquant` is in effect.
+    pub kv_group_size: i32,
+    /// `--kv-quant-scheme` value. `None` means "use the default scheme"
+    /// ([`mlxcel_core::cache::KvQuantScheme::Uniform`]); supplying this
+    /// flag without `--kv-bits` does not enable quantization on its own —
+    /// `kv_bits` is the master switch.
+    pub kv_quant_scheme: Option<String>,
+    /// `--kv-skip-last-layer` value. Defaults to `true` (the
+    /// gemma-4-31b-style last-layer skip is on by default per the
+    /// issue #545 acceptance criterion). Set to `false` to opt out
+    /// for benchmarking.
+    pub kv_skip_last_layer: bool,
 }
 
 impl ServerStartupInput {
@@ -312,6 +344,19 @@ impl ServerStartupInput {
             self.kv_cache_mode_legacy.as_deref(),
         )
         .map_err(|e| anyhow::anyhow!("KV cache mode error: {e}"))?;
+
+        // Issue #545: resolve the batch KV quantization config from the
+        // new `--kv-bits` / `--kv-group-size` / `--kv-quant-scheme` /
+        // `--kv-skip-last-layer` flags. When `kv_bits == 0` this falls
+        // through to the disabled default which is bit-exact equivalent
+        // to the legacy `kv_cache_mode`-only path.
+        let batch_kv_quant = resolve_batch_kv_quant_config(
+            self.kv_bits,
+            self.kv_group_size,
+            self.kv_quant_scheme.as_deref(),
+            self.kv_skip_last_layer,
+        )
+        .map_err(|e| anyhow::anyhow!("batch KV cache quant error: {e}"))?;
 
         Ok(ServerStartupConfig {
             model_path: self.model_path,
@@ -391,18 +436,243 @@ impl ServerStartupInput {
             chat_template_kwargs,
             prompt_cache,
             kv_cache_mode,
+            batch_kv_quant,
         })
     }
 }
 
-// KV cache type split flags: the canonical implementations live in
+// ── KV cache type split flags ────────────────────────────────────────────────
+//
+// The canonical implementations of `resolve_kv_cache_mode` and the
+// `--cache-type-k`/`--cache-type-v` env-var fallbacks live in
 // `crate::cli::turbo_args` so the resolution logic is shared with `mlxcel
-// generate` (which does not go through `ServerStartupInput`). The
-// re-exports below preserve the historical `mlxcel::server::*` public
-// surface for existing callers (binary entry points, downstream tests).
+// generate` (which does not go through `ServerStartupInput`). The re-exports
+// below preserve the historical `mlxcel::server::*` public surface for
+// existing callers (binary entry points, downstream tests).
 pub use crate::cli::turbo_args::{
     env_fallback_cache_type_k, env_fallback_cache_type_v, resolve_kv_cache_mode,
 };
+
+// ── Issue #545 — batched KV-cache quantization knobs ─────────────────────────
+
+/// Resolve the [`BatchKvQuantConfig`] from the raw CLI string fields.
+///
+/// `bits == 0` (the default) returns [`BatchKvQuantConfig::default`] which
+/// is a no-op disabled config — this preserves bit-exact behavior when the
+/// operator does not pass any of the new flags. Validation errors are
+/// surfaced verbatim so `into_startup_config` can wrap them in a server
+/// startup error message.
+///
+/// Used by: [`ServerStartupInput::into_startup_config`] and the unit tests
+/// in `cli_input_tests.rs`.
+pub fn resolve_batch_kv_quant_config(
+    bits: i32,
+    group_size: i32,
+    quant_scheme: Option<&str>,
+    skip_last_layer: bool,
+) -> Result<BatchKvQuantConfig, String> {
+    if bits <= 0 {
+        // Disabled. Honour the operator-provided group_size / scheme /
+        // skip_last_layer fields anyway so reading-back the resolved
+        // config still reflects what they typed (this is convenient for
+        // operator-facing diagnostics like `/props`).
+        let scheme = match quant_scheme {
+            Some(s) => s.parse::<KvQuantScheme>()?,
+            None => KvQuantScheme::Uniform,
+        };
+        let group = if group_size > 0 {
+            group_size
+        } else {
+            DEFAULT_KV_GROUP_SIZE
+        };
+        return Ok(BatchKvQuantConfig {
+            scheme,
+            bits: 0,
+            group_size: group,
+            skip_last_layer,
+        });
+    }
+    let scheme = match quant_scheme {
+        Some(s) => s.parse::<KvQuantScheme>()?,
+        None => KvQuantScheme::Uniform,
+    };
+    let group = if group_size > 0 {
+        group_size
+    } else {
+        DEFAULT_KV_GROUP_SIZE
+    };
+    BatchKvQuantConfig::new(scheme, bits, group, skip_last_layer)
+}
+
+/// Apply `LLAMA_ARG_KV_BITS` env var fallback to the raw `--kv-bits` CLI
+/// value (issue #545).
+///
+/// Precedence rule: CLI flag beats env var.
+///
+/// - When the CLI value is the off-sentinel (`0`) and the env var is a
+///   parseable integer, the env value takes effect.
+/// - When the CLI value is non-zero and the env var is also set, the CLI
+///   value wins and an INFO log is emitted.
+/// - Unparseable env values are logged and ignored (the CLI default `0`
+///   is kept so the server still starts).
+pub fn env_fallback_kv_bits(value: &mut i32) {
+    let cli_default = *value == 0;
+    if !cli_default {
+        // The CLI was set to a non-default value. Only warn if the env var
+        // differs from the current value — if they match, clap already
+        // injected the env value as the CLI value so no conflict exists.
+        if let Ok(raw) = std::env::var("LLAMA_ARG_KV_BITS")
+            && raw.trim().parse::<i32>().ok().as_ref() != Some(value)
+        {
+            tracing::info!(
+                "LLAMA_ARG_KV_BITS env var is set but --kv-bits CLI flag takes precedence; ignoring LLAMA_ARG_KV_BITS"
+            );
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var("LLAMA_ARG_KV_BITS") {
+        match raw.trim().parse::<i32>() {
+            Ok(parsed) => *value = parsed,
+            Err(err) => {
+                tracing::warn!(
+                    "LLAMA_ARG_KV_BITS=\"{raw}\" is not a valid integer ({err}); keeping --kv-bits=0"
+                );
+            }
+        }
+    }
+}
+
+/// Apply `LLAMA_ARG_KV_GROUP_SIZE` env var fallback to the raw
+/// `--kv-group-size` CLI value (issue #545).
+///
+/// Same precedence rule as [`env_fallback_kv_bits`]. The CLI default is
+/// [`DEFAULT_KV_GROUP_SIZE`] (`64`); the env var only takes effect when
+/// the CLI value matches that default.
+pub fn env_fallback_kv_group_size(value: &mut i32) {
+    let cli_default = *value == DEFAULT_KV_GROUP_SIZE;
+    if !cli_default {
+        // Only log a conflict when the env var differs from the current
+        // value. When clap injected the env var as the CLI value they are
+        // equal and logging would be misleading.
+        if let Ok(raw) = std::env::var("LLAMA_ARG_KV_GROUP_SIZE")
+            && raw.trim().parse::<i32>().ok().as_ref() != Some(value)
+        {
+            tracing::info!(
+                "LLAMA_ARG_KV_GROUP_SIZE env var is set but --kv-group-size CLI flag takes precedence; ignoring LLAMA_ARG_KV_GROUP_SIZE"
+            );
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var("LLAMA_ARG_KV_GROUP_SIZE") {
+        match raw.trim().parse::<i32>() {
+            Ok(parsed) if parsed > 0 => *value = parsed,
+            Ok(parsed) => {
+                tracing::warn!(
+                    "LLAMA_ARG_KV_GROUP_SIZE={parsed} is non-positive; keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
+                );
+            }
+            Err(err) => {
+                tracing::warn!(
+                    "LLAMA_ARG_KV_GROUP_SIZE=\"{raw}\" is not a valid integer ({err}); keeping --kv-group-size={DEFAULT_KV_GROUP_SIZE}"
+                );
+            }
+        }
+    }
+}
+
+/// Apply `LLAMA_ARG_KV_QUANT_SCHEME` env var fallback to the raw
+/// `--kv-quant-scheme` CLI value (issue #545).
+///
+/// Same precedence rule as [`env_fallback_cache_type_k`].
+pub fn env_fallback_kv_quant_scheme(value: &mut Option<String>) {
+    apply_optional_string_env_fallback(value, "LLAMA_ARG_KV_QUANT_SCHEME", "kv-quant-scheme");
+}
+
+/// Apply `LLAMA_ARG_KV_SKIP_LAST_LAYER` / `MLXCEL_KV_SKIP_LAST_LAYER` env
+/// var fallbacks to the raw `--kv-skip-last-layer` value (issue #545).
+///
+/// The CLI default is `true`. The env var only takes effect when the CLI
+/// value matches that default. Acceptable env values are
+/// `1`/`0`/`true`/`false`/`on`/`off` (case-insensitive). Any unparseable
+/// value is logged and ignored.
+pub fn env_fallback_kv_skip_last_layer(value: &mut bool) {
+    let cli_default = *value;
+    for var in ["LLAMA_ARG_KV_SKIP_LAST_LAYER", "MLXCEL_KV_SKIP_LAST_LAYER"] {
+        let env_val = std::env::var_os(var);
+        if env_val.is_none() {
+            continue;
+        }
+        if !cli_default {
+            // Only log a conflict when the env value genuinely differs from
+            // the current CLI value. When clap injected the env var as the
+            // CLI value they agree and logging would be misleading.
+            let env_parsed = std::env::var(var).ok().and_then(|raw| {
+                match raw.trim().to_ascii_lowercase().as_str() {
+                    "1" | "true" | "on" | "yes" => Some(true),
+                    "0" | "false" | "off" | "no" => Some(false),
+                    _ => None,
+                }
+            });
+            if env_parsed.is_none_or(|v| v != *value) {
+                tracing::info!(
+                    "{var} env var is set but --kv-skip-last-layer CLI flag takes precedence; ignoring {var}"
+                );
+            }
+            return;
+        }
+        if let Ok(raw) = std::env::var(var) {
+            match raw.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => {
+                    *value = true;
+                    return;
+                }
+                "0" | "false" | "off" | "no" => {
+                    *value = false;
+                    return;
+                }
+                other => {
+                    // Unparseable value: log and fall through to try the
+                    // next env var (MLXCEL_KV_SKIP_LAST_LAYER) before giving up.
+                    tracing::warn!(
+                        "{var}=\"{other}\" is not a valid boolean; trying next fallback env var"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// Shared helper: if `value` is `None` and the named env var is set, fill
+/// `value` from the env var. If `value` is `Some` (CLI was set) and the env
+/// var is also present and differs, log an INFO and keep the CLI value.
+/// When `value` already equals the env var string (because clap's `env = "..."`
+/// injected it), no conflict log is emitted since there is no real conflict.
+///
+/// Used locally by [`env_fallback_kv_quant_scheme`]. The cache-type-K/V
+/// helpers re-exported above use the equivalent helper that lives next to
+/// their canonical definitions in `crate::cli::turbo_args`.
+fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
+    if value.is_some() {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            // Only log a conflict when the values genuinely differ. When
+            // clap injected the env var as the CLI value they are equal
+            // and logging would be misleading.
+            if value.as_deref() != Some(trimmed) {
+                tracing::info!(
+                    "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
+                );
+            }
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var(key) {
+        let trimmed = raw.trim().to_string();
+        if !trimmed.is_empty() {
+            *value = Some(trimmed);
+        }
+    }
+}
 
 /// Apply the `LLAMA_ARG_REASONING_BUDGET` env-var fallback to the raw CLI
 /// `--reasoning-budget` value (issue #409).

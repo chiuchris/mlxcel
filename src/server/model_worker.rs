@@ -84,6 +84,15 @@ pub(crate) struct WorkerSchedulerConfig {
     /// applies it to each new sequence's per-layer cache and picks the
     /// Turbo4-aware paged layout (#482).
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+    /// Issue #545: continuous-batching KV quantization configuration.
+    ///
+    /// When enabled (`bits > 0`), the scheduler resolves per-layer
+    /// [`mlxcel_core::cache::KVCacheMode`] values from this config (with
+    /// the last layer optionally forced to FP16) and overrides the
+    /// nominal [`Self::kv_cache_mode`] for each newly-allocated sequence.
+    /// Defaults to a disabled config so existing deployments stay
+    /// bit-exact.
+    pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -265,7 +274,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         .with_token_bias(token_bias)
         .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
         .with_prompt_cache(sched_config.prompt_cache)
-        .with_kv_cache_mode(sched_config.kv_cache_mode);
+        .with_kv_cache_mode(sched_config.kv_cache_mode)
+        .with_batch_kv_quant(sched_config.batch_kv_quant);
         scheduler.run();
     })
 }

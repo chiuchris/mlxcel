@@ -75,6 +75,7 @@
 //! path and is intended as an opt-in performance comparison, not the default
 //! compressed-only memory target.
 
+pub mod batch_quant;
 mod detach;
 mod paged;
 mod paged_detach;
@@ -89,6 +90,10 @@ pub mod turbo;
 #[path = "cache/turbo_tests.rs"]
 mod turbo_tests;
 
+pub use batch_quant::{
+    BatchKvQuantConfig, BatchQuantizedKVCache, BatchTurboQuantKVCache, KvQuantScheme,
+    DEFAULT_KV_GROUP_SIZE,
+};
 pub use detach::{DetachedCacheSet, DetachedHandle, DetachedKVCache, DetachedRotatingKVCache};
 pub use paged::{
     PagedBlockId, PagedBlockPool, PagedCacheStats, PagedKvLayout, PagedLayerState,

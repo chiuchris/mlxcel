@@ -17,7 +17,9 @@ use std::sync::{Mutex, OnceLock};
 
 use super::{
     DecodeStorageBackend, ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
-    resolve_compat_toggle, resolve_kv_cache_mode, resolve_prefill_chunk_size, resolve_seed,
+    env_fallback_kv_bits, env_fallback_kv_group_size, env_fallback_kv_quant_scheme,
+    env_fallback_kv_skip_last_layer, resolve_compat_toggle, resolve_kv_cache_mode,
+    resolve_prefill_chunk_size, resolve_seed,
 };
 use crate::lang_bias::LangBiasCliArgs;
 
@@ -124,6 +126,11 @@ fn sample_input() -> ServerStartupInput {
         cache_type_k: None,
         cache_type_v: None,
         kv_cache_mode_legacy: None,
+        // Issue #545: continuous-batching KV quantization knobs (off by default).
+        kv_bits: 0,
+        kv_group_size: mlxcel_core::cache::DEFAULT_KV_GROUP_SIZE,
+        kv_quant_scheme: None,
+        kv_skip_last_layer: true,
     }
 }
 
@@ -1122,5 +1129,135 @@ fn cache_type_k_empty_env_var_is_ignored() {
     assert!(
         value.is_none(),
         "whitespace-only env var must not be applied"
+    );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Issue #545 — env-var fallback tests for kv-bits / kv-group-size /
+// kv-quant-scheme / kv-skip-last-layer (Fix 1, Fix 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Fix 1: when LLAMA_ARG_KV_BITS and --kv-bits agree (clap injected the env
+/// value as the CLI value), the helper must NOT emit the misleading "env
+/// ignored" conflict. We test indirectly: the function must not panic and the
+/// value must be preserved.
+#[test]
+fn kv_bits_no_conflict_when_env_and_cli_agree() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_BITS", "8");
+
+    // Simulate clap having already injected LLAMA_ARG_KV_BITS=8 into the
+    // CLI value.
+    let mut value: i32 = 8;
+    env_fallback_kv_bits(&mut value);
+    assert_eq!(value, 8, "value must be preserved when env and CLI agree");
+}
+
+/// Fix 1: when LLAMA_ARG_KV_BITS differs from --kv-bits, the CLI value must
+/// still win (backward compat).
+#[test]
+fn kv_bits_cli_wins_when_env_differs() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_BITS", "4");
+
+    let mut value: i32 = 8; // explicit --kv-bits 8
+    env_fallback_kv_bits(&mut value);
+    assert_eq!(value, 8, "CLI --kv-bits must win over differing env var");
+}
+
+/// Fix 1: LLAMA_ARG_KV_BITS is applied when no CLI flag was given (value == 0
+/// is the sentinel meaning "not set").
+#[test]
+fn kv_bits_env_applied_when_cli_absent() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_BITS", "8");
+
+    let mut value: i32 = 0;
+    env_fallback_kv_bits(&mut value);
+    assert_eq!(value, 8, "env var must apply when CLI flag was not given");
+}
+
+/// Fix 1: kv-group-size — env and CLI agree (clap injected), no spurious conflict.
+#[test]
+fn kv_group_size_no_conflict_when_env_and_cli_agree() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_GROUP_SIZE", "32");
+
+    // Simulate clap injecting the env value as the CLI value.
+    let mut value: i32 = 32;
+    env_fallback_kv_group_size(&mut value);
+    assert_eq!(value, 32, "value must be preserved when env and CLI agree");
+}
+
+/// Fix 1: kv-quant-scheme — env and CLI agree (clap injected), no conflict.
+#[test]
+fn kv_quant_scheme_no_conflict_when_env_and_cli_agree() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_QUANT_SCHEME", "turboquant");
+
+    let mut value: Option<String> = Some("turboquant".to_string());
+    env_fallback_kv_quant_scheme(&mut value);
+    assert_eq!(
+        value.as_deref(),
+        Some("turboquant"),
+        "value must be preserved when env and CLI agree"
+    );
+}
+
+/// Fix 1: kv-skip-last-layer — env and CLI agree (clap injected `false`),
+/// no spurious conflict log and the value is preserved.
+#[test]
+fn kv_skip_last_layer_no_conflict_when_env_and_cli_agree() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_SKIP_LAST_LAYER", "false");
+
+    // Simulate clap injecting the env value `false` as the CLI value.
+    let mut value: bool = false;
+    env_fallback_kv_skip_last_layer(&mut value);
+    assert!(!value, "value must remain false when env and CLI agree");
+}
+
+/// Fix 2: when LLAMA_ARG_KV_SKIP_LAST_LAYER is unparseable, the function must
+/// fall through to MLXCEL_KV_SKIP_LAST_LAYER and apply the valid fallback.
+#[test]
+fn kv_skip_last_layer_unparseable_llama_falls_through_to_mlxcel() {
+    let _env_guard = env_lock();
+    let _guard1 = EnvGuard::set("LLAMA_ARG_KV_SKIP_LAST_LAYER", "garbage");
+    let _guard2 = EnvGuard::set("MLXCEL_KV_SKIP_LAST_LAYER", "false");
+
+    // CLI default is `true` (the sentinel meaning "not overridden").
+    let mut value: bool = true;
+    env_fallback_kv_skip_last_layer(&mut value);
+    assert!(
+        !value,
+        "MLXCEL_KV_SKIP_LAST_LAYER=false must apply when LLAMA_ARG_KV_SKIP_LAST_LAYER is unparseable"
+    );
+}
+
+/// Fix 2: a parseable LLAMA_ARG_KV_SKIP_LAST_LAYER must still take effect
+/// (regression guard — the fall-through fix must not break the happy path).
+#[test]
+fn kv_skip_last_layer_parseable_llama_applies() {
+    let _env_guard = env_lock();
+    let _guard = EnvGuard::set("LLAMA_ARG_KV_SKIP_LAST_LAYER", "false");
+
+    let mut value: bool = true;
+    env_fallback_kv_skip_last_layer(&mut value);
+    assert!(!value, "LLAMA_ARG_KV_SKIP_LAST_LAYER=false must be applied");
+}
+
+/// Fix 2: when both LLAMA and MLXCEL env vars are unparseable, value stays at
+/// the CLI default (true).
+#[test]
+fn kv_skip_last_layer_both_unparseable_keeps_cli_default() {
+    let _env_guard = env_lock();
+    let _guard1 = EnvGuard::set("LLAMA_ARG_KV_SKIP_LAST_LAYER", "garbage");
+    let _guard2 = EnvGuard::set("MLXCEL_KV_SKIP_LAST_LAYER", "also-garbage");
+
+    let mut value: bool = true;
+    env_fallback_kv_skip_last_layer(&mut value);
+    assert!(
+        value,
+        "value must remain at CLI default when all env vars are unparseable"
     );
 }

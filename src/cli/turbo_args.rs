@@ -284,13 +284,21 @@ pub fn env_fallback_cache_type_v(value: &mut Option<String>) {
 
 /// Shared helper: if `value` is `None` and the named env var is set, fill
 /// `value` from the env var. If `value` is `Some` (CLI was set) and the env
-/// var is also present, log an INFO and keep the CLI value.
+/// var is also present and differs, log an INFO and keep the CLI value.
+/// When `value` already equals the env var string (because clap's `env = "..."`
+/// injected it), no conflict log is emitted since there is no real conflict.
 fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
     if value.is_some() {
-        if std::env::var_os(key).is_some() {
-            tracing::info!(
-                "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
-            );
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            // Only log a conflict when the values genuinely differ. When
+            // clap injected the env var as the CLI value they are equal
+            // and logging would be misleading.
+            if value.as_deref() != Some(trimmed) {
+                tracing::info!(
+                    "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
+                );
+            }
         }
         return;
     }

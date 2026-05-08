@@ -307,6 +307,19 @@ pub struct ServerConfig {
     /// when constructing per-sequence `CxxGenerator` instances so that every
     /// sequence in the batch sees the same KV quantization policy.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+
+    /// Issue #545: batch KV cache quantization configuration for the
+    /// continuous-batching scheduler.
+    ///
+    /// Resolved from the `--kv-bits`, `--kv-group-size`,
+    /// `--kv-quant-scheme`, and `--kv-skip-last-layer` CLI flags. When
+    /// disabled (`bits == 0`) the scheduler honours the legacy
+    /// [`Self::kv_cache_mode`] field. When enabled, the resolved
+    /// per-layer modes from
+    /// [`mlxcel_core::cache::BatchKvQuantConfig::resolve_layer_modes`]
+    /// take precedence (with the last layer forced to FP16 when
+    /// `skip_last_layer == true`).
+    pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
 }
 
 impl Default for ServerConfig {
@@ -353,6 +366,7 @@ impl Default for ServerConfig {
             chat_template_kwargs: None,
             prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
         }
     }
 }

@@ -982,3 +982,163 @@ fn scheduler_paged_turbo_layout_arguments_are_valid() {
         });
     }
 }
+
+// -------------------------------------------------------------------
+// Issue #545 — Batched KV quantization config plumbing
+// -------------------------------------------------------------------
+//
+// These tests exercise the resolver in `cli_input.rs` and the per-layer
+// mode table that the scheduler reads when applying the configured
+// quantization to each new sequence's caches. They do not require a
+// real model — they cover the data-flow plumbing only. The end-to-end
+// "decoded output within tolerance of unquantized baseline" criterion
+// is validated separately with a real model (the issue's
+// "regression tests cover both cache variants on a small batched
+// scenario" item).
+
+#[test]
+fn cli_resolver_disabled_returns_default_disabled_config() {
+    use crate::server::resolve_batch_kv_quant_config;
+    let cfg = resolve_batch_kv_quant_config(0, 64, None, true).unwrap();
+    assert!(!cfg.is_enabled());
+    assert_eq!(
+        cfg.base_mode(),
+        mlxcel_core::cache::KVCacheMode::Fp16,
+        "disabled config must map to Fp16 baseline"
+    );
+}
+
+#[test]
+fn cli_resolver_uniform_8bit_default_scheme() {
+    use crate::server::resolve_batch_kv_quant_config;
+    // No --kv-quant-scheme provided → default Uniform.
+    let cfg = resolve_batch_kv_quant_config(8, 64, None, true).unwrap();
+    assert!(cfg.is_enabled());
+    assert_eq!(
+        cfg.scheme,
+        mlxcel_core::cache::KvQuantScheme::Uniform,
+        "default scheme must be Uniform"
+    );
+    assert_eq!(cfg.base_mode(), mlxcel_core::cache::KVCacheMode::Int8);
+}
+
+#[test]
+fn cli_resolver_turboquant_4bit_explicit_scheme() {
+    use crate::server::resolve_batch_kv_quant_config;
+    let cfg = resolve_batch_kv_quant_config(4, 64, Some("turboquant"), true).unwrap();
+    assert!(cfg.is_enabled());
+    assert_eq!(cfg.scheme, mlxcel_core::cache::KvQuantScheme::TurboQuant);
+    assert_eq!(cfg.base_mode(), mlxcel_core::cache::KVCacheMode::Turbo4Asym);
+}
+
+#[test]
+fn cli_resolver_rejects_uniform_4bit_combination() {
+    use crate::server::resolve_batch_kv_quant_config;
+    // (Uniform, 4) has no Int4Affine single-stream cache mode in
+    // mlxcel-core today. The previous behaviour was to silently downgrade
+    // `base_mode()` to `Fp16`, which meant operators saw no quantization
+    // with no error. The resolver now rejects this combination at server
+    // startup and points operators at the supported 4-bit batched mode
+    // (TurboQuant) and the supported 8-bit uniform mode.
+    let err = resolve_batch_kv_quant_config(4, 64, Some("uniform"), true).unwrap_err();
+    assert!(
+        err.contains("--kv-quant-scheme uniform")
+            && err.contains("--kv-bits 4")
+            && err.contains("not yet supported"),
+        "expected error about unsupported (uniform, 4) combination, got: {err}"
+    );
+    assert!(
+        err.contains("turboquant") && err.contains("--kv-bits 8"),
+        "expected error to suggest both turboquant and 8-bit alternatives, got: {err}"
+    );
+}
+
+#[test]
+fn cli_resolver_rejects_invalid_bits() {
+    use crate::server::resolve_batch_kv_quant_config;
+    // 6 is not in the supported set for either scheme.
+    let err = resolve_batch_kv_quant_config(6, 64, Some("uniform"), true).unwrap_err();
+    assert!(err.contains("not supported"));
+}
+
+#[test]
+fn cli_resolver_rejects_unknown_scheme_string() {
+    use crate::server::resolve_batch_kv_quant_config;
+    let err = resolve_batch_kv_quant_config(8, 64, Some("polar"), true).unwrap_err();
+    assert!(err.contains("unknown --kv-quant-scheme"));
+}
+
+#[test]
+fn cli_resolver_falls_back_to_default_group_size_when_zero() {
+    use crate::server::resolve_batch_kv_quant_config;
+    // group_size == 0 is the "use default" sentinel: validators should
+    // not see a non-positive group when we route through the resolver.
+    let cfg = resolve_batch_kv_quant_config(8, 0, None, true).unwrap();
+    assert_eq!(cfg.group_size, mlxcel_core::cache::DEFAULT_KV_GROUP_SIZE);
+}
+
+#[test]
+fn skip_last_layer_default_is_true_in_resolver() {
+    use crate::server::resolve_batch_kv_quant_config;
+    let cfg = resolve_batch_kv_quant_config(0, 64, None, true).unwrap();
+    assert!(cfg.skip_last_layer);
+}
+
+// -------------------------------------------------------------------
+// Issue #545 — Per-layer mode table for batched scheduler
+// -------------------------------------------------------------------
+
+/// The scheduler's `apply_kv_cache_mode_to` method reads the resolved
+/// per-layer modes from `BatchKvQuantConfig::resolve_layer_modes` when
+/// the new config is enabled. This test verifies the table directly so
+/// we do not need a real model + sequence state to exercise it.
+#[test]
+fn batch_kv_quant_per_layer_table_skips_last_layer_only() {
+    let cfg = mlxcel_core::cache::BatchKvQuantConfig::new(
+        mlxcel_core::cache::KvQuantScheme::Uniform,
+        8,
+        64,
+        true,
+    )
+    .unwrap();
+    let modes = cfg.resolve_layer_modes(40); // gemma-4-31b-class
+    assert_eq!(modes.len(), 40);
+    // Issue #545: ONLY the last layer is skipped, NOT first 2 + last 2
+    // (that latter behaviour is the existing Boundary-V from #478, which
+    // is a separate orthogonal mechanism).
+    assert_eq!(
+        modes[0],
+        mlxcel_core::cache::KVCacheMode::Int8,
+        "first layer must keep nominal mode (last-layer-skip is separate from Boundary-V)"
+    );
+    assert_eq!(
+        modes[1],
+        mlxcel_core::cache::KVCacheMode::Int8,
+        "second layer must keep nominal mode"
+    );
+    assert_eq!(modes[38], mlxcel_core::cache::KVCacheMode::Int8);
+    assert_eq!(
+        modes[39],
+        mlxcel_core::cache::KVCacheMode::Fp16,
+        "last layer MUST be downgraded to Fp16 when skip_last_layer is set"
+    );
+}
+
+#[test]
+fn batch_kv_quant_per_layer_table_disabled_skip_keeps_uniform_modes() {
+    let cfg = mlxcel_core::cache::BatchKvQuantConfig::new(
+        mlxcel_core::cache::KvQuantScheme::TurboQuant,
+        4,
+        64,
+        false,
+    )
+    .unwrap();
+    let modes = cfg.resolve_layer_modes(8);
+    for (i, mode) in modes.iter().enumerate() {
+        assert_eq!(
+            *mode,
+            mlxcel_core::cache::KVCacheMode::Turbo4Asym,
+            "layer {i} must keep nominal Turbo4Asym when skip_last_layer is disabled"
+        );
+    }
+}

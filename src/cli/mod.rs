@@ -21,4 +21,5 @@
 //! help text, env-var bridges, and resolution helpers stay defined in exactly
 //! one place.
 
+pub mod batch_quant_args;
 pub mod turbo_args;

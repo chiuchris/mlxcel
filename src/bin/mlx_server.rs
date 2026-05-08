@@ -15,12 +15,14 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
+use mlxcel::cli::batch_quant_args::BatchKvQuantArgs;
 use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::{DownloadArgs, DownloadOptions, download_repo};
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
     ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
-    env_fallback_chat_template_kwargs, env_fallback_lang_bias,
+    env_fallback_chat_template_kwargs, env_fallback_kv_bits, env_fallback_kv_group_size,
+    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
     env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
     env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
     env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
@@ -613,10 +615,21 @@ struct ServerArgs {
     // Placed immediately before the `lang_bias` flatten so that the
     // `KV Cache (TurboQuant) Options` heading introduced by `TurboKvCacheArgs`
     // does not bleed into sibling fields below; the next `next_help_heading`
-    // (`Language Bias Options`, set on `LangBiasCliArgs`) takes over the
-    // moment lang_bias is parsed.
+    // (`Batch KV Quantization Options`, set on `BatchKvQuantArgs`, then
+    // `Language Bias Options`, set on `LangBiasCliArgs`) takes over the
+    // moment the next group is parsed.
     #[command(flatten)]
     turbo: TurboKvCacheArgs,
+
+    /// Issue #545: continuous-batching KV quantization flag group
+    /// (`--kv-bits`, `--kv-group-size`, `--kv-quant-scheme`,
+    /// `--kv-skip-last-layer`). Defined once in
+    /// `mlxcel::cli::batch_quant_args` so both server binaries
+    /// (`mlxcel serve`, `mlxcel-server`) expose identical help text and
+    /// flags. Not flattened on `mlxcel generate`; the offline path has no
+    /// continuous-batching scheduler to feed.
+    #[command(flatten)]
+    batch_quant: BatchKvQuantArgs,
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. See `--lang-bias`, `--lang-bias-config`, `--lang-bias-policy`,
@@ -802,6 +815,15 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // warn-on-conflict logic (e.g. if a separate MLXCEL_* alias is added).
     env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
     env_fallback_cache_type_v(&mut args.turbo.cache_type_v);
+    // Issue #545: env-var fallbacks for the continuous-batching KV
+    // quantization knobs. The flags themselves live in
+    // `mlxcel::cli::batch_quant_args::BatchKvQuantArgs` (flattened above);
+    // these helpers honor the warn-on-CLI-conflict pattern shared with the
+    // other LLAMA_ARG_* env vars.
+    env_fallback_kv_bits(&mut args.batch_quant.kv_bits);
+    env_fallback_kv_group_size(&mut args.batch_quant.kv_group_size);
+    env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme);
+    env_fallback_kv_skip_last_layer(&mut args.batch_quant.kv_skip_last_layer);
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
@@ -915,5 +937,11 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         cache_type_k: args.turbo.cache_type_k,
         cache_type_v: args.turbo.cache_type_v,
         kv_cache_mode_legacy: args.turbo.kv_cache_mode,
+        // Issue #545: continuous-batching KV quantization knobs (flattened
+        // from `BatchKvQuantArgs`).
+        kv_bits: args.batch_quant.kv_bits,
+        kv_group_size: args.batch_quant.kv_group_size,
+        kv_quant_scheme: args.batch_quant.kv_quant_scheme,
+        kv_skip_last_layer: args.batch_quant.kv_skip_last_layer,
     })
 }

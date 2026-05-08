@@ -248,6 +248,20 @@ pub struct ServerStartupConfig {
     /// one of K or V is specified, the unspecified side defaults to `fp16`.
     /// Unsupported K/V combinations are rejected at startup.
     pub kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+
+    /// Issue #545: resolved batch KV cache quantization configuration
+    /// (uniform `mx.quantize` or TurboQuant variant) for the
+    /// continuous-batching path.
+    ///
+    /// Built from the `--kv-bits`, `--kv-group-size`, `--kv-quant-scheme`,
+    /// and `--kv-skip-last-layer` CLI flags. When `bits == 0`
+    /// ([`mlxcel_core::cache::BatchKvQuantConfig::is_enabled`] returns
+    /// `false`) the batched scheduler keeps the legacy
+    /// `kv_cache_mode`-driven path bit-exactly. Otherwise the scheduler
+    /// reuses `BatchKvQuantConfig::resolve_layer_modes` so the last layer
+    /// stays at FP16 even when the nominal mode is quantized — preserving
+    /// quality on deep models such as gemma-4-31b.
+    pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
 }
 
 impl Default for ServerStartupConfig {
@@ -330,6 +344,7 @@ impl Default for ServerStartupConfig {
             chat_template_kwargs: None,
             prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
         }
     }
 }
@@ -492,6 +507,10 @@ pub(super) fn build_server_config(
         // Issue #484 (B11): wire the resolved KV cache mode through so the
         // model worker can apply it when constructing per-sequence generators.
         kv_cache_mode: startup.kv_cache_mode,
+        // Issue #545: wire the resolved batch KV quant config through so
+        // the continuous-batching scheduler can apply per-layer modes
+        // (with the last-layer skip) at sequence allocation time.
+        batch_kv_quant: startup.batch_kv_quant,
     }
 }
 

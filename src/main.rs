@@ -17,6 +17,7 @@ use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
 mod commands;
+use mlxcel::cli::batch_quant_args::BatchKvQuantArgs;
 use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::DownloadArgs;
 use mlxcel::lang_bias::LangBiasCliArgs;
@@ -725,10 +726,21 @@ pub(crate) struct ServeArgs {
     // Placed immediately before the `lang_bias` flatten so that the
     // `KV Cache (TurboQuant) Options` heading introduced by `TurboKvCacheArgs`
     // does not bleed into sibling fields below; the next `next_help_heading`
-    // (`Language Bias Options`, set on `LangBiasCliArgs`) takes over the
-    // moment lang_bias is parsed.
+    // (`Batch KV Quantization Options`, set on `BatchKvQuantArgs`, then
+    // `Language Bias Options`, set on `LangBiasCliArgs`) takes over the
+    // moment the next group is parsed.
     #[command(flatten)]
     turbo: TurboKvCacheArgs,
+
+    /// Issue #545: continuous-batching KV quantization flag group
+    /// (`--kv-bits`, `--kv-group-size`, `--kv-quant-scheme`,
+    /// `--kv-skip-last-layer`). Defined once in
+    /// `mlxcel::cli::batch_quant_args` so both server binaries
+    /// (`mlxcel serve`, `mlxcel-server`) expose identical help text and
+    /// flags. Not flattened on `mlxcel generate`; the offline path has no
+    /// continuous-batching scheduler to feed.
+    #[command(flatten)]
+    batch_quant: BatchKvQuantArgs,
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. Mirrors the same flags exposed on the `generate` subcommand.

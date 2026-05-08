@@ -33,8 +33,8 @@ use std::sync::mpsc;
 use std::time::Instant;
 
 use mlxcel_core::cache::{
-    CachePool, DetachedCacheSet, KVCacheMode, PagedKvLayout, SequenceId, SequenceStateBackend,
-    SequenceStateLayout,
+    BatchKvQuantConfig, CachePool, DetachedCacheSet, KVCacheMode, PagedKvLayout, SequenceId,
+    SequenceStateBackend, SequenceStateLayout,
 };
 use mlxcel_core::generate::{
     DecodeBatchContext, DecodeStorageBackend as CoreDecodeStorageBackend, LanguageModel,
@@ -168,6 +168,16 @@ pub struct BatchScheduler {
     ///
     /// Defaults to [`KVCacheMode::Fp16`] (bit-exact baseline).
     kv_cache_mode: KVCacheMode,
+
+    /// Issue #545: server-wide batch KV quantization configuration.
+    ///
+    /// When [`BatchKvQuantConfig::is_enabled`] returns `true`, the
+    /// scheduler resolves per-layer modes from this config (with the
+    /// last layer optionally forced to FP16 per
+    /// [`BatchKvQuantConfig::skip_last_layer`]) and uses them in place of
+    /// the legacy [`Self::kv_cache_mode`]-driven path. When disabled
+    /// (the default), the legacy path is bit-exact preserved.
+    batch_kv_quant: BatchKvQuantConfig,
 
     // -- Vision feature cache --
     /// Per-model vision feature cache bundle. Contains LRU caches for
@@ -328,6 +338,7 @@ impl BatchScheduler {
             prompt_cache: None,
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
             kv_cache_mode: KVCacheMode::Fp16,
+            batch_kv_quant: BatchKvQuantConfig::default(),
         }
     }
 
@@ -347,6 +358,27 @@ impl BatchScheduler {
     /// Returns the server-wide KV cache quantization mode (for tests).
     pub fn kv_cache_mode(&self) -> KVCacheMode {
         self.kv_cache_mode
+    }
+
+    /// Attach the server-wide batch KV quantization configuration
+    /// (issue #545).
+    ///
+    /// When `config.is_enabled()` returns `true`, every newly-allocated
+    /// sequence's per-layer caches are upgraded from the default Fp16
+    /// to the resolved nominal [`KVCacheMode`], with the last layer
+    /// optionally forced back to Fp16 per `config.skip_last_layer`. When
+    /// `config.is_enabled()` is `false` (the default) this builder is a
+    /// no-op and the legacy [`Self::with_kv_cache_mode`] path is used
+    /// bit-exactly.
+    pub fn with_batch_kv_quant(mut self, config: BatchKvQuantConfig) -> Self {
+        self.batch_kv_quant = config;
+        self
+    }
+
+    /// Returns the server-wide batch KV quantization configuration (for
+    /// tests).
+    pub fn batch_kv_quant(&self) -> BatchKvQuantConfig {
+        self.batch_kv_quant
     }
 
     /// Replace the default vision feature cache with one sized per the server
@@ -760,12 +792,14 @@ impl BatchScheduler {
     /// [`mlxcel_core::cache::turbo::resolve_layer_modes`] so boundary
     /// layers stay FP16 (issue #478) for quality.
     ///
-    /// Used by: [`Self::allocate_sequence_state`] (#508).
+    /// Issue #545: when [`BatchKvQuantConfig::is_enabled`] returns
+    /// `true`, the per-layer mode table is sourced from
+    /// [`BatchKvQuantConfig::resolve_layer_modes`] instead — that table
+    /// honours the `skip_last_layer` policy, which is distinct from
+    /// (and composes with) the existing Boundary-V mechanism.
+    ///
+    /// Used by: [`Self::allocate_sequence_state`] (#508, #545).
     fn apply_kv_cache_mode_to(&mut self, seq_id: SequenceId) {
-        let nominal = self.kv_cache_mode;
-        if nominal == KVCacheMode::Fp16 {
-            return;
-        }
         let Some(caches) = self.cache_pool.get_caches_mut(seq_id) else {
             return;
         };
@@ -776,10 +810,29 @@ impl BatchScheduler {
             return;
         }
         let n_layers = caches.len();
+
+        // Issue #545: when the batched KV quant config is active, it
+        // takes precedence over the legacy `kv_cache_mode` path. The
+        // resolved table already encodes the per-layer mode (with the
+        // last-layer skip applied), so apply it directly.
+        if self.batch_kv_quant.is_enabled() {
+            let layer_modes = self.batch_kv_quant.resolve_layer_modes(n_layers);
+            for (cache, mode) in caches.iter_mut().zip(layer_modes) {
+                cache.mode = mode;
+            }
+            return;
+        }
+
+        // Legacy path (issue #484 / #508): nominal mode + Boundary-V
+        // protection only.
+        let nominal = self.kv_cache_mode;
+        if nominal == KVCacheMode::Fp16 {
+            return;
+        }
         let requested = mlxcel_core::cache::turbo::boundary_v_layers_from_env();
         let layer_modes =
             mlxcel_core::cache::turbo::resolve_layer_modes(nominal, n_layers, requested);
-        for (cache, mode) in caches.iter_mut().zip(layer_modes.into_iter()) {
+        for (cache, mode) in caches.iter_mut().zip(layer_modes) {
             cache.mode = mode;
         }
     }
@@ -804,12 +857,20 @@ impl BatchScheduler {
         }
 
         let num_layers = self.model.num_layers();
+        // Issue #545: prefer the batched KV quant config when active so
+        // its `base_mode()` drives paged-layout selection (Turbo-aware
+        // when scheme is TurboQuant, otherwise the legacy uniform path).
+        let effective_mode = if self.batch_kv_quant.is_enabled() {
+            self.batch_kv_quant.base_mode()
+        } else {
+            self.kv_cache_mode
+        };
         // Issue #508: when a Turbo4 cache mode is configured, build a
         // packed-aware paged layout (PR #502 / issue #482) so per-page
         // sidecar accounting and detach/adopt round-trip work correctly.
         // Fp16/Int8 keep the historical `PagedKvLayout::uniform` path —
         // bit-identical to pre-#508.
-        let paged_layout = if Self::is_turbo_mode(self.kv_cache_mode) {
+        let paged_layout = if Self::is_turbo_mode(effective_mode) {
             // The actual per-token packed sidecar size depends on the
             // model's V head_dim, which is not known to the scheduler
             // at construction time (the dense `KVCache::update_turbo4_*`
@@ -825,7 +886,7 @@ impl BatchScheduler {
                 num_layers,
                 DEFAULT_PAGED_BLOCK_SIZE,
                 DEFAULT_PAGED_BLOCK_SIZE,
-                self.kv_cache_mode,
+                effective_mode,
                 sidecar_bytes_per_block,
             )
             .expect("valid paged Turbo4 decode layout")

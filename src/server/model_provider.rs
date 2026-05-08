@@ -186,6 +186,7 @@ impl ModelProvider {
                 config.reasoning_budget,
                 prompt_cache_store,
                 config.kv_cache_mode,
+                config.batch_kv_quant,
                 batch_metrics,
                 batch_observability,
             )
@@ -323,6 +324,7 @@ impl ModelProvider {
             reasoning_budget,
             None,
             mlxcel_core::cache::KVCacheMode::Fp16,
+            mlxcel_core::cache::BatchKvQuantConfig::default(),
             batch_metrics,
             batch_observability,
         )
@@ -351,6 +353,7 @@ impl ModelProvider {
         reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+        batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -382,6 +385,7 @@ impl ModelProvider {
             reasoning_budget,
             prompt_cache: prompt_cache_store.clone(),
             kv_cache_mode,
+            batch_kv_quant,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -450,6 +454,7 @@ impl ModelProvider {
             reasoning_budget: None,
             prompt_cache: None,
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
+            batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
