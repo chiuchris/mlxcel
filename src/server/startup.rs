@@ -1111,6 +1111,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
 
     let api_key = resolve_api_key(startup.api_key.clone(), startup.api_key_file.as_deref())?;
     let mut config = build_server_config(&startup, api_key);
+
     if config.pipeline_parallel_runtime.is_some() && distributed.pipeline_runtime.is_some() {
         anyhow::bail!(
             "server startup resolved both in-process and remote pipeline runtimes; remove either --pp-layers or the remote pipeline cluster topology"
@@ -1191,6 +1192,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         None
     };
 
+    // Issue #548: `--timeout` is validated inside `new_with_server_config_and_prompt_cache` and
+    // the resolved `Duration` is stashed on `ModelProvider`, where it flows into the drain loops.
+    // A zero value triggers a logged warning and falls back to the 300 s default.
     let model_provider = Arc::new(ModelProvider::new_with_server_config_and_prompt_cache(
         startup.model_path.clone(),
         startup.adapter_path.clone(),

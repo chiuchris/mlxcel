@@ -169,7 +169,9 @@ async fn stream_native_completion(
     options.reasoning_budget = budget_override;
     let prompt = request.prompt.clone();
 
-    let (events, stream, cancelled) = sse_channel(100);
+    // Issue #548: sse_channel also returns an SseKeepAlive for proxy
+    // idle-timeout prevention during long prefill phases.
+    let (events, stream, cancelled, keepalive) = sse_channel(100);
     let finish_events = events.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -201,7 +203,9 @@ async fn stream_native_completion(
         let _ = finish_events.json(&final_chunk);
     });
 
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(keepalive.into_inner())
+        .into_response()
 }
 
 fn build_native_options(

@@ -15,7 +15,10 @@
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{CancellationToken, DONE_MARKER, payload_channel, serialize_json_data};
+use super::{
+    CancellationToken, DONE_MARKER, SSE_KEEPALIVE_INTERVAL_SECS, payload_channel,
+    serialize_json_data,
+};
 use crate::server::types::{ChatCompletionChunk, CompletionChunk};
 
 #[derive(Serialize)]
@@ -292,3 +295,70 @@ fn sender_without_cancellation_token_does_not_panic_on_dropped_receiver() {
     // Should not panic even without a cancellation token
     sender.text("hello");
 }
+
+// ── Long-prefill keepalive regression tests (issue #548) ────────────────────
+
+/// The SSE keepalive interval must be less than typical proxy idle timeouts
+/// (nginx 60 s, HAProxy 60 s, AWS ALB 60 s) so that long-prefill requests
+/// keep the connection alive.
+///
+/// This is enforced as a `const` assertion so a regression is caught at
+/// compile time rather than test time. (Using `assert!` on a constant
+/// expression triggers `clippy::assertions_on_constants`.)
+const _: () = assert!(
+    SSE_KEEPALIVE_INTERVAL_SECS < 60,
+    "SSE keepalive interval must be less than the 60s default used by most reverse proxies"
+);
+
+/// During a long prefill phase (no events from the model worker), the SSE
+/// channel must remain open and operational. This test exercises the token
+/// queue flow without a real model: the sender holds the channel open while
+/// a background thread simulates the prefill delay before sending the first
+/// token. The receiver must not error out during the wait (issue #548).
+#[test]
+fn long_prefill_channel_stays_open_before_first_token() {
+    use std::thread;
+    use std::time::Duration;
+
+    // Buffer of 4 is enough for our synthetic token sequence.
+    let (sender, mut rx) = payload_channel(4, None);
+
+    // Simulate the model worker: pause for 50 ms (representing a long prefill),
+    // then emit a token event and a DONE marker. The channel must survive the
+    // delay without being closed or timing out.
+    let sender_clone = sender.clone();
+    let worker = thread::spawn(move || {
+        // Simulate prefill latency — no events emitted during this window.
+        thread::sleep(Duration::from_millis(50));
+        // First generated token arrives after prefill completes.
+        sender_clone.text("hello");
+        sender_clone.done();
+    });
+
+    // The receiver should successfully collect both the token and the DONE
+    // marker without error, even though there was a delay before the first
+    // event arrived.
+    let first = rx
+        .blocking_recv()
+        .expect("channel must stay open during prefill");
+    assert_eq!(first.unwrap(), "hello", "first token must be correct");
+
+    let second = rx
+        .blocking_recv()
+        .expect("channel must deliver DONE marker");
+    assert_eq!(
+        second.unwrap(),
+        DONE_MARKER,
+        "DONE marker must follow the token"
+    );
+
+    worker.join().expect("worker thread must not panic");
+}
+
+// TODO: add a test that verifies the SSE keepalive comment frame is emitted
+// before the first event arrives (issue #548 LOW #2). This requires an axum
+// integration test harness to drive `Sse::new(stream).keep_alive(...)` end-to-end
+// and read raw SSE frames from the response body. The existing unit-level
+// `payload_channel` tests cannot reach the axum `KeepAlive` layer. A suitable
+// approach would be `axum_test::TestClient` or `tower::ServiceExt::oneshot`
+// with `hyper::body::to_bytes`; skipped here to avoid the additional test infra.

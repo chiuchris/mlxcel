@@ -21,6 +21,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
+use std::time::Duration;
 
 use anyhow::Result;
 use mlxcel_core::sampling::TokenLogprobData;
@@ -89,6 +90,13 @@ pub struct ModelProvider {
     /// Shared cross-request prompt-prefix KV cache (epic #416 / issue #419).
     /// `None` when the feature is disabled by config.
     prompt_cache: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+    /// Bounded wait applied during the decode phase of `drain_generation_events*`
+    /// to detect a hung model worker (issue #548).
+    ///
+    /// Resolved at startup from the `--timeout` CLI flag via
+    /// [`validated_decode_hang_timeout`]. Constructors that do not receive a
+    /// `ServerConfig` initialise this to [`DECODE_HANG_TIMEOUT`].
+    decode_hang_timeout: Duration,
     _worker_handle: thread::JoinHandle<()>,
 }
 
@@ -155,6 +163,12 @@ impl ModelProvider {
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
+        // Validate `--timeout` once at construction time and stash it on the
+        // provider so the same `Duration` is used by every drain loop. Issue
+        // #548: a value of 0 falls back to `DECODE_HANG_TIMEOUT` with a logged
+        // warning so an operator typo never silently expires every request.
+        let decode_hang_timeout = validated_decode_hang_timeout(config.timeout_seconds);
+
         if config.no_batch {
             let mut provider = Self::new_with_legacy_worker(
                 model_path,
@@ -168,9 +182,10 @@ impl ModelProvider {
             // legacy path won't exercise it yet — `AppState` should still
             // be able to observe it via the model provider handle.
             provider.prompt_cache = prompt_cache_store;
+            provider.decode_hang_timeout = decode_hang_timeout;
             Ok(provider)
         } else {
-            Self::new_with_full_config_and_prompt_cache(
+            let mut provider = Self::new_with_full_config_and_prompt_cache(
                 model_path,
                 adapter_path,
                 config.max_batch_size,
@@ -189,7 +204,9 @@ impl ModelProvider {
                 config.batch_kv_quant,
                 batch_metrics,
                 batch_observability,
-            )
+            )?;
+            provider.decode_hang_timeout = decode_hang_timeout;
+            Ok(provider)
         }
     }
 
@@ -239,6 +256,7 @@ impl ModelProvider {
             batch_metrics,
             batch_observability,
             prompt_cache: None,
+            decode_hang_timeout: DECODE_HANG_TIMEOUT,
             _worker_handle: worker_handle,
         })
     }
@@ -407,6 +425,7 @@ impl ModelProvider {
             batch_metrics,
             batch_observability,
             prompt_cache: prompt_cache_store,
+            decode_hang_timeout: DECODE_HANG_TIMEOUT,
             _worker_handle: worker_handle,
         })
     }
@@ -476,6 +495,7 @@ impl ModelProvider {
             batch_metrics,
             batch_observability,
             prompt_cache: None,
+            decode_hang_timeout: DECODE_HANG_TIMEOUT,
             _worker_handle: worker_handle,
         })
     }
@@ -541,7 +561,7 @@ impl ModelProvider {
         audio: Vec<Vec<u8>>,
     ) -> Result<GenerationResult> {
         let response_rx = self.send_generate_request(prompt, options, images, audio)?;
-        drain_generation_events(response_rx, |_| {})
+        drain_generation_events(response_rx, self.decode_hang_timeout, |_| {})
     }
 
     /// Generate text with streaming callback
@@ -569,7 +589,7 @@ impl ModelProvider {
         F: FnMut(String),
     {
         let response_rx = self.send_generate_request(prompt, options, images, Vec::new())?;
-        drain_generation_events(response_rx, callback)
+        drain_generation_events(response_rx, self.decode_hang_timeout, callback)
     }
 
     /// Generate text with optional images/audio and a logprobs-aware streaming callback.
@@ -589,7 +609,7 @@ impl ModelProvider {
         F: FnMut(String, Option<TokenLogprobData>),
     {
         let response_rx = self.send_generate_request(prompt, options, images, audio)?;
-        drain_generation_events_with_logprobs(response_rx, callback)
+        drain_generation_events_with_logprobs(response_rx, self.decode_hang_timeout, callback)
     }
 
     /// Generate text with streaming callback and cancellation support.
@@ -615,7 +635,7 @@ impl ModelProvider {
             Vec::new(),
             cancelled,
         )?;
-        drain_generation_events(response_rx, callback)
+        drain_generation_events(response_rx, self.decode_hang_timeout, callback)
     }
 
     /// Generate text with logprobs-aware streaming callback and cancellation
@@ -639,7 +659,7 @@ impl ModelProvider {
     {
         let response_rx = self
             .send_generate_request_with_cancellation(prompt, options, images, audio, cancelled)?;
-        drain_generation_events_with_logprobs(response_rx, callback)
+        drain_generation_events_with_logprobs(response_rx, self.decode_hang_timeout, callback)
     }
 
     fn send_generate_request(
@@ -692,8 +712,64 @@ fn send_shutdown_signal(request_tx: &mpsc::Sender<ModelRequest>) -> bool {
     request_tx.send(ModelRequest::Shutdown).is_ok()
 }
 
-fn drain_generation_events<F>(
+/// Default timeout applied after the first generated token has been received
+/// to detect a hung model worker (issue #548).
+///
+/// Once the prefill is complete and decoding has begun, each subsequent decode
+/// step should finish within a bounded wall-clock time. The model worker thread
+/// emits events in a tight loop during decode; if no event arrives within this
+/// window, the request is considered hung.
+///
+/// 300 seconds (5 minutes) is deliberately generous to handle large batch
+/// sizes, slow hardware, and long decode chains without causing false-positive
+/// timeouts during normal operation. Operators can configure this with
+/// `--timeout SECONDS`. Setting `--timeout 0` falls back to this 300 s default
+/// (with a logged warning at startup) because `0` would otherwise expire every
+/// request instantly.
+///
+/// At runtime the per-provider `Duration` resolved by
+/// [`validated_decode_hang_timeout`] is threaded through
+/// [`drain_generation_events`] / [`drain_generation_events_with_logprobs`] /
+/// [`drain_generation_events_impl`]; this constant is the fallback used by
+/// [`validated_decode_hang_timeout`] and the constructors that do not see a
+/// `ServerConfig`.
+#[doc(hidden)] // pub(crate) for tests
+pub(crate) const DECODE_HANG_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Validate `timeout_seconds` from the server config and convert it to a
+/// `Duration`.
+///
+/// Returns the configured duration on success. Logs a warning and returns the
+/// fallback ([`DECODE_HANG_TIMEOUT`]) when the value is `0`, which would cause
+/// every request to time out instantly (issue #548 — "invalid timeout config
+/// values produce a clean log message").
+///
+/// Used by: `ModelProvider::new_with_server_config_and_prompt_cache` (the only
+/// constructor that receives a `ServerConfig`); other constructors default to
+/// [`DECODE_HANG_TIMEOUT`].
+pub(crate) fn validated_decode_hang_timeout(timeout_seconds: u64) -> Duration {
+    if timeout_seconds == 0 {
+        tracing::warn!(
+            "server timeout_seconds is 0, which would expire immediately; \
+             using built-in fallback of {}s. \
+             Set --timeout to a positive value to suppress this warning.",
+            DECODE_HANG_TIMEOUT.as_secs()
+        );
+        return DECODE_HANG_TIMEOUT;
+    }
+    Duration::from_secs(timeout_seconds)
+}
+
+/// Drain `response_rx`, forwarding decoded tokens to `on_token` and applying
+/// the two-phase timeout policy described on
+/// [`drain_generation_events_impl`].
+///
+/// `decode_hang_timeout` is the per-provider Phase-2 bound resolved at startup
+/// via [`validated_decode_hang_timeout`]; pass [`DECODE_HANG_TIMEOUT`] when a
+/// caller has no configured value.
+pub(super) fn drain_generation_events<F>(
     response_rx: mpsc::Receiver<GenerateEvent>,
+    decode_hang_timeout: Duration,
     mut on_token: F,
 ) -> Result<GenerationResult>
 where
@@ -703,19 +779,21 @@ where
     // GenerationResult can carry them even in non-streaming mode.
     let mut accumulated_logprobs: Vec<TokenLogprobData> = Vec::new();
 
-    let mut result = loop {
-        match response_rx.recv() {
-            Ok(GenerateEvent::Token(token)) => on_token(token),
+    let mut result =
+        drain_generation_events_impl(&response_rx, decode_hang_timeout, |event| match event {
+            GenerateEvent::Token(token) => {
+                on_token(token);
+                Ok(None)
+            }
             // Collect logprobs even when the streaming callback ignores them.
-            Ok(GenerateEvent::TokenWithLogprobs(token, lp)) => {
+            GenerateEvent::TokenWithLogprobs(token, lp) => {
                 accumulated_logprobs.push(lp);
                 on_token(token);
+                Ok(None)
             }
-            Ok(GenerateEvent::Done(result)) => break result,
-            Ok(GenerateEvent::Error(err)) => return Err(anyhow::anyhow!(err)),
-            Err(_) => return Err(anyhow::anyhow!("Response channel closed")),
-        }
-    };
+            GenerateEvent::Done(result) => Ok(Some(result)),
+            GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+        })?;
 
     if !accumulated_logprobs.is_empty() {
         result.logprobs = Some(accumulated_logprobs);
@@ -724,20 +802,103 @@ where
     Ok(result)
 }
 
-fn drain_generation_events_with_logprobs<F>(
+/// Like [`drain_generation_events`] but exposes per-token logprob data to the
+/// callback. `decode_hang_timeout` follows the same contract.
+pub(super) fn drain_generation_events_with_logprobs<F>(
     response_rx: mpsc::Receiver<GenerateEvent>,
+    decode_hang_timeout: Duration,
     mut on_token: F,
 ) -> Result<GenerationResult>
 where
     F: FnMut(String, Option<TokenLogprobData>),
 {
+    drain_generation_events_impl(&response_rx, decode_hang_timeout, |event| match event {
+        GenerateEvent::Token(token) => {
+            on_token(token, None);
+            Ok(None)
+        }
+        GenerateEvent::TokenWithLogprobs(token, lp) => {
+            on_token(token, Some(lp));
+            Ok(None)
+        }
+        GenerateEvent::Done(result) => Ok(Some(result)),
+        GenerateEvent::Error(err) => Err(anyhow::anyhow!(err)),
+    })
+}
+
+/// Core receive loop that distinguishes "prefill still running" from "hung
+/// model" (issue #548).
+///
+/// Two-phase timeout strategy:
+///
+/// **Phase 1 — prefill window** (`decode_phase_started == false`): block
+/// indefinitely (`recv()`). Long prompts (32k+ tokens) may require minutes of
+/// prefill computation before the first generated token appears. Any timeout
+/// applied here would incorrectly abort valid in-progress requests.
+///
+/// **Phase 2 — decode window** (`decode_phase_started == true`): apply
+/// `decode_hang_timeout`. Once decoding has started, each subsequent decode
+/// step is a single forward pass that should complete in seconds even on slow
+/// hardware, so a bounded window catches genuine worker deadlocks without
+/// false-positives on legitimate long-running decode chains. The provider
+/// resolves this duration at startup from the `--timeout SECONDS` CLI flag via
+/// [`validated_decode_hang_timeout`]; `--timeout 0` falls back to the
+/// [`DECODE_HANG_TIMEOUT`] (300 s) default with a logged warning.
+///
+/// `handler` maps a `GenerateEvent` to `Ok(Some(result))` (done),
+/// `Ok(None)` (continue), or `Err(...)` (fatal).
+pub(super) fn drain_generation_events_impl<H>(
+    response_rx: &mpsc::Receiver<GenerateEvent>,
+    decode_hang_timeout: Duration,
+    mut handler: H,
+) -> Result<GenerationResult>
+where
+    H: FnMut(GenerateEvent) -> Result<Option<GenerationResult>>,
+{
+    // True once any token, logprob-token, or Done event has been seen.
+    // `Done` may arrive before any token (e.g. max_tokens=0 guard), so the
+    // flag reflects "the decode phase has begun" rather than "a token arrived".
+    let mut decode_phase_started = false;
+
     loop {
-        match response_rx.recv() {
-            Ok(GenerateEvent::Token(token)) => on_token(token, None),
-            Ok(GenerateEvent::TokenWithLogprobs(token, lp)) => on_token(token, Some(lp)),
-            Ok(GenerateEvent::Done(result)) => return Ok(result),
-            Ok(GenerateEvent::Error(err)) => return Err(anyhow::anyhow!(err)),
-            Err(_) => return Err(anyhow::anyhow!("Response channel closed")),
+        // Phase 1: infinite wait during prefill.
+        // Phase 2: bounded wait during decode to detect hangs.
+        let event = if decode_phase_started {
+            match response_rx.recv_timeout(decode_hang_timeout) {
+                Ok(ev) => ev,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    return Err(anyhow::anyhow!(
+                        "model worker did not produce a token within {}s after decode started; \
+                         possible hang or crash (issue #548). \
+                         Increase --timeout if this model legitimately takes longer.",
+                        decode_hang_timeout.as_secs()
+                    ));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow::anyhow!("Response channel closed"));
+                }
+            }
+        } else {
+            // Prefill may take minutes for very large prompts — wait without
+            // any timeout so we never spuriously abort a valid request.
+            match response_rx.recv() {
+                Ok(ev) => ev,
+                Err(_) => return Err(anyhow::anyhow!("Response channel closed")),
+            }
+        };
+
+        // Transition to decode phase on any token or result event.
+        match &event {
+            GenerateEvent::Token(_)
+            | GenerateEvent::TokenWithLogprobs(_, _)
+            | GenerateEvent::Done(_) => {
+                decode_phase_started = true;
+            }
+            GenerateEvent::Error(_) => {}
+        }
+
+        if let Some(result) = handler(event)? {
+            return Ok(result);
         }
     }
 }

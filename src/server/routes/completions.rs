@@ -268,7 +268,10 @@ async fn stream_completion(
         };
     }
 
-    let (events, stream, cancelled) = sse_channel(100);
+    // Issue #548: sse_channel also returns an SseKeepAlive that sends periodic
+    // SSE comment events to prevent proxy/client idle-timeout disconnects
+    // during long prefill phases.
+    let (events, stream, cancelled, keepalive) = sse_channel(100);
 
     // Clone for the spawned task
     let request_id_clone = request_id.clone();
@@ -343,5 +346,7 @@ async fn stream_completion(
         finish_events.done();
     });
 
-    Sse::new(stream).into_response()
+    Sse::new(stream)
+        .keep_alive(keepalive.into_inner())
+        .into_response()
 }

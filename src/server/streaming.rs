@@ -16,18 +16,72 @@
 //!
 //! Chat, completion, and llama-server-compatible routes all stream over the
 //! same blocking channel pattern even though their payload shapes differ.
+//!
+//! ## Long-prefill keepalive
+//!
+//! When a prompt is large (e.g. 32k+ tokens), the batch scheduler may spend
+//! tens of seconds running the prefill forward pass before emitting the first
+//! generated token. During that window the SSE stream is open but silent.
+//! Reverse proxies and HTTP clients that apply per-stream idle timeouts (nginx
+//! `proxy_read_timeout`, HAProxy `timeout tunnel`, AWS ALB 60 s default, etc.)
+//! will drop the connection before the first token arrives.
+//!
+//! `sse_channel` returns a keepalive configuration via `SseKeepAlive` that
+//! route handlers must attach to the `Sse` response with `.keep_alive()`. The
+//! keepalive interval is 15 seconds — shorter than typical proxy idle timeouts
+//! and long enough not to spam comment events for short responses.
 
 use std::convert::Infallible;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use axum::response::sse::Event;
+use axum::response::sse::{Event, KeepAlive};
 use futures::{Stream, StreamExt};
 use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
 pub(crate) const DONE_MARKER: &str = "[DONE]";
+
+/// Default interval at which SSE keepalive comment events are sent during
+/// long prefills so that proxies and HTTP clients do not time out the
+/// connection before the first token arrives.
+///
+/// 15 seconds is shorter than virtually all proxy idle timeouts (nginx
+/// default 60 s, HAProxy 60 s, AWS ALB 60 s) while being long enough to
+/// avoid noticeable overhead for ordinary short responses.
+pub(crate) const SSE_KEEPALIVE_INTERVAL_SECS: u64 = 15;
+
+/// Keepalive configuration attached to an `Sse` response.
+///
+/// Constructed by `sse_channel` and passed through to route handlers so they
+/// can call `Sse::new(stream).keep_alive(keepalive.into_inner())`. Using a
+/// newtype keeps the keepalive wired to the same channel creation point and
+/// makes it impossible to forget to attach it. The inner `KeepAlive` is private
+/// to prevent callers from constructing a mismatched keepalive independently.
+///
+/// Used by: chat.rs, completions.rs, native_completion.rs
+pub(crate) struct SseKeepAlive(KeepAlive);
+
+impl SseKeepAlive {
+    /// Build a keepalive that sends an empty comment every
+    /// [`SSE_KEEPALIVE_INTERVAL_SECS`] seconds to prevent proxy timeouts
+    /// during long prefill phases.
+    ///
+    /// `KeepAlive::new()` already emits an empty SSE comment by default, so
+    /// only the interval needs to be customised.
+    pub(crate) fn default_for_long_prefill() -> Self {
+        Self(KeepAlive::new().interval(Duration::from_secs(SSE_KEEPALIVE_INTERVAL_SECS)))
+    }
+
+    /// Unwrap the inner `KeepAlive` for attaching to an `Sse` response.
+    ///
+    /// Consuming `self` ensures each `SseKeepAlive` is applied exactly once.
+    pub(crate) fn into_inner(self) -> KeepAlive {
+        self.0
+    }
+}
 
 type SsePayload = Result<String, Infallible>;
 
@@ -48,11 +102,16 @@ pub(crate) struct BlockingSseSender {
 
 /// Create an SSE channel with a cancellation token.
 ///
-/// Returns `(sender, stream, cancellation_token)`. The cancellation token is
-/// an `Arc<AtomicBool>` that is set to `true` when `BlockingSseSender::text()`
-/// detects the client has disconnected (SSE receiver dropped). Pass the token
-/// to `ModelRequest::Generate` so the `BatchScheduler` can abort orphaned
-/// sequences.
+/// Returns `(sender, stream, cancellation_token, keepalive)`. The cancellation
+/// token is an `Arc<AtomicBool>` that is set to `true` when
+/// `BlockingSseSender::text()` detects the client has disconnected (SSE
+/// receiver dropped). Pass the token to `ModelRequest::Generate` so the
+/// `BatchScheduler` can abort orphaned sequences.
+///
+/// The `keepalive` value must be attached to the `Sse` response via
+/// `Sse::new(stream).keep_alive(keepalive.0)` in the route handler. This
+/// ensures proxy idle timeouts do not close the connection during long prefill
+/// phases before the first generated token arrives (issue #548).
 ///
 /// Used by: chat.rs, completions.rs, native_completion.rs
 pub(crate) fn sse_channel(
@@ -61,11 +120,13 @@ pub(crate) fn sse_channel(
     BlockingSseSender,
     impl Stream<Item = Result<Event, Infallible>>,
     CancellationToken,
+    SseKeepAlive,
 ) {
     let cancelled: CancellationToken = Arc::new(AtomicBool::new(false));
     let (sender, rx) = payload_channel(buffer, Some(cancelled.clone()));
     let stream = ReceiverStream::new(rx).map(|payload| payload.map(sse_event));
-    (sender, stream, cancelled)
+    let keepalive = SseKeepAlive::default_for_long_prefill();
+    (sender, stream, cancelled, keepalive)
 }
 
 impl BlockingSseSender {
