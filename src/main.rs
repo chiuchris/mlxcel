@@ -17,6 +17,7 @@ use mlxcel::tokenizer::MlxcelTokenizer;
 use std::path::PathBuf;
 
 mod commands;
+use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::DownloadArgs;
 use mlxcel::lang_bias::LangBiasCliArgs;
 
@@ -153,48 +154,12 @@ pub(crate) struct GenerationOptions {
     #[arg(long, default_value_t = false)]
     pub(crate) recommend_quant: bool,
 
-    /// KV cache quantization mode.
-    ///
-    /// Controls how accumulated key/value tensors are stored:
-    ///   fp16        — Standard half-precision storage (default, no overhead).
-    ///   int8        — Per-token INT8 absmax quantization; reduces KV cache
-    ///                 memory by ~50% at the cost of small quantization error
-    ///                 per token.
-    ///   fp16+turbo4 — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
-    ///                 K side stays FP16; V side uses 4-bit PolarQuant with
-    ///                 Walsh–Hadamard rotation. ~26% net KV savings at long
-    ///                 context with negligible quality loss on Q4_K_M dense
-    ///                 weights (epic #458 / issue #474).
-    ///   fp16+turbo3 — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
-    ///                 Same shape as fp16+turbo4 but the V side uses a
-    ///                 3-bit codebook, raising compression to ~5.1× total
-    ///                 KV savings at the cost of a slightly higher V
-    ///                 reconstruction error. Symmetric Turbo3 is *not*
-    ///                 offered by this binary (epic #458 / issue #477).
-    ///
-    /// INT8 and turbo* modes are most beneficial for long context generation
-    /// where KV cache becomes the memory bottleneck.
-    #[arg(long = "kv-cache-mode", default_value = "fp16", value_name = "MODE")]
-    pub(crate) kv_cache_mode: String,
-
-    /// Number of boundary transformer layers to protect at higher precision
-    /// when a Turbo4* KV cache mode is active.
-    ///
-    /// Per `references/turboquant_plus/docs/papers/layer-aware-v-compression.md`,
-    /// the first 2 and last 2 V layers contribute disproportionately to
-    /// quality loss under aggressive V quantization. Keeping these 4 layers
-    /// at higher precision (Fp16) recovers 37–91% of the perplexity gap at
-    /// zero speed cost.
-    ///
-    /// `0` disables the policy entirely. The count is clamped to
-    /// `min(value, n_layers / 2)` so a too-large value on a shallow model
-    /// degrades gracefully into "every layer Fp16". Inert when
-    /// `--kv-cache-mode` is `fp16` or `int8`.
-    ///
-    /// Equivalent to setting `MLXCEL_KV_BOUNDARY_V_LAYERS=<value>` in the
-    /// environment; the CLI flag wins when both are present.
-    #[arg(long = "turbo-boundary-v", value_name = "COUNT")]
-    pub(crate) turbo_boundary_v: Option<i32>,
+    // Shared TurboQuant KV-cache flag group (--cache-type-k, --cache-type-v,
+    // --kv-cache-mode, --turbo-boundary-v). Defined once in
+    // mlxcel::cli::turbo_args so all three binaries (mlxcel generate,
+    // mlxcel serve, mlxcel-server) expose identical help text and flags.
+    #[command(flatten)]
+    pub(crate) turbo: TurboKvCacheArgs,
 }
 
 /// Sampling strategy options
@@ -700,60 +665,6 @@ pub(crate) struct ServeArgs {
     #[arg(long, hide = true)]
     _cont_batching: bool,
 
-    /// K-side KV cache quantization type (issue #484 / B11).
-    ///
-    /// Accepted values:
-    ///   fp16             — Standard half-precision storage (default, no overhead).
-    ///   int8             — Per-token INT8 absmax quantization; reduces KV cache
-    ///                      memory by ~50% at the cost of small quantization
-    ///                      error per token.
-    ///   fp16+turbo4      — Asymmetric Fp16-K + Turbo4-V (alias: turbo4-asym).
-    ///                      K side stays FP16; V side uses 4-bit PolarQuant
-    ///                      with Walsh–Hadamard rotation. ~26% net KV savings
-    ///                      at long context (epic #458 / issue #474).
-    ///   fp16+turbo3      — Asymmetric Fp16-K + Turbo3-V (alias: turbo3-asym).
-    ///                      ~5.1× total KV savings at slightly higher
-    ///                      reconstruction error (epic #458 / issue #477).
-    ///   turbo4           — Symmetric Turbo4-K + Turbo4-V (allowlisted models
-    ///                      only, falls back to turbo4-asym otherwise).
-    ///   turbo4-delegated — Hot/cold split with FP16 hot tail + packed turbo
-    ///                      cold body (epic #458 / issue #479).
-    ///
-    /// When only one of `--cache-type-k`/`--cache-type-v` is specified, the
-    /// other side defaults to `fp16`. Takes precedence over `--kv-cache-mode`
-    /// when both are set (a warning is emitted).
-    ///
-    /// Also read from `LLAMA_ARG_CACHE_TYPE_K`.
-    #[arg(
-        long = "cache-type-k",
-        env = "LLAMA_ARG_CACHE_TYPE_K",
-        value_name = "TYPE"
-    )]
-    cache_type_k: Option<String>,
-
-    /// V-side KV cache quantization type (issue #484 / B11).
-    ///
-    /// Accepted values: `fp16` (default), `int8`, `turbo4`, `turbo4-asym`,
-    /// `turbo4-delegated`. When only one of `--cache-type-k`/`--cache-type-v`
-    /// is specified, the other side defaults to `fp16`. Takes precedence over
-    /// `--kv-cache-mode` when both are set (a warning is emitted).
-    ///
-    /// Also read from `LLAMA_ARG_CACHE_TYPE_V`.
-    #[arg(
-        long = "cache-type-v",
-        env = "LLAMA_ARG_CACHE_TYPE_V",
-        value_name = "TYPE"
-    )]
-    cache_type_v: Option<String>,
-
-    /// KV cache mode shorthand (legacy; prefer --cache-type-k / --cache-type-v).
-    ///
-    /// Sets both K and V to the same mode. Accepted values: `fp16` (default),
-    /// `int8`, `turbo4-asym`, `turbo4`, `turbo4-delegated`. When the split
-    /// flags are also supplied, they win (with a warning).
-    #[arg(long = "kv-cache-mode", value_name = "MODE")]
-    kv_cache_mode: Option<String>,
-
     /// Decode storage backend for continuous batching.
     ///
     /// Accepted values: `auto`, `dense`, `paged`. When omitted, the server
@@ -805,6 +716,19 @@ pub(crate) struct ServeArgs {
     /// Write chrome-tracing JSON for pipeline scheduler actions.
     #[arg(long = "debug-pp-trace", value_name = "PATH")]
     debug_pp_trace: Option<PathBuf>,
+
+    // Shared TurboQuant KV-cache flag group (--cache-type-k, --cache-type-v,
+    // --kv-cache-mode, --turbo-boundary-v). Defined once in
+    // mlxcel::cli::turbo_args so all three binaries (mlxcel generate,
+    // mlxcel serve, mlxcel-server) expose identical help text and flags.
+    //
+    // Placed immediately before the `lang_bias` flatten so that the
+    // `KV Cache (TurboQuant) Options` heading introduced by `TurboKvCacheArgs`
+    // does not bleed into sibling fields below; the next `next_help_heading`
+    // (`Language Bias Options`, set on `LangBiasCliArgs`) takes over the
+    // moment lang_bias is parsed.
+    #[command(flatten)]
+    turbo: TurboKvCacheArgs,
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. Mirrors the same flags exposed on the `generate` subcommand.

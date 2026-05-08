@@ -104,8 +104,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             profile: false,
             no_chat_template: false,
             recommend_quant: false,
-            kv_cache_mode: "fp16".to_string(),
-            turbo_boundary_v: None,
+            turbo: mlxcel::cli::turbo_args::TurboKvCacheArgs::default(),
         },
         sampling: crate::SamplingOptions {
             temp: 0.0,

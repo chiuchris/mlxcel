@@ -35,6 +35,17 @@ pub(crate) async fn run_serve(args: crate::ServeArgs) -> anyhow::Result<()> {
 }
 
 fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStartupInput> {
+    // Translate `--turbo-boundary-v` into the `MLXCEL_KV_BOUNDARY_V_LAYERS`
+    // env var before any caller of `mlxcel-core` constructs a cache.
+    // mlxcel-core reads this env var on first cache instantiation, and the
+    // write site must be upstream of any code that spawns tasks reading the
+    // process environment. The tokio worker threads spawned by
+    // `#[tokio::main]` are still parked at this point (no task has been
+    // scheduled yet), so the only env reader is this thread. See the
+    // function-level SAFETY note on `TurboKvCacheArgs::apply_to_environment`
+    // for the full precondition.
+    args.turbo.apply_to_environment();
+
     // Axis B Epic #362 (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
     // before resolving, so env-supplied values flow through the same
     // validation path as CLI flags. CLI flag wins on conflict.
@@ -55,8 +66,8 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     // The clap `env = "..."` attribute already reads these env vars; the
     // explicit calls below maintain the warn-on-conflict pattern used by
     // other LLAMA_ARG_* pairs.
-    env_fallback_cache_type_k(&mut args.cache_type_k);
-    env_fallback_cache_type_v(&mut args.cache_type_v);
+    env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
+    env_fallback_cache_type_v(&mut args.turbo.cache_type_v);
 
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
@@ -152,9 +163,9 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         prompt_cache_min_prefix: args.prompt_cache_min_prefix,
         // Issue #484 (B11): KV cache type split flags already resolved via
         // env-var fallbacks (and clap `env = "..."`) above.
-        cache_type_k: args.cache_type_k,
-        cache_type_v: args.cache_type_v,
-        kv_cache_mode_legacy: args.kv_cache_mode,
+        cache_type_k: args.turbo.cache_type_k,
+        cache_type_v: args.turbo.cache_type_v,
+        kv_cache_mode_legacy: args.turbo.kv_cache_mode,
     })
 }
 

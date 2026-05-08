@@ -18,6 +18,7 @@
 //! direct MLX C++ bindings via mlxcel-core.
 
 pub mod audio;
+pub mod cli;
 pub mod distributed;
 pub mod downloader;
 pub mod execution;

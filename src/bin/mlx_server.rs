@@ -15,6 +15,7 @@
 use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
+use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::{DownloadArgs, DownloadOptions, download_repo};
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
@@ -500,52 +501,6 @@ struct ServerArgs {
     )]
     tp_lm_head_mode: String,
 
-    // Issue #484 (B11): llama-server-compatible K/V cache type split flags.
-    //
-    // These take precedence over `--kv-cache-mode` when both are supplied
-    // (a warning is emitted). Supported pairs are documented in
-    // `docs/turbo-kv-cache.md`.
-    /// K-side KV cache quantization type.
-    ///
-    /// Accepted values: `fp16` (default), `int8`, `turbo4`, `turbo4-asym`,
-    /// `turbo4-delegated`.  Also read from `LLAMA_ARG_CACHE_TYPE_K`.
-    /// When only one of `--cache-type-k`/`--cache-type-v` is specified, the
-    /// other side defaults to `fp16`.
-    ///
-    /// Takes precedence over `--kv-cache-mode` when both are set.
-    /// Unsupported K/V combinations are rejected at startup with a clear error.
-    #[arg(
-        long = "cache-type-k",
-        env = "LLAMA_ARG_CACHE_TYPE_K",
-        value_name = "TYPE"
-    )]
-    cache_type_k: Option<String>,
-
-    /// V-side KV cache quantization type.
-    ///
-    /// Accepted values: `fp16` (default), `int8`, `turbo4`, `turbo4-asym`,
-    /// `turbo4-delegated`.  Also read from `LLAMA_ARG_CACHE_TYPE_V`.
-    /// When only one of `--cache-type-k`/`--cache-type-v` is specified, the
-    /// other side defaults to `fp16`.
-    ///
-    /// Takes precedence over `--kv-cache-mode` when both are set.
-    /// Unsupported K/V combinations are rejected at startup with a clear error.
-    #[arg(
-        long = "cache-type-v",
-        env = "LLAMA_ARG_CACHE_TYPE_V",
-        value_name = "TYPE"
-    )]
-    cache_type_v: Option<String>,
-
-    /// KV cache mode shorthand (legacy; prefer --cache-type-k / --cache-type-v).
-    ///
-    /// Sets both K and V to the same mode. Accepted values: `fp16` (default),
-    /// `int8`, `turbo4-asym`, `turbo4`, `turbo4-delegated`.  When
-    /// `--cache-type-k` or `--cache-type-v` are also supplied, the split
-    /// flags win and this flag is ignored (with a warning).
-    #[arg(long = "kv-cache-mode", value_name = "MODE")]
-    kv_cache_mode: Option<String>,
-
     /// Decode storage backend for continuous batching.
     ///
     /// Accepted values: `auto`, `dense`, `paged`. When omitted, the server
@@ -649,6 +604,19 @@ struct ServerArgs {
     /// `chrome://tracing` or Perfetto.
     #[arg(long = "debug-pp-trace", value_name = "PATH")]
     debug_pp_trace: Option<PathBuf>,
+
+    // Shared TurboQuant KV-cache flag group (--cache-type-k, --cache-type-v,
+    // --kv-cache-mode, --turbo-boundary-v). Defined once in
+    // mlxcel::cli::turbo_args so all three binaries (mlxcel generate,
+    // mlxcel serve, mlxcel-server) expose identical help text and flags.
+    //
+    // Placed immediately before the `lang_bias` flatten so that the
+    // `KV Cache (TurboQuant) Options` heading introduced by `TurboKvCacheArgs`
+    // does not bleed into sibling fields below; the next `next_help_heading`
+    // (`Language Bias Options`, set on `LangBiasCliArgs`) takes over the
+    // moment lang_bias is parsed.
+    #[command(flatten)]
+    turbo: TurboKvCacheArgs,
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. See `--lang-bias`, `--lang-bias-config`, `--lang-bias-policy`,
@@ -787,6 +755,17 @@ fn run_download(args: DownloadArgs) -> anyhow::Result<()> {
 }
 
 fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInput> {
+    // Translate `--turbo-boundary-v` into the `MLXCEL_KV_BOUNDARY_V_LAYERS`
+    // env var before any caller of `mlxcel-core` constructs a cache.
+    // mlxcel-core reads this env var on first cache instantiation, and the
+    // write site must be upstream of any code that spawns tasks reading the
+    // process environment. The tokio worker threads spawned by
+    // `#[tokio::main]` are still parked at this point (no task has been
+    // scheduled yet), so the only env reader is this thread. See the
+    // function-level SAFETY note on `TurboKvCacheArgs::apply_to_environment`
+    // for the full precondition.
+    args.turbo.apply_to_environment();
+
     // Axis B Epic #362 (B7): apply `LLAMA_ARG_LANG_BIAS` env-var fallback
     // before resolving, so env-supplied values flow through the same
     // validation and normalization as CLI flags. CLI flag wins on conflict
@@ -821,8 +800,8 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     // are not strictly necessary here — clap already reads the env vars.
     // We still call them for consistency with the pattern and to allow future
     // warn-on-conflict logic (e.g. if a separate MLXCEL_* alias is added).
-    env_fallback_cache_type_k(&mut args.cache_type_k);
-    env_fallback_cache_type_v(&mut args.cache_type_v);
+    env_fallback_cache_type_k(&mut args.turbo.cache_type_k);
+    env_fallback_cache_type_v(&mut args.turbo.cache_type_v);
 
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
@@ -933,8 +912,8 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         prompt_cache_min_prefix: args.prompt_cache_min_prefix,
         // Issue #484 (B11): KV cache type split flags already resolved via
         // env-var fallbacks (and clap `env = "..."`) above.
-        cache_type_k: args.cache_type_k,
-        cache_type_v: args.cache_type_v,
-        kv_cache_mode_legacy: args.kv_cache_mode,
+        cache_type_k: args.turbo.cache_type_k,
+        cache_type_v: args.turbo.cache_type_v,
+        kv_cache_mode_legacy: args.turbo.kv_cache_mode,
     })
 }

@@ -22,7 +22,6 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 
-use mlxcel_core::cache::KVCacheMode;
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 
 use super::chat_template_kwargs::resolve_server_default_kwargs;
@@ -396,127 +395,14 @@ impl ServerStartupInput {
     }
 }
 
-// ── Issue #484 (B11) — KV cache type split flags ─────────────────────────────
-
-/// Supported K/V combinations and their corresponding `KVCacheMode`.
-///
-/// | K      | V                 | Mode              |
-/// |--------|-------------------|-------------------|
-/// | fp16   | fp16              | `Fp16`            |
-/// | int8   | int8              | `Int8`            |
-/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`   |
-/// | turbo4 | turbo4            | `Turbo4`          |
-/// | fp16   | turbo4-delegated  | `Turbo4Delegated` |
-///
-/// Any other combination returns an error with a description of valid pairs.
-pub fn resolve_kv_cache_mode(
-    cache_type_k: Option<&str>,
-    cache_type_v: Option<&str>,
-    kv_cache_mode_legacy: Option<&str>,
-) -> Result<KVCacheMode, String> {
-    let have_split = cache_type_k.is_some() || cache_type_v.is_some();
-    let have_legacy = kv_cache_mode_legacy.is_some();
-
-    if have_split && have_legacy {
-        tracing::warn!(
-            "--cache-type-k/--cache-type-v and --kv-cache-mode are both set; \
-             --cache-type-k/--cache-type-v take precedence (use one or the other)"
-        );
-    }
-
-    if have_split {
-        // Resolve each side, defaulting the unspecified side to fp16.
-        let k_str = cache_type_k.unwrap_or("fp16");
-        let v_str = cache_type_v.unwrap_or("fp16");
-
-        let k_mode = k_str
-            .parse::<KVCacheMode>()
-            .map_err(|_| format!("unrecognised --cache-type-k value \"{k_str}\""))?;
-        let v_mode = v_str
-            .parse::<KVCacheMode>()
-            .map_err(|_| format!("unrecognised --cache-type-v value \"{v_str}\""))?;
-
-        return map_kv_modes_to_cache_mode(k_mode, v_mode);
-    }
-
-    if let Some(legacy) = kv_cache_mode_legacy {
-        return legacy
-            .parse::<KVCacheMode>()
-            .map_err(|_| format!("unrecognised --kv-cache-mode value \"{legacy}\""));
-    }
-
-    // Default: FP16 (bit-exact baseline).
-    Ok(KVCacheMode::Fp16)
-}
-
-/// Map a (K-mode, V-mode) pair to the combined `KVCacheMode`.
-///
-/// Not all combinations are supported. Returns an error with a human-readable
-/// message when the pair is unsupported.
-fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheMode, String> {
-    use KVCacheMode::{Fp16, Int8, Turbo4, Turbo4Asym, Turbo4Delegated};
-    match (k, v) {
-        (Fp16, Fp16) => Ok(Fp16),
-        (Int8, Int8) => Ok(Int8),
-        // Asymmetric: FP16 K + Turbo4 V → Turbo4Asym (covers turbo4-asym input on V side)
-        (Fp16, Turbo4Asym) | (Fp16, Turbo4) => Ok(Turbo4Asym),
-        // Symmetric: Turbo4 K + Turbo4 V → Turbo4 (allowlist-gated inside mlxcel-core)
-        (Turbo4, Turbo4) => Ok(Turbo4),
-        // Delegated hot/cold: FP16 K + Turbo4Delegated V → Turbo4Delegated
-        (Fp16, Turbo4Delegated) => Ok(Turbo4Delegated),
-        // Anything else is unsupported.
-        (k, v) => Err(format!(
-            "unsupported --cache-type-k={k} / --cache-type-v={v} combination; \
-             supported pairs:\n  \
-             fp16   / fp16              -> fp16 (default)\n  \
-             int8   / int8              -> int8\n  \
-             fp16   / turbo4            -> fp16+turbo4 (Turbo4Asym)\n  \
-             fp16   / turbo4-asym       -> fp16+turbo4 (Turbo4Asym)\n  \
-             turbo4 / turbo4            -> turbo4 (symmetric, allowlist-gated)\n  \
-             fp16   / turbo4-delegated  -> turbo4-delegated"
-        )),
-    }
-}
-
-/// Apply `LLAMA_ARG_CACHE_TYPE_K` env var fallback to the raw
-/// `--cache-type-k` CLI value (issue #484).
-///
-/// Precedence: CLI flag beats env var. When the CLI flag was not provided
-/// (value is `None`) and the env var is set, the env var value is applied.
-/// When both are present, the CLI value is kept and an INFO log is emitted.
-pub fn env_fallback_cache_type_k(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_K", "cache-type-k");
-}
-
-/// Apply `LLAMA_ARG_CACHE_TYPE_V` env var fallback to the raw
-/// `--cache-type-v` CLI value (issue #484).
-///
-/// Precedence: CLI flag beats env var.  When the CLI flag was not provided
-/// (value is `None`) and the env var is set, the env var value is applied.
-/// When both are present, the CLI value is kept and an INFO log is emitted.
-pub fn env_fallback_cache_type_v(value: &mut Option<String>) {
-    apply_optional_string_env_fallback(value, "LLAMA_ARG_CACHE_TYPE_V", "cache-type-v");
-}
-
-/// Shared helper: if `value` is `None` and the named env var is set, fill
-/// `value` from the env var. If `value` is `Some` (CLI was set) and the env
-/// var is also present, log an INFO and keep the CLI value.
-fn apply_optional_string_env_fallback(value: &mut Option<String>, key: &str, flag_name: &str) {
-    if value.is_some() {
-        if std::env::var_os(key).is_some() {
-            tracing::info!(
-                "{key} env var is set but --{flag_name} CLI flag takes precedence; ignoring {key}"
-            );
-        }
-        return;
-    }
-    if let Ok(raw) = std::env::var(key) {
-        let trimmed = raw.trim().to_string();
-        if !trimmed.is_empty() {
-            *value = Some(trimmed);
-        }
-    }
-}
+// KV cache type split flags: the canonical implementations live in
+// `crate::cli::turbo_args` so the resolution logic is shared with `mlxcel
+// generate` (which does not go through `ServerStartupInput`). The
+// re-exports below preserve the historical `mlxcel::server::*` public
+// surface for existing callers (binary entry points, downstream tests).
+pub use crate::cli::turbo_args::{
+    env_fallback_cache_type_k, env_fallback_cache_type_v, resolve_kv_cache_mode,
+};
 
 /// Apply the `LLAMA_ARG_REASONING_BUDGET` env-var fallback to the raw CLI
 /// `--reasoning-budget` value (issue #409).
