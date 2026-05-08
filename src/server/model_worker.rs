@@ -739,12 +739,22 @@ pub(crate) fn build_generation_result_with_cache(
     }
 }
 
+/// Maximum number of bytes accumulated in the byte-fallback buffer before the
+/// buffer is force-flushed as replacement characters to avoid holding tokens
+/// indefinitely on pathological model outputs.
+const BYTE_FALLBACK_BUFFER_MAX: usize = 4;
+
 pub(crate) struct StreamingDecodeState {
     all_ids: Vec<u32>,
     prev_decoded_len: usize,
     generated_text: String,
     completion_tokens: usize,
     first_token_time: Option<Instant>,
+    /// Buffer for raw bytes accumulated from consecutive byte-fallback tokens
+    /// (`<0xXX>`). Held until enough bytes arrive to form a valid UTF-8
+    /// sequence. Cleared on each successful decode or when a non-byte-fallback
+    /// token follows.
+    byte_fallback_buffer: Vec<u8>,
 }
 
 impl StreamingDecodeState {
@@ -758,6 +768,7 @@ impl StreamingDecodeState {
             generated_text: String::new(),
             completion_tokens: 0,
             first_token_time: None,
+            byte_fallback_buffer: Vec::new(),
         }
     }
 
@@ -772,14 +783,85 @@ impl StreamingDecodeState {
         self.completion_tokens += 1;
         self.all_ids.push(token_id as u32);
 
+        // --- Byte-fallback buffering (issue #547) ---
+        // Tokenizers that use byte-fallback (e.g. Gemma variants with
+        // `byte_fallback = true`) map each byte of a multi-byte UTF-8
+        // character to an individual token in the form `<0xXX>`. When decoded
+        // one token at a time, incomplete byte sequences produce U+FFFD
+        // replacement characters in the output.
+        //
+        // We detect byte-fallback tokens by looking up the raw token piece. If
+        // the piece matches `<0xXX>`, we accumulate the raw byte into a
+        // dedicated buffer and defer emission until the buffer forms valid
+        // UTF-8. Once a non-byte-fallback token arrives, any remaining bytes in
+        // the buffer are force-flushed as replacement characters.
+        //
+        // The buffer is also bounded to BYTE_FALLBACK_BUFFER_MAX bytes to
+        // prevent indefinite buffering on pathological inputs; excess bytes are
+        // force-flushed as replacement characters.
+        if let Some(piece) = tokenizer.token_piece(token_id as u32)
+            && let Some(byte_val) = parse_byte_fallback_token(&piece)
+        {
+            self.byte_fallback_buffer.push(byte_val);
+
+            // Force-flush if buffer exceeds the maximum size (guards
+            // against unbounded growth on unusual model outputs).
+            if self.byte_fallback_buffer.len() >= BYTE_FALLBACK_BUFFER_MAX {
+                return self.flush_byte_fallback_buffer();
+            }
+
+            // Try to decode the buffered bytes as UTF-8.
+            match std::str::from_utf8(&self.byte_fallback_buffer) {
+                Ok(decoded) if !decoded.is_empty() => {
+                    let decoded = decoded.to_string();
+                    self.byte_fallback_buffer.clear();
+                    self.generated_text.push_str(&decoded);
+                    // Advance prev_decoded_len by syncing with the full
+                    // re-decode so that subsequent tokens start from the
+                    // right position.
+                    let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
+                    self.prev_decoded_len = safe_emit_boundary(&full_text);
+                    return Some(decoded);
+                }
+                _ => {
+                    // Incomplete sequence -- hold in buffer, emit nothing.
+                    return None;
+                }
+            }
+        }
+
+        // Non-byte-fallback token: flush any leftover byte-fallback bytes as
+        // replacement characters before continuing with the normal decode path.
+        if !self.byte_fallback_buffer.is_empty() {
+            let flushed = self.flush_byte_fallback_buffer();
+            // Re-run the normal path for the current (non-byte-fallback) token.
+            // The flush already updated prev_decoded_len, so the subsequent
+            // re-decode will pick up where it left off.
+            let extra = self.emit_regular_token(tokenizer);
+            return match (flushed, extra) {
+                (Some(a), Some(b)) => Some(a + &b),
+                (Some(a), None) => Some(a),
+                (None, Some(b)) => Some(b),
+                (None, None) => None,
+            };
+        }
+
+        self.emit_regular_token(tokenizer)
+    }
+
+    /// Emit text from the current `all_ids` using the standard re-decode path.
+    ///
+    /// Advances `prev_decoded_len` to the safe boundary. Returns the newly
+    /// emitted text, or `None` if nothing can be emitted yet.
+    fn emit_regular_token(&mut self, tokenizer: &MlxcelTokenizer) -> Option<String> {
         let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
 
         // Find the safe emit boundary: skip trailing U+FFFD replacement characters.
         // Byte-level BPE tokenizers split multi-byte UTF-8 sequences across tokens.
         // Incomplete byte sequences decode as U+FFFD, but become valid characters
         // once the completing token arrives. Emitting FFFD prematurely corrupts
-        // the output (e.g. "최솟값" → "최�값") because the byte offset shifts
-        // when the replacement chars resolve into shorter real characters.
+        // the output because the byte offset shifts when the replacement chars
+        // resolve into shorter real characters.
         let safe_len = safe_emit_boundary(&full_text);
 
         if safe_len <= self.prev_decoded_len {
@@ -796,9 +878,58 @@ impl StreamingDecodeState {
         Some(new_text.to_string())
     }
 
+    /// Flush the byte-fallback buffer to the output.
+    ///
+    /// If the buffered bytes form valid UTF-8, emit the decoded string.
+    /// Otherwise emit one replacement character (U+FFFD) per buffered byte, in
+    /// line with the `ByteFallback` decoder's own fallback behaviour. In both
+    /// cases the buffer is cleared and `prev_decoded_len` is re-synced.
+    fn flush_byte_fallback_buffer(&mut self) -> Option<String> {
+        if self.byte_fallback_buffer.is_empty() {
+            return None;
+        }
+        let buf = std::mem::take(&mut self.byte_fallback_buffer);
+        let flushed = match std::str::from_utf8(&buf) {
+            Ok(s) => s.to_string(),
+            Err(_) => "\u{FFFD}".repeat(buf.len()),
+        };
+        // Advance prev_decoded_len by the exact byte length of what was just
+        // emitted. Using safe_emit_boundary on the full re-decode would advance
+        // past any trailing text from the next regular token (which has already
+        // been pushed into all_ids), causing that text to be silently dropped.
+        self.prev_decoded_len += flushed.len();
+
+        if flushed.is_empty() {
+            None
+        } else {
+            self.generated_text.push_str(&flushed);
+            Some(flushed)
+        }
+    }
+
     /// Flush any remaining buffered text (including unresolved replacement chars)
     /// at the end of generation.
+    ///
+    /// Also drains the byte-fallback buffer: any accumulated bytes that did not
+    /// form a complete UTF-8 sequence are emitted as U+FFFD replacement
+    /// characters so that the streamed output matches the non-streaming result.
     pub(crate) fn flush(&mut self, tokenizer: &MlxcelTokenizer) {
+        // Drain the byte-fallback buffer first. Any incomplete byte sequences
+        // are flushed as replacement characters here; we then skip past the
+        // corresponding replacement chars in the full-decode result below so
+        // they are not emitted a second time.
+        if !self.byte_fallback_buffer.is_empty() {
+            self.flush_byte_fallback_buffer();
+            // After a byte-fallback flush, prev_decoded_len sits at
+            // safe_emit_boundary (i.e. just before trailing U+FFFD chars
+            // from the incomplete sequence). Advance it past those trailing
+            // replacement chars so the normal emit path below does not
+            // re-emit them.
+            let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
+            self.prev_decoded_len = full_text.len();
+            return;
+        }
+
         let full_text = tokenizer.decode(&self.all_ids, false).unwrap_or_default();
         if full_text.len() > self.prev_decoded_len {
             let remaining = &full_text[self.prev_decoded_len..];
@@ -853,6 +984,34 @@ fn safe_emit_boundary(text: &str) -> usize {
         .find(|(_, c)| *c != '\u{FFFD}')
         .map(|(i, c)| i + c.len_utf8())
         .unwrap_or(0)
+}
+
+/// Detect a byte-fallback token piece and return the raw byte value.
+///
+/// Byte-fallback tokens have the form `<0xXX>` where `XX` is a two-digit
+/// hex value, e.g. `<0xE2>`, `<0x80>`, `<0x9C>`. These are produced by
+/// tokenizers whose model config has `byte_fallback = true` (common in Gemma
+/// and some Llama variants built with SentencePiece byte-fallback vocabulary).
+///
+/// Returns `None` for regular token pieces that do not match this pattern.
+///
+/// Used by: StreamingDecodeState (model_worker.rs)
+fn parse_byte_fallback_token(piece: &str) -> Option<u8> {
+    // Must be exactly 6 bytes: '<', '0', 'x', HI, LO, '>'
+    // Use byte-level checks so that `from_str_radix` never sees a leading '+'
+    // or '-' sign (defense-in-depth: e.g. `<0x+f>` would otherwise parse as
+    // byte 0x0F).
+    let bytes = piece.as_bytes();
+    if bytes.len() == 6
+        && &bytes[..3] == b"<0x"
+        && bytes[5] == b'>'
+        && bytes[3].is_ascii_hexdigit()
+        && bytes[4].is_ascii_hexdigit()
+    {
+        u8::from_str_radix(std::str::from_utf8(&bytes[3..5]).ok()?, 16).ok()
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

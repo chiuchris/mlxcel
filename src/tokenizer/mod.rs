@@ -55,6 +55,62 @@ impl MlxcelTokenizer {
         Self::HuggingFace(tokenizer)
     }
 
+    /// Create a minimal tokenizer with byte-fallback support for regression tests
+    /// (issue #547). The vocabulary includes:
+    ///
+    /// - Tokens 0/1: `<BOS>` / `<EOS>` (special)
+    /// - Token 2: `Hello` (regular ASCII)
+    /// - Token 5/6/7: `<0xE5>` / `<0x8F>` / `<0xAB>` → "叫" (CJK, 3 bytes)
+    /// - Token 8/9/10/11: `<0xF0>` / `<0x9F>` / `<0x98>` / `<0x80>` → "😀" (emoji, 4 bytes)
+    /// - Token 12: `<0x61>` → 'a' (single-byte ASCII via byte-fallback)
+    ///
+    /// The decoder is set to `ByteFallback` so that sequences of `<0xXX>` tokens
+    /// are assembled into bytes and decoded as UTF-8.
+    #[cfg(test)]
+    pub(crate) fn stub_with_byte_fallback() -> Self {
+        let json = r#"{
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [
+                {"id": 0, "content": "<BOS>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true},
+                {"id": 1, "content": "<EOS>", "single_word": false, "lstrip": false, "rstrip": false, "normalized": false, "special": true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": {"type": "ByteFallback"},
+            "model": {
+                "type": "BPE",
+                "dropout": null,
+                "unk_token": null,
+                "continuing_subword_prefix": null,
+                "end_of_word_suffix": null,
+                "fuse_unk": false,
+                "byte_fallback": true,
+                "vocab": {
+                    "<BOS>": 0,
+                    "<EOS>": 1,
+                    "Hello": 2,
+                    "▁World": 3,
+                    " ": 4,
+                    "<0xE5>": 5,
+                    "<0x8F>": 6,
+                    "<0xAB>": 7,
+                    "<0xF0>": 8,
+                    "<0x9F>": 9,
+                    "<0x98>": 10,
+                    "<0x80>": 11,
+                    "<0x61>": 12
+                },
+                "merges": []
+            }
+        }"#;
+        let tokenizer = tokenizers::Tokenizer::from_bytes(json.as_bytes())
+            .expect("Failed to build byte-fallback test tokenizer");
+        Self::HuggingFace(tokenizer)
+    }
+
     pub fn encode(&self, text: &str, add_special_tokens: bool) -> Result<Vec<u32>> {
         match self {
             Self::HuggingFace(t) => {
@@ -87,6 +143,23 @@ impl MlxcelTokenizer {
     pub fn hf_tokenizer(&self) -> Option<&tokenizers::Tokenizer> {
         match self {
             Self::HuggingFace(t) => Some(t),
+            Self::SentencePiece(_) | Self::Tiktoken(_) => None,
+        }
+    }
+
+    /// Look up the raw token string for a given token ID, without applying any
+    /// decoder transformations. Returns `None` if the ID is out of vocabulary.
+    ///
+    /// Used by [`StreamingDecodeState`] to detect byte-fallback tokens
+    /// (`<0xXX>`) so they can be buffered until a complete UTF-8 sequence forms.
+    ///
+    /// Used by: StreamingDecodeState (model_worker.rs)
+    pub fn token_piece(&self, id: u32) -> Option<String> {
+        match self {
+            Self::HuggingFace(t) => t.id_to_token(id),
+            // SentencePiece byte-fallback tokens appear directly as <0xXX> in
+            // the decoded output; the incremental decoder handles them via the
+            // full re-decode path rather than per-piece inspection.
             Self::SentencePiece(_) | Self::Tiktoken(_) => None,
         }
     }
