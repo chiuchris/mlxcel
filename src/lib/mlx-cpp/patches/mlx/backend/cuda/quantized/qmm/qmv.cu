@@ -1,7 +1,8 @@
 // Copyright © 2026 Apple Inc.
-// Patched by mlxcel: matches upstream 68cf2fdd. The only practical change
-// vs the previous pin is GatherQMM's broadcast_w predicate, which now also
-// triggers for non-contiguous batched weights via w.size() != w.data_size().
+// Patched by mlxcel: matches upstream c9aa5605. Carries the GatherQMM
+// broadcast_w predicate fix that also triggers for non-contiguous batched
+// weights via w.size() != w.data_size(); no functional change in this file
+// between 68cf2fdd and c9aa5605.
 
 #include "mlx/backend/cuda/kernel_utils.cuh"
 #include "mlx/backend/cuda/quantized/qmm/cute_dequant.cuh"

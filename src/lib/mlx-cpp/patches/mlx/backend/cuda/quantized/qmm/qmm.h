@@ -1,7 +1,7 @@
 // Copyright © 2026 Apple Inc.
-// Patched by mlxcel: matches upstream 68cf2fdd (declarations updated for the
-// new optional<array> lhs_indices / rhs_indices parameters added to qmm_sm80
-// and qmm_naive).
+// Patched by mlxcel: matches upstream c9aa5605. Declarations carry the
+// optional<array> lhs_indices / rhs_indices parameters on qmm_sm80 and
+// qmm_naive; no functional change between 68cf2fdd and c9aa5605.
 
 #pragma once
 

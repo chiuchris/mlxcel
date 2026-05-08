@@ -1,9 +1,10 @@
 // Copyright © 2025 Apple Inc.
 // Patched by mlxcel: ensure input contiguity in QuantizedMatmul for
 // non-contiguous 3D batched weights (e.g. GLM-4 MLA embed_q with
-// transpose=false). Updated for upstream 68cf2fdd, which added optional
-// lhs_indices/rhs_indices parameters to qmm_sm80 / qmm_naive and routed
-// GatherQMM through them.
+// transpose=false). Synced to upstream c9aa5605, which folds in the
+// #3469 cutlass-half-type fix (ensure_row_contiguous on x and indices)
+// and continues to accept the optional<array> lhs_indices / rhs_indices
+// parameters on qmm_sm80 / qmm_naive.
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
@@ -155,15 +156,21 @@ void GatherQMM::eval_gpu(const std::vector<array>& inputs, array& out) {
   auto& s = stream();
   auto& encoder = cu::get_command_encoder(s);
 
-  const array& x = inputs[0];
+  // [mlxcel] Sync with upstream #3469: ensure x is row-contiguous, and use
+  // ensure_row_contiguous for lhs/rhs indices (was ensure_contiguous before
+  // c9aa5605). w / scales / biases are intentionally left as const refs here
+  // because the gather paths consume them per-batch via indices.
+  array x = ensure_row_contiguous(inputs[0], encoder, s);
   const array& w = inputs[1];
   const array& scales = inputs[2];
   std::optional<array> biases;
   if (inputs.size() == 6) {
     biases = inputs[3];
   }
-  array lhs_indices = ensure_contiguous(inputs[inputs.size() - 2], encoder, s);
-  array rhs_indices = ensure_contiguous(inputs[inputs.size() - 1], encoder, s);
+  array lhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 2], encoder, s);
+  array rhs_indices =
+      ensure_row_contiguous(inputs[inputs.size() - 1], encoder, s);
 
   int M = out.ndim() > 1 ? out.shape(-2) : 1;
   int N = out.shape(-1);

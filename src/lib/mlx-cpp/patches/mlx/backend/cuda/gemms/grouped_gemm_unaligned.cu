@@ -1,6 +1,7 @@
 // Copyright © 2025 Apple Inc.
 // Modified by mlxcel: Added cutlass_gather_mm for general GatherMM with both
-// lhs_indices and rhs_indices support.
+// lhs_indices and rhs_indices support. Synced to upstream c9aa5605, which
+// folds in #3469's Accumulator C-type fix for cutlass half-type matmul.
 
 #include "mlx/backend/cuda/cublas_utils.h"
 #include "mlx/backend/cuda/cutlass_utils.cuh"
@@ -288,7 +289,10 @@ void grouped_gemm_v2(
           LayoutB,
           cutlass::ComplexTransform::kNone,
           GemmConfiguration::kAlignmentAB,
-          typename GemmConfiguration::Element,
+          // [mlxcel] Sync with upstream #3469: use Accumulator for the C
+          // operand type so cutlass picks the correct half-precision GEMM
+          // configuration (was Element pre-c9aa5605).
+          typename GemmConfiguration::Accumulator,
           cutlass::layout::RowMajor,
           typename GemmConfiguration::Accumulator,
           typename GemmConfiguration::OpClass,
