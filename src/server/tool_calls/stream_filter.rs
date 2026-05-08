@@ -15,8 +15,8 @@
 //! Streaming content filter for model-specific structural tokens.
 //!
 //! Prevents model-internal structural tokens (`<think>`, `</think>`,
-//! `<|channel>`, `<|tool_call>`, `<turn|>`, etc.) from leaking into SSE
-//! content deltas during streaming generation.
+//! `<|channel>`, `<|tool_call>`, `<tool_call>`, `<turn|>`, etc.) from leaking
+//! into SSE content deltas during streaming generation.
 //!
 //! The filter operates as a state machine on decoded text fragments (after
 //! `StreamingDecodeState` has resolved UTF-8 boundaries).  It buffers text
@@ -24,12 +24,21 @@
 //! two decode fragments.
 //!
 //! **Supported families:**
-//! - Qwen-style: `<think>` / `</think>` — Qwen3.x, Exaone4, Hunyuan, GLM4, etc.
+//! - Qwen-style reasoning: `<think>` / `</think>` — Qwen3.x, Exaone4, Hunyuan, GLM4, etc.
+//! - Hermes-style tool calls: `<tool_call>` / `</tool_call>` — Qwen/DeepSeek tool call format
+//! - Mistral Nemo: `[TOOL_CALLS]` — one-shot start marker (rest of output is tool call JSON)
 //! - Gemma 4: `<|channel>` / `<channel|>`, `<|tool_call>` / `<tool_call|>`,
 //!   `<|think|>`, `<|turn>` / `<turn|>`
 //!
+//! **Tool-call suppression behavior:** when the filter enters `ToolCall` state,
+//! all subsequent tokens are suppressed from `delta.content`. The tool-call
+//! payload is accumulated by the caller (routes/chat) and materialized as
+//! `tool_calls` fields on the final SSE chunk with `finish_reason=tool_calls`.
+//! Partial marker matches at token boundaries are buffered until the full
+//! marker can be confirmed (no premature suppression or leakage).
+//!
 //! The non-streaming counterpart (`tool_calls::parser::strip_thinking`) already
-//! handles both families; this filter keeps the streaming path consistent.
+//! handles these families; this filter keeps the streaming path consistent.
 //!
 //! Used by: routes/chat (streaming path)
 
@@ -89,16 +98,32 @@ enum DelimiterAction {
 
 /// Delimiter table shared across reasoning model families.
 ///
-/// Qwen-style markers (`<think>` / `</think>`) appear **before** Gemma 4
-/// markers to mirror the probe ordering in
-/// `thinking_budget::resolve_thinking_token_ids`, which also checks the Qwen
-/// pair first.  The ordering is a consistency convention rather than a
-/// functional guard — no Qwen delimiter prefix-matches any Gemma 4 delimiter
-/// in practice.
-///
-/// Tool-call delimiters (`<|tool_call>` / `<tool_call|>`) and the turn/think
-/// strip markers remain Gemma-4-scoped — Qwen-style templates use a different
-/// tool-call mechanism (`<tool_call>` Hermes markers handled by `parser.rs`).
+/// Ordering notes:
+/// `find_earliest_delimiter` selects by byte position first, then by longest
+/// delimiter on ties, so the array order is NOT load-bearing for correctness.
+/// The entries below follow a documentation convention that mirrors the probe
+/// ordering in `thinking_budget::resolve_thinking_token_ids` and makes the
+/// intent of each group clear:
+/// - Qwen-style markers (`<think>` / `</think>`) appear before Gemma 4
+///   markers to mirror the probe ordering in
+///   `thinking_budget::resolve_thinking_token_ids`.  No Qwen delimiter
+///   prefix-matches any Gemma 4 delimiter, so the order has no runtime effect.
+/// - `</tool_call>` (Hermes exit) appears before `<tool_call>` (Hermes enter)
+///   as a documentation convention: the closer is listed before the opener.
+///   Because matching selects by earliest byte position, ordering cannot cause
+///   the enter tag to win over the exit tag when both appear at the same offset
+///   (they cannot — they are different strings at different positions).
+/// - Gemma 4 `<|tool_call>` / `<tool_call|>` appear before the plain Hermes
+///   `<tool_call>` / `</tool_call>` entries because the Gemma 4 open tag
+///   (`<|tool_call>`) is a prefix-extension of the Hermes open tag
+///   (`<tool_call>` inside `<|tool_call>`).  Probing Gemma 4 first avoids
+///   a spurious Hermes match inside Gemma 4 output.  This IS a correctness
+///   guard: both tags match at the same position, so the longest-delimiter
+///   tiebreak selects `<|tool_call>` (12 bytes) over `<tool_call>` (11 bytes).
+/// - `[TOOL_CALLS]` (Mistral Nemo) is a one-shot entry marker — no exit marker
+///   exists; all subsequent content (the JSON array) is tool-call payload.
+///   It is placed after the `<tag>` families so angle-bracket markers still
+///   benefit from the tighter (shorter) partial-match window that `<` gives.
 ///
 /// TODO (#444): Consider extracting this into a startup-time configurable
 /// owned by the model worker so new reasoning families don't require a rebuild.
@@ -107,14 +132,22 @@ const CHAT_DELIMITERS: &[(&str, DelimiterAction)] = &[
     // Probe these first to mirror resolve_thinking_token_ids ordering.
     ("</think>", DelimiterAction::ExitThinking),
     ("<think>", DelimiterAction::EnterThinking),
-    // Gemma 4 reasoning channel
+    // Gemma 4 tool-call delimiters — must precede Hermes `<tool_call>` to avoid
+    // a spurious Hermes hit on the Gemma 4 open tag.
     ("<|tool_call>", DelimiterAction::EnterToolCall),
     ("<tool_call|>", DelimiterAction::ExitToolCall),
+    // Gemma 4 reasoning channel and structural strip markers.
     ("<|channel>", DelimiterAction::EnterThinking),
     ("<channel|>", DelimiterAction::ExitThinking),
     ("<|think|>", DelimiterAction::Strip),
     ("<|turn>", DelimiterAction::Strip),
     ("<turn|>", DelimiterAction::Strip),
+    // Hermes / Qwen / DeepSeek tool call markers (issue #551).
+    // Exit before enter so the closer is matched when both appear in one fragment.
+    ("</tool_call>", DelimiterAction::ExitToolCall),
+    ("<tool_call>", DelimiterAction::EnterToolCall),
+    // Mistral Nemo: `[TOOL_CALLS] [...]` — no exit; the rest of output is JSON.
+    ("[TOOL_CALLS]", DelimiterAction::EnterToolCall),
 ];
 
 /// The state of the streaming filter state machine.
@@ -132,9 +165,10 @@ enum FilterState {
 /// content deltas, routing reasoning-block text to `delta.reasoning_content`
 /// and regular response text to `delta.content`.
 ///
-/// Covers both Qwen-style (`<think>` / `</think>`) and Gemma 4
-/// (`<|channel>` / `<channel|>`) reasoning families, plus Gemma 4 tool-call
-/// and turn markers.
+/// Covers Qwen-style (`<think>` / `</think>`), Hermes-style
+/// (`<tool_call>` / `</tool_call>`), Mistral Nemo (`[TOOL_CALLS]`), and
+/// Gemma 4 (`<|channel>` / `<channel|>`) reasoning families, plus Gemma 4
+/// tool-call and turn markers.
 ///
 /// Feed decoded text fragments via [`feed()`](StreamFilter::feed).  The
 /// filter returns only the content that should be emitted to the client.
@@ -154,7 +188,7 @@ impl Default for StreamFilter {
 }
 
 impl StreamFilter {
-    /// Create a new stream filter covering Qwen-style and Gemma 4 delimiters.
+    /// Create a new stream filter covering Qwen-style, Hermes-style, Mistral Nemo, and Gemma 4 delimiters.
     pub fn new() -> Self {
         let max_delim_len = CHAT_DELIMITERS
             .iter()
@@ -751,5 +785,280 @@ mod tests {
         assert_eq!(out.content.as_deref(), Some("Answer text"));
         assert!(!out.content.as_deref().unwrap_or("").contains("<|channel>"));
         assert!(!out.content.as_deref().unwrap_or("").contains("<channel|>"));
+    }
+
+    // -- Hermes / Qwen / DeepSeek tool-call markup suppression (issue #551) --
+
+    #[test]
+    fn hermes_tool_call_only_suppressed() {
+        // A response that is entirely a Hermes-style tool call: the model emits
+        // `<tool_call>{...}</tool_call>` without any preceding text.
+        // delta.content must remain empty — no markup leaks.
+        let mut f = StreamFilter::new();
+        let out = f.feed(
+            r#"<tool_call>{"name": "get_weather", "arguments": {"location": "Paris"}}</tool_call>"#,
+        );
+        assert_eq!(
+            out.content, None,
+            "tool-call markup must not appear in delta.content"
+        );
+        assert_eq!(out.reasoning, None);
+    }
+
+    #[test]
+    fn hermes_content_then_tool_call_strips_markup() {
+        // Model emits normal text then transitions to a tool call. Only the
+        // preamble text must appear in delta.content; the tool-call markup and
+        // payload must be suppressed.
+        let mut f = StreamFilter::new();
+        let out = f.feed(r#"Let me check the weather.<tool_call>{"name": "get_weather", "arguments": {"location": "Tokyo"}}</tool_call>"#);
+        assert_eq!(
+            out.content.as_deref(),
+            Some("Let me check the weather."),
+            "only the preamble text must appear in delta.content"
+        );
+        assert!(!out.content.as_deref().unwrap_or("").contains("<tool_call>"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("get_weather"));
+        assert!(
+            !out.content
+                .as_deref()
+                .unwrap_or("")
+                .contains("</tool_call>")
+        );
+    }
+
+    #[test]
+    fn hermes_tool_call_token_by_token_suppressed() {
+        // Feed the Hermes tool-call markers and payload one token at a time.
+        // No token that is part of the markup or JSON payload should surface
+        // as delta.content.
+        let mut f = StreamFilter::new();
+        let fragments = [
+            "<tool_call>",
+            r#"{"name": "search", "arguments": {"q": "rust"}}"#,
+            "</tool_call>",
+        ];
+        let mut total_content = String::new();
+        for frag in &fragments {
+            if let Some(c) = f.feed(frag).content {
+                total_content.push_str(&c);
+            }
+        }
+        assert!(
+            total_content.is_empty(),
+            "tool-call tokens must not appear in delta.content during streaming; got: {total_content:?}"
+        );
+        let flushed = f.flush();
+        assert_eq!(
+            flushed.content, None,
+            "flush must not emit buffered tool-call payload"
+        );
+    }
+
+    #[test]
+    fn hermes_partial_marker_at_token_boundary_buffered_and_released() {
+        // When a fragment ends with `<tool_` (a prefix of `<tool_call>`), the
+        // filter must hold it back until more text arrives to determine whether
+        // it is really a delimiter.  If it turns out not to be a tool-call
+        // boundary, the held-back bytes must be released into delta.content.
+        let mut f = StreamFilter::new();
+        // Buffer ends with a 7-byte prefix of `<tool_call>`.
+        let out1 = f.feed("preamble <tool_");
+        assert_eq!(
+            out1.content.as_deref(),
+            Some("preamble "),
+            "text before partial marker must be emitted immediately"
+        );
+        // Continue: next fragment resolves the ambiguity as NOT a tool-call tag.
+        let out2 = f.feed("notamarker>");
+        assert_eq!(
+            out2.content.as_deref(),
+            Some("<tool_notamarker>"),
+            "held-back partial prefix must be released to delta.content when not a marker"
+        );
+    }
+
+    #[test]
+    fn hermes_partial_marker_at_boundary_then_complete_tool_call() {
+        // Fragment ends with partial marker prefix. Next fragment completes it
+        // as a real `<tool_call>` open tag. The tag must NOT appear in content.
+        let mut f = StreamFilter::new();
+        // Buffer ends with partial prefix of `<tool_call>`.
+        let out1 = f.feed("preamble <tool_");
+        assert_eq!(
+            out1.content.as_deref(),
+            Some("preamble "),
+            "preamble before partial prefix must be emitted"
+        );
+        // Next fragment completes the open tag and adds JSON payload.
+        let out2 = f.feed(r#"call>{"name": "fn", "arguments": {}}</tool_call>"#);
+        assert_eq!(
+            out2.content, None,
+            "tool-call open tag completion must suppress subsequent content"
+        );
+    }
+
+    #[test]
+    fn hermes_multiple_tool_calls_suppressed() {
+        // Two consecutive Hermes tool calls — all markup and payloads suppressed.
+        let mut f = StreamFilter::new();
+        let input = r#"<tool_call>{"name": "a", "arguments": {}}</tool_call><tool_call>{"name": "b", "arguments": {"x": 1}}</tool_call>"#;
+        let out = f.feed(input);
+        assert_eq!(
+            out.content, None,
+            "multiple tool calls must be fully suppressed"
+        );
+    }
+
+    #[test]
+    fn hermes_flush_in_tool_call_state_suppresses() {
+        // If generation ends while still inside `<tool_call>...</tool_call>`,
+        // flush must discard the buffered partial payload (not emit it).
+        let mut f = StreamFilter::new();
+        // Open tag seen, no closing tag yet.
+        let out = f.feed(r#"<tool_call>{"name": "fn", "arguments": {}}"#);
+        assert_eq!(out.content, None);
+        let flushed = f.flush();
+        assert_eq!(
+            flushed.content, None,
+            "flush inside ToolCall state must not emit suppressed payload"
+        );
+    }
+
+    // -- Regression: Gemma 4 tool-call markers must not be confused with Hermes (issue #551) --
+
+    #[test]
+    fn gemma4_tool_call_not_confused_with_hermes() {
+        // Gemma 4 uses `<|tool_call>` (with pipe) as the open tag; Hermes uses
+        // `<tool_call>` (no pipe). After adding both to CHAT_DELIMITERS, the
+        // filter must continue to correctly suppress Gemma 4 markers while not
+        // confusing one format for the other.
+        let mut f = StreamFilter::new();
+        // Gemma 4 tool call (pipe-delimited)
+        let out = f.feed("<|tool_call>call:fn{}<tool_call|>");
+        assert_eq!(
+            out.content, None,
+            "Gemma 4 pipe-delimited tool call must still be suppressed"
+        );
+        // After exit, content resumes normally.
+        assert_eq!(
+            f.feed("answer").content.as_deref(),
+            Some("answer"),
+            "content after Gemma 4 tool call must be emitted"
+        );
+    }
+
+    #[test]
+    fn hermes_tool_call_does_not_enter_gemma4_state() {
+        // Hermes `<tool_call>` must map to `EnterToolCall` just like Gemma 4's
+        // `<|tool_call>`. Both put the filter into ToolCall state, so content
+        // before the open tag and after the close tag must be emitted while the
+        // inner payload is suppressed.
+        let mut f = StreamFilter::new();
+        let out = f.feed("before<tool_call>payload</tool_call>after");
+        // drain_buffer processes the whole fragment in one pass: emits "before",
+        // suppresses "payload", then resumes and emits "after" — all merged into
+        // a single content string by the accumulating loop in drain_buffer.
+        let content = out.content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("before"),
+            "text before <tool_call> must appear in delta.content; got: {content:?}"
+        );
+        assert!(
+            content.contains("after"),
+            "text after </tool_call> must appear in delta.content; got: {content:?}"
+        );
+        assert!(
+            !content.contains("<tool_call>"),
+            "open tag must not appear in delta.content; got: {content:?}"
+        );
+        assert!(
+            !content.contains("payload"),
+            "tool-call payload must not appear in delta.content; got: {content:?}"
+        );
+        assert!(
+            !content.contains("</tool_call>"),
+            "close tag must not appear in delta.content; got: {content:?}"
+        );
+    }
+
+    #[test]
+    fn hermes_content_after_tool_call_emitted_in_same_fragment() {
+        // If the model emits content before AND after a tool call in one large
+        // fragment, both pre and post text must appear in delta.content while
+        // the tool-call block is suppressed.
+        let mut f = StreamFilter::new();
+        let out = f.feed(r#"Here is the result.<tool_call>{"name": "fn", "arguments": {}}</tool_call>Any follow-up."#);
+        let content = out.content.as_deref().unwrap_or("");
+        assert!(
+            content.contains("Here is the result."),
+            "preamble must appear in content; got: {content:?}"
+        );
+        assert!(
+            content.contains("Any follow-up."),
+            "text after tool call must appear in content; got: {content:?}"
+        );
+        assert!(
+            !content.contains("<tool_call>"),
+            "open tag must not appear in content; got: {content:?}"
+        );
+        assert!(
+            !content.contains("</tool_call>"),
+            "close tag must not appear in content; got: {content:?}"
+        );
+    }
+
+    // -- Mistral Nemo `[TOOL_CALLS]` suppression (issue #551) --
+
+    #[test]
+    fn mistral_nemo_tool_calls_marker_suppressed() {
+        // Mistral Nemo emits `[TOOL_CALLS] [{"name": ...}]`. Everything from
+        // the `[TOOL_CALLS]` marker onwards is tool-call payload and must not
+        // appear in delta.content.
+        let mut f = StreamFilter::new();
+        let out = f.feed(r#"[TOOL_CALLS] [{"name": "search", "arguments": {"query": "rust"}}]"#);
+        assert_eq!(
+            out.content, None,
+            "Mistral Nemo [TOOL_CALLS] payload must not appear in delta.content"
+        );
+    }
+
+    #[test]
+    fn mistral_nemo_partial_marker_at_boundary_held() {
+        // Fragment ends with `[TOOL_` — a prefix of `[TOOL_CALLS]`. The filter
+        // must hold it back until more text arrives to resolve the ambiguity.
+        let mut f = StreamFilter::new();
+        let out1 = f.feed("preamble [TOOL_");
+        assert_eq!(
+            out1.content.as_deref(),
+            Some("preamble "),
+            "text before partial Mistral marker must be emitted"
+        );
+        // Complete the marker
+        let out2 = f.feed(r#"CALLS] [{"name": "fn", "arguments": {}}]"#);
+        assert_eq!(
+            out2.content, None,
+            "content after Mistral Nemo marker must be suppressed"
+        );
+    }
+
+    #[test]
+    fn mistral_nemo_partial_marker_resolves_to_content() {
+        // `[TOOL_` at end of buffer that turns out NOT to be `[TOOL_CALLS]`
+        // must be released back to delta.content.
+        let mut f = StreamFilter::new();
+        let out1 = f.feed("text [TOOL_");
+        assert_eq!(
+            out1.content.as_deref(),
+            Some("text "),
+            "prefix before potential Mistral marker must be emitted"
+        );
+        // Not a Mistral Nemo marker — the held-back partial must be released.
+        let out2 = f.feed("something_else");
+        assert_eq!(
+            out2.content.as_deref(),
+            Some("[TOOL_something_else"),
+            "partial [TOOL_ that is not [TOOL_CALLS] must be released to content"
+        );
     }
 }
