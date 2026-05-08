@@ -635,13 +635,60 @@ pub(crate) fn top_k_filter(logits: &MlxArray, k: i32) -> UniquePtr<MlxArray> {
 }
 
 /// Apply top-p (nucleus) filtering to logits.
+///
+/// Operates per-row on `[B, V]` logits tensors: argsort, cumsum, and mask
+/// construction all use axis=-1 so each batch row is filtered independently.
+///
+/// Algorithm (mirrors upstream mlx-vlm PR #1094 / commit c7aaf2d):
+///   1. softmax(logits, axis=-1)  → probs per row
+///   2. argsort(-probs, axis=-1)  → indices that sort each row descending
+///   3. take_along_axis(probs, sorted_indices, axis=-1) → sorted_probs per row
+///   4. exclusive cumsum per row: computed as inclusive_cumsum(sorted_probs, axis=-1) − sorted_probs
+///      → cumulative probability strictly *before* each token position
+///   5. mask = cumsum_before <= p  (include tokens up to the nucleus boundary)
+///   6. apply mask to sorted logits; masked positions get -inf
+///   7. argsort(sorted_indices, axis=-1) → indices to undo the sort per row
+///   8. take_along_axis(filtered_sorted_logits, unsort_indices, axis=-1) → result
+///
+/// Note: production generation routes through the C++ `fused_sample` → C++ `top_p_filter`
+/// at `cpp/mlx_cxx_bridge.cpp`. This Rust implementation is a reference/test-parity
+/// copy used to validate the algorithm and in unit tests for batched correctness.
+///
+/// Used by: unit tests (`top_p_filter_*` in `sampling::tests`)
 #[allow(dead_code)]
-pub(crate) fn top_p_filter(logits: &MlxArray, _p: f32) -> UniquePtr<MlxArray> {
+pub(crate) fn top_p_filter(logits: &MlxArray, p: f32) -> UniquePtr<MlxArray> {
+    // Step 1: per-row softmax probabilities.
     let probs = ffi::softmax(logits, -1);
+
+    // Step 2: per-row descending sort via ascending argsort of negated probs.
     let neg_probs = ffi::negative(&probs);
     let sorted_indices = ffi::argsort(&neg_probs, -1);
-    let _sorted_probs = ffi::take(&probs, &sorted_indices, -1);
-    ffi::copy(logits)
+
+    // Step 3: gather sorted probabilities per row.
+    let sorted_probs = ffi::take_along_axis(&probs, &sorted_indices, -1);
+
+    // Step 4: exclusive cumulative sum along vocab axis.
+    // cumsum(..., reverse=false, inclusive=true) gives inclusive cumsum;
+    // subtracting sorted_probs yields the cumulative probability *before*
+    // each token, which is the exclusive (shifted) form needed for nucleus.
+    let cum_probs = ffi::cumsum(&sorted_probs, -1, false, true);
+    let shifted_cum = ffi::subtract(&cum_probs, &sorted_probs);
+
+    // Step 5: mask — keep tokens whose cumulative-before-prob is <= p.
+    let p_scalar = ffi::full_f32(&[1], p, dtype::FLOAT32);
+    let mask = ffi::less_equal(&shifted_cum, &p_scalar);
+
+    // Step 6: apply mask to sorted logits; excluded positions become -inf.
+    let sorted_logits = ffi::take_along_axis(logits, &sorted_indices, -1);
+    let neg_inf = ffi::full_f32(&[1], f32::NEG_INFINITY, dtype::FLOAT32);
+    let filtered_sorted = ffi::where_cond(&mask, &sorted_logits, &neg_inf);
+
+    // Step 7: per-row inverse permutation — argsort of the sort indices undoes
+    // the sort (stable property of argsort on a permutation).
+    let unsort_indices = ffi::argsort(&sorted_indices, -1);
+
+    // Step 8: scatter filtered logits back to original vocab order per row.
+    ffi::take_along_axis(&filtered_sorted, &unsort_indices, -1)
 }
 
 #[cfg(test)]
@@ -889,5 +936,130 @@ mod tests {
         assert_eq!(logit_at(&result, 0), 1.0);
         assert_eq!(logit_at(&result, 1), 2.0);
         assert_eq!(logit_at(&result, 2), 3.0);
+    }
+
+    // Helper: extract a flat f32 vector from an MlxArray.
+    fn to_vec_f32(a: &MlxArray) -> Vec<f32> {
+        ffi::eval(a);
+        let bytes = ffi::array_to_raw_bytes(a);
+        bytes
+            .chunks_exact(4)
+            .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+            .collect()
+    }
+
+    // Helper: extract row `row` of a 2-D [B, V] MlxArray as Vec<f32>.
+    fn row_vec(a: &MlxArray, row: i32, v: i32) -> Vec<f32> {
+        let row_arr = ffi::slice(a, &[row, 0], &[row + 1, v]);
+        to_vec_f32(&row_arr)
+    }
+
+    #[test]
+    fn top_p_filter_single_row_nucleus_boundary() {
+        // Row with 5 tokens. Logits are large enough that softmax concentrates
+        // probability on the first two tokens. With p=0.7 the nucleus should
+        // include the top-1 and top-2 tokens and exclude the rest.
+        //
+        // logits: [10.0, 8.0, 1.0, 1.0, 1.0]
+        // After softmax (approx): token0 ≈ 0.88, token1 ≈ 0.12, others ≈ 0
+        // Sorted descending: [0.88, 0.12, ~0, ~0, ~0]
+        // Exclusive cumsum:  [0.00, 0.88, ~1,  ~1,  ~1 ]
+        // Mask (<=0.7):      [true, false, ...]
+        // Only token0 should survive with p=0.7.
+        let logits = ffi::from_slice_f32(&[10.0, 8.0, 1.0, 1.0, 1.0], &[1, 5]);
+        let result = top_p_filter(&logits, 0.7);
+        ffi::eval(&result);
+
+        // token0 (argmax) must survive; all others must be -inf.
+        let v = to_vec_f32(&result);
+        assert!(
+            v[0].is_finite(),
+            "top token should survive nucleus (got {})",
+            v[0]
+        );
+        for i in 1..5 {
+            assert!(
+                v[i].is_infinite() && v[i] < 0.0,
+                "token {i} should be filtered to -inf (got {})",
+                v[i]
+            );
+        }
+    }
+
+    #[test]
+    fn top_p_filter_single_row_all_pass_at_one() {
+        // With p=1.0 all tokens should survive (no filtering).
+        let logits = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]);
+        let result = top_p_filter(&logits, 1.0);
+        ffi::eval(&result);
+        let v = to_vec_f32(&result);
+        for (i, &x) in v.iter().enumerate() {
+            assert!(
+                x.is_finite(),
+                "all tokens should survive with p=1.0 (token {i} got {x})"
+            );
+        }
+    }
+
+    #[test]
+    fn top_p_filter_batched_equals_per_row() {
+        // Regression test for issue #546 (upstream mlx-vlm PR #1094, commit c7aaf2d).
+        //
+        // Construct a [2, 6] logits tensor where the two rows have deliberately
+        // different distributions so a buggy global sort would give wrong results.
+        //
+        // Row 0: token 2 is the most probable; token 0 dominates next.
+        // Row 1: token 5 is the most probable; token 3 dominates next.
+        //
+        // Running top_p_filter on the full [2, 6] batch must produce the same
+        // filtered logits as running it on each [1, 6] row independently.
+        let row0 = [1.0f32, 2.0, 10.0, 1.0, 1.0, 1.0]; // token2 dominates
+        let row1 = [1.0f32, 1.0, 1.0, 2.0, 1.0, 10.0]; // token5 dominates
+        let flat: Vec<f32> = row0.iter().chain(row1.iter()).copied().collect();
+
+        // Batched call.
+        let batch_logits = ffi::from_slice_f32(&flat, &[2, 6]);
+        let p = 0.8_f32;
+        let batch_result = top_p_filter(&batch_logits, p);
+        ffi::eval(&batch_result);
+
+        // Per-row calls.
+        let logits0 = ffi::from_slice_f32(&row0, &[1, 6]);
+        let logits1 = ffi::from_slice_f32(&row1, &[1, 6]);
+        let result0 = top_p_filter(&logits0, p);
+        let result1 = top_p_filter(&logits1, p);
+        ffi::eval(&result0);
+        ffi::eval(&result1);
+
+        let batch_row0 = row_vec(&batch_result, 0, 6);
+        let batch_row1 = row_vec(&batch_result, 1, 6);
+        let solo_row0 = to_vec_f32(&result0);
+        let solo_row1 = to_vec_f32(&result1);
+
+        // Each batched row must match its corresponding solo result within
+        // floating-point tolerance (1e-5).
+        for i in 0..6 {
+            let b0 = batch_row0[i];
+            let s0 = solo_row0[i];
+            if b0.is_infinite() && s0.is_infinite() {
+                // Both filtered to -inf — correct.
+            } else {
+                assert!(
+                    (b0 - s0).abs() < 1e-5,
+                    "row0 token {i}: batched={b0} vs per-row={s0} mismatch"
+                );
+            }
+
+            let b1 = batch_row1[i];
+            let s1 = solo_row1[i];
+            if b1.is_infinite() && s1.is_infinite() {
+                // Both filtered to -inf — correct.
+            } else {
+                assert!(
+                    (b1 - s1).abs() < 1e-5,
+                    "row1 token {i}: batched={b1} vs per-row={s1} mismatch"
+                );
+            }
+        }
     }
 }
