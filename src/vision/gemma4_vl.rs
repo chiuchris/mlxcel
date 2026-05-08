@@ -17,56 +17,16 @@
 //! Used by: Gemma4 VLM
 
 use super::feature_cache::{CacheKey, SingleArrayFeatures, VisionFeatureCache};
+use super::gemma4_multimodal_embedder::{Gemma4MultimodalEmbedder, masked_scatter};
+use super::gemma4_per_layer_inputs_state::Gemma4PerLayerInputsState;
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
 use crate::audio;
 use crate::multimodal::batched_dispatch::forward_batched_with_seq_ids_dispatch;
 use mlxcel_core::cache::{SequenceId, SequenceStateLayout};
 use mlxcel_core::generate::DecodeBatchContext;
-use mlxcel_core::layers::{KVCache, UnifiedLinear};
+use mlxcel_core::layers::KVCache;
 use mlxcel_core::{MlxArray, UniquePtr};
-
-pub struct Gemma4MultimodalEmbedder {
-    embedding_projection: UnifiedLinear,
-    pre_projection_norm: crate::models::gemma4::RMSNormNoScale,
-}
-
-impl Gemma4MultimodalEmbedder {
-    /// Construct the Gemma 4 multimodal embedder.
-    ///
-    /// `embedding_dim` is the input feature dimension (the vision or audio
-    /// encoder output size) — i.e. the column count of the projection weight
-    /// `embedding_projection.weight`. The RMS norm is applied on this dim
-    /// BEFORE the projection, matching upstream mlx-vlm after the reordering
-    /// that renamed `embedding_post_projection_norm` to
-    /// `embedding_pre_projection_norm`.
-    pub fn from_weights(
-        weights: &mlxcel_core::weights::WeightMap,
-        prefix: &str,
-        embedding_dim: usize,
-        eps: f32,
-        group_size: i32,
-        bits: i32,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            embedding_projection: UnifiedLinear::from_weights(
-                weights,
-                &format!("{}.embedding_projection", prefix),
-                group_size,
-                bits,
-            )?,
-            pre_projection_norm: crate::models::gemma4::RMSNormNoScale::new(
-                embedding_dim as i32,
-                eps,
-            ),
-        })
-    }
-
-    pub fn forward(&self, inputs_embeds: &MlxArray) -> UniquePtr<MlxArray> {
-        let normed = self.pre_projection_norm.forward(inputs_embeds);
-        self.embedding_projection.forward(&normed)
-    }
-}
 
 pub struct Gemma4VLModel {
     pub text_model: crate::models::Gemma4Wrapper,
@@ -81,7 +41,9 @@ pub struct Gemma4VLModel {
     pub audio_token_id: i32,
     pub boa_token_id: i32,
     pub eoa_token_id: i32,
-    cached_per_layer_inputs: std::cell::RefCell<Option<UniquePtr<MlxArray>>>,
+    /// Per-`SequenceId` storage for projected `per_layer_inputs`
+    /// (issue #543). Mirrors `MRopeState` (#540).
+    per_layer_inputs_state: Gemma4PerLayerInputsState,
     _weight_backing: crate::models::Gemma4WeightBacking,
 }
 
@@ -108,7 +70,7 @@ impl Gemma4VLModel {
             audio_token_id: 258_881,
             boa_token_id: 256_000,
             eoa_token_id: 258_883,
-            cached_per_layer_inputs: std::cell::RefCell::new(None),
+            per_layer_inputs_state: Gemma4PerLayerInputsState::new(),
             _weight_backing: crate::models::Gemma4WeightBacking::default(),
         }
     }
@@ -318,35 +280,62 @@ impl Gemma4VLModel {
             result_embeds.inputs_embeds = scattered;
         }
 
-        *self.cached_per_layer_inputs.borrow_mut() = per_layer_inputs;
+        // Issue #543: park the freshly projected tensor in the
+        // container's fallback slot. The scheduler binds it to a
+        // `SequenceId` right after `prepare_request_vlm_embeddings`
+        // returns; legacy CLI/single-row callers consume it via
+        // `take_fallback` on the next prefill.
+        self.per_layer_inputs_state.set_fallback(per_layer_inputs);
         result_embeds
     }
-}
 
-/// Scatter source values into input at positions where mask is true.
-///
-/// Equivalent to Python's `masked_scatter`: flattens mask, computes cumulative
-/// indices, aligns source, and uses where_cond.
-fn masked_scatter(input: &MlxArray, mask: &MlxArray, source: &MlxArray) -> UniquePtr<MlxArray> {
-    let input_shape = mlxcel_core::array_shape(input);
-    let total_size: i32 = input_shape.iter().product();
+    // -- Per-sequence per_layer_inputs (issue #543) --------------------
+    //
+    // These thin wrappers route through `Gemma4PerLayerInputsState`. The
+    // scheduler calls them via `LoadedModel::*` capability helpers (see
+    // `loaded_model_capabilities.rs`) right after
+    // `prepare_request_vlm_embeddings` so a burst of Gemma 4 VLM
+    // requests cannot have one row's prefill consume another row's
+    // tensor. Mirrors the Qwen MRoPE binding flow from issue #540.
 
-    let mask_flat = mlxcel_core::reshape(mask, &[total_size]);
-    let mask_i32 = mlxcel_core::astype(&mask_flat, mlxcel_core::dtype::INT32);
-    let indices = mlxcel_core::cumsum(&mask_i32, 0, false, true);
-    let ones = mlxcel_core::ones(&[1], mlxcel_core::dtype::INT32);
-    let indices = mlxcel_core::subtract(&indices, &ones);
+    /// Drain the container's fallback slot into the per-`SequenceId`
+    /// map under `seq_id`. No-op when the slot is empty (E1B variant
+    /// or text-only request).
+    pub fn bind_per_layer_inputs_to_sequence(&self, seq_id: SequenceId) {
+        self.per_layer_inputs_state
+            .bind_fallback_to_sequence(seq_id);
+    }
 
-    let source_flat_size: i32 = mlxcel_core::array_shape(source).iter().product();
-    let source_size_arr = mlxcel_core::from_slice_i32(&[source_flat_size], &[1]);
-    let safe_indices = mlxcel_core::remainder(&indices, &source_size_arr);
+    /// Drop a sequence's stored `per_layer_inputs`. Called from
+    /// [`Self::release_sequence_state_by_id`] so the map drains in
+    /// step with the scheduler's per-sequence cache cleanup.
+    pub fn release_per_layer_inputs(&self, seq_id: SequenceId) {
+        self.per_layer_inputs_state.release_sequence(seq_id);
+    }
 
-    let source_flat = mlxcel_core::reshape(source, &[source_flat_size]);
-    let aligned = mlxcel_core::take(&source_flat, &safe_indices, 0);
+    /// Take a sequence's tensor out of the map without dropping the
+    /// `UniquePtr`. Used by the scheduler's preemption path so the
+    /// tensor can be carried across the eviction (which releases the
+    /// old sequence id) and reinstalled under the freshly allocated
+    /// id with [`Self::install_per_layer_inputs_for_sequence`].
+    pub fn take_per_layer_inputs_for_sequence(
+        &self,
+        seq_id: SequenceId,
+    ) -> Option<UniquePtr<MlxArray>> {
+        self.per_layer_inputs_state.take_for_sequence(seq_id)
+    }
 
-    let input_flat = mlxcel_core::reshape(input, &[total_size]);
-    let result = mlxcel_core::where_cond(&mask_flat, &aligned, &input_flat);
-    mlxcel_core::reshape(&result, &input_shape)
+    /// Re-install a previously taken tensor under `seq_id`. No-op
+    /// when the snapshot is `None`.
+    pub fn install_per_layer_inputs_for_sequence(
+        &self,
+        seq_id: SequenceId,
+        snapshot: Option<UniquePtr<MlxArray>>,
+    ) {
+        if let Some(value) = snapshot {
+            self.per_layer_inputs_state.bind_for_sequence(seq_id, value);
+        }
+    }
 }
 
 impl LanguageModel for Gemma4VLModel {
@@ -397,13 +386,18 @@ impl LanguageModel for Gemma4VLModel {
         mask: Option<&MlxArray>,
     ) -> UniquePtr<MlxArray> {
         if let Some(embeds) = input_embeddings {
-            // VLM prefill path. The scheduler runs VLM prefill
-            // sequentially (see `scheduler.rs`: any sequence with
-            // `vlm_embeddings.is_some()` falls back to per-row prefill),
-            // so only one consumer touches `cached_per_layer_inputs` at
-            // a time. The `take()` empties the cell so a stale entry
-            // cannot leak into the next request.
-            let per_layer_inputs = self.cached_per_layer_inputs.borrow_mut().take();
+            // Issue #543: prefer the per-`SequenceId` slot so each
+            // row of a burst-enqueued batch sees its own projection.
+            // Fall back to the legacy fallback slot when there is no
+            // `seq_id` (CLI/single-row) or the bind step did not run
+            // before this consumer.
+            let per_layer_inputs = match seq_id {
+                Some(id) => self
+                    .per_layer_inputs_state
+                    .take_for_sequence(id)
+                    .or_else(|| self.per_layer_inputs_state.take_fallback()),
+                None => self.per_layer_inputs_state.take_fallback(),
+            };
             self.text_model.forward_with_inputs_and_sequence_id(
                 input_ids,
                 Some(embeds),
@@ -438,6 +432,11 @@ impl LanguageModel for Gemma4VLModel {
     }
 
     fn release_sequence_state_by_id(&self, seq_id: SequenceId) {
+        // Issue #543: drop the per-sequence `per_layer_inputs`
+        // alongside the text model's per-sequence cache release so
+        // the map cannot grow without bound across long-running
+        // server sessions.
+        self.per_layer_inputs_state.release_sequence(seq_id);
         self.text_model.release_sequence_state_by_id(seq_id);
     }
 

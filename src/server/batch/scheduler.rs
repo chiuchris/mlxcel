@@ -1031,6 +1031,15 @@ impl BatchScheduler {
         // the call is a no-op for everything else.
         self.model.bind_qwen_vl_mrope_state_to_sequence(seq_id);
 
+        // Issue #543: per-sequence `per_layer_inputs` for Gemma 4
+        // E2B/E4B. `prepare_request_vlm_embeddings` writes the
+        // freshly projected tensor to the VL model's fallback slot;
+        // this call drains the slot into a per-`SequenceId` map so a
+        // burst of Gemma 4 VLM requests in a single drain tick cannot
+        // have one row consume another row's tensor. No-op for
+        // everything that is not a Gemma 4 VLM.
+        self.model.bind_gemma4_per_layer_inputs_to_sequence(seq_id);
+
         let decode_state = StreamingDecodeState::new(&self.tokenizer, &prompt_tokens);
 
         // Issue #409: resolve the effective thinking-token budget for this
@@ -2013,6 +2022,15 @@ impl BatchScheduler {
             // an empty snapshot and the rebind is a no-op.
             let mrope_snapshot = self.model.take_qwen_vl_mrope_entry(victim.seq_id);
 
+            // Issue #543: same lifecycle invariant for Gemma 4 E2B/E4B
+            // `per_layer_inputs`. The tensor is projected exactly once
+            // by `prepare_request_vlm_embeddings` at enqueue time and
+            // is consumed at prefill time; preemption-and-reallocate
+            // would otherwise drop it and the re-prefill would observe
+            // `per_layer_inputs == None` for an E2B/E4B request. Take
+            // it out before `release_sequence_caches` drains the map.
+            let pli_snapshot = self.model.take_gemma4_per_layer_inputs_entry(victim.seq_id);
+
             // Release its KV cache
             self.release_sequence_caches(victim.seq_id);
 
@@ -2041,6 +2059,12 @@ impl BatchScheduler {
                     // (issue #540 follow-up).
                     self.model
                         .install_qwen_vl_mrope_entry(new_id, mrope_snapshot);
+                    // Issue #543: same for Gemma 4 `per_layer_inputs`.
+                    // The tensor is reused unchanged across re-prefill
+                    // because both depend only on the request's
+                    // input_ids (no decode-time updates).
+                    self.model
+                        .install_gemma4_per_layer_inputs_entry(new_id, pli_snapshot);
                     if let Err(err) = victim.state.transition_to(SequenceState::Queued) {
                         tracing::error!("Eviction state transition error: {err}");
                         self.release_sequence_caches(new_id);
@@ -2055,10 +2079,11 @@ impl BatchScheduler {
                     let _ = victim.response_tx.send(GenerateEvent::Error(format!(
                         "Preemption re-queue failed: {err}"
                     )));
-                    // The MRoPE snapshot is dropped here; the request is
-                    // about to error out so the entry has no further
+                    // The snapshots are dropped here; the request is
+                    // about to error out so the entries have no further
                     // consumer.
                     drop(mrope_snapshot);
+                    drop(pli_snapshot);
                     return true; // Slot is still freed
                 }
             }

@@ -206,6 +206,63 @@ impl LoadedModel {
         }
     }
 
+    /// Bind any pending Gemma 4 VLM `per_layer_inputs` tensor (just
+    /// projected by `get_input_embeddings_with_audio_and_cache`) to a
+    /// specific server sequence id so a burst of Gemma 4 VLM requests
+    /// in a single drain tick cannot have one row's prefill consume
+    /// another row's tensor (issue #543).
+    ///
+    /// This is a no-op for non-Gemma-4 models. The caller passes the
+    /// id the scheduler already allocated for the request; the VLM
+    /// runtime transfers the fallback slot's tensor into its
+    /// per-`SequenceId` map. When the fallback is empty (E1B variant
+    /// or text-only request after a Gemma 4 VLM model load), the
+    /// binding leaves the map without an entry — the prefill consumer
+    /// then surfaces `None` for `per_layer_inputs`, matching the
+    /// no-VLM-prefill semantics.
+    pub fn bind_gemma4_per_layer_inputs_to_sequence(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        if let Some(VlmRuntimeRef::Gemma4(gemma4)) = self.vlm_runtime() {
+            gemma4.bind_per_layer_inputs_to_sequence(seq_id);
+        }
+    }
+
+    /// Take the per-sequence Gemma 4 `per_layer_inputs` tensor out of
+    /// the underlying VL model. Used by the scheduler's preemption
+    /// path so the tensor survives the eviction (which releases the
+    /// old sequence id) and can be reinstalled under the freshly
+    /// allocated id — `prepare_request_vlm_embeddings` does not run
+    /// again on re-prefill, so without the take/install round trip
+    /// the re-prefill would observe `per_layer_inputs == None` and
+    /// produce wrong logits for E2B/E4B variants (issue #543).
+    ///
+    /// Returns `None` for non-Gemma-4 models, the E1B variant, or
+    /// when no entry exists for `seq_id`.
+    pub fn take_gemma4_per_layer_inputs_entry(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+    ) -> Option<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>> {
+        if let Some(VlmRuntimeRef::Gemma4(gemma4)) = self.vlm_runtime() {
+            return gemma4.take_per_layer_inputs_for_sequence(seq_id);
+        }
+        None
+    }
+
+    /// Re-install a previously taken Gemma 4 `per_layer_inputs`
+    /// tensor under `seq_id`. No-op for non-Gemma-4 models or when
+    /// the snapshot is `None`.
+    pub fn install_gemma4_per_layer_inputs_entry(
+        &self,
+        seq_id: mlxcel_core::cache::SequenceId,
+        snapshot: Option<mlxcel_core::UniquePtr<mlxcel_core::MlxArray>>,
+    ) {
+        if snapshot.is_none() {
+            return;
+        }
+        if let Some(VlmRuntimeRef::Gemma4(gemma4)) = self.vlm_runtime() {
+            gemma4.install_per_layer_inputs_for_sequence(seq_id, snapshot);
+        }
+    }
+
     pub fn image_token_block_info(&self) -> Option<vlm_prompt::ImageTokenBlockInfo> {
         image_token_block_info_from_runtime(self.vlm_runtime()?)
     }

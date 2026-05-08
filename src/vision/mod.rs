@@ -36,6 +36,8 @@ pub mod processors;
 
 // VLM model implementations
 pub mod gemma3n_vl;
+pub mod gemma4_multimodal_embedder;
+pub mod gemma4_per_layer_inputs_state;
 pub mod gemma4_vl;
 pub mod minicpmo_vl;
 pub mod molmo2_vl;

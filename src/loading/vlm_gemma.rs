@@ -336,7 +336,7 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     // after the `embedding_post_projection_norm` -> `embedding_pre_projection_norm`
     // rename. This is a BREAKING change for pre-rename Gemma 4 VLM checkpoints;
     // users must re-download `mlx-community/gemma-4-*-it-4bit` or equivalent.
-    let embed_vision = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
+    let embed_vision = vision::gemma4_multimodal_embedder::Gemma4MultimodalEmbedder::from_weights(
         &weights,
         "embed_vision",
         vision_config.hidden_size,
@@ -413,15 +413,16 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
             // (`audio_config.hidden_size`) BEFORE projection, matching the
             // reordered upstream Gemma 4 multimodal embedder. See the note on
             // `embed_vision` above for migration guidance.
-            let embed_audio = vision::gemma4_vl::Gemma4MultimodalEmbedder::from_weights(
-                &weights,
-                "embed_audio",
-                audio_config.hidden_size,
-                audio_config.rms_norm_eps,
-                group_size,
-                bits,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to load audio embedder: {}", e))?;
+            let embed_audio =
+                vision::gemma4_multimodal_embedder::Gemma4MultimodalEmbedder::from_weights(
+                    &weights,
+                    "embed_audio",
+                    audio_config.hidden_size,
+                    audio_config.rms_norm_eps,
+                    group_size,
+                    bits,
+                )
+                .map_err(|e| anyhow::anyhow!("Failed to load audio embedder: {}", e))?;
 
             let audio_token_id = full_config
                 .get("audio_token_id")
