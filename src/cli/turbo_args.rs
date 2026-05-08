@@ -184,13 +184,14 @@ impl TurboKvCacheArgs {
 
 /// Supported K/V combinations and their corresponding `KVCacheMode`.
 ///
-/// | K      | V                 | Mode              |
-/// |--------|-------------------|-------------------|
-/// | fp16   | fp16              | `Fp16`            |
-/// | int8   | int8              | `Int8`            |
-/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`   |
-/// | turbo4 | turbo4            | `Turbo4`          |
-/// | fp16   | turbo4-delegated  | `Turbo4Delegated` |
+/// | K      | V                    | Mode              |
+/// |--------|----------------------|-------------------|
+/// | fp16   | fp16                 | `Fp16`            |
+/// | int8   | int8                 | `Int8`            |
+/// | fp16   | turbo4 / turbo4-asym | `Turbo4Asym`      |
+/// | turbo4 | turbo4               | `Turbo4`          |
+/// | fp16   | turbo4-delegated     | `Turbo4Delegated` |
+/// | fp16   | turbo3 / turbo3-asym | `Turbo3Asym`      |
 ///
 /// Any other combination returns an error with a description of valid pairs.
 pub fn resolve_kv_cache_mode(
@@ -238,7 +239,7 @@ pub fn resolve_kv_cache_mode(
 /// Not all combinations are supported. Returns an error with a human-readable
 /// message when the pair is unsupported.
 fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheMode, String> {
-    use KVCacheMode::{Fp16, Int8, Turbo4, Turbo4Asym, Turbo4Delegated};
+    use KVCacheMode::{Fp16, Int8, Turbo3Asym, Turbo4, Turbo4Asym, Turbo4Delegated};
     match (k, v) {
         (Fp16, Fp16) => Ok(Fp16),
         (Int8, Int8) => Ok(Int8),
@@ -248,6 +249,13 @@ fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheM
         (Turbo4, Turbo4) => Ok(Turbo4),
         // Delegated hot/cold: FP16 K + Turbo4Delegated V → Turbo4Delegated
         (Fp16, Turbo4Delegated) => Ok(Turbo4Delegated),
+        // Asymmetric 3-bit: FP16 K + Turbo3 V → Turbo3Asym. Symmetric Turbo3
+        // is intentionally not offered (see KVCacheMode::Turbo3Asym docs and
+        // the help text for `--cache-type-v`). The legacy
+        // `--kv-cache-mode fp16+turbo3` shorthand routed through
+        // `KVCacheMode::from_str` already accepted this pair, so the split
+        // flags must accept it too for parity.
+        (Fp16, Turbo3Asym) => Ok(Turbo3Asym),
         // Anything else is unsupported.
         (k, v) => Err(format!(
             "unsupported --cache-type-k={k} / --cache-type-v={v} combination; \
@@ -257,7 +265,9 @@ fn map_kv_modes_to_cache_mode(k: KVCacheMode, v: KVCacheMode) -> Result<KVCacheM
              fp16   / turbo4            -> fp16+turbo4 (Turbo4Asym)\n  \
              fp16   / turbo4-asym       -> fp16+turbo4 (Turbo4Asym)\n  \
              turbo4 / turbo4            -> turbo4 (symmetric, allowlist-gated)\n  \
-             fp16   / turbo4-delegated  -> turbo4-delegated"
+             fp16   / turbo4-delegated  -> turbo4-delegated\n  \
+             fp16   / turbo3            -> fp16+turbo3 (Turbo3Asym)\n  \
+             fp16   / turbo3-asym       -> fp16+turbo3 (Turbo3Asym)"
         )),
     }
 }

@@ -474,23 +474,36 @@ fn sparse_v_attention_returns_none_when_not_available() {
 /// `sparse_v::threshold()` means tests should not assume mid-test
 /// reconfiguration takes effect; the guard is here to set the env *before*
 /// any other test in this binary calls `threshold()`.
+///
+/// The guard takes the crate-wide `ENV_LOCK` for its full lifetime so that
+/// `set_var`/`remove_var` calls cannot race with env mutations in any other
+/// `#[cfg(test)]` module of the same test binary (issue #573 — libc's env
+/// block has no internal lock).
 struct SparseVThresholdGuard {
     prev: Option<String>,
+    // The lock guard outlives the env mutations: it is taken in `set` and
+    // dropped only AFTER `Drop::drop` restores the previous value.
+    _lock: std::sync::MutexGuard<'static, ()>,
 }
 
 impl SparseVThresholdGuard {
     #[allow(dead_code)] // used only by the cache-mode unit tests below
     fn set(value: &str) -> Self {
+        // Acquire the crate-wide env-var lock BEFORE reading or writing the
+        // env block so the read-modify-write window is atomic w.r.t. other
+        // env-touching tests.
+        let lock = crate::test_support::env_lock::env_lock();
         let prev = std::env::var(super::turbo::sparse_v::ENV_VAR).ok();
-        // SAFETY: env mutation is single-threaded in cargo test by default
-        // for the affected scope; we only use this in `#[test]` paths.
+        // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
         unsafe { std::env::set_var(super::turbo::sparse_v::ENV_VAR, value) };
-        Self { prev }
+        Self { prev, _lock: lock }
     }
 }
 
 impl Drop for SparseVThresholdGuard {
     fn drop(&mut self) {
+        // SAFETY: the `_lock` field still holds the ENV_LOCK guard, so this
+        // restoration is serialized w.r.t. all other env-touching tests.
         match self.prev.take() {
             Some(v) => unsafe { std::env::set_var(super::turbo::sparse_v::ENV_VAR, v) },
             None => unsafe { std::env::remove_var(super::turbo::sparse_v::ENV_VAR) },

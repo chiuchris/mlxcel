@@ -16,6 +16,10 @@
 
 use super::*;
 use std::path::PathBuf;
+// Env-var-sensitive tests must serialize through the crate-wide `ENV_LOCK`
+// (issue #573); without it, two test threads can call `setenv`/`getenv`
+// concurrently — undefined behavior under Rust 2024's unsafe env contract.
+use crate::test_support::env_lock::env_lock;
 
 fn args(repo_id: &str) -> DownloadArgs {
     DownloadArgs {
@@ -241,10 +245,10 @@ fn malicious_siblings_payload_is_filtered_out() {
 
 #[test]
 fn token_resolution_explicit_wins() {
+    let _env_guard = env_lock();
     let prev_hf = std::env::var("HF_TOKEN").ok();
     let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
-    // SAFETY: tests in this binary run single-threaded relative to one
-    // another for env-var manipulation; we restore values at the end.
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe {
         std::env::set_var("HF_TOKEN", "from-env");
     }
@@ -256,8 +260,10 @@ fn token_resolution_explicit_wins() {
 
 #[test]
 fn token_resolution_hf_token_env() {
+    let _env_guard = env_lock();
     let prev_hf = std::env::var("HF_TOKEN").ok();
     let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe {
         std::env::set_var("HF_TOKEN", "tok-hf");
         std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
@@ -270,8 +276,10 @@ fn token_resolution_hf_token_env() {
 
 #[test]
 fn token_resolution_falls_back_to_alt_env() {
+    let _env_guard = env_lock();
     let prev_hf = std::env::var("HF_TOKEN").ok();
     let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe {
         std::env::remove_var("HF_TOKEN");
         std::env::set_var("HUGGING_FACE_HUB_TOKEN", "tok-alt");
@@ -284,8 +292,10 @@ fn token_resolution_falls_back_to_alt_env() {
 
 #[test]
 fn token_resolution_anonymous_when_unset() {
+    let _env_guard = env_lock();
     let prev_hf = std::env::var("HF_TOKEN").ok();
     let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe {
         std::env::remove_var("HF_TOKEN");
         std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
@@ -297,8 +307,10 @@ fn token_resolution_anonymous_when_unset() {
 
 #[test]
 fn token_resolution_treats_empty_as_anonymous() {
+    let _env_guard = env_lock();
     let prev_hf = std::env::var("HF_TOKEN").ok();
     let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe {
         std::env::set_var("HF_TOKEN", "");
         std::env::set_var("HUGGING_FACE_HUB_TOKEN", "  ");

@@ -1599,16 +1599,13 @@ mod tests {
     // B8 — LangBiasConfig::resolve_token_bias
     // =========================================================================
 
-    /// Shared mutex serializing tests that mutate `MLXCEL_CACHE_DIR`. Duplicates
-    /// the guard used in `cache.rs` tests so both modules can cooperate.
-    static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        ENV_LOCK
-            .get_or_init(|| std::sync::Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
+    // Tests that mutate `MLXCEL_CACHE_DIR` (or any other env var) must
+    // serialize through the crate-wide `ENV_LOCK` from
+    // `mlxcel_core::test_support::env_lock`. Per-module locks would race
+    // with env mutations in unrelated modules of the same test binary —
+    // libc's env block has no internal lock and concurrent
+    // `setenv`/`getenv` is undefined behavior (issue #573).
+    use crate::test_support::env_lock::env_lock;
 
     fn resolve_mock_tokenizer_json(marker: &str) -> String {
         format!(

@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use std::path::PathBuf;
-use std::sync::{Mutex, OnceLock};
 
 use super::{
     DecodeStorageBackend, ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
@@ -22,20 +21,12 @@ use super::{
     resolve_prefill_chunk_size, resolve_seed,
 };
 use crate::lang_bias::LangBiasCliArgs;
-
-// Global mutex to serialize all tests that mutate env vars via `EnvGuard`.
-// `std::env::set_var` / `remove_var` are not thread-safe under cargo's default
-// parallel test runner.  Every test that calls `EnvGuard::set` must acquire
-// this lock *before* constructing the guard so the lock outlives the guard's
-// `Drop` (which calls `remove_var`).
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
+// Tests that mutate env vars (via `EnvGuard` or directly) must acquire the
+// crate-wide `ENV_LOCK` *before* the guard so the lock outlives the
+// guard's `Drop` (which calls `remove_var`). See issue #573 — a per-module
+// lock would race with env mutations in unrelated modules of the same
+// test binary.
+use crate::test_support::env_lock::env_lock;
 
 fn sample_input() -> ServerStartupInput {
     ServerStartupInput {
@@ -343,8 +334,9 @@ struct EnvGuard(&'static str);
 
 impl EnvGuard {
     fn set(key: &'static str, value: &str) -> Self {
-        // SAFETY: single-threaded access guaranteed by cargo test (or
-        // serial execution with env isolation if run under a test harness).
+        // SAFETY: callers acquire `env_lock()` before constructing this guard
+        // (see the `let _env_guard = env_lock();` lines in each test), so only
+        // one thread mutates the process environment at a time.
         #[allow(unsafe_code)]
         unsafe {
             std::env::set_var(key, value);
@@ -355,6 +347,8 @@ impl EnvGuard {
 
 impl Drop for EnvGuard {
     fn drop(&mut self) {
+        // SAFETY: same env_lock serialization as in `set`; the lock guard is
+        // dropped after this guard, so the lock still covers `remove_var`.
         #[allow(unsafe_code)]
         unsafe {
             std::env::remove_var(self.0);

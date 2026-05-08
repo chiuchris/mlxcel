@@ -20,20 +20,14 @@
 //! the re-exports from `mlxcel::server`. The tests here pin down the
 //! `apply_to_environment` translation that is unique to this module.
 
-use std::sync::{Mutex, OnceLock};
+use mlxcel_core::cache::KVCacheMode;
 
-use super::TurboKvCacheArgs;
-
-// `std::env::set_var` / `remove_var` are not thread-safe. Serialize every
-// test that touches `MLXCEL_KV_BOUNDARY_V_LAYERS` through this lock.
-static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-}
+use super::{TurboKvCacheArgs, resolve_kv_cache_mode};
+// `std::env::set_var` / `remove_var` are not thread-safe. Tests that touch
+// the process environment must serialize through the crate-wide
+// `ENV_LOCK` (issue #573) — a per-module lock would race with the env
+// mutations in unrelated modules of the same test binary.
+use crate::test_support::env_lock::env_lock;
 
 fn boundary_env_key() -> &'static str {
     mlxcel_core::cache::turbo::BOUNDARY_V_ENV
@@ -114,4 +108,51 @@ fn apply_to_environment_preserves_negative_inputs_for_runtime_clamping() {
     unsafe {
         std::env::remove_var(boundary_env_key());
     }
+}
+
+// Issue #573 Finding 1 — `--cache-type-k fp16 --cache-type-v turbo3` was
+// rejected by the split-flag resolver even though the legacy
+// `--kv-cache-mode fp16+turbo3` shorthand worked, and the help text on all
+// three binaries advertises `fp16+turbo3` as a supported value. Pin the
+// fixed arm so a regression on the split-flag path fails loudly.
+
+/// K=fp16, V=turbo3 (canonical short form) → Turbo3Asym.
+#[test]
+fn resolve_split_flags_fp16_k_turbo3_v_returns_turbo3_asym() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo3"), None)
+        .expect("fp16 + turbo3 split flags must resolve");
+    assert_eq!(mode, KVCacheMode::Turbo3Asym);
+}
+
+/// K=fp16, V=turbo3-asym (explicit alias) → Turbo3Asym.
+#[test]
+fn resolve_split_flags_fp16_k_turbo3_asym_v_returns_turbo3_asym() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("turbo3-asym"), None)
+        .expect("fp16 + turbo3-asym split flags must resolve");
+    assert_eq!(mode, KVCacheMode::Turbo3Asym);
+}
+
+/// K=fp16, V=fp16+turbo3 (canonical long form, accepted by `KVCacheMode::from_str`).
+#[test]
+fn resolve_split_flags_fp16_k_fp16_plus_turbo3_v_returns_turbo3_asym() {
+    let mode = resolve_kv_cache_mode(Some("fp16"), Some("fp16+turbo3"), None)
+        .expect("fp16 + fp16+turbo3 split flags must resolve");
+    assert_eq!(mode, KVCacheMode::Turbo3Asym);
+}
+
+/// Symmetric Turbo3 is intentionally not offered (see `KVCacheMode::Turbo3Asym`
+/// docs). K=turbo3 + V=turbo3 must fail and the error message must list the
+/// supported pairs, including the new `fp16 / turbo3` row.
+#[test]
+fn resolve_split_flags_symmetric_turbo3_is_rejected_with_helpful_error() {
+    let err = resolve_kv_cache_mode(Some("turbo3"), Some("turbo3"), None)
+        .expect_err("symmetric turbo3 must be rejected");
+    assert!(
+        err.contains("unsupported"),
+        "error must explain that the pair is unsupported, got: {err}"
+    );
+    assert!(
+        err.contains("fp16   / turbo3"),
+        "error must list the supported `fp16 / turbo3` row, got: {err}"
+    );
 }

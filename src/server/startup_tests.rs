@@ -23,6 +23,10 @@ use super::{
 use crate::distributed::{ClusterConfig, TransportBackend};
 use crate::server::chat_template::ChatMessage;
 use crate::server::{DecodeStorageBackend, PipelineParallelRuntimeConfig};
+// Env-var-sensitive tests must serialize through the crate-wide `ENV_LOCK`
+// (issue #573); per-module locks race with env mutations in unrelated
+// modules of the same test binary.
+use crate::test_support::env_lock::env_lock;
 
 fn temp_path(name: &str) -> PathBuf {
     let path = std::env::temp_dir().join(format!("mlxcel-{}-{}", name, uuid::Uuid::new_v4()));
@@ -455,12 +459,15 @@ fn decode_storage_backend_parses_auto_dense_and_paged() {
 
 #[test]
 fn resolve_decode_storage_backend_defaults_to_auto() {
+    let _env_guard = env_lock();
     let key = "MLXCEL_SERVER_DECODE_STORAGE";
     let prev = std::env::var_os(key);
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     unsafe { std::env::remove_var(key) };
 
     let resolved = resolve_decode_storage_backend();
 
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
     match prev {
         Some(value) => unsafe { std::env::set_var(key, value) },
         None => unsafe { std::env::remove_var(key) },

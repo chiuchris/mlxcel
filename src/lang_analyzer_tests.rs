@@ -23,17 +23,10 @@ use mlxcel_core::lang_analyzer::{
     CURRENT_VERSION, Script, TokenLanguageIndex, cache, classify_token, is_numeric, is_punctuation,
     is_whitespace,
 };
-
-// Serialize env-var-sensitive integration tests to avoid race conditions in
-// parallel test execution.
-static ENV_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
-
-fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-    ENV_LOCK
-        .get_or_init(|| std::sync::Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-}
+// Env-var-sensitive tests must serialize through the crate-wide `ENV_LOCK`
+// (issue #573); per-module locks race with env mutations in unrelated
+// modules of the same test binary.
+use crate::test_support::env_lock::env_lock;
 
 // ============================================================================
 // B2 — classify_token — §10.1 acceptance criteria strings

@@ -2395,6 +2395,14 @@ pub mod rope_proportional;
 // can consume it without further structural changes.
 pub mod lang_analyzer;
 
+// Crate-wide helpers for `#[cfg(test)]` paths. Provides the single shared
+// `ENV_LOCK` that every env-mutating test in this crate must acquire (issue
+// #573); see `test_support::env_lock` for the rationale. `pub(crate)` so
+// that test modules at any depth (e.g. `crate::lang_analyzer::cache::tests`)
+// can name it as `crate::test_support::env_lock`.
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[cfg(test)]
 #[path = "ffi_tests.rs"]
 mod ffi_tests;

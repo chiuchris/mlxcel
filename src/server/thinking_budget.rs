@@ -442,6 +442,10 @@ pub enum ThinkingDecision {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Env-var fallback tests must serialize through the crate-wide
+    // `ENV_LOCK` (issue #573); per-module locks race with env mutations
+    // in unrelated modules of the same test binary.
+    use crate::test_support::env_lock::env_lock;
 
     // -- ThinkingBudget::from_raw_i32 --
 
@@ -766,12 +770,10 @@ mod tests {
 
     #[test]
     fn server_default_env_fallback_all_cases() {
-        use std::sync::Mutex;
-        static LOCK: Mutex<()> = Mutex::new(());
-        let _guard = LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = env_lock();
 
         // Case 1: CLI wins over env.
-        // SAFETY: std::env::set_var is unsafe in edition 2024; test-only use.
+        // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
         unsafe {
             std::env::set_var("LLAMA_ARG_REASONING_BUDGET", "64");
         }
