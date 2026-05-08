@@ -2038,6 +2038,23 @@ mod ffi {
             threshold: f32,
         ) -> UniquePtr<MlxArray>;
 
+        /// Fused bulk rotated dequant for the Swift-LM-style
+        /// Turbo4Delegated dequant-first SDPA path.
+        ///
+        /// Inputs:
+        /// - `v_packed`:  `[B, H, T, D/2]` UINT8 packed Turbo4 V indices.
+        /// - `v_rescale`: `[B, H, T, 1]` FP16 precomputed `norm/|y_hat|`.
+        /// - `codebook`:  `[16]` FP32 Lloyd-Max centroids.
+        /// - `dim`:       head dimension `D`.
+        ///
+        /// Output: `[B, H, T, D]` FP16 in rotated value basis.
+        fn turbo4_delegated_bulk_dequant_rotated(
+            v_packed: &MlxArray,
+            v_rescale: &MlxArray,
+            codebook: &MlxArray,
+            dim: i32,
+        ) -> UniquePtr<MlxArray>;
+
         // Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA
         // kernel launcher. One Metal dispatch performs the entire post-Q·K
         // SDPA inline (numerically stable softmax over T_total + cold-V

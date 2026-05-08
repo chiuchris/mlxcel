@@ -205,26 +205,23 @@ impl Attention {
         // the per-token skip only wins at long context, and prefill builds
         // the cache from scratch.
         //
-        // Issue #528: When the cache is Turbo4Delegated and we are in the
-        // single-token decode case, optionally use the fused dequant + SDPA
-        // kernel path which reads packed cold V directly. The kernel keeps
-        // the V-memory budget at 4-bit packed (no FP16 cold-V working set)
-        // but trades that against the host-side multi-op pipeline
-        // (Q·K + softmax + cold kernel + hot matmul + sum) being slower
-        // than steel attention SDPA on a materialised FP16 cold V on
-        // M5 Max at 4K/16K. The path is opt-in via
-        // `MLXCEL_TURBO4_DELEGATED_FUSED=1`; the default route remains
-        // `update_and_fetch` + `attention()` until follow-up work brings
-        // the kernel inside the steel-attention envelope. The opt-in flag
-        // is parsed once and cached in a `OnceLock<bool>` — see
-        // `mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_fused_enabled`.
-        let use_fused_delegated =
-            mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_fused_enabled();
+        // Turbo4 compressed attention mirrors mlx-swift-lm's current decode
+        // policy: prefer dequant-first native SDPA by default. Delegated mode
+        // keeps the custom packed-V Metal kernels available as a forced
+        // fallback.
+        // The gate is parsed once and cached in a `OnceLock<bool>` — see
+        // `mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_compressed_attention_enabled`.
+        let use_delegated_compressed =
+            mlxcel_core::cache::turbo::sparse_v::turbo4_delegated_compressed_attention_enabled();
+        let use_turbo4_dequant_sdpa =
+            mlxcel_core::cache::turbo::sparse_v::turbo4_dequant_sdpa_enabled();
         let attn_out = if l == 1 && cache.sparse_v_available() {
             cache
                 .update_and_sparse_v_attention(&q, k, v, self.scale, mask)
                 .expect("update_and_sparse_v_attention returned None despite sparse_v_available")
-        } else if l == 1 && use_fused_delegated && cache.turbo4_delegated_available() {
+        } else if l == 1 && use_turbo4_dequant_sdpa && cache.turbo4_dequant_sdpa_available() {
+            cache.update_and_turbo4_dequant_sdpa_attention(&q, k, v, self.scale, mask)
+        } else if l == 1 && use_delegated_compressed && cache.turbo4_delegated_available() {
             // The helper always produces an attention output: it routes
             // through the fused Metal kernel when available and falls
             // through to the graph-only reference path otherwise.

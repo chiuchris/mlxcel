@@ -1580,6 +1580,15 @@ std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
     int32_t n_rep,
     float threshold);
 
+// Bulk rotated dequant launcher for the Swift-LM-style dequant-first SDPA
+// route. One Metal dispatch converts `[B,H,T,D/2]` packed Turbo4 V plus
+// `[B,H,T,1]` rescale into `[B,H,T,D]` FP16 in rotated codec space.
+std::unique_ptr<MlxArray> turbo4_delegated_bulk_dequant_rotated(
+    const MlxArray& v_packed,
+    const MlxArray& v_rescale,
+    const MlxArray& codebook,
+    int32_t dim);
+
 // Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA launcher.
 // Wraps `mlxcel::turbo::turbo4_delegated_steel_sdpa`. Returns a pair of MLX
 // arrays (`out_cold_pre`, `out_hot`) that the host sums after applying the

@@ -500,13 +500,7 @@ fn dequantize_from_packed(
     signs1: &[f32],
     signs2: &[f32],
 ) -> UniquePtr<MlxArray> {
-    let packed_shape = ffi::array_shape(packed);
-    debug_assert_eq!(packed_shape.len(), 4, "packed must be 4-D");
-    let b = packed_shape[0];
-    let h = packed_shape[1];
-    let t = packed_shape[2];
-    let bytes_per_token = packed_shape[3];
-    let d = bytes_per_token * 2;
+    let (indices_u8, _b, _h, _t, d) = unpack_turbo4_indices(packed);
     debug_assert_eq!(d as u32, params.head_dim, "head_dim mismatch on dequantize");
     debug_assert_eq!(
         signs1.len(),
@@ -521,34 +515,13 @@ fn dequantize_from_packed(
         signs2.len()
     );
 
-    // 1. Unpack nibbles entirely on-device. The earlier implementation forced
-    //    a sync + host round-trip per call, which dominates decode latency at
-    //    long context (~5× slowdown on Llama 3.1 8B at 8K — see PR #490 H2).
-    //    We now stay on the GPU using bitwise ops + stack/reshape to interleave
-    //    the two nibbles in the documented "low = even, high = odd" order.
-    //
-    //    Layout (matches the quantize-time packing in `quantize_into_packed`):
-    //        byte[i] low nibble  → indices[2*i]   (even coord)
-    //        byte[i] high nibble → indices[2*i+1] (odd coord)
-    //    so `stack([low, high], axis=-1)` builds `[..., D/2, 2]` with the
-    //    correct interleave; `reshape` to `[..., D]` flattens that pair axis.
-    let mask_u8 = ffi::full_f32(&[1], 0x0F_u8 as f32, dtype::UINT8);
-    let shift4_u8 = ffi::full_f32(&[1], 4.0, dtype::UINT8);
-    let low_nibble = ffi::bitwise_and(packed, &mask_u8); // [B, H, T, D/2] u8
-    let high_nibble = ffi::right_shift(packed, &shift4_u8); // [B, H, T, D/2] u8
-    let indices_u8 = {
-        let stacked = crate::ops::stack_owned(&[low_nibble, high_nibble], -1); // [B, H, T, D/2, 2]
-        ffi::reshape(&stacked, &[b, h, t, d]) // [B, H, T, D] u8
-    };
-    // MLX `take` requires an integer index array; UINT8 works directly.
-
-    // 2. Centroid gather: y_hat[b, h, t, k] = centroids[indices[b, h, t, k]].
+    // 1. Centroid gather: y_hat[b, h, t, k] = centroids[indices[b, h, t, k]].
     let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
     let centroids_arr =
         ffi::from_slice_f32(&centroids_vec, &[params.codebook.centroids.len() as i32]);
     let y_hat = ffi::take(&centroids_arr, &indices_u8, 0); // [B, H, T, D]
 
-    // 3. Norm correction: rescale y_hat to unit norm so the inverse rotation
+    // 2. Norm correction: rescale y_hat to unit norm so the inverse rotation
     //    sees a unit vector. Mirrors the Python `if norm_correction` branch
     //    in `references/turboquant_plus/turboquant/polar_quant.py`.
     let y_hat_sq = ffi::multiply(&y_hat, &y_hat);
@@ -560,7 +533,7 @@ fn dequantize_from_packed(
     let safe_y_norm = ffi::maximum(&y_hat_norm, &eps);
     let y_hat_unit = ffi::divide(&y_hat, &safe_y_norm);
 
-    // 4. Inverse rotation. Since D and H are symmetric (D^T = D, H^T = H),
+    // 3. Inverse rotation. Since D and H are symmetric (D^T = D, H^T = H),
     //    the transpose D2·H·D1 is D1·H·D2 — apply in reverse.
     let signs1_arr = ffi::from_slice_f32(signs1, &[1, 1, 1, d]);
     let signs2_arr = ffi::from_slice_f32(signs2, &[1, 1, 1, d]);
@@ -568,11 +541,102 @@ fn dequantize_from_packed(
     let v_pre_d1 = wht(&v_pre_h);
     let v_unit = ffi::multiply(&v_pre_d1, &signs1_arr);
 
-    // 5. Rescale by the stored original norms. norms shape is [B, H, T, 1]
+    // 4. Rescale by the stored original norms. norms shape is [B, H, T, 1]
     //    fp16; cast to fp32 to match v_unit, then back to fp16 at the end.
     let norms_f32 = ffi::astype(norms, dtype::FLOAT32);
     let v_full_f32 = ffi::multiply(&v_unit, &norms_f32);
     ffi::astype(&v_full_f32, dtype::FLOAT16)
+}
+
+/// Unpack Turbo4 nibbles into one uint8 codebook index per coordinate.
+///
+/// Stays entirely on-device. The packing layout is the documented low-nibble
+/// even coordinate / high-nibble odd coordinate order used by
+/// [`quantize_into_packed`].
+fn unpack_turbo4_indices(packed: &MlxArray) -> (UniquePtr<MlxArray>, i32, i32, i32, i32) {
+    let packed_shape = ffi::array_shape(packed);
+    debug_assert_eq!(packed_shape.len(), 4, "packed must be 4-D");
+    let b = packed_shape[0];
+    let h = packed_shape[1];
+    let t = packed_shape[2];
+    let bytes_per_token = packed_shape[3];
+    let d = bytes_per_token * 2;
+
+    let mask_u8 = ffi::full_f32(&[1], 0x0F_u8 as f32, dtype::UINT8);
+    let shift4_u8 = ffi::full_f32(&[1], 4.0, dtype::UINT8);
+    let low_nibble = ffi::bitwise_and(packed, &mask_u8);
+    let high_nibble = ffi::right_shift(packed, &shift4_u8);
+    let stacked = crate::ops::stack_owned(&[low_nibble, high_nibble], -1);
+    let indices = ffi::reshape(&stacked, &[b, h, t, d]);
+
+    (indices, b, h, t, d)
+}
+
+/// Dequantize packed V into TurboQuant's rotated value basis.
+///
+/// This is the bulk-dequant analogue used by the Turbo4Delegated dequant-SDPA
+/// path inspired by `references/mlx-swift-lm`: it gathers codebook centroids
+/// and applies the precomputed `v_rescale = norm / |y_hat|`, but deliberately
+/// skips the inverse WHT/sign rotation. A caller can run SDPA with this rotated
+/// V tensor and then inverse-rotate the much smaller attention output.
+///
+/// Inputs:
+/// - `v_packed`: `[B, H, T, D/2]` u8 packed V indices.
+/// - `v_rescale`: `[B, H, T, 1]` fp16 precomputed `norm / |y_hat|`.
+/// - `params`: TurboQuant params used at quantize time.
+///
+/// Returns `[B, H, T, D]` fp16 in rotated value basis.
+pub fn dequantize_v_turbo4_rotated(
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    let (indices_u8, _b, _h, _t, d) = unpack_turbo4_indices(v_packed);
+    debug_assert_eq!(
+        d as u32, params.head_dim,
+        "head_dim mismatch on rotated dequantize"
+    );
+
+    let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let centroids_arr =
+        ffi::from_slice_f32(&centroids_vec, &[params.codebook.centroids.len() as i32]);
+    let y_hat = ffi::take(&centroids_arr, &indices_u8, 0);
+    let rescale_f32 = ffi::astype(v_rescale, dtype::FLOAT32);
+    let rotated_f32 = ffi::multiply(&y_hat, &rescale_f32);
+    ffi::astype(&rotated_f32, dtype::FLOAT16)
+}
+
+/// Dequantize packed K into TurboQuant's rotated key basis.
+///
+/// Symmetric `KVCacheMode::Turbo4` can run Swift-LM-style dequant-first SDPA
+/// without fully inverse-rotating cached K. The caller forward-rotates Q into
+/// the same K basis, runs SDPA, then inverse-rotates only the V-side output.
+/// This helper mirrors the norm-correction half of [`dequantize_k_turbo4`]
+/// and deliberately skips the inverse WHT/sign rotation.
+pub fn dequantize_k_turbo4_rotated(
+    k_packed: &MlxArray,
+    k_norms: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    let (indices_u8, _b, _h, _t, d) = unpack_turbo4_indices(k_packed);
+    debug_assert_eq!(
+        d as u32, params.head_dim,
+        "head_dim mismatch on rotated K dequantize"
+    );
+
+    let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let centroids_arr =
+        ffi::from_slice_f32(&centroids_vec, &[params.codebook.centroids.len() as i32]);
+    let y_hat = ffi::take(&centroids_arr, &indices_u8, 0);
+    let y_hat_sq = ffi::multiply(&y_hat, &y_hat);
+    let y_hat_sum_sq = ffi::sum_axis(&y_hat_sq, -1, true);
+    let y_hat_norm = ffi::sqrt(&y_hat_sum_sq);
+    let eps = ffi::full_f32(&[1], 1e-10, dtype::FLOAT32);
+    let safe_y_norm = ffi::maximum(&y_hat_norm, &eps);
+    let y_hat_unit = ffi::divide(&y_hat, &safe_y_norm);
+    let norms_f32 = ffi::astype(k_norms, dtype::FLOAT32);
+    let rotated_f32 = ffi::multiply(&y_hat_unit, &norms_f32);
+    ffi::astype(&rotated_f32, dtype::FLOAT16)
 }
 
 /// Dequantize a packed-V slice back to fp16 for the attention kernel.
@@ -661,6 +725,53 @@ pub fn turbo4_v_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<Mlx
     let x_d1 = ffi::multiply(&x_f32, &signs1_arr);
     let x_h = wht(&x_d1);
     ffi::multiply(&x_h, &signs2_arr)
+}
+
+/// Apply the K-side TurboQuant `D2 · H · D1` rotation.
+///
+/// Used by the symmetric Turbo4 dequant-first SDPA path to rotate Q into the
+/// same basis as [`dequantize_k_turbo4_rotated`].
+pub fn turbo4_k_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let d = *shape
+        .last()
+        .expect("turbo4_k_rotate: input must be at least 1-D") as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_k_rotate: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    let signs1_arr = ffi::from_slice_f32(&params.k_signs1, &[1, 1, 1, d as i32]);
+    let signs2_arr = ffi::from_slice_f32(&params.k_signs2, &[1, 1, 1, d as i32]);
+    let x_f32 = ffi::astype(x, crate::dtype::FLOAT32);
+    let x_d1 = ffi::multiply(&x_f32, &signs1_arr);
+    let x_h = wht(&x_d1);
+    ffi::multiply(&x_h, &signs2_arr)
+}
+
+/// Apply the inverse TurboQuant V rotation to a tensor in rotated value basis.
+///
+/// Used by the delegated dequant-SDPA path: cold V is dequantized as
+/// `codebook[index] * rescale`, hot V is forward-rotated into the same basis,
+/// SDPA consumes that rotated V, and only the small output tensor is brought
+/// back to the model's original value basis.
+pub fn turbo4_v_inverse_rotate(x: &MlxArray, params: &TurboQuantParams) -> UniquePtr<MlxArray> {
+    let shape = ffi::array_shape(x);
+    let d = *shape
+        .last()
+        .expect("turbo4_v_inverse_rotate: input must be at least 1-D") as usize;
+    assert_eq!(
+        d, params.head_dim as usize,
+        "turbo4_v_inverse_rotate: last dim ({d}) must match TurboQuantParams head_dim ({})",
+        params.head_dim
+    );
+    let signs1_arr = ffi::from_slice_f32(&params.signs1, &[1, 1, 1, d as i32]);
+    let signs2_arr = ffi::from_slice_f32(&params.signs2, &[1, 1, 1, d as i32]);
+    let x_f32 = ffi::astype(x, crate::dtype::FLOAT32);
+    let pre_h = ffi::multiply(&x_f32, &signs2_arr);
+    let post_h = wht(&pre_h);
+    let out_f32 = ffi::multiply(&post_h, &signs1_arr);
+    ffi::astype(&out_f32, dtype::FLOAT16)
 }
 
 // ---------------------------------------------------------------------------
@@ -1030,6 +1141,57 @@ mod tests {
             let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             assert!(val.abs() < 1e-3, "expected ~0, got {val}");
         }
+    }
+
+    /// Rotated-space bulk dequant plus output inverse-rotation should match
+    /// the standard per-token full dequant path. This is the algebra used by
+    /// the Turbo4Delegated dequant-SDPA path.
+    #[test]
+    fn rotated_dequant_then_inverse_matches_full_dequant() {
+        let head_dim: i32 = 64;
+        let params = TurboQuantParams::new(head_dim as u32, 123);
+        let n_tokens = 4;
+        let v_data: Vec<f32> = (0..(n_tokens * head_dim))
+            .map(|i| {
+                let f = i as f32;
+                0.35 * (f * 0.17).sin() + 0.15 * (f * 0.07).cos()
+            })
+            .collect();
+        let v = ffi::from_slice_f32(&v_data, &[1, 1, n_tokens, head_dim]);
+        let (packed, norms, rescale) = quantize_v_turbo4(&v, &params);
+
+        let full = dequantize_v_turbo4(&packed, &norms, &params);
+        let rotated = dequantize_v_turbo4_rotated(&packed, &rescale, &params);
+        let inverse = turbo4_v_inverse_rotate(&rotated, &params);
+
+        let full_vec = {
+            let arr = ffi::astype(&full, dtype::FLOAT32);
+            ffi::eval(&arr);
+            ffi::array_to_raw_bytes(&arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+        let inverse_vec = {
+            let arr = ffi::astype(&inverse, dtype::FLOAT32);
+            ffi::eval(&arr);
+            ffi::array_to_raw_bytes(&arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(full_vec.len(), inverse_vec.len());
+        let mut sum_sq = 0.0_f64;
+        for (a, b) in full_vec.iter().zip(inverse_vec.iter()) {
+            let d = (*a - *b) as f64;
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / full_vec.len() as f64).sqrt() as f32;
+        assert!(
+            rms < 2e-3,
+            "rotated bulk dequant + inverse rotation RMS {rms:.4e} exceeds 2e-3"
+        );
     }
 
     /// Determinism: same params + same V → same packed bytes.

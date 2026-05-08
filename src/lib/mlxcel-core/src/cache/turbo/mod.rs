@@ -62,8 +62,9 @@ pub use codebook::{
     optimal_centroids, optimal_codebook, Codebook,
 };
 pub use quant::{
-    dequantize_k_turbo4, dequantize_v_turbo4, generate_signs, quantize_k_turbo4, quantize_v_turbo4,
-    turbo4_v_rotate, TurboQuantParams, BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET, V_BIT_WIDTH,
+    dequantize_k_turbo4, dequantize_k_turbo4_rotated, dequantize_v_turbo4, generate_signs,
+    quantize_k_turbo4, quantize_v_turbo4, turbo4_k_rotate, turbo4_v_rotate, TurboQuantParams,
+    BLOCK_SIZE, K_BIT_WIDTH, K_SEED_OFFSET, V_BIT_WIDTH,
 };
 
 /// Default hot-tail threshold for `KVCacheMode::Turbo4Delegated` (issue #479).
@@ -124,8 +125,7 @@ pub enum DelegatedFp16SidecarPolicy {
 ///   during decode.
 /// - `lazy` / `on-demand`: skip foreground generation compaction and compact
 ///   only when a preservation path explicitly asks for sidecars.
-pub const DELEGATED_FP16_SIDECAR_POLICY_ENV: &str =
-    "MLXCEL_TURBO4_DELEGATED_FP16_SIDECARS";
+pub const DELEGATED_FP16_SIDECAR_POLICY_ENV: &str = "MLXCEL_TURBO4_DELEGATED_FP16_SIDECARS";
 
 static DELEGATED_FP16_SIDECAR_POLICY: OnceLock<DelegatedFp16SidecarPolicy> = OnceLock::new();
 
@@ -147,9 +147,7 @@ pub fn delegated_fp16_fast_path_enabled() -> bool {
 /// Parse the delegated FP16 sidecar policy env var value.
 pub fn parse_delegated_fp16_sidecar_policy(value: &str) -> Option<DelegatedFp16SidecarPolicy> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "" | "predecode" | "pre-decode" | "eager" => {
-            Some(DelegatedFp16SidecarPolicy::Predecode)
-        }
+        "" | "predecode" | "pre-decode" | "eager" => Some(DelegatedFp16SidecarPolicy::Predecode),
         "lazy" | "on-demand" | "ondemand" => Some(DelegatedFp16SidecarPolicy::Lazy),
         _ => None,
     }

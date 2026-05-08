@@ -5734,6 +5734,19 @@ std::unique_ptr<MlxArray> turbo4_delegated_cold_weighted_sum(
     return std::make_unique<MlxArray>(std::move(out));
 }
 
+std::unique_ptr<MlxArray> turbo4_delegated_bulk_dequant_rotated(
+    const MlxArray& v_packed,
+    const MlxArray& v_rescale,
+    const MlxArray& codebook,
+    int32_t dim) {
+    auto out = mlxcel::turbo::turbo4_delegated_bulk_dequant_rotated(
+        v_packed.inner,
+        v_rescale.inner,
+        codebook.inner,
+        dim);
+    return std::make_unique<MlxArray>(std::move(out));
+}
+
 // Issue #531 — Steel-attention-envelope fused Turbo4Delegated SDPA bridge.
 // Wraps the launcher in `src/lib/mlx-cpp/turbo/turbo4_delegated_sdpa.cpp` and
 // repackages the std::vector<mlx::core::array> return into the `cxx`-friendly

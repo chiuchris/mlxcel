@@ -524,10 +524,7 @@ impl KVCache {
         if self.delegated_fp16_fast_path {
             return self.compact_turbo4_delegated_fp16_sidecars_for_decode();
         }
-        if self.cold_offset == 0
-            && self.offset > 0
-            && self.values.is_some()
-            && self.keys.is_some()
+        if self.cold_offset == 0 && self.offset > 0 && self.values.is_some() && self.keys.is_some()
         {
             self.fold_hot_to_cold_full();
             return true;
@@ -1712,11 +1709,7 @@ impl KVCache {
             return;
         }
         let block = end - start;
-        let v_slice = ffi::slice(
-            values,
-            &[0, 0, start, 0],
-            &[b, n_kv_heads, end, v_head_dim],
-        );
+        let v_slice = ffi::slice(values, &[0, 0, start, 0], &[b, n_kv_heads, end, v_head_dim]);
 
         if self.turbo_params.is_none() {
             self.turbo_params = Some(turbo::TurboQuantParams::new(
@@ -2573,6 +2566,77 @@ impl KVCache {
         ))
     }
 
+    /// Returns `true` iff this cache can route symmetric `Turbo4` through the
+    /// Swift-LM-style dequant-first SDPA path.
+    pub fn turbo4_dequant_sdpa_available(&self) -> bool {
+        self.mode == KVCacheMode::Turbo4
+    }
+
+    /// Combined update + symmetric Turbo4 dequant-first SDPA dispatch.
+    ///
+    /// This mirrors `references/mlx-swift-lm`'s default compressed K/V route
+    /// for the Rust symmetric `Turbo4` mode: cache state stays packed, K/V are
+    /// transiently dequantized in their rotated codec bases for the current
+    /// attention call, Q is forward-rotated into the K basis, and only the
+    /// small output tensor is inverse-rotated through the V basis.
+    ///
+    /// Used by: model attention call sites when `mode == KVCacheMode::Turbo4`
+    /// and [`turbo::sparse_v::turbo4_dequant_sdpa_enabled`] is true.
+    pub fn update_and_turbo4_dequant_sdpa_attention(
+        &mut self,
+        q: &MlxArray,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+        scale: f32,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        assert!(
+            self.turbo4_dequant_sdpa_available(),
+            "update_and_turbo4_dequant_sdpa_attention called on a cache that is not in \
+             Turbo4 mode (mode={:?})",
+            self.mode
+        );
+        self.update(new_keys, new_values);
+
+        let kp = self.k_packed.as_ref().expect("k_packed must exist");
+        let kn = self.k_norms.as_ref().expect("k_norms must exist");
+        let vp = self.v_packed.as_ref().expect("v_packed must exist");
+        let vr = self.v_rescale.as_ref().expect("v_rescale must exist");
+        let params = self
+            .turbo_params
+            .as_ref()
+            .expect("turbo_params must be initialised after first update_turbo4_sym");
+
+        let kp_shape = ffi::array_shape(kp);
+        let kn_shape = ffi::array_shape(kn);
+        let vp_shape = ffi::array_shape(vp);
+        let vr_shape = ffi::array_shape(vr);
+        let kp_slice = ffi::slice(
+            kp,
+            &[0, 0, 0, 0],
+            &[kp_shape[0], kp_shape[1], self.offset, kp_shape[3]],
+        );
+        let kn_slice = ffi::slice(
+            kn,
+            &[0, 0, 0, 0],
+            &[kn_shape[0], kn_shape[1], self.offset, 1],
+        );
+        let vp_slice = ffi::slice(
+            vp,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], self.offset, vp_shape[3]],
+        );
+        let vr_slice = ffi::slice(
+            vr,
+            &[0, 0, 0, 0],
+            &[vr_shape[0], vr_shape[1], self.offset, 1],
+        );
+
+        turbo::sparse_v::attention_turbo4_dequant_sdpa(
+            q, &kp_slice, &kn_slice, &vp_slice, &vr_slice, params, scale, mask,
+        )
+    }
+
     /// Returns `true` iff this cache is in `KVCacheMode::Turbo4Delegated` mode
     /// and the fused dequant + SDPA decode path (issue #528) is reachable.
     ///
@@ -2596,17 +2660,18 @@ impl KVCache {
     /// The standard `update_and_fetch + attention()` pair pays the full
     /// `dequantize_v_turbo4(v_packed[:cold_offset])` graph cost on every
     /// decode step, plus a `concat(cold_v_dequant, hot_v, axis=2)` that
-    /// scales with `cold_offset`. Pre-#528 the PR-#525 memo amortised the
-    /// dequant across folds at the cost of a `[B, Hkv, cold_offset, V_dim]`
-    /// FP16 working set per layer per sequence. Issue #528 replaces both
-    /// with a fused Metal kernel that reads packed cold V directly:
+    /// scales with `cold_offset`. The default compressed path now mirrors
+    /// `references/mlx-swift-lm`: it dequantizes cold V only into the rotated
+    /// codec basis, runs native SDPA, and inverse-rotates the small output.
+    /// If `MLXCEL_TURBO4_DELEGATED_DEQUANT_SDPA=0`, the function falls back
+    /// to the custom packed-V Metal kernels:
     ///
     /// 1. [`Self::update`] fills the unified K buffer, the V hot ring, and
     ///    (when `hot_offset > hot_threshold`) the packed cold V sidecars.
-    /// 2. [`turbo::sparse_v::attention_turbo4_delegated_fused`] runs Q·K
-    ///    against the unified K, softmax, the fused cold-V kernel for the
-    ///    cold contribution, a small host matmul for the hot contribution,
-    ///    and sums the two.
+    /// 2. [`turbo::sparse_v::attention_turbo4_delegated_steel`] or
+    ///    [`turbo::sparse_v::attention_turbo4_delegated_fused`] runs Q·K
+    ///    against the unified K, softmax, the packed cold-V contribution, a
+    ///    small hot-V contribution, and sums the two.
     ///
     /// When the fused kernel is gated off (non-macOS, non-power-of-2 head
     /// dim, or `MLXCEL_SPARSE_V_KERNEL=0`) this function falls through to a
@@ -2625,8 +2690,9 @@ impl KVCache {
     /// responsible for that, just as with the standard path.
     ///
     /// Used by: per-model attention call sites (Llama 3, Qwen 3, etc.) when
-    /// the cache is in `Turbo4Delegated` mode and the model has opted into
-    /// the fused path via [`turbo::sparse_v::turbo4_delegated_fused_enabled`].
+    /// the cache is in `Turbo4Delegated` mode and
+    /// [`turbo::sparse_v::turbo4_delegated_compressed_attention_enabled`]
+    /// returns `true`.
     pub fn update_and_turbo4_delegated_attention(
         &mut self,
         q: &MlxArray,
@@ -2749,6 +2815,29 @@ impl KVCache {
         let v_packed_ref = v_packed_owned.as_deref();
         let v_rescale_ref = v_rescale_owned.as_deref();
         let hot_v_ref = hot_v_owned.as_deref();
+
+        // Swift-LM reference path — dequant cold packed V in rotated value
+        // basis, run native SDPA, then inverse-rotate only the small output.
+        // This keeps persistent cold V compressed while avoiding an inverse
+        // WHT over every cold token on each graph fallback. It is the default
+        // compressed path; set `MLXCEL_TURBO4_DELEGATED_DEQUANT_SDPA=0` to
+        // compare against the custom steel/cold-only order below.
+        if turbo::sparse_v::turbo4_delegated_dequant_sdpa_enabled() {
+            if let Some(out) = turbo::sparse_v::attention_turbo4_delegated_dequant_sdpa(
+                q,
+                &k_slice,
+                v_packed_ref,
+                v_rescale_ref,
+                hot_v_ref,
+                params,
+                cold_offset,
+                hot_offset,
+                scale,
+                mask,
+            ) {
+                return out;
+            }
+        }
 
         // Issue #531 — Prefer the steel-attention-envelope kernel when
         // available. It collapses softmax + cold-V dequant + hot-V accum into

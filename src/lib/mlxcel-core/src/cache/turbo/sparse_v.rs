@@ -173,6 +173,40 @@ pub const TURBO4_DELEGATED_FUSED_ENV_VAR: &str = "MLXCEL_TURBO4_DELEGATED_FUSED"
 /// first read of [`TURBO4_DELEGATED_FUSED_ENV_VAR`]).
 static TURBO4_DELEGATED_FUSED_ENABLED: OnceLock<bool> = OnceLock::new();
 
+/// Environment variable controlling the Swift-LM-inspired dequant-first SDPA
+/// strategy inside `KVCacheMode::Turbo4Delegated`'s compressed attention
+/// wrapper.
+///
+/// Default: **on**, matching `references/mlx-swift-lm`'s compressed attention
+/// route where dequant-first SDPA is preferred for single-token decode and can
+/// be disabled with an env override. Set this to `0`, `false`, `off`, or `no`
+/// to fall back to the custom steel-envelope / cold-only fused-kernel order,
+/// or ultimately the legacy graph path.
+pub const TURBO4_DELEGATED_DEQUANT_SDPA_ENV_VAR: &str = "MLXCEL_TURBO4_DELEGATED_DEQUANT_SDPA";
+
+static TURBO4_DELEGATED_DEQUANT_SDPA_ENABLED: OnceLock<bool> = OnceLock::new();
+
+/// Environment variable controlling the Swift-LM-inspired dequant-first SDPA
+/// strategy for symmetric `KVCacheMode::Turbo4`.
+///
+/// Default: **on**, matching the Swift reference's standard compressed K/V
+/// route. Set this to `0`, `false`, `off`, or `no` to force the older
+/// `update_and_fetch + attention()` path that fully inverse-rotates K/V before
+/// SDPA.
+pub const TURBO4_DEQUANT_SDPA_ENV_VAR: &str = "MLXCEL_TURBO4_DEQUANT_SDPA";
+
+static TURBO4_DEQUANT_SDPA_ENABLED: OnceLock<bool> = OnceLock::new();
+
+fn parse_env_default_on(var_name: &str) -> bool {
+    match std::env::var(var_name) {
+        Ok(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
+        Err(_) => true,
+    }
+}
+
 /// Returns `true` iff the caller has opted into the fused Turbo4Delegated
 /// dequant + SDPA kernel path via [`TURBO4_DELEGATED_FUSED_ENV_VAR`].
 ///
@@ -196,6 +230,41 @@ pub fn turbo4_delegated_fused_enabled() -> bool {
             Err(_) => false,
         }
     })
+}
+
+/// Returns `true` iff the delegated compressed wrapper should try dequant-first
+/// SDPA before the custom steel-envelope kernels.
+///
+/// The path keeps packed cold V as the persistent cache state, dequantizes it
+/// transiently in rotated value basis for the current SDPA call, and
+/// inverse-rotates only the small attention output. This mirrors the
+/// `references/mlx-swift-lm` decode strategy. It is default-on; set
+/// [`TURBO4_DELEGATED_DEQUANT_SDPA_ENV_VAR`] to a falsy value to compare
+/// against the custom Metal kernels or the legacy graph path.
+pub fn turbo4_delegated_dequant_sdpa_enabled() -> bool {
+    *TURBO4_DELEGATED_DEQUANT_SDPA_ENABLED
+        .get_or_init(|| parse_env_default_on(TURBO4_DELEGATED_DEQUANT_SDPA_ENV_VAR))
+}
+
+/// Returns `true` iff symmetric `Turbo4` should use dequant-first native SDPA.
+///
+/// This path keeps persistent K/V packed, dequantizes both into their rotated
+/// codec bases for the current attention call, forward-rotates Q into the
+/// K basis, runs native SDPA, and inverse-rotates the small output through the
+/// V basis.
+pub fn turbo4_dequant_sdpa_enabled() -> bool {
+    *TURBO4_DEQUANT_SDPA_ENABLED.get_or_init(|| parse_env_default_on(TURBO4_DEQUANT_SDPA_ENV_VAR))
+}
+
+/// Returns `true` iff model attention call sites should route
+/// `Turbo4Delegated` single-token decode through
+/// [`KVCache::update_and_turbo4_delegated_attention`].
+///
+/// The Swift-LM-style dequant-first SDPA route is now the default compressed
+/// path. The older custom Metal kernels remain reachable when dequant-SDPA is
+/// disabled and [`TURBO4_DELEGATED_FUSED_ENV_VAR`] is enabled.
+pub fn turbo4_delegated_compressed_attention_enabled() -> bool {
+    turbo4_delegated_dequant_sdpa_enabled() || turbo4_delegated_fused_enabled()
 }
 
 /// Compute the per-(KV head, KV token) "alive" mask from attention scores.
@@ -793,6 +862,156 @@ pub fn attention_turbo4_delegated_fused(
     Some(ffi::astype(&combined, dtype::FLOAT16))
 }
 
+/// Dequant-first SDPA path for symmetric `KVCacheMode::Turbo4`.
+///
+/// This is the direct K/V-compressed analogue of the Swift-LM compressed cache
+/// route:
+///
+/// 1. Rotate Q into the K codec basis.
+/// 2. Dequantize packed K into the same rotated basis.
+/// 3. Dequantize packed V into the V rotated basis.
+/// 4. Run native SDPA and inverse-rotate only the small output tensor.
+///
+/// The persistent cache state remains packed K/V. Only the current attention
+/// call materializes transient rotated FP16 K/V workspaces.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_turbo4_dequant_sdpa(
+    q: &MlxArray,
+    k_packed: &MlxArray,
+    k_norms: &MlxArray,
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+    scale: f32,
+    mask: Option<&MlxArray>,
+) -> UniquePtr<MlxArray> {
+    let q_rot_f32 = super::quant::turbo4_k_rotate(q, params);
+    let q_rot = ffi::astype(&q_rot_f32, ffi::array_dtype(q));
+    let k_rot = super::quant::dequantize_k_turbo4_rotated(k_packed, k_norms, params);
+    let v_rot = dequantize_v_turbo4_rotated_for_sdpa(v_packed, v_rescale, params);
+    let rot_out = crate::layers::attention(&q_rot, &k_rot, &v_rot, scale, mask, 0.0, 0);
+    super::quant::turbo4_v_inverse_rotate(&rot_out, params)
+}
+
+/// Dequant-first SDPA path for `KVCacheMode::Turbo4Delegated`.
+///
+/// This mirrors the default single-token decode strategy in
+/// `references/mlx-swift-lm`: keep the persistent cache compressed, but
+/// transiently dequantize packed V into TurboQuant's rotated value basis for
+/// the current SDPA call. Because attention scores depend only on Q/K, SDPA
+/// can consume rotated V and the output can be inverse-rotated afterward:
+///
+/// `SDPA(q, k, rotate(v)) = rotate(SDPA(q, k, v))`
+///
+/// The key difference from [`crate::cache::turbo::quant::dequantize_v_turbo4`]
+/// is that the cold body skips inverse WHT per token. We pay one inverse WHT
+/// on the small `[B, Hq, Tq, D]` output instead, plus one forward rotation for
+/// the small FP16 hot tail.
+///
+/// Persistent memory remains packed cold V + FP16 hot V. The rotated full-V
+/// tensor is a transient SDPA workspace.
+#[allow(clippy::too_many_arguments)]
+pub fn attention_turbo4_delegated_dequant_sdpa(
+    q: &MlxArray,
+    unified_k: &MlxArray,
+    v_packed: Option<&MlxArray>,
+    v_rescale: Option<&MlxArray>,
+    hot_v: Option<&MlxArray>,
+    params: &TurboQuantParams,
+    cold_offset: i32,
+    hot_offset: i32,
+    scale: f32,
+    mask: Option<&MlxArray>,
+) -> Option<UniquePtr<MlxArray>> {
+    let q_shape = ffi::array_shape(q);
+    let k_shape = ffi::array_shape(unified_k);
+    debug_assert_eq!(q_shape.len(), 4, "q must be 4-D [B, Hq, Tq, D]");
+    debug_assert_eq!(
+        k_shape.len(),
+        4,
+        "unified_k must be 4-D [B, Hkv, T_total, D]"
+    );
+    let head_dim = q_shape[3];
+    let t_total = k_shape[2];
+    debug_assert_eq!(
+        t_total,
+        cold_offset + hot_offset,
+        "unified_k length ({t_total}) must equal cold_offset ({cold_offset}) + hot_offset ({hot_offset})"
+    );
+
+    // The rotation helpers use WHT, so match the same production precondition
+    // as the existing delegated fused paths.
+    if !(head_dim as u32).is_power_of_two() {
+        return None;
+    }
+    if cold_offset == 0 && hot_offset == 0 {
+        return None;
+    }
+
+    // Before the first fold there is no packed cold V. Avoid a pointless
+    // hot-V rotate/inverse-rotate pair and use the native path directly.
+    if cold_offset == 0 {
+        let hot_v = hot_v.expect("hot_v must exist when cold_offset == 0");
+        return Some(crate::layers::attention(
+            q, unified_k, hot_v, scale, mask, 0.0, 0,
+        ));
+    }
+
+    let cold_v_rotated = {
+        let vp = v_packed.expect("v_packed must exist when cold_offset > 0");
+        let vr = v_rescale.expect("v_rescale must exist when cold_offset > 0");
+        dequantize_v_turbo4_rotated_for_sdpa(vp, vr, params)
+    };
+
+    let hot_v_rotated = if hot_offset > 0 {
+        let hv = hot_v.expect("hot_v must exist when hot_offset > 0");
+        let hot_rot_f32 = super::quant::turbo4_v_rotate(hv, params);
+        Some(ffi::astype(&hot_rot_f32, dtype::FLOAT16))
+    } else {
+        None
+    };
+
+    let full_v_rotated = match hot_v_rotated {
+        Some(hot_rot) => crate::concatenate(&cold_v_rotated, &hot_rot, 2),
+        None => cold_v_rotated,
+    };
+
+    let rotated_out = crate::layers::attention(q, unified_k, &full_v_rotated, scale, mask, 0.0, 0);
+    Some(super::quant::turbo4_v_inverse_rotate(&rotated_out, params))
+}
+
+fn dequantize_v_turbo4_rotated_for_sdpa(
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+) -> UniquePtr<MlxArray> {
+    dequantize_v_turbo4_rotated_fused(v_packed, v_rescale, params)
+        .unwrap_or_else(|| super::quant::dequantize_v_turbo4_rotated(v_packed, v_rescale, params))
+}
+
+fn dequantize_v_turbo4_rotated_fused(
+    v_packed: &MlxArray,
+    v_rescale: &MlxArray,
+    params: &TurboQuantParams,
+) -> Option<UniquePtr<MlxArray>> {
+    if !kernel_enabled() {
+        return None;
+    }
+    let shape = ffi::array_shape(v_packed);
+    if shape.len() != 4 || shape[3] * 2 != params.head_dim as i32 {
+        return None;
+    }
+
+    let centroids_vec: Vec<f32> = params.codebook.centroids.as_ref().to_vec();
+    let codebook = ffi::from_slice_f32(&centroids_vec, &[centroids_vec.len() as i32]);
+    Some(ffi::turbo4_delegated_bulk_dequant_rotated(
+        v_packed,
+        v_rescale,
+        &codebook,
+        params.head_dim as i32,
+    ))
+}
+
 /// Steel-attention-envelope fused dequant + SDPA path for
 /// `KVCacheMode::Turbo4Delegated` (issue #531).
 ///
@@ -999,6 +1218,15 @@ pub fn attention_turbo4_delegated_steel(
 mod tests {
     use super::*;
 
+    fn flatten_fp32(arr: &MlxArray) -> Vec<f32> {
+        let arr = ffi::astype(arr, dtype::FLOAT32);
+        ffi::eval(&arr);
+        ffi::array_to_raw_bytes(&arr)
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+
     /// Threshold env-var parsing — empty / unset → default.
     #[test]
     fn threshold_default_when_unset() {
@@ -1057,5 +1285,65 @@ mod tests {
         assert!(!parse("no"));
         assert!(!parse(""));
         assert!(!parse("enabled"));
+    }
+
+    /// Turbo4Delegated dequant-SDPA preference is default-on. Only explicit
+    /// falsy literals disable it, matching mlx-swift-lm's `TURBO_DEQUANT_SDPA`
+    /// comparison where unset keeps the dequant-first SDPA path active.
+    #[test]
+    fn turbo4_delegated_dequant_sdpa_parse_logic() {
+        let parse = |s: &str| -> bool {
+            !matches!(
+                s.trim().to_ascii_lowercase().as_str(),
+                "0" | "false" | "off" | "no"
+            )
+        };
+
+        assert!(parse("1"));
+        assert!(parse("true"));
+        assert!(parse("on"));
+        assert!(parse("yes"));
+        assert!(parse(""));
+        assert!(parse("enabled"));
+        assert!(!parse("0"));
+        assert!(!parse("false"));
+        assert!(!parse("off"));
+        assert!(!parse("no"));
+    }
+
+    #[test]
+    fn fused_bulk_dequant_rotated_matches_graph() {
+        if !kernel_enabled() {
+            return;
+        }
+
+        let head_dim = 64_i32;
+        let params = TurboQuantParams::new(head_dim as u32, 9123);
+        let n_tokens = 5_i32;
+        let data: Vec<f32> = (0..(2 * 3 * n_tokens * head_dim))
+            .map(|i| {
+                let f = i as f32;
+                0.27 * (f * 0.013).sin() + 0.19 * (f * 0.031).cos()
+            })
+            .collect();
+        let v = ffi::from_slice_f32(&data, &[2, 3, n_tokens, head_dim]);
+        let (packed, _norms, rescale) = super::super::quant::quantize_v_turbo4(&v, &params);
+
+        let graph = super::super::quant::dequantize_v_turbo4_rotated(&packed, &rescale, &params);
+        let fused = dequantize_v_turbo4_rotated_fused(&packed, &rescale, &params)
+            .expect("kernel_enabled should allow fused bulk rotated dequant");
+
+        let graph_vec = flatten_fp32(&graph);
+        let fused_vec = flatten_fp32(&fused);
+        assert_eq!(graph_vec.len(), fused_vec.len());
+
+        let mut max_abs = 0.0_f32;
+        for (a, b) in graph_vec.iter().zip(fused_vec.iter()) {
+            max_abs = max_abs.max((a - b).abs());
+        }
+        assert!(
+            max_abs < 2e-3,
+            "fused bulk rotated dequant max abs {max_abs:.4e} exceeds 2e-3"
+        );
     }
 }

@@ -103,8 +103,8 @@ impl TurboQuantParams3 {
     /// Panics if `head_dim` is not a positive power of two — the WHT op
     /// requires it. Also panics if `head_dim` is not a multiple of 8 — the
     /// 3-bit packing layout requires byte-aligned 8-coord groups (see
-    /// [`super::pack3`]). All currently-supported head dims (64, 80, 96,
-    /// 128, 192, 256) satisfy both constraints.
+    /// [`super::pack3`]). Non-power-of-two head dims need a non-WHT rotation
+    /// path before they can be enabled for Turbo3.
     pub fn new(head_dim: u32, seed: u32) -> Self {
         assert!(
             head_dim > 0 && head_dim.is_power_of_two(),

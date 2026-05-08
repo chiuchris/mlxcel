@@ -681,3 +681,27 @@ fn turbo4_delegated_fused_enabled_default_off() {
         }
     }
 }
+
+/// Turbo4Delegated dequant-first SDPA gate sanity.
+///
+/// This mirrors mlx-swift-lm's default-on `TURBO_DEQUANT_SDPA` policy: unset
+/// or non-falsy values keep the dequant-first SDPA route active, and explicit
+/// falsy values disable it for A/B comparison against the older packed-V
+/// kernels or graph fallback.
+#[test]
+fn turbo4_delegated_dequant_sdpa_enabled_default_on() {
+    let enabled = sparse_v::turbo4_delegated_dequant_sdpa_enabled();
+    let env = std::env::var(sparse_v::TURBO4_DELEGATED_DEQUANT_SDPA_ENV_VAR).ok();
+    let env_norm = env.as_deref().map(|s| s.trim().to_ascii_lowercase());
+    match env_norm.as_deref() {
+        Some("0" | "false" | "off" | "no") => {
+            assert!(
+                !enabled,
+                "expected dequant-SDPA disabled when env says falsy"
+            );
+        }
+        _ => {
+            assert!(enabled, "expected dequant-SDPA enabled by default");
+        }
+    }
+}

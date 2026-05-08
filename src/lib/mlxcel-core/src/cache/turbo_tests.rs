@@ -1099,6 +1099,74 @@ mod boundary_v {
 }
 
 // ===========================================================================
+// Symmetric Turbo4 dequant-first SDPA
+// ===========================================================================
+
+fn turbo4_reference_attention(
+    cache: &mut KVCache,
+    q: &ffi::MlxArray,
+    k: cxx::UniquePtr<ffi::MlxArray>,
+    v: cxx::UniquePtr<ffi::MlxArray>,
+    scale: f32,
+) -> cxx::UniquePtr<ffi::MlxArray> {
+    let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+    crate::layers::attention(q, &cache_k, &cache_v, scale, None, 0.0, 0)
+}
+
+#[test]
+fn turbo4_dequant_sdpa_matches_full_dequant_attention() {
+    let head_dim = 64;
+    let prefill_len = 8;
+    let total_steps = 32;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut cache_dequant = KVCache::new_with_mode(KVCacheMode::Turbo4);
+    let mut cache_ref = KVCache::new_with_mode(KVCacheMode::Turbo4);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 31);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 32);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_dequant.update_and_fetch(k_pre, v_pre);
+    let _ = cache_ref.update_and_fetch(k_pre_b, v_pre_b);
+
+    let mut max_rms = 0.0_f32;
+    for step in 0..total_steps {
+        let k_a = synth_kv_tensor(1, 1, 1, head_dim, 20_000 + step as u32);
+        let v_a = synth_kv_tensor(1, 1, 1, head_dim, 21_000 + step as u32);
+        let k_b = ffi::copy(&k_a);
+        let v_b = ffi::copy(&v_a);
+        let q = synth_kv_tensor(1, 2, 1, head_dim, 22_000 + step as u32);
+
+        let out_dequant =
+            cache_dequant.update_and_turbo4_dequant_sdpa_attention(&q, k_a, v_a, scale, None);
+        let out_ref = turbo4_reference_attention(&mut cache_ref, &q, k_b, v_b, scale);
+
+        let flat_a = flatten_fp32(&out_dequant);
+        let flat_b = flatten_fp32(&out_ref);
+        assert_eq!(flat_a.len(), flat_b.len(), "step {step}: shape mismatch");
+        let mut sum_sq = 0.0_f64;
+        for (x, y) in flat_a.iter().zip(flat_b.iter()) {
+            let d = (x - y) as f64;
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / flat_a.len() as f64).sqrt() as f32;
+        if rms > max_rms {
+            max_rms = rms;
+        }
+        assert!(
+            rms < 5e-3,
+            "step {step}: Turbo4 dequant-SDPA vs full-dequant RMS {rms:.4e} exceeds 5e-3"
+        );
+    }
+
+    eprintln!(
+        "turbo4_dequant_sdpa_matches_full_dequant_attention: max RMS over {total_steps} steps = \
+         {max_rms:.4e}"
+    );
+}
+
+// ===========================================================================
 // Turbo3Asym (issue #477, epic #458) — 3-bit V-side PolarQuant
 // ===========================================================================
 
@@ -1484,12 +1552,12 @@ fn turbo3_asym_uses_fewer_bytes_than_turbo4_asym() {
     assert!(c3.values.is_none());
 }
 
-/// Spot-check the head_dim grid: head_dim=80 must produce a 30-byte/token
-/// V buffer (240 bits per token). Catches accidental misalignment introduced
-/// by future changes to `pack_3bit_per_token`.
+/// Spot-check the active WHT-compatible head_dim grid: head_dim=64 must
+/// produce a 24-byte/token V buffer (192 bits per token). Catches accidental
+/// misalignment introduced by future changes to `pack_3bit_per_token`.
 #[test]
 fn turbo3_asym_packed_dim_matches_head_dim_grid() {
-    for &(d, expected_bytes) in &[(64_i32, 24_i32), (96, 36), (128, 48), (256, 96)] {
+    for &(d, expected_bytes) in &[(64_i32, 24_i32), (128, 48), (256, 96)] {
         let mut cache = KVCache::new_with_mode(KVCacheMode::Turbo3Asym);
         let k = synth_kv_tensor(1, 1, 1, d, 81);
         let v = synth_kv_tensor(1, 1, 1, d, 82);
@@ -2114,7 +2182,10 @@ fn delegated_fp16_fast_path_survives_detach_adopt() {
     delegated_decode_run(&mut src, head_dim, 16, 64);
 
     assert!(src.delegated_fp16_fast_path);
-    assert!(src.cold_offset() > 0, "test setup must trigger sidecar folds");
+    assert!(
+        src.cold_offset() > 0,
+        "test setup must trigger sidecar folds"
+    );
 
     let handle = src.clone_handle();
     let mut tgt = KVCache::new_with_mode(KVCacheMode::Turbo4Delegated);
@@ -2266,6 +2337,107 @@ fn delegated_reference_attention(
     ffi::astype(&out_f32, dtype::FLOAT16)
 }
 
+#[cfg(target_os = "macos")]
+fn delegated_dequant_sdpa_from_updated_cache(
+    cache: &mut KVCache,
+    q: &ffi::MlxArray,
+    scale: f32,
+    mask: Option<&ffi::MlxArray>,
+) -> cxx::UniquePtr<ffi::MlxArray> {
+    let cold_offset = cache.cold_offset();
+    let hot_offset = cache.seq_len() - cold_offset;
+
+    if cache.turbo_params.is_none() {
+        let head_dim_u32 = cache
+            .values
+            .as_ref()
+            .map(|v| ffi::array_shape(v)[3] as u32)
+            .or_else(|| {
+                cache
+                    .v_packed
+                    .as_ref()
+                    .map(|vp| (ffi::array_shape(vp)[3] as u32) * 2)
+            })
+            .expect("either hot V ring or v_packed must exist after update");
+        cache.turbo_params = Some(super::turbo::TurboQuantParams::new(
+            head_dim_u32,
+            cache.turbo_seed,
+        ));
+    }
+
+    let k_buf = cache
+        .keys
+        .as_ref()
+        .expect("unified keys must exist after update on Turbo4Delegated");
+    let ks = ffi::array_shape(k_buf);
+    let k_slice = ffi::slice(
+        k_buf,
+        &[0, 0, 0, 0],
+        &[ks[0], ks[1], cache.seq_len(), ks[3]],
+    );
+
+    let v_packed_owned = if cold_offset > 0 {
+        let vp = cache
+            .v_packed
+            .as_ref()
+            .expect("v_packed must exist when cold_offset > 0");
+        let vp_shape = ffi::array_shape(vp);
+        Some(ffi::slice(
+            vp,
+            &[0, 0, 0, 0],
+            &[vp_shape[0], vp_shape[1], cold_offset, vp_shape[3]],
+        ))
+    } else {
+        None
+    };
+    let v_rescale_owned = if cold_offset > 0 {
+        let vr = cache
+            .v_rescale
+            .as_ref()
+            .expect("v_rescale must exist when cold_offset > 0");
+        let vr_shape = ffi::array_shape(vr);
+        Some(ffi::slice(
+            vr,
+            &[0, 0, 0, 0],
+            &[vr_shape[0], vr_shape[1], cold_offset, 1],
+        ))
+    } else {
+        None
+    };
+    let hot_v_owned = if hot_offset > 0 {
+        let hv = cache
+            .values
+            .as_ref()
+            .expect("hot values must exist when hot_offset > 0");
+        let hv_shape = ffi::array_shape(hv);
+        Some(ffi::slice(
+            hv,
+            &[0, 0, 0, 0],
+            &[hv_shape[0], hv_shape[1], hot_offset, hv_shape[3]],
+        ))
+    } else {
+        None
+    };
+    let params = cache
+        .turbo_params
+        .as_ref()
+        .expect("turbo_params populated above");
+
+    super::turbo::sparse_v::attention_turbo4_delegated_dequant_sdpa(
+        q,
+        &k_slice,
+        v_packed_owned.as_deref(),
+        v_rescale_owned.as_deref(),
+        hot_v_owned.as_deref(),
+        params,
+        cold_offset,
+        hot_offset,
+        scale,
+        mask,
+    )
+    .expect("dequant-SDPA path must accept power-of-two delegated test inputs")
+}
+
 /// 200-step decode parity: the fused kernel's attention output must be
 /// within RMS < 5e-3 of the reference path that runs full V dequant +
 /// graph-level SDPA. Spans at least three folds at `hot_threshold = 32`
@@ -2346,6 +2518,89 @@ fn delegated_fused_kernel_matches_reference_over_200_steps() {
     );
     eprintln!(
         "delegated_fused_kernel_matches_reference: max RMS over {total_steps} steps = \
+         {max_rms:.4e}; folds crossed = {steps_with_fold}"
+    );
+}
+
+/// Dequant-first SDPA parity for the Swift-LM-inspired delegated path.
+///
+/// This path dequantizes cold packed V into rotated value basis, forward-rotates
+/// the small hot tail, runs native SDPA, and inverse-rotates the output. It must
+/// match the legacy full-dequant reference because the value rotation is linear
+/// and Q/K scores are unchanged.
+#[cfg(target_os = "macos")]
+#[test]
+fn delegated_dequant_sdpa_matches_reference_attention() {
+    let head_dim = 64;
+    let prefill_len = 8;
+    let total_steps = 48;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    let mut cache_dequant = build_delegated_cache_with_small_threshold(32);
+    let mut cache_ref = build_delegated_cache_with_small_threshold(32);
+
+    let k_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 17);
+    let v_pre = synth_kv_tensor(1, 1, prefill_len, head_dim, 18);
+    let k_pre_b = ffi::copy(&k_pre);
+    let v_pre_b = ffi::copy(&v_pre);
+    let _ = cache_dequant.update_and_fetch(k_pre, v_pre);
+    let _ = cache_ref.update_and_fetch(k_pre_b, v_pre_b);
+
+    let mut max_rms = 0.0_f32;
+    let mut steps_with_fold = 0;
+    let mut prev_cold_offset = cache_dequant.cold_offset();
+
+    for step in 0..total_steps {
+        let k_a = synth_kv_tensor(1, 1, 1, head_dim, 15_000 + step as u32);
+        let v_a = synth_kv_tensor(1, 1, 1, head_dim, 16_000 + step as u32);
+        let k_b = ffi::copy(&k_a);
+        let v_b = ffi::copy(&v_a);
+        let q = synth_kv_tensor(1, 1, 1, head_dim, 19_000 + step as u32);
+
+        cache_dequant.update(k_a, v_a);
+        let q_for_dequant = ffi::copy(&q);
+        let out_dequant = delegated_dequant_sdpa_from_updated_cache(
+            &mut cache_dequant,
+            &q_for_dequant,
+            scale,
+            None,
+        );
+
+        let out_ref = delegated_reference_attention(&mut cache_ref, &q, k_b, v_b, scale);
+
+        let flat_a = flatten_fp32(&out_dequant);
+        let flat_b = flatten_fp32(&out_ref);
+        assert_eq!(flat_a.len(), flat_b.len(), "step {step}: shape mismatch");
+        let mut sum_sq = 0.0_f64;
+        for (x, y) in flat_a.iter().zip(flat_b.iter()) {
+            let d = (x - y) as f64;
+            sum_sq += d * d;
+        }
+        let rms = (sum_sq / flat_a.len() as f64).sqrt() as f32;
+        if rms > max_rms {
+            max_rms = rms;
+        }
+
+        if cache_dequant.cold_offset() != prev_cold_offset {
+            steps_with_fold += 1;
+            prev_cold_offset = cache_dequant.cold_offset();
+        }
+
+        assert!(
+            rms < 5e-3,
+            "step {step}: dequant-SDPA vs reference RMS {rms:.4e} exceeds 5e-3 \
+             (cold_offset={}, hot_offset={})",
+            cache_dequant.cold_offset(),
+            cache_dequant.seq_len() - cache_dequant.cold_offset()
+        );
+    }
+
+    assert!(
+        steps_with_fold >= 2,
+        "test must cross at least two fold boundaries; only saw {steps_with_fold}"
+    );
+    eprintln!(
+        "delegated_dequant_sdpa_matches_reference: max RMS over {total_steps} steps = \
          {max_rms:.4e}; folds crossed = {steps_with_fold}"
     );
 }

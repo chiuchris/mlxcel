@@ -187,6 +187,61 @@ inline Turbo4DelegatedKernelHolder& get_turbo4_delegated_kernel() {
     return holder;
 }
 
+// Bulk rotated dequant kernel for the Swift-LM-style dequant-first SDPA path.
+// Each thread owns one output coordinate `(b, h, t, d)`, unpacks one 4-bit
+// codebook index, applies the precomputed token rescale, and writes rotated V.
+constexpr const char* TURBO4_BULK_DEQUANT_ROTATED_SOURCE = R"(
+    auto d = thread_position_in_grid.x;
+    auto n = thread_position_in_grid.z;
+
+    auto h_count = (uint)packed_shape[1];
+    auto t_count = (uint)packed_shape[2];
+    auto packed_width = (uint)packed_shape[3];
+    auto token_count = h_count * t_count;
+
+    if (token_count == 0 || n >= (uint)packed_shape[0] * token_count) {
+        return;
+    }
+
+    auto t = (uint)n % t_count;
+    auto bh = (uint)n / t_count;
+    auto byte_idx = (uint)d >> 1u;
+    auto nibble_shift = ((uint)d & 1u) * 4u;
+
+    float scaled = 0.0f;
+    if (d < (uint)Dim) {
+        uint packed_offset = (bh * t_count + t) * packed_width + byte_idx;
+        uint pb = (uint)packed[packed_offset];
+        uint idx = (pb >> nibble_shift) & 0x0Fu;
+        scaled = codebook[idx] * (float)rescale[bh * t_count + t];
+    }
+
+    if (d < (uint)Dim) {
+        out[(bh * t_count + t) * (uint)Dim + d] = scaled;
+    }
+)";
+
+struct Turbo4BulkDequantRotatedKernelHolder {
+    std::optional<mlx::core::fast::CustomKernelFunction> kernel;
+    std::once_flag init_flag;
+
+    mlx::core::fast::CustomKernelFunction& get() {
+        std::call_once(init_flag, [this] {
+            kernel = mlx::core::fast::metal_kernel(
+                "mlxcel_turbo4_bulk_dequant_rotated",
+                {"packed", "rescale", "codebook"},
+                {"out"},
+                std::string(TURBO4_BULK_DEQUANT_ROTATED_SOURCE));
+        });
+        return *kernel;
+    }
+};
+
+inline Turbo4BulkDequantRotatedKernelHolder& get_turbo4_bulk_dequant_rotated_kernel() {
+    static Turbo4BulkDequantRotatedKernelHolder holder;
+    return holder;
+}
+
 } // namespace (cold-only kernel internals; #528)
 
 namespace {  // anonymous namespace for issue #531 steel-envelope kernel internals
@@ -629,6 +684,53 @@ mlx::core::array turbo4_delegated_cold_weighted_sum(
         output_dtypes,
         std::make_tuple(dim, 1, bhq),    // grid
         std::make_tuple(tg_x, 1, 1),     // threadgroup
+        template_args,
+        std::nullopt,
+        false,
+        {});
+
+    return results[0];
+}
+
+mlx::core::array turbo4_delegated_bulk_dequant_rotated(
+    const mlx::core::array& v_packed,
+    const mlx::core::array& v_rescale,
+    const mlx::core::array& codebook,
+    int dim) {
+    using mlx::core::Dtype;
+    using mlx::core::Shape;
+    using mlx::core::fast::TemplateArg;
+
+    auto& p_shape = v_packed.shape();
+    int b = p_shape[0];
+    int h = p_shape[1];
+    int t = p_shape[2];
+    int bht = b * h * t;
+
+    auto& kernel = get_turbo4_bulk_dequant_rotated_kernel().get();
+
+    std::vector<std::pair<std::string, TemplateArg>> template_args = {
+        {"Dim", dim},
+    };
+
+    std::vector<mlx::core::array> inputs = {
+        v_packed,   // [B, H, T, D/2] u8
+        v_rescale,  // [B, H, T, 1]   f16
+        codebook,   // [16]           f32
+    };
+    std::vector<Shape> output_shapes = {Shape{b, h, t, dim}};
+    std::vector<Dtype> output_dtypes = {mlx::core::float16};
+
+    int tg_x = dim;
+    if (tg_x > 1024) {
+        tg_x = 1024;
+    }
+    auto results = kernel(
+        inputs,
+        output_shapes,
+        output_dtypes,
+        std::make_tuple(dim, 1, bht),
+        std::make_tuple(tg_x, 1, 1),
         template_args,
         std::nullopt,
         false,

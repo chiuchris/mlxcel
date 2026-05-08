@@ -100,6 +100,20 @@ mlx::core::array turbo4_delegated_cold_weighted_sum(
     int n_rep,
     float threshold);
 
+// Bulk dequantize packed Turbo4 V into rotated codec space.
+//
+// This is the fused equivalent of the Rust graph helper
+// `dequantize_v_turbo4_rotated`: one Metal dispatch unpacks nibbles, gathers
+// Lloyd-Max centroids, multiplies by the precomputed per-token rescale, and
+// writes `[B, H, T, D]` FP16. It intentionally does not apply inverse WHT /
+// signs; callers that use native SDPA over rotated V inverse-rotate only the
+// small attention output.
+mlx::core::array turbo4_delegated_bulk_dequant_rotated(
+    const mlx::core::array& v_packed,   // [B, H, T, D/2] u8
+    const mlx::core::array& v_rescale,  // [B, H, T, 1] f16
+    const mlx::core::array& codebook,   // [16] f32
+    int dim);
+
 // Run the steel-attention-envelope fused SDPA kernel for Turbo4Delegated
 // (issue #531). One Metal dispatch performs the entire post-Q·K SDPA inline:
 // numerically stable softmax over the full (cold + hot) score range, cold-V
