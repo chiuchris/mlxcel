@@ -43,6 +43,29 @@ pub async fn native_completion(
     headers: HeaderMap,
     Json(request): Json<NativeCompletionRequest>,
 ) -> Response {
+    // Issue #550: the native `/completion` endpoint does not support
+    // `response_format`. Reject up front with a clear 400 so the client
+    // does not assume their schema was honored — the chat-completions
+    // route is the supported path for constrained decoding.
+    if let Some(value) = request.response_format.as_ref() {
+        // Treat `{"type": "text"}` (and `null`) as a no-op rather than an
+        // error since they explicitly disable structured output.
+        let format_type = value
+            .as_object()
+            .and_then(|m| m.get("type"))
+            .and_then(|t| t.as_str())
+            .unwrap_or("");
+        if format_type != "text" {
+            return ErrorResponse::new(
+                "response_format is not supported on /completion; use /v1/chat/completions \
+                 for structured-output / JSON-Schema constrained decoding"
+                    .to_string(),
+                "invalid_request_error",
+            )
+            .into_response();
+        }
+    }
+
     // Issue #409: validate thinking_budget_tokens early (semantics match
     // /v1/chat/completions but the cap is checked against n_predict).
     let effective_n_predict = request.n_predict.unwrap_or(state.config.default_max_tokens);

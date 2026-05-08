@@ -668,6 +668,68 @@ impl BatchScheduler {
         final_id
     }
 
+    /// Issue #550: apply the structured-output mask (if any) to logits before
+    /// sampling.
+    ///
+    /// Returns either the masked logits or `Err(_)` describing why the
+    /// matcher refused to advance. The scheduler propagates the error as
+    /// `FinishReason::Error(...)` so the SSE stream terminates cleanly
+    /// instead of emitting non-conforming output.
+    fn apply_structured_mask(
+        constraint: &std::sync::Arc<
+            std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>,
+        >,
+        logits: UniquePtr<mlxcel_core::MlxArray>,
+        vocab_size_hint: usize,
+    ) -> Result<UniquePtr<mlxcel_core::MlxArray>, String> {
+        let mut guard = constraint
+            .lock()
+            .map_err(|e| format!("structured-output constraint poisoned: {e}"))?;
+        let masked = crate::server::structured::apply_structured_mask_to_logits(
+            &mut guard,
+            &logits,
+            vocab_size_hint,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(masked)
+    }
+
+    /// Issue #550: advance the matcher state by the just-sampled token.
+    ///
+    /// Returns `Ok(())` on success, `Err(msg)` when `consume_token` fails or
+    /// the matcher is in an error state. The caller transitions the sequence
+    /// to `Finished(Error(msg))` on error.
+    fn consume_structured_token(
+        constraint: &std::sync::Arc<
+            std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>,
+        >,
+        token: i32,
+    ) -> Result<(), String> {
+        let mut guard = constraint
+            .lock()
+            .map_err(|e| format!("structured-output constraint poisoned: {e}"))?;
+        guard.consume_token(token).map_err(|e| e.to_string())
+    }
+
+    /// Issue #550: send a clean SSE error event and transition the sequence
+    /// to `Finished(Error(msg))`. Used by the structured-output path to
+    /// abort cleanly when the matcher refuses to advance.
+    fn abort_sequence_with_error(seq: Option<&mut SequenceInfo>, prefix: &str, msg: &str) {
+        if let Some(seq) = seq {
+            let _ = seq
+                .response_tx
+                .send(GenerateEvent::Error(format!("{prefix}: {msg}")));
+            if let Err(err) = seq
+                .state
+                .transition_to(SequenceState::Finished(FinishReason::Error(
+                    msg.to_string(),
+                )))
+            {
+                tracing::error!("State transition error: {err}");
+            }
+        }
+    }
+
     /// Effective thinking-budget for a single sequence.
     ///
     /// Combines the server default with any per-request override attached to
@@ -1168,6 +1230,9 @@ impl BatchScheduler {
             token_history: Vec::new(),
             merged_eos: Vec::new(),
             thinking,
+            // Issue #550: forward the structured-output constraint built by
+            // the route layer so the per-step sampling path can consult it.
+            structured: options.structured.clone(),
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
@@ -1904,10 +1969,59 @@ impl BatchScheduler {
         mut token_history: Vec<i32>,
         needs_history: bool,
     ) {
+        // Issue #550: apply structured-output mask to the prefill logits
+        // before sampling the first token so the very first emitted token
+        // already conforms to the schema.
+        let logits_for_sampling = if let Some(constraint) = seq.structured.clone() {
+            // Read the vocab dimension from the prefill logits so the mask
+            // matches the sampler's vocabulary exactly.
+            let shape = mlxcel_core::array_shape(&logits);
+            let vocab = *shape.last().unwrap_or(&0) as usize;
+            match Self::apply_structured_mask(&constraint, mlxcel_core::copy(&logits), vocab) {
+                Ok(masked) => masked,
+                Err(msg) => {
+                    let _ = seq
+                        .response_tx
+                        .send(GenerateEvent::Error(format!("structured output: {msg}")));
+                    if let Err(err) = seq
+                        .state
+                        .transition_to(SequenceState::Finished(FinishReason::Error(msg)))
+                    {
+                        tracing::error!("State transition error: {err}");
+                    }
+                    self.prompt_cache_seq_ctx.remove(&seq.seq_id);
+                    self.release_sequence_caches(seq.seq_id);
+                    return;
+                }
+            }
+        } else {
+            mlxcel_core::copy(&logits)
+        };
         let (first_token_arr, adjusted_logits) =
-            sample_token_optimized(&logits, &seq.sampling, &token_history);
+            sample_token_optimized(&logits_for_sampling, &seq.sampling, &token_history);
         mlxcel_core::eval(&first_token_arr);
         let sampled_first_token = mlxcel_core::item_i32(&first_token_arr);
+
+        // Issue #550: advance the matcher state with the just-sampled token.
+        // If consume_token errors, transition the sequence to Finished(Error)
+        // and surface a clean SSE error event rather than leaking
+        // non-conforming output.
+        if let Some(constraint) = seq.structured.clone()
+            && let Err(msg) = Self::consume_structured_token(&constraint, sampled_first_token)
+        {
+            let _ = seq
+                .response_tx
+                .send(GenerateEvent::Error(format!("structured output: {msg}")));
+            if let Err(err) = seq
+                .state
+                .transition_to(SequenceState::Finished(FinishReason::Error(msg)))
+            {
+                tracing::error!("State transition error: {err}");
+            }
+            self.prompt_cache_seq_ctx.remove(&seq.seq_id);
+            self.release_sequence_caches(seq.seq_id);
+            return;
+        }
 
         // Issue #409: thinking-budget override. Qwen3 chat templates prime
         // `<think>\n`, so the first prefill-completion token is already
@@ -2165,12 +2279,24 @@ impl BatchScheduler {
     }
 
     /// Select the eviction victim based on the configured policy.
+    ///
+    /// Issue #550 follow-up: sequences with an attached structured-output
+    /// constraint are excluded from the candidate set. Preemption resets
+    /// `generated_tokens`, the streaming decoder, and the KV cache, but the
+    /// `llguidance` matcher carries grammar progress that cannot be safely
+    /// rewound — re-prefill would advance the matcher from a state that
+    /// reflects the discarded tokens, producing either an empty mask error
+    /// or silent grammar mis-advance. Skipping these sequences trades a
+    /// rare scheduling stall for correctness; if no other candidate is
+    /// available, `try_evict_for_preemption` falls through to its existing
+    /// "no candidate" path and the new request stays queued.
     fn select_eviction_victim(&self) -> Option<SequenceId> {
         match self.preemption_policy {
             PreemptionPolicy::LongestFirst => {
                 // Evict the sequence with the most generated tokens
                 self.active_batch
                     .iter_sequences()
+                    .filter(|seq| seq.structured.is_none())
                     .max_by_key(|seq| seq.generated_tokens.len())
                     .map(|seq| seq.seq_id)
             }
@@ -2178,6 +2304,7 @@ impl BatchScheduler {
                 // Evict the lowest-priority sequence; break ties by longest
                 self.active_batch
                     .iter_sequences()
+                    .filter(|seq| seq.structured.is_none())
                     .min_by(|a, b| {
                         a.priority
                             .cmp(&b.priority)
@@ -2306,15 +2433,50 @@ impl BatchScheduler {
             let seq_logits =
                 mlxcel_core::slice(&logits, &[i as i32, 0, 0], &[i as i32 + 1, 1, i32::MAX]);
 
+            // Issue #550: when the sequence has a structured-output
+            // constraint, apply the schema mask to the per-sequence logits
+            // before sampling. Failures here surface as a clean
+            // FinishReason::Error rather than silent non-conforming output.
+            let constraint_clone = self
+                .active_batch
+                .get_mut(seq_id)
+                .and_then(|s| s.structured.clone());
+            let logits_for_sampling = if let Some(constraint) = constraint_clone.as_ref() {
+                let shape = mlxcel_core::array_shape(&seq_logits);
+                let vocab = *shape.last().unwrap_or(&0) as usize;
+                match Self::apply_structured_mask(constraint, mlxcel_core::copy(&seq_logits), vocab)
+                {
+                    Ok(masked) => masked,
+                    Err(msg) => {
+                        Self::abort_sequence_with_error(
+                            self.active_batch.get_mut(seq_id),
+                            "structured output",
+                            &msg,
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                mlxcel_core::copy(&seq_logits)
+            };
+
             // Use cached token_history (incrementally maintained) instead of
             // rebuilding per step. Use cached merged_eos computed once at prefill.
-            let (token_val, token_lp) = {
+            //
+            // Issue #550 follow-up: we capture `sampled` separately from
+            // `final_id` so the structured-output matcher (below) can be
+            // advanced by the *pre-override* token. The matcher's mask
+            // describes which token ids are grammatically legal at this
+            // step; feeding it the post-override forced `</think>` would
+            // hand it a token outside its allowed set and cause a parser
+            // error or silent mis-advance.
+            let (sampled_token, token_val, token_lp) = {
                 let seq = match self.active_batch.get_mut(seq_id) {
                     Some(s) => s,
                     None => continue,
                 };
                 let (token_arr, adjusted_logits) =
-                    sample_token_optimized(&seq_logits, &seq.sampling, &seq.token_history);
+                    sample_token_optimized(&logits_for_sampling, &seq.sampling, &seq.token_history);
                 mlxcel_core::eval(&token_arr);
                 let sampled = mlxcel_core::item_i32(&token_arr);
                 // Issue #409: apply the thinking-budget override first so that
@@ -2331,8 +2493,31 @@ impl BatchScheduler {
                     // stay consistent, so drop the logprob for this step.
                     None
                 };
-                (final_id, lp)
+                (sampled, final_id, lp)
             };
+
+            // Issue #550: advance the matcher state with the *pre-override*
+            // sampled token (`sampled_token`), not the post-override
+            // `token_val`. The matcher derived its mask from the unaltered
+            // logits, so feeding it `final_id` after a thinking-budget
+            // override would hand it a token outside its allowed set and
+            // either cause a parser error or silently mis-advance. Mirrors
+            // the pattern in `finish_prefill` which uses
+            // `sampled_first_token`.
+            //
+            // If `consume_token` fails (matcher hit an error state),
+            // transition the sequence to `Finished(Error)` and skip
+            // emission so non-conforming output never reaches the client.
+            if let Some(constraint) = constraint_clone
+                && let Err(msg) = Self::consume_structured_token(&constraint, sampled_token)
+            {
+                Self::abort_sequence_with_error(
+                    self.active_batch.get_mut(seq_id),
+                    "structured output",
+                    &msg,
+                );
+                continue;
+            }
 
             let seq = match self.active_batch.get_mut(seq_id) {
                 Some(s) => s,
@@ -2416,13 +2601,44 @@ impl BatchScheduler {
         };
         self.sync_sequence_storage(seq_id);
 
+        // Issue #550: apply structured-output mask to per-step logits when
+        // the sequence has an attached constraint. Errors abort the
+        // sequence cleanly rather than emitting non-conforming output.
+        let constraint_clone = self
+            .active_batch
+            .get_mut(seq_id)
+            .and_then(|s| s.structured.clone());
+        let logits_for_sampling = if let Some(constraint) = constraint_clone.as_ref() {
+            let shape = mlxcel_core::array_shape(&logits);
+            let vocab = *shape.last().unwrap_or(&0) as usize;
+            match Self::apply_structured_mask(constraint, mlxcel_core::copy(&logits), vocab) {
+                Ok(masked) => masked,
+                Err(msg) => {
+                    Self::abort_sequence_with_error(
+                        self.active_batch.get_mut(seq_id),
+                        "structured output",
+                        &msg,
+                    );
+                    return;
+                }
+            }
+        } else {
+            mlxcel_core::copy(&logits)
+        };
+
         // Use cached token_history from SequenceInfo (incrementally maintained)
         // and cached merged_eos (computed once during prefill) to avoid
         // per-step allocation and reconstruction overhead.
-        let (token_val, token_lp) = {
+        //
+        // Issue #550 follow-up: we capture `sampled` separately from
+        // `final_id`. The structured-output matcher (below) must be
+        // advanced by the pre-override token because its mask was derived
+        // from the unaltered logits; passing the post-override forced
+        // `</think>` would feed it a token outside its allowed set.
+        let (sampled_token, token_val, token_lp) = {
             let seq = self.active_batch.get_mut(seq_id).unwrap();
             let (token_arr, adjusted_logits) =
-                sample_token_optimized(&logits, &seq.sampling, &seq.token_history);
+                sample_token_optimized(&logits_for_sampling, &seq.sampling, &seq.token_history);
             mlxcel_core::eval(&token_arr);
             let sampled = mlxcel_core::item_i32(&token_arr);
             // Issue #409: apply the thinking-budget override first so that
@@ -2436,8 +2652,22 @@ impl BatchScheduler {
             } else {
                 None
             };
-            (final_id, lp)
+            (sampled, final_id, lp)
         };
+
+        // Issue #550: advance the matcher state with the *pre-override*
+        // sampled token. See the parallel comment in
+        // `execute_batched_decode` for why this must not be `token_val`.
+        if let Some(constraint) = constraint_clone
+            && let Err(msg) = Self::consume_structured_token(&constraint, sampled_token)
+        {
+            Self::abort_sequence_with_error(
+                self.active_batch.get_mut(seq_id),
+                "structured output",
+                &msg,
+            );
+            return;
+        }
 
         let seq = match self.active_batch.get_mut(seq_id) {
             Some(s) => s,

@@ -305,6 +305,7 @@ fn sequence_info_fields_transport_cache_hit_metadata() {
         token_history: Vec::new(),
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
+        structured: None,
     };
 
     assert_eq!(seq.prefill_start_offset, 73);

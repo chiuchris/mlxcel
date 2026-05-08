@@ -266,6 +266,17 @@ pub struct SequenceInfo {
     /// no budget, or when the server default is unbounded.
     pub(crate) thinking: ThinkingState,
 
+    // -- Issue #550: structured-output constraint --
+    /// Optional `llguidance` matcher state for constrained decoding. When
+    /// `Some(_)`, the scheduler computes a per-step token mask before sampling
+    /// and consumes the sampled token after sampling so the partial output
+    /// stays JSON-Schema-conforming. `None` means generation is unconstrained
+    /// (the existing behavior preserved bit-for-bit when the request does not
+    /// supply `response_format`).
+    pub(crate) structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
+
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.
     pub response_tx: mpsc::Sender<GenerateEvent>,
@@ -311,6 +322,7 @@ impl std::fmt::Debug for SequenceInfo {
             .field("generated_tokens_len", &self.generated_tokens.len())
             .field("prefill_offset", &self.prefill_offset)
             .field("is_vlm", &self.is_vlm_request())
+            .field("structured", &self.structured.is_some())
             .field("created_at", &self.created_at)
             .field("prefill_start", &self.prefill_start)
             .field("first_token_time", &self.first_token_time)

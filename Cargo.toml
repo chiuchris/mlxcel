@@ -71,6 +71,21 @@ glob = "0.3.2"
 path-clean = "1.0.1"
 minijinja = { version = "2.5", features = ["loop_controls"] }
 
+# Structured outputs / constrained decoding (issue #550).
+#
+# `llguidance` is the same library used by mlx-vlm upstream PR #1047 for the
+# JSON-schema response_format MVP. The Rust crate exposes `Matcher` /
+# `ParserFactory` directly so we don't need to round-trip through Python.
+# `toktrie_hf_tokenizers` adapts our existing HuggingFace `tokenizers::Tokenizer`
+# into the byte-level `TokEnv` that llguidance expects.
+#
+# `default-features = false, features = ["lark", "referencing"]` drops the
+# optional `rayon` thread pool and the `ahash` non-deterministic hasher; we
+# keep `lark` (string-form grammar parsing — used by `from_tagged_str`) and
+# `referencing` (JSON-schema $ref resolution required for nested schemas).
+llguidance = { version = "1.7", default-features = false, features = ["lark", "referencing"] }
+toktrie_hf_tokenizers = "1.7"
+
 # HTTP Server
 tokio = { version = "1.35", features = ["full"] }
 axum = { version = "0.7", features = ["json", "macros"] }

@@ -32,12 +32,15 @@ use crate::server::AppState;
 use crate::server::batch::RequestPriority;
 use crate::server::config::ReasoningBudgetOverride;
 use crate::server::streaming::sse_channel;
+use crate::server::structured::build_constraint_from_response_format;
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::types::response::CompletionLogprobs;
 use crate::server::types::{CompletionChunk, CompletionRequest, CompletionResponse, ErrorResponse};
 use crate::tokenizer::MlxcelTokenizer;
 
-use super::chat::{build_generate_options, decode_token, parse_priority_header};
+use super::chat::{
+    build_generate_options, decode_token, parse_priority_header, structured_error_to_response,
+};
 
 /// Build a `CompletionLogprobs` from a list of `TokenLogprobData` (legacy format).
 fn build_completion_logprobs(
@@ -147,11 +150,34 @@ pub async fn completions(
         }
     };
 
+    // Issue #550 + PR #575 H2: build the structured-output constraint up
+    // front. Grammar compilation can be slow on adversarial schemas, so
+    // we run it on `spawn_blocking` rather than blocking the Tokio
+    // runtime thread. Returns `None` when no `response_format` was
+    // supplied.
+    let structured = {
+        let tokenizer = state.tokenizer.clone();
+        let response_format = request.response_format.clone();
+        match tokio::task::spawn_blocking(move || {
+            build_constraint_from_response_format(tokenizer.as_ref(), response_format.as_ref())
+        })
+        .await
+        {
+            Ok(Ok(opt)) => opt,
+            Ok(Err(err)) => return structured_error_to_response(err).into_response(),
+            Err(join_err) => {
+                tracing::error!("structured-output build task panicked: {join_err}");
+                return ErrorResponse::new("structured-output preparation failed", "server_error")
+                    .into_response();
+            }
+        }
+    };
+
     let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_completion(state, request, priority, budget_override).await
+        stream_completion(state, request, priority, budget_override, structured).await
     } else {
-        non_stream_completion(state, request, priority, budget_override)
+        non_stream_completion(state, request, priority, budget_override, structured)
             .await
             .into_response()
     }
@@ -162,6 +188,9 @@ async fn non_stream_completion(
     request: CompletionRequest,
     priority: RequestPriority,
     budget_override: ReasoningBudgetOverride,
+    structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
 ) -> Result<Json<CompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -183,6 +212,8 @@ async fn non_stream_completion(
     // `build_generate_options` so the scheduler waits for the model to emit
     // `<think>` itself before counting reasoning tokens.
     options.thinking_enter_block_on_start = false;
+    // Issue #550: forward structured-output constraint into the worker.
+    options.structured = structured;
 
     // In the legacy format, `logprobs` is a number (top-k); 0 means return only
     // the selected token's log-prob, None means don't return logprobs at all.
@@ -232,6 +263,9 @@ async fn stream_completion(
     request: CompletionRequest,
     priority: RequestPriority,
     budget_override: ReasoningBudgetOverride,
+    structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
 ) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
@@ -249,6 +283,8 @@ async fn stream_completion(
     // `<think>\n` priming, so the scheduler must wait for the model to
     // emit `<think>` itself before counting reasoning tokens.
     options.thinking_enter_block_on_start = false;
+    // Issue #550: forward structured-output constraint into the worker.
+    options.structured = structured;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request

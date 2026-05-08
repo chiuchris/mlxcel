@@ -557,6 +557,8 @@ fn warmup_model(model_provider: &ModelProvider) -> Result<()> {
             // Warmup bypasses the prompt cache entirely — a single literal
             // "Hello" is not worth donating back.
             prompt_cache_ctx: None,
+            // Warmup never asks for structured output.
+            structured: None,
         },
     )?;
     Ok(())

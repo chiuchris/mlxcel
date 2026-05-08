@@ -38,6 +38,7 @@ fn request_with_messages(messages: Vec<Message>) -> ChatCompletionRequest {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     }
 }
@@ -336,6 +337,7 @@ fn build_raw_json_messages_includes_tool_fields() {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     };
 
@@ -602,6 +604,7 @@ async fn prefix_stability_across_turns_when_preserve_thinking_true() {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     };
     let request_t3 = ChatCompletionRequest {
@@ -619,6 +622,7 @@ async fn prefix_stability_across_turns_when_preserve_thinking_true() {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     };
 

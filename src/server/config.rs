@@ -121,6 +121,25 @@ pub struct ServerGenerateOptions {
     /// off) or when the request does not participate in prefix reuse (e.g.
     /// raw text-completion endpoints that do not render a chat template).
     pub prompt_cache_ctx: Option<PromptCacheRequestContext>,
+
+    /// Issue #550: optional structured-output constraint produced by
+    /// [`crate::server::structured::build_constraint_from_response_format`].
+    ///
+    /// `None` when the request did not supply a `response_format` of type
+    /// `"json_schema"`. When `Some`, the scheduler attaches the constraint
+    /// to the queued sequence and drives `compute_mask` / `consume_token`
+    /// around every per-step `sample_token_optimized` call so the emitted
+    /// tokens always conform to the supplied JSON schema.
+    ///
+    /// Wrapped in `Arc<Mutex<...>>` because the constraint mutates internal
+    /// matcher state on every step and must move from the route handler
+    /// across the channel into the model worker thread without a fresh
+    /// build (rebuilding is expensive — see `TOK_ENV_CACHE` in
+    /// `structured.rs`). The Mutex is uncontended in practice: only the
+    /// worker thread that owns the sequence touches it.
+    pub structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
 }
 
 /// Per-request reasoning-budget override.

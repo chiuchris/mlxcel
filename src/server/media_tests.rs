@@ -43,6 +43,7 @@ fn build_chat_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     }
 }
@@ -184,6 +185,7 @@ async fn extract_chat_image_data_collects_images_across_messages() {
         prompt_cache_key: None,
         user: None,
         extra_body_fields: serde_json::Map::new(),
+        response_format: None,
         params: SamplingParams::default(),
     };
 

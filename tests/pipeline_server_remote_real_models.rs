@@ -136,6 +136,7 @@ fn assert_remote_coordinator_matches_dense_baseline(
         reasoning_budget: Default::default(),
         thinking_enter_block_on_start: false,
         prompt_cache_ctx: None,
+        structured: None,
     };
 
     let dense = dense_provider

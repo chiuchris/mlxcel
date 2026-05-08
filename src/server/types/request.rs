@@ -409,6 +409,30 @@ pub struct ChatCompletionRequest {
     #[serde(default, flatten)]
     pub extra_body_fields: serde_json::Map<String, serde_json::Value>,
 
+    /// Issue #550: OpenAI-compatible structured-output spec.
+    ///
+    /// Accepts the OpenAI Chat Completions shape:
+    ///
+    /// ```json
+    /// {
+    ///   "response_format": {
+    ///     "type": "json_schema",
+    ///     "json_schema": {
+    ///       "name": "result",
+    ///       "strict": true,
+    ///       "schema": { "type": "object", ... }
+    ///     }
+    ///   }
+    /// }
+    /// ```
+    ///
+    /// When set with `type: "json_schema"`, generation is constrained via
+    /// [`crate::server::structured`] so emitted tokens always conform to the
+    /// supplied schema. Other types (`text`, `null`) are no-ops; `json_object`
+    /// is rejected as unsupported in the MVP — see `extract_json_schema_from_response_format`.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
+
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
@@ -430,6 +454,10 @@ pub struct CompletionRequest {
     /// Number of top log-probability alternatives to return (legacy format: 0–5)
     #[serde(default)]
     pub logprobs: Option<u8>,
+    /// Issue #550: OpenAI-compatible structured-output spec; see the
+    /// matching field on [`ChatCompletionRequest`] for shape details.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
@@ -605,6 +633,15 @@ pub struct NativeCompletionRequest {
     pub thinking_token_budget: Option<i32>,
     /// Qwen-official alias for `thinking_budget_tokens`.
     pub thinking_budget: Option<i32>,
+
+    /// Issue #550: structured-output `response_format` is **not** supported
+    /// on the native llama-server `/completion` endpoint. The field is
+    /// captured here only so the route can reject the request with a clear
+    /// 400 instead of silently ignoring the schema and emitting
+    /// non-conforming output. Use `/v1/chat/completions` for constrained
+    /// decoding.
+    #[serde(default)]
+    pub response_format: Option<serde_json::Value>,
 }
 
 /// Tokenize request (POST /tokenize)

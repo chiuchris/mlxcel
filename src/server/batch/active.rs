@@ -162,6 +162,7 @@ mod tests {
             token_history: Vec::new(),
             merged_eos: Vec::new(),
             thinking: crate::server::thinking_budget::ThinkingState::disabled(),
+            structured: None,
         };
 
         (seq, rx)

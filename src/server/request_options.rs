@@ -94,6 +94,10 @@ pub(crate) fn build_server_generate_options(
         // Default unset; chat routes populate this when the prompt cache
         // store is installed (see `src/server/routes/chat.rs`).
         prompt_cache_ctx: None,
+        // Issue #550: defaults to `None` (unconstrained generation). Routes
+        // that handle `response_format` populate this after the helper
+        // returns — see `chat.rs` and `completions.rs`.
+        structured: None,
     }
 }
 

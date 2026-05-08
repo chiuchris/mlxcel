@@ -29,6 +29,7 @@ pub mod routes;
 mod startup;
 mod state;
 mod streaming;
+pub mod structured;
 pub mod thinking_budget;
 pub mod tool_calls;
 pub mod types;

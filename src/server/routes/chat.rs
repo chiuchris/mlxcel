@@ -34,6 +34,7 @@ use crate::server::config::{PromptCacheRequestContext, ReasoningBudgetOverride};
 use crate::server::prompt_cache::key::{resolve_session_key, template_sig};
 use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
 use crate::server::streaming::sse_channel;
+use crate::server::structured::{StructuredOutputError, build_constraint_from_response_format};
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::tool_calls;
 use crate::server::tool_calls::stream_filter::StreamFilter;
@@ -44,6 +45,28 @@ use crate::server::types::{
 };
 use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
 use crate::tokenizer::MlxcelTokenizer;
+
+/// Map a [`StructuredOutputError`] to an HTTP error response.
+///
+/// Schema-shape problems and unsupported variants are 400; anything else
+/// (matcher build failures, tokenizer adaptation issues) is 500.
+///
+/// `SchemaTooLarge` is treated as 400 (`invalid_request_error`) because the
+/// fault is in the user-supplied schema. The error message — which already
+/// avoids leaking llguidance internals — is safe to surface to the client
+/// directly so they can correct their input.
+pub(crate) fn structured_error_to_response(err: StructuredOutputError) -> ErrorResponse {
+    match err {
+        StructuredOutputError::InvalidRequest(_)
+        | StructuredOutputError::InvalidSchema(_)
+        | StructuredOutputError::SchemaTooLarge(_) => {
+            ErrorResponse::new(err.to_string(), "invalid_request_error")
+        }
+        StructuredOutputError::UnsupportedTokenizer(_) | StructuredOutputError::Matcher(_) => {
+            ErrorResponse::new(err.to_string(), "server_error")
+        }
+    }
+}
 
 /// Build the per-request prompt-cache context (epic #416 / issue #421).
 ///
@@ -236,11 +259,38 @@ pub async fn chat_completions(
         }
     };
 
+    // Issue #550 + PR #575 H2: build the structured-output constraint up
+    // front so any schema validation error surfaces as a 400 before
+    // generation work starts. Grammar compilation can be ~hundreds of ms
+    // and (worst case, before the size guard) hundreds of MB — running
+    // it directly on the Tokio runtime worker thread would block other
+    // in-flight requests. We move it onto a blocking task and await the
+    // join handle. Returns `None` when the request did not ask for
+    // structured output, in which case the rest of the pipeline behaves
+    // identically to before this issue.
+    let structured = {
+        let tokenizer = state.tokenizer.clone();
+        let response_format = request.response_format.clone();
+        match tokio::task::spawn_blocking(move || {
+            build_constraint_from_response_format(tokenizer.as_ref(), response_format.as_ref())
+        })
+        .await
+        {
+            Ok(Ok(opt)) => opt,
+            Ok(Err(err)) => return structured_error_to_response(err).into_response(),
+            Err(join_err) => {
+                tracing::error!("structured-output build task panicked: {join_err}");
+                return ErrorResponse::new("structured-output preparation failed", "server_error")
+                    .into_response();
+            }
+        }
+    };
+
     let priority = parse_priority_header(&headers);
     if request.stream {
-        stream_chat_completion(state, request, priority, budget_override).await
+        stream_chat_completion(state, request, priority, budget_override, structured).await
     } else {
-        non_stream_chat_completion(state, request, priority, budget_override)
+        non_stream_chat_completion(state, request, priority, budget_override, structured)
             .await
             .into_response()
     }
@@ -260,6 +310,9 @@ async fn non_stream_chat_completion(
     request: ChatCompletionRequest,
     priority: RequestPriority,
     budget_override: ReasoningBudgetOverride,
+    structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
 ) -> Result<Json<ChatCompletionResponse>, ErrorResponse> {
     // Queue-depth admission control: reject when prefill queue is full
     if !state.can_accept_request() {
@@ -299,6 +352,10 @@ async fn non_stream_chat_completion(
     // counting ordinary content tokens as reasoning when the prompt
     // wasn't primed.
     options.thinking_enter_block_on_start = primed_open_thinking;
+    // Issue #550: attach the structured-output constraint built at the
+    // request boundary so the scheduler runs constrained sampling for this
+    // sequence.
+    options.structured = structured;
 
     // Set logprobs configuration when requested
     let top_k = request.top_logprobs.unwrap_or(0) as usize;
@@ -412,6 +469,9 @@ async fn stream_chat_completion(
     request: ChatCompletionRequest,
     priority: RequestPriority,
     budget_override: ReasoningBudgetOverride,
+    structured: Option<
+        std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
+    >,
 ) -> Response {
     // Queue-depth admission control: return 503 before opening SSE stream
     if !state.can_accept_request() {
@@ -448,6 +508,9 @@ async fn stream_chat_completion(
     // counting ordinary content tokens as reasoning when the prompt
     // wasn't primed.
     options.thinking_enter_block_on_start = primed_open_thinking;
+    // Issue #550: forward the constraint built at the request boundary so
+    // streamed generation is also constrained.
+    options.structured = structured;
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request
