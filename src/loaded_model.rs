@@ -130,6 +130,8 @@ pub enum LoadedModel {
     Mamba2(models::Mamba2Model),
     Jamba(models::JambaModel),
     NemotronH(models::NemotronHModel),
+    /// Nemotron H Nano Omni — vision-capable variant (issue #554, vision-only).
+    NemotronHNanoOmniVLM(vision::NemotronHNanoOmniVlModel),
     NemotronNAS(models::NemotronNASModel),
     Step3p5(models::Step3p5Model),
     KimiLinear(models::KimiLinearModel),
@@ -229,6 +231,7 @@ macro_rules! delegate_language_model {
             LoadedModel::Mamba2(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Jamba(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::NemotronH(inner) => LanguageModel::$method(inner, $($arg),*),
+            LoadedModel::NemotronHNanoOmniVLM(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::NemotronNAS(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::Step3p5(inner) => LanguageModel::$method(inner, $($arg),*),
             LoadedModel::KimiLinear(inner) => LanguageModel::$method(inner, $($arg),*),

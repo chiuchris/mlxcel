@@ -1603,6 +1603,23 @@ impl NemotronHModel {
         }
     }
 
+    /// Look up token embeddings without running the rest of the model.
+    /// The VLM path needs raw embeddings to merge image features at
+    /// `<image>` token positions before running the layer stack.
+    ///
+    /// Used by: Nemotron H Nano Omni VLM
+    pub fn input_embeddings(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
+        self.embeddings.forward(input_ids)
+    }
+
+    /// Hidden size of the text backbone, useful for shape sanity checks
+    /// in VLM glue code.
+    ///
+    /// Used by: Nemotron H Nano Omni VLM
+    pub fn hidden_size(&self) -> usize {
+        self.config.hidden_size
+    }
+
     pub fn forward_with_caches(
         &self,
         inputs: &MlxArray,
@@ -1869,12 +1886,31 @@ impl NemotronHModel {
         inputs: &MlxArray,
         caches: &mut [NemotronLayerCache],
     ) -> UniquePtr<MlxArray> {
+        let h = self.embeddings.forward(inputs);
+        self.forward_layer_stack(h, caches)
+    }
+
+    /// Run the full layer stack starting from a pre-computed hidden
+    /// state. Used by the VLM path that produces multimodal embeddings
+    /// upstream of the text backbone (issue #554, Nemotron H Nano Omni).
+    ///
+    /// Used by: Nemotron H Nano Omni VLM
+    pub fn forward_with_inputs_embeds(&self, inputs_embeds: &MlxArray) -> UniquePtr<MlxArray> {
+        let mut internal = self.internal_caches.borrow_mut();
+        self.forward_layer_stack(mlxcel_core::copy(inputs_embeds), &mut internal)
+    }
+
+    fn forward_layer_stack(
+        &self,
+        starting_hidden: UniquePtr<MlxArray>,
+        caches: &mut [NemotronLayerCache],
+    ) -> UniquePtr<MlxArray> {
         let profile_blocks = std::env::var("MLXCEL_PROFILE_BLOCKS").is_ok();
         let mut mamba_ns = 0u128;
         let mut attn_ns = 0u128;
         let mut moe_ns = 0u128;
 
-        let mut h = self.embeddings.forward(inputs);
+        let mut h = starting_hidden;
 
         // Find first attention cache offset
         let attn_offset = caches

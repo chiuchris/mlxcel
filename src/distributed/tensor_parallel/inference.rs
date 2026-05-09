@@ -210,6 +210,7 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::Mamba2 => "mamba2",
         ModelType::Jamba => "jamba",
         ModelType::NemotronH => "nemotron_h",
+        ModelType::NemotronHNanoOmniVLM => "nemotron_h_nano_omni",
         ModelType::NemotronNAS => "nemotron_nas",
         ModelType::Rwkv7 => "rwkv7",
         ModelType::KimiLinear => "kimi_linear",

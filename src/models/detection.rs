@@ -167,6 +167,9 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "mamba2" => Ok(ModelType::Mamba2),
         "jamba" => Ok(ModelType::Jamba),
         "nemotron_h" => Ok(ModelType::NemotronH),
+        "nemotron_h_nano_omni" | "nemotronh_nano_omni_reasoning_v3" => {
+            Ok(ModelType::NemotronHNanoOmniVLM)
+        }
         "nemotron-nas" => Ok(ModelType::NemotronNAS),
         "rwkv7" => Ok(ModelType::Rwkv7),
         "kimi_linear" => Ok(ModelType::KimiLinear),

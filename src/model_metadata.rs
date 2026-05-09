@@ -176,6 +176,7 @@ macro_rules! for_each_model_registration {
             Mamba2 => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             Jamba => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             NemotronH => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
+            NemotronHNanoOmniVLM => { kind: Vlm, directory: Vlm, weight: None, adapter: Some("Nemotron H Nano Omni VLM does not support adapter loading; use load_model() instead") };
             NemotronNAS => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             KimiLinear => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };
             LongcatFlash => { kind: Text, directory: Nonstandard, weight: Some(WeightLoadRoute::Special), adapter: None };

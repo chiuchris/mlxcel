@@ -23,6 +23,7 @@ pub mod minicpmo;
 pub mod molmo2;
 pub mod molmo_point;
 pub mod moondream3;
+pub mod nemotron_h_nano_omni;
 pub mod phi4_siglip;
 pub mod pixtral;
 pub mod qwen2_5_vl;

@@ -41,6 +41,8 @@ use models::sanitize_config_json;
 mod gemma;
 #[path = "vlm_llava.rs"]
 mod llava;
+#[path = "vlm_nemotron_h_nano_omni.rs"]
+mod nemotron_h_nano_omni;
 #[path = "vlm_pixtral.rs"]
 mod pixtral;
 #[path = "vlm_qwen.rs"]
@@ -52,6 +54,7 @@ mod special;
 
 pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm, load_gemma4_vlm};
 pub(crate) use llava::{load_llava_bunny_vlm, load_llava_vlm};
+pub(crate) use nemotron_h_nano_omni::load_nemotron_h_nano_omni_vlm;
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};
 pub(crate) use qwen::{
     load_qwen2_5_vl, load_qwen2_vl, load_qwen3_5_moe_vlm, load_qwen3_5_vlm, load_qwen3_vl,

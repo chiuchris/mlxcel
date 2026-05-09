@@ -87,6 +87,10 @@ pub enum VlmPreparationSummary {
         image_slots: usize,
         total_tokens: usize,
     },
+    NemotronHNanoOmni {
+        image_slots: usize,
+        total_tokens: usize,
+    },
     ImageBlocks(ImageTokenBlockStats),
 }
 
@@ -513,6 +517,82 @@ where
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
                 preparation,
+            }))
+        }
+        VlmRuntimeRef::NemotronHNanoOmni(model) => {
+            // Per-image dynamic-resolution preprocessing produces a
+            // distinct `num_tokens` per image. We expand each
+            // `<image>`-style placeholder in the existing prompt token
+            // stream into `image_start + img_context * n + image_end`
+            // (mirrors upstream `processing_nemotron_h_nano_omni`).
+            let processed_images = model.processor.preprocess_batch(images);
+            let placeholder = model.config.img_context_token_id;
+            let image_start = model.config.image_start_token_id;
+            let image_end = model.config.image_end_token_id;
+
+            // Count placeholder occurrences. Each occurrence consumes
+            // one preprocessed image; if the prompt has no placeholder
+            // (e.g., legacy callers passing only an image), we prepend
+            // one block per image so the runtime always sees the
+            // image-context tokens before any text tokens.
+            let placeholder_positions: Vec<usize> = prompt_tokens
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, &tok)| if tok == placeholder { Some(idx) } else { None })
+                .collect();
+
+            let mut expanded: Vec<i32> = Vec::with_capacity(
+                prompt_tokens.len()
+                    + processed_images
+                        .iter()
+                        .map(|img| img.num_tokens + 2)
+                        .sum::<usize>(),
+            );
+
+            if placeholder_positions.is_empty() {
+                for image in processed_images.iter() {
+                    if image_start != 0 {
+                        expanded.push(image_start);
+                    }
+                    for _ in 0..image.num_tokens {
+                        expanded.push(placeholder);
+                    }
+                    if image_end != 0 {
+                        expanded.push(image_end);
+                    }
+                }
+                expanded.extend_from_slice(prompt_tokens);
+            } else {
+                let mut image_idx = 0usize;
+                for &token in prompt_tokens.iter() {
+                    if token == placeholder && image_idx < processed_images.len() {
+                        let image = &processed_images[image_idx];
+                        if image_start != 0 {
+                            expanded.push(image_start);
+                        }
+                        for _ in 0..image.num_tokens {
+                            expanded.push(placeholder);
+                        }
+                        if image_end != 0 {
+                            expanded.push(image_end);
+                        }
+                        image_idx += 1;
+                    } else {
+                        expanded.push(token);
+                    }
+                }
+            }
+            *prompt_tokens = expanded;
+
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings = model.get_input_embeddings(&input_ids_arr, &processed_images);
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation: Some(VlmPreparationSummary::NemotronHNanoOmni {
+                    image_slots: processed_images.len(),
+                    total_tokens: prompt_tokens.len(),
+                }),
             }))
         }
         VlmRuntimeRef::Standard(vision_module) => {

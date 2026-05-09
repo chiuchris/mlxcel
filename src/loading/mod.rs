@@ -143,6 +143,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::Phi3VLM => Some(load_phi3_vlm(model_path)?),
         ModelType::Molmo2VLM => Some(load_molmo2_vlm(model_path)?),
         ModelType::MolmoPointVLM => Some(load_molmo_point_vlm(model_path)?),
+        ModelType::NemotronHNanoOmniVLM => Some(load_nemotron_h_nano_omni_vlm(model_path)?),
         _ => None,
     })
 }
