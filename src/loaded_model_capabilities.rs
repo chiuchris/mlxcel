@@ -40,6 +40,8 @@ pub enum VlmRuntimeRef<'a> {
     MolmoPoint(&'a vision::MolmoPointVLModel),
     /// Nemotron H Nano Omni vision runtime (issue #554, vision-only scope).
     NemotronHNanoOmni(&'a vision::NemotronHNanoOmniVlModel),
+    /// Youtu-VL runtime (issue #555).
+    YoutuVL(&'a vision::YoutuVLModel),
     Standard(&'a vision::VisionModule),
 }
 
@@ -135,6 +137,7 @@ impl LoadedModel {
             Self::Molmo2VLM(model) => Some(VlmRuntimeRef::Molmo2(model)),
             Self::MolmoPointVLM(model) => Some(VlmRuntimeRef::MolmoPoint(model)),
             Self::NemotronHNanoOmniVLM(model) => Some(VlmRuntimeRef::NemotronHNanoOmni(model)),
+            Self::YoutuVL(model) => Some(VlmRuntimeRef::YoutuVL(model)),
             Self::Gemma3VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
             Self::Llama4VLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),
             Self::LlavaVLM(vlm) => Some(VlmRuntimeRef::Standard(&vlm.vision)),

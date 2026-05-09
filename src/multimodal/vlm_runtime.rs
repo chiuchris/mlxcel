@@ -35,6 +35,7 @@ use crate::vision::feature_cache::{CacheKey, ModelVisionCaches, image_hash_from_
 use crate::vision::merge::InputEmbeddings;
 use crate::vision::processors::ImageProcessor;
 use crate::vlm_prompt::{ImageTokenBlockStats, apply_image_token_blocks};
+use crate::youtu_vl_prompt::insert_youtu_vl_image_tokens;
 use crate::{LoadedModel, VlmRuntimeRef};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +91,10 @@ pub enum VlmPreparationSummary {
     NemotronHNanoOmni {
         image_slots: usize,
         total_tokens: usize,
+    },
+    YoutuVL {
+        image_blocks: usize,
+        total_image_tokens: i32,
     },
     ImageBlocks(ImageTokenBlockStats),
 }
@@ -593,6 +598,44 @@ where
                     image_slots: processed_images.len(),
                     total_tokens: prompt_tokens.len(),
                 }),
+            }))
+        }
+        VlmRuntimeRef::YoutuVL(youtu) => {
+            // Preprocess images into the flattened-patch + spatial_shapes
+            // contract that Youtu-VL's vision tower expects.
+            let (pixel_values, spatial_shapes) = youtu.processor.preprocess_with_spatial(images);
+
+            // Splice image-token runs into the prompt when they aren't already
+            // present. We mirror the upstream `<vision_start> + image*N +
+            // <vision_end>` framing.
+            let preparation = insert_youtu_vl_image_tokens(
+                prompt_tokens,
+                &spatial_shapes,
+                youtu.spatial_merge_size,
+                youtu.vision_start_token_id,
+                youtu.vision_end_token_id,
+                youtu.image_token_id,
+            )
+            .map(|stats| VlmPreparationSummary::YoutuVL {
+                image_blocks: stats.image_blocks,
+                total_image_tokens: stats.total_image_tokens,
+            });
+
+            // Drop any opportunistic cache wiring for now — Youtu-VL processes
+            // every image's pixels in one tower call, but we can revisit later
+            // to avoid recomputation across multi-turn requests sharing the
+            // same image set. Skipping the cache here keeps the first
+            // integration small and easy to validate.
+            let _ = active_caches;
+            let _ = image_cache_keys;
+
+            let input_ids_arr = prompt_ids_array(prompt_tokens);
+            let embeddings =
+                youtu.get_input_embeddings(&input_ids_arr, &pixel_values, &spatial_shapes);
+
+            Ok(Some(PreparedVlmEmbeddings {
+                embeddings,
+                preparation,
             }))
         }
         VlmRuntimeRef::Standard(vision_module) => {

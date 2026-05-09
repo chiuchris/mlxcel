@@ -52,6 +52,7 @@ pub mod qwen2_vl;
 pub mod qwen3_5_vl;
 pub mod qwen3_vl;
 pub mod qwen3_vl_moe;
+pub mod youtu_vl;
 
 // Re-export VLM model types
 pub use gemma3n_vl::Gemma3nVLModel;
@@ -69,6 +70,7 @@ pub use qwen2_vl::Qwen2VLModel;
 pub use qwen3_5_vl::Qwen35VLModel;
 pub use qwen3_vl::Qwen3VLModel;
 pub use qwen3_vl_moe::Qwen3VLMoeModel;
+pub use youtu_vl::YoutuVLModel;
 
 use crate::LanguageModel;
 use connectors::MultiModalConnector;

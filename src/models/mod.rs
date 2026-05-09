@@ -99,6 +99,7 @@ pub mod solar_open;
 pub mod stablelm;
 pub mod starcoder2;
 pub mod step3p5;
+pub mod youtu_vl_lm;
 
 // Re-export model types
 pub use baichuan::BaichuanModel;
@@ -212,6 +213,7 @@ pub enum ModelType {
     Qwen25VL,      // Qwen2.5-VL (windowed ViT + Qwen2 w/ MRoPE)
     Qwen3VL,       // Qwen3-VL (ViT + interleaved MRoPE + DeepStack)
     Qwen3VLMoe,    // Qwen3-VL-MoE (Qwen3-VL + MoE text backbone)
+    YoutuVLM,      // Youtu-VL (SigLIP2 windowed-attn + DeepSeek-V3-style MLA)
     MiniCPMOVLM,   // MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)
     Moondream3VLM, // Moondream3 (custom ViT + custom text decoder, query/caption image path)
     Gemma3n,       // Gemma 3n (text-only)

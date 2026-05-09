@@ -27,6 +27,7 @@ pub mod phi4_siglip;
 pub mod phi4mm;
 pub mod qwen2_vl;
 pub mod siglip;
+pub mod youtu_vl;
 
 use mlxcel_core::{MlxArray, UniquePtr};
 

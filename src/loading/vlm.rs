@@ -51,6 +51,8 @@ mod qwen;
 mod siglip;
 #[path = "vlm_special.rs"]
 mod special;
+#[path = "vlm_youtu_vl.rs"]
+mod youtu_vl_loader;
 
 pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm, load_gemma4_vlm};
 pub(crate) use llava::{load_llava_bunny_vlm, load_llava_vlm};
@@ -65,6 +67,7 @@ pub(crate) use special::{
     load_llama4_vlm, load_minicpmo_vlm, load_molmo_point_vlm, load_molmo2_vlm, load_moondream3_vlm,
     load_phi3_vlm, load_phi4_siglip_vlm, load_phi4mm_vlm,
 };
+pub(crate) use youtu_vl_loader::load_youtu_vl_vlm;
 
 fn read_sanitized_vlm_config(model_path: &Path) -> Result<(String, Value)> {
     let config_path = model_path.join("config.json");

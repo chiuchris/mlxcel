@@ -44,6 +44,7 @@ pub mod qwen_vl;
 pub mod video;
 pub mod vlm_prompt;
 pub mod vlm_runtime;
+pub mod youtu_vl_prompt;
 
 #[cfg(test)]
 #[path = "moondream3_prompt_tests.rs"]

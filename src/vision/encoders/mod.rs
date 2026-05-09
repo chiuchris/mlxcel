@@ -30,6 +30,7 @@ pub mod qwen2_5_vl;
 pub mod qwen2_vl;
 pub mod qwen3_vl;
 pub mod siglip;
+pub mod youtu_vl;
 
 use mlxcel_core::{MlxArray, UniquePtr};
 
