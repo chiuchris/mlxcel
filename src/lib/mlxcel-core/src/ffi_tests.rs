@@ -101,6 +101,126 @@ fn test_fast_rope_batched_matches_per_sequence_offsets() {
     assert!(item_bool(&close));
 }
 
+/// Uniform-batch fast path (issue #556 / mlx-vlm PR #1055): when every
+/// row shares the same RoPE offset, `fast_rope_batched` collapses to a
+/// single full-batch `fast_rope` call. The collapsed result must be
+/// bit-equivalent (within float tolerance) to the per-row slice / concat
+/// reference, otherwise the optimization would silently corrupt RoPE.
+#[test]
+fn test_fast_rope_batched_uniform_offsets_match_per_row_path() {
+    let x = from_slice_f32(
+        &[
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, //
+            16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0,
+        ],
+        &[3, 1, 2, 4],
+    );
+
+    // All three rows share offset = 5. The optimized path takes a single
+    // full-batch dispatch.
+    let actual = fast_rope_batched(&x, 4, false, 10000.0, 1.0, &[5, 5, 5]);
+
+    // The reference is the literal per-row slice / concat path with the
+    // same uniform offset, which is what the optimization replaces.
+    let first = slice(&x, &[0, 0, 0, 0], &[1, i32::MAX, i32::MAX, i32::MAX]);
+    let first = fast_rope(&first, 4, false, 10000.0, 1.0, 5);
+    let second = slice(&x, &[1, 0, 0, 0], &[2, i32::MAX, i32::MAX, i32::MAX]);
+    let second = fast_rope(&second, 4, false, 10000.0, 1.0, 5);
+    let third = slice(&x, &[2, 0, 0, 0], &[3, i32::MAX, i32::MAX, i32::MAX]);
+    let third = fast_rope(&third, 4, false, 10000.0, 1.0, 5);
+    let expected = concatenate(&first, &second, 0);
+    let expected = concatenate(&expected, &third, 0);
+
+    eval(&actual);
+    eval(&expected);
+    let close = allclose(&actual, &expected, 1e-5, 1e-5);
+    eval(&close);
+    assert!(
+        item_bool(&close),
+        "uniform-batch RoPE fast path must match per-row reference"
+    );
+}
+
+/// The single-row case (`batch == 1`) is its own branch in
+/// `fast_rope_batched` and must not be regressed by the uniform-batch
+/// fast-path addition. Keep an explicit test so any future refactor of
+/// the dispatch logic notices if the single-row early-out is broken.
+#[test]
+fn test_fast_rope_batched_single_row_matches_scalar_fast_rope() {
+    let x = from_slice_f32(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0], &[1, 1, 2, 4]);
+    let actual = fast_rope_batched(&x, 4, false, 10000.0, 1.0, &[7]);
+    let expected = fast_rope(&x, 4, false, 10000.0, 1.0, 7);
+
+    eval(&actual);
+    eval(&expected);
+    let close = allclose(&actual, &expected, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
+/// Mixed offsets must still take the per-row slice / concat path.
+/// Asserts no behavioral regression on the heterogeneous branch the
+/// uniform-batch optimization left untouched.
+#[test]
+fn test_fast_rope_batched_mixed_offsets_take_per_row_path() {
+    let x = from_slice_f32(
+        &[
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, //
+            16.0, 17.0, 18.0, 19.0, 20.0, 21.0, 22.0, 23.0,
+        ],
+        &[3, 1, 2, 4],
+    );
+
+    let actual = fast_rope_batched(&x, 4, false, 10000.0, 1.0, &[2, 5, 11]);
+
+    let first = slice(&x, &[0, 0, 0, 0], &[1, i32::MAX, i32::MAX, i32::MAX]);
+    let first = fast_rope(&first, 4, false, 10000.0, 1.0, 2);
+    let second = slice(&x, &[1, 0, 0, 0], &[2, i32::MAX, i32::MAX, i32::MAX]);
+    let second = fast_rope(&second, 4, false, 10000.0, 1.0, 5);
+    let third = slice(&x, &[2, 0, 0, 0], &[3, i32::MAX, i32::MAX, i32::MAX]);
+    let third = fast_rope(&third, 4, false, 10000.0, 1.0, 11);
+    let expected = concatenate(&first, &second, 0);
+    let expected = concatenate(&expected, &third, 0);
+
+    eval(&actual);
+    eval(&expected);
+    let close = allclose(&actual, &expected, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
+/// Defensive: confirm uniform-with-zero is still treated as a uniform
+/// batch and matches the per-row reference. The all-zero offsets case
+/// is the most common at the very first decode step (no prior tokens
+/// generated yet) and would silently slow down every step if the
+/// optimization regressed on `offset == 0`.
+#[test]
+fn test_fast_rope_batched_uniform_zero_offsets_match_per_row_path() {
+    let x = from_slice_f32(
+        &[
+            0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, //
+            8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0,
+        ],
+        &[2, 1, 2, 4],
+    );
+
+    let actual = fast_rope_batched(&x, 4, false, 10000.0, 1.0, &[0, 0]);
+
+    let first = slice(&x, &[0, 0, 0, 0], &[1, i32::MAX, i32::MAX, i32::MAX]);
+    let first = fast_rope(&first, 4, false, 10000.0, 1.0, 0);
+    let second = slice(&x, &[1, 0, 0, 0], &[2, i32::MAX, i32::MAX, i32::MAX]);
+    let second = fast_rope(&second, 4, false, 10000.0, 1.0, 0);
+    let expected = concatenate(&first, &second, 0);
+
+    eval(&actual);
+    eval(&expected);
+    let close = allclose(&actual, &expected, 1e-5, 1e-5);
+    eval(&close);
+    assert!(item_bool(&close));
+}
+
 #[test]
 fn test_paged_decode_attention_dense_compat_matches_fallback() {
     let q = from_slice_f32(&[1.0, 0.5, 0.25, 1.25], &[2, 1, 1, 2]);

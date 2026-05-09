@@ -26,11 +26,52 @@ struct MlxStream {
     explicit MlxStream(mlx::core::Stream s) : inner(s) {}
 };
 
+// Opaque wrapper for mlx::core::ThreadLocalStream.
+//
+// A `ThreadLocalStream` is a stream-like handle whose physical
+// `mlx::core::Stream` is resolved per-thread on demand via
+// `mlx::core::stream_from_thread_local_stream`. Holding the same handle
+// across threads gives every thread its own dedicated MLX stream
+// without any explicit coordination between them. Used by
+// `mlxcel-core` to back the generation stream of `BatchScheduler`,
+// `CxxGenerator`, and `SpeculativeGenerator` (issue #556 / upstream
+// MLX commit `728fab1` in mlx-vlm PR #1050).
+struct MlxThreadLocalStream {
+    mlx::core::ThreadLocalStream inner;
+
+    explicit MlxThreadLocalStream(mlx::core::ThreadLocalStream s) : inner(s) {}
+};
+
 
 // Stream functions.
 std::unique_ptr<MlxStream> default_stream();
 std::unique_ptr<MlxStream> new_stream_on_device(bool gpu);
 void synchronize_stream(const MlxStream& stream);
+
+// Thread-local stream factory bound to the GPU device.
+//
+// The returned handle is safe to share across threads: each calling
+// thread sees its own per-thread MLX stream when it calls
+// `stream_from_thread_local_stream`. Used by the generation stream
+// owners so that decoding and synchronization always happen on the
+// same per-thread stream, even if the owner is later moved between
+// threads.
+std::unique_ptr<MlxThreadLocalStream> new_thread_local_stream_gpu();
+
+// Resolve the calling thread's `MlxStream` from a thread-local handle.
+//
+// Each calling thread receives its own `mlx::core::Stream` for the
+// device the handle was created on. The same handle returns the same
+// per-thread stream across calls on that thread.
+std::unique_ptr<MlxStream> stream_from_thread_local_stream(const MlxThreadLocalStream& tls);
+
+// Synchronize the calling thread's stream associated with this handle.
+//
+// Equivalent to resolving the handle and calling `synchronize_stream`,
+// but goes through MLX's `synchronize(ThreadLocalStream)` overload so
+// that synchronization is bound to the same per-thread stream that
+// dispatched the work.
+void synchronize_thread_local_stream(const MlxThreadLocalStream& tls);
 
 // Array factory functions.
 // Create array filled with zeros

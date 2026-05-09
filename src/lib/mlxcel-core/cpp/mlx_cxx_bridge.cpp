@@ -109,6 +109,28 @@ void synchronize_stream(const MlxStream& stream) {
     mlx::core::synchronize(stream.inner);
 }
 
+// Thread-local stream surface (issue #556 / mlx-vlm PR #1050).
+//
+// Each `ThreadLocalStream` registers a TLS slot keyed by a stream
+// index. When a different thread first calls
+// `stream_from_thread_local_stream` with the same handle, MLX
+// transparently allocates a dedicated `Stream` for that thread on the
+// same device. Synchronization through `synchronize(ThreadLocalStream)`
+// targets the calling thread's resolved stream — exactly what the
+// generation stream owners want so dispatch and sync stay paired.
+std::unique_ptr<MlxThreadLocalStream> new_thread_local_stream_gpu() {
+    return std::make_unique<MlxThreadLocalStream>(
+        mlx::core::new_thread_local_stream(mlx::core::Device::gpu));
+}
+
+std::unique_ptr<MlxStream> stream_from_thread_local_stream(const MlxThreadLocalStream& tls) {
+    return std::make_unique<MlxStream>(mlx::core::stream_from_thread_local_stream(tls.inner));
+}
+
+void synchronize_thread_local_stream(const MlxThreadLocalStream& tls) {
+    mlx::core::synchronize(tls.inner);
+}
+
 // Array factory functions.
 std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype) {
     return std::make_unique<MlxArray>(mlx::core::zeros(to_shape(shape), to_dtype(dtype)));

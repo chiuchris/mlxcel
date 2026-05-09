@@ -30,6 +30,14 @@ mod ffi {
         /// Opaque wrapper for mlx::core::Stream
         type MlxStream;
 
+        /// Opaque wrapper for mlx::core::ThreadLocalStream.
+        ///
+        /// Holds a TLS handle that resolves to a per-thread `MlxStream`
+        /// on demand. Used by the generation stream owners (issue
+        /// #556) so dispatch and synchronization stay on the same
+        /// per-thread stream.
+        type MlxThreadLocalStream;
+
         // Stream functions.
         /// Get the default stream
         fn default_stream() -> UniquePtr<MlxStream>;
@@ -39,6 +47,18 @@ mod ffi {
 
         /// Synchronize a stream
         fn synchronize_stream(stream: &MlxStream);
+
+        /// Create a new thread-local stream bound to the GPU device.
+        ///
+        /// The returned handle is safe to share across threads — each
+        /// thread gets its own `MlxStream` on first resolution.
+        fn new_thread_local_stream_gpu() -> UniquePtr<MlxThreadLocalStream>;
+
+        /// Resolve the calling thread's `MlxStream` from a TLS handle.
+        fn stream_from_thread_local_stream(tls: &MlxThreadLocalStream) -> UniquePtr<MlxStream>;
+
+        /// Synchronize the calling thread's stream for this TLS handle.
+        fn synchronize_thread_local_stream(tls: &MlxThreadLocalStream);
 
         // Array factory functions.
         /// Create array filled with zeros
@@ -2199,6 +2219,21 @@ fn use_bool_causal_mask_path() -> bool {
 /// the batch dimension and reuses MLX's scalar-offset fast kernel for each
 /// sequence, then concatenates the results back together.
 ///
+/// Uniform-batch fast path (issue #556 / upstream `mlx-vlm` PR #1055): when
+/// every row in `offsets` has the same value, the helper bypasses the
+/// per-row slice / concat loop and dispatches a single
+/// `fast_rope(x, ..., offsets[0])` call over the whole batch. RoPE is
+/// applied along the last (head) dimension and `mlx::core::fast::rope`'s
+/// scalar-offset overload broadcasts the same offset to every leading axis,
+/// so this is bit-equivalent to the per-row path while saving `(batch - 1)`
+/// `slice` calls and `(batch - 1)` `concatenate` calls. Mixed-offset batches
+/// continue to take the original per-row path. The collapse is purely
+/// per-call: it never caches a "the batch is uniform" assumption across
+/// decode steps, so a future step with non-uniform offsets transparently
+/// falls back to per-row dispatch (compare with the explicit per-row state
+/// invariant on [`crate::cache::BatchedAttentionMetadata`], which exists to
+/// prevent shape-changing storage state across batch grow / shrink).
+///
 /// Used by: Llama3 batched decode, Qwen3 batched decode
 pub fn fast_rope_batched(
     x: &MlxArray,
@@ -2223,6 +2258,17 @@ pub fn fast_rope_batched(
     }
     if batch == 1 {
         return ffi::fast_rope(x, dims, traditional, base, scale, offsets[0]);
+    }
+
+    // Uniform-batch fast path: every row sees the same offset. Dispatch a
+    // single RoPE on the full batch and skip the slice / concat loop.
+    // `offsets.iter().all(...)` short-circuits, so the check itself is
+    // O(batch) integer comparisons — negligible compared to the
+    // `(batch - 1)` graph-node allocations the loop would otherwise
+    // perform.
+    let first_offset = offsets[0];
+    if offsets[1..].iter().all(|&o| o == first_offset) {
+        return ffi::fast_rope(x, dims, traditional, base, scale, first_offset);
     }
 
     let rank = shape.len();

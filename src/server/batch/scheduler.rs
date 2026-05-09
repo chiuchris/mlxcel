@@ -44,9 +44,11 @@ use mlxcel_core::generation_policy::{
 };
 use mlxcel_core::hardware;
 use mlxcel_core::sampling::{TokenBiasMap, compute_logprobs, sample_token_optimized};
-use mlxcel_core::streams::{install_default_stream, new_generation_stream};
+use mlxcel_core::streams::{
+    install_thread_local_default_stream, new_thread_local_generation_stream,
+};
 use mlxcel_core::utils::{align_to_na_tile, create_padded_prefill_mask};
-use mlxcel_core::{MlxStream, UniquePtr};
+use mlxcel_core::{MlxThreadLocalStream, UniquePtr};
 
 use crate::LoadedModel;
 use crate::server::ServerGenerateOptions;
@@ -120,7 +122,15 @@ pub struct BatchScheduler {
     tokenizer: MlxcelTokenizer,
 
     // -- Generation infrastructure --
-    generation_stream: Option<UniquePtr<MlxStream>>,
+    //
+    // Thread-local generation stream owned by this scheduler. The TLS
+    // handle resolves to a per-thread `MlxStream` on demand, which
+    // keeps dispatch and synchronization paired on the same thread even
+    // if construction and execution happen on different threads.
+    // Currently constructed and run on the same thread; the TLS design
+    // leaves room to separate them in the future if needed.
+    // See `mlxcel_core::streams` and issue #556.
+    generation_stream: Option<UniquePtr<MlxThreadLocalStream>>,
 
     // -- Request channel --
     request_rx: mpsc::Receiver<ModelRequest>,
@@ -290,7 +300,7 @@ impl BatchScheduler {
         max_batch_prefill: usize,
         decode_storage_backend: DecodeStorageBackend,
     ) -> Self {
-        let generation_stream = new_generation_stream();
+        let generation_stream = new_thread_local_generation_stream();
         let max_batch_size = max_batch_size.max(1);
         let effective_decode_storage = effective_decode_storage_backend(
             decode_storage_backend,
@@ -758,7 +768,7 @@ impl BatchScheduler {
 
     /// Run the scheduler loop until shutdown or channel close.
     pub fn run(&mut self) {
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         loop {
             // 1. Non-blocking drain of all pending requests

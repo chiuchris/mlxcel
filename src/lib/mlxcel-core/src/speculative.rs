@@ -29,13 +29,13 @@
 //!    d. Continue from the divergence point
 
 use crate::ffi;
-use crate::ffi::MlxStream;
+use crate::ffi::MlxThreadLocalStream;
 use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
 use crate::generation_policy::{initial_token_history, merged_eos_token_ids};
 use crate::hardware;
 use crate::layers::KVCache;
 use crate::sampling::{sample_token_optimized, TokenBiasMap};
-use crate::streams::{install_default_stream, new_generation_stream};
+use crate::streams::{install_thread_local_default_stream, new_thread_local_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::borrow::Cow;
@@ -58,7 +58,12 @@ pub struct SpeculativeGenerator {
     main_caches: Vec<KVCache>,
     draft_caches: Vec<KVCache>,
     generated_tokens: Vec<i32>,
-    generation_stream: Option<UniquePtr<MlxStream>>,
+    /// Thread-local generation stream — see `mlxcel_core::streams`
+    /// (issue #556). Resolves to a per-thread `MlxStream` on the
+    /// worker thread that calls `generate`, so dispatch and
+    /// synchronization stay paired even when the generator is moved
+    /// across threads after construction.
+    generation_stream: Option<UniquePtr<MlxThreadLocalStream>>,
     /// Cached per-generator `TokenBiasMap` resolved from a `LangBiasConfig`.
     ///
     /// **Axis B invariant**: the bias is applied **only** to the target
@@ -78,7 +83,7 @@ impl SpeculativeGenerator {
             main_caches: (0..main_num_layers).map(|_| KVCache::new()).collect(),
             draft_caches: (0..draft_num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
-            generation_stream: new_generation_stream(),
+            generation_stream: new_thread_local_generation_stream(),
             token_bias: TokenBiasMap::default(),
         }
     }
@@ -175,7 +180,7 @@ impl SpeculativeGenerator {
         let draft_sampling: &SamplingConfig = self.draft_sampling(sampling);
 
         // Set generation stream
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         // History + EOS handling inherit the caller's policy; history-based
         // penalties apply to both models so we read flags from the caller's

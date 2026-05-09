@@ -28,14 +28,14 @@ use std::borrow::Cow;
 
 use crate::cache::{CachePool, KVCacheMode, SequenceId};
 use crate::ffi;
-use crate::ffi::{MlxArray, MlxStream};
+use crate::ffi::{MlxArray, MlxThreadLocalStream};
 use crate::generation_policy::{
     ensure_model_caches, initial_token_history, merged_eos_token_ids, seed_rng_if_needed,
 };
 use crate::hardware;
 use crate::layers::KVCache;
 use crate::sampling::{sample_token_optimized, TokenBiasMap};
-use crate::streams::{install_default_stream, new_generation_stream};
+use crate::streams::{install_thread_local_default_stream, new_thread_local_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 
@@ -580,8 +580,15 @@ impl GenerationStats {
 pub struct CxxGenerator {
     caches: Vec<KVCache>,
     generated_tokens: Vec<i32>,
-    /// Dedicated generation stream for pipelining
-    generation_stream: Option<UniquePtr<MlxStream>>,
+    /// Dedicated thread-local generation stream for pipelining.
+    ///
+    /// The TLS handle resolves to a per-thread `MlxStream` on demand
+    /// when the generator first dispatches work on a worker thread.
+    /// This keeps dispatch and synchronization paired even if the
+    /// generator is constructed on one thread (e.g. the request
+    /// dispatcher) and run on another (e.g. the model worker), per
+    /// upstream `mlx-vlm` PR #1050 / mlxcel issue #556.
+    generation_stream: Option<UniquePtr<MlxThreadLocalStream>>,
     /// KV cache quantization mode applied to all layer caches.
     /// Default: `KVCacheMode::Fp16` (no quantization).
     kv_cache_mode: KVCacheMode,
@@ -606,7 +613,7 @@ impl CxxGenerator {
         Self {
             caches: (0..num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
-            generation_stream: new_generation_stream(),
+            generation_stream: new_thread_local_generation_stream(),
             kv_cache_mode: KVCacheMode::Fp16,
             token_bias: TokenBiasMap::default(),
         }
@@ -636,7 +643,7 @@ impl CxxGenerator {
                 .map(KVCache::new_with_mode)
                 .collect(),
             generated_tokens: Vec::new(),
-            generation_stream: new_generation_stream(),
+            generation_stream: new_thread_local_generation_stream(),
             kv_cache_mode,
             token_bias: TokenBiasMap::default(),
         }
@@ -830,7 +837,7 @@ impl CxxGenerator {
         self.apply_kv_cache_mode_with_boundary_policy();
 
         // Set generation stream as default for better pipelining
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         // Get EOS tokens for this model
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -1091,7 +1098,7 @@ impl CxxGenerator {
         // at FP16 to recover the V-quantization quality gap.
         self.apply_kv_cache_mode_with_boundary_policy();
 
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
 
@@ -1235,7 +1242,7 @@ impl CxxGenerator {
         // nominal mode to per-layer caches: the first/last N layers stay
         // at FP16 to recover the V-quantization quality gap.
         self.apply_kv_cache_mode_with_boundary_policy();
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
         let needs_history = sampling.needs_token_history();
@@ -1389,7 +1396,7 @@ impl CxxGenerator {
         self.apply_kv_cache_mode_with_boundary_policy();
 
         // Set generation stream as default for better pipelining
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         // Get EOS tokens for this model
         let eos_tokens = merged_eos_token_ids(model.eos_token_ids(), &sampling.stop_token_ids);
@@ -1563,7 +1570,7 @@ impl CxxGenerator {
         // `reset_with_model` so models with internal sliding/SSM caches are
         // also cleared — matches the reset behaviour of `generate_*` paths.
         self.reset_with_model(model);
-        install_default_stream(self.generation_stream.as_ref());
+        install_thread_local_default_stream(self.generation_stream.as_ref());
 
         // Single forward over the full window. We do not pad: tile alignment
         // is a decode optimisation that complicates the position→target
