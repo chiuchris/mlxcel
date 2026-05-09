@@ -1169,6 +1169,24 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     let batch_metrics = Arc::new(BatchMetrics::new());
     let batch_observability = Arc::new(BatchObservability::new());
 
+    // Issue #552: hybrid SSM / linear-attention models cannot use APC because
+    // their recurrent state cannot be reconstructed from a token-prefix hash.
+    // Detect by reading model_type / architectures from config.json and
+    // force-disable APC at runtime (the whole-prefix prompt cache is still
+    // safe and stays enabled).
+    if config.prompt_cache.apc.enabled
+        && let Ok(Some(family)) =
+            crate::server::prompt_cache::detect_hybrid_ssm_from_path(&startup.model_path)
+    {
+        tracing::warn!(
+            model_type = %family,
+            "Detected hybrid SSM / linear-attention model family ({family}); \
+             auto-disabling APC because recurrent state cannot decompose \
+             into hashable blocks. Whole-prefix prompt cache is unaffected."
+        );
+        config.prompt_cache.apc.enabled = false;
+    }
+
     // Cross-request prompt-prefix KV cache store (epic #416 / issue #419).
     // Gated on the config flag so a disabled policy reserves zero memory.
     // Issue #423: wire BatchMetrics into the store so hits/misses/evictions
@@ -1186,7 +1204,10 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
             max_entries = config.prompt_cache.max_entries,
             ttl_seconds = config.prompt_cache.ttl.as_secs(),
             min_prefix_tokens = config.prompt_cache.min_prefix_tokens,
-            "Prompt-prefix KV cache store enabled (epic #416 / issue #419)"
+            apc_enabled = config.prompt_cache.apc.enabled,
+            apc_block_size = config.prompt_cache.apc.block_size,
+            apc_hash = %config.prompt_cache.apc.hash,
+            "Prompt-prefix KV cache store enabled (epic #416 / issue #419 + APC #552)"
         );
         Some(store)
     } else {

@@ -96,6 +96,11 @@ pub fn create_app(state: AppState) -> Router {
         .route("/v1/chat/completions", post(routes::chat_completions))
         .route("/v1/completions", post(routes::completions))
         .route("/v1/models", get(routes::list_models))
+        // Issue #552: prompt-cache observability endpoints (always mounted —
+        // the handlers return a stable "disabled" payload when the cache is
+        // off so monitoring clients can poll without conditional logic).
+        .route("/v1/cache/stats", get(routes::cache_stats))
+        .route("/v1/cache/reset", post(routes::cache_reset))
         // Aliases (some clients use these)
         .route("/chat/completions", post(routes::chat_completions))
         .route("/completions", post(routes::completions))

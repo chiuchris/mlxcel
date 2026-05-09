@@ -20,13 +20,14 @@ use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::{DownloadArgs, DownloadOptions, download_repo};
 use mlxcel::lang_bias::LangBiasCliArgs;
 use mlxcel::server::{
-    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
-    env_fallback_chat_template_kwargs, env_fallback_kv_bits, env_fallback_kv_group_size,
-    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
-    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
-    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
-    env_fallback_reasoning_budget, start_server,
+    ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
+    env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_cache_type_k,
+    env_fallback_cache_type_v, env_fallback_chat_template_kwargs, env_fallback_kv_bits,
+    env_fallback_kv_group_size, env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer,
+    env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
+    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
+    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, start_server,
 };
 
 /// mlxcel-server: llama-server compatible HTTP server for MLX inference
@@ -743,6 +744,45 @@ struct ServerArgs {
     /// CLI flag takes precedence.
     #[arg(long = "prompt-cache-min-prefix", value_name = "N")]
     prompt_cache_min_prefix: Option<usize>,
+
+    // Issue #552: Automatic Prefix Caching (APC) knobs.
+    /// Enable Automatic Prefix Caching (APC) with block-granularity hash chains
+    /// (default: false).
+    ///
+    /// APC layers on top of the existing prompt-prefix cache to enable
+    /// finer-grained KV reuse with chained `(parent_hash, tokens, extra_hash)`
+    /// per block. When enabled on a hybrid SSM/attention model (jamba, mamba,
+    /// mamba2, nemotron_h, gated_delta, kimi_linear, qwen3_next), APC is
+    /// automatically disabled at runtime since SSM state cannot be decomposed
+    /// into hashable blocks.
+    ///
+    /// Also reads `APC_ENABLED` (parity with upstream `mlx-vlm`).
+    #[arg(long = "apc-enabled", default_value_t = false, value_name = "BOOL")]
+    apc_enabled: bool,
+
+    /// Tokens per APC block (default: 16).
+    ///
+    /// Smaller values increase reuse granularity at the cost of per-block
+    /// hashing overhead. Also reads `APC_BLOCK_SIZE`.
+    #[arg(long = "apc-block-size", value_name = "N")]
+    apc_block_size: Option<usize>,
+
+    /// Maximum number of APC block entries to track. `None` falls back to
+    /// the heuristic derived from `--prompt-cache-max-entries`.
+    ///
+    /// Also reads `APC_NUM_BLOCKS`.
+    #[arg(long = "apc-num-blocks", value_name = "N")]
+    apc_num_blocks: Option<usize>,
+
+    /// APC hash algorithm (default: `sha256`).
+    ///
+    /// Accepted values: `sha256`, `blake3`. SHA-256 is the default for
+    /// wire-compatibility with upstream APC artifacts; BLAKE3 is faster but
+    /// not wire-compatible.
+    ///
+    /// Also reads `APC_HASH`.
+    #[arg(long = "apc-hash", value_name = "ALGO")]
+    apc_hash: Option<String>,
 }
 
 #[tokio::main]
@@ -803,6 +843,13 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
     env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
     env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
+
+    // Issue #552 — env-var fallbacks for the APC knobs (parity with upstream
+    // mlx-vlm `APC_*` env vars).
+    env_fallback_apc_enabled(&mut args.apc_enabled, false);
+    env_fallback_apc_block_size(&mut args.apc_block_size);
+    env_fallback_apc_num_blocks(&mut args.apc_num_blocks);
+    env_fallback_apc_hash(&mut args.apc_hash);
 
     // Issue #484 (B11): env-var fallbacks for KV cache type split flags.
     // LLAMA_ARG_CACHE_TYPE_K / LLAMA_ARG_CACHE_TYPE_V are the canonical env
@@ -932,6 +979,11 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         prompt_cache_max_entries: args.prompt_cache_max_entries,
         prompt_cache_ttl_seconds: args.prompt_cache_ttl,
         prompt_cache_min_prefix: args.prompt_cache_min_prefix,
+        // Issue #552: APC knobs already resolved via env-var fallbacks above.
+        apc_enabled: args.apc_enabled,
+        apc_block_size: args.apc_block_size,
+        apc_num_blocks: args.apc_num_blocks,
+        apc_hash: args.apc_hash,
         // Issue #484 (B11): KV cache type split flags already resolved via
         // env-var fallbacks (and clap `env = "..."`) above.
         cache_type_k: args.turbo.cache_type_k,

@@ -37,7 +37,10 @@
 //! [`super::state::AppState`] and [`super::model_provider::ModelProvider`].
 //! When disabled the store slot stays `None` so no memory is reserved.
 
+mod apc_lookup;
+pub mod block_hash;
 pub mod entry;
+pub mod hybrid_ssm;
 pub mod key;
 mod lookup;
 pub mod metrics;
@@ -47,15 +50,25 @@ mod trie;
 mod types;
 
 #[cfg(test)]
+mod apc_integration_tests;
+#[cfg(test)]
 mod prefix_matcher_tests;
 
+pub use apc_lookup::ApcStoreStats;
+pub use block_hash::{
+    ApcBlockHash, ApcHashAlgo, BlockHashChain, DEFAULT_APC_BLOCK_SIZE, ParseApcHashError,
+};
 pub use entry::CacheEntry;
+pub use hybrid_ssm::{
+    HYBRID_SSM_MODEL_TYPES, detect_hybrid_ssm, detect_hybrid_ssm_from_path,
+    is_hybrid_ssm_model_type,
+};
 pub use key::{
     ANONYMOUS_SESSION_SENTINEL, MultimodalDigest, PromptCacheKey, PromptCacheKeyDigest,
     multimodal_digest, multimodal_digest_from_vecs, resolve_session_key, template_sig,
     tools_digest,
 };
 pub use metrics::{AtomicPromptCacheMetrics, NoopPromptCacheMetrics, PromptCacheMetrics};
-pub use policy::{PromptCacheConfig, PromptCacheStats};
+pub use policy::{ApcConfig, PromptCacheConfig, PromptCacheStats};
 pub use store::PromptCacheStore;
 pub use types::{BucketKey, InsertError};

@@ -260,6 +260,30 @@ pub struct ServerStartupInput {
     /// Also accepts `MLXCEL_PROMPT_CACHE_MIN_PREFIX`.
     pub prompt_cache_min_prefix: Option<usize>,
 
+    // Issue #552: Automatic Prefix Caching (APC) knobs.
+    //
+    // APC layers block-granularity hash chains on top of the existing
+    // prompt-prefix cache so finer-grained reuse becomes possible. The
+    // raw fields here are normalised into [`super::prompt_cache::ApcConfig`]
+    // by [`build_prompt_cache_config`].
+    /// `--apc-enabled`: master switch for APC. Defaults to `false` so
+    /// behaviour matches the pre-#552 server. Also accepts
+    /// `APC_ENABLED` (parity with upstream `mlx-vlm`).
+    pub apc_enabled: bool,
+
+    /// `--apc-block-size`: tokens per APC block. `None` means "use the
+    /// compiled-in default (16)". Also accepts `APC_BLOCK_SIZE`.
+    pub apc_block_size: Option<usize>,
+
+    /// `--apc-num-blocks`: optional hard cap on the number of APC block
+    /// entries. `None` falls back to the heuristic derived from
+    /// `prompt_cache_max_entries`. Also accepts `APC_NUM_BLOCKS`.
+    pub apc_num_blocks: Option<usize>,
+
+    /// `--apc-hash`: hash algorithm name. `None` means "use the
+    /// compiled-in default (sha256)". Also accepts `APC_HASH`.
+    pub apc_hash: Option<String>,
+
     // Issue #545: continuous-batching KV quantization knobs.
     //
     // These mirror the upstream `mlx-vlm` PR #1030 server CLI flags. The
@@ -328,13 +352,19 @@ impl ServerStartupInput {
                 .map_err(|e| anyhow::anyhow!("--chat-template-kwargs: {e}"))?;
         // Issue #424: build PromptCacheConfig from raw CLI/env-resolved values.
         // Any field left at `None` picks up the compiled-in default.
+        // Issue #552: layer APC config on top.
         let prompt_cache = build_prompt_cache_config(
             self.prompt_cache_enabled,
             self.prompt_cache_capacity_bytes,
             self.prompt_cache_max_entries,
             self.prompt_cache_ttl_seconds,
             self.prompt_cache_min_prefix,
-        );
+            self.apc_enabled,
+            self.apc_block_size,
+            self.apc_num_blocks,
+            self.apc_hash.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("--apc-hash: {e}"))?;
 
         // Issue #484 (B11): resolve the effective KV cache mode from split flags,
         // legacy shorthand, or the default (FP16).
@@ -785,22 +815,48 @@ pub fn resolve_seed(seed: i64) -> Option<u64> {
 ///
 /// `None` for any numeric field falls back to the compiled-in default from
 /// [`crate::server::prompt_cache::PromptCacheConfig::default`].
+///
+/// Issue #552: also accepts the APC knobs (`apc_enabled`, `apc_block_size`,
+/// `apc_num_blocks`, `apc_hash`) and assembles them into the
+/// [`crate::server::prompt_cache::ApcConfig`] sub-struct. Returns an error
+/// when `apc_hash` is supplied but cannot be parsed.
 pub(super) fn build_prompt_cache_config(
     enabled: bool,
     capacity_bytes: Option<usize>,
     max_entries: Option<usize>,
     ttl_seconds: Option<u64>,
     min_prefix: Option<usize>,
-) -> crate::server::prompt_cache::PromptCacheConfig {
-    use crate::server::prompt_cache::PromptCacheConfig;
+    apc_enabled: bool,
+    apc_block_size: Option<usize>,
+    apc_num_blocks: Option<usize>,
+    apc_hash: Option<&str>,
+) -> Result<crate::server::prompt_cache::PromptCacheConfig, String> {
+    use crate::server::prompt_cache::{ApcConfig, ApcHashAlgo, PromptCacheConfig};
     let defaults = PromptCacheConfig::default();
-    PromptCacheConfig::new(
+    let apc_defaults = ApcConfig::default();
+
+    let hash = match apc_hash {
+        Some(s) => s.parse::<ApcHashAlgo>().map_err(|e| e.to_string())?,
+        None => apc_defaults.hash,
+    };
+
+    let apc = ApcConfig {
+        enabled: apc_enabled,
+        block_size: apc_block_size.unwrap_or(apc_defaults.block_size),
+        num_blocks: apc_num_blocks,
+        hash,
+    };
+
+    let cfg = PromptCacheConfig::new(
         enabled,
         capacity_bytes.unwrap_or(defaults.capacity_bytes),
         max_entries.unwrap_or(defaults.max_entries),
         std::time::Duration::from_secs(ttl_seconds.unwrap_or(defaults.ttl.as_secs())),
         min_prefix.unwrap_or(defaults.min_prefix_tokens),
     )
+    .with_apc(apc);
+
+    Ok(cfg)
 }
 
 /// Apply `MLXCEL_PROMPT_CACHE_ENABLED` and the llama.cpp-compat
@@ -917,6 +973,61 @@ pub fn env_fallback_prompt_cache_min_prefix(value: &mut Option<usize>) {
         "MLXCEL_PROMPT_CACHE_MIN_PREFIX",
         "prompt-cache-min-prefix",
     );
+}
+
+// ── Issue #552 — Automatic Prefix Caching env-var fallbacks ─────────────────
+//
+// Mirrors the upstream `mlx-vlm` env-var surface (`APC_ENABLED`,
+// `APC_BLOCK_SIZE`, `APC_NUM_BLOCKS`, `APC_HASH`) so operators migrating from
+// upstream can keep their existing env files. Each helper follows the same
+// CLI-beats-env precedence as the prompt-cache fallbacks: the CLI flag is
+// authoritative when set, the env var is consulted only when the CLI is at
+// its default. Unparseable values are warn-logged and ignored.
+
+/// Apply `APC_ENABLED` env var fallback to the raw `--apc-enabled` value.
+///
+/// `cli_was_set` must be `true` when clap explicitly received the flag (i.e.
+/// the operator typed `--apc-enabled=true|false`); a default `false` from
+/// clap should be reported as `cli_was_set = false` so a `true` env value
+/// can still take effect.
+pub fn env_fallback_apc_enabled(enabled: &mut bool, cli_was_set: bool) {
+    const KEY: &str = "APC_ENABLED";
+    if cli_was_set {
+        if std::env::var_os(KEY).is_some() {
+            tracing::info!("{KEY} env var is set but --apc-enabled CLI flag takes precedence");
+        }
+        return;
+    }
+    if let Ok(raw) = std::env::var(KEY) {
+        match parse_env_bool(&raw) {
+            Some(v) => *enabled = v,
+            None => tracing::warn!(
+                "{KEY} has unparseable value {:?}; ignoring (expected true/false/1/0)",
+                raw
+            ),
+        }
+    }
+}
+
+/// Apply `APC_BLOCK_SIZE` env var fallback to the raw `--apc-block-size` value.
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_apc_block_size(value: &mut Option<usize>) {
+    apply_optional_usize_env_fallback(value, "APC_BLOCK_SIZE", "apc-block-size");
+}
+
+/// Apply `APC_NUM_BLOCKS` env var fallback to the raw `--apc-num-blocks` value.
+///
+/// CLI flag beats env var. Unparseable env values are warn-logged and ignored.
+pub fn env_fallback_apc_num_blocks(value: &mut Option<usize>) {
+    apply_optional_usize_env_fallback(value, "APC_NUM_BLOCKS", "apc-num-blocks");
+}
+
+/// Apply `APC_HASH` env var fallback to the raw `--apc-hash` value.
+///
+/// CLI flag beats env var. Empty / whitespace-only env values are skipped.
+pub fn env_fallback_apc_hash(value: &mut Option<String>) {
+    apply_optional_string_env_fallback(value, "APC_HASH", "apc-hash");
 }
 
 /// Shared helper for `Option<usize>` env-var fallbacks.

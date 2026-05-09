@@ -831,6 +831,44 @@ pub(crate) struct ServeArgs {
     /// Also reads `MLXCEL_PROMPT_CACHE_MIN_PREFIX` when the CLI flag is absent.
     #[arg(long = "prompt-cache-min-prefix", value_name = "N")]
     prompt_cache_min_prefix: Option<usize>,
+
+    // Issue #552: Automatic Prefix Caching (APC) knobs.
+    /// Enable Automatic Prefix Caching (APC) with block-granularity hash chains
+    /// (default: false).
+    ///
+    /// APC layers on top of the existing prompt-prefix cache to enable
+    /// finer-grained KV reuse. When enabled on a hybrid SSM/attention model
+    /// (jamba, mamba, mamba2, nemotron_h, gated_delta, kimi_linear,
+    /// qwen3_next), APC is automatically disabled at runtime since SSM
+    /// state cannot be decomposed into hashable blocks.
+    ///
+    /// Also reads `APC_ENABLED` (parity with upstream `mlx-vlm`).
+    #[arg(long = "apc-enabled", default_value_t = false, value_name = "BOOL")]
+    apc_enabled: bool,
+
+    /// Tokens per APC block (default: 16).
+    ///
+    /// Smaller values increase reuse granularity at the cost of per-block
+    /// hashing overhead. Also reads `APC_BLOCK_SIZE`.
+    #[arg(long = "apc-block-size", value_name = "N")]
+    apc_block_size: Option<usize>,
+
+    /// Maximum number of APC block entries to track. `None` falls back to
+    /// the heuristic derived from `--prompt-cache-max-entries`.
+    ///
+    /// Also reads `APC_NUM_BLOCKS`.
+    #[arg(long = "apc-num-blocks", value_name = "N")]
+    apc_num_blocks: Option<usize>,
+
+    /// APC hash algorithm (default: `sha256`).
+    ///
+    /// Accepted values: `sha256`, `blake3`. SHA-256 is the default for
+    /// wire-compatibility with upstream APC artifacts; BLAKE3 is faster but
+    /// not wire-compatible.
+    ///
+    /// Also reads `APC_HASH`.
+    #[arg(long = "apc-hash", value_name = "ALGO")]
+    apc_hash: Option<String>,
 }
 
 fn main() -> anyhow::Result<()> {

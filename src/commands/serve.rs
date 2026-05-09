@@ -20,13 +20,14 @@
 //! on schema and routing.
 
 use mlxcel::server::{
-    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
-    env_fallback_chat_template_kwargs, env_fallback_kv_bits, env_fallback_kv_group_size,
-    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
-    env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
-    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
-    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
-    env_fallback_reasoning_budget, start_server,
+    ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
+    env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_cache_type_k,
+    env_fallback_cache_type_v, env_fallback_chat_template_kwargs, env_fallback_kv_bits,
+    env_fallback_kv_group_size, env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer,
+    env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
+    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
+    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
+    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, start_server,
 };
 
 /// Run the `mlxcel serve` subcommand.
@@ -63,6 +64,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_prompt_cache_max_entries(&mut args.prompt_cache_max_entries);
     env_fallback_prompt_cache_ttl(&mut args.prompt_cache_ttl);
     env_fallback_prompt_cache_min_prefix(&mut args.prompt_cache_min_prefix);
+    // Issue #552 — env-var fallbacks for the APC knobs.
+    env_fallback_apc_enabled(&mut args.apc_enabled, false);
+    env_fallback_apc_block_size(&mut args.apc_block_size);
+    env_fallback_apc_num_blocks(&mut args.apc_num_blocks);
+    env_fallback_apc_hash(&mut args.apc_hash);
     // Issue #484 (B11): env-var fallbacks for KV cache type split flags.
     // The clap `env = "..."` attribute already reads these env vars; the
     // explicit calls below maintain the warn-on-conflict pattern used by
@@ -171,6 +177,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         prompt_cache_max_entries: args.prompt_cache_max_entries,
         prompt_cache_ttl_seconds: args.prompt_cache_ttl,
         prompt_cache_min_prefix: args.prompt_cache_min_prefix,
+        // Issue #552: APC knobs already resolved via env-var fallbacks above.
+        apc_enabled: args.apc_enabled,
+        apc_block_size: args.apc_block_size,
+        apc_num_blocks: args.apc_num_blocks,
+        apc_hash: args.apc_hash,
         // Issue #484 (B11): KV cache type split flags already resolved via
         // env-var fallbacks (and clap `env = "..."`) above.
         cache_type_k: args.turbo.cache_type_k,

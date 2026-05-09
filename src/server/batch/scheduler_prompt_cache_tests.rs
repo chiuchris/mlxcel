@@ -57,13 +57,13 @@ fn fake_entry(tokens: Vec<i32>, size_bytes: usize) -> CacheEntry {
 }
 
 fn test_store() -> Arc<PromptCacheStore> {
-    Arc::new(PromptCacheStore::with_config(PromptCacheConfig {
-        enabled: true,
-        capacity_bytes: 128 * 1024,
-        max_entries: 32,
-        ttl: Duration::from_secs(60),
-        min_prefix_tokens: 4,
-    }))
+    Arc::new(PromptCacheStore::with_config(PromptCacheConfig::new(
+        true,
+        128 * 1024,
+        32,
+        Duration::from_secs(60),
+        4,
+    )))
 }
 
 fn make_key<'a>(
@@ -229,13 +229,13 @@ fn oversized_entry_records_reject_counter() {
     // Build a store with a 1-byte capacity so any real entry is
     // oversized. The scheduler mirrors this via
     // `record_prompt_cache_insert_reject()` in its insert-error branch.
-    let store = Arc::new(PromptCacheStore::with_config(PromptCacheConfig {
-        enabled: true,
-        capacity_bytes: 1,
-        max_entries: 32,
-        ttl: Duration::from_secs(60),
-        min_prefix_tokens: 4,
-    }));
+    let store = Arc::new(PromptCacheStore::with_config(PromptCacheConfig::new(
+        true,
+        1,
+        32,
+        Duration::from_secs(60),
+        4,
+    )));
     let tokens: Vec<i32> = (1..=16).collect();
     let entry = CacheEntry::new_for_test(tokens.clone(), 4096); // 4 KiB > 1 byte
     let key = make_key("m", "s", "t", &tokens);

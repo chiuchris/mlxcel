@@ -41,13 +41,14 @@ pub use chat_template_kwargs::{
     env_fallback_chat_template_kwargs,
 };
 pub use cli_input::{
-    ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v, env_fallback_kv_bits,
-    env_fallback_kv_group_size, env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer,
-    env_fallback_lang_bias, env_fallback_lang_bias_include_byte_fragments,
-    env_fallback_prompt_cache_capacity_bytes, env_fallback_prompt_cache_enabled,
-    env_fallback_prompt_cache_max_entries, env_fallback_prompt_cache_min_prefix,
-    env_fallback_prompt_cache_ttl, env_fallback_reasoning_budget, resolve_batch_kv_quant_config,
-    resolve_kv_cache_mode,
+    ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
+    env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_cache_type_k,
+    env_fallback_cache_type_v, env_fallback_kv_bits, env_fallback_kv_group_size,
+    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, env_fallback_lang_bias,
+    env_fallback_lang_bias_include_byte_fragments, env_fallback_prompt_cache_capacity_bytes,
+    env_fallback_prompt_cache_enabled, env_fallback_prompt_cache_max_entries,
+    env_fallback_prompt_cache_min_prefix, env_fallback_prompt_cache_ttl,
+    env_fallback_reasoning_budget, resolve_batch_kv_quant_config, resolve_kv_cache_mode,
 };
 pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
@@ -55,8 +56,10 @@ pub use config::{
 };
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use prompt_cache::{
-    CacheEntry, InsertError as PromptCacheInsertError, MultimodalDigest, PromptCacheConfig,
-    PromptCacheKey, PromptCacheStats, PromptCacheStore, multimodal_digest,
+    ApcBlockHash, ApcConfig, ApcHashAlgo, BlockHashChain, CacheEntry, DEFAULT_APC_BLOCK_SIZE,
+    HYBRID_SSM_MODEL_TYPES, InsertError as PromptCacheInsertError, MultimodalDigest,
+    PromptCacheConfig, PromptCacheKey, PromptCacheStats, PromptCacheStore, detect_hybrid_ssm,
+    detect_hybrid_ssm_from_path, is_hybrid_ssm_model_type, multimodal_digest,
     multimodal_digest_from_vecs,
 };
 pub use startup::{ServerStartupConfig, start_server};

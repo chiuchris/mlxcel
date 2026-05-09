@@ -24,6 +24,8 @@ use std::time::Instant;
 
 use mlxcel_core::cache::DetachedCacheSet;
 
+use super::block_hash::ApcBlockHash;
+
 /// Send/Sync holder for a [`DetachedCacheSet`].
 ///
 /// The upstream type wraps `cxx::UniquePtr<MlxArray>` which is neither
@@ -83,11 +85,19 @@ unsafe impl Sync for DetachedHolder {}
 ///   by the LRU / TTL policy).
 /// * `size_bytes` — cached byte footprint at insert time. We snapshot this
 ///   once instead of recomputing on every eviction pass.
+/// * `apc_block_hashes` — Automatic Prefix Caching (APC, issue #552)
+///   block-granularity hash chain over `tokens`. Populated only when APC
+///   is enabled at insert time; `None` otherwise. The chain is computed
+///   from `tokens`, the configured block size, the configured hash algo,
+///   and the request's `MultimodalDigest`. Used by lookup paths to
+///   verify block-level prefix consistency in addition to the existing
+///   trie/scan candidate selection.
 pub struct CacheEntry {
     pub tokens: Vec<i32>,
     pub(crate) detached: Mutex<DetachedHolder>,
     pub last_used: Mutex<Instant>,
     pub size_bytes: usize,
+    pub apc_block_hashes: Option<Vec<ApcBlockHash>>,
 }
 
 impl CacheEntry {
@@ -96,6 +106,10 @@ impl CacheEntry {
     /// `size_bytes` is captured from [`DetachedCacheSet::nbytes`] so the
     /// store's byte-budget accounting is consistent even if the underlying
     /// tensors are later adopted out of the entry.
+    ///
+    /// The APC block-hash chain is left unset; callers that have APC
+    /// enabled should attach it via [`CacheEntry::with_apc_block_hashes`]
+    /// before inserting into the store.
     pub fn new(tokens: Vec<i32>, detached: DetachedCacheSet) -> Self {
         let size_bytes = detached.nbytes();
         Self {
@@ -103,7 +117,31 @@ impl CacheEntry {
             detached: Mutex::new(DetachedHolder::new(detached)),
             last_used: Mutex::new(Instant::now()),
             size_bytes,
+            apc_block_hashes: None,
         }
+    }
+
+    /// Builder-style: attach an APC block-hash chain to this entry.
+    ///
+    /// Returns `self` so callers can chain `.with_apc_block_hashes(..)`
+    /// after [`CacheEntry::new`]. The store calls this internally during
+    /// `insert` when APC is enabled, so most callers do not need to invoke
+    /// it directly.
+    #[must_use]
+    pub fn with_apc_block_hashes(mut self, hashes: Vec<ApcBlockHash>) -> Self {
+        self.apc_block_hashes = Some(hashes);
+        self
+    }
+
+    /// Read the APC block-hash chain attached to this entry, if any.
+    ///
+    /// Returns `Some(&[ApcBlockHash])` when APC was enabled at insert time
+    /// and the entry was constructed with a populated chain; `None`
+    /// otherwise. Callers that depend on APC behaviour should treat
+    /// `None` as "APC was not active for this entry" and fall back to
+    /// the existing whole-prefix matcher.
+    pub fn apc_block_hashes(&self) -> Option<&[ApcBlockHash]> {
+        self.apc_block_hashes.as_deref()
     }
 
     /// Take ownership of the detached cache set for adopt. Returns `None`
@@ -158,6 +196,11 @@ impl CacheEntry {
     /// Test-only constructor that fabricates a zero-tensor detached set and
     /// overrides the reported `size_bytes`. This lets unit tests exercise
     /// budget / LRU paths without allocating real MLX buffers.
+    ///
+    /// The APC block-hash chain is left unset. Tests that want to populate
+    /// it explicitly can chain [`CacheEntry::with_apc_block_hashes`] on
+    /// the returned value, but the store path itself attaches the chain
+    /// during `insert` so most tests do not need to.
     pub(crate) fn new_for_test(tokens: Vec<i32>, size_bytes: usize) -> Self {
         use mlxcel_core::cache::SequenceId;
         let now = Instant::now();
@@ -175,6 +218,7 @@ impl CacheEntry {
             detached: Mutex::new(DetachedHolder::new(detached)),
             last_used: Mutex::new(Instant::now()),
             size_bytes,
+            apc_block_hashes: None,
         }
     }
 }
@@ -185,6 +229,10 @@ impl std::fmt::Debug for CacheEntry {
             .field("tokens_len", &self.tokens.len())
             .field("size_bytes", &self.size_bytes)
             .field("has_detached", &self.has_detached())
+            .field(
+                "apc_blocks",
+                &self.apc_block_hashes.as_ref().map(|h| h.len()),
+            )
             .finish()
     }
 }

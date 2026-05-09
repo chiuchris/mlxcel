@@ -113,6 +113,11 @@ fn sample_input() -> ServerStartupInput {
         prompt_cache_max_entries: None,
         prompt_cache_ttl_seconds: None,
         prompt_cache_min_prefix: None,
+        // Issue #552: APC knobs — disabled by default.
+        apc_enabled: false,
+        apc_block_size: None,
+        apc_num_blocks: None,
+        apc_hash: None,
         // Issue #484 (B11): KV cache type split flags — default to None (FP16).
         cache_type_k: None,
         cache_type_v: None,

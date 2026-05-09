@@ -28,6 +28,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
+use super::apc_lookup::{ApcStoreStats, apc_consistent_prefix_len};
+use super::block_hash::{ApcBlockHash, BlockHashChain};
 use super::entry::CacheEntry;
 use super::key::{PromptCacheKey, PromptCacheKeyDigest};
 use super::metrics::{NoopPromptCacheMetrics, PromptCacheMetrics};
@@ -293,9 +295,61 @@ impl PromptCacheStore {
         self.inner.read().map(|g| g.stats()).unwrap_or_default()
     }
 
+    /// Snapshot of APC-specific aggregate statistics across all live
+    /// entries.
+    ///
+    /// Walks every entry under the read lock and reports:
+    ///
+    /// - `total_blocks_stored` — sum of per-entry APC chain lengths.
+    /// - `unique_block_hashes` — number of distinct block hashes across
+    ///   all entries (deduplication potential metric).
+    /// - `apc_active_entries` — number of entries that actually carry an
+    ///   APC chain. When APC is disabled at the store level, this is
+    ///   always `0` because `insert` does not populate the chain.
+    ///
+    /// The walk is `O(N * B)` in entry count `N` and average chain length
+    /// `B`, so the call is meant for periodic monitoring rather than the
+    /// per-request hot path.
+    pub fn apc_stats(&self) -> ApcStoreStats {
+        let guard = match self.inner.read() {
+            Ok(g) => g,
+            Err(_) => return ApcStoreStats::default(),
+        };
+        if !guard.config.apc_enabled() {
+            return ApcStoreStats::default();
+        }
+        let mut total_blocks_stored = 0usize;
+        let mut apc_active_entries = 0usize;
+        // Collecting into a HashSet preserves the dedup-potential metric:
+        // identical block hashes from different entries collapse to a
+        // single set member.
+        let mut unique: std::collections::HashSet<ApcBlockHash> = std::collections::HashSet::new();
+        for slot in guard.entries.values() {
+            if let Some(hashes) = slot.entry.apc_block_hashes() {
+                apc_active_entries += 1;
+                total_blocks_stored += hashes.len();
+                unique.extend(hashes.iter().copied());
+            }
+        }
+        ApcStoreStats {
+            total_blocks_stored,
+            unique_block_hashes: unique.len(),
+            apc_active_entries,
+        }
+    }
+
     /// Insert an entry. Evicts older entries as needed to satisfy the
     /// entry-count and byte-budget caps. Returns [`InsertError`] if the
     /// store is disabled or if the single entry is too large to ever fit.
+    ///
+    /// When Automatic Prefix Caching (APC, issue #552) is enabled on this
+    /// store, the entry's APC block-hash chain is computed during insert
+    /// from the entry's tokens, the configured block size, the configured
+    /// hash algo, and the request's `MultimodalDigest` (carried by `key`).
+    /// The chain is attached to the entry before it lands in the store so
+    /// subsequent lookups can verify block-level prefix consistency. When
+    /// APC is disabled, no extra work is performed and the entry's
+    /// `apc_block_hashes` field stays `None`.
     pub fn insert(&self, key: &PromptCacheKey<'_>, entry: CacheEntry) -> Result<(), InsertError> {
         let digest = key.digest();
         let entry_bytes = entry.size_bytes;
@@ -334,6 +388,25 @@ impl PromptCacheStore {
             // Treat replacement as an LRU eviction for accounting purposes.
             guard.evictions_lru = guard.evictions_lru.saturating_add(1);
         }
+
+        // APC integration (issue #552): when APC is on, fold the block-hash
+        // chain into the entry. The chain is computed against the entry's
+        // own token prefix and the request's mm_digest (carried by `key`),
+        // so two entries with identical tokens but different multimodal
+        // payloads — should they ever land in the same bucket — diverge on
+        // every block hash and lookup-time block verification will reject
+        // the cross-payload candidate.
+        let entry = if guard.config.apc_enabled() {
+            let chain = BlockHashChain::compute(
+                &entry.tokens,
+                guard.config.apc.block_size,
+                guard.config.apc.hash,
+                key.mm_digest.as_bytes(),
+            );
+            entry.with_apc_block_hashes(chain.hashes)
+        } else {
+            entry
+        };
 
         // Speculatively account for the new bytes, then evict as needed.
         guard.total_bytes = guard.total_bytes.saturating_add(entry_bytes);
@@ -381,6 +454,21 @@ impl PromptCacheStore {
     ///
     /// Underlying lookup uses the per-`(model, lora, template)` radix
     /// trie from [`super::trie::RadixTrie`]: `O(L)` in the matched depth.
+    ///
+    /// When Automatic Prefix Caching (APC, issue #552) is enabled, the
+    /// candidate selected by the trie / scan tier is additionally
+    /// verified against the request's APC block-hash chain. The chain is
+    /// computed from the request's tokens with the same block size, hash
+    /// algo, and `extra_hash` (the request's `MultimodalDigest`) used at
+    /// insert time. For each full block in the candidate's matched
+    /// prefix, the candidate's stored block hash must equal the request's
+    /// block hash; otherwise the matched length is truncated to the last
+    /// consistent block boundary. If after truncation the matched length
+    /// drops below `min_prefix_tokens`, the lookup is reported as a miss.
+    /// This gives APC its core safety property: a candidate cannot be
+    /// adopted unless every covered block hashes identically on both
+    /// sides (text *and* multimodal content). When APC is disabled the
+    /// fast path is unchanged and no block hashes are touched.
     pub fn lookup_longest_prefix(
         &self,
         key: &PromptCacheKey<'_>,
@@ -428,9 +516,24 @@ impl PromptCacheStore {
             guard.lookups = guard.lookups.saturating_add(1);
             match best {
                 Some(winner) => {
-                    guard.hits = guard.hits.saturating_add(1);
-                    let slot = match guard.entries.get(&winner.digest) {
-                        Some(s) => s,
+                    // Snapshot every value we need from the entry slot up
+                    // front so we can drop the immutable borrow of
+                    // `guard.entries` before mutating `guard.hits`. The APC
+                    // block-hash clone only happens when APC is actually
+                    // enabled, keeping the disabled path allocation-free.
+                    let apc_on = guard.config.apc_enabled();
+                    let block_size = guard.config.apc.block_size;
+                    let hash_algo = guard.config.apc.hash;
+                    let min_prefix = guard.config.min_prefix_tokens;
+                    let (entry_arc, entry_apc_hashes) = match guard.entries.get(&winner.digest) {
+                        Some(s) => {
+                            let hashes = if apc_on {
+                                s.entry.apc_block_hashes().map(|h| h.to_vec())
+                            } else {
+                                None
+                            };
+                            (Arc::clone(&s.entry), hashes)
+                        }
                         None => {
                             drop(guard);
                             let metrics = Arc::clone(&self.metrics);
@@ -438,9 +541,43 @@ impl PromptCacheStore {
                             return None;
                         }
                     };
-                    slot.entry.touch();
-                    let entry = Arc::clone(&slot.entry);
-                    (Some(entry), winner.matched)
+
+                    // APC block-hash verification. When APC is on AND the
+                    // candidate has a stored chain, recompute the request's
+                    // chain on-demand and clamp `matched_len` to the last
+                    // block boundary where both chains agree. This is the
+                    // load-bearing safety property of APC: identical token
+                    // prefixes with different multimodal payloads diverge
+                    // on every block, so even if a candidate slipped
+                    // through bucket isolation it cannot be adopted across
+                    // payloads.
+                    let apc_matched = if apc_on && let Some(hashes) = entry_apc_hashes.as_deref() {
+                        apc_consistent_prefix_len(
+                            tokens,
+                            hashes,
+                            block_size,
+                            hash_algo,
+                            key.mm_digest.as_bytes(),
+                            winner.matched,
+                        )
+                    } else {
+                        winner.matched
+                    };
+
+                    if apc_matched < min_prefix {
+                        // The block-hash check truncated past the minimum
+                        // useful prefix. Treat as a miss so the caller does
+                        // not adopt a partial cache for fewer tokens than
+                        // the configured threshold.
+                        drop(guard);
+                        let metrics = Arc::clone(&self.metrics);
+                        metrics.record_lookup(false, 0);
+                        return None;
+                    }
+
+                    guard.hits = guard.hits.saturating_add(1);
+                    entry_arc.touch();
+                    (Some(entry_arc), apc_matched)
                 }
                 None => (None, 0),
             }

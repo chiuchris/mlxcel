@@ -110,6 +110,10 @@ fn sample_args() -> crate::ServeArgs {
         prompt_cache_max_entries: None,
         prompt_cache_ttl: None,
         prompt_cache_min_prefix: None,
+        apc_enabled: false,
+        apc_block_size: None,
+        apc_num_blocks: None,
+        apc_hash: None,
     }
 }
 

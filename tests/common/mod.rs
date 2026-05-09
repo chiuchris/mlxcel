@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+#[allow(dead_code)]
 pub fn repo_model_dir(name: &str) -> PathBuf {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let primary = manifest_dir.join("models").join(name);
