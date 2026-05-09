@@ -50,7 +50,7 @@ VLM_MODE=0
 OUTPUT=""
 SUFFIX=""
 DATE=$(date '+%Y-%m-%d')
-MLX_VERSION="0.31.1"
+MLX_VERSION="0.31.2"
 BUILD_TYPE="release"
 
 # Thermal cooldown between models. Defaults to 0 to preserve existing
