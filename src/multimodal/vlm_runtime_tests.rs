@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{VlmPreparationSummary, prepared_embedding_refs, should_prepare_vlm_embeddings};
+use super::{
+    VlmPreparationSummary, expand_gemma4_video_tokens, prepared_embedding_refs,
+    should_prepare_vlm_embeddings,
+};
 use crate::vision::merge::InputEmbeddings;
 use crate::vlm_prompt::{ImageTokenBlockAction, ImageTokenBlockStats};
 use mlxcel_core::{self, UniquePtr, dtype};
@@ -73,4 +76,66 @@ fn prepared_embedding_refs_rejects_null_attention_masks() {
         Err(err) => err.to_string(),
     };
     assert!(err.contains("null 4D attention mask"));
+}
+
+// -- Gemma 4 video token expansion (issue #553) ----------------------
+
+#[test]
+fn expand_gemma4_video_tokens_replaces_explicit_placeholder() {
+    // BOS + video_token + suffix
+    let mut prompt = vec![1, 100, 7];
+    let frames = vec![vec![3, 3]]; // one video, two frames, 3 soft tokens each
+    expand_gemma4_video_tokens(&mut prompt, 100, 200, 201, 202, &frames).unwrap();
+    // Expected:
+    //   BOS=1
+    //   <boi>=201, image=200,200,200, <eoi>=202   (frame 1)
+    //   <boi>=201, image=200,200,200, <eoi>=202   (frame 2)
+    //   suffix=7
+    assert_eq!(
+        prompt,
+        vec![1, 201, 200, 200, 200, 202, 201, 200, 200, 200, 202, 7]
+    );
+}
+
+#[test]
+fn expand_gemma4_video_tokens_inserts_after_bos_when_no_placeholder() {
+    let mut prompt = vec![1, 7, 8];
+    let frames = vec![vec![2]]; // one video, one frame, 2 soft tokens
+    expand_gemma4_video_tokens(&mut prompt, 100, 200, 201, 202, &frames).unwrap();
+    // BOS=1, <boi>=201, image=200,200, <eoi>=202, suffix=7,8
+    assert_eq!(prompt, vec![1, 201, 200, 200, 202, 7, 8]);
+}
+
+#[test]
+fn expand_gemma4_video_tokens_handles_multiple_videos() {
+    let mut prompt = vec![1, 100, 100, 7];
+    // Two videos: 1 frame x 2 tokens, 2 frames x 1 token each.
+    let frames = vec![vec![2], vec![1, 1]];
+    expand_gemma4_video_tokens(&mut prompt, 100, 200, 201, 202, &frames).unwrap();
+    assert_eq!(
+        prompt,
+        vec![
+            1, // BOS
+            201, 200, 200, 202, // video 1 frame 1
+            201, 200, 202, // video 2 frame 1
+            201, 200, 202, // video 2 frame 2
+            7,
+        ]
+    );
+}
+
+#[test]
+fn expand_gemma4_video_tokens_errors_on_count_mismatch() {
+    let mut prompt = vec![1, 100, 100, 7];
+    let frames = vec![vec![2]]; // only one video for two placeholders
+    let err = expand_gemma4_video_tokens(&mut prompt, 100, 200, 201, 202, &frames).unwrap_err();
+    assert!(err.to_string().contains("video placeholder"));
+}
+
+#[test]
+fn expand_gemma4_video_tokens_no_op_when_videos_empty() {
+    let mut prompt = vec![1, 7, 8];
+    let original = prompt.clone();
+    expand_gemma4_video_tokens(&mut prompt, 100, 200, 201, 202, &[]).unwrap();
+    assert_eq!(prompt, original);
 }

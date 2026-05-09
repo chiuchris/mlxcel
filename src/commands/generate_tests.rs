@@ -100,6 +100,8 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             prompt: "Hello".to_string(),
             image: Vec::new(),
             audio: None,
+            video: Vec::new(),
+            fps: 2.0,
             max_tokens: 16,
             profile: false,
             no_chat_template: false,

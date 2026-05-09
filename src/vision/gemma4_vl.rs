@@ -106,6 +106,60 @@ impl Gemma4VLModel {
         self.get_input_embeddings_with_audio_and_cache(input_ids, images, None, None, None, None)
     }
 
+    /// Compute input embeddings from video features (issue #553).
+    ///
+    /// Each [`processors::gemma4::Gemma4VideoFeatures`] supplies one
+    /// `[1, 3, H, W]` tensor per sampled frame. We reuse the existing
+    /// vision tower + multimodal projector by flattening every video's
+    /// frames into a single sequence of [`processors::gemma4::Gemma4ImageInput`]s
+    /// and dispatching to the per-image embedding path. Optional
+    /// `images` are concatenated *before* video frames so callers that
+    /// mix images and videos in the same prompt see image features
+    /// merged first.
+    ///
+    /// The Gemma 4 chat template emits a sequence of
+    /// `boi + image_token*N + eoi` blocks for each frame; the
+    /// `image_token_id`-driven `merge::merge_llava` step then scatters
+    /// per-frame features into those token slots.
+    pub fn get_input_embeddings_with_videos(
+        &self,
+        input_ids: &MlxArray,
+        images: &[processors::gemma4::Gemma4ImageInput],
+        videos: &[processors::gemma4::Gemma4VideoFeatures],
+    ) -> merge::InputEmbeddings {
+        if videos.is_empty() {
+            return self.get_input_embeddings_with_audio_and_cache(
+                input_ids, images, None, None, None, None,
+            );
+        }
+
+        // Lower videos to per-frame Gemma4ImageInput entries so the
+        // existing per-image path handles them. Each frame becomes its
+        // own (1, 3, H, W) tensor that the vision tower runs
+        // independently — matches the per-frame execution in upstream
+        // mlx-vlm.
+        let total_frames: usize = videos.iter().map(|v| v.num_frames()).sum();
+        let mut combined: Vec<processors::gemma4::Gemma4ImageInput> =
+            Vec::with_capacity(images.len() + total_frames);
+        for image in images {
+            combined.push(processors::gemma4::Gemma4ImageInput {
+                pixel_values: mlxcel_core::copy(image.pixel_values.as_ref().unwrap()),
+                patch_grid: image.patch_grid,
+                num_soft_tokens: image.num_soft_tokens,
+            });
+        }
+        for video in videos {
+            for frame in &video.frames {
+                combined.push(processors::gemma4::Gemma4ImageInput {
+                    pixel_values: mlxcel_core::copy(frame.pixel_values.as_ref().unwrap()),
+                    patch_grid: frame.patch_grid,
+                    num_soft_tokens: frame.num_soft_tokens,
+                });
+            }
+        }
+        self.get_input_embeddings_with_audio_and_cache(input_ids, &combined, None, None, None, None)
+    }
+
     /// Compute input embeddings with both vision and audio features.
     pub fn get_input_embeddings_with_audio(
         &self,

@@ -19,13 +19,172 @@
 //! async so local file reads and remote URL fetches do not block Axum workers.
 
 use base64::Engine;
-use std::{path::Path, sync::OnceLock, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Duration,
+};
 
 use super::types::ChatCompletionRequest;
-use super::types::request::InputAudio;
+use super::types::request::{InputAudio, VideoUrl};
 
 pub(crate) async fn extract_chat_image_data(request: &ChatCompletionRequest) -> Vec<Vec<u8>> {
     collect_image_data(request.image_urls()).await
+}
+
+/// Resolve `video_url` content blocks from a chat request to local file
+/// paths (issue #553). For `file://` and bare local paths the path is
+/// returned as-is. For `data:video/...;base64,...` and `http(s)://` we
+/// materialise the bytes to a temporary file because `ffmpeg` needs an
+/// on-disk handle. Returned `(PathBuf, Option<f64>)` tuples carry the
+/// optional per-video FPS override from [`VideoUrl::fps`].
+///
+/// Caller is responsible for deleting any temp files (returned paths
+/// outside `std::env::temp_dir()` were supplied directly by the user
+/// and must NOT be deleted).
+///
+/// This helper is currently invoked only by tests. The chat-request
+/// handler wiring that drives video frames through the VLM runtime is
+/// tracked as a follow-up; the helper sits here so the schema-side
+/// support is complete and the integration step in a later PR has a
+/// drop-in extraction utility.
+#[allow(dead_code)]
+pub(crate) async fn extract_chat_video_paths(
+    request: &ChatCompletionRequest,
+) -> Vec<(PathBuf, Option<f64>)> {
+    let mut paths = Vec::new();
+    for video in request.video_urls() {
+        if let Some(path) = resolve_video_url(&video).await {
+            paths.push((path, video.fps));
+        }
+    }
+    paths
+}
+
+#[allow(dead_code)]
+async fn resolve_video_url(video: &VideoUrl) -> Option<PathBuf> {
+    let url = &video.url;
+
+    if url.starts_with("data:video/") {
+        return decode_video_data_uri(url).await;
+    }
+    if let Some(path) = url.strip_prefix("file://") {
+        let p = Path::new(path).to_path_buf();
+        return p.is_file().then_some(p);
+    }
+    if is_http_url(url) {
+        return fetch_remote_video(url).await;
+    }
+    let path = Path::new(url);
+    if path.is_file() {
+        return Some(path.to_path_buf());
+    }
+    tracing::warn!("Unsupported video URL scheme or missing file: {}", url);
+    None
+}
+
+/// Maximum decoded video payload size: 1 GB. Mirrors the audio cap to
+/// prevent OOM from extremely large base64 attachments.
+#[allow(dead_code)]
+const MAX_VIDEO_PAYLOAD_SIZE: usize = 1024 * 1024 * 1024;
+
+#[allow(dead_code)]
+async fn decode_video_data_uri(url: &str) -> Option<PathBuf> {
+    let Some((metadata, encoded_data)) = url.split_once(',') else {
+        tracing::warn!("Invalid video data URI format");
+        return None;
+    };
+    if !metadata.ends_with(";base64") {
+        tracing::warn!("Unsupported video data URI encoding: {}", metadata);
+        return None;
+    }
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(encoded_data) {
+        Ok(b) => b,
+        Err(err) => {
+            tracing::warn!("Failed to decode base64 video: {}", err);
+            return None;
+        }
+    };
+    if bytes.len() > MAX_VIDEO_PAYLOAD_SIZE {
+        tracing::warn!(
+            "Video payload too large ({} bytes, max {}); rejecting",
+            bytes.len(),
+            MAX_VIDEO_PAYLOAD_SIZE
+        );
+        return None;
+    }
+    write_video_temp_file(&bytes, infer_video_extension(metadata)).await
+}
+
+#[allow(dead_code)]
+async fn fetch_remote_video(url: &str) -> Option<PathBuf> {
+    let response = match http_image_client().get(url).send().await {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!("Failed to fetch video URL {}: {}", url, err);
+            return None;
+        }
+    };
+    let response = match response.error_for_status() {
+        Ok(r) => r,
+        Err(err) => {
+            tracing::warn!("Video URL returned error status {}: {}", url, err);
+            return None;
+        }
+    };
+    let bytes = match response.bytes().await {
+        Ok(b) => b.to_vec(),
+        Err(err) => {
+            tracing::warn!("Failed to read video response body {}: {}", url, err);
+            return None;
+        }
+    };
+    if bytes.len() > MAX_VIDEO_PAYLOAD_SIZE {
+        tracing::warn!(
+            "Remote video too large ({} bytes, max {}); rejecting",
+            bytes.len(),
+            MAX_VIDEO_PAYLOAD_SIZE
+        );
+        return None;
+    }
+    let ext = url
+        .rsplit_once('.')
+        .map(|(_, ext)| ext.split('?').next().unwrap_or(ext).to_string())
+        .unwrap_or_else(|| "mp4".to_string());
+    write_video_temp_file(&bytes, &ext).await
+}
+
+#[allow(dead_code)]
+fn infer_video_extension(metadata: &str) -> &str {
+    if metadata.contains("video/mp4") {
+        "mp4"
+    } else if metadata.contains("video/webm") {
+        "webm"
+    } else if metadata.contains("video/x-matroska") {
+        "mkv"
+    } else if metadata.contains("video/quicktime") {
+        "mov"
+    } else {
+        "mp4"
+    }
+}
+
+#[allow(dead_code)]
+async fn write_video_temp_file(bytes: &[u8], ext: &str) -> Option<PathBuf> {
+    let dir = std::env::temp_dir();
+    let unique = uuid::Uuid::new_v4();
+    let path = dir.join(format!("mlxcel-video-{unique}.{ext}"));
+    match tokio::fs::write(&path, bytes).await {
+        Ok(()) => Some(path),
+        Err(err) => {
+            tracing::warn!(
+                "Failed to write video temp file {}: {}",
+                path.display(),
+                err
+            );
+            None
+        }
+    }
 }
 
 /// Extract raw audio bytes from chat request audio inputs.

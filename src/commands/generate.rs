@@ -170,7 +170,9 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         "CLI pipeline parallelism does not support speculative decoding yet"
     );
     ensure!(
-        args.generation.image.is_empty() && args.generation.audio.is_none(),
+        args.generation.image.is_empty()
+            && args.generation.audio.is_none()
+            && args.generation.video.is_empty(),
         "CLI pipeline parallelism currently supports text-only generation"
     );
     if let Some(spec) = pp.pp_layers.as_deref() {
@@ -888,6 +890,8 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             &prompt,
             &args.generation.image,
             args.generation.audio.as_deref(),
+            &args.generation.video,
+            args.generation.fps,
             &tokenizer,
         )?;
         print_generation_preamble(&args.generation.prompt)?;

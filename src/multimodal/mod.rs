@@ -31,6 +31,7 @@
 //! - `phi3v_prompt`: Phi3V image-tag normalization
 //! - `vlm_prompt`: generic image-token block expansion
 //! - `vlm_runtime`: image preprocessing and embedding preparation shared by CLI/server
+//! - `video`: generic VLM video frame extraction and FPS sampling (issue #553)
 
 pub mod batched_dispatch;
 pub mod gemma4_vl;
@@ -40,6 +41,7 @@ pub mod phi3v_prompt;
 pub mod phi4_siglip_prompt;
 pub mod phi4mm_prompt;
 pub mod qwen_vl;
+pub mod video;
 pub mod vlm_prompt;
 pub mod vlm_runtime;
 

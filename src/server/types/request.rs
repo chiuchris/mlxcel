@@ -150,6 +150,14 @@ pub enum ContentPart {
     /// and `http(s)` URLs)
     #[serde(rename = "image_url")]
     ImageUrl { image_url: ImageUrl },
+    /// Video URL content for VLMs that support video inputs (issue #553).
+    /// Mirrors the `image_url` shape for symmetry. Accepts local paths,
+    /// `file://...`, and (where the model supports it) `http(s)://...`.
+    /// Frame extraction relies on `ffmpeg` being available on the server
+    /// host's PATH; missing `ffmpeg` produces a clean 4xx response rather
+    /// than a crash.
+    #[serde(rename = "video_url")]
+    VideoUrl { video_url: VideoUrl },
     /// Audio input content (base64-encoded audio data)
     #[serde(rename = "input_audio")]
     InputAudio { input_audio: InputAudio },
@@ -161,6 +169,21 @@ pub struct ImageUrl {
     /// URL: `data:image/...;base64,...`, `file://...`, bare local path, or
     /// `http(s)://...`
     pub url: String,
+}
+
+/// Video URL reference (issue #553). Same wire shape as [`ImageUrl`] for
+/// symmetry with the OpenAI vision content blocks.
+///
+/// `fps` is an optional sampling rate. When omitted, the server falls
+/// back to [`mlxcel::video::DEFAULT_FPS`] (2.0 fps).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VideoUrl {
+    /// URL: `data:video/...;base64,...` (where supported), `file://...`,
+    /// bare local path, or `http(s)://...`.
+    pub url: String,
+    /// Optional sampling rate override.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
 }
 
 /// Audio input reference (OpenAI-compatible)
@@ -225,6 +248,20 @@ impl MessageContent {
                 .iter()
                 .filter_map(|p| match p {
                     ContentPart::InputAudio { input_audio } => Some(input_audio.clone()),
+                    _ => None,
+                })
+                .collect(),
+        }
+    }
+
+    /// Extract video URL references from multimodal content (issue #553).
+    pub fn video_urls(&self) -> Vec<VideoUrl> {
+        match self {
+            MessageContent::Text(_) => Vec::new(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::VideoUrl { video_url } => Some(video_url.clone()),
                     _ => None,
                 })
                 .collect(),
@@ -582,6 +619,14 @@ impl ChatCompletionRequest {
         self.messages
             .iter()
             .flat_map(|m| m.content.audio_inputs())
+            .collect()
+    }
+
+    /// Extract all video URL references from messages (issue #553).
+    pub fn video_urls(&self) -> Vec<VideoUrl> {
+        self.messages
+            .iter()
+            .flat_map(|m| m.content.video_urls())
             .collect()
     }
 }

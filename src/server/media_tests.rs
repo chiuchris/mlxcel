@@ -14,7 +14,10 @@
 
 use std::fs;
 
-use super::{collect_image_data, extract_chat_image_data, read_image_url};
+use super::{
+    collect_image_data, extract_chat_image_data, extract_chat_video_paths, read_image_url,
+};
+use crate::server::types::request::VideoUrl;
 use crate::server::types::{
     ChatCompletionRequest, ContentPart, ImageUrl, Message, MessageContent, Role, SamplingParams,
 };
@@ -191,4 +194,56 @@ async fn extract_chat_image_data_collects_images_across_messages() {
 
     let images = extract_chat_image_data(&request).await;
     assert_eq!(images, vec![b"hello".to_vec(), b"world".to_vec()]);
+}
+
+// -- Video URL handling (issue #553) ---------------------------------
+
+#[tokio::test]
+async fn extract_chat_video_paths_resolves_local_path() {
+    let path = std::env::temp_dir().join(format!("mlxcel-video-{}.mp4", uuid::Uuid::new_v4()));
+    fs::write(&path, b"fake-video-bytes").unwrap();
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: path.to_str().unwrap().to_string(),
+            fps: Some(1.5),
+        },
+    }]);
+
+    let paths = extract_chat_video_paths(&request).await;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].0, path);
+    assert_eq!(paths[0].1, Some(1.5));
+
+    fs::remove_file(path).unwrap();
+}
+
+#[tokio::test]
+async fn extract_chat_video_paths_drops_missing_file() {
+    let bogus = std::env::temp_dir().join(format!("mlxcel-missing-{}.mp4", uuid::Uuid::new_v4()));
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: bogus.to_str().unwrap().to_string(),
+            fps: None,
+        },
+    }]);
+    let paths = extract_chat_video_paths(&request).await;
+    assert!(paths.is_empty(), "missing file must produce empty result");
+}
+
+#[tokio::test]
+async fn extract_chat_video_paths_supports_file_url_scheme() {
+    let path =
+        std::env::temp_dir().join(format!("mlxcel-video-fileurl-{}.mp4", uuid::Uuid::new_v4()));
+    fs::write(&path, b"hello").unwrap();
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: format!("file://{}", path.display()),
+            fps: None,
+        },
+    }]);
+    let paths = extract_chat_video_paths(&request).await;
+    assert_eq!(paths.len(), 1);
+    assert_eq!(paths[0].0, path);
+    assert_eq!(paths[0].1, None);
+    fs::remove_file(path).unwrap();
 }

@@ -60,6 +60,15 @@ pub enum VlmPreparationSummary {
         audio_tokens: usize,
         total_tokens: usize,
     },
+    /// Issue #553: Gemma 4 expanded `<|video|>` placeholders for one or
+    /// more decoded videos. `frame_slots` is the total number of frames
+    /// across all videos (each frame consumes
+    /// `boi + image_token * num_soft_tokens_per_frame + eoi`).
+    Gemma4Video {
+        video_count: usize,
+        frame_slots: usize,
+        total_tokens: usize,
+    },
     Phi4MM {
         image_slots: usize,
         total_tokens: usize,
@@ -605,6 +614,88 @@ pub fn expand_gemma4_image_tokens_pub(
         eoi_token_id,
         num_soft_tokens,
     )
+}
+
+/// Expand a Gemma 4 video token placeholder into per-frame
+/// `<boi> image_token * N <eoi>` runs (issue #553).
+///
+/// Mirrors the upstream Python `Gemma4Processor.__call__(videos=...)`
+/// expansion: every `video_token_id` in `prompt_tokens` is replaced by
+/// the concatenation of its corresponding video's frames, where each
+/// frame contributes `<boi>` + `image_token_id × num_soft_tokens_per_frame`
+/// + `<eoi>`.
+///
+/// When the prompt does not contain a `video_token_id` (e.g. the chat
+/// template did not insert one — common for the basic CLI path that
+/// just appends `--video` files), the expansion runs are inserted
+/// after the BOS token, in the same position the image expansion path
+/// uses for fallback insertion.
+///
+/// # Errors
+/// Returns `Err` if the prompt has more `video_token_id` placeholders
+/// than the number of supplied videos.
+pub fn expand_gemma4_video_tokens(
+    prompt_tokens: &mut Vec<i32>,
+    video_token_id: i32,
+    image_token_id: i32,
+    boi_token_id: i32,
+    eoi_token_id: i32,
+    soft_tokens_per_frame_per_video: &[Vec<usize>],
+) -> Result<()> {
+    if prompt_tokens.is_empty() || soft_tokens_per_frame_per_video.is_empty() {
+        return Ok(());
+    }
+
+    let placeholder_count = prompt_tokens
+        .iter()
+        .filter(|&&t| t == video_token_id)
+        .count();
+
+    let build_video_run = |frames: &[usize]| -> Vec<i32> {
+        let total_len: usize = frames.iter().map(|n| n + 2).sum();
+        let mut run = Vec::with_capacity(total_len);
+        for &n in frames {
+            run.push(boi_token_id);
+            run.extend(std::iter::repeat_n(image_token_id, n));
+            run.push(eoi_token_id);
+        }
+        run
+    };
+
+    if placeholder_count > 0 {
+        if placeholder_count != soft_tokens_per_frame_per_video.len() {
+            return Err(anyhow::anyhow!(
+                "Gemma4 prompt has {} video placeholder(s) but {} video(s) were provided",
+                placeholder_count,
+                soft_tokens_per_frame_per_video.len()
+            ));
+        }
+        let mut runs = soft_tokens_per_frame_per_video.iter();
+        let mut expanded = Vec::with_capacity(prompt_tokens.len());
+        for &token in prompt_tokens.iter() {
+            if token == video_token_id {
+                let frames = runs
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("video run iterator drained early"))?;
+                expanded.extend(build_video_run(frames));
+            } else {
+                expanded.push(token);
+            }
+        }
+        *prompt_tokens = expanded;
+        return Ok(());
+    }
+
+    // No placeholder in prompt — splice all video runs in after BOS.
+    let bos = prompt_tokens[0];
+    let rest: Vec<i32> = prompt_tokens[1..].to_vec();
+    let mut expanded = vec![bos];
+    for frames in soft_tokens_per_frame_per_video {
+        expanded.extend(build_video_run(frames));
+    }
+    expanded.extend(rest);
+    *prompt_tokens = expanded;
+    Ok(())
 }
 
 /// Expand audio token placeholder in prompt tokens for server requests.

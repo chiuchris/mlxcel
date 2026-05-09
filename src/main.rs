@@ -130,6 +130,20 @@ pub(crate) struct GenerationOptions {
     #[arg(long, value_name = "PATH")]
     pub(crate) audio: Option<PathBuf>,
 
+    /// Video file paths for VLMs that support video inputs (e.g. Gemma4
+    /// with video). Pass the flag multiple times for multiple videos:
+    /// `--video clip1.mp4 --video clip2.mp4`. Frame extraction requires
+    /// `ffmpeg` on PATH (issue #553).
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub(crate) video: Vec<PathBuf>,
+
+    /// Target sampling FPS for `--video` decoding. Frames are
+    /// uniformly resampled to this rate before being fed to the
+    /// vision tower. Defaults to 2.0 to match the upstream mlx-vlm
+    /// behaviour (issue #553).
+    #[arg(long, value_name = "FLOAT", default_value_t = 2.0)]
+    pub(crate) fps: f64,
+
     /// Maximum number of tokens to generate
     #[arg(short = 'n', long, default_value_t = 100, value_name = "N")]
     pub(crate) max_tokens: usize,

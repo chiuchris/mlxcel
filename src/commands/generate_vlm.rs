@@ -16,6 +16,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use mlxcel::LoadedModel;
+use mlxcel::video;
 use mlxcel::vision::merge::InputEmbeddings;
 use mlxcel::vlm_prompt::ImageTokenBlockAction;
 use mlxcel::vlm_runtime::{VlmPreparationSummary, prepare_and_compute_vlm_embeddings};
@@ -68,6 +69,16 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
             println!(
                 "Gemma4: expanded audio into {} soft tokens ({} total tokens)",
                 audio_tokens, total_tokens
+            );
+        }
+        VlmPreparationSummary::Gemma4Video {
+            video_count,
+            frame_slots,
+            total_tokens,
+        } => {
+            println!(
+                "Gemma4: expanded {} video(s) into {} frame slot(s) ({} total tokens)",
+                video_count, frame_slots, total_tokens
             );
         }
         VlmPreparationSummary::Phi4MM {
@@ -134,8 +145,33 @@ pub(crate) fn compute_vlm_embeddings(
     prompt: &str,
     image_paths: &[PathBuf],
     audio_path: Option<&Path>,
+    video_paths: &[PathBuf],
+    target_fps: f64,
     tokenizer: &MlxcelTokenizer,
 ) -> Result<Option<InputEmbeddings>> {
+    // Handle video-only or video + image mode for Gemma4 (issue #553).
+    // Video and audio cannot coexist in this CLI surface yet — surface a
+    // clean error rather than silently accept one.
+    if !video_paths.is_empty() {
+        if audio_path.is_some() {
+            return Err(anyhow::anyhow!(
+                "Combined --video and --audio inputs are not supported yet"
+            ));
+        }
+        if let LoadedModel::Gemma4VLM(gemma4_vl) = model {
+            return compute_gemma4_video_embeddings(
+                gemma4_vl,
+                prompt_tokens,
+                image_paths,
+                video_paths,
+                target_fps,
+            );
+        }
+        return Err(anyhow::anyhow!(
+            "--video input is currently only supported by Gemma4 VLMs"
+        ));
+    }
+
     // Handle audio-only mode for Gemma4
     if image_paths.is_empty()
         && let Some(audio) = audio_path
@@ -358,6 +394,128 @@ fn compute_gemma4_multimodal_embeddings(
         Some(&audio_features),
         Some(&audio_mask),
     );
+
+    Ok(Some(embeddings))
+}
+
+/// Compute video embeddings (and optional preceding image embeddings)
+/// for the Gemma 4 VLM (issue #553).
+///
+/// Decodes each video via `mlxcel::video::load_video` (subprocess
+/// `ffmpeg`), processes frames through
+/// [`mlxcel::vision::processors::gemma4::Gemma4Processor::process_videos`],
+/// expands `<|video|>` placeholders in the prompt into per-frame
+/// `<boi> image_token*N <eoi>` runs, and dispatches the combined
+/// (images + video frames) tensor through the same vision tower /
+/// multimodal projector path that powers static image inputs.
+fn compute_gemma4_video_embeddings(
+    gemma4_vl: &mlxcel::vision::Gemma4VLModel,
+    prompt_tokens: &mut Vec<i32>,
+    image_paths: &[PathBuf],
+    video_paths: &[PathBuf],
+    target_fps: f64,
+) -> Result<Option<InputEmbeddings>> {
+    if !video::ffmpeg_available() {
+        return Err(anyhow::anyhow!(
+            "Video input requires `ffmpeg` on PATH. Install ffmpeg (e.g. `brew install ffmpeg` \
+             on macOS or `apt install ffmpeg` on Linux) and retry."
+        ));
+    }
+
+    // Decode the videos. `target_fps == 0` is rejected by `smart_nframes`,
+    // so guard here with a clean error.
+    let videos = video::load_videos(video_paths, Some(target_fps), None)
+        .map_err(|err| anyhow::anyhow!("Failed to load video(s): {}", err))?;
+    println!(
+        "Loaded {} video(s) ({} total frames after sampling).",
+        videos.len(),
+        videos.iter().map(Vec::len).sum::<usize>()
+    );
+
+    // Optional companion images (e.g. user passes both --image and --video).
+    let images: Vec<image::DynamicImage> = image_paths
+        .iter()
+        .map(|path| {
+            image::open(path).map_err(|e| anyhow::anyhow!("Failed to load image {:?}: {}", path, e))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    if !images.is_empty() {
+        println!("Loaded {} image(s).", images.len());
+    }
+
+    let processed_images = gemma4_vl.processor.preprocess(&images);
+    let image_soft_tokens: Vec<usize> = processed_images
+        .iter()
+        .map(|img| img.num_soft_tokens)
+        .collect();
+
+    let fps_per_video = vec![target_fps; video_paths.len()];
+    let processed_videos = gemma4_vl
+        .processor
+        .process_videos(&videos, Some(&fps_per_video));
+
+    // Build the per-video soft-token-per-frame matrix expected by
+    // `expand_gemma4_video_tokens`.
+    let video_frame_tokens: Vec<Vec<usize>> = processed_videos
+        .iter()
+        .map(|v| vec![v.num_soft_tokens_per_frame; v.num_frames()])
+        .collect();
+
+    // The CLI path does not insert a dedicated `<|video|>` marker into
+    // the prompt — the chat template handles `type == "image"` blocks
+    // and we splice video frames in after BOS using the existing image-
+    // token expansion. `i32::MIN` is a sentinel that cannot appear in a
+    // tokenised prompt, so the placeholder-replace branch of
+    // `expand_gemma4_video_tokens` is bypassed and the function takes
+    // its "splice after BOS" fallback path. Server / chat-template
+    // callers that *do* emit a real video token id can pass the proper
+    // value through `mlxcel::vlm_runtime::expand_gemma4_video_tokens`
+    // directly.
+    let video_token_sentinel = i32::MIN;
+
+    if image_paths.is_empty() {
+        // Pure-video path: place `boi/image/eoi` runs after BOS.
+        mlxcel::vlm_runtime::expand_gemma4_video_tokens(
+            prompt_tokens,
+            video_token_sentinel,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &video_frame_tokens,
+        )?;
+    } else {
+        // Mixed path: expand image placeholders first, then videos.
+        mlxcel::vlm_runtime::expand_gemma4_image_tokens_pub(
+            prompt_tokens,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &image_soft_tokens,
+        )?;
+        mlxcel::vlm_runtime::expand_gemma4_video_tokens(
+            prompt_tokens,
+            video_token_sentinel,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &video_frame_tokens,
+        )?;
+    }
+
+    let total_frames: usize = processed_videos.iter().map(|v| v.num_frames()).sum();
+    let input_ids_arr =
+        mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings = gemma4_vl.get_input_embeddings_with_videos(
+        &input_ids_arr,
+        &processed_images,
+        &processed_videos,
+    );
+
+    print_preparation_summary(VlmPreparationSummary::Gemma4Video {
+        video_count: processed_videos.len(),
+        frame_slots: total_frames,
+        total_tokens: prompt_tokens.len(),
+    });
 
     Ok(Some(embeddings))
 }

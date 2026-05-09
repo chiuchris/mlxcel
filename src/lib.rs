@@ -67,7 +67,7 @@ pub use mlxcel_core::generate::{
 pub use mlxcel_core::speculative::SpeculativeGenerator;
 pub use multimodal::{
     minicpmo_prompt, moondream3_prompt, phi3v_prompt, phi4_siglip_prompt, phi4mm_prompt, qwen_vl,
-    vlm_prompt, vlm_runtime,
+    video, vlm_prompt, vlm_runtime,
 };
 
 // Re-export split modules
