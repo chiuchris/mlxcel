@@ -4624,6 +4624,8 @@ namespace {
                 if (thread_index_in_simdgroup == 0) {
                     y[dv_idx] = static_cast<InT>(out);
                 }
+            } else {
+                y[dv_idx] = static_cast<InT>(0);
             }
             q_ += Hk * Dk;
             k_ += Hk * Dk;
@@ -4756,6 +4758,8 @@ namespace {
                 if (thread_index_in_simdgroup == 0) {
                     y[dv_idx] = static_cast<InT>(out);
                 }
+            } else {
+                y[dv_idx] = static_cast<InT>(0);
             }
             q_ += Hk * Dk;
             k_ += Hk * Dk;
