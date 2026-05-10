@@ -285,6 +285,17 @@ impl MlxcelTokenizer {
     /// Tiktoken paths) so callers can chain this on every load without a
     /// guard.
     ///
+    /// **Empty `tool_call_end` handling (Mistral-like tokenizers, upstream
+    /// mlx-lm PR #1151 fix):** some tokenizers (Mistral variants) report a
+    /// non-empty `tool_call_start` but an empty `tool_call_end` string.
+    /// Encoding an empty string can produce a non-empty token sequence on
+    /// some tokenizers, but the intent is clear: there is no end marker, so
+    /// the `tool → normal` state-machine transition must not be registered,
+    /// and the empty sequence must not be inserted into the sequence map.
+    /// When `tool_call_end` is empty the end-marker fields are left at their
+    /// `None` default so downstream callers can distinguish "no end marker"
+    /// from "end marker not yet resolved".
+    ///
     /// Currently consumed by unit tests; future wiring point for
     /// `server::startup` after resolving a tool-call format — pass the
     /// canonical start/end strings through here so the resulting
@@ -302,21 +313,33 @@ impl MlxcelTokenizer {
         let Ok(start_enc) = hf.encode(tool_call_start, false) else {
             return markers;
         };
-        let Ok(end_enc) = hf.encode(tool_call_end, false) else {
-            return markers;
-        };
         let start_ids = start_enc.get_ids().to_vec();
-        let end_ids = end_enc.get_ids().to_vec();
-        if start_ids.is_empty() || end_ids.is_empty() {
-            // A tokenizer that drops the marker entirely cannot be matched
-            // on an id basis. Leave the markers untouched so the text-based
-            // stream filter remains the single source of truth.
+        if start_ids.is_empty() {
+            // A tokenizer that drops the start marker entirely cannot be
+            // matched on an id basis. Leave the markers untouched so the
+            // text-based stream filter remains the single source of truth.
             return markers;
         }
         markers.tool_call_start = Some(tool_call_start.to_string());
-        markers.tool_call_end = Some(tool_call_end.to_string());
         markers.tool_call_start_tokens = Some(start_ids);
-        markers.tool_call_end_tokens = Some(end_ids);
+
+        // Only register the end marker when `tool_call_end` is non-empty.
+        // Some tokenizers (Mistral variants) provide a non-empty start
+        // marker but an empty end marker. Encoding "" may still produce a
+        // non-empty token sequence on certain tokenizers, so guard on the
+        // source string rather than on the encoded ids (mirrors upstream
+        // mlx-lm PR #1151: `transitions["tool"] = [(te, "normal")] if te
+        // else []` / `if te: sequences[te] = tokenizer.tool_call_end`).
+        if !tool_call_end.is_empty()
+            && let Ok(end_enc) = hf.encode(tool_call_end, false)
+        {
+            let end_ids = end_enc.get_ids().to_vec();
+            if !end_ids.is_empty() {
+                markers.tool_call_end = Some(tool_call_end.to_string());
+                markers.tool_call_end_tokens = Some(end_ids);
+            }
+        }
+
         markers
     }
 }
@@ -774,6 +797,71 @@ mod tests {
         let markers = tok.infer_thinking_markers();
         let merged = tok.with_tool_call_markers(markers.clone(), "<tool_call>", "</tool_call>");
         assert_eq!(merged, markers);
+    }
+
+    // -- issue #591: empty tool_call_end (Mistral-like tokenizers) --------
+
+    #[test]
+    fn with_tool_call_markers_empty_end_skips_end_transition() {
+        // Mistral-like tokenizers report a non-empty tool_call_start but an
+        // empty tool_call_end. The state machine must NOT register an
+        // empty-sequence tool→normal transition, and tool_call_end /
+        // tool_call_end_tokens must remain None (mirrors upstream mlx-lm
+        // PR #1151: `transitions["tool"] = [(te, "normal")] if te else []`
+        // and `if te: sequences[te] = tokenizer.tool_call_end`).
+        let tok = mlxcel_with_added(&["[TOOL_CALLS]"]);
+        let markers = tok.infer_thinking_markers();
+
+        // Pass an empty end string (the Mistral case).
+        let merged = tok.with_tool_call_markers(markers, "[TOOL_CALLS]", "");
+
+        // Start marker IS populated (we can still enter tool-call mode).
+        assert!(merged.has_tool_calling());
+        assert_eq!(merged.tool_call_start.as_deref(), Some("[TOOL_CALLS]"));
+        assert!(
+            merged
+                .tool_call_start_tokens
+                .as_ref()
+                .map_or(false, |v| !v.is_empty())
+        );
+
+        // End marker must NOT be populated (no tool→normal transition).
+        assert!(
+            merged.tool_call_end.is_none(),
+            "tool_call_end must be None when end string is empty; got {:?}",
+            merged.tool_call_end
+        );
+        assert!(
+            merged.tool_call_end_tokens.is_none(),
+            "tool_call_end_tokens must be None when end string is empty; got {:?}",
+            merged.tool_call_end_tokens
+        );
+    }
+
+    #[test]
+    fn with_tool_call_markers_nonempty_end_still_registers_transition() {
+        // Regression guard: non-empty end markers continue to work correctly
+        // after the Mistral empty-end fix. Both start and end fields must be
+        // populated when both strings are non-empty (PR #1151 positive path).
+        let tok = mlxcel_with_added(&["<tool_call>", "</tool_call>"]);
+        let markers = tok.infer_thinking_markers();
+        let merged = tok.with_tool_call_markers(markers, "<tool_call>", "</tool_call>");
+
+        assert!(merged.has_tool_calling());
+        assert_eq!(merged.tool_call_start.as_deref(), Some("<tool_call>"));
+        assert_eq!(merged.tool_call_end.as_deref(), Some("</tool_call>"));
+        assert!(
+            merged
+                .tool_call_start_tokens
+                .as_ref()
+                .map_or(false, |v| !v.is_empty())
+        );
+        assert!(
+            merged
+                .tool_call_end_tokens
+                .as_ref()
+                .map_or(false, |v| !v.is_empty())
+        );
     }
 
     // -- find_think_* / rfind_think_* via subseq helpers (#590) ----------
