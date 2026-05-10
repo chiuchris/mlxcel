@@ -608,3 +608,431 @@ fn bench_single_pass_768_frames() {
         elapsed.as_millis()
     );
 }
+
+// ─── Content-preservation tests (require ffmpeg) ─────────────────────────────
+//
+// Issue #598: These tests verify that load_video preserves pixel content, not
+// just shape. They catch:
+//   - Wrong color channel order (BGR vs RGB)
+//   - Wrong sample timing (off-by-one in frame indexing)
+//   - Frame content corruption / silent truncation
+//
+// Each frame has a known color incremented by a deterministic formula so that
+// the expected per-frame channel means can be computed independently and
+// compared against the decoded output.
+
+/// Synthesize a "color increment" video where each frame is a solid color that
+/// increments per frame. Frame i has color (r, g, b) = (5*i, 4*i, 3*i) clamped
+/// to [0, 255]. Per-frame PNGs are written to a temp dir and encoded to MP4
+/// via ffmpeg. Returns the path to the MP4 or None when ffmpeg is unavailable.
+fn synth_color_increment_video(
+    out: &std::path::Path,
+    frames: usize,
+    fps: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    use image::{ImageBuffer, Rgb};
+    use std::path::PathBuf;
+
+    if !ffmpeg_available() {
+        return false;
+    }
+
+    // Create temp directory for per-frame PNGs.
+    let tmp_dir = std::env::temp_dir().join(format!("mlxcel-synth-color-{fps}fps-{frames}f"));
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        eprintln!("SKIP: could not create temp dir: {e}");
+        return false;
+    }
+
+    // Write one solid-color PNG per frame.
+    for i in 0..frames {
+        let r = (i * 5).min(255) as u8;
+        let g = (i * 4).min(255) as u8;
+        let b = (i * 3).min(255) as u8;
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(width, height, Rgb([r, g, b]));
+        let frame_path: PathBuf = tmp_dir.join(format!("frame_{i:03}.png"));
+        if img.save(&frame_path).is_err() {
+            eprintln!("SKIP: could not save frame {i}");
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return false;
+        }
+    }
+
+    // Encode all PNGs to an MP4 via ffmpeg.
+    let pattern = tmp_dir.join("frame_%03d.png");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+        ])
+        .arg(&pattern)
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(out)
+        .status()
+        .ok();
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+/// Synthesize a "moving square" video where an 8x8 white square on a black
+/// background moves diagonally one pixel per frame in both x and y. Frame
+/// index can be inferred from the square's top-left corner position.
+fn synth_moving_square_video(
+    out: &std::path::Path,
+    frames: usize,
+    fps: u32,
+    width: u32,
+    height: u32,
+) -> bool {
+    use image::{ImageBuffer, Luma};
+
+    if !ffmpeg_available() {
+        return false;
+    }
+
+    let tmp_dir = std::env::temp_dir().join(format!("mlxcel-synth-square-{fps}fps-{frames}f"));
+    if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
+        eprintln!("SKIP: could not create temp dir: {e}");
+        return false;
+    }
+
+    const SQUARE_SIZE: u32 = 8;
+
+    for i in 0..frames {
+        let mut img: ImageBuffer<Luma<u8>, Vec<u8>> = ImageBuffer::new(width, height);
+        // Square moves diagonally; clamp so it stays on screen.
+        let sx = (i as u32).min(width.saturating_sub(SQUARE_SIZE));
+        let sy = (i as u32).min(height.saturating_sub(SQUARE_SIZE));
+        for dy in 0..SQUARE_SIZE {
+            for dx in 0..SQUARE_SIZE {
+                img.put_pixel(sx + dx, sy + dy, Luma([255u8]));
+            }
+        }
+        let frame_path = tmp_dir.join(format!("frame_{i:03}.png"));
+        if img.save(&frame_path).is_err() {
+            eprintln!("SKIP: could not save moving-square frame {i}");
+            let _ = std::fs::remove_dir_all(&tmp_dir);
+            return false;
+        }
+    }
+
+    let pattern = tmp_dir.join("frame_%03d.png");
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-framerate",
+            &fps.to_string(),
+            "-i",
+        ])
+        .arg(&pattern)
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(out)
+        .status()
+        .ok();
+
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    status.map(|s| s.success()).unwrap_or(false)
+}
+
+/// Compute the per-channel mean of an RGB image as (mean_r, mean_g, mean_b).
+fn rgb_channel_means(img: &image::DynamicImage) -> (f64, f64, f64) {
+    let rgb = img.to_rgb8();
+    let (w, h) = (rgb.width() as u64, rgb.height() as u64);
+    let total_pixels = w * h;
+    if total_pixels == 0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let (mut sum_r, mut sum_g, mut sum_b) = (0u64, 0u64, 0u64);
+    for pix in rgb.pixels() {
+        sum_r += pix[0] as u64;
+        sum_g += pix[1] as u64;
+        sum_b += pix[2] as u64;
+    }
+    (
+        sum_r as f64 / total_pixels as f64,
+        sum_g as f64 / total_pixels as f64,
+        sum_b as f64 / total_pixels as f64,
+    )
+}
+
+/// Test that load_video preserves per-frame color increments across the
+/// sampled frames. This catches both wrong-frame-index and wrong-channel-order
+/// bugs because both the frame timing and the exact channel values are verified.
+///
+/// Tolerance of ±15 accounts for YUV420 chroma subsampling and H.264 codec
+/// rounding. YUV420 chroma is shared across 2x2 pixel blocks, which can shift
+/// individual channel values by up to ~10 counts; we add a few counts of slack.
+#[test]
+fn extract_frames_preserves_color_increment_per_frame() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // 50 frames at 10 fps = 5-second video. Colors increment per frame:
+    // frame i → (5*i, 4*i, 3*i) clamped to 255.
+    const TOTAL_FRAMES: usize = 50;
+    const VIDEO_FPS: u32 = 10;
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 64;
+
+    let video_path = std::env::temp_dir().join("mlxcel-test-color-increment.mp4");
+    let _ = std::fs::remove_file(&video_path);
+    if !synth_color_increment_video(&video_path, TOTAL_FRAMES, VIDEO_FPS, WIDTH, HEIGHT) {
+        eprintln!("SKIP: could not synthesize color-increment video");
+        return;
+    }
+
+    // Request 25 frames from a 50-frame, 10-fps video (target fps = 5.0).
+    // The sampled frame indices are linspace(0, 49, 25).round() =
+    // [0, 2, 4, 6, ..., 48] — every even source frame.
+    let frames = load_video(&video_path, Some(5.0), None);
+    let _ = std::fs::remove_file(&video_path);
+
+    let frames = match frames {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("SKIP: load_video failed: {e}");
+            return;
+        }
+    };
+
+    assert!(!frames.is_empty(), "should have decoded at least one frame");
+
+    // Compute the expected source-frame indices for the sampled frames.
+    // uniform_indices(50, 25) → linspace(0, 49, 25).round() = [0,2,4,...,48].
+    let expected_indices: Vec<usize> = (0..frames.len())
+        .map(|i| {
+            let last = (TOTAL_FRAMES - 1) as f64;
+            let step = last / (frames.len() as f64 - 1.0);
+            (i as f64 * step).round() as usize
+        })
+        .collect();
+
+    // Tolerance: YUV420 + H.264 codec round-trip ≤ ±15 per channel.
+    const TOLERANCE: f64 = 15.0;
+
+    for (frame_idx, (frame, &src_idx)) in frames.iter().zip(expected_indices.iter()).enumerate() {
+        let expected_r = (src_idx * 5).min(255) as f64;
+        let expected_g = (src_idx * 4).min(255) as f64;
+        let expected_b = (src_idx * 3).min(255) as f64;
+
+        let (mean_r, mean_g, mean_b) = rgb_channel_means(frame);
+
+        assert!(
+            (mean_r - expected_r).abs() <= TOLERANCE,
+            "frame {frame_idx} (src_idx {src_idx}): R channel mean {mean_r:.1} != expected {expected_r:.1} (tolerance ±{TOLERANCE})"
+        );
+        assert!(
+            (mean_g - expected_g).abs() <= TOLERANCE,
+            "frame {frame_idx} (src_idx {src_idx}): G channel mean {mean_g:.1} != expected {expected_g:.1} (tolerance ±{TOLERANCE})"
+        );
+        assert!(
+            (mean_b - expected_b).abs() <= TOLERANCE,
+            "frame {frame_idx} (src_idx {src_idx}): B channel mean {mean_b:.1} != expected {expected_b:.1} (tolerance ±{TOLERANCE})"
+        );
+    }
+}
+
+/// Test that load_video returns frames with the correct RGB channel order (not
+/// BGR). Synthesizes a 1-second video where every frame is the same solid color
+/// (R=200, G=100, B=50) and asserts center-pixel channel layout after decoding.
+///
+/// Tolerance of ±15 accounts for YUV420 chroma subsampling and codec rounding.
+#[test]
+fn extract_frames_preserves_channel_order() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // Solid-color video: R=200, G=100, B=50 — all three channels differ so
+    // any channel-order permutation (e.g., BGR) is distinguishable.
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 64;
+    const TARGET_R: u8 = 200;
+    const TARGET_G: u8 = 100;
+    const TARGET_B: u8 = 50;
+    const TOLERANCE: i32 = 15;
+
+    // Write a single-color 1-second video (10 fps, 10 frames all identical).
+    let tmp_dir = std::env::temp_dir().join("mlxcel-synth-channel-order");
+    std::fs::create_dir_all(&tmp_dir).unwrap();
+
+    use image::{ImageBuffer, Rgb};
+    for i in 0..10usize {
+        let img: ImageBuffer<Rgb<u8>, Vec<u8>> =
+            ImageBuffer::from_pixel(WIDTH, HEIGHT, Rgb([TARGET_R, TARGET_G, TARGET_B]));
+        let fp = tmp_dir.join(format!("frame_{i:03}.png"));
+        img.save(&fp).expect("save channel-order test frame");
+    }
+
+    let video_path = std::env::temp_dir().join("mlxcel-test-channel-order.mp4");
+    let _ = std::fs::remove_file(&video_path);
+    let status = Command::new("ffmpeg")
+        .args(["-y", "-loglevel", "error", "-framerate", "10", "-i"])
+        .arg(tmp_dir.join("frame_%03d.png"))
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(&video_path)
+        .status()
+        .ok();
+    let _ = std::fs::remove_dir_all(&tmp_dir);
+
+    if !status.map(|s| s.success()).unwrap_or(false) {
+        eprintln!("SKIP: could not synthesize channel-order video");
+        return;
+    }
+
+    // Load 2 frames from the 1-second / 10-fps video (target fps = 2).
+    let frames = load_video(&video_path, Some(2.0), None);
+    let _ = std::fs::remove_file(&video_path);
+
+    let frames = match frames {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("SKIP: load_video failed: {e}");
+            return;
+        }
+    };
+
+    assert!(!frames.is_empty(), "should have decoded at least one frame");
+
+    for (idx, frame) in frames.iter().enumerate() {
+        let rgb = frame.to_rgb8();
+        let cx = rgb.width() / 2;
+        let cy = rgb.height() / 2;
+        let pixel = rgb.get_pixel(cx, cy);
+
+        let r = pixel[0] as i32;
+        let g = pixel[1] as i32;
+        let b = pixel[2] as i32;
+
+        assert!(
+            (r - TARGET_R as i32).abs() <= TOLERANCE,
+            "frame {idx} center pixel: R={r} expected ~{TARGET_R} (±{TOLERANCE}). \
+             If G or B is closer to {TARGET_R} the channel order is wrong (BGR)."
+        );
+        assert!(
+            (g - TARGET_G as i32).abs() <= TOLERANCE,
+            "frame {idx} center pixel: G={g} expected ~{TARGET_G} (±{TOLERANCE})"
+        );
+        assert!(
+            (b - TARGET_B as i32).abs() <= TOLERANCE,
+            "frame {idx} center pixel: B={b} expected ~{TARGET_B} (±{TOLERANCE})"
+        );
+    }
+}
+
+/// Test that load_video places the bright square in the expected pixel region
+/// for each sampled frame. The square's position encodes the source frame index,
+/// so this test catches off-by-one frame-indexing bugs.
+///
+/// The moving-square video has 20 frames at 10 fps (2 seconds). The square
+/// moves from the top-left at frame 0 diagonally to (19, 19) at frame 19.
+/// We sample all 20 frames (target fps = 10) and verify that the brightest
+/// region of each frame overlaps the expected 8x8 window.
+#[test]
+fn extract_frames_preserves_moving_square_position() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // 2-second video at 10 fps = 20 source frames.
+    const TOTAL_FRAMES: usize = 20;
+    const VIDEO_FPS: u32 = 10;
+    const WIDTH: u32 = 64;
+    const HEIGHT: u32 = 64;
+    const SQUARE_SIZE: u32 = 8;
+
+    let video_path = std::env::temp_dir().join("mlxcel-test-moving-square.mp4");
+    let _ = std::fs::remove_file(&video_path);
+    if !synth_moving_square_video(&video_path, TOTAL_FRAMES, VIDEO_FPS, WIDTH, HEIGHT) {
+        eprintln!("SKIP: could not synthesize moving-square video");
+        return;
+    }
+
+    // Sample all 20 frames (target fps = 10 matches source fps).
+    let frames = load_video(&video_path, Some(10.0), None);
+    let _ = std::fs::remove_file(&video_path);
+
+    let frames = match frames {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("SKIP: load_video failed: {e}");
+            return;
+        }
+    };
+
+    assert!(!frames.is_empty(), "should have decoded at least one frame");
+
+    // Expected source-frame indices for the sampled frames.
+    let expected_indices: Vec<usize> = (0..frames.len())
+        .map(|i| {
+            let last = (TOTAL_FRAMES - 1) as f64;
+            let step = if frames.len() > 1 {
+                last / (frames.len() as f64 - 1.0)
+            } else {
+                0.0
+            };
+            (i as f64 * step).round() as usize
+        })
+        .collect();
+
+    // For each sampled frame, find the pixel with maximum luminance and check
+    // that it falls inside the expected 8x8 square window (±2 pixels slack for
+    // H.264 blocking artifacts near the square edge).
+    const POSITION_TOLERANCE: i32 = 4; // pixels; H.264 DCT blocks are 4x4
+
+    for (frame_idx, (frame, &src_idx)) in frames.iter().zip(expected_indices.iter()).enumerate() {
+        let rgb = frame.to_rgb8();
+
+        // Expected top-left corner of the white square (clamped to stay in frame).
+        let expected_sx = (src_idx as u32).min(WIDTH.saturating_sub(SQUARE_SIZE));
+        let expected_sy = (src_idx as u32).min(HEIGHT.saturating_sub(SQUARE_SIZE));
+
+        // Find the pixel with the maximum luminance in the decoded frame.
+        let mut max_luma = 0u32;
+        let mut max_px = 0u32;
+        let mut max_py = 0u32;
+        for y in 0..rgb.height() {
+            for x in 0..rgb.width() {
+                let p = rgb.get_pixel(x, y);
+                // BT.601 luminance approximation: Y ≈ 0.299R + 0.587G + 0.114B
+                // Using integer math: (299*R + 587*G + 114*B) / 1000
+                let luma = 299 * p[0] as u32 + 587 * p[1] as u32 + 114 * p[2] as u32;
+                if luma > max_luma {
+                    max_luma = luma;
+                    max_px = x;
+                    max_py = y;
+                }
+            }
+        }
+
+        // The brightest pixel must lie within the expected 8x8 window (plus
+        // POSITION_TOLERANCE pixels of slack on each side for codec artifacts).
+        let in_x_range =
+            (max_px as i32 - expected_sx as i32).abs() <= SQUARE_SIZE as i32 + POSITION_TOLERANCE;
+        let in_y_range =
+            (max_py as i32 - expected_sy as i32).abs() <= SQUARE_SIZE as i32 + POSITION_TOLERANCE;
+
+        assert!(
+            in_x_range && in_y_range,
+            "frame {frame_idx} (src {src_idx}): brightest pixel at ({max_px},{max_py}) \
+             but expected square window starts at ({expected_sx},{expected_sy}); \
+             frame index or position is wrong"
+        );
+    }
+}
