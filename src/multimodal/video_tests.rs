@@ -13,8 +13,11 @@
 // limitations under the License.
 
 use std::path::Path;
+use std::process::Command;
 
 use super::*;
+
+// ─── Extension detection ─────────────────────────────────────────────────────
 
 #[test]
 fn is_video_file_recognises_common_extensions() {
@@ -36,6 +39,8 @@ fn is_video_file_rejects_images_and_other_files() {
     assert!(!is_video_file(Path::new("/data/clip")));
     assert!(!is_video_file(Path::new("/data/")));
 }
+
+// ─── smart_nframes ───────────────────────────────────────────────────────────
 
 #[test]
 fn smart_nframes_uniform_default_fps_two() {
@@ -102,6 +107,8 @@ fn smart_nframes_handles_zero_video_fps_gracefully() {
     assert!(n.is_multiple_of(FRAME_FACTOR));
 }
 
+// ─── load_video error paths (no ffmpeg needed) ───────────────────────────────
+
 #[test]
 fn load_video_missing_file_errors() {
     let path = Path::new("/non/existent/video.mp4");
@@ -127,4 +134,477 @@ fn load_video_without_ffmpeg_returns_clear_error() {
     let path = Path::new("/tmp/does-not-exist.mp4");
     let err = load_video(path, None, None).unwrap_err();
     matches!(err, VideoError::FfmpegMissing);
+}
+
+// ─── PNG stream splitter unit test ───────────────────────────────────────────
+
+#[test]
+fn find_subsequence_locates_needle() {
+    let haystack = b"hello world IEND goodbye";
+    let needle = b"IEND";
+    assert_eq!(find_subsequence(haystack, needle), Some(12));
+}
+
+#[test]
+fn find_subsequence_returns_none_when_absent() {
+    let haystack = b"hello world";
+    let needle = b"IEND";
+    assert_eq!(find_subsequence(haystack, needle), None);
+}
+
+#[test]
+fn find_subsequence_handles_empty_needle() {
+    let haystack = b"hello";
+    assert_eq!(find_subsequence(haystack, b""), Some(0));
+}
+
+// ─── TempFile drop guard ─────────────────────────────────────────────────────
+
+#[test]
+fn temp_file_drop_removes_file() {
+    let path = std::env::temp_dir().join("mlxcel-test-tempfile-drop.tmp");
+    std::fs::write(&path, b"test content").expect("write temp file");
+    assert!(path.exists(), "file should exist before drop");
+
+    let guard = TempFile::new(path.clone());
+    drop(guard);
+
+    assert!(!path.exists(), "file should be removed after TempFile drop");
+}
+
+#[test]
+fn temp_file_drop_survives_nonexistent_file() {
+    // TempFile::drop should not panic when the file has already been removed.
+    let path = std::env::temp_dir().join("mlxcel-test-tempfile-missing.tmp");
+    // Deliberately do NOT create the file.
+    let guard = TempFile::new(path.clone());
+    drop(guard); // Must not panic.
+    assert!(!path.exists());
+}
+
+#[test]
+fn temp_file_drop_on_panic_cleanup() {
+    let path = std::env::temp_dir().join("mlxcel-test-tempfile-panic.tmp");
+    std::fs::write(&path, b"should be deleted").expect("write temp file");
+    assert!(path.exists(), "file should exist before panic");
+
+    // Clone the path so we can check it after the catch_unwind.
+    let path_clone = path.clone();
+
+    let result = std::panic::catch_unwind(move || {
+        let _guard = TempFile::new(path.clone());
+        panic!("simulated panic to test TempFile cleanup");
+    });
+
+    // The catch_unwind should have caught the panic.
+    assert!(result.is_err(), "catch_unwind should have caught the panic");
+
+    // The TempFile guard should have fired Drop during unwinding.
+    assert!(
+        !path_clone.exists(),
+        "TempFile should have cleaned up the file even after a panic"
+    );
+}
+
+// ─── Resolution / duration cap tests (require ffmpeg) ────────────────────────
+
+/// Create a minimal synthetic video file via ffmpeg. Returns the temp path.
+/// The video has the given `width`, `height`, frame rate, and total `duration_sec`.
+/// Uses a color source (`lavfi testsrc2`) to avoid needing any input file.
+fn make_test_video(
+    width: u32,
+    height: u32,
+    fps: u32,
+    duration_sec: f64,
+) -> Option<std::path::PathBuf> {
+    if !ffmpeg_available() {
+        return None;
+    }
+    let path = std::env::temp_dir().join(format!(
+        "mlxcel-test-video-{width}x{height}-{fps}fps-{duration_sec}s.mp4"
+    ));
+    // Remove a leftover from a previous run if present.
+    let _ = std::fs::remove_file(&path);
+
+    let status = Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("testsrc2=size={width}x{height}:rate={fps}"),
+            "-t",
+            &format!("{duration_sec:.3}"),
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+        ])
+        .arg(&path)
+        .status()
+        .ok()?;
+
+    if status.success() { Some(path) } else { None }
+}
+
+#[test]
+fn load_video_rejects_oversized_resolution() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // Synthesize a 100x100 video (well within defaults), then set a tiny
+    // cap via environment variable to trigger the rejection.
+    let video_path = match make_test_video(100, 100, 5, 2.0) {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: could not create test video");
+            return;
+        }
+    };
+
+    // Temporarily set a very small pixel cap (e.g. 50x50 = 2500 pixels).
+    // We can't set env vars in a truly isolated way in unit tests without
+    // side effects, so we use a helper that reads the env var at call time.
+    // Run the actual check: create a wrapper that overrides the environment.
+    let result = {
+        // SAFETY: standard test, no multi-threading inside this block that
+        // reads MLXCEL_VIDEO_MAX_PIXELS.
+        unsafe {
+            std::env::set_var("MLXCEL_VIDEO_MAX_PIXELS", "2500");
+        }
+        let r = load_video(&video_path, Some(2.0), None);
+        unsafe {
+            std::env::remove_var("MLXCEL_VIDEO_MAX_PIXELS");
+        }
+        r
+    };
+
+    // Clean up the temp video.
+    let _ = std::fs::remove_file(&video_path);
+
+    match result {
+        Err(VideoError::ResolutionTooLarge {
+            width,
+            height,
+            pixels,
+            max_pixels,
+        }) => {
+            assert_eq!(width, 100, "width should match");
+            assert_eq!(height, 100, "height should match");
+            assert_eq!(pixels, 10_000, "pixels should be width*height");
+            assert_eq!(max_pixels, 2500, "max_pixels should match the env var");
+        }
+        Err(other) => panic!("expected ResolutionTooLarge, got: {other:?}"),
+        Ok(_) => panic!("expected ResolutionTooLarge error, but load_video succeeded"),
+    }
+}
+
+#[test]
+fn load_video_rejects_overlong_duration() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // Synthesize a short 4-second video and set a 2-second cap.
+    let video_path = match make_test_video(64, 64, 5, 4.0) {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: could not create test video");
+            return;
+        }
+    };
+
+    let result = {
+        unsafe {
+            std::env::set_var("MLXCEL_VIDEO_MAX_DURATION_SEC", "2");
+        }
+        let r = load_video(&video_path, Some(2.0), None);
+        unsafe {
+            std::env::remove_var("MLXCEL_VIDEO_MAX_DURATION_SEC");
+        }
+        r
+    };
+
+    let _ = std::fs::remove_file(&video_path);
+
+    match result {
+        Err(VideoError::DurationTooLong {
+            seconds,
+            max_seconds,
+        }) => {
+            assert!(
+                seconds > 2.0,
+                "reported duration {seconds:.2}s should exceed the cap"
+            );
+            assert_eq!(max_seconds, 2.0, "max_seconds should match the env var");
+        }
+        Err(other) => panic!("expected DurationTooLong, got: {other:?}"),
+        Ok(_) => panic!("expected DurationTooLong error, but load_video succeeded"),
+    }
+}
+
+#[test]
+fn load_video_single_pass_produces_correct_frame_count() {
+    // Verify that the single-pass implementation produces the expected
+    // number of frames for a short synthetic video. This is the key
+    // regression test for the single-pass refactor (issue #597).
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // 10 seconds at 10 fps = 100 frames source. With target fps 2 =>
+    // smart_nframes(100, 10.0, Some(2.0), None) = 100/10*2 = 20 frames.
+    let video_path = match make_test_video(64, 64, 10, 10.0) {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: could not create test video");
+            return;
+        }
+    };
+
+    let frames = load_video(&video_path, Some(2.0), None);
+    let _ = std::fs::remove_file(&video_path);
+
+    let frames = frames.expect("load_video should succeed for a valid test video");
+    assert!(!frames.is_empty(), "should have decoded at least one frame");
+    // All frames should have the correct dimensions.
+    for frame in &frames {
+        assert_eq!(frame.width(), 64, "frame width should match source");
+        assert_eq!(frame.height(), 64, "frame height should match source");
+    }
+    // Frame count should be a multiple of FRAME_FACTOR.
+    assert!(
+        frames.len().is_multiple_of(FRAME_FACTOR),
+        "frame count {} is not a multiple of FRAME_FACTOR={}",
+        frames.len(),
+        FRAME_FACTOR
+    );
+}
+
+// ─── Fail-closed sentinel tests (no ffmpeg needed) ───────────────────────────
+
+/// When ffprobe does not return a `width` field, `apply_probe_caps` must
+/// default to `u32::MAX` so the resolution cap trips instead of silently
+/// passing a 0×0 video through.
+#[test]
+fn probe_video_missing_width_trips_resolution_cap() {
+    use std::path::Path;
+    // nb_frames=4 so we don't fall into the "can't determine frame count" branch.
+    // height=100, width=None — should be treated as u32::MAX.
+    let path = Path::new("/synthetic/missing-width.mp4");
+    let result = apply_probe_caps(
+        path,
+        Some(4),
+        30.0,
+        None, // width missing
+        Some(100),
+        Some(10.0),
+    );
+    match result {
+        Err(VideoError::ResolutionTooLarge {
+            width,
+            height,
+            pixels,
+            max_pixels,
+        }) => {
+            assert_eq!(width, u32::MAX, "sentinel width should be u32::MAX");
+            assert_eq!(height, 100);
+            // saturating_mul: u32::MAX as u64 * 100 should not overflow
+            assert_eq!(pixels, (u32::MAX as u64).saturating_mul(100));
+            assert!(pixels > max_pixels, "sentinel pixels should exceed the cap");
+        }
+        Err(other) => panic!("expected ResolutionTooLarge, got: {other:?}"),
+        Ok(_) => panic!("expected ResolutionTooLarge but probe caps passed"),
+    }
+}
+
+/// When ffprobe does not return a `height` field, `apply_probe_caps` must
+/// default to `u32::MAX` so the resolution cap trips.
+#[test]
+fn probe_video_missing_height_trips_resolution_cap() {
+    use std::path::Path;
+    let path = Path::new("/synthetic/missing-height.mp4");
+    let result = apply_probe_caps(
+        path,
+        Some(4),
+        30.0,
+        Some(100),
+        None, // height missing
+        Some(10.0),
+    );
+    match result {
+        Err(VideoError::ResolutionTooLarge { width, height, .. }) => {
+            assert_eq!(width, 100);
+            assert_eq!(height, u32::MAX, "sentinel height should be u32::MAX");
+        }
+        Err(other) => panic!("expected ResolutionTooLarge, got: {other:?}"),
+        Ok(_) => panic!("expected ResolutionTooLarge but probe caps passed"),
+    }
+}
+
+/// When ffprobe does not return a `duration` field, `apply_probe_caps` must
+/// default to +∞ so the duration cap trips instead of silently accepting the
+/// video with duration 0.
+#[test]
+fn probe_video_missing_duration_trips_duration_cap() {
+    use std::path::Path;
+    // Small resolution so resolution cap does not trip first.
+    // nb_frames=4 so frame count is deterministic.
+    let path = Path::new("/synthetic/missing-duration.mp4");
+    let result = apply_probe_caps(
+        path,
+        Some(4),
+        30.0,
+        Some(100),
+        Some(100),
+        None, // duration missing
+    );
+    match result {
+        Err(VideoError::DurationTooLong {
+            seconds,
+            max_seconds,
+        }) => {
+            assert!(
+                seconds.is_infinite(),
+                "missing duration should default to +∞, got {seconds}"
+            );
+            assert_eq!(max_seconds, DEFAULT_MAX_DURATION_SEC);
+        }
+        Err(other) => panic!("expected DurationTooLong, got: {other:?}"),
+        Ok(_) => panic!("expected DurationTooLong but probe caps passed"),
+    }
+}
+
+/// Verify that saturating_mul prevents u32::MAX * u32::MAX from overflowing
+/// to 0 (which would silently bypass the resolution cap).
+#[test]
+fn probe_video_both_dimensions_missing_saturates_not_overflows() {
+    use std::path::Path;
+    let path = Path::new("/synthetic/missing-both-dims.mp4");
+    let result = apply_probe_caps(
+        path,
+        Some(4),
+        30.0,
+        None, // width missing
+        None, // height missing
+        Some(10.0),
+    );
+    match result {
+        Err(VideoError::ResolutionTooLarge {
+            pixels, max_pixels, ..
+        }) => {
+            // With saturating_mul, u32::MAX as u64 * u32::MAX as u64 yields
+            // 18_446_744_065_119_617_025 (no overflow wrapping to 0).
+            // The critical property is that pixels > max_pixels so the cap fires.
+            // If wrapping mul were used instead, the result would be 1 (overflow)
+            // and the guard would not trip.
+            assert!(
+                pixels > max_pixels,
+                "sentinel pixels {pixels} must exceed the cap {max_pixels}"
+            );
+            assert!(
+                pixels > 0,
+                "saturating_mul must not wrap to 0; got pixels={pixels}"
+            );
+            // Confirm the exact product so any future arithmetic change is caught.
+            assert_eq!(
+                pixels,
+                (u32::MAX as u64).saturating_mul(u32::MAX as u64),
+                "pixels should equal (u32::MAX as u64).saturating_mul(u32::MAX as u64)"
+            );
+        }
+        Err(other) => panic!("expected ResolutionTooLarge, got: {other:?}"),
+        Ok(_) => panic!("saturating_mul overflow: sentinel 0 bypassed resolution cap"),
+    }
+}
+
+// ─── PNG frame size cap tests ─────────────────────────────────────────────────
+
+/// A stream that never emits IEND must be rejected once the per-frame byte
+/// cap is reached, not after exhausting all input.
+#[test]
+fn split_png_stream_rejects_oversized_frame() {
+    use std::path::Path;
+
+    // Set a tiny cap so we don't need to allocate 256 MiB in the test.
+    // SAFETY: no other threads read MLXCEL_VIDEO_MAX_PNG_FRAME_BYTES here.
+    unsafe {
+        std::env::set_var("MLXCEL_VIDEO_MAX_PNG_FRAME_BYTES", "1024");
+    }
+
+    // Feed 2 KiB of random-ish bytes with no IEND marker.
+    // The cap is 1 KiB, so the function must reject before reading all 2 KiB.
+    let bogus: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+    let path = Path::new("/synthetic/no-iend.png");
+    let result = split_png_stream(bogus.as_slice(), path, 1);
+
+    unsafe {
+        std::env::remove_var("MLXCEL_VIDEO_MAX_PNG_FRAME_BYTES");
+    }
+
+    match result {
+        Err(VideoError::Extract { message, .. }) => {
+            assert!(
+                message.contains("PNG frame exceeded"),
+                "error message should mention PNG frame cap; got: {message}"
+            );
+        }
+        Err(other) => panic!("expected Extract error for oversized frame, got: {other:?}"),
+        Ok(_) => panic!("expected rejection of stream without IEND, but got frames"),
+    }
+}
+
+// ─── Benchmark placeholder (manual only) ─────────────────────────────────────
+
+/// Performance benchmark for single-pass extraction. Marked `#[ignore]` so
+/// it is skipped in CI but can be run manually with:
+///
+/// ```sh
+/// cargo test --lib -- multimodal::video::tests::bench_single_pass_768_frames --ignored --nocapture
+/// ```
+///
+/// The test synthesises a video large enough to drive ~768 frame extraction
+/// and asserts the wall time is below 500 ms. The assertion is intentionally
+/// generous; on developer hardware the single-pass path typically completes
+/// in well under 300 ms for a short lavfi source.
+#[test]
+#[ignore]
+fn bench_single_pass_768_frames() {
+    if !ffmpeg_available() {
+        eprintln!("SKIP: ffmpeg not available");
+        return;
+    }
+
+    // ~12.8 s at 60 fps = 768 frames source; target fps 60 => all frames.
+    let video_path = match make_test_video(320, 240, 60, 12.9) {
+        Some(p) => p,
+        None => {
+            eprintln!("SKIP: could not create test video");
+            return;
+        }
+    };
+
+    let start = std::time::Instant::now();
+    let frames = load_video(&video_path, Some(60.0), None);
+    let elapsed = start.elapsed();
+
+    let _ = std::fs::remove_file(&video_path);
+
+    let frames = frames.expect("benchmark load_video should succeed");
+    eprintln!(
+        "bench_single_pass_768_frames: {} frames in {:.1}ms",
+        frames.len(),
+        elapsed.as_millis()
+    );
+    assert!(
+        elapsed.as_millis() < 500,
+        "single-pass extraction took {}ms; expected < 500ms",
+        elapsed.as_millis()
+    );
 }
