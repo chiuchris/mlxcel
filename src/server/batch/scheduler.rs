@@ -524,9 +524,34 @@ impl BatchScheduler {
         // `take_detached` is one-shot: it returns `None` if a racing lookup
         // already consumed this entry. The miss path is safe — the current
         // sequence just does a fresh prefill.
-        let detached = entry.take_detached()?;
+        let mut detached = entry.take_detached()?;
         if detached.caches.is_empty() || detached.caches.iter().all(|c| c.is_empty()) {
             return None;
+        }
+
+        // APC block-level partial adoption (issue #580). When APC clamps
+        // `matched_len` to a block boundary shorter than the cached entry's
+        // full token length, the request diverged from the cached prefix at
+        // the next block. Truncate the detached KV state to exactly
+        // `matched_len` so the adopted cache covers only the consistent
+        // prefix; the prefill loop will then re-prefill the divergent tail
+        // starting at `matched_len`. When `matched_len == detached.seq_len()`
+        // this branch is skipped, preserving the bit-exact full-prefix
+        // adoption path.
+        let detached_seq_len = detached.seq_len();
+        if matched_len < detached_seq_len as usize {
+            let target = matched_len as i32;
+            if let Err(err) = detached.truncate_to(target) {
+                tracing::warn!(
+                    "prompt-cache adopt: APC partial truncate to {target} failed ({err}); falling back to cold prefill"
+                );
+                return None;
+            }
+            tracing::debug!(
+                from = detached_seq_len,
+                to = target,
+                "prompt-cache adopt: APC partial adoption truncated detached cache to block boundary"
+            );
         }
 
         match self

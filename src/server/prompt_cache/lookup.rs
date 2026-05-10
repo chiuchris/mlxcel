@@ -75,6 +75,16 @@ impl BestCandidate {
 /// * `tokens` — the incoming request's token prefix.
 /// * `min_len` — the minimum number of matching tokens required before
 ///   the candidate is even considered.
+/// * `apc_partial_allowed` — when `true` (issue #580), accept candidates
+///   whose stored token prefix is **not** fully contained in the request
+///   (i.e. the request and the entry diverge somewhere inside the entry's
+///   prefix). The reported `matched` field then carries the actual
+///   request-side match depth, which the store's caller is expected to
+///   clamp to a block boundary via
+///   [`super::apc_lookup::apc_consistent_prefix_len`] before adopting.
+///   When `false`, the legacy whole-prefix-contained safety check
+///   applies: a candidate is rejected unless `matched == dl.token_len`,
+///   matching the pre-APC behaviour exactly.
 ///
 /// Returns the winning [`BestCandidate`], or `None` when no candidate
 /// reaches the minimum-length threshold.
@@ -83,6 +93,7 @@ pub(super) fn select_best<'a, F>(
     key: &PromptCacheKey<'_>,
     tokens: &[i32],
     min_len: usize,
+    apc_partial_allowed: bool,
     mut slot_for_digest: F,
 ) -> Option<BestCandidate>
 where
@@ -106,12 +117,21 @@ where
         // A detached KV set can only be adopted safely when the whole stored
         // token prefix is contained in the incoming prompt. If the request
         // diverged before the stored entry ended, adopting that entry would
-        // import KV state for tokens the caller did not send.
-        if dl.token_len > tokens.len() {
+        // import KV state for tokens the caller did not send — UNLESS APC
+        // partial adoption is enabled (issue #580), in which case the
+        // store's caller will clamp the matched length to the longest
+        // block-aligned consistent prefix and pass that to the model
+        // worker's truncate path.
+        if dl.token_len > tokens.len() && !apc_partial_allowed {
             return;
         }
+        // Cap at the lesser of the trie depth and the entry's stored
+        // prefix length. With APC off this expression equals
+        // `dl.token_len` whenever the candidate would survive the legacy
+        // gate; with APC on it may be strictly less, which the caller
+        // clamps to a block boundary via the block-hash discriminator.
         let matched = match_depth.min(dl.token_len);
-        if matched != dl.token_len {
+        if !apc_partial_allowed && matched != dl.token_len {
             return;
         }
         if matched < min_len {

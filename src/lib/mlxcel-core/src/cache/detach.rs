@@ -170,6 +170,205 @@ impl DetachedKVCache {
     pub fn values(&self) -> Option<&MlxArray> {
         self.values.as_deref()
     }
+
+    /// Shrink the inert detached cache to exactly `new_len` tokens along the
+    /// sequence-length axis (axis 2 of the per-layer 4-D tensors).
+    ///
+    /// Mirrors [`KVCache::trim`] semantics on the post-detach handle:
+    ///
+    /// * `new_len == 0` drops every backing buffer (keys, values, INT8 scale
+    ///   sidecars, Turbo4 packed sidecars / norms / V-rescale, K-side packed
+    ///   sidecars and norms when in symmetric Turbo4) and resets `offset`.
+    ///   The mode tag and `step` are preserved so a subsequent
+    ///   [`KVCache::install_detached`] round-trip stays consistent.
+    /// * `0 < new_len < self.offset` re-slices each tensor's seq-len axis to
+    ///   `new_len` via the same `ffi::slice` primitive `KVCache::trim` uses.
+    ///   For `Turbo4Delegated` the K side is unified so the shape contract is
+    ///   identical to `Fp16`; the V-side cold/hot split is rebuilt from
+    ///   `cold_offset.min(new_len)` and `delegated_fp16_fast_path` decides
+    ///   whether `values` is a unified FP16 buffer or a hot ring.
+    /// * `new_len == self.offset` is a no-op (zero allocations).
+    /// * `new_len < 0` or `new_len > self.offset` returns `Err` and leaves
+    ///   the handle untouched.
+    ///
+    /// This is the inert-side counterpart of [`KVCache::trim_to`] and is the
+    /// load-bearing primitive that lets the scheduler adopt only the first
+    /// `matched_len` tokens' worth of KV state when an Automatic Prefix
+    /// Caching (APC, issue #552) lookup returns a block-aligned matched
+    /// length shorter than the full cached entry. See server-side
+    /// `try_adopt_cached_prefix` in `src/server/batch/scheduler.rs`.
+    ///
+    /// INT8 scale tensors and the Turbo4* per-token sidecars (`v_packed`,
+    /// `v_norms`, `v_rescale`, `k_packed`, `k_norms`) are sliced in lockstep
+    /// so a subsequent install + dequantize stays bit-identical to the
+    /// already-trimmed live cache.
+    ///
+    /// Used by: [`DetachedCacheSet::truncate_to`] (issue #580 — APC
+    /// block-level partial cache adoption in the scheduler).
+    pub fn trim_to(&mut self, new_len: i32) -> Result<(), String> {
+        if new_len < 0 {
+            return Err(format!(
+                "DetachedKVCache::trim_to: new_len must be non-negative, got {new_len}"
+            ));
+        }
+        if new_len > self.offset {
+            return Err(format!(
+                "DetachedKVCache::trim_to: new_len ({new_len}) exceeds current offset ({})",
+                self.offset
+            ));
+        }
+        if new_len == self.offset {
+            return Ok(());
+        }
+
+        let prev_offset = self.offset;
+
+        if new_len == 0 {
+            // Drop every backing buffer and reset offsets / cold-V state.
+            self.keys = None;
+            self.values = None;
+            self.key_scales = None;
+            self.val_scales = None;
+            self.v_packed = None;
+            self.v_norms = None;
+            self.v_rescale = None;
+            self.k_packed = None;
+            self.k_norms = None;
+            self.cold_offset = 0;
+            self.offset = 0;
+            return Ok(());
+        }
+
+        // Slice axis 2 (seq-len) of each tensor to the new length. Width axes
+        // (B, H, head_dim / packed_dim) come from the existing shape.
+        let trim_axis_seq = |a: &Option<UniquePtr<MlxArray>>,
+                             tail_axis: i32|
+         -> Option<UniquePtr<MlxArray>> {
+            a.as_ref().map(|arr| {
+                let shape = ffi::array_shape(arr);
+                let last = if tail_axis == 0 { shape[3] } else { tail_axis };
+                ffi::slice(
+                    arr,
+                    &[0, 0, 0, 0],
+                    &[shape[0], shape[1], new_len, last],
+                )
+            })
+        };
+
+        if self.mode == KVCacheMode::Turbo4Delegated {
+            // K is unified — same shape contract as Fp16. Slice to `new_len`.
+            self.keys = trim_axis_seq(&self.keys, 0);
+
+            let new_cold = self.cold_offset.min(new_len);
+            let new_hot_len = new_len - new_cold;
+
+            // V buffer interpretation depends on the FP16 fast path. When the
+            // fast path is on, V is a unified FP16 working set sliced to the
+            // total length; when off, V is the hot ring sliced to the new hot
+            // tail length.
+            if let Some(ref v) = self.values {
+                let v_shape = ffi::array_shape(v);
+                let visible_v_len = if self.delegated_fp16_fast_path {
+                    new_len
+                } else {
+                    new_hot_len
+                };
+                // NOTE: when `visible_v_len == 0` we explicitly drop the V
+                // buffer (set to `None`). This diverges intentionally from
+                // `KVCache::trim`, which leaves the backing buffer in place
+                // in the same scenario (its `if visible_v_len > 0` guard
+                // simply skips the slice call). In the live cache the
+                // retained stale buffer is harmless because `update_and_fetch`
+                // checks `offset == 0` before reading V; in the detached
+                // handle the stale buffer would be re-installed via
+                // `install_detached` and could be decoded against, so we zero
+                // it out defensively here.
+                self.values = if visible_v_len > 0 {
+                    Some(ffi::slice(
+                        v,
+                        &[0, 0, 0, 0],
+                        &[v_shape[0], v_shape[1], visible_v_len, v_shape[3]],
+                    ))
+                } else {
+                    None
+                };
+            }
+
+            // Cold-V sidecars only need re-slicing when cold actually shrank.
+            // Re-slice unconditionally to `new_cold` so we never carry cold
+            // state past the new logical boundary.
+            if new_cold > 0 {
+                if let Some(ref vp) = self.v_packed {
+                    let vp_shape = ffi::array_shape(vp);
+                    self.v_packed = Some(ffi::slice(
+                        vp,
+                        &[0, 0, 0, 0],
+                        &[vp_shape[0], vp_shape[1], new_cold, vp_shape[3]],
+                    ));
+                }
+                if let Some(ref vn) = self.v_norms {
+                    let vn_shape = ffi::array_shape(vn);
+                    self.v_norms = Some(ffi::slice(
+                        vn,
+                        &[0, 0, 0, 0],
+                        &[vn_shape[0], vn_shape[1], new_cold, 1],
+                    ));
+                }
+                if let Some(ref vr) = self.v_rescale {
+                    let vr_shape = ffi::array_shape(vr);
+                    self.v_rescale = Some(ffi::slice(
+                        vr,
+                        &[0, 0, 0, 0],
+                        &[vr_shape[0], vr_shape[1], new_cold, 1],
+                    ));
+                }
+            } else {
+                // Cold portion fully erased.
+                self.v_packed = None;
+                self.v_norms = None;
+                self.v_rescale = None;
+            }
+
+            self.cold_offset = new_cold;
+            self.offset = new_len;
+        } else {
+            // Non-delegated modes: simple buffer-prefix trim along axis 2.
+            self.keys = trim_axis_seq(&self.keys, 0);
+            self.values = trim_axis_seq(&self.values, 0);
+
+            // INT8 scale sidecars carry a width-1 head-axis (axis 3).
+            if self.mode == KVCacheMode::Int8 {
+                self.key_scales = trim_axis_seq(&self.key_scales, 1);
+                self.val_scales = trim_axis_seq(&self.val_scales, 1);
+            }
+
+            // Turbo4* V sidecars (per-token packed + norms + rescale).
+            if matches!(
+                self.mode,
+                KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo3Asym
+            ) {
+                self.v_packed = trim_axis_seq(&self.v_packed, 0);
+                self.v_norms = trim_axis_seq(&self.v_norms, 1);
+                self.v_rescale = trim_axis_seq(&self.v_rescale, 1);
+            }
+
+            // K-side sidecars exist only in symmetric Turbo4.
+            if self.mode == KVCacheMode::Turbo4 {
+                self.k_packed = trim_axis_seq(&self.k_packed, 0);
+                self.k_norms = trim_axis_seq(&self.k_norms, 1);
+            }
+
+            self.offset = new_len;
+        }
+
+        debug_assert!(
+            self.offset == new_len,
+            "DetachedKVCache::trim_to: post-condition failed: offset {} != new_len {} (was {prev_offset})",
+            self.offset,
+            new_len
+        );
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for DetachedKVCache {
@@ -579,6 +778,77 @@ impl DetachedCacheSet {
     /// so the first layer's `offset` is a faithful summary of the set.
     pub fn seq_len(&self) -> i32 {
         self.caches.first().map(|c| c.offset).unwrap_or(0)
+    }
+
+    /// Shrink every per-layer detached cache to exactly `new_len` tokens.
+    ///
+    /// Walks each [`DetachedKVCache`] and calls [`DetachedKVCache::trim_to`]
+    /// in lockstep, then updates the set-wide `prompt_len` and
+    /// `current_offset` so accounting downstream of `CachePool::adopt`
+    /// matches the new logical length. An empty cache set or `new_len`
+    /// equal to the existing length is a no-op.
+    ///
+    /// The intended caller is the scheduler's `try_adopt_cached_prefix` when
+    /// an APC (issue #552) lookup returns a block-aligned `matched_len`
+    /// shorter than the candidate entry's full token length — i.e. the
+    /// request and the cached entry agree on the first N blocks but diverge
+    /// at block N+1. Truncating the detached set to `matched_len` before
+    /// adoption gives the model worker a KV cache whose logical length
+    /// exactly matches the prefix the prefill loop will skip, so the next
+    /// `update_and_fetch` writes at the correct seq-len offset.
+    ///
+    /// Returns `Err(_)` if any layer's `trim_to` rejects the request (e.g.
+    /// `new_len > seq_len`). On error, layers already truncated stay at
+    /// the new length — the caller should drop the set rather than retry.
+    ///
+    /// Used by: [`crate::cache::CachePool::adopt`] callers that need
+    /// per-block partial adoption (issue #580).
+    #[must_use = "truncate_to returns Err on partial failure; on error some layers are already trimmed and the set must be dropped, not retried"]
+    pub fn truncate_to(&mut self, new_len: i32) -> Result<(), String> {
+        if new_len < 0 {
+            return Err(format!(
+                "DetachedCacheSet::truncate_to: new_len must be non-negative, got {new_len}"
+            ));
+        }
+        if self.caches.is_empty() {
+            // Empty set is a degenerate value; truncation is vacuously OK.
+            self.current_offset = new_len;
+            self.prompt_len = (new_len as usize).min(self.prompt_len);
+            return Ok(());
+        }
+        // Sanity: every layer must agree on the pre-truncate seq length so
+        // we never silently divergent-trim a set produced by a different
+        // sequence layout.
+        let head = self.caches[0].offset;
+        debug_assert!(
+            self.caches.iter().all(|c| c.offset == head),
+            "DetachedCacheSet::truncate_to: layers disagree on seq_len: {:?}",
+            self.caches.iter().map(|c| c.offset).collect::<Vec<_>>()
+        );
+        if new_len == head {
+            return Ok(());
+        }
+        if new_len > head {
+            return Err(format!(
+                "DetachedCacheSet::truncate_to: new_len ({new_len}) exceeds current seq_len ({head})"
+            ));
+        }
+
+        for (i, cache) in self.caches.iter_mut().enumerate() {
+            cache.trim_to(new_len).map_err(|e| {
+                format!("DetachedCacheSet::truncate_to: layer {i} trim_to failed: {e}")
+            })?;
+        }
+
+        self.current_offset = new_len;
+        // `prompt_len` is the originating prompt size at detach time. After a
+        // partial adoption the request shares only `new_len` of those tokens,
+        // so clamp to that — never grow beyond.
+        let new_prompt = new_len.max(0) as usize;
+        if new_prompt < self.prompt_len {
+            self.prompt_len = new_prompt;
+        }
+        Ok(())
     }
 }
 

@@ -6,6 +6,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+- APC block-level partial cache adoption in the scheduler (issue #580). When Automatic Prefix Caching is enabled, a request whose prompt shares the first N blocks with a cached entry but diverges at block N+1 now reuses blocks 0..N and re-prefills only from the divergence boundary — rather than cold-prefilling the entire prompt. Three components: `DetachedKVCache::trim_to` and `DetachedCacheSet::truncate_to` in `mlxcel-core` perform per-layer KV tensor slicing on the detached handle (mirroring `KVCache::trim` semantics, covering FP16/INT8/Turbo4/Turbo4Delegated sidecars); the `PromptCacheStore` lookup relaxes the legacy "stored prefix must be fully contained in request" gate when APC is on, routing the actual common-prefix depth through the existing `apc_consistent_prefix_len` block-hash discriminator; and `Scheduler::try_adopt_cached_prefix` calls `truncate_to(matched_len)` before adoption when the lookup returns a sub-entry-length match. APC-off retains the pre-#580 behaviour bit-exactly. Wall-clock bench procedure on Apple Silicon documented in `docs/apc-partial-adoption-bench.md` (#580).
+
 ## [v0.0.26] - 2026-05-10
 
 ### Added

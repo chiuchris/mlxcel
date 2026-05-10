@@ -624,3 +624,350 @@ fn property_detach_adopt_decode_matches_fresh_prefill_int8_within_tolerance() {
         "INT8 detach+adopt+decode dequantized values diverge from fresh prefill"
     );
 }
+
+// ---------------------------------------------------------------------------
+// DetachedKVCache::trim_to / DetachedCacheSet::truncate_to (issue #580)
+// ---------------------------------------------------------------------------
+
+/// Build a [`DetachedCacheSet`] with `num_layers` Fp16 layers, each carrying
+/// the supplied k/v vectors. Convenience helper for the truncate_to tests.
+fn detached_set_with_fp16_layers(num_layers: usize, k: &[f32], v: &[f32]) -> DetachedCacheSet {
+    let mut layer_handles = Vec::with_capacity(num_layers);
+    for _ in 0..num_layers {
+        let mut layer = KVCache::new();
+        layer.update(fp32_tokens(k), fp32_tokens(v));
+        layer_handles.push(layer.clone_handle());
+    }
+    let prompt_len = k.len();
+    let now = Instant::now();
+    DetachedCacheSet {
+        caches: layer_handles,
+        backend: SequenceStateBackend::DenseKvCache,
+        prompt_len,
+        current_offset: prompt_len as i32,
+        created_at: now,
+        detached_at: now,
+        origin_seq_id: SequenceId::from_raw(42),
+    }
+}
+
+#[test]
+fn detached_kvcache_trim_to_mid_buffer_resets_offset_and_visible_keys() {
+    // Build a live cache with 6 tokens, detach it, then trim the inert
+    // handle to 4. After install_detached the visible region must hold the
+    // first 4 tokens bit-identically.
+    let mut live = KVCache::new();
+    let keys = fp32_tokens(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    let values = fp32_tokens(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0]);
+    live.update(keys, values);
+    let mut handle = live.clone_handle();
+    assert_eq!(handle.seq_len(), 6);
+
+    handle.trim_to(4).expect("trim_to mid-buffer must succeed");
+    assert_eq!(handle.seq_len(), 4);
+    assert!(!handle.is_empty());
+
+    // Round-trip into a fresh cache and verify the first 4 tokens survived.
+    let mut restored = KVCache::new();
+    restored.install_detached(handle).unwrap();
+    assert_eq!(restored.seq_len(), 4);
+    assert_eq!(visible_keys_as_fp32(&restored), vec![1.0, 2.0, 3.0, 4.0]);
+}
+
+#[test]
+fn detached_kvcache_trim_to_zero_drops_storage_and_keeps_mode() {
+    let mut live = KVCache::new_with_mode(KVCacheMode::Int8);
+    live.update(
+        fp32_tokens(&[1.0, 2.0, 3.0]),
+        fp32_tokens(&[4.0, 5.0, 6.0]),
+    );
+    let mut handle = live.clone_handle();
+    assert_eq!(handle.seq_len(), 3);
+    assert_eq!(handle.mode(), KVCacheMode::Int8);
+
+    handle.trim_to(0).expect("trim_to zero must succeed");
+    assert_eq!(handle.seq_len(), 0);
+    assert!(handle.is_empty(), "all backing buffers must drop");
+    // Mode is preserved so a downstream install can still adopt INT8 layers.
+    assert_eq!(handle.mode(), KVCacheMode::Int8);
+}
+
+#[test]
+fn detached_kvcache_trim_to_exact_offset_is_noop() {
+    let mut live = KVCache::new();
+    live.update(fp32_tokens(&[1.0, 2.0]), fp32_tokens(&[3.0, 4.0]));
+    let mut handle = live.clone_handle();
+
+    handle.trim_to(2).expect("trim_to exact offset must succeed");
+    assert_eq!(handle.seq_len(), 2);
+
+    let mut restored = KVCache::new();
+    restored.install_detached(handle).unwrap();
+    assert_eq!(visible_keys_as_fp32(&restored), vec![1.0, 2.0]);
+}
+
+#[test]
+fn detached_kvcache_trim_to_past_offset_returns_error_without_mutation() {
+    let mut live = KVCache::new();
+    live.update(fp32_tokens(&[1.0, 2.0]), fp32_tokens(&[3.0, 4.0]));
+    let mut handle = live.clone_handle();
+
+    let err = handle
+        .trim_to(5)
+        .expect_err("trim_to past offset must error");
+    assert!(err.contains("exceeds current offset"));
+    assert_eq!(handle.seq_len(), 2, "handle must be unchanged after error");
+}
+
+#[test]
+fn detached_kvcache_trim_to_negative_returns_error() {
+    let mut live = KVCache::new();
+    live.update(fp32_tokens(&[1.0]), fp32_tokens(&[2.0]));
+    let mut handle = live.clone_handle();
+
+    let err = handle.trim_to(-1).expect_err("trim_to negative must error");
+    assert!(err.contains("non-negative"));
+    assert_eq!(handle.seq_len(), 1);
+}
+
+#[test]
+fn detached_kvcache_trim_to_int8_preserves_per_token_scales() {
+    // INT8 mode carries per-token scale tensors. Trim must slice them in
+    // lockstep with the data tensors so a subsequent dequantize stays
+    // bit-identical to the already-trimmed live cache.
+    let mut live = KVCache::new_with_mode(KVCacheMode::Int8);
+    live.update(
+        fp32_tokens(&[1.0, 8.0, 64.0, 0.125]),
+        fp32_tokens(&[2.0, 16.0, 128.0, 0.0625]),
+    );
+    let mut handle = live.clone_handle();
+    assert_eq!(handle.seq_len(), 4);
+    assert!(handle.key_scales.is_some(), "INT8 carries key_scales");
+    assert!(handle.val_scales.is_some(), "INT8 carries val_scales");
+
+    handle.trim_to(2).expect("trim_to 2 must succeed");
+    assert_eq!(handle.seq_len(), 2);
+
+    // Scale buffers must still be present and shaped consistently with the
+    // data tensors. We probe shape via a round-trip install.
+    let mut restored = KVCache::new_with_mode(KVCacheMode::Int8);
+    restored.install_detached(handle).unwrap();
+    assert_eq!(restored.seq_len(), 2);
+    assert_eq!(restored.mode, KVCacheMode::Int8);
+    assert!(restored.key_scales.is_some());
+    assert!(restored.val_scales.is_some());
+
+    // Dequantization should still produce a plausible value range for the
+    // first two tokens. The exact bytes are mode-dependent so we just check
+    // the cache reports the right length and survives a no-op update.
+    let (k, v) = restored.update_and_fetch(fp32_tokens(&[256.0]), fp32_tokens(&[512.0]));
+    eval(&k);
+    eval(&v);
+    assert_eq!(restored.seq_len(), 3);
+}
+
+#[test]
+fn detached_cache_set_truncate_to_partial_shrinks_every_layer() {
+    // Build a 3-layer set with 8 tokens per layer and truncate to 5. Every
+    // layer's per-tensor seq-len axis must end up at 5, the set-wide
+    // current_offset must mirror that, and prompt_len clamps too. The
+    // round-trip into a fresh CachePool must produce caches at length 5.
+    let model = RecordingModel::new(3);
+    let mut pool = CachePool::new(2);
+    let k: Vec<f32> = (1..=8).map(|i| i as f32 * 0.5).collect();
+    let v: Vec<f32> = (1..=8).map(|i| i as f32 * 1.5).collect();
+    let mut detached = detached_set_with_fp16_layers(3, &k, &v);
+    assert_eq!(detached.seq_len(), 8);
+    assert_eq!(detached.prompt_len, 8);
+
+    detached.truncate_to(5).expect("truncate_to must succeed");
+    assert_eq!(detached.seq_len(), 5, "first layer length must shrink");
+    assert!(
+        detached.caches.iter().all(|c| c.seq_len() == 5),
+        "every layer must agree on the new length"
+    );
+    assert_eq!(detached.current_offset, 5);
+    assert_eq!(detached.prompt_len, 5, "prompt_len must clamp downward");
+
+    let new_id = pool.adopt(&model, detached).expect("adopt truncated set");
+    let caches = pool.get_caches_mut(new_id).unwrap();
+    assert_eq!(caches.len(), 3);
+    assert_eq!(caches[0].seq_len(), 5);
+    assert_eq!(caches[1].seq_len(), 5);
+    assert_eq!(caches[2].seq_len(), 5);
+
+    // First five visible keys must equal the originating prefix.
+    assert_eq!(
+        visible_keys_as_fp32(&caches[0]),
+        vec![0.5, 1.0, 1.5, 2.0, 2.5]
+    );
+}
+
+#[test]
+fn detached_cache_set_truncate_to_full_length_is_noop() {
+    let k: Vec<f32> = (1..=4).map(|i| i as f32).collect();
+    let v: Vec<f32> = (1..=4).map(|i| i as f32 * 10.0).collect();
+    let mut detached = detached_set_with_fp16_layers(2, &k, &v);
+    assert_eq!(detached.seq_len(), 4);
+
+    detached
+        .truncate_to(4)
+        .expect("truncate_to to current length must succeed");
+    assert_eq!(detached.seq_len(), 4);
+    assert!(detached.caches.iter().all(|c| c.seq_len() == 4));
+    assert_eq!(detached.current_offset, 4);
+    assert_eq!(detached.prompt_len, 4);
+}
+
+#[test]
+fn detached_cache_set_truncate_to_zero_drops_every_layer() {
+    let k: Vec<f32> = (1..=4).map(|i| i as f32).collect();
+    let v: Vec<f32> = (1..=4).map(|i| i as f32 * 10.0).collect();
+    let mut detached = detached_set_with_fp16_layers(2, &k, &v);
+
+    detached.truncate_to(0).expect("truncate_to zero must succeed");
+    assert!(detached.caches.iter().all(|c| c.is_empty()));
+    assert_eq!(detached.current_offset, 0);
+    assert_eq!(detached.prompt_len, 0);
+}
+
+#[test]
+fn detached_cache_set_truncate_to_above_seq_len_returns_error() {
+    let k: Vec<f32> = (1..=3).map(|i| i as f32).collect();
+    let v: Vec<f32> = (1..=3).map(|i| i as f32).collect();
+    let mut detached = detached_set_with_fp16_layers(1, &k, &v);
+
+    let err = detached
+        .truncate_to(99)
+        .expect_err("truncate_to past current seq_len must error");
+    assert!(err.contains("exceeds current seq_len"));
+    // The handle must remain at its original length.
+    assert_eq!(detached.seq_len(), 3);
+}
+
+#[test]
+fn detached_cache_set_truncate_to_negative_returns_error() {
+    let mut detached = detached_set_with_fp16_layers(1, &[1.0, 2.0], &[3.0, 4.0]);
+
+    let err = detached
+        .truncate_to(-1)
+        .expect_err("truncate_to negative must error");
+    assert!(err.contains("non-negative"));
+    assert_eq!(detached.seq_len(), 2);
+}
+
+#[test]
+fn detached_cache_set_truncate_to_then_adopt_then_decode_matches_partial_prefill() {
+    // The key correctness property for issue #580: truncate the detached
+    // set to N tokens, adopt, then decode M more tokens. The resulting
+    // cache state must equal a fresh prefill of the first N tokens followed
+    // by the same M tokens — i.e. truncate is a faithful "rewind to N"
+    // operation on the inert handle.
+    let model = RecordingModel::new(1);
+    let mut pool = CachePool::new(4);
+
+    // Source sequence: 8 tokens of FP16 KV state.
+    let full_k: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+    let full_v: Vec<f32> = (1..=8).map(|i| (i as f32) * 0.25).collect();
+
+    let seq_src = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq_src).unwrap();
+        caches[0].update(fp32_tokens(&full_k), fp32_tokens(&full_v));
+    }
+    let mut detached = pool.detach(seq_src).unwrap();
+    assert_eq!(detached.seq_len(), 8);
+
+    // Truncate to 5 (simulates an APC partial adoption: blocks 0..5 agree
+    // with the request; blocks 5..8 diverge and need re-prefill).
+    detached.truncate_to(5).unwrap();
+    assert_eq!(detached.seq_len(), 5);
+
+    let seq_adopted = pool.adopt(&model, detached).unwrap();
+    let extra_k = &full_k[5..];
+    let extra_v = &full_v[5..];
+    {
+        let caches = pool.get_caches_mut(seq_adopted).unwrap();
+        caches[0].update(fp32_tokens(extra_k), fp32_tokens(extra_v));
+    }
+    let path_a_keys = {
+        let caches = pool.get_caches_mut(seq_adopted).unwrap();
+        visible_keys_as_fp32(&caches[0])
+    };
+
+    // Reference: fresh prefill(8) of the same tokens.
+    let seq_fresh = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq_fresh).unwrap();
+        caches[0].update(fp32_tokens(&full_k), fp32_tokens(&full_v));
+    }
+    let path_b_keys = {
+        let caches = pool.get_caches_mut(seq_fresh).unwrap();
+        visible_keys_as_fp32(&caches[0])
+    };
+
+    assert_eq!(path_a_keys.len(), 8);
+    assert_eq!(path_b_keys.len(), 8);
+    assert_eq!(
+        path_a_keys, path_b_keys,
+        "truncate_to(5)+adopt+decode(3) must reproduce fresh prefill(8) bit-for-bit"
+    );
+}
+
+#[test]
+fn detached_cache_set_truncate_to_int8_preserves_dequantization() {
+    // INT8 layers must survive truncate_to via lockstep slicing of the
+    // per-token scale buffers. A round-trip dequantize must match a fresh
+    // INT8 prefill of the same tokens within tolerance.
+    let model = RecordingModel::new(1);
+    let mut pool = CachePool::new(4);
+
+    let full_k: Vec<f32> = (0..8).map(|i| (i as f32 - 3.0) * 1.75).collect();
+    let full_v: Vec<f32> = (0..8).map(|i| 1.0 + i as f32 * 0.1).collect();
+
+    let seq_src = pool.allocate(&model).unwrap();
+    {
+        let caches = pool.get_caches_mut(seq_src).unwrap();
+        caches[0] = KVCache::new_with_mode(KVCacheMode::Int8);
+        caches[0].update(fp32_tokens(&full_k), fp32_tokens(&full_v));
+    }
+    let mut detached = pool.detach(seq_src).unwrap();
+    detached
+        .truncate_to(5)
+        .expect("INT8 truncate_to must succeed");
+    assert_eq!(detached.seq_len(), 5);
+
+    let seq_adopted = pool.adopt(&model, detached).unwrap();
+    let (k_a, v_a) = {
+        let caches = pool.get_caches_mut(seq_adopted).unwrap();
+        caches[0].update_and_fetch(
+            fp32_tokens(&full_k[5..]),
+            fp32_tokens(&full_v[5..]),
+        )
+    };
+    eval(&k_a);
+    eval(&v_a);
+
+    // Reference: fresh INT8 prefill of all 8 tokens.
+    let seq_fresh = pool.allocate(&model).unwrap();
+    let (k_b, v_b) = {
+        let caches = pool.get_caches_mut(seq_fresh).unwrap();
+        caches[0] = KVCache::new_with_mode(KVCacheMode::Int8);
+        caches[0].update_and_fetch(fp32_tokens(&full_k), fp32_tokens(&full_v))
+    };
+    eval(&k_b);
+    eval(&v_b);
+
+    let close_k = allclose(&k_a, &k_b, 1e-3, 1e-3);
+    eval(&close_k);
+    assert!(
+        item_bool(&close_k),
+        "INT8 truncate_to+adopt+decode keys diverge from fresh prefill"
+    );
+    let close_v = allclose(&v_a, &v_b, 1e-3, 1e-3);
+    eval(&close_v);
+    assert!(
+        item_bool(&close_v),
+        "INT8 truncate_to+adopt+decode values diverge from fresh prefill"
+    );
+}

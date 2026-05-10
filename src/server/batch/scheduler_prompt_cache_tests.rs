@@ -41,7 +41,7 @@ use mlxcel_core::cache::SequenceId;
 
 use crate::server::batch::BatchObservability;
 use crate::server::prompt_cache::{
-    CacheEntry, PromptCacheConfig, PromptCacheStore,
+    ApcConfig, ApcHashAlgo, CacheEntry, PromptCacheConfig, PromptCacheStore,
     key::{MultimodalDigest, PromptCacheKey},
 };
 
@@ -340,4 +340,393 @@ fn batched_prefill_path_detects_adopted_sequences() {
         offsets.iter().any(|&o| o > 0),
         "a single adopted sequence must trigger the fallback"
     );
+}
+
+// ---------------------------------------------------------------------------
+// APC block-level partial adoption (issue #580)
+// ---------------------------------------------------------------------------
+
+const APC_BLOCK_SIZE: usize = 16;
+
+/// Build a [`PromptCacheStore`] with APC enabled and `min_prefix_tokens` set
+/// low enough that block-aligned partial matches (32 tokens at block_size 16)
+/// pass the threshold check. Mirrors `apc_on_config` in
+/// `apc_integration_tests.rs` but adapted to the scheduler-test idiom.
+fn apc_on_test_store() -> Arc<PromptCacheStore> {
+    let apc = ApcConfig {
+        enabled: true,
+        block_size: APC_BLOCK_SIZE,
+        num_blocks: None,
+        hash: ApcHashAlgo::Sha256,
+    };
+    let cfg = PromptCacheConfig::new(
+        true,
+        128 * 1024,
+        32,
+        Duration::from_secs(60),
+        // Low enough that a single full block (16 tokens) passes — but our
+        // scheduler-level partial test below uses 2 full blocks (32 tokens)
+        // which is well above this threshold.
+        4,
+    )
+    .with_apc(apc);
+    Arc::new(PromptCacheStore::with_config(cfg))
+}
+
+/// Build the cache key the scheduler would compose for a request, with an
+/// empty multimodal digest (text-only path — multimodal bypasses the cache
+/// entirely per the scheduler's `is_multimodal` check at request time).
+fn make_text_key<'a>(
+    model_id: &'a str,
+    session_key: &'a str,
+    template_sig: &'a str,
+    tokens: &'a [i32],
+) -> PromptCacheKey<'a> {
+    PromptCacheKey::new_full(
+        model_id,
+        None,
+        template_sig,
+        Some(session_key),
+        MultimodalDigest::empty(),
+        tokens,
+    )
+}
+
+#[test]
+fn apc_block_aligned_partial_match_truncates_to_block_boundary() {
+    // The headline property for issue #580: when a request shares the first
+    // 32 tokens (= 2 blocks) of a 48-token cached entry but diverges at
+    // token 32 (= start of block 2), the store's APC discriminator must
+    // return matched_len == 32, NOT 48. This is the value the scheduler then
+    // hands to `DetachedCacheSet::truncate_to` to adopt only the consistent
+    // prefix and re-prefill the divergent tail.
+    //
+    // The discriminator is exercised at scheduler granularity here: the
+    // entry was inserted under one set of tokens, the lookup runs under a
+    // different (overlapping) set of tokens, and the resulting matched_len
+    // is the value the scheduler's `try_adopt_cached_prefix` would feed to
+    // the partial-adoption truncate path.
+    let store = apc_on_test_store();
+
+    // Stored entry: 48 tokens (3 full blocks of 16).
+    let stored: Vec<i32> = (1..=48).collect();
+    let insert_key = make_text_key("model-A", "session-1", "tpl-A", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert succeeds");
+
+    // Request: first 32 tokens identical, but token 32 diverges (e.g. user
+    // typed something different on the third turn). The next 16 tokens
+    // belong to block 2 of the request's chain, so the chain agreement
+    // length is 32.
+    let mut request: Vec<i32> = stored.clone();
+    request[32] = 9_999; // poison block 2
+    request.extend([1_001, 1_002, 1_003, 1_004]); // tail diverges past token 48
+    let lookup_key = make_text_key("model-A", "session-1", "tpl-A", &request);
+
+    let (hit_entry, matched_len) = store
+        .lookup_longest_prefix(&lookup_key, &request)
+        .expect("APC must report a partial hit, not a miss");
+
+    // The trie's whole-prefix match length is 48 (the full stored prefix).
+    // After APC's block-aligned discriminator, the scheduler-visible
+    // matched_len drops to 32 — exactly two full blocks of agreement.
+    assert_eq!(
+        matched_len, 32,
+        "APC discriminator must clamp to the last block boundary where chains agree"
+    );
+
+    // The cached entry's chain must still cover all 3 of its own blocks; only
+    // the *reported* matched_len was clamped — the entry stays whole so
+    // future requests with a fully-matching prefix can still reuse the
+    // tail.
+    let entry_chain = hit_entry
+        .apc_block_hashes()
+        .expect("APC chain must be attached at insert");
+    assert_eq!(
+        entry_chain.len(),
+        3,
+        "stored entry has 48 tokens / 16 = 3 blocks"
+    );
+
+    // The scheduler's next step would call `take_detached()` then
+    // `DetachedCacheSet::truncate_to(matched_len as i32)`. The truncate API
+    // is unit-tested separately in `mlxcel_core::cache::detach_tests`; here
+    // we only verify that the matched_len fed to it is exactly the
+    // block-aligned partial value.
+    assert!(
+        matched_len < hit_entry.tokens.len(),
+        "matched_len ({matched_len}) must be strictly less than entry.tokens.len() ({}) so the scheduler triggers the truncate path",
+        hit_entry.tokens.len()
+    );
+    assert_eq!(
+        matched_len % APC_BLOCK_SIZE,
+        0,
+        "matched_len must be block-aligned for the truncate to land on a block boundary"
+    );
+
+    // Bookkeeping: the scheduler advances the same observability counters
+    // for partial adoptions that it uses for full ones. The matched-token
+    // tally reflects the partial value.
+    let obs = BatchObservability::new();
+    obs.record_prompt_cache_hit(matched_len);
+    let snap = obs.snapshot();
+    assert_eq!(snap.prompt_cache_hits, 1);
+    assert_eq!(snap.prompt_cache_hit_tokens, 32);
+}
+
+#[test]
+fn apc_block_aligned_partial_match_drops_below_min_prefix_returns_miss() {
+    // When the block-aligned partial match is shorter than
+    // `min_prefix_tokens`, the store treats it as a miss so the scheduler
+    // does not adopt sub-threshold partial caches. This is the safety
+    // valve already encoded in `lookup_longest_prefix`; we exercise it at
+    // scheduler granularity to catch any future regression.
+    let apc = ApcConfig {
+        enabled: true,
+        block_size: APC_BLOCK_SIZE,
+        num_blocks: None,
+        hash: ApcHashAlgo::Sha256,
+    };
+    // min_prefix_tokens = 24, divergence at token 16 -> matched_len = 16 < 24.
+    let cfg =
+        PromptCacheConfig::new(true, 128 * 1024, 32, Duration::from_secs(60), 24).with_apc(apc);
+    let store = Arc::new(PromptCacheStore::with_config(cfg));
+
+    let stored: Vec<i32> = (1..=48).collect();
+    let insert_key = make_text_key("m", "s", "t", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert");
+
+    let mut request = stored.clone();
+    request[16] = 9_999; // diverge at start of block 1 -> agreement = 16 tokens
+    let lookup_key = make_text_key("m", "s", "t", &request);
+
+    assert!(
+        store.lookup_longest_prefix(&lookup_key, &request).is_none(),
+        "matched_len 16 < min_prefix 24 must surface as a miss to the scheduler"
+    );
+}
+
+#[test]
+fn apc_full_match_yields_entry_length_matched_len_no_truncate_path() {
+    // Sanity: when the request's first N tokens fully agree with all blocks
+    // of the cached entry, matched_len equals the entry's full token length.
+    // The scheduler then skips the truncate branch entirely (no work, no
+    // allocations). This is the bit-exact full-prefix path that pre-#580
+    // already worked.
+    let store = apc_on_test_store();
+
+    let stored: Vec<i32> = (1..=48).collect();
+    let insert_key = make_text_key("model-A", "session-1", "tpl-A", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert");
+
+    // Request: stored prefix + 5 fresh user tokens, no divergence inside the
+    // shared portion.
+    let mut request = stored.clone();
+    request.extend([100, 101, 102, 103, 104]);
+    let lookup_key = make_text_key("model-A", "session-1", "tpl-A", &request);
+
+    let (hit_entry, matched_len) = store
+        .lookup_longest_prefix(&lookup_key, &request)
+        .expect("full APC match must hit");
+
+    assert_eq!(
+        matched_len,
+        hit_entry.tokens.len(),
+        "no divergence inside the shared portion -> matched_len equals entry length"
+    );
+    assert_eq!(matched_len, 48);
+}
+
+#[test]
+fn apc_disabled_lookup_ignores_block_divergence_returns_full_prefix() {
+    // With APC disabled, the store's lookup path falls through the
+    // discriminator. Even when block 2 of the request diverges from the
+    // stored entry, the trie / scan path does not see that — the request's
+    // *whole prefix* must contain the entry's tokens for a hit. So this
+    // request (which mutates a token *inside* the stored prefix) misses,
+    // because the trie key check fails: `tokens[..token_len] !=
+    // slot.entry.tokens`.
+    //
+    // This guards against a regression where APC-off accidentally inherits
+    // APC-on truncation logic.
+    let cfg = PromptCacheConfig::new(true, 128 * 1024, 32, Duration::from_secs(60), 4);
+    let store = Arc::new(PromptCacheStore::with_config(cfg));
+
+    let stored: Vec<i32> = (1..=48).collect();
+    let insert_key = make_text_key("model-A", "session-1", "tpl-A", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert");
+
+    let mut request = stored.clone();
+    request[32] = 9_999;
+    request.extend([200, 201]);
+    let lookup_key = make_text_key("model-A", "session-1", "tpl-A", &request);
+
+    // Both the trie path and the scan path require the entry's full token
+    // prefix to match the request's leading tokens byte-for-byte. The
+    // mutated token at index 32 invalidates that, so the lookup is a miss
+    // — APC discriminator never runs because there is no candidate.
+    assert!(
+        store.lookup_longest_prefix(&lookup_key, &request).is_none(),
+        "APC-off lookup with internal divergence must miss (no partial adoption)"
+    );
+}
+
+#[test]
+fn scheduler_partial_adoption_synthetic_savings_match_expected_fraction() {
+    // Synthetic prefill-cost microbench for issue #580. We model the
+    // scheduler's prefill workload as `prompt_tokens.len() - matched_len`
+    // and confirm that block-aligned partial adoption recovers the
+    // expected fraction of work compared to a cold prefill (matched_len 0).
+    //
+    // This is the synthetic counterpart to the Apple-Silicon hardware bench
+    // documented in `docs/apc-partial-adoption-bench.md`; that bench
+    // measures wall-clock prefill time on Llama 3.1 8B 4bit. Here we just
+    // verify the algebra: matched_len drives a proportional reduction in
+    // tokens fed to the model.
+    //
+    // Configuration:
+    // - block_size = 16
+    // - cached entry length = 64 tokens (4 full blocks)
+    // - request length = 80 tokens (5 blocks)
+    // - divergence at request-token K -> matched_len = floor(K/16) * 16
+    let store = apc_on_test_store();
+    let stored: Vec<i32> = (1..=64).collect();
+    let insert_key = make_text_key("model-A", "session-1", "tpl-A", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert");
+
+    let request_total = 80usize;
+    // Cold prefill baseline: no cache, all tokens fed to the model.
+    let cold_prefill_cost = request_total;
+
+    struct Case {
+        divergence_token: usize,
+        expected_matched: usize,
+        expected_savings_fraction: f64,
+    }
+    let cases = [
+        // Divergence at block boundary -> matched_len equals divergence.
+        Case {
+            divergence_token: 16,
+            expected_matched: 16,
+            expected_savings_fraction: 16.0 / 80.0,
+        },
+        Case {
+            divergence_token: 32,
+            expected_matched: 32,
+            expected_savings_fraction: 32.0 / 80.0,
+        },
+        Case {
+            divergence_token: 48,
+            expected_matched: 48,
+            expected_savings_fraction: 48.0 / 80.0,
+        },
+        // Divergence inside block 3 (mid-block). matched_len floors to the
+        // last full-block boundary the chains agree on -> 48.
+        Case {
+            divergence_token: 55,
+            expected_matched: 48,
+            expected_savings_fraction: 48.0 / 80.0,
+        },
+        // Full match: request shares all 64 stored tokens, matched_len = 64.
+        // (No divergence inside the shared portion.)
+        Case {
+            divergence_token: usize::MAX,
+            expected_matched: 64,
+            expected_savings_fraction: 64.0 / 80.0,
+        },
+    ];
+
+    for case in cases {
+        let mut request: Vec<i32> = stored.clone();
+        if case.divergence_token < stored.len() {
+            request[case.divergence_token] = 9_999;
+        }
+        // Pad request to 80 tokens with a trailing user turn.
+        while request.len() < request_total {
+            request.push(1_000 + request.len() as i32);
+        }
+        assert_eq!(request.len(), request_total);
+
+        let lookup_key = make_text_key("model-A", "session-1", "tpl-A", &request);
+        let matched = store
+            .lookup_longest_prefix(&lookup_key, &request)
+            .map(|(_, m)| m)
+            .unwrap_or(0);
+        assert_eq!(
+            matched, case.expected_matched,
+            "divergence@{} -> matched_len mismatch",
+            case.divergence_token
+        );
+
+        let warm_prefill_cost = request_total - matched;
+        let savings = cold_prefill_cost - warm_prefill_cost;
+        let savings_fraction = savings as f64 / cold_prefill_cost as f64;
+        assert!(
+            (savings_fraction - case.expected_savings_fraction).abs() < 1e-9,
+            "divergence@{} -> savings_fraction {savings_fraction} expected ~{}",
+            case.divergence_token,
+            case.expected_savings_fraction
+        );
+
+        // Print a row a human can read when the test is run with --nocapture.
+        eprintln!(
+            "[apc_partial_adoption_bench] divergence@{:>3}  matched={:>2}/{}  cold_cost={cold_prefill_cost}  warm_cost={warm_prefill_cost}  savings={:>5.1}%",
+            case.divergence_token,
+            matched,
+            stored.len(),
+            savings_fraction * 100.0
+        );
+    }
+}
+
+#[test]
+fn scheduler_partial_adoption_invariant_matched_len_is_block_aligned() {
+    // Property: for any APC-on lookup that returns Some, the reported
+    // matched_len is divisible by `block_size`. The scheduler's truncate_to
+    // call therefore always lands on a block boundary, never producing a
+    // sub-block KV state that the next prefill step couldn't continue from.
+    //
+    // We sweep divergence points across multiple blocks to exercise the
+    // invariant beyond a single configuration.
+    let store = apc_on_test_store();
+    let stored: Vec<i32> = (1..=64).collect(); // 4 full blocks
+    let insert_key = make_text_key("m", "s", "t", &stored);
+    store
+        .insert(&insert_key, CacheEntry::new_for_test(stored.clone(), 4096))
+        .expect("insert");
+
+    // Divergence at the start of block 1, 2, 3 should give matched_len
+    // 16, 32, 48 respectively. Divergence at token 4 (inside block 0) is
+    // below min_prefix and surfaces as a miss; that case is covered by a
+    // separate test above.
+    for divergence in [16usize, 32, 48] {
+        let mut request = stored.clone();
+        request[divergence] = 9_999;
+        request.extend([700, 701]);
+        let lookup_key = make_text_key("m", "s", "t", &request);
+
+        let (_, matched_len) = store
+            .lookup_longest_prefix(&lookup_key, &request)
+            .unwrap_or_else(|| {
+                panic!("divergence at token {divergence} must produce a partial hit, not a miss")
+            });
+        assert_eq!(
+            matched_len, divergence,
+            "matched_len for divergence at token {divergence} must equal {divergence}"
+        );
+        assert_eq!(
+            matched_len % APC_BLOCK_SIZE,
+            0,
+            "matched_len {matched_len} for divergence at {divergence} must be block-aligned"
+        );
+    }
 }

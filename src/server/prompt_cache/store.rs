@@ -497,6 +497,14 @@ impl PromptCacheStore {
         let best = {
             let guard = self.inner.read().expect("prompt cache inner lock");
             let min_len = guard.config.min_prefix_tokens;
+            // Issue #580: when APC is on, the trie / scan tiers may surface
+            // candidates whose stored prefix is **not** fully contained in
+            // the request. The block-hash discriminator below clamps the
+            // resulting `matched` value to the last block boundary where
+            // the chains agree. When APC is off, retain the legacy
+            // whole-prefix-contained check inside both tiers so the
+            // pre-#580 hot path is bit-exact.
+            let apc_partial_allowed = guard.config.apc_enabled();
             let trie = match guard.tries.get(&sessionless) {
                 Some(t) => t,
                 None => {
@@ -504,8 +512,19 @@ impl PromptCacheStore {
                     return self.finalize_miss();
                 }
             };
-            super::lookup::select_best(trie, key, tokens, min_len, |d| guard.entries.get(d))
-                .or_else(|| select_best_by_scan(&guard, &sessionless, key, tokens, min_len))
+            super::lookup::select_best(trie, key, tokens, min_len, apc_partial_allowed, |d| {
+                guard.entries.get(d)
+            })
+            .or_else(|| {
+                select_best_by_scan(
+                    &guard,
+                    &sessionless,
+                    key,
+                    tokens,
+                    min_len,
+                    apc_partial_allowed,
+                )
+            })
         };
 
         // Increment lookup counters under the write lock so statistics stay
@@ -551,6 +570,18 @@ impl PromptCacheStore {
                     // on every block, so even if a candidate slipped
                     // through bucket isolation it cannot be adopted across
                     // payloads.
+                    // When `apc_on` is true but `entry_apc_hashes` is `None`
+                    // the entry was written before APC was enabled on this
+                    // store (e.g. the store was reconfigured at runtime, or
+                    // the entry was inserted by a code path that predates
+                    // APC). This is not an invariant violation — it is a
+                    // normal "old-format entry in a new-APC store" case.
+                    // Falling through to `winner.matched` is safe: we cannot
+                    // perform block-hash verification without a stored chain,
+                    // so we treat the entry as if APC were off and accept the
+                    // trie-reported match depth at face value. The entry will
+                    // be replaced by an APC-aware version after the next
+                    // insert on this key.
                     let apc_matched = if apc_on && let Some(hashes) = entry_apc_hashes.as_deref() {
                         apc_consistent_prefix_len(
                             tokens,
@@ -640,12 +671,22 @@ fn better_candidate(a: &super::lookup::BestCandidate, b: &super::lookup::BestCan
     a.last_used > b.last_used
 }
 
+/// Scan-tier fallback for `lookup_longest_prefix`. Called when the trie
+/// lookup yields no candidate for the given sessionless bucket key.
+///
+/// **Per-entry cost note (APC on):** when `apc_partial_allowed` is `true`
+/// each entry in the bucket is scored by `common_prefix_len`, an O(min(a,b))
+/// comparison. For stores with many entries per bucket and long prompts this
+/// is linear in both dimensions. The primary trie path (O(prompt_len)) should
+/// handle the common case; this scan path is the cold fallback for entries
+/// that share a bucket key but were not indexed under a matching trie prefix.
 fn select_best_by_scan(
     guard: &Inner,
     sessionless: &SessionlessBucketKey,
     key: &PromptCacheKey<'_>,
     tokens: &[i32],
     min_len: usize,
+    apc_partial_allowed: bool,
 ) -> Option<super::lookup::BestCandidate> {
     let caller_session = key.session_key;
     let mut best_same_session: Option<super::lookup::BestCandidate> = None;
@@ -656,10 +697,30 @@ fn select_best_by_scan(
             continue;
         }
         let token_len = slot.entry.tokens.len();
-        if token_len < min_len || token_len > tokens.len() {
+        if token_len < min_len {
             continue;
         }
-        if slot.entry.tokens.as_slice() != &tokens[..token_len] {
+        // Compute the longest common prefix between the request tokens
+        // and the entry's stored tokens. When APC partial adoption is
+        // enabled (issue #580) we surface candidates whose stored prefix
+        // diverges inside the request — the caller will clamp the
+        // matched length to a block boundary via the APC discriminator
+        // before adopting. With APC off, the legacy "stored prefix must
+        // be fully contained in request" gate is preserved bit-exactly.
+        if !apc_partial_allowed {
+            if token_len > tokens.len() {
+                continue;
+            }
+            if slot.entry.tokens.as_slice() != &tokens[..token_len] {
+                continue;
+            }
+        }
+        let common = if apc_partial_allowed {
+            common_prefix_len(slot.entry.tokens.as_slice(), tokens)
+        } else {
+            token_len
+        };
+        if common < min_len {
             continue;
         }
 
@@ -670,7 +731,7 @@ fn select_best_by_scan(
         };
         let candidate = super::lookup::BestCandidate {
             digest: *digest,
-            matched: token_len,
+            matched: common,
             last_used: slot.entry.last_used(),
         };
         let bucket = if same_session {
@@ -694,6 +755,15 @@ fn select_best_by_scan(
         (None, Some(o)) => Some(o),
         (None, None) => None,
     }
+}
+
+/// Length of the longest common token prefix between `a` and `b`. Used by
+/// the APC partial-adoption scan path (issue #580) so a candidate whose
+/// stored prefix diverges inside the request still surfaces with its
+/// actual common-prefix length, ready for the block-hash discriminator
+/// to clamp.
+fn common_prefix_len(a: &[i32], b: &[i32]) -> usize {
+    a.iter().zip(b.iter()).take_while(|(x, y)| x == y).count()
 }
 
 impl Default for PromptCacheStore {
