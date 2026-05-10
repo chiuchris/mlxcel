@@ -71,11 +71,15 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
     let config_str = sanitize_config_json(&config_str);
     let v: serde_json::Value = serde_json::from_str(&config_str)?;
 
-    let model_type = v["model_type"]
+    let model_type_raw = v["model_type"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("model_type not found"))?;
+    // Normalize to lowercase so HuggingFace checkpoints that preserve the
+    // upstream casing (e.g. `NemotronH_Nano_Omni_Reasoning_V3`) match the
+    // same arm as their canonical lowercase form.
+    let model_type = model_type_raw.to_ascii_lowercase();
 
-    match model_type {
+    match model_type.as_str() {
         "llama" | "mistral" => Ok(ModelType::Llama),
         "llama4" => Ok(detect_text_or_vlm(
             &v,
@@ -191,6 +195,9 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "pixtral" => Ok(ModelType::PixtralVLM),
         "molmo2" => Ok(ModelType::Molmo2VLM),
         "molmo_point" => Ok(ModelType::MolmoPointVLM),
-        _ => Err(anyhow::anyhow!("Unsupported model type: {}", model_type)),
+        _ => Err(anyhow::anyhow!(
+            "Unsupported model type: {}",
+            model_type_raw
+        )),
     }
 }

@@ -50,6 +50,90 @@ use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 use serde::Deserialize;
 
+/// Bilinear resize a `(src_h, src_w, embed_dim)` table to
+/// `(dst_h, dst_w, embed_dim)`.
+///
+/// Mirrors `align_corners=False, antialias=False` from upstream
+/// `mlx_vlm.models.interpolate.resize_bilinear` — sampling positions are
+/// `(dst + 0.5) * src / dst - 0.5`, with floor/ceil indices clamped to
+/// `[0, src - 1]`. Indices and weights are precomputed on the CPU and the
+/// 4 corners gathered through a single flat `take(axis=0)`, following the
+/// same fast pattern used in `vision/encoders/qwen3_vl.rs`.
+fn bilinear_resize_pos_table(
+    table: &MlxArray,
+    src_h: i32,
+    src_w: i32,
+    dst_h: i32,
+    dst_w: i32,
+    embed_dim: i32,
+) -> UniquePtr<MlxArray> {
+    let dtype = mlxcel_core::array_dtype(table);
+    let total = (dst_h * dst_w) as usize;
+
+    let mut idx_tl = Vec::with_capacity(total);
+    let mut idx_tr = Vec::with_capacity(total);
+    let mut idx_bl = Vec::with_capacity(total);
+    let mut idx_br = Vec::with_capacity(total);
+    let mut w_tl = Vec::with_capacity(total);
+    let mut w_tr = Vec::with_capacity(total);
+    let mut w_bl = Vec::with_capacity(total);
+    let mut w_br = Vec::with_capacity(total);
+
+    let scale_h = src_h as f32 / dst_h as f32;
+    let scale_w = src_w as f32 / dst_w as f32;
+    let h_max = src_h - 1;
+    let w_max = src_w - 1;
+
+    for di in 0..dst_h {
+        let src_i = (di as f32 + 0.5) * scale_h - 0.5;
+        let i_floor_raw = src_i.floor() as i32;
+        let i_floor = i_floor_raw.clamp(0, h_max);
+        let i_ceil = (i_floor_raw + 1).clamp(0, h_max);
+        let dy = src_i - i_floor as f32;
+
+        for dj in 0..dst_w {
+            let src_j = (dj as f32 + 0.5) * scale_w - 0.5;
+            let j_floor_raw = src_j.floor() as i32;
+            let j_floor = j_floor_raw.clamp(0, w_max);
+            let j_ceil = (j_floor_raw + 1).clamp(0, w_max);
+            let dx = src_j - j_floor as f32;
+
+            idx_tl.push(i_floor * src_w + j_floor);
+            idx_tr.push(i_floor * src_w + j_ceil);
+            idx_bl.push(i_ceil * src_w + j_floor);
+            idx_br.push(i_ceil * src_w + j_ceil);
+
+            w_tl.push((1.0 - dy) * (1.0 - dx));
+            w_tr.push((1.0 - dy) * dx);
+            w_bl.push(dy * (1.0 - dx));
+            w_br.push(dy * dx);
+        }
+    }
+
+    let total_i32 = dst_h * dst_w;
+    let flat_table = mlxcel_core::reshape(table, &[src_h * src_w, embed_dim]);
+
+    let gather = |idx: &[i32]| -> UniquePtr<MlxArray> {
+        let idx_arr = mlxcel_core::from_slice_i32(idx, &[total_i32]);
+        mlxcel_core::take(&flat_table, &idx_arr, 0)
+    };
+    let weight = |w: &[f32]| -> UniquePtr<MlxArray> {
+        let w_arr = mlxcel_core::from_slice_f32(w, &[total_i32, 1]);
+        mlxcel_core::astype(&w_arr, dtype)
+    };
+
+    let tl = mlxcel_core::multiply(&gather(&idx_tl), &weight(&w_tl));
+    let tr = mlxcel_core::multiply(&gather(&idx_tr), &weight(&w_tr));
+    let bl = mlxcel_core::multiply(&gather(&idx_bl), &weight(&w_bl));
+    let br = mlxcel_core::multiply(&gather(&idx_br), &weight(&w_br));
+
+    let sum_top = mlxcel_core::add(&tl, &tr);
+    let sum_bot = mlxcel_core::add(&bl, &br);
+    let summed = mlxcel_core::add(&sum_top, &sum_bot);
+
+    mlxcel_core::reshape(&summed, &[dst_h, dst_w, embed_dim])
+}
+
 /// Output of the RADIO vision tower.
 ///
 /// Mirrors upstream `RadioOutput` in `vision.py`. `summary` is the
@@ -324,6 +408,11 @@ struct ViTPatchGenerator {
     /// bilinear-interpolated lookup.
     input_rows: usize,
     input_cols: usize,
+    /// CPE (Conditional Position Embedding) mode flag. Mirrors upstream
+    /// `cpe_mode = (num_rows, num_cols) != input_dims`. When true, dynamic
+    /// resolutions go through a (max_dim, max_dim) bilinear pre-resize
+    /// before window cropping; when false the table is simply cropped.
+    cpe_mode: bool,
 }
 
 impl ViTPatchGenerator {
@@ -364,6 +453,8 @@ impl ViTPatchGenerator {
         let cls_token = ClsToken::from_weights(weights, &format!("{prefix}.cls_token"), config)?;
         let pos_embed = copy_weight(weights, &format!("{prefix}.pos_embed"))?;
 
+        let cpe_mode = (num_rows, num_cols) != (input_rows, input_cols);
+
         Ok(Self {
             embedder,
             video_embedder,
@@ -374,6 +465,7 @@ impl ViTPatchGenerator {
             num_cols,
             input_rows,
             input_cols,
+            cpe_mode,
         })
     }
 
@@ -395,56 +487,84 @@ impl ViTPatchGenerator {
         )
     }
 
-    /// Slice / broadcast the learned position-embed table to the
-    /// runtime's `(patch_h, patch_w)` grid. Returns shape
+    /// Resize the learned position-embed table to the runtime's
+    /// `(patch_h, patch_w)` grid. Returns shape
     /// `[batch, patch_h * patch_w, embed_dim]`.
+    ///
+    /// Mirrors upstream `_get_pos_embeddings` from
+    /// `references/mlx-vlm/mlx_vlm/models/nemotron_h_nano_omni/vision.py`:
+    /// 1. Fast path when runtime grid matches the stored table (no resize).
+    /// 2. CPE mode: bilinear resize the (num_rows, num_cols) table to
+    ///    (max_dim, max_dim) where `max_dim = max(patch_h, patch_w)`, then
+    ///    window-crop to the actual `(patch_h, patch_w)` grid. This keeps
+    ///    the position resolution consistent at the larger axis when the
+    ///    image is non-square.
+    /// 3. Non-CPE mode: window-crop the stored table directly.
+    /// 4. Final bilinear resize if the cropped/resized table still
+    ///    doesn't match `(patch_h, patch_w)` exactly (e.g. when the
+    ///    runtime grid exceeds the stored table on a non-CPE checkpoint).
     fn get_pos_embeddings(
         &self,
         batch_size: i32,
         patch_h: usize,
         patch_w: usize,
     ) -> UniquePtr<MlxArray> {
-        // Fast path: runtime grid matches the table's stored grid; just
-        // broadcast without slicing.
         if patch_h == self.num_rows && patch_w == self.num_cols {
             let shape = mlxcel_core::array_shape(&self.pos_embed);
             return mlxcel_core::broadcast_to(&self.pos_embed, &[batch_size, shape[1], shape[2]]);
         }
 
-        // Released-checkpoint path: image_size matches the configured
-        // input size, so the relevant tile lives at the top-left corner
-        // of the position-embed table. We reshape to a 2D grid and slice.
         let shape = mlxcel_core::array_shape(&self.pos_embed);
         let embed_dim = shape[2];
-        if patch_h <= self.num_rows && patch_w <= self.num_cols {
-            let grid = mlxcel_core::reshape(
-                &self.pos_embed,
-                &[1, self.num_rows as i32, self.num_cols as i32, embed_dim],
-            );
-            let sliced = mlxcel_core::slice(
-                &grid,
-                &[0, 0, 0, 0],
-                &[1, patch_h as i32, patch_w as i32, embed_dim],
-            );
-            let flat = mlxcel_core::reshape(&sliced, &[1, (patch_h * patch_w) as i32, embed_dim]);
-            return mlxcel_core::broadcast_to(
-                &flat,
-                &[batch_size, (patch_h * patch_w) as i32, embed_dim],
-            );
-        }
+        let num_rows_i32 = self.num_rows as i32;
+        let num_cols_i32 = self.num_cols as i32;
+        let patch_h_i32 = patch_h as i32;
+        let patch_w_i32 = patch_w as i32;
 
-        // Larger grid than the stored table — fall back to the broadcast
-        // of the full table. This is only reached for resolutions above
-        // `cpe_max_size`, which the checkpoint metadata explicitly
-        // forbids; we keep the path defensive rather than panicking.
-        mlxcel_core::broadcast_to(
-            &self.pos_embed,
-            &[
-                batch_size,
-                (self.num_rows * self.num_cols) as i32,
-                embed_dim,
-            ],
-        )
+        // Reshape stored 1D table to (num_rows, num_cols, embed_dim).
+        let pos_2d =
+            mlxcel_core::reshape(&self.pos_embed, &[num_rows_i32, num_cols_i32, embed_dim]);
+
+        let (resized, cur_h, cur_w) = if self.cpe_mode {
+            // CPE mode: pre-resize to (max_dim, max_dim), then crop.
+            let max_dim = patch_h_i32.max(patch_w_i32);
+            let pre = if max_dim == num_rows_i32 && max_dim == num_cols_i32 {
+                mlxcel_core::copy(pos_2d.as_ref().unwrap())
+            } else {
+                bilinear_resize_pos_table(
+                    &pos_2d,
+                    num_rows_i32,
+                    num_cols_i32,
+                    max_dim,
+                    max_dim,
+                    embed_dim,
+                )
+            };
+            let cropped = if patch_h_i32 < max_dim || patch_w_i32 < max_dim {
+                mlxcel_core::slice(&pre, &[0, 0, 0], &[patch_h_i32, patch_w_i32, embed_dim])
+            } else {
+                pre
+            };
+            (cropped, patch_h_i32, patch_w_i32)
+        } else {
+            // Non-CPE: window-crop the stored table to whichever fits.
+            let h_clip = patch_h_i32.min(num_rows_i32);
+            let w_clip = patch_w_i32.min(num_cols_i32);
+            let cropped = mlxcel_core::slice(&pos_2d, &[0, 0, 0], &[h_clip, w_clip, embed_dim]);
+            (cropped, h_clip, w_clip)
+        };
+
+        // Final bilinear resize if the cropped table still doesn't match
+        // the runtime grid (occurs on non-CPE checkpoints when the image
+        // exceeds the stored grid in either dimension).
+        let final_table = if cur_h != patch_h_i32 || cur_w != patch_w_i32 {
+            bilinear_resize_pos_table(&resized, cur_h, cur_w, patch_h_i32, patch_w_i32, embed_dim)
+        } else {
+            resized
+        };
+
+        let flat = mlxcel_core::reshape(&final_table, &[1, patch_h_i32 * patch_w_i32, embed_dim]);
+        mlxcel_core::broadcast_to(&flat, &[batch_size, patch_h_i32 * patch_w_i32, embed_dim])
     }
 
     fn forward(&self, x: &MlxArray, use_video_embedder: bool) -> UniquePtr<MlxArray> {
