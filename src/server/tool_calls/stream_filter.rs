@@ -52,10 +52,63 @@
 /// "thinking" status without parsing model-specific markers. Both are `None`
 /// when the fragment was fully buffered or fell inside a tool-call block
 /// (tool calls are materialized by the non-streaming parser path, not here).
+///
+/// `suppressed_positions` counts how many input **tokens** (i.e. `feed()`
+/// calls) were consumed by delimiter matching in this call. When a
+/// control-token sequence fires (e.g. `<tool_call>`, `</tool_call>`), the
+/// matched bytes are drained from the buffer without producing any text
+/// output. If the caller is tracking per-token logprobs or other
+/// position-sensitive bookkeeping, it must emit an empty-text placeholder
+/// event for each suppressed position so that the downstream position index
+/// stays aligned with the actual token stream.
+///
+/// This mirrors the upstream mlx-lm fix (PR #1170, commit `aa4f880`):
+///
+/// ```python
+/// if tok.match is not None:
+///     popped = [buffered_stream.pop() for _ in tok.match]
+///     for t in reversed(popped):
+///         buffered_stream.append(replace(t, text=""))
+/// ```
+///
+/// In that code each element of `tok.match` is one token ID (one token
+/// position). The equivalent here counts how many `feed()` calls contributed
+/// text to the matched delimiter span — **not** just the number of complete
+/// delimiter matches. For single-token delimiters the two counts are
+/// identical; for multi-token delimiters (e.g. a Gemma 4 `<|channel>thought`
+/// marker spread across two tokens, or any delimiter that straddles two
+/// consecutive `feed()` calls), this correctly counts each contributing token.
+/// Callers that do not track per-token positions can ignore this field.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FilterOutput {
     pub content: Option<String>,
     pub reasoning: Option<String>,
+    /// Number of input token positions (i.e. `feed()` calls) consumed by
+    /// delimiter matching in this call, with no text emitted. Callers that
+    /// track per-token positions (e.g. logprobs alignment for streaming tool
+    /// calls) should emit one empty-text placeholder event per suppressed
+    /// position so the downstream position index stays in sync with the
+    /// actual token stream.
+    ///
+    /// For most calls this is `0`. It is non-zero only when a complete
+    /// delimiter (e.g. `<tool_call>`, `</tool_call>`) was matched and
+    /// consumed during this `feed()` invocation, **counting each `feed()`
+    /// call that contributed bytes to the matched span**.
+    pub suppressed_positions: usize,
+    /// Total number of input token positions (i.e. `feed()` calls) consumed
+    /// from the internal buffer during this call — both text that was emitted
+    /// to `content` / `reasoning` **and** delimiter matches (suppressed text).
+    ///
+    /// `consumed_positions >= suppressed_positions` always holds.
+    /// `consumed_positions - suppressed_positions` gives the number of token
+    /// positions whose text was emitted (not suppressed) in this call.
+    ///
+    /// Callers that maintain a per-token side-buffer (e.g. a logprob queue
+    /// parallel to the text buffer) can use this to drain the corresponding
+    /// entries in lockstep: drop `consumed_positions - suppressed_positions`
+    /// emitted entries, then pop `suppressed_positions` entries for placeholder
+    /// chunks.
+    pub consumed_positions: usize,
 }
 
 impl FilterOutput {
@@ -64,6 +117,8 @@ impl FilterOutput {
         Self {
             content: Some(text),
             reasoning: None,
+            suppressed_positions: 0,
+            consumed_positions: 0,
         }
     }
 
@@ -72,12 +127,29 @@ impl FilterOutput {
         Self {
             content: None,
             reasoning: Some(text),
+            suppressed_positions: 0,
+            consumed_positions: 0,
         }
     }
 
-    /// `true` when the filter produced no output at all.
+    /// Convenience constructor for a suppressed-positions-only emit.
+    ///
+    /// Used when a delimiter match consumed one or more token positions but
+    /// produced no text output. Callers that track per-token positions should
+    /// emit `n` empty-text placeholder events to preserve position alignment.
+    pub fn suppressed(n: usize) -> Self {
+        Self {
+            content: None,
+            reasoning: None,
+            suppressed_positions: n,
+            consumed_positions: n,
+        }
+    }
+
+    /// `true` when the filter produced no output at all (no text and no
+    /// suppressed positions).
     pub fn is_empty(&self) -> bool {
-        self.content.is_none() && self.reasoning.is_none()
+        self.content.is_none() && self.reasoning.is_none() && self.suppressed_positions == 0
     }
 }
 
@@ -177,6 +249,19 @@ enum FilterState {
 pub struct StreamFilter {
     state: FilterState,
     buffer: String,
+    /// Per-feed byte-length queue used to count how many token positions
+    /// (i.e. `feed()` calls) contributed to the bytes currently in `buffer`.
+    ///
+    /// Each `feed(fragment)` call appends `fragment.len()` to this queue.
+    /// When `drain_buffer()` consumes bytes from the front of `buffer` (via
+    /// `buffer.drain(..N)`), it pops fragment-length entries from the front
+    /// of this queue until `N` bytes are accounted for. The number of entries
+    /// popped is the number of token positions whose text spanned that byte
+    /// range — used as `suppressed_positions` for delimiter matches.
+    ///
+    /// Invariant: `fragment_lengths.iter().sum::<usize>() == buffer.len()`
+    /// before and after every `feed()` / `drain_buffer()` call.
+    fragment_lengths: std::collections::VecDeque<usize>,
     /// Length of the longest delimiter (for partial-match buffering).
     max_delim_len: usize,
 }
@@ -199,6 +284,7 @@ impl StreamFilter {
         Self {
             state: FilterState::Content,
             buffer: String::new(),
+            fragment_lengths: std::collections::VecDeque::new(),
             max_delim_len,
         }
     }
@@ -224,7 +310,16 @@ impl StreamFilter {
     /// text that should be emitted as `delta.content`, `reasoning` holds
     /// text that should be emitted as `delta.reasoning_content`. Either (or
     /// both) may be `None` when the fragment is entirely buffered / suppressed.
+    ///
+    /// Each call corresponds to exactly one decoded token. The byte length of
+    /// `fragment` is recorded in `fragment_lengths` so that `drain_buffer()`
+    /// can count how many token positions (i.e. `feed()` calls) contributed
+    /// to a given byte range when a delimiter is matched.
     pub fn feed(&mut self, fragment: &str) -> FilterOutput {
+        // Record the number of bytes this token contributes to the buffer.
+        // An empty fragment still counts as one token position so that callers
+        // do not lose position alignment when the tokenizer emits empty strings.
+        self.fragment_lengths.push_back(fragment.len());
         self.buffer.push_str(fragment);
         self.drain_buffer()
     }
@@ -238,9 +333,11 @@ impl StreamFilter {
     /// via the parser path, not here).
     pub fn flush(&mut self) -> FilterOutput {
         if self.buffer.is_empty() {
+            self.fragment_lengths.clear();
             return FilterOutput::default();
         }
         let remaining = std::mem::take(&mut self.buffer);
+        self.fragment_lengths.clear();
         match self.state {
             FilterState::Content if !remaining.is_empty() => FilterOutput::content(remaining),
             FilterState::Thinking if !remaining.is_empty() => FilterOutput::reasoning(remaining),
@@ -248,11 +345,69 @@ impl StreamFilter {
         }
     }
 
+    /// Drain `n` bytes from the front of `fragment_lengths`, returning the
+    /// number of `feed()` calls (token positions) that were fully or partially
+    /// consumed.
+    ///
+    /// Each entry in `fragment_lengths` records how many bytes one `feed()`
+    /// call contributed to `buffer`. This method walks the queue from the
+    /// front, subtracting each entry from `n` until all `n` bytes are
+    /// accounted for. The count of entries consumed is returned.
+    ///
+    /// A fragment entry is considered consumed if its bytes fall entirely
+    /// within the `n`-byte window **or** if its bytes straddle the boundary
+    /// (the last entry covers bytes on both sides). Straddling means the
+    /// delimiter ended in the middle of what was originally one token's text —
+    /// that token still counts as a suppressed position because it contributed
+    /// bytes to the matched span.
+    ///
+    /// After this call the sum of remaining entries in `fragment_lengths`
+    /// equals `buffer.len() - n` (since the caller drains those bytes from
+    /// `buffer` immediately after).
+    fn drain_fragment_lengths(&mut self, mut n: usize) -> usize {
+        let mut count = 0usize;
+        while n > 0 {
+            match self.fragment_lengths.pop_front() {
+                Some(frag_len) => {
+                    count += 1;
+                    if frag_len <= n {
+                        n -= frag_len;
+                    } else {
+                        // This fragment straddles the boundary: `n` bytes were
+                        // consumed from it but `frag_len - n` bytes remain.
+                        // Push back the remainder so the invariant holds.
+                        let remainder = frag_len - n;
+                        self.fragment_lengths.push_front(remainder);
+                        n = 0;
+                    }
+                }
+                None => break,
+            }
+        }
+        count
+    }
+
     /// Process the internal buffer: find delimiters, emit content/reasoning,
     /// and transition states.
+    ///
+    /// When a complete delimiter is consumed (e.g. `<tool_call>`,
+    /// `</tool_call>`), the matched bytes are drained without producing text
+    /// output. `suppressed_positions` in the returned [`FilterOutput`] is
+    /// incremented by the number of `feed()` calls whose text spanned the
+    /// matched byte range — **not** merely by one per delimiter hit. This
+    /// correctly handles multi-token delimiters (e.g. a delimiter whose bytes
+    /// were delivered across two or more consecutive `feed()` calls).
+    ///
+    /// This mirrors the upstream mlx-lm fix (PR #1170, commit `aa4f880`):
+    /// `popped = [buffered_stream.pop() for _ in tok.match]` followed by
+    /// `buffered_stream.append(replace(t, text=""))` — each element of
+    /// `tok.match` is one token ID (one position); here we count how many
+    /// `feed()` positions contributed bytes to the matched span.
     fn drain_buffer(&mut self) -> FilterOutput {
         let mut content = String::new();
         let mut reasoning = String::new();
+        let mut suppressed_positions: usize = 0;
+        let mut consumed_positions: usize = 0;
 
         loop {
             if self.buffer.is_empty() {
@@ -270,12 +425,20 @@ impl StreamFilter {
                             FilterState::Thinking => reasoning.push_str(&self.buffer[..pos]),
                             FilterState::ToolCall => {}
                         }
+                        // These bytes are emitted (not suppressed). Drain them
+                        // from fragment_lengths and count as consumed (emitted).
+                        consumed_positions += self.drain_fragment_lengths(pos);
+                        self.buffer.drain(..pos);
                     }
 
-                    // Consume the delimiter and transition (drain in-place
-                    // to avoid allocating a new String per delimiter hit).
-                    let after = pos + delim_len;
-                    self.buffer.drain(..after);
+                    // Consume the delimiter bytes and count how many token
+                    // positions they spanned. Each position that contributed
+                    // bytes to the delimiter range is one suppressed position:
+                    // callers emit empty-text placeholder events for each.
+                    let delim_positions = self.drain_fragment_lengths(delim_len);
+                    suppressed_positions += delim_positions;
+                    consumed_positions += delim_positions;
+                    self.buffer.drain(..delim_len);
                     self.apply_action(action);
                 }
                 None => {
@@ -289,6 +452,7 @@ impl StreamFilter {
                             FilterState::Thinking => reasoning.push_str(&self.buffer[..safe_len]),
                             FilterState::ToolCall => {}
                         }
+                        consumed_positions += self.drain_fragment_lengths(safe_len);
                         self.buffer.drain(..safe_len);
                     }
                     break;
@@ -307,6 +471,8 @@ impl StreamFilter {
             } else {
                 Some(reasoning)
             },
+            suppressed_positions,
+            consumed_positions,
         }
     }
 
@@ -1059,6 +1225,284 @@ mod tests {
             out2.content.as_deref(),
             Some("[TOOL_something_else"),
             "partial [TOOL_ that is not [TOOL_CALLS] must be released to content"
+        );
+    }
+
+    // -- Token-position preservation for parallel tool calls (issue #592) --
+    //
+    // Upstream mlx-lm PR #1170 (commit aa4f880) fixed `_process_control_tokens`
+    // so that matched tokens are re-emitted with `text=""` instead of being
+    // silently dropped. Without this, parallel tool calls in streaming mode
+    // lose token-position alignment (logprobs indices go out of sync).
+    //
+    // The equivalent in Rust: `FilterOutput::suppressed_positions` counts how
+    // many delimiter matches were consumed in a single `feed()` call. Callers
+    // that track per-token positions should emit empty-text placeholder events
+    // for each suppressed position.
+
+    #[test]
+    fn parallel_tool_calls_delimiter_tokens_have_suppressed_positions() {
+        // Two consecutive Hermes tool calls, fed token-by-token. Each delimiter
+        // token (`<tool_call>`, `</tool_call>`) must produce exactly one
+        // suppressed_positions event while payload tokens produce zero. This
+        // verifies the upstream mlx-lm PR #1170 fix: delimiter-matched tokens
+        // are re-emitted as empty-text placeholders, not silently dropped.
+        //
+        // In the Python fix: `popped = [buffered_stream.pop() for _ in tok.match]`
+        // followed by `buffered_stream.append(replace(t, text=""))`. Each element
+        // of `tok.match` is one matched token ID. Here, each delimiter `feed()`
+        // call that matches a complete delimiter contributes one suppressed
+        // position, matching the Python per-match-element semantics.
+        let tokens: &[(&str, usize)] = &[
+            // (fragment, expected_suppressed_positions)
+            ("<tool_call>", 1), // EnterToolCall: 1 delimiter match
+            (r#"{"name": "a", "arguments": {"x": 1}}"#, 0), // payload: no delimiter
+            ("</tool_call>", 1), // ExitToolCall: 1 delimiter match
+            ("<tool_call>", 1), // EnterToolCall: 1 delimiter match
+            (r#"{"name": "b", "arguments": {"y": 2}}"#, 0), // payload: no delimiter
+            ("</tool_call>", 1), // ExitToolCall: 1 delimiter match
+        ];
+        // Total delimiter matches (suppressed positions from control-token hits)
+        let expected_suppressed: usize = tokens.iter().map(|(_, n)| n).sum();
+
+        let mut f = StreamFilter::new();
+        let mut actual_suppressed: usize = 0;
+
+        for (tok, expected_sp) in tokens {
+            let out = f.feed(tok);
+            assert_eq!(
+                out.suppressed_positions, *expected_sp,
+                "token {tok:?}: expected suppressed_positions == {expected_sp}, \
+                 got {}",
+                out.suppressed_positions
+            );
+            actual_suppressed += out.suppressed_positions;
+        }
+
+        assert_eq!(
+            actual_suppressed, expected_suppressed,
+            "total suppressed_positions must match expected delimiter-match count"
+        );
+    }
+
+    #[test]
+    fn parallel_tool_calls_delimiter_matches_have_suppressed_positions() {
+        // When a delimiter (`<tool_call>` or `</tool_call>`) is matched, the
+        // returned `FilterOutput` must have `suppressed_positions >= 1` to
+        // signal the position to callers tracking per-token logprobs.
+        let mut f = StreamFilter::new();
+
+        // Open tag: EnterToolCall should suppress 1 position.
+        let out_open = f.feed("<tool_call>");
+        assert_eq!(
+            out_open.suppressed_positions, 1,
+            "`<tool_call>` open tag must produce suppressed_positions == 1; \
+             got {}",
+            out_open.suppressed_positions
+        );
+        assert_eq!(out_open.content, None, "open tag must not emit content");
+
+        // Payload (inside ToolCall state): no delimiter match, 0 suppressed.
+        let out_payload = f.feed(r#"{"name": "fn", "arguments": {}}"#);
+        assert_eq!(
+            out_payload.suppressed_positions, 0,
+            "tool-call payload must not produce suppressed_positions"
+        );
+
+        // Close tag: ExitToolCall should suppress 1 position.
+        let out_close = f.feed("</tool_call>");
+        assert_eq!(
+            out_close.suppressed_positions, 1,
+            "`</tool_call>` close tag must produce suppressed_positions == 1; \
+             got {}",
+            out_close.suppressed_positions
+        );
+        assert_eq!(out_close.content, None, "close tag must not emit content");
+    }
+
+    #[test]
+    fn parallel_gemma4_tool_calls_delimiter_tokens_have_suppressed_positions() {
+        // Same position-preservation test for Gemma 4 pipe-delimited tool calls.
+        // Each `<|tool_call>` / `<tool_call|>` delimiter must produce one
+        // suppressed_positions event; payload tokens produce zero.
+        let tokens: &[(&str, usize)] = &[
+            ("<|tool_call>", 1),
+            ("call:search{q:<|\"|>rust<|\"|>}", 0),
+            ("<tool_call|>", 1),
+            ("<|tool_call>", 1),
+            ("call:fetch{url:<|\"|>https://example.com<|\"|>}", 0),
+            ("<tool_call|>", 1),
+        ];
+        let expected_suppressed: usize = tokens.iter().map(|(_, n)| n).sum();
+
+        let mut f = StreamFilter::new();
+        let mut actual_suppressed: usize = 0;
+
+        for (tok, expected_sp) in tokens {
+            let out = f.feed(tok);
+            assert_eq!(
+                out.suppressed_positions, *expected_sp,
+                "token {tok:?}: expected suppressed_positions == {expected_sp}, \
+                 got {}",
+                out.suppressed_positions
+            );
+            actual_suppressed += out.suppressed_positions;
+        }
+
+        assert_eq!(
+            actual_suppressed, expected_suppressed,
+            "Gemma 4 parallel tool calls: total suppressed must match delimiter-match count"
+        );
+    }
+
+    #[test]
+    fn content_tokens_have_zero_suppressed_positions() {
+        // Regular content tokens must always have suppressed_positions == 0
+        // so that callers do not accidentally emit extra empty-text events.
+        let mut f = StreamFilter::new();
+        let out = f.feed("Hello, world!");
+        assert_eq!(
+            out.suppressed_positions, 0,
+            "plain content must have suppressed_positions == 0"
+        );
+        assert_eq!(
+            out.content.as_deref(),
+            Some("Hello, world!"),
+            "plain content must pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn thinking_delimiter_also_increments_suppressed_positions() {
+        // Thinking delimiters (`<think>`, `</think>`, `<|channel>`, etc.)
+        // are also matched-and-drained, so they should also increment
+        // suppressed_positions. This ensures position alignment is preserved
+        // even when reasoning blocks appear before or between tool calls.
+        let mut f = StreamFilter::new();
+        let out = f.feed("<think>reasoning</think>");
+        // The fragment contains TWO delimiters: <think> and </think>.
+        assert_eq!(
+            out.suppressed_positions, 2,
+            "<think>...</think> must produce suppressed_positions == 2 (one per delimiter match)"
+        );
+        // No content emitted from the markers; reasoning text goes to `reasoning`.
+        assert_eq!(out.content, None);
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning"));
+    }
+
+    // -- HIGH-1 regression: multi-fragment (multi-token) delimiter counting --
+    //
+    // When a delimiter straddles multiple `feed()` calls (i.e. the tokenizer
+    // emits the delimiter bytes spread across several consecutive tokens),
+    // `suppressed_positions` must equal the number of `feed()` calls whose
+    // bytes contributed to the matched delimiter — **not** merely 1 per
+    // delimiter match.
+    //
+    // This is the HIGH-1 fix from PR #615 review: the old code did
+    // `suppressed_positions += 1` per match, which under-counted for
+    // multi-token delimiters. The new code tracks per-fragment byte lengths
+    // and counts how many fragments were consumed by each match.
+
+    #[test]
+    fn multi_fragment_hermes_close_tag_counts_all_token_positions() {
+        // Regression test: `</tool_call>` split across 3 `feed()` calls.
+        // Each call corresponds to one token. The close tag consumes 3 token
+        // positions, so `suppressed_positions` must be 3 for the call that
+        // completes the match (the third feed).
+        let mut f = StreamFilter::new();
+        // Enter ToolCall state with a single-token open tag.
+        let open = f.feed("<tool_call>");
+        assert_eq!(
+            open.suppressed_positions, 1,
+            "single-token open tag == 1 position"
+        );
+        // Feed payload: no delimiter, 0 suppressed.
+        f.feed(r#"{"name":"fn"}"#);
+        // Split close tag across 3 tokens: "</", "tool", "_call>"
+        let frag1 = f.feed("</");
+        assert_eq!(
+            frag1.suppressed_positions, 0,
+            "partial close tag must not fire yet"
+        );
+        let frag2 = f.feed("tool");
+        assert_eq!(frag2.suppressed_positions, 0, "still partial close tag");
+        let frag3 = f.feed("_call>");
+        // When the 3rd fragment completes the close tag, 3 feed() calls'
+        // bytes were consumed: suppressed_positions must be 3.
+        assert_eq!(
+            frag3.suppressed_positions, 3,
+            "3-fragment `</tool_call>` must produce suppressed_positions == 3; \
+             got {}",
+            frag3.suppressed_positions
+        );
+    }
+
+    #[test]
+    fn multi_fragment_gemma4_close_tag_two_tokens_counts_two_positions() {
+        // Regression test: Gemma 4 `<tool_call|>` (12 bytes) split across 2
+        // `feed()` calls — mimicking a tokenizer that emits `<tool_call` and
+        // `|>` as two separate token IDs.
+        let mut f = StreamFilter::new();
+        // Enter ToolCall state.
+        f.feed("<|tool_call>");
+        // Feed payload.
+        f.feed("call:fn{}");
+        // Split `<tool_call|>` across two tokens.
+        let part1 = f.feed("<tool_call");
+        assert_eq!(
+            part1.suppressed_positions, 0,
+            "partial `<tool_call` must not fire"
+        );
+        let part2 = f.feed("|>");
+        assert_eq!(
+            part2.suppressed_positions, 2,
+            "2-fragment `<tool_call|>` must produce suppressed_positions == 2; \
+             got {}",
+            part2.suppressed_positions
+        );
+    }
+
+    #[test]
+    fn single_token_delimiter_still_counts_one_position() {
+        // Sanity check: a delimiter delivered in a single `feed()` call must
+        // still count as exactly 1 suppressed position (no regression for the
+        // common case).
+        let mut f = StreamFilter::new();
+        let out = f.feed("</tool>");
+        // `</tool>` is not a registered delimiter, so no suppression.
+        assert_eq!(out.suppressed_positions, 0);
+
+        let mut f2 = StreamFilter::new();
+        let out2 = f2.feed("<tool_call>");
+        assert_eq!(
+            out2.suppressed_positions, 1,
+            "single-token `<tool_call>` must produce suppressed_positions == 1"
+        );
+        let out3 = f2.feed("</tool_call>");
+        assert_eq!(
+            out3.suppressed_positions, 1,
+            "single-token `</tool_call>` must produce suppressed_positions == 1"
+        );
+    }
+
+    #[test]
+    fn multi_fragment_hermes_close_three_feeds_suppressed_equals_three() {
+        // Explicit assertion matching the PR review example:
+        // feed("</") + feed("tool") + feed("_call>") → suppressed_positions == 3
+        // on the final feed that completes the match.
+        let mut f = StreamFilter::new();
+        f.feed("<tool_call>");
+        f.feed("payload");
+        let r1 = f.feed("</");
+        assert_eq!(r1.suppressed_positions, 0);
+        let r2 = f.feed("tool");
+        assert_eq!(r2.suppressed_positions, 0);
+        let r3 = f.feed("_call>");
+        assert_eq!(
+            r3.suppressed_positions, 3,
+            "feed(`</`) + feed(`tool`) + feed(`_call>`) must give suppressed_positions == 3; \
+             got {}",
+            r3.suppressed_positions
         );
     }
 }
