@@ -1,10 +1,12 @@
 // Copyright © 2025 Apple Inc.
 // Patched by mlxcel: ensure input contiguity in QuantizedMatmul for
 // non-contiguous 3D batched weights (e.g. GLM-4 MLA embed_q with
-// transpose=false). Synced to upstream c9aa5605, which folds in the
-// #3469 cutlass-half-type fix (ensure_row_contiguous on x and indices)
-// and continues to accept the optional<array> lhs_indices / rhs_indices
-// parameters on qmm_sm80 / qmm_naive.
+// transpose=false). Synced to upstream 84961223 (post-c9aa5605: PR #3443
+// extracted qmm_naive / qmm_sm80 kernel bodies into .cuh headers but
+// preserved the public function signatures consumed here, including the
+// #3469 cutlass-half-type fix that landed at c9aa5605: ensure_row_contiguous
+// on x and indices, plus the optional<array> lhs_indices / rhs_indices
+// parameters on qmm_sm80 / qmm_naive).
 
 #include "mlx/backend/cuda/quantized/quantized.h"
 #include "mlx/backend/cuda/device.h"
