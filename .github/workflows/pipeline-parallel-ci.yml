@@ -87,7 +87,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -95,7 +95,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo registry
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry/index/
@@ -136,7 +136,7 @@ jobs:
       # the version suffix when the fixture is rotated.
       - name: Cache CI fixture weights
         id: ci-fixture-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: models/qwen3-0.6b-4bit
           key: ${{ runner.os }}-ci-fixture-qwen3-0.6b-4bit-v1
@@ -212,7 +212,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Resolve model root
         id: model
@@ -236,7 +236,7 @@ jobs:
 
       - name: Upload captured rollout CSV
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: pp-3host-benchmarks-${{ github.run_id }}
           path: |
