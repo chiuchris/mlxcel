@@ -92,6 +92,15 @@ pub enum VlmPreparationSummary {
         image_slots: usize,
         total_tokens: usize,
     },
+    /// Issue #582: Nemotron H Nano Omni expanded one or more audio
+    /// clip placeholders. `audio_clips` is the number of clips
+    /// processed; `audio_tokens` is the post-subsampling encoder
+    /// output token count fed into the merge step.
+    NemotronHNanoOmniAudio {
+        audio_clips: usize,
+        audio_tokens: usize,
+        total_tokens: usize,
+    },
     YoutuVL {
         image_blocks: usize,
         total_image_tokens: i32,

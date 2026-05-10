@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Nemotron H Nano Omni VLM loader (vision-only scope, issue #554).
+//! Nemotron H Nano Omni VLM loader (issues #554, #582).
 //!
 //! Constructs [`crate::vision::NemotronHNanoOmniVlModel`] from a HF
-//! `mlx-community` checkpoint. Audio weights present in the checkpoint
-//! are filtered out — see issue #554's audio follow-up.
+//! `mlx-community` checkpoint. The vision path landed in #554; the
+//! audio path was added in #582 and only activates when the checkpoint
+//! ships a `sound_config` block.
 //!
 //! Wire-up:
 //! - `config.json` carries `text_config` (parsed by
@@ -26,11 +27,19 @@
 //!   and the top-level projector knobs (`projector_hidden_size`,
 //!   `vit_hidden_size`, `downsample_ratio`, `ps_version`,
 //!   `img_context_token_id`).
-//! - Weight remap mirrors upstream `Model.sanitize`: rename
-//!   `mlp1.{0,1,3}` → `mlp1.layers.{0,1,3}` and strip the
-//!   `language_model.` prefix from text weights so the existing
-//!   [`crate::models::NemotronHModel`] sees the same names it does for
-//!   the text-only Nemotron-H checkpoint.
+//! - When `sound_config` is present, the loader additionally parses it
+//!   into [`crate::audio::nemotron_h_nano_omni::NemotronOmniAudioConfig`]
+//!   and builds the Parakeet/Conformer encoder + projection.
+//! - Weight remap mirrors upstream `Model.sanitize` and
+//!   `sanitize_audio_weights`:
+//!   * rename `mlp1.{0,1,3}` → `mlp1.layers.{0,1,3}`,
+//!   * strip the `language_model.` prefix from text weights,
+//!   * skip `sound_encoder.encoder.feature_extractor.*` (training-only
+//!     DSP reference weights),
+//!   * skip `*.num_batches_tracked` BatchNorm scratch state,
+//!   * transpose Conv1d weights `[O, I, K]` → `[O, K, I]` and Conv2d
+//!     weights `[O, I, kh, kw]` → `[O, kh, kw, I]` so MLX channel-last
+//!     conv ops can consume them directly.
 
 use anyhow::Result;
 use mlxcel_core::weights::WeightMap;
@@ -39,6 +48,10 @@ use std::path::Path;
 
 use super::{load_vlm_weights, read_sanitized_vlm_config};
 use crate::LoadedModel;
+use crate::audio::nemotron_h_nano_omni::{
+    NemotronOmniAudioConfig, NemotronOmniFeatureExtractor, NemotronOmniSoundEncoder,
+    NemotronOmniSoundProjection,
+};
 use crate::models::NemotronHModel;
 use crate::models::nemotron_h::{BlockType, NemotronHConfig};
 use crate::vision::encoders::nemotron_h_nano_omni::{
@@ -46,14 +59,24 @@ use crate::vision::encoders::nemotron_h_nano_omni::{
 };
 use crate::vision::nemotron_h_nano_omni_vl::{
     NemotronHNanoOmniProjector, NemotronHNanoOmniVlConfig, NemotronHNanoOmniVlModel,
+    NemotronOmniAudioBundle,
 };
 use crate::vision::processors::nemotron_h_nano_omni::{
     NemotronHNanoOmniImageProcessor, NemotronHNanoOmniProcessorConfig,
 };
 
-/// Strip audio-only weights from the checkpoint. Vision-only PR per
-/// issue #554; audio support is tracked separately.
-fn filter_out_audio_weights(weights: WeightMap) -> WeightMap {
+/// Strip audio-only weights when the checkpoint has no `sound_config`.
+///
+/// Issue #554 dropped every `sound_*`/`audio_tower.*` weight at load
+/// time. Issue #582 keeps them when the checkpoint advertises a
+/// `sound_config` (so the audio encoder can pick them up) and only
+/// strips them when audio is genuinely absent. This preserves
+/// backwards-compatibility for older Nemotron H Nano Omni snapshots
+/// that ship without a sound config.
+fn filter_out_audio_weights(weights: WeightMap, drop_audio: bool) -> WeightMap {
+    if !drop_audio {
+        return weights;
+    }
     weights
         .into_iter()
         .filter(|(key, _)| {
@@ -63,6 +86,44 @@ fn filter_out_audio_weights(weights: WeightMap) -> WeightMap {
                 || key.starts_with("audio_tower."))
         })
         .collect()
+}
+
+/// Mirror upstream `sanitize_audio_weights` from
+/// `references/.../nemotron_h_nano_omni/audio.py`:
+/// - drop `sound_encoder.encoder.feature_extractor.*` (training-only),
+/// - drop `*.num_batches_tracked` BatchNorm scratch state,
+/// - transpose Conv1d weights from PyTorch `[O, I, K]` to MLX
+///   channel-last `[O, K, I]`,
+/// - transpose Conv2d weights from PyTorch `[O, I, kh, kw]` to MLX
+///   channel-last `[O, kh, kw, I]`.
+fn sanitize_audio_weights(weights: WeightMap) -> WeightMap {
+    let mut out = WeightMap::new();
+    for (key, value) in weights {
+        if key.starts_with("sound_encoder.encoder.feature_extractor.") {
+            continue;
+        }
+        if key.ends_with(".num_batches_tracked") {
+            continue;
+        }
+        if key.starts_with("sound_encoder.encoder.") && key.ends_with(".weight") {
+            let shape = mlxcel_core::array_shape(&value);
+            match shape.len() {
+                3 => {
+                    let transposed = mlxcel_core::transpose_axes(&value, &[0, 2, 1]);
+                    out.insert(key, transposed);
+                    continue;
+                }
+                4 => {
+                    let transposed = mlxcel_core::transpose_axes(&value, &[0, 2, 3, 1]);
+                    out.insert(key, transposed);
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        out.insert(key, value);
+    }
+    out
 }
 
 /// Mirror upstream `Model.sanitize` mlp1 layer rename:
@@ -277,12 +338,43 @@ pub(crate) fn load_nemotron_h_nano_omni_vlm(model_path: &Path) -> Result<LoadedM
         .and_then(Value::as_i64)
         .unwrap_or(0) as i32;
 
+    // Parse audio config (issue #582). Audio is opt-in: when
+    // `sound_config` is absent the loader stays bit-for-bit identical
+    // to the issue-#554 path.
+    let audio_config = full_config
+        .get("sound_config")
+        .map(|value| -> Result<NemotronOmniAudioConfig> {
+            serde_json::from_value(value.clone()).map_err(|e| {
+                anyhow::anyhow!("Failed to parse Nemotron H Nano Omni sound_config: {e}")
+            })
+        })
+        .transpose()?;
+    let sound_context_token_id = full_config
+        .get("sound_context_token_id")
+        .and_then(Value::as_i64)
+        .map(|v| v as i32);
+    let sound_start_token_id = full_config
+        .get("sound_start_token_id")
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as i32;
+    let sound_end_token_id = full_config
+        .get("sound_end_token_id")
+        .and_then(Value::as_i64)
+        .unwrap_or(0) as i32;
+
     let eos_token_ids = parse_eos_token_ids(model_path, &full_config);
 
-    // 2. Load weights, drop audio, rename projector layers, then split
-    // text vs. other weights for downstream component construction.
+    // 2. Load weights. When the checkpoint ships a sound_config we
+    // keep audio weights and run the upstream `sanitize_audio_weights`
+    // transpose pass; when audio is absent we drop them as before.
     let raw_weights = load_vlm_weights(model_path)?;
-    let raw_weights = filter_out_audio_weights(raw_weights);
+    let drop_audio = audio_config.is_none();
+    let raw_weights = filter_out_audio_weights(raw_weights, drop_audio);
+    let raw_weights = if audio_config.is_some() {
+        sanitize_audio_weights(raw_weights)
+    } else {
+        raw_weights
+    };
     let raw_weights = rename_projector_weights(raw_weights);
     let (text_weights, other_weights) = split_text_and_others(raw_weights);
 
@@ -313,7 +405,10 @@ pub(crate) fn load_nemotron_h_nano_omni_vlm(model_path: &Path) -> Result<LoadedM
                 anyhow::anyhow!("Failed to load Nemotron H Nano Omni projector: {err}")
             })?;
 
-    // 5. Compose the VLM wrapper.
+    // 5. Compose the VLM wrapper. Audio bundle is attached only when
+    // the checkpoint actually shipped it; failures here surface as
+    // load errors, since a partial audio path is worse than a clean
+    // text+vision-only fallback would be.
     let text_hidden_size = text_model.hidden_size();
     let vl_config = NemotronHNanoOmniVlConfig {
         vit_hidden_size,
@@ -324,10 +419,45 @@ pub(crate) fn load_nemotron_h_nano_omni_vlm(model_path: &Path) -> Result<LoadedM
         img_context_token_id,
         image_start_token_id,
         image_end_token_id,
+        sound_context_token_id,
+        sound_start_token_id,
+        sound_end_token_id,
         eos_token_ids,
     };
-    let model =
+    let mut model =
         NemotronHNanoOmniVlModel::new(text_model, vision_tower, projector, processor, vl_config);
+
+    if let Some(audio_config) = audio_config {
+        let encoder = NemotronOmniSoundEncoder::from_weights(
+            &other_weights,
+            "sound_encoder",
+            &audio_config,
+            group_size,
+            bits,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!("Failed to load Nemotron H Nano Omni sound encoder: {err}")
+        })?;
+        let projection = NemotronOmniSoundProjection::from_weights(
+            &other_weights,
+            "sound_projection",
+            &audio_config,
+            group_size,
+            bits,
+        )
+        .map_err(|err| {
+            anyhow::anyhow!("Failed to load Nemotron H Nano Omni sound projection: {err}")
+        })?;
+        let feature_extractor = NemotronOmniFeatureExtractor::new(&audio_config);
+        let bundle = NemotronOmniAudioBundle {
+            config: audio_config,
+            feature_extractor,
+            encoder,
+            projection,
+        };
+        model = model.with_audio(bundle);
+    }
+
     Ok(LoadedModel::NemotronHNanoOmniVLM(model))
 }
 
@@ -345,4 +475,110 @@ fn bits_from_config(full_config: &Value) -> i32 {
         .and_then(|q| q.get("bits"))
         .and_then(Value::as_i64)
         .unwrap_or(4) as i32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ones(shape: &[i32]) -> mlxcel_core::UniquePtr<mlxcel_core::MlxArray> {
+        mlxcel_core::ones(shape, mlxcel_core::dtype::FLOAT32)
+    }
+
+    #[test]
+    fn filter_out_audio_weights_keeps_audio_when_audio_enabled() {
+        let mut weights = WeightMap::new();
+        weights.insert("language_model.embed_tokens.weight".into(), ones(&[8, 8]));
+        weights.insert(
+            "sound_encoder.encoder.subsampling.layers.0.weight".into(),
+            ones(&[4, 3, 3, 1]),
+        );
+        weights.insert("sound_projection.linear1.weight".into(), ones(&[16, 8]));
+        weights.insert(
+            "sound_encoder.encoder.feature_extractor.something.weight".into(),
+            ones(&[1]),
+        );
+
+        // Audio enabled: only `feature_extractor.*` is left in the map for the sanitizer to drop later.
+        let kept = filter_out_audio_weights(weights, false);
+        assert!(kept.contains_key("sound_encoder.encoder.subsampling.layers.0.weight"));
+        assert!(kept.contains_key("sound_projection.linear1.weight"));
+        assert!(kept.contains_key("sound_encoder.encoder.feature_extractor.something.weight"));
+    }
+
+    #[test]
+    fn filter_out_audio_weights_drops_audio_when_disabled() {
+        let mut weights = WeightMap::new();
+        weights.insert("language_model.embed_tokens.weight".into(), ones(&[8, 8]));
+        weights.insert(
+            "sound_encoder.encoder.subsampling.layers.0.weight".into(),
+            ones(&[4, 3, 3, 1]),
+        );
+        weights.insert("sound_projection.linear1.weight".into(), ones(&[16, 8]));
+        weights.insert("audio_tower.foo".into(), ones(&[1]));
+
+        let kept = filter_out_audio_weights(weights, true);
+        assert!(kept.contains_key("language_model.embed_tokens.weight"));
+        assert!(!kept.contains_key("sound_encoder.encoder.subsampling.layers.0.weight"));
+        assert!(!kept.contains_key("sound_projection.linear1.weight"));
+        assert!(!kept.contains_key("audio_tower.foo"));
+    }
+
+    #[test]
+    fn sanitize_audio_weights_drops_feature_extractor_and_num_batches_tracked() {
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "sound_encoder.encoder.feature_extractor.window".into(),
+            ones(&[10]),
+        );
+        weights.insert(
+            "sound_encoder.encoder.layers.0.conv.norm.num_batches_tracked".into(),
+            ones(&[1]),
+        );
+        weights.insert(
+            "sound_encoder.encoder.layers.0.conv.norm.running_mean".into(),
+            ones(&[16]),
+        );
+        weights.insert("sound_projection.linear1.weight".into(), ones(&[16, 8]));
+
+        let sanitized = sanitize_audio_weights(weights);
+        assert!(!sanitized.contains_key("sound_encoder.encoder.feature_extractor.window"));
+        assert!(
+            !sanitized.contains_key("sound_encoder.encoder.layers.0.conv.norm.num_batches_tracked")
+        );
+        assert!(sanitized.contains_key("sound_encoder.encoder.layers.0.conv.norm.running_mean"));
+        assert!(sanitized.contains_key("sound_projection.linear1.weight"));
+    }
+
+    #[test]
+    fn sanitize_audio_weights_transposes_conv_weights() {
+        let mut weights = WeightMap::new();
+        // Conv1d weight in PyTorch layout: [out=4, in=8, kernel=3].
+        weights.insert(
+            "sound_encoder.encoder.layers.0.conv.depthwise_conv.weight".into(),
+            ones(&[4, 8, 3]),
+        );
+        // Conv2d weight in PyTorch layout: [out=4, in=1, kh=3, kw=3].
+        weights.insert(
+            "sound_encoder.encoder.subsampling.layers.0.weight".into(),
+            ones(&[4, 1, 3, 3]),
+        );
+
+        let sanitized = sanitize_audio_weights(weights);
+        let conv1d_shape = mlxcel_core::array_shape(
+            sanitized
+                .get("sound_encoder.encoder.layers.0.conv.depthwise_conv.weight")
+                .unwrap(),
+        );
+        // After transpose(0,2,1): [4, 3, 8].
+        assert_eq!(conv1d_shape, vec![4, 3, 8]);
+
+        let conv2d_shape = mlxcel_core::array_shape(
+            sanitized
+                .get("sound_encoder.encoder.subsampling.layers.0.weight")
+                .unwrap(),
+        );
+        // After transpose(0,2,3,1): [4, 3, 3, 1].
+        assert_eq!(conv2d_shape, vec![4, 3, 3, 1]);
+    }
 }

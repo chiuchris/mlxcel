@@ -12,18 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Gemma4 audio encoder and feature extraction.
+//! Audio modality root.
 //!
-//! This module implements the Conformer-based audio encoder for Gemma 4's
-//! audio modality, including mel spectrogram feature extraction and the
-//! full encoder pipeline.
+//! mlxcel hosts more than one audio family. The legacy entries
+//! (`config`, `encoder`, `feature_extractor`, `attention`) are the
+//! Gemma 4 USM-style implementation; sibling families add their own
+//! sub-namespaces (currently `nemotron_h_nano_omni`). The Gemma 4
+//! modules are kept at the top level for backwards-compatibility with
+//! the existing VLM wiring; new families should land under their own
+//! submodule from the start.
 //!
-//! Used by: Gemma4 VLM (audio modality)
+//! Used by:
+//! - Gemma 4 VLM (audio modality, top-level files)
+//! - Nemotron H Nano Omni VLM (audio modality, [`nemotron_h_nano_omni`])
 
 mod attention;
 pub mod config;
 pub mod encoder;
 pub mod feature_extractor;
+pub mod nemotron_h_nano_omni;
 
 pub use config::AudioConfig;
 pub use encoder::AudioEncoder;

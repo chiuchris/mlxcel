@@ -129,6 +129,16 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_slots, total_tokens
             );
         }
+        VlmPreparationSummary::NemotronHNanoOmniAudio {
+            audio_clips,
+            audio_tokens,
+            total_tokens,
+        } => {
+            println!(
+                "Nemotron H Nano Omni audio: tokenized {} clip(s) into {} audio token(s) ({} total tokens)",
+                audio_clips, audio_tokens, total_tokens
+            );
+        }
         VlmPreparationSummary::YoutuVL {
             image_blocks,
             total_image_tokens,
@@ -204,6 +214,32 @@ pub(crate) fn compute_vlm_embeddings(
         && let LoadedModel::Gemma4VLM(gemma4_vl) = model
     {
         return compute_gemma4_multimodal_embeddings(gemma4_vl, prompt_tokens, image_paths, audio);
+    }
+
+    // Nemotron H Nano Omni — audio-only or combined image + audio
+    // (issue #582). Mirrors the Gemma 4 dispatch above; the helper
+    // handles both branches so a single match arm covers both modes.
+    if let Some(audio) = audio_path
+        && let LoadedModel::NemotronHNanoOmniVLM(nemotron_vl) = model
+    {
+        return compute_nemotron_h_nano_omni_audio_embeddings(
+            nemotron_vl,
+            prompt_tokens,
+            image_paths,
+            audio,
+        );
+    }
+
+    // Reject `--audio` for any remaining VLM that does not have a
+    // dedicated dispatch above. Without this guard, `--audio` would be
+    // silently dropped and the runtime would emit text-only output —
+    // which is worse than a clear error since the user supplied data
+    // they expect the model to consume.
+    if audio_path.is_some() {
+        return Err(anyhow::anyhow!(
+            "--audio input is not supported for this model family. Currently audio is wired \
+             through Gemma 4 and Nemotron H Nano Omni VLMs only."
+        ));
     }
 
     if image_paths.is_empty() {
@@ -567,4 +603,350 @@ fn expand_gemma4_audio_tokens(
         expanded.push(last);
     }
     *prompt_tokens = expanded;
+}
+
+/// Expand the Nemotron H Nano Omni sound placeholder block.
+///
+/// Mirrors upstream `processing_nemotron_h_nano_omni`'s text rewrite:
+/// each `sound_context_token_id` occurrence in the prompt is wrapped
+/// into `sound_start + sound_context * num_audio_tokens + sound_end`.
+/// If `sound_start_token_id` or `sound_end_token_id` is `0`, the
+/// framing token is omitted (matches the model surface contract that
+/// `0` means "no framing token configured").
+///
+/// If no placeholder is found in the prompt — common when the user
+/// runs `mlxcel generate --audio file.wav -p "..."` without manually
+/// inserting a sound token — the block is prepended before the first
+/// non-special token, mirroring the Nemotron image-token-expansion
+/// path that does the equivalent prepend when the prompt has no
+/// `<image>` placeholder.
+///
+/// Returns the number of audio tokens (post-subsampling) inserted, so
+/// the caller can pass it into the runtime summary.
+fn expand_nemotron_h_nano_omni_audio_tokens(
+    prompt_tokens: &mut Vec<i32>,
+    sound_context_token_id: i32,
+    sound_start_token_id: i32,
+    sound_end_token_id: i32,
+    num_audio_tokens: usize,
+) -> usize {
+    let block_len = num_audio_tokens
+        + if sound_start_token_id != 0 { 1 } else { 0 }
+        + if sound_end_token_id != 0 { 1 } else { 0 };
+    let mut expanded = Vec::with_capacity(prompt_tokens.len() + block_len);
+
+    let mut placed = false;
+    for &token in prompt_tokens.iter() {
+        if token == sound_context_token_id && !placed {
+            placed = true;
+            if sound_start_token_id != 0 {
+                expanded.push(sound_start_token_id);
+            }
+            for _ in 0..num_audio_tokens {
+                expanded.push(sound_context_token_id);
+            }
+            if sound_end_token_id != 0 {
+                expanded.push(sound_end_token_id);
+            }
+        } else {
+            expanded.push(token);
+        }
+    }
+
+    if !placed {
+        // No placeholder. Prepend the audio block (matches the image-
+        // token-expansion fallback in `vlm_runtime` for this model).
+        let mut prepended = Vec::with_capacity(prompt_tokens.len() + block_len);
+        if sound_start_token_id != 0 {
+            prepended.push(sound_start_token_id);
+        }
+        for _ in 0..num_audio_tokens {
+            prepended.push(sound_context_token_id);
+        }
+        if sound_end_token_id != 0 {
+            prepended.push(sound_end_token_id);
+        }
+        prepended.extend(expanded);
+        *prompt_tokens = prepended;
+    } else {
+        *prompt_tokens = expanded;
+    }
+    num_audio_tokens
+}
+
+/// Compute audio embeddings (with optional preceding images) for the
+/// Nemotron H Nano Omni VLM (issue #582).
+///
+/// Mirrors upstream `_extract_sound_features` + `_merge_features`:
+/// 1. Loads the WAV via the shared `audio::load_wav_file` helper.
+/// 2. Validates that the model exposes `sound_context_token_id` and
+///    that the WAV's sample rate matches the configured
+///    `sampling_rate` (mlxcel does not yet ship a resampler in core).
+/// 3. Runs the Parakeet feature extractor to produce mel features +
+///    attention mask + per-clip frame counts.
+/// 4. Computes the post-subsampling audio token count via
+///    `bundle.config.subsampling_output_length(num_frames)` and
+///    expands the sound-context placeholder in `prompt_tokens` into
+///    `sound_start + sound_context * num_audio_tokens + sound_end`.
+/// 5. (Image+audio) preprocesses the images and expands the image
+///    placeholder block. Image expansion uses the same per-image
+///    `num_tokens` and start/end framing as the image-only runtime
+///    path so the combined token stream is identical to what the
+///    runtime would emit for image-only or audio-only inputs.
+/// 6. Calls `model.extract_audio_features(...)` to obtain the
+///    `[total_audio_tokens, hidden_size]` audio embedding flattened
+///    across the batch.
+/// 7. Calls `model.get_input_embeddings_full(input_ids, &images,
+///    Some(&audio_features))` which scatters image features at
+///    `img_context_token_id` slots and audio features at
+///    `sound_context_token_id` slots.
+/// 8. Emits a `VlmPreparationSummary::NemotronHNanoOmniAudio`
+///    summary so the runtime CLI surfaces the audio path.
+fn compute_nemotron_h_nano_omni_audio_embeddings(
+    model: &mlxcel::vision::NemotronHNanoOmniVlModel,
+    prompt_tokens: &mut Vec<i32>,
+    image_paths: &[PathBuf],
+    audio_path: &Path,
+) -> Result<Option<InputEmbeddings>> {
+    use mlxcel::audio;
+    use mlxcel::audio::nemotron_h_nano_omni::NemotronOmniFeatureExtractor;
+
+    let bundle = model.audio().ok_or_else(|| {
+        anyhow::anyhow!(
+            "This Nemotron H Nano Omni checkpoint was loaded without audio support. \
+             The released model must ship a `sound_config` block in `config.json` for audio inputs."
+        )
+    })?;
+
+    let sound_context_token_id = model.config.sound_context_token_id.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Audio path requires `sound_context_token_id` in the model config but it is missing."
+        )
+    })?;
+
+    // Load WAV. Same helper Gemma 4's audio path uses; no duplication.
+    let (samples, sample_rate) =
+        audio::load_wav_file(audio_path).map_err(|e| anyhow::anyhow!("{}", e))?;
+    println!(
+        "Loaded audio: {} samples at {} Hz ({:.1}s)",
+        samples.len(),
+        sample_rate,
+        samples.len() as f64 / sample_rate as f64
+    );
+
+    if sample_rate != bundle.config.sampling_rate {
+        return Err(anyhow::anyhow!(
+            "Audio sample rate {} Hz does not match the model's expected {} Hz. \
+             Resample the WAV (e.g. via `ffmpeg -i in.wav -ar {} out.wav`) before passing it.",
+            sample_rate,
+            bundle.config.sampling_rate,
+            bundle.config.sampling_rate
+        ));
+    }
+
+    // Run the feature extractor. The output is row-major f32 with
+    // shape `[1, num_frames, num_mel_bins]` plus an int32 attention
+    // mask of shape `[1, num_frames]` and a `[1]` lengths vector.
+    let extractor = NemotronOmniFeatureExtractor::new(&bundle.config);
+    let extracted = extractor.extract_batch(&[&samples[..]]);
+    let num_frames = extracted.features_shape[1] as usize;
+
+    // Post-subsampling token count = encoder output length, which
+    // becomes the number of `sound_context_token_id` placeholders in
+    // the expanded prompt. Single-clip CLI input, so feature_lengths
+    // has length 1.
+    let total_frames = extracted
+        .feature_lengths
+        .first()
+        .copied()
+        .unwrap_or(num_frames as i32) as usize;
+    let num_audio_tokens = bundle.config.subsampling_output_length(total_frames).max(1);
+
+    expand_nemotron_h_nano_omni_audio_tokens(
+        prompt_tokens,
+        sound_context_token_id,
+        model.config.sound_start_token_id,
+        model.config.sound_end_token_id,
+        num_audio_tokens,
+    );
+
+    // Optional image branch: preprocess and expand image tokens with
+    // the same per-image token count + framing that the image-only
+    // runtime path uses, so the combined stream matches.
+    let processed_images = if !image_paths.is_empty() {
+        let images: Vec<image::DynamicImage> = image_paths
+            .iter()
+            .map(|path| {
+                image::open(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to load image {:?}: {}", path, e))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        println!("Loaded {} image(s).", images.len());
+        let processed = model.processor.preprocess_batch(&images);
+        expand_nemotron_h_nano_omni_image_tokens(
+            prompt_tokens,
+            model.config.img_context_token_id,
+            model.config.image_start_token_id,
+            model.config.image_end_token_id,
+            &processed,
+        );
+        processed
+    } else {
+        Vec::new()
+    };
+
+    // Build MLX tensors for the encoder. Features in row-major f32,
+    // attention mask in int32 (the encoder broadcasts it via `less`).
+    let audio_features_in = mlxcel_core::from_slice_f32(
+        &extracted.features,
+        &[
+            extracted.features_shape[0],
+            extracted.features_shape[1],
+            extracted.features_shape[2],
+        ],
+    );
+    let audio_attention_mask = mlxcel_core::from_slice_i32(
+        &extracted.attention_mask,
+        &[
+            extracted.attention_mask_shape[0],
+            extracted.attention_mask_shape[1],
+        ],
+    );
+    let feature_lengths = mlxcel_core::from_slice_i32(
+        &extracted.feature_lengths,
+        &[extracted.feature_lengths.len() as i32],
+    );
+
+    // Run the encoder + projector and trim to per-clip valid lengths.
+    let audio_features = model
+        .extract_audio_features(
+            &audio_features_in,
+            Some(&audio_attention_mask),
+            Some(&feature_lengths),
+        )
+        .map_err(|e| anyhow::anyhow!("Audio feature extraction failed: {}", e))?;
+
+    // Compose final input embeddings — image placeholders get image
+    // features, audio placeholders get audio features, in upstream
+    // order (images first, then audio).
+    let input_ids_arr =
+        mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings =
+        model.get_input_embeddings_full(&input_ids_arr, &processed_images, Some(&audio_features));
+
+    print_preparation_summary(VlmPreparationSummary::NemotronHNanoOmniAudio {
+        audio_clips: 1,
+        audio_tokens: num_audio_tokens,
+        total_tokens: prompt_tokens.len(),
+    });
+
+    Ok(Some(embeddings))
+}
+
+/// Expand each `img_context_token_id` placeholder in `prompt_tokens`
+/// into `image_start + img_context * num_tokens + image_end`. Mirrors
+/// the matching block in `vlm_runtime` for this model so the audio +
+/// image CLI path produces the same token stream as the image-only
+/// runtime path.
+fn expand_nemotron_h_nano_omni_image_tokens(
+    prompt_tokens: &mut Vec<i32>,
+    img_context_token_id: i32,
+    image_start_token_id: i32,
+    image_end_token_id: i32,
+    images: &[mlxcel::vision::processors::nemotron_h_nano_omni::NemotronHNanoOmniImageInput],
+) {
+    let mut expanded = Vec::with_capacity(
+        prompt_tokens.len() + images.iter().map(|img| img.num_tokens + 2).sum::<usize>(),
+    );
+    let placeholder_positions: Vec<usize> = prompt_tokens
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &tok)| {
+            if tok == img_context_token_id {
+                Some(idx)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if placeholder_positions.is_empty() {
+        // Prepend one block per image. Matches the runtime fallback.
+        for image in images.iter() {
+            if image_start_token_id != 0 {
+                expanded.push(image_start_token_id);
+            }
+            for _ in 0..image.num_tokens {
+                expanded.push(img_context_token_id);
+            }
+            if image_end_token_id != 0 {
+                expanded.push(image_end_token_id);
+            }
+        }
+        expanded.extend_from_slice(prompt_tokens);
+    } else {
+        let mut image_idx = 0usize;
+        for &token in prompt_tokens.iter() {
+            if token == img_context_token_id && image_idx < images.len() {
+                let image = &images[image_idx];
+                if image_start_token_id != 0 {
+                    expanded.push(image_start_token_id);
+                }
+                for _ in 0..image.num_tokens {
+                    expanded.push(img_context_token_id);
+                }
+                if image_end_token_id != 0 {
+                    expanded.push(image_end_token_id);
+                }
+                image_idx += 1;
+            } else {
+                expanded.push(token);
+            }
+        }
+    }
+    *prompt_tokens = expanded;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_nemotron_h_nano_omni_audio_tokens;
+
+    #[test]
+    fn audio_token_expansion_replaces_first_placeholder() {
+        // Prompt: [BOS, sound_ctx, "hello", EOS]
+        let mut tokens = vec![1i32, 99, 42, 2];
+        let inserted = expand_nemotron_h_nano_omni_audio_tokens(&mut tokens, 99, 7, 8, 3);
+        assert_eq!(inserted, 3);
+        // Expected: [BOS, sound_start, sound_ctx, sound_ctx, sound_ctx, sound_end, "hello", EOS]
+        assert_eq!(tokens, vec![1i32, 7, 99, 99, 99, 8, 42, 2]);
+    }
+
+    #[test]
+    fn audio_token_expansion_omits_zero_framing_tokens() {
+        // sound_start=0, sound_end=0 → no framing tokens emitted.
+        let mut tokens = vec![1i32, 99, 2];
+        let inserted = expand_nemotron_h_nano_omni_audio_tokens(&mut tokens, 99, 0, 0, 2);
+        assert_eq!(inserted, 2);
+        assert_eq!(tokens, vec![1i32, 99, 99, 2]);
+    }
+
+    #[test]
+    fn audio_token_expansion_prepends_when_no_placeholder_present() {
+        // Prompt has no sound_ctx token — block prepended before the
+        // existing tokens.
+        let mut tokens = vec![1i32, 42, 2];
+        let inserted = expand_nemotron_h_nano_omni_audio_tokens(&mut tokens, 99, 7, 8, 2);
+        assert_eq!(inserted, 2);
+        assert_eq!(tokens, vec![7i32, 99, 99, 8, 1, 42, 2]);
+    }
+
+    #[test]
+    fn audio_token_expansion_replaces_only_first_occurrence() {
+        // Two sound_ctx tokens — only the first is expanded so a multi-
+        // clip prompt would land each clip in its own marker (the
+        // single-clip CLI surface uses N=1 here).
+        let mut tokens = vec![99i32, 42, 99, 2];
+        expand_nemotron_h_nano_omni_audio_tokens(&mut tokens, 99, 7, 8, 1);
+        assert_eq!(tokens, vec![7i32, 99, 8, 42, 99, 2]);
+    }
 }

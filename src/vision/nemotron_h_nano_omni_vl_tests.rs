@@ -20,7 +20,10 @@
 
 // `super` is the `nemotron_h_nano_omni_vl` module that includes this
 // file via `#[path]`, so types defined there are reachable directly.
-use super::{NemotronHNanoOmniProjector, NemotronHNanoOmniVlConfig};
+use super::{
+    NemotronHNanoOmniProjector, NemotronHNanoOmniVlConfig, read_int32_vec,
+    subsampling_output_lengths,
+};
 use mlxcel_core::weights::WeightMap;
 
 const PROJ_IN_FEATURES: usize = 16;
@@ -69,6 +72,28 @@ fn projector_maps_features_to_text_hidden_size() {
     );
 }
 
+/// `subsampling_output_lengths` should mirror upstream
+/// `_get_subsampling_output_length` exactly. We exercise the helper here
+/// because audio merge correctness depends on precise per-clip length
+/// trimming; a one-off bug in the divider would silently skew the
+/// number of audio tokens emitted into the LLM stream.
+#[test]
+fn subsampling_output_lengths_matches_python_reference() {
+    let lengths = mlxcel_core::from_slice_i32(&[800, 400, 100, 0], &[4]);
+    let kernel = 3;
+    let stride = 2;
+    let stages = 3; // log2(8) -- the released Nemotron Omni default.
+    let out = subsampling_output_lengths(lengths.as_ref().unwrap(), kernel, stride, stages);
+    let cpu = read_int32_vec(&out);
+    // Python: floor((L - 1) / 2 + 1) per stage.
+    // 800 → 400 → 200 → 100
+    // 400 → 200 → 100 → 50
+    // 100 → 50  → 25  → 13
+    //   0 →  0  →  0  →  0  (padding does not produce more frames)
+    // For clarity, emit the chain for the third element.
+    assert_eq!(cpu, vec![100, 50, 13, 0]);
+}
+
 #[test]
 fn vl_config_default_downsample_factor_round_trips() {
     let config = NemotronHNanoOmniVlConfig {
@@ -80,10 +105,14 @@ fn vl_config_default_downsample_factor_round_trips() {
         img_context_token_id: 100,
         image_start_token_id: 0,
         image_end_token_id: 0,
+        sound_context_token_id: None,
+        sound_start_token_id: 0,
+        sound_end_token_id: 0,
         eos_token_ids: Vec::new(),
     };
     // Sanity that the config struct exposes everything the runtime wires.
     assert_eq!(config.downsample_ratio, 0.5);
     assert_eq!(config.ps_version, "v1");
     assert_eq!(config.img_context_token_id, 100);
+    assert!(config.sound_context_token_id.is_none());
 }

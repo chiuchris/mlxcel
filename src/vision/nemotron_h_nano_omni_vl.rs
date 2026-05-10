@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Nemotron H Nano Omni vision-language model wrapper (issue #554).
+//! Nemotron H Nano Omni vision-language model wrapper (issues #554, #582).
 //!
-//! Faithful Rust port of the vision path in
+//! Faithful Rust port of the multimodal path in
 //! `references/mlx-vlm/mlx_vlm/models/nemotron_h_nano_omni/nemotron_h_nano_omni.py`.
 //! Composes:
 //! - the existing Nemotron-H text backbone
@@ -24,15 +24,19 @@
 //! - the multimodal projector (`mlp1`): `RMSNorm -> Linear -> ReLU² ->
 //!   Linear` with the upstream "pixel shuffle" downsample applied to
 //!   the patch grid before projection
-//!
-//! Audio is intentionally out of scope for this port — see issue #554
-//! (PR vision-only scope decision). This wrapper raises an error when
-//! the loader supplies an audio config, rather than partially wiring
-//! up audio embeddings.
+//! - **(issue #582)** an optional audio path:
+//!   `crate::audio::nemotron_h_nano_omni::{NemotronOmniSoundEncoder,
+//!   NemotronOmniSoundProjection, NemotronOmniFeatureExtractor}`,
+//!   wired only when `sound_config` is present in the released
+//!   checkpoint's `config.json`.
 //!
 //! Used by: Nemotron H Nano Omni VLM
 
 use crate::LanguageModel;
+use crate::audio::nemotron_h_nano_omni::{
+    NemotronOmniAudioConfig, NemotronOmniFeatureExtractor, NemotronOmniSoundEncoder,
+    NemotronOmniSoundProjection,
+};
 use crate::models::NemotronHModel;
 use crate::vision::encoders::nemotron_h_nano_omni::NemotronHNanoOmniVisionModel;
 use crate::vision::merge::InputEmbeddings;
@@ -45,9 +49,9 @@ use mlxcel_core::{MlxArray, UniquePtr};
 
 /// Multimodal projector configuration.
 ///
-/// Mirrors the upstream `ModelConfig` fields that drive `VisionProjection`
-/// and the `pixel_shuffle` downsample. The defaults match the released
-/// 30B-A3B Nano Omni checkpoint.
+/// Mirrors the upstream `ModelConfig` fields that drive `VisionProjection`,
+/// the `pixel_shuffle` downsample, and the optional audio path. The
+/// defaults match the released 30B-A3B Nano Omni checkpoint.
 #[derive(Debug, Clone)]
 pub struct NemotronHNanoOmniVlConfig {
     pub vit_hidden_size: usize,
@@ -63,6 +67,14 @@ pub struct NemotronHNanoOmniVlConfig {
     /// framing tokens emitted in the prompt expansion".
     pub image_start_token_id: i32,
     pub image_end_token_id: i32,
+    /// Audio placeholder token ID. `None` when the checkpoint does not
+    /// surface `sound_context_token_id` (audio path remains disabled).
+    pub sound_context_token_id: Option<i32>,
+    /// Optional audio-start / audio-end framing token IDs (mirrors the
+    /// upstream image_start/image_end behaviour applied to the audio
+    /// modality). Both default to `0` when not provided.
+    pub sound_start_token_id: i32,
+    pub sound_end_token_id: i32,
     /// EOS token IDs from the released checkpoint's `generation_config.json`.
     pub eos_token_ids: Vec<i32>,
 }
@@ -116,13 +128,30 @@ impl NemotronHNanoOmniProjector {
     }
 }
 
-/// Top-level Nemotron H Nano Omni VLM (vision-only scope, issue #554).
+/// Top-level Nemotron H Nano Omni VLM.
+///
+/// Issue #554 introduced this struct with vision-only scope; issue #582
+/// added the optional audio path (`audio` field set to `Some` when the
+/// checkpoint ships a `sound_config`).
 pub struct NemotronHNanoOmniVlModel {
     pub text_model: NemotronHModel,
     pub vision_tower: NemotronHNanoOmniVisionModel,
     pub projector: NemotronHNanoOmniProjector,
     pub processor: NemotronHNanoOmniImageProcessor,
     pub config: NemotronHNanoOmniVlConfig,
+    /// Optional audio bundle. Present when the checkpoint shipped a
+    /// `sound_config` block and the loader successfully built the
+    /// audio encoder/projector.
+    pub audio: Option<NemotronOmniAudioBundle>,
+}
+
+/// Bundles every audio-side artifact loaded from the checkpoint so the
+/// model surface stays cohesive (one `Option`, not three).
+pub struct NemotronOmniAudioBundle {
+    pub config: NemotronOmniAudioConfig,
+    pub feature_extractor: NemotronOmniFeatureExtractor,
+    pub encoder: NemotronOmniSoundEncoder,
+    pub projection: NemotronOmniSoundProjection,
 }
 
 impl NemotronHNanoOmniVlModel {
@@ -139,7 +168,25 @@ impl NemotronHNanoOmniVlModel {
             projector,
             processor,
             config,
+            audio: None,
         }
+    }
+
+    /// Builder-style attach for the audio bundle, used by the loader
+    /// when `sound_config` is present in `config.json`.
+    pub fn with_audio(mut self, audio: NemotronOmniAudioBundle) -> Self {
+        self.audio = Some(audio);
+        self
+    }
+
+    /// `true` when this VLM was loaded with audio support enabled.
+    pub fn has_audio(&self) -> bool {
+        self.audio.is_some()
+    }
+
+    /// Audio bundle accessor for the runtime layer.
+    pub fn audio(&self) -> Option<&NemotronOmniAudioBundle> {
+        self.audio.as_ref()
     }
 
     /// Run the vision tower + projector for a single preprocessed image.
@@ -198,26 +245,157 @@ impl NemotronHNanoOmniVlModel {
         input_ids: &MlxArray,
         images: &[NemotronHNanoOmniImageInput],
     ) -> InputEmbeddings {
-        let inputs_embeds = self.text_model.input_embeddings(input_ids);
+        self.get_input_embeddings_full(input_ids, images, None)
+    }
 
-        let Some(features) = self.extract_image_features(images) else {
-            return InputEmbeddings {
+    /// Generalised entry-point that mirrors upstream
+    /// `get_input_embeddings(input_ids, pixel_values, sound_clips=...)`.
+    ///
+    /// `audio_features` is the precomputed
+    /// `[total_audio_tokens, hidden_size]` embedding produced by
+    /// [`extract_audio_features`]; the runtime layer is responsible for
+    /// running the audio encoder/projection so the heavy lifting can
+    /// share the same image-token-merge helper as the vision path.
+    pub fn get_input_embeddings_full(
+        &self,
+        input_ids: &MlxArray,
+        images: &[NemotronHNanoOmniImageInput],
+        audio_features: Option<&MlxArray>,
+    ) -> InputEmbeddings {
+        let inputs_embeds = self.text_model.input_embeddings(input_ids);
+        let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
+
+        // Apply image features first (mirrors upstream ordering). When
+        // the prompt has no image placeholders or no images were
+        // supplied, this returns the unchanged embedding stream.
+        let after_images = if let Some(features) = self.extract_image_features(images) {
+            let features = mlxcel_core::astype(&features, embed_dtype);
+            crate::vision::merge::merge_llava(
+                self.config.img_context_token_id,
+                &features,
+                &inputs_embeds,
+                input_ids,
+            )
+        } else {
+            InputEmbeddings {
                 inputs_embeds,
                 attention_mask_4d: None,
-            };
+            }
         };
 
-        // Cast features to text-embedding dtype before scatter so the
-        // merge helper sees a uniform dtype across vision and text.
-        let embed_dtype = mlxcel_core::array_dtype(&inputs_embeds);
-        let features = mlxcel_core::astype(&features, embed_dtype);
+        // Apply audio features over the image-merged stream. Without an
+        // audio config or audio token id, the merge is a no-op.
+        match (audio_features, self.config.sound_context_token_id) {
+            (Some(audio), Some(token_id)) => {
+                let audio = mlxcel_core::astype(audio, embed_dtype);
+                crate::vision::merge::merge_llava(
+                    token_id,
+                    &audio,
+                    &after_images.inputs_embeds,
+                    input_ids,
+                )
+            }
+            _ => after_images,
+        }
+    }
 
-        crate::vision::merge::merge_llava(
-            self.config.img_context_token_id,
-            &features,
-            &inputs_embeds,
-            input_ids,
-        )
+    /// Extract audio embeddings from a precomputed mel feature batch.
+    ///
+    /// `input_features: [B, T, num_mel_bins]`
+    /// `attention_mask: [B, T]` (`1` = valid frame, `0` = padding)
+    /// `feature_lengths: [B]` total frame count per clip (matches
+    /// upstream `full_lengths`; falls back to `attention_mask.sum(-1)`
+    /// when not provided).
+    ///
+    /// Returns `[total_audio_tokens, text_hidden_size]` — flattened
+    /// across the batch, with each clip trimmed to its post-subsampling
+    /// valid length. This mirrors upstream `_extract_sound_features`'s
+    /// final concatenation that the merge step expects.
+    pub fn extract_audio_features(
+        &self,
+        input_features: &MlxArray,
+        attention_mask: Option<&MlxArray>,
+        feature_lengths: Option<&MlxArray>,
+    ) -> Result<UniquePtr<MlxArray>, String> {
+        let bundle = self
+            .audio
+            .as_ref()
+            .ok_or_else(|| "Audio bundle is not configured for this VLM".to_string())?;
+
+        // Cast to the lm-head's dtype the same way upstream does
+        // (`compute_dtype = lm_head.scales.dtype or lm_head.weight.dtype`).
+        // We read the dtype off the projector's RMSNorm scale tensor,
+        // which is loaded from the same checkpoint at the same compute
+        // precision as the rest of the model. This is zero-cost
+        // (just a metadata read) — strictly avoid running a real
+        // embedding lookup or allocating a 1×1 input_ids tensor purely
+        // to inspect the resulting dtype.
+        let embed_dtype = bundle.projection.compute_dtype();
+        let input_features = mlxcel_core::astype(input_features, embed_dtype);
+
+        let encoded = bundle.encoder.forward(&input_features, attention_mask);
+        let projected = bundle.projection.forward(&encoded);
+
+        // Trim to post-subsampling valid lengths and concatenate across
+        // the batch axis. Feature lengths default to attention_mask sum.
+        let lengths_arr = match feature_lengths {
+            Some(l) => mlxcel_core::astype(l, mlxcel_core::dtype::INT32),
+            None => match attention_mask {
+                Some(m) => {
+                    let s = mlxcel_core::sum_axis(m, -1, false);
+                    mlxcel_core::astype(&s, mlxcel_core::dtype::INT32)
+                }
+                None => {
+                    // No mask either: assume the entire encoder output
+                    // is valid for every clip.
+                    let pre_shape = mlxcel_core::array_shape(&projected);
+                    return Ok(mlxcel_core::reshape(
+                        &projected,
+                        &[pre_shape[0] * pre_shape[1], pre_shape[2]],
+                    ));
+                }
+            },
+        };
+
+        // Compute per-batch output lengths via subsampling formula. We
+        // need scalar lengths, so we sync each one once. `B` is small
+        // (typically 1) per request.
+        let kernel = bundle.config.subsampling_conv_kernel_size as i32;
+        let stride = bundle.config.subsampling_conv_stride as i32;
+        let stages = bundle.config.num_subsampling_layers();
+        let output_lengths = subsampling_output_lengths(&lengths_arr, kernel, stride, stages);
+
+        let pre_shape = mlxcel_core::array_shape(&projected);
+        let batch = pre_shape[0] as usize;
+        let hidden = pre_shape[2];
+        if batch == 0 {
+            return Ok(mlxcel_core::reshape(&projected, &[0, hidden]));
+        }
+
+        let lengths_cpu = read_int32_vec(&output_lengths);
+        let mut pieces: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+        for (b, length) in lengths_cpu.into_iter().enumerate() {
+            if length <= 0 {
+                continue;
+            }
+            let length = length.min(pre_shape[1]);
+            let starts = vec![b as i32, 0, 0];
+            let ends = vec![b as i32 + 1, length, hidden];
+            let slice = mlxcel_core::slice(&projected, &starts, &ends);
+            // Drop the leading batch dim so we end up with [length, H].
+            let slice = mlxcel_core::reshape(&slice, &[length, hidden]);
+            pieces.push(slice);
+        }
+
+        if pieces.is_empty() {
+            return Ok(mlxcel_core::reshape(&projected, &[0, hidden]));
+        }
+
+        let mut acc = pieces.remove(0);
+        for piece in pieces {
+            acc = mlxcel_core::concatenate(&acc, &piece, 0);
+        }
+        Ok(acc)
     }
 
     fn pixel_shuffle(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
@@ -324,6 +502,49 @@ impl LanguageModel for NemotronHNanoOmniVlModel {
     fn trim_internal_caches(&self, excess: i32) {
         self.text_model.trim_internal_caches(excess);
     }
+}
+
+/// Apply N stages of upstream `_get_output_length` (same kernel/stride
+/// per stage) on an int32 length tensor. Mirrors
+/// `_get_subsampling_output_length` from
+/// `references/.../nemotron_h_nano_omni/audio.py`.
+fn subsampling_output_lengths(
+    lengths: &MlxArray,
+    kernel_size: i32,
+    stride: i32,
+    num_stages: usize,
+) -> UniquePtr<MlxArray> {
+    let mut current = mlxcel_core::astype(lengths, mlxcel_core::dtype::INT32);
+    let padding = (kernel_size - 1) / 2;
+    let add_pad = (2 * padding - kernel_size) as f32;
+    let stride_f = stride as f32;
+    for _ in 0..num_stages {
+        let f32_lengths = mlxcel_core::astype(&current, mlxcel_core::dtype::FLOAT32);
+        let pad_arr = mlxcel_core::full_f32(&[1], add_pad, mlxcel_core::dtype::FLOAT32);
+        let added = mlxcel_core::add(&f32_lengths, &pad_arr);
+        let stride_arr = mlxcel_core::full_f32(&[1], stride_f, mlxcel_core::dtype::FLOAT32);
+        let divided = mlxcel_core::divide(&added, &stride_arr);
+        let one_arr = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::FLOAT32);
+        let plus_one = mlxcel_core::add(&divided, &one_arr);
+        let floored = mlxcel_core::floor(&plus_one);
+        current = mlxcel_core::astype(&floored, mlxcel_core::dtype::INT32);
+    }
+    current
+}
+
+/// Materialize an int32 array as a host-side `Vec<i32>`.
+fn read_int32_vec(arr: &MlxArray) -> Vec<i32> {
+    mlxcel_core::eval(arr);
+    let bytes = mlxcel_core::array_to_raw_bytes(arr);
+    bytes
+        .chunks_exact(4)
+        .map(|b| {
+            i32::from_ne_bytes(
+                b.try_into()
+                    .expect("chunks_exact(4) always yields a 4-byte slice"),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]
