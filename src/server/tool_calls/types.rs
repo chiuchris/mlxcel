@@ -47,6 +47,8 @@ pub enum ToolCallFormat {
     Gemma4,
     /// Generic JSON: raw `{"name": ..., "arguments": ...}` object
     GenericJson,
+    /// MiniMax M2: `<invoke name="fn_name"><parameter name="k">v</parameter></invoke>`
+    MinimaxM2,
 }
 
 /// Result of parsing model output for tool calls.

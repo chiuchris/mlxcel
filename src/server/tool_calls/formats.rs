@@ -679,6 +679,221 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
+/// Maximum number of `<invoke>` blocks the MiniMax M2 parser will accept from a
+/// single model output. Caps memory amplification when an adversarial model
+/// emits a long run of well-formed open tags. Real models emit at most a handful
+/// of parallel calls; 1024 leaves room for pathological-but-legitimate behavior
+/// while preventing a 100k-call DoS.
+const MINIMAX_M2_MAX_CALLS: usize = 1024;
+/// Same idea for `<parameter>` tags inside one `<invoke>` body.
+const MINIMAX_M2_MAX_PARAMS_PER_CALL: usize = 1024;
+
+/// Try parsing MiniMax M2 format:
+/// `<invoke name="fn_name"><parameter name="k">v</parameter></invoke>`
+///
+/// Multiple `<invoke>` blocks may appear sequentially for parallel tool calls.
+/// Parameter values are converted to their most likely JSON types (number,
+/// boolean, null, object/array via JSON parse) before falling back to string.
+///
+/// Mirrors the upstream Python rewrite in mlx-lm PR #1171 (commit 6d11468).
+pub fn try_minimax_m2(text: &str) -> Option<ToolCallParseResult> {
+    let invoke_open = "<invoke name=";
+    let invoke_close = "</invoke>";
+
+    if !text.contains(invoke_open) {
+        return None;
+    }
+
+    let mut calls = Vec::new();
+    let mut remaining = text;
+
+    while let Some(start) = remaining.find(invoke_open) {
+        let after_tag = start + invoke_open.len();
+
+        // Extract the function name (inside quotes or until ">").
+        // Use if-let instead of `?` so that a trailing malformed
+        // `<invoke name=` (without a closing `>`) does not discard
+        // already-parsed calls — same fix pattern as `try_functionary_v31`.
+        let Some(name_end) = remaining[after_tag..].find('>') else {
+            // Malformed tag without '>': stop scanning, keep prior calls
+            break;
+        };
+        let raw_name = &remaining[after_tag..after_tag + name_end];
+        let function_name = extract_quoted_name(raw_name);
+        if function_name.is_empty() {
+            remaining = &remaining[after_tag + name_end + 1..];
+            continue;
+        }
+
+        // Everything up to </invoke> is the body
+        let body_start = after_tag + name_end + 1; // skip '>'
+        let body_end = remaining[body_start..].find(invoke_close);
+
+        let body = if let Some(end_offset) = body_end {
+            let b = &remaining[body_start..body_start + end_offset];
+            remaining = &remaining[body_start + end_offset + invoke_close.len()..];
+            b
+        } else {
+            // No closing </invoke>: take the rest as the body
+            let b = &remaining[body_start..];
+            remaining = "";
+            b
+        };
+
+        let arguments = extract_minimax_parameters(body);
+        calls.push(ParsedToolCall {
+            name: function_name,
+            arguments,
+        });
+
+        // Defensive cap: bound parallel-call memory under adversarial output.
+        if calls.len() >= MINIMAX_M2_MAX_CALLS {
+            break;
+        }
+    }
+
+    if calls.is_empty() {
+        return None;
+    }
+
+    Some(ToolCallParseResult {
+        format: Some(ToolCallFormat::MinimaxM2),
+        tool_calls: calls,
+        content: String::new(),
+    })
+}
+
+/// Extract the name from a possibly-quoted attribute value.
+///
+/// Handles `"fn_name"`, `'fn_name'`, or bare `fn_name`.  Requires `s.len()
+/// >= 2` before stripping outer quotes, otherwise a single lone quote
+/// character would panic on the `s[1..s.len() - 1]` slice (`1..0`).
+fn extract_quoted_name(s: &str) -> String {
+    let s = s.trim();
+    if s.len() >= 2
+        && ((s.starts_with('"') && s.ends_with('"')) || (s.starts_with('\'') && s.ends_with('\'')))
+    {
+        s[1..s.len() - 1].to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Parse all `<parameter name="k">v</parameter>` tags inside an `<invoke>` body.
+///
+/// Returns a JSON object string mapping parameter names to their typed values.
+/// Type coercion order: null → integer → float → boolean → JSON object/array → string.
+fn extract_minimax_parameters(body: &str) -> String {
+    let param_open = "<parameter name=";
+    let param_close = "</parameter>";
+
+    let mut pairs: Vec<(String, serde_json::Value)> = Vec::new();
+    let mut remaining = body;
+
+    while let Some(start) = remaining.find(param_open) {
+        let after_tag = start + param_open.len();
+
+        // Find the closing '>' of the opening tag.
+        //
+        // If there is no '>' anywhere in the remaining buffer, no well-formed
+        // `<parameter name=key>val</parameter>` block can follow, so stop
+        // scanning. Using `continue` here with `remaining = &remaining[after_tag..]`
+        // would still match the next `<parameter name=` prefix in the body,
+        // re-scan the buffer for '>' (and again find none), and repeat —
+        // producing O(N^2) work in the number of malformed parameter prefixes.
+        // An adversarial model output can pin a request handler thread for
+        // many seconds this way; `break` matches the outer `try_minimax_m2`
+        // loop's behavior for the analogous missing-'>' case.
+        let Some(gt_pos) = remaining[after_tag..].find('>') else {
+            break;
+        };
+
+        let raw_name = &remaining[after_tag..after_tag + gt_pos];
+        let param_name = extract_quoted_name(raw_name);
+
+        let value_start = after_tag + gt_pos + 1;
+        let value_end = remaining[value_start..].find(param_close);
+
+        let raw_value = if let Some(end_offset) = value_end {
+            let v = &remaining[value_start..value_start + end_offset];
+            remaining = &remaining[value_start + end_offset + param_close.len()..];
+            v
+        } else {
+            let v = &remaining[value_start..];
+            remaining = "";
+            v
+        };
+
+        // Trim leading/trailing newlines (upstream behaviour)
+        let mut raw_value = raw_value;
+        if raw_value.starts_with('\n') {
+            raw_value = &raw_value[1..];
+        }
+        if raw_value.ends_with('\n') {
+            raw_value = &raw_value[..raw_value.len() - 1];
+        }
+        let raw_value = raw_value.trim();
+
+        let json_value = coerce_minimax_param(raw_value);
+        if !param_name.is_empty() {
+            pairs.push((param_name, json_value));
+        }
+
+        // Defensive cap: bound per-call parameter memory under adversarial output.
+        if pairs.len() >= MINIMAX_M2_MAX_PARAMS_PER_CALL {
+            break;
+        }
+    }
+
+    // Build a JSON object from the collected pairs
+    let mut map = serde_json::Map::with_capacity(pairs.len());
+    for (k, v) in pairs {
+        map.insert(k, v);
+    }
+    serde_json::to_string(&serde_json::Value::Object(map)).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Convert a raw string parameter value to the most specific JSON type.
+///
+/// Priority: null → integer → float → boolean → JSON object/array → string.
+fn coerce_minimax_param(value: &str) -> serde_json::Value {
+    // Null
+    let lower = value.to_lowercase();
+    if lower == "null" || lower == "none" || lower == "nil" {
+        return serde_json::Value::Null;
+    }
+
+    // Integer (try before float so we preserve exact integer representation)
+    if let Ok(i) = value.parse::<i64>() {
+        return serde_json::Value::Number(serde_json::Number::from(i));
+    }
+
+    // Float
+    if let Ok(f) = value.parse::<f64>()
+        && let Some(n) = serde_json::Number::from_f64(f)
+    {
+        return serde_json::Value::Number(n);
+    }
+
+    // Boolean
+    if lower == "true" || lower == "1" || lower == "yes" || lower == "on" {
+        return serde_json::Value::Bool(true);
+    }
+    if lower == "false" || lower == "0" || lower == "no" || lower == "off" {
+        return serde_json::Value::Bool(false);
+    }
+
+    // JSON object or array
+    if (value.starts_with('{') || value.starts_with('['))
+        && let Ok(v) = serde_json::from_str::<serde_json::Value>(value)
+    {
+        return v;
+    }
+
+    // Fallback: string
+    serde_json::Value::String(value.to_string())
+}
+
 /// Try parsing generic JSON format:
 /// `{"name": "fn", "arguments": {...}}` or `{"name": "fn", "parameters": {...}}`
 ///
@@ -1114,5 +1329,218 @@ mod tests {
     #[test]
     fn generic_json_not_a_tool_call() {
         assert!(try_generic_json(r#"{"key": "value"}"#).is_none());
+    }
+
+    // -- MiniMax M2 --
+
+    #[test]
+    fn minimax_m2_single_tool_call() {
+        // From upstream test_tool_parsing.py: single invoke with a string parameter
+        let text = "<invoke name=\"get_current_temperature\">\n<parameter name=\"location\">London</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_current_temperature");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["location"], "London");
+        assert_eq!(result.format, Some(ToolCallFormat::MinimaxM2));
+    }
+
+    #[test]
+    fn minimax_m2_parallel_tool_calls() {
+        // From upstream test_minimax_m2: two parallel invocations in one response
+        let text = "<invoke name=\"search\">\n<parameter name=\"query\">weather</parameter>\n</invoke>\n<invoke name=\"read_file\">\n<parameter name=\"path\">/tmp/test.txt</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "search");
+        let args0: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args0["query"], "weather");
+        assert_eq!(result.tool_calls[1].name, "read_file");
+        let args1: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[1].arguments).unwrap();
+        assert_eq!(args1["path"], "/tmp/test.txt");
+    }
+
+    #[test]
+    fn minimax_m2_numeric_params() {
+        // From upstream test_parsers: multiply with numeric a and b
+        let text = "<invoke name=\"multiply\">\n<parameter name=\"a\">12234585</parameter>\n<parameter name=\"b\">48838483920</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "multiply");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        // Numeric values must be coerced to numbers, not kept as strings
+        assert_eq!(args["a"], 12234585i64);
+        assert_eq!(args["b"], 48838483920i64);
+    }
+
+    #[test]
+    fn minimax_m2_boolean_param() {
+        let text = "<invoke name=\"fn\">\n<parameter name=\"active\">true</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["active"], true);
+    }
+
+    #[test]
+    fn minimax_m2_null_param() {
+        let text = "<invoke name=\"fn\">\n<parameter name=\"val\">null</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["val"], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn minimax_m2_json_object_param() {
+        let text = "<invoke name=\"fn\">\n<parameter name=\"config\">{\"key\": \"val\", \"n\": 1}</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        let config = &args["config"];
+        assert_eq!(config["key"], "val");
+        assert_eq!(config["n"], 1);
+    }
+
+    #[test]
+    fn minimax_m2_no_match_plain_text() {
+        assert!(try_minimax_m2("Hello, world!").is_none());
+    }
+
+    #[test]
+    fn minimax_m2_no_match_hermes_format() {
+        assert!(
+            try_minimax_m2(r#"<tool_call>{"name": "fn", "arguments": {}}</tool_call>"#).is_none()
+        );
+    }
+
+    #[test]
+    fn minimax_m2_single_quotes_name() {
+        // Name quoted with single quotes (edge case)
+        let text = "<invoke name='search'>\n<parameter name='query'>rust</parameter>\n</invoke>";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls[0].name, "search");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["query"], "rust");
+    }
+
+    #[test]
+    fn minimax_m2_missing_close_invoke() {
+        // No </invoke> closing tag: still parses what it can
+        let text = "<invoke name=\"search\">\n<parameter name=\"query\">rust</parameter>\n";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "search");
+    }
+
+    #[test]
+    fn minimax_m2_lone_quote_in_name_does_not_panic() {
+        // A model emitting `<invoke name=">...` previously caused a runtime
+        // panic in `extract_quoted_name` (`s[1..s.len() - 1]` with len=1 is
+        // `1..0`).  The fix gates the slice on `s.len() >= 2` so the lone
+        // quote is treated as a bare (invalid) name and the parser either
+        // skips that block or returns no calls — but never panics.
+        let text = "<invoke name=\">\n<parameter name=\"k\">v</parameter>\n</invoke>";
+        // Must not panic.
+        let _ = try_minimax_m2(text);
+
+        // Same check for a single apostrophe.
+        let text = "<invoke name='>\n<parameter name=\"k\">v</parameter>\n</invoke>";
+        let _ = try_minimax_m2(text);
+
+        // Same check inside a parameter name.
+        let text = "<invoke name=\"fn\">\n<parameter name=\">v</parameter>\n</invoke>";
+        let _ = try_minimax_m2(text);
+    }
+
+    #[test]
+    fn minimax_m2_trailing_malformed_invoke_preserves_prior_calls() {
+        // A trailing `<invoke name=` without a closing `>` previously caused
+        // the entire parse to abort via `?`, discarding the already-parsed
+        // first call.  Same fix pattern as
+        // `functionary_v31_malformed_trailing_tag_preserves_prior_calls`.
+        let text = "<invoke name=\"get_weather\">\n<parameter name=\"loc\">Paris</parameter>\n</invoke><invoke name=\"broken_no_close";
+        let result = try_minimax_m2(text).unwrap();
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["loc"], "Paris");
+    }
+
+    #[test]
+    fn minimax_m2_malformed_parameter_no_quadratic_blowup() {
+        // Adversarial body filled with `<parameter name=` fragments that never
+        // close with '>'. Before the fix, each loop iteration re-scanned the
+        // entire remaining buffer for '>' (O(N) per iteration, N iterations =
+        // O(N^2)) so a 1 MB run pinned a thread for ~15 s. After the fix, the
+        // missing-'>' branch breaks out of the loop on the first hit.
+        //
+        // Test on a size that would have taken multiple seconds before the
+        // fix; with the fix this completes in milliseconds.
+        let mut body = String::from("<invoke name=\"fn\">");
+        for _ in 0..50_000 {
+            body.push_str("<parameter name=hello");
+        }
+        body.push_str("</invoke>");
+
+        let start = std::time::Instant::now();
+        let result = try_minimax_m2(&body);
+        let elapsed = start.elapsed();
+
+        // Should complete in well under one second on any reasonable hardware.
+        assert!(
+            elapsed.as_secs() < 2,
+            "parsing took {elapsed:?}; suggests O(N^2) regression"
+        );
+        // The first malformed `<parameter name=` immediately breaks out, so
+        // no parameters are parsed but the invoke itself produces an empty
+        // arguments object.
+        let calls = result.unwrap().tool_calls;
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "fn");
+        assert_eq!(calls[0].arguments, "{}");
+    }
+
+    #[test]
+    fn minimax_m2_caps_excessive_parallel_calls() {
+        // 10_000 well-formed parallel `<invoke>` blocks should be capped at
+        // MINIMAX_M2_MAX_CALLS to bound memory amplification.
+        let one = "<invoke name=\"x\"><parameter name=\"a\">1</parameter></invoke>";
+        let huge = one.repeat(10_000);
+        let result = try_minimax_m2(&huge).unwrap();
+        assert!(
+            result.tool_calls.len() <= MINIMAX_M2_MAX_CALLS,
+            "expected <= {}, got {}",
+            MINIMAX_M2_MAX_CALLS,
+            result.tool_calls.len()
+        );
+        assert_eq!(result.tool_calls.len(), MINIMAX_M2_MAX_CALLS);
+    }
+
+    #[test]
+    fn minimax_m2_caps_excessive_parameters_per_call() {
+        // 10_000 well-formed `<parameter>` tags inside a single invoke must
+        // be capped to bound per-call memory.
+        let mut body = String::from("<invoke name=\"fn\">");
+        for i in 0..10_000 {
+            body.push_str(&format!("<parameter name=\"k{i}\">v</parameter>"));
+        }
+        body.push_str("</invoke>");
+        let result = try_minimax_m2(&body).unwrap();
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        let obj = args.as_object().unwrap();
+        assert!(
+            obj.len() <= MINIMAX_M2_MAX_PARAMS_PER_CALL,
+            "expected <= {}, got {}",
+            MINIMAX_M2_MAX_PARAMS_PER_CALL,
+            obj.len()
+        );
+        assert_eq!(obj.len(), MINIMAX_M2_MAX_PARAMS_PER_CALL);
     }
 }

@@ -145,6 +145,7 @@ pub fn parse_tool_calls(raw_output: &str, tools: Option<&[Tool]>) -> ToolCallPar
         formats::try_granite, // <response><tool_call> — more specific than bare Hermes
         formats::try_gemma4,  // <|tool_call>call:... — pipe-delimited, before Hermes
         formats::try_hermes,  // <tool_call> — Hermes/Qwen/DeepSeek
+        formats::try_minimax_m2, // <invoke name=...><parameter name=...>...</parameter></invoke>
         formats::try_mistral_nemo, // [TOOL_CALLS]
         formats::try_functionary_v31, // <function=name>
         formats::try_functionary_v32, // >>>name\n
@@ -517,6 +518,45 @@ mod tests {
         let input = "prompt thinking<channel|>middle<|channel>more thought<channel|>tail";
         let result = strip_thinking(input);
         assert_eq!(result, "middletail");
+    }
+
+    // -- MiniMax M2 --
+
+    #[test]
+    fn parse_minimax_m2_single_call() {
+        let output = "<invoke name=\"get_weather\">\n<parameter name=\"location\">Paris</parameter>\n</invoke>";
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 1);
+        assert_eq!(result.tool_calls[0].name, "get_weather");
+        let args: serde_json::Value =
+            serde_json::from_str(&result.tool_calls[0].arguments).unwrap();
+        assert_eq!(args["location"], "Paris");
+        assert_eq!(
+            result.format,
+            Some(crate::server::tool_calls::ToolCallFormat::MinimaxM2)
+        );
+    }
+
+    #[test]
+    fn parse_minimax_m2_parallel_calls() {
+        // Multiple <invoke> blocks = parallel tool calls (the fix in PR #1171)
+        let output = "<invoke name=\"search\">\n<parameter name=\"query\">weather</parameter>\n</invoke>\n<invoke name=\"read_file\">\n<parameter name=\"path\">/tmp/test.txt</parameter>\n</invoke>";
+        let tools = vec![make_tool("search"), make_tool("read_file")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(result.has_tool_calls());
+        assert_eq!(result.tool_calls.len(), 2);
+        assert_eq!(result.tool_calls[0].name, "search");
+        assert_eq!(result.tool_calls[1].name, "read_file");
+    }
+
+    #[test]
+    fn parse_minimax_m2_filters_unknown_tools() {
+        let output = "<invoke name=\"unknown_fn\">\n<parameter name=\"k\">v</parameter>\n</invoke>";
+        let tools = vec![make_tool("get_weather")];
+        let result = parse_tool_calls(output, Some(&tools));
+        assert!(!result.has_tool_calls());
     }
 
     #[test]
