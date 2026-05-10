@@ -90,6 +90,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+#[cfg(unix)]
+use std::os::fd::{AsRawFd, OwnedFd};
+
 use image::DynamicImage;
 
 /// Default FPS target when callers do not specify `--fps`. Mirrors the
@@ -208,6 +211,7 @@ pub enum VideoError {
 /// let path = tmp.path(); // borrow to ffmpeg
 /// // drop(tmp) removes the file, even if earlier code panicked.
 /// ```
+#[derive(Debug)]
 pub struct TempFile {
     path: PathBuf,
 }
@@ -235,6 +239,220 @@ impl Drop for TempFile {
                 tracing::warn!("TempFile: failed to remove {:?}: {}", self.path, err);
             }
         }
+    }
+}
+
+// ─── VideoSource (issue #601): TOCTOU-safe video handle ─────────────────────
+
+/// A video input that can be safely passed to `ffmpeg` / `ffprobe` without
+/// re-opening by path.
+///
+/// On Unix, the [`VideoSource::Fd`] variant carries an owned read-only file
+/// descriptor produced by [`crate::server::media::extract_chat_video_paths`]
+/// after canonicalisation, allowlist prefix checks, regular-file stats, and
+/// extension filtering have all succeeded. The fd is then surrendered to
+/// ffmpeg via `/dev/fd/N` so ffmpeg never re-opens the underlying path.
+/// This closes the TOCTOU window where an attacker with write access inside
+/// an allowlisted directory could swap the validated file for a symlink to
+/// `/etc/passwd` (or another out-of-sandbox secret) between the resolver's
+/// `canonicalize` call and ffmpeg's `open`.
+///
+/// The [`VideoSource::Path`] variant remains for callers that legitimately
+/// need path-based access — most importantly the `mlxcel` CLI, which receives
+/// paths from `--video` flags chosen by the operator at the local terminal
+/// and is not running in a multi-tenant, untrusted-input setting.
+///
+/// On non-Unix platforms only the `Path` variant is constructible; the fd
+/// path is gated behind `#[cfg(unix)]` because `/dev/fd/N` is a Unix-only
+/// kernel interface. This is acceptable because mlxcel server's threat
+/// model targets Linux and macOS deployments only.
+#[derive(Debug)]
+pub enum VideoSource {
+    /// A bare filesystem path. Subprocesses re-open this path. Suitable for
+    /// trusted-input contexts (CLI arguments, internal callers).
+    Path(PathBuf),
+
+    /// An owned read-only file descriptor plus the canonical path it was
+    /// opened from (the path is retained for diagnostics only — subprocesses
+    /// receive `/dev/fd/N`, never the canonical path). Available on Unix
+    /// targets only (Linux, macOS).
+    #[cfg(unix)]
+    Fd {
+        /// The owned read-only file descriptor. Closed when [`VideoSource`]
+        /// drops. The fd is opened with `O_CLOEXEC` set on the parent side;
+        /// the cloexec flag is cleared inside [`Command::pre_exec`] before
+        /// the child execs ffmpeg/ffprobe so the fd is inherited by the
+        /// child and `/dev/fd/N` resolves successfully.
+        fd: OwnedFd,
+        /// Canonical path the fd was opened from. Used solely for error
+        /// messages and the resolved-path piece of `(path, fps)` tuples
+        /// returned to callers that still need a path-shaped identity. The
+        /// path is never opened again.
+        canonical: PathBuf,
+    },
+}
+
+impl VideoSource {
+    /// Construct a path-only video source. Used by CLI / non-allowlist
+    /// callers and on non-Unix targets.
+    #[must_use]
+    pub fn from_path(path: PathBuf) -> Self {
+        VideoSource::Path(path)
+    }
+
+    /// Construct an fd-backed video source from an already-opened
+    /// [`OwnedFd`] and its canonical path. Unix only.
+    #[cfg(unix)]
+    #[must_use]
+    pub fn from_fd(fd: OwnedFd, canonical: PathBuf) -> Self {
+        VideoSource::Fd { fd, canonical }
+    }
+
+    /// Return the canonical path identity of this source.
+    ///
+    /// For [`VideoSource::Path`] this is the input path verbatim. For the
+    /// Unix fd variant this is the canonical path the fd was originally
+    /// opened from — used for error messages and as a stable identifier
+    /// the rest of the request handler can carry around. **Do not pass
+    /// this to a subprocess** when the source is fd-backed: the subprocess
+    /// must receive `/dev/fd/N` (see [`VideoSource::ffmpeg_input`]) so it
+    /// reads from the validated open file description rather than the
+    /// path, which an attacker could have swapped post-resolution.
+    #[must_use]
+    pub fn canonical_path(&self) -> &Path {
+        match self {
+            VideoSource::Path(p) => p.as_path(),
+            #[cfg(unix)]
+            VideoSource::Fd { canonical, .. } => canonical.as_path(),
+        }
+    }
+
+    /// Return the input string to pass to `ffmpeg -i` / `ffprobe`.
+    ///
+    /// For [`VideoSource::Path`] this is the path as a [`PathBuf`]. For the
+    /// Unix fd variant this is `/dev/fd/N` where `N` is the integer fd. On
+    /// Linux the kernel resolves `/dev/fd/N` via the magic-symlink in
+    /// `/proc/self/fd`; on macOS `/dev/fd/N` is a built-in special device.
+    /// Both yield a new file description bound to the same underlying open
+    /// file, so the child ffmpeg process reads the bytes of the file the
+    /// parent already validated.
+    fn ffmpeg_input(&self) -> PathBuf {
+        match self {
+            VideoSource::Path(p) => p.clone(),
+            #[cfg(unix)]
+            VideoSource::Fd { fd, .. } => PathBuf::from(format!("/dev/fd/{}", fd.as_raw_fd())),
+        }
+    }
+
+    /// Return `true` when this source carries a writable fd whose offset
+    /// must be reset before each subprocess. The path-variant has no such
+    /// requirement (each subprocess opens the file fresh, with its own
+    /// offset).
+    #[cfg(unix)]
+    fn needs_offset_reset(&self) -> bool {
+        matches!(self, VideoSource::Fd { .. })
+    }
+
+    /// Reset the file offset of the fd (if any) to 0 before invoking a
+    /// subprocess.
+    ///
+    /// On Linux, opening `/dev/fd/N` from a child process duplicates the
+    /// **same open file description** as the parent's master fd (per
+    /// `proc(5)`: "the new file descriptor refers to the same OFD as the
+    /// corresponding entry in /proc/[pid]/fd, and thus shares the same file
+    /// offset"). macOS `/dev/fd/N` follows the same dup-style semantics.
+    /// Consequently a previous ffprobe invocation that left the offset at
+    /// the end of the moov atom would cause the next ffmpeg invocation to
+    /// read from that offset rather than from byte 0.
+    ///
+    /// We seek the master fd back to 0 in the parent before each spawn so
+    /// each ffmpeg/ffprobe child sees the file from the start.
+    #[cfg(unix)]
+    fn rewind(&self) -> io::Result<()> {
+        if let VideoSource::Fd { fd, .. } = self {
+            // SAFETY: `lseek` on a valid raw fd is async-signal-safe and
+            // does not invalidate the OwnedFd. The fd is still owned by
+            // `self`; the libc call only adjusts kernel-side offset state.
+            let raw = fd.as_raw_fd();
+            let r = unsafe { libc::lseek(raw, 0, libc::SEEK_SET) };
+            if r < 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Configure a [`Command`] so the child can read from this source.
+    ///
+    /// For [`VideoSource::Path`] this is a no-op — the child receives the
+    /// path on the command line and opens it via the normal path-lookup
+    /// rules. For the Unix fd variant this installs a `pre_exec` hook
+    /// that clears `FD_CLOEXEC` on the inherited fd so the kernel keeps
+    /// the fd open across `execve`, and the child can then `open(/dev/fd/N)`
+    /// successfully.
+    #[cfg(unix)]
+    fn configure_child(&self, command: &mut Command) {
+        if let VideoSource::Fd { fd, .. } = self {
+            use std::os::unix::process::CommandExt;
+            let raw_fd = fd.as_raw_fd();
+            // SAFETY: This closure is executed in the child process after
+            // `fork()` and before `execve()`. In this single-threaded
+            // post-fork environment, only async-signal-safe functions may
+            // be called (POSIX.1-2017 §2.4.3). The contract is met:
+            //
+            // 1. `libc::fcntl(F_GETFD)` / `libc::fcntl(F_SETFD, ...)` are
+            //    listed in the POSIX async-signal-safe table (they perform a
+            //    pure kernel-side fd-flags read/write with no heap interaction).
+            //
+            // 2. `io::Error::last_os_error()` reads `errno` and stores the
+            //    integer value in an `io::Error` struct. Despite the `Error`
+            //    wrapper, this particular constructor **does not allocate**:
+            //    `io::Error::from_raw_os_error` stores the `i32` inline and
+            //    only wraps it in a heap-allocated message on `Display`/`Debug`
+            //    formatting, which does not happen in the pre-exec closure.
+            //    The return path therefore satisfies the no-malloc constraint.
+            //
+            // 3. The captured `raw_fd` is a plain `i32` (copy type). No Rust
+            //    drop glue runs for it in the child, so there is no risk of a
+            //    double-free or destructor calling allocator functions.
+            //
+            // 4. Only the child's fd table is mutated; `fork` copies the fd
+            //    table by value so the parent's `OwnedFd` is unaffected.
+            unsafe {
+                command.pre_exec(move || {
+                    let flags = libc::fcntl(raw_fd, libc::F_GETFD);
+                    if flags < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let new_flags = flags & !libc::FD_CLOEXEC;
+                    if libc::fcntl(raw_fd, libc::F_SETFD, new_flags) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+    }
+
+    /// Configure a child Command on non-Unix platforms.
+    ///
+    /// No-op shim so the call sites in [`probe_video`] and
+    /// [`extract_frames_single_pass`] do not need explicit cfg gating.
+    /// Constructing a [`VideoSource::Fd`] is impossible on non-Unix targets,
+    /// so all paths reduce to the path-only variant.
+    #[cfg(not(unix))]
+    fn configure_child(&self, _command: &mut Command) {}
+}
+
+impl From<PathBuf> for VideoSource {
+    fn from(path: PathBuf) -> Self {
+        VideoSource::Path(path)
+    }
+}
+
+impl From<&Path> for VideoSource {
+    fn from(path: &Path) -> Self {
+        VideoSource::Path(path.to_path_buf())
     }
 }
 
@@ -400,36 +618,58 @@ struct VideoMeta {
 ///
 /// - `MLXCEL_VIDEO_MAX_PIXELS` — product of width × height (default 16 777 216)
 /// - `MLXCEL_VIDEO_MAX_DURATION_SEC` — duration in seconds (default 600)
-fn probe_video(path: &Path) -> Result<VideoMeta, VideoError> {
-    if !path.exists() {
-        return Err(VideoError::FileNotFound(path.to_path_buf()));
+///
+/// Accepts a [`VideoSource`] so the resolver in `src/server/media.rs` can
+/// pass an opened fd (issue #601) instead of the canonical path. The fd
+/// path closes the TOCTOU window between the resolver's `canonicalize`
+/// and ffmpeg's `open`.
+fn probe_video(source: &VideoSource) -> Result<VideoMeta, VideoError> {
+    let canonical_path = source.canonical_path();
+    // For path-variant sources we still verify the path exists; for fd-variant
+    // sources the fd was opened by the resolver and the file is guaranteed
+    // accessible (we are reading from the open file description, not the path).
+    if matches!(source, VideoSource::Path(_)) && !canonical_path.exists() {
+        return Err(VideoError::FileNotFound(canonical_path.to_path_buf()));
     }
-    let output = Command::new("ffprobe")
-        .args([
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=nb_frames,avg_frame_rate,r_frame_rate,duration,width,height",
-            "-of",
-            "default=noprint_wrappers=1",
-        ])
-        .arg(path)
-        .output()
-        .map_err(|err| {
-            if err.kind() == std::io::ErrorKind::NotFound {
-                VideoError::FfprobeMissing
-            } else {
-                VideoError::Io {
-                    path: path.to_path_buf(),
-                    source: err,
-                }
+    // Reset the master fd offset to 0 (no-op for path sources) so ffprobe
+    // sees the file from the beginning even if a previous probe invocation
+    // had left the offset advanced. See `VideoSource::rewind` for rationale.
+    #[cfg(unix)]
+    if source.needs_offset_reset()
+        && let Err(err) = source.rewind()
+    {
+        return Err(VideoError::Io {
+            path: canonical_path.to_path_buf(),
+            source: err,
+        });
+    }
+
+    let mut cmd = Command::new("ffprobe");
+    cmd.args([
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames,avg_frame_rate,r_frame_rate,duration,width,height",
+        "-of",
+        "default=noprint_wrappers=1",
+    ])
+    .arg(source.ffmpeg_input());
+    source.configure_child(&mut cmd);
+    let output = cmd.output().map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            VideoError::FfprobeMissing
+        } else {
+            VideoError::Io {
+                path: canonical_path.to_path_buf(),
+                source: err,
             }
-        })?;
+        }
+    })?;
     if !output.status.success() {
         return Err(VideoError::Probe {
-            path: path.to_path_buf(),
+            path: canonical_path.to_path_buf(),
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }
@@ -479,7 +719,7 @@ fn probe_video(path: &Path) -> Result<VideoMeta, VideoError> {
         .filter(|f| f.is_finite() && *f > 0.0)
         .unwrap_or(1.0);
 
-    apply_probe_caps(path, nb_frames, fps, width, height, duration)
+    apply_probe_caps(canonical_path, nb_frames, fps, width, height, duration)
 }
 
 /// Enforce resolution and duration caps on raw ffprobe field values, returning
@@ -636,20 +876,44 @@ fn parse_rational(value: &str) -> Option<f64> {
 ///     mlxcel::multimodal::video::load_video(&path, target_fps, target_nframes)
 /// }).await??;
 /// ```
+///
+/// # Path vs fd input (issue #601)
+///
+/// This function operates on a [`Path`]. Server callers that source the
+/// video from an untrusted user request should instead use
+/// [`load_video_source`] with a [`VideoSource::Fd`] produced by the media
+/// resolver — that closes the canonicalize → ffmpeg-open TOCTOU window
+/// described in `extract_chat_video_paths_with_allowlist`.
 pub fn load_video(
     path: &Path,
+    target_fps: Option<f64>,
+    target_nframes: Option<usize>,
+) -> Result<Vec<DynamicImage>, VideoError> {
+    let source = VideoSource::from_path(path.to_path_buf());
+    load_video_source(&source, target_fps, target_nframes)
+}
+
+/// Decode a [`VideoSource`] into uniformly-sampled frames.
+///
+/// Equivalent to [`load_video`] but accepts a [`VideoSource`] so the
+/// fd-backed variant (used by the chat-completion video resolver, issue
+/// #601) can pipe the file through `/dev/fd/N` instead of re-opening the
+/// canonical path. See [`VideoSource`] for the security rationale.
+pub fn load_video_source(
+    source: &VideoSource,
     target_fps: Option<f64>,
     target_nframes: Option<usize>,
 ) -> Result<Vec<DynamicImage>, VideoError> {
     if !ffmpeg_available() {
         return Err(VideoError::FfmpegMissing);
     }
-    let meta = probe_video(path)?;
+    let canonical = source.canonical_path().to_path_buf();
+    let meta = probe_video(source)?;
     let nframes =
         smart_nframes(meta.total_frames, meta.fps, target_fps, target_nframes).map_err(|err| {
             match err {
                 VideoError::Extract { message, .. } => VideoError::Extract {
-                    path: path.to_path_buf(),
+                    path: canonical.clone(),
                     message,
                 },
                 other => other,
@@ -657,15 +921,15 @@ pub fn load_video(
         })?;
 
     let indices = uniform_indices(meta.total_frames, nframes);
-    let frames = extract_frames_single_pass(path, &indices, meta.fps)?;
+    let frames = extract_frames_single_pass(source, &indices, meta.fps)?;
 
     if frames.is_empty() {
-        return Err(VideoError::EmptyVideo(path.to_path_buf()));
+        return Err(VideoError::EmptyVideo(canonical));
     }
     Ok(frames)
 }
 
-/// Convenience: load multiple videos, returning one frame vector per video.
+/// Convenience: load multiple videos by path, returning one frame vector per video.
 ///
 /// Errors short-circuit on the first failure. Callers that need
 /// per-video error tolerance should call [`load_video`] in a loop and
@@ -718,13 +982,39 @@ fn uniform_indices(total_frames: usize, nframes: usize) -> Vec<usize> {
 /// 0-based frame index. ffmpeg's `select` filter compares the frame
 /// presentation number `n` against each operand and outputs a frame when
 /// any equality holds. The `+` operator is a logical OR.
+///
+/// ## Issue #601: fd-bearing source support
+///
+/// Accepts a [`VideoSource`] so the resolver in `src/server/media.rs` can
+/// pass an opened fd instead of the canonical path. When the source is
+/// fd-backed, the parent's master fd is rewound to offset 0, the
+/// `pre_exec` hook clears `FD_CLOEXEC` so the fd is inherited by the
+/// ffmpeg child, and ffmpeg opens `/dev/fd/N` (Linux/macOS). This closes
+/// the TOCTOU window between the resolver's `canonicalize` and ffmpeg's
+/// `open` call.
 fn extract_frames_single_pass(
-    path: &Path,
+    source: &VideoSource,
     indices: &[usize],
     _video_fps: f64,
 ) -> Result<Vec<DynamicImage>, VideoError> {
     if indices.is_empty() {
         return Ok(Vec::new());
+    }
+
+    let canonical_path = source.canonical_path().to_path_buf();
+
+    // Reset the master fd offset to 0 (no-op for path sources) so the new
+    // ffmpeg invocation reads the file from the beginning even after a
+    // previous ffprobe call advanced the offset. See `VideoSource::rewind`
+    // for the OFD-sharing rationale.
+    #[cfg(unix)]
+    if source.needs_offset_reset()
+        && let Err(err) = source.rewind()
+    {
+        return Err(VideoError::Io {
+            path: canonical_path,
+            source: err,
+        });
     }
 
     // Build the select filter: "eq(n\,0)+eq(n\,5)+eq(n\,30)+..."
@@ -738,9 +1028,9 @@ fn extract_frames_single_pass(
 
     // Spawn ffmpeg with stdout piped; stderr is piped so we can surface
     // error messages on failure.
-    let mut child = Command::new("ffmpeg")
-        .args(["-loglevel", "error", "-i"])
-        .arg(path)
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-loglevel", "error", "-i"])
+        .arg(source.ffmpeg_input())
         .args([
             "-vf",
             &format!("select='{select_expr}',setpts=N/FRAME_RATE/TB"),
@@ -753,18 +1043,18 @@ fn extract_frames_single_pass(
             "-",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|err| {
-            if err.kind() == io::ErrorKind::NotFound {
-                VideoError::FfmpegMissing
-            } else {
-                VideoError::Io {
-                    path: path.to_path_buf(),
-                    source: err,
-                }
+        .stderr(Stdio::piped());
+    source.configure_child(&mut cmd);
+    let mut child = cmd.spawn().map_err(|err| {
+        if err.kind() == io::ErrorKind::NotFound {
+            VideoError::FfmpegMissing
+        } else {
+            VideoError::Io {
+                path: source.canonical_path().to_path_buf(),
+                source: err,
             }
-        })?;
+        }
+    })?;
 
     // We must read stdout and wait for the process concurrently — if we
     // call child.wait() before draining stdout the process blocks on a
@@ -774,11 +1064,11 @@ fn extract_frames_single_pass(
         .take()
         .expect("stdout was piped but is None — this is a bug");
 
-    let frames = split_png_stream(stdout, path, indices.len())?;
+    let frames = split_png_stream(stdout, source.canonical_path(), indices.len())?;
 
     // Collect stderr and wait for the process exit status.
     let output = child.wait_with_output().map_err(|err| VideoError::Io {
-        path: path.to_path_buf(),
+        path: source.canonical_path().to_path_buf(),
         source: err,
     })?;
 
@@ -787,7 +1077,7 @@ fn extract_frames_single_pass(
         // ffmpeg sometimes exits non-zero for harmless reasons (e.g.,
         // stream ended cleanly but signals EIO on stdout close).
         return Err(VideoError::Extract {
-            path: path.to_path_buf(),
+            path: source.canonical_path().to_path_buf(),
             message: String::from_utf8_lossy(&output.stderr).into_owned(),
         });
     }

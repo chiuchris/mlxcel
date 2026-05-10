@@ -1273,14 +1273,14 @@ async fn chat_request_drops_temp_files_on_completion() {
     );
     let prepared = prepare_chat_request(&processor, &request, None).await;
 
-    // Resolved: exactly one temp path, exactly one guard.
-    assert_eq!(prepared.video_paths.len(), 1, "data:video URL must resolve");
-    assert_eq!(
-        prepared.video_temp_guards.len(),
-        1,
-        "data:video URL must yield one Drop guard"
+    // Resolved: exactly one entry whose temp_guard is `Some` (data:video
+    // is server-owned and must carry the Drop guard alongside it).
+    assert_eq!(prepared.videos.len(), 1, "data:video URL must resolve");
+    assert!(
+        prepared.videos[0].temp_guard.is_some(),
+        "data:video URL must yield a Drop guard for cleanup"
     );
-    let temp_path = prepared.video_paths[0].0.clone();
+    let temp_path = prepared.videos[0].canonical_path().to_path_buf();
     assert!(
         temp_path.exists(),
         "temp file must exist while PreparedChatRequest is alive"

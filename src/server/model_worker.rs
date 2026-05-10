@@ -483,7 +483,7 @@ pub(crate) fn prepare_request_vlm_embeddings(
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
     audio: &[Vec<u8>],
-    videos: &[(std::path::PathBuf, Option<f64>)],
+    videos: &[crate::server::media::ResolvedVideo],
     vision_caches: Option<&ModelVisionCaches>,
 ) -> Result<Option<InputEmbeddings>> {
     let has_media = !images.is_empty() || !audio.is_empty() || !videos.is_empty();
@@ -722,7 +722,7 @@ fn prepare_request_video_embeddings(
     model: &LoadedModel,
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
-    videos: &[(std::path::PathBuf, Option<f64>)],
+    videos: &[crate::server::media::ResolvedVideo],
 ) -> Result<Option<InputEmbeddings>> {
     use crate::multimodal::video;
 
@@ -744,12 +744,25 @@ fn prepare_request_video_embeddings(
 
     // Decode each video honoring the per-video FPS override when supplied;
     // otherwise fall back to `multimodal::video::DEFAULT_FPS`.
+    //
+    // Issue #601: every `ResolvedVideo` carries a [`VideoSource`] handle —
+    // on Unix this is fd-backed, so the call to `load_video_source` reads
+    // from the open file description the resolver already validated. ffmpeg
+    // never re-opens the canonical path, so an attacker cannot win the
+    // canonicalise → ffmpeg-open swap race even with write access to an
+    // allowlist directory.
     let mut decoded_videos: Vec<Vec<image::DynamicImage>> = Vec::with_capacity(videos.len());
     let mut fps_per_video: Vec<f64> = Vec::with_capacity(videos.len());
-    for (path, fps_override) in videos.iter() {
-        let fps = fps_override.unwrap_or(video::DEFAULT_FPS);
-        let frames = video::load_video(path, Some(fps), None)
-            .map_err(|err| anyhow!("Failed to load video {:?}: {}", path, err))?;
+    for resolved in videos.iter() {
+        let fps = resolved.fps.unwrap_or(video::DEFAULT_FPS);
+        let frames =
+            video::load_video_source(&resolved.source, Some(fps), None).map_err(|err| {
+                anyhow!(
+                    "Failed to load video {:?}: {}",
+                    resolved.source.canonical_path(),
+                    err
+                )
+            })?;
         decoded_videos.push(frames);
         fps_per_video.push(fps);
     }

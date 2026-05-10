@@ -385,7 +385,7 @@ async fn non_stream_chat_completion(
     // Generate (blocking call handled by model provider's worker thread).
     // Issue #596: forward resolved video paths alongside images and audio.
     // For non-video models the route guard above already rejected the
-    // request, so `prepared.video_paths` is always empty here unless the
+    // request, so `prepared.videos` is always empty here unless the
     // model supports video.
     let result = state
         .model_provider
@@ -394,7 +394,7 @@ async fn non_stream_chat_completion(
             options,
             prepared.image_data,
             prepared.audio_data,
-            prepared.video_paths,
+            prepared.videos,
         )
         .map_err(|e| ErrorResponse::new(format!("Generation error: {e}"), "server_error"))?;
 
@@ -613,7 +613,7 @@ async fn stream_chat_completion(
                 options,
                 prepared.image_data,
                 prepared.audio_data,
-                prepared.video_paths,
+                prepared.videos,
                 cancelled,
                 |token, lp_data| {
                     // Always accumulate raw text for tool call parsing

@@ -222,13 +222,19 @@ async fn extract_chat_video_paths_resolves_local_path() {
         },
     }]);
 
-    let (paths, guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert_eq!(paths.len(), 1);
-    assert_eq!(paths[0].0, fs::canonicalize(&path).unwrap());
-    assert_eq!(paths[0].1, Some(1.5));
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].canonical_path(),
+        fs::canonicalize(&path).unwrap()
+    );
+    assert_eq!(resolved[0].fps, Some(1.5));
     // file:// / bare local paths are server-not-owned: no temp guard.
-    assert!(guards.is_empty(), "no guards expected for non-owned paths");
+    assert!(
+        resolved[0].temp_guard.is_none(),
+        "no temp guard expected for non-owned paths"
+    );
 
     fs::remove_dir_all(sandbox).unwrap();
 }
@@ -243,9 +249,12 @@ async fn extract_chat_video_paths_drops_missing_file() {
             fps: None,
         },
     }]);
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert!(paths.is_empty(), "missing file must produce empty result");
+    assert!(
+        resolved.is_empty(),
+        "missing file must produce empty result"
+    );
     fs::remove_dir_all(sandbox).unwrap();
 }
 
@@ -260,12 +269,18 @@ async fn extract_chat_video_paths_supports_file_url_scheme() {
             fps: None,
         },
     }]);
-    let (paths, guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert_eq!(paths.len(), 1);
-    assert_eq!(paths[0].0, fs::canonicalize(&path).unwrap());
-    assert_eq!(paths[0].1, None);
-    assert!(guards.is_empty(), "no guards expected for file:// URLs");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].canonical_path(),
+        fs::canonicalize(&path).unwrap()
+    );
+    assert_eq!(resolved[0].fps, None);
+    assert!(
+        resolved[0].temp_guard.is_none(),
+        "no temp guard expected for file:// URLs"
+    );
     fs::remove_dir_all(sandbox).unwrap();
 }
 
@@ -291,10 +306,17 @@ async fn extract_chat_video_paths_canonicalises_parent_dir_inside_allowlist() {
         },
     }]);
 
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert_eq!(paths.len(), 1, "in-sandbox parent-dir traversal is allowed");
-    assert_eq!(paths[0].0, fs::canonicalize(&video).unwrap());
+    assert_eq!(
+        resolved.len(),
+        1,
+        "in-sandbox parent-dir traversal is allowed"
+    );
+    assert_eq!(
+        resolved[0].canonical_path(),
+        fs::canonicalize(&video).unwrap()
+    );
     fs::remove_dir_all(sandbox).unwrap();
 }
 
@@ -310,9 +332,12 @@ async fn extract_chat_video_paths_rejects_non_video_local_file() {
         },
     }]);
 
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert!(paths.is_empty(), "non-video local files must be rejected");
+    assert!(
+        resolved.is_empty(),
+        "non-video local files must be rejected"
+    );
 
     fs::remove_dir_all(sandbox).unwrap();
 }
@@ -333,9 +358,9 @@ async fn extract_chat_video_paths_rejects_when_allowlist_empty() {
             fps: None,
         },
     }]);
-    let (bare_paths, _) = extract_chat_video_paths_with_allowlist(&bare_request, &[]).await;
+    let bare_resolved = extract_chat_video_paths_with_allowlist(&bare_request, &[]).await;
     assert!(
-        bare_paths.is_empty(),
+        bare_resolved.is_empty(),
         "bare path must be rejected when allowlist is empty"
     );
 
@@ -345,9 +370,9 @@ async fn extract_chat_video_paths_rejects_when_allowlist_empty() {
             fps: None,
         },
     }]);
-    let (fileurl_paths, _) = extract_chat_video_paths_with_allowlist(&file_url_request, &[]).await;
+    let fileurl_resolved = extract_chat_video_paths_with_allowlist(&file_url_request, &[]).await;
     assert!(
-        fileurl_paths.is_empty(),
+        fileurl_resolved.is_empty(),
         "file:// URI must be rejected when allowlist is empty"
     );
 
@@ -370,11 +395,12 @@ async fn extract_chat_video_paths_rejects_outside_allowlist() {
             fps: None,
         },
     }]);
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&allowed)).await;
     assert!(
-        paths.is_empty(),
-        "video outside allowlist must be rejected; got {paths:?}"
+        resolved.is_empty(),
+        "video outside allowlist must be rejected; got {} resolved",
+        resolved.len()
     );
 
     fs::remove_dir_all(allowed).unwrap();
@@ -403,11 +429,12 @@ async fn extract_chat_video_paths_rejects_symlink_to_outside_allowlist() {
                 fps: None,
             },
         }]);
-        let (paths, _guards) =
+        let resolved =
             extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&allowed)).await;
         assert!(
-            paths.is_empty(),
-            "symlink pointing outside the allowlist must be rejected; got {paths:?}"
+            resolved.is_empty(),
+            "symlink pointing outside the allowlist must be rejected; got {} resolved",
+            resolved.len()
         );
 
         fs::remove_dir_all(allowed).unwrap();
@@ -429,11 +456,12 @@ async fn extract_chat_video_paths_rejects_non_regular_file() {
             fps: None,
         },
     }]);
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
     assert!(
-        paths.is_empty(),
-        "directory must be rejected even with .mp4 extension; got {paths:?}"
+        resolved.is_empty(),
+        "directory must be rejected even with .mp4 extension; got {} resolved",
+        resolved.len()
     );
 
     fs::remove_dir_all(sandbox).unwrap();
@@ -456,11 +484,14 @@ async fn extract_chat_video_paths_accepts_path_inside_allowlist() {
         },
     }]);
 
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert_eq!(paths.len(), 1);
-    assert_eq!(paths[0].0, fs::canonicalize(&video).unwrap());
-    assert_eq!(paths[0].1, Some(2.5));
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        resolved[0].canonical_path(),
+        fs::canonicalize(&video).unwrap()
+    );
+    assert_eq!(resolved[0].fps, Some(2.5));
 
     fs::remove_dir_all(sandbox).unwrap();
 }
@@ -489,11 +520,18 @@ async fn extract_chat_video_paths_async_canonicalize_works() {
         },
     }]);
 
-    let (paths, _guards) =
+    let resolved =
         extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
-    assert_eq!(paths.len(), 1, "async canonicalize should resolve the file");
-    assert_eq!(paths[0].0, fs::canonicalize(&video).unwrap());
-    assert_eq!(paths[0].1, Some(0.5));
+    assert_eq!(
+        resolved.len(),
+        1,
+        "async canonicalize should resolve the file"
+    );
+    assert_eq!(
+        resolved[0].canonical_path(),
+        fs::canonicalize(&video).unwrap()
+    );
+    assert_eq!(resolved[0].fps, Some(0.5));
 
     fs::remove_dir_all(sandbox).unwrap();
 }
@@ -586,14 +624,10 @@ async fn fetch_remote_video_streaming_rejects_oversized() {
     }]);
     // Sandbox is irrelevant for HTTP fetch (allowlist gate is only for
     // local paths) but we pass an empty one to confirm.
-    let (paths, guards) = extract_chat_video_paths_with_allowlist(&request, &[]).await;
+    let resolved = extract_chat_video_paths_with_allowlist(&request, &[]).await;
     assert!(
-        paths.is_empty(),
-        "oversized declared body must produce no resolved path"
-    );
-    assert!(
-        guards.is_empty(),
-        "rejected fetch must not leave a temp guard behind"
+        resolved.is_empty(),
+        "oversized declared body must produce no resolved path or temp guard"
     );
 
     let _ = server.await;
@@ -620,6 +654,195 @@ fn scan_insecure_allowlist_dirs_flags_world_writable_directory() {
     // Restore reasonable permissions before delete (some systems require it).
     fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
     fs::remove_dir_all(dir).unwrap();
+}
+
+// -- Issue #601: fd-based TOCTOU closure ----------------------------------
+
+/// Issue #601 regression test: the resolver retains a read-only fd on the
+/// originally-validated file, so an attacker who swaps the path for a
+/// symlink to `/etc/passwd` (or any other out-of-sandbox file) between
+/// resolution and consumption cannot trick the server into reading the
+/// substituted bytes.
+///
+/// The test exercises the security property *directly* by reading from
+/// the fd the resolver returned. If the resolver were still path-based,
+/// any subsequent `open(path)` call would follow the swapped symlink and
+/// read `/etc/passwd`. Because we read from the open file description the
+/// resolver opened *before* the swap, we get the original bytes back.
+///
+/// This test would FAIL on the pre-#601 path-based resolver: the path
+/// returned by the resolver is itself the symlink target (after
+/// canonicalize) — opening it after the swap yields `/etc/passwd`. With
+/// the fd-based resolver, we hold the open file description before the
+/// swap takes place.
+#[cfg(unix)]
+#[tokio::test]
+async fn extract_chat_video_paths_fd_survives_symlink_swap() {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+
+    let sandbox = make_sandbox_dir();
+    // The "real" video the resolver should canonicalise to.
+    let original = sandbox.join(format!("mlxcel-real-video-{}.mp4", uuid::Uuid::new_v4()));
+    let original_bytes = b"ORIGINAL VIDEO BYTES (the bytes the fd must continue to read)";
+    fs::write(&original, original_bytes).unwrap();
+    fs::set_permissions(&original, fs::Permissions::from_mode(0o644)).unwrap();
+
+    // The "decoy" file the attacker swaps in. In a real attack this would
+    // be `/etc/passwd` or another sensitive file; for the test we use a
+    // deliberately distinct fixture so the assertion can compare bytes
+    // exactly without depending on host filesystem state.
+    let decoy_dir = make_sandbox_dir();
+    let decoy = decoy_dir.join("decoy.mp4");
+    let decoy_bytes = b"DECOY BYTES (these MUST NOT leak to ffmpeg after the swap)";
+    fs::write(&decoy, decoy_bytes).unwrap();
+
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: original.to_str().unwrap().to_string(),
+            fps: None,
+        },
+    }]);
+
+    // Resolution (open + canonicalise + allowlist + extension checks).
+    // After this call the resolver holds an OwnedFd on `original`.
+    let mut resolved =
+        extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
+    assert_eq!(resolved.len(), 1, "resolver must produce exactly one entry");
+    let canonical_after_resolve = resolved[0].canonical_path().to_path_buf();
+    assert_eq!(
+        canonical_after_resolve,
+        fs::canonicalize(&original).unwrap()
+    );
+
+    // Verify the resolver opened the fd-backed variant on Unix. On non-
+    // Unix targets the resolver falls back to the path variant; that case
+    // is not exercised by this test (the test is `#[cfg(unix)]`).
+    use crate::multimodal::video::VideoSource;
+    assert!(
+        matches!(&resolved[0].source, VideoSource::Fd { .. }),
+        "Unix resolver must produce the fd-backed VideoSource variant"
+    );
+
+    // ── Attack: swap the original file with a symlink pointing to the decoy.
+    // We delete the original (the fd we opened earlier still holds the open
+    // file description, so the file remains accessible via the fd even
+    // after unlink) and create a symlink at the same path pointing at the
+    // decoy.
+    fs::remove_file(&original).unwrap();
+    use std::os::unix::fs as unix_fs;
+    unix_fs::symlink(&decoy, &original).unwrap();
+
+    // Sanity: opening the path now follows the symlink to the decoy.
+    let bytes_via_path = fs::read(&original).unwrap();
+    assert_eq!(
+        bytes_via_path, decoy_bytes,
+        "control: opening by path after the swap must follow the symlink \
+         to the decoy (this is the attack the fd path closes)"
+    );
+
+    // ── Critical assertion: read the bytes through the fd the resolver
+    // already opened. They must be the original bytes, not the decoy's.
+    //
+    // We extract the fd from the ResolvedVideo, dup it (so the resolver's
+    // OwnedFd remains intact for its Drop), seek to 0, and read all bytes.
+    let raw_fd = match &resolved[0].source {
+        VideoSource::Fd { fd, .. } => fd,
+        VideoSource::Path(_) => unreachable!("checked above"),
+    };
+    use std::os::fd::AsRawFd;
+    // SAFETY: `dup` returns a fresh kernel fd referring to the same OFD;
+    // closing the dup does not close the original. We wrap it in a
+    // `std::fs::File` for the standard `Read` trait without taking
+    // ownership of the resolver's master fd.
+    let dup_raw = unsafe { libc::dup(raw_fd.as_raw_fd()) };
+    assert!(dup_raw >= 0, "dup must succeed");
+    // Seek dup'd fd to 0 (it shares the OFD's offset with the master fd
+    // which may have been advanced by canonicalise/stat — defensive).
+    unsafe {
+        libc::lseek(dup_raw, 0, libc::SEEK_SET);
+    }
+    let mut file_view = unsafe {
+        use std::os::fd::FromRawFd;
+        std::fs::File::from_raw_fd(dup_raw)
+    };
+    let mut bytes_via_fd = Vec::new();
+    file_view.read_to_end(&mut bytes_via_fd).unwrap();
+    drop(file_view);
+
+    assert_eq!(
+        bytes_via_fd, original_bytes,
+        "fd-based read must return the ORIGINAL bytes after the symlink \
+         swap; if this fails the TOCTOU race is open"
+    );
+    assert_ne!(
+        bytes_via_fd, decoy_bytes,
+        "fd-based read must NOT return the decoy bytes; the swap was \
+         supposed to be defeated by the fd path"
+    );
+
+    // Cleanup: drop the resolved entries (closes the fd) and remove
+    // sandbox directories. We also remove the symlink first so
+    // remove_dir_all does not chase it into the decoy directory.
+    resolved.clear();
+    let _ = fs::remove_file(&original); // remove the symlink
+    fs::remove_dir_all(sandbox).unwrap();
+    fs::remove_dir_all(decoy_dir).unwrap();
+}
+
+/// Issue #601: when the file is unlinked between resolution and use, the
+/// fd-based path must still surface the originally-validated bytes. This
+/// is the simpler companion to the symlink-swap test — same property,
+/// different attacker move (unlink vs swap).
+#[cfg(unix)]
+#[tokio::test]
+async fn extract_chat_video_paths_fd_survives_unlink_after_resolution() {
+    use std::io::Read;
+
+    let sandbox = make_sandbox_dir();
+    let original = sandbox.join(format!("mlxcel-unlink-{}.mp4", uuid::Uuid::new_v4()));
+    let payload = b"PRESERVED BYTES";
+    fs::write(&original, payload).unwrap();
+
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: original.to_str().unwrap().to_string(),
+            fps: None,
+        },
+    }]);
+
+    let resolved =
+        extract_chat_video_paths_with_allowlist(&request, std::slice::from_ref(&sandbox)).await;
+    assert_eq!(resolved.len(), 1);
+
+    // Unlink the file. On Unix, the open file description in the
+    // resolver's OwnedFd keeps the inode alive until the fd is closed.
+    fs::remove_file(&original).unwrap();
+    assert!(!original.exists(), "control: path must no longer resolve");
+
+    use crate::multimodal::video::VideoSource;
+    let raw_fd = match &resolved[0].source {
+        VideoSource::Fd { fd, .. } => fd,
+        VideoSource::Path(_) => panic!("Unix resolver must produce fd variant"),
+    };
+    use std::os::fd::AsRawFd;
+    let dup_raw = unsafe { libc::dup(raw_fd.as_raw_fd()) };
+    assert!(dup_raw >= 0);
+    unsafe {
+        libc::lseek(dup_raw, 0, libc::SEEK_SET);
+    }
+    let mut file_view = unsafe {
+        use std::os::fd::FromRawFd;
+        std::fs::File::from_raw_fd(dup_raw)
+    };
+    let mut buf = Vec::new();
+    file_view.read_to_end(&mut buf).unwrap();
+    assert_eq!(
+        buf, payload,
+        "fd-based read must still return the original bytes after unlink"
+    );
+
+    fs::remove_dir_all(sandbox).unwrap();
 }
 
 #[cfg(unix)]

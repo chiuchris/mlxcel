@@ -28,10 +28,11 @@ use mlxcel_core::sampling::TokenLogprobData;
 
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::BatchObservability;
+use crate::server::media::ResolvedVideo;
 use crate::server::state::BatchMetrics;
 
 /// Request to the model thread
-pub enum ModelRequest {
+pub(crate) enum ModelRequest {
     Generate {
         prompt: String,
         options: ServerGenerateOptions,
@@ -39,13 +40,17 @@ pub enum ModelRequest {
         images: Vec<Vec<u8>>,
         /// Raw audio bytes for audio-language models (empty for text/vision-only)
         audio: Vec<Vec<u8>>,
-        /// Resolved video file paths with optional per-video FPS overrides
-        /// (issue #596). Each entry is a path that has already been validated
-        /// against `MLXCEL_VIDEO_DIR_ALLOWLIST` at the HTTP edge — the worker
-        /// trusts the paths and just feeds them to ffmpeg via
-        /// [`crate::multimodal::video::load_video`]. Empty for non-video
-        /// requests.
-        videos: Vec<(PathBuf, Option<f64>)>,
+        /// Resolved video items with optional per-video FPS overrides
+        /// (issue #596, hardened in #601). Each entry carries a
+        /// [`crate::multimodal::video::VideoSource`] handle the worker
+        /// passes to [`crate::multimodal::video::load_video_source`]. On
+        /// Unix the handle is fd-backed: the resolver opened the file
+        /// after canonicalising and matching against
+        /// `MLXCEL_VIDEO_DIR_ALLOWLIST`, and ffmpeg consumes that open
+        /// file description (via `/dev/fd/N`) rather than re-opening the
+        /// path — closing the canonicalise → ffmpeg-open TOCTOU window.
+        /// Empty for non-video requests.
+        videos: Vec<ResolvedVideo>,
         response_tx: mpsc::Sender<GenerateEvent>,
         /// Cancellation flag set by the SSE sender when the client disconnects.
         /// The `BatchScheduler` polls this to abort orphaned sequences.
@@ -577,13 +582,18 @@ impl ModelProvider {
     /// guard in [`crate::server::media::extract_chat_video_paths`] has cleared
     /// each entry against `MLXCEL_VIDEO_DIR_ALLOWLIST`. Empty `videos` matches
     /// pre-#596 behavior bit-for-bit.
-    pub fn generate_with_media_and_videos(
+    ///
+    /// Restricted to `pub(crate)` because the input type [`ResolvedVideo`] is
+    /// crate-internal — it carries an [`crate::multimodal::video::VideoSource`]
+    /// owning an open fd whose lifecycle is managed by the request handler.
+    /// Exposing it across the crate boundary would invite leaks.
+    pub(crate) fn generate_with_media_and_videos(
         &self,
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
-        videos: Vec<(PathBuf, Option<f64>)>,
+        videos: Vec<ResolvedVideo>,
     ) -> Result<GenerationResult> {
         let response_rx = self.send_generate_request(prompt, options, images, audio, videos)?;
         drain_generation_events(response_rx, self.decode_hang_timeout, |_| {})
@@ -698,13 +708,17 @@ impl ModelProvider {
     /// Like [`Self::generate_streaming_with_logprobs_cancellable`] but also
     /// forwards resolved video paths to the worker (issue #596). Empty
     /// `videos` is bit-exact with the no-video variant.
-    pub fn generate_streaming_with_logprobs_cancellable_videos<F>(
+    ///
+    /// `pub(crate)` for the same reason as
+    /// [`Self::generate_with_media_and_videos`] — the [`ResolvedVideo`]
+    /// input type is crate-internal.
+    pub(crate) fn generate_streaming_with_logprobs_cancellable_videos<F>(
         &self,
         prompt: String,
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
-        videos: Vec<(PathBuf, Option<f64>)>,
+        videos: Vec<ResolvedVideo>,
         cancelled: Arc<AtomicBool>,
         callback: F,
     ) -> Result<GenerationResult>
@@ -723,7 +737,7 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
-        videos: Vec<(PathBuf, Option<f64>)>,
+        videos: Vec<ResolvedVideo>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         self.send_generate_request_with_cancellation(
             prompt,
@@ -746,7 +760,7 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
-        videos: Vec<(PathBuf, Option<f64>)>,
+        videos: Vec<ResolvedVideo>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();

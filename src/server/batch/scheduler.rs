@@ -257,7 +257,14 @@ impl BatchScheduler {
     }
 
     /// Create a new batch scheduler, taking ownership of the model and channel.
-    pub fn new(
+    ///
+    /// Currently unused at the call site (`with_config` is what production
+    /// constructs) but retained as a convenience for future tests/benches.
+    /// The scheduler API is `pub(crate)` after the issue #601 refactor so
+    /// `dead_code` is silenced explicitly rather than dropped, keeping the
+    /// preserved-behavior intent visible.
+    #[allow(dead_code)]
+    pub(crate) fn new(
         model: LoadedModel,
         tokenizer: MlxcelTokenizer,
         config_eos: Vec<i32>,
@@ -285,7 +292,7 @@ impl BatchScheduler {
 
     /// Create a new batch scheduler with chunked-prefill and preemption config.
     #[allow(clippy::too_many_arguments)]
-    pub fn with_config(
+    pub(crate) fn with_config(
         model: LoadedModel,
         tokenizer: MlxcelTokenizer,
         config_eos: Vec<i32>,
@@ -1076,7 +1083,7 @@ impl BatchScheduler {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
-        videos: Vec<(std::path::PathBuf, Option<f64>)>,
+        videos: Vec<crate::server::media::ResolvedVideo>,
         response_tx: mpsc::Sender<GenerateEvent>,
         cancelled: Arc<AtomicBool>,
     ) {

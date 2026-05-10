@@ -411,22 +411,58 @@ pub(super) fn resolve_api_key(
 /// when the env var is empty/unset, so this runs as a no-op for operators
 /// who haven't opted into the feature.
 ///
+/// Issue #601 closed the dominant canonicalise → ffmpeg-open TOCTOU window
+/// at the kernel level: every file open now uses `O_NOFOLLOW` (so a symlink
+/// swap in the metadata→open gap returns `ELOOP` instead of silently
+/// following the link), and subprocesses receive `/dev/fd/N` rather than a
+/// path, so they cannot be redirected post-open regardless. Any residual
+/// window is limited to the kernel-internal `namei` compare-and-swap race,
+/// which is not practical to exploit. The startup warning is preserved as
+/// defence-in-depth and operator-policy guidance: a writable upload
+/// directory remains a policy red flag (anyone with shell access on the
+/// host can drop arbitrary files into the sandbox), and restricting to
+/// mode 0750 or stricter is the recommended posture.
+///
+/// On non-Unix targets this function emits a single warning when
+/// `MLXCEL_VIDEO_DIR_ALLOWLIST` is set, because the `O_NOFOLLOW` +
+/// fd-passing security layer is unavailable on those platforms. The
+/// video-allowlist feature is a Linux/macOS capability; non-Unix operators
+/// should leave the env var unset.
+///
 /// We log instead of refusing to start so that operators can still bring
 /// the server up with a loose-mode directory while they fix the
-/// permissions; the resolver itself is still safe against the static path
-/// checks (canonicalise + allowlist prefix + regular-file + extension).
+/// permissions; the resolver itself is safe against the static path
+/// checks (canonicalise + allowlist prefix + regular-file + extension)
+/// and the issue #601 fd-passing + `O_NOFOLLOW` guarantee.
 fn warn_on_insecure_video_allowlist() {
     let allowlist = super::media::video_dir_allowlist_from_env();
     if allowlist.is_empty() {
         return;
     }
-    let insecure = super::media::scan_insecure_allowlist_dirs(&allowlist);
-    for dir in insecure {
+    #[cfg(not(unix))]
+    {
         tracing::warn!(
-            "Allowlist directory '{}' is world/group-writable; this exposes a TOCTOU race. \
-             Restrict permissions to 0750 or stricter.",
-            dir.display()
+            "{} is set but the O_NOFOLLOW + fd-passing security layer \
+             (issue #601) is only available on Unix (Linux, macOS). \
+             On this platform the video resolver falls back to path-only \
+             mode, which retains a residual TOCTOU window. Leave \
+             MLXCEL_VIDEO_DIR_ALLOWLIST unset on non-Unix deployments.",
+            super::media::VIDEO_DIR_ALLOWLIST_ENV
         );
+    }
+    #[cfg(unix)]
+    {
+        let insecure = super::media::scan_insecure_allowlist_dirs(&allowlist);
+        for dir in insecure {
+            tracing::warn!(
+                "Allowlist directory '{}' is world/group-writable. The dominant \
+                 TOCTOU race against video resolution is closed at the kernel level \
+                 by the issue #601 O_NOFOLLOW + fd-passing fix, but a writable \
+                 upload directory remains a policy red flag. Restrict permissions \
+                 to 0750 or stricter.",
+                dir.display()
+            );
+        }
     }
 }
 
@@ -1329,10 +1365,13 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
 
     // Issue #596 hardening: scan the operator-provided
     // `MLXCEL_VIDEO_DIR_ALLOWLIST` directories for world/group-writable
-    // entries. A loose-mode directory exposes the path-based file resolver
-    // to a TOCTOU race (attacker swaps the file between canonicalize and
-    // ffmpeg open). The full FD-passing fix is out of scope for this PR;
-    // the startup-time warning here gives operators an actionable signal.
+    // entries. The technical TOCTOU race (attacker swaps the file between
+    // canonicalize and ffmpeg open) is now closed by issue #601's
+    // fd-passing fix in `media::extract_chat_video_paths_with_allowlist`,
+    // but a loose-mode allowlist directory still violates operator-policy
+    // hygiene and can re-enable the race if a future ffmpeg version
+    // interprets `/dev/fd/N` differently. We keep the warning as
+    // defence-in-depth.
     warn_on_insecure_video_allowlist();
 
     let state = AppState::with_observability(

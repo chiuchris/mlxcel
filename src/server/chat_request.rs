@@ -65,7 +65,9 @@ use super::chat_template_kwargs::{
     ChatTemplateKwargs, extract_request_kwargs, merge_server_and_request, strip_rolling_checkpoint,
     strip_think_block,
 };
-use super::media::{extract_chat_audio_data, extract_chat_image_data, extract_chat_video_paths};
+use super::media::{
+    ResolvedVideo, extract_chat_audio_data, extract_chat_image_data, extract_chat_video_paths,
+};
 use super::prompt_cache::key::resolve_session_key;
 use super::types::ChatCompletionRequest;
 use super::types::request::Tool;
@@ -74,33 +76,24 @@ pub(crate) struct PreparedChatRequest {
     pub(crate) prompt: String,
     pub(crate) image_data: Vec<Vec<u8>>,
     pub(crate) audio_data: Vec<Vec<u8>>,
-    /// Resolved video paths (issue #596). Each entry has been canonicalised
-    /// and validated against `MLXCEL_VIDEO_DIR_ALLOWLIST`; the paired
-    /// `Option<f64>` is the per-video sampling rate override from
-    /// [`crate::server::types::request::VideoUrl::fps`].
-    pub(crate) video_paths: Vec<(std::path::PathBuf, Option<f64>)>,
-    /// RAII drop guards for every server-owned temp file backing
-    /// `video_paths` (PR #600 review fix for the temp-file leak).
+    /// Resolved video items (issue #596, hardened by issue #601).
     ///
-    /// We keep these here rather than return them from
-    /// [`super::media::extract_chat_video_paths`] so the lifetime of the
-    /// guard equals the lifetime of the response handler: as soon as the
-    /// last consumer of `PreparedChatRequest` drops it, the temp files
-    /// vanish from `/tmp` regardless of which return path we took
-    /// (success, early error, panic).
-    ///
-    /// The scheduler still receives only `Vec<(PathBuf, Option<f64>)>` —
-    /// paths are forwarded by value to the worker thread, but ownership of
-    /// the temp file (i.e., the responsibility for deletion) stays inside
-    /// `PreparedChatRequest`. ffmpeg reads the file by path during prefill;
-    /// once that finishes the worker has no further reference to disk and
-    /// dropping the guards in the HTTP handler is safe.
-    ///
-    /// Read solely for its `Drop` impl; `dead_code` suppression here is
-    /// intentional — every other access path would defeat the whole point
-    /// of the guard.
-    #[allow(dead_code)]
-    pub(crate) video_temp_guards: Vec<crate::multimodal::video::TempFile>,
+    /// Each entry holds:
+    /// * a [`crate::multimodal::video::VideoSource`] handle that the
+    ///   model worker passes to
+    ///   [`crate::multimodal::video::load_video_source`]. On Unix this is
+    ///   the fd-backed variant — the resolver opened the file once after
+    ///   canonicalise + allowlist + regular-file + extension checks, and
+    ///   ffmpeg reads from that open file description (via `/dev/fd/N`),
+    ///   so the canonicalise → ffmpeg-open TOCTOU race is closed at the
+    ///   kernel level.
+    /// * the optional per-video FPS override from
+    ///   [`crate::server::types::request::VideoUrl::fps`].
+    /// * an internal RAII guard for any server-owned temp file (data-URI
+    ///   decode / HTTP fetch). The guard fires `fs::remove_file` when the
+    ///   `PreparedChatRequest` drops, so the temp file lifecycle equals
+    ///   the request handler lifecycle.
+    pub(crate) videos: Vec<ResolvedVideo>,
 }
 
 /// Dedup set for the "defaulted `preserve_thinking=true`" info log.
@@ -210,7 +203,7 @@ pub(crate) async fn prepare_chat_request_with_cache(
             })
     };
 
-    let (image_data, audio_data, (video_paths, video_temp_guards)) = tokio::join!(
+    let (image_data, audio_data, videos) = tokio::join!(
         extract_chat_image_data(request),
         extract_chat_audio_data(request),
         extract_chat_video_paths(request),
@@ -220,8 +213,7 @@ pub(crate) async fn prepare_chat_request_with_cache(
         prompt,
         image_data,
         audio_data,
-        video_paths,
-        video_temp_guards,
+        videos,
     }
 }
 
