@@ -247,3 +247,44 @@ async fn extract_chat_video_paths_supports_file_url_scheme() {
     assert_eq!(paths[0].1, None);
     fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn extract_chat_video_paths_rejects_parent_dir_components() {
+    let root = std::env::temp_dir().join(format!("mlxcel-video-root-{}", uuid::Uuid::new_v4()));
+    let nested = root.join("nested");
+    fs::create_dir_all(&nested).unwrap();
+    let video = root.join("clip.mp4");
+    fs::write(&video, b"fake-video-bytes").unwrap();
+    let traversal = nested.join("..").join("clip.mp4");
+    assert!(traversal.is_file(), "test path must resolve to the fixture");
+
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: traversal.to_str().unwrap().to_string(),
+            fps: None,
+        },
+    }]);
+
+    let paths = extract_chat_video_paths(&request).await;
+    assert!(paths.is_empty(), "parent-dir traversal must be rejected");
+
+    fs::remove_file(video).unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn extract_chat_video_paths_rejects_non_video_local_file() {
+    let path = std::env::temp_dir().join(format!("mlxcel-not-video-{}.txt", uuid::Uuid::new_v4()));
+    fs::write(&path, b"not a video").unwrap();
+    let request = build_chat_request(vec![ContentPart::VideoUrl {
+        video_url: VideoUrl {
+            url: path.to_str().unwrap().to_string(),
+            fps: None,
+        },
+    }]);
+
+    let paths = extract_chat_video_paths(&request).await;
+    assert!(paths.is_empty(), "non-video local files must be rejected");
+
+    fs::remove_file(path).unwrap();
+}

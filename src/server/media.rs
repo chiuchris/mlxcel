@@ -20,10 +20,12 @@
 
 use base64::Engine;
 use std::{
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     sync::OnceLock,
     time::Duration,
 };
+
+use crate::multimodal::video::is_video_file;
 
 use super::types::ChatCompletionRequest;
 use super::types::request::{InputAudio, VideoUrl};
@@ -69,18 +71,30 @@ async fn resolve_video_url(video: &VideoUrl) -> Option<PathBuf> {
         return decode_video_data_uri(url).await;
     }
     if let Some(path) = url.strip_prefix("file://") {
-        let p = Path::new(path).to_path_buf();
-        return p.is_file().then_some(p);
+        return resolve_local_video_path(path);
     }
     if is_http_url(url) {
         return fetch_remote_video(url).await;
     }
-    let path = Path::new(url);
-    if path.is_file() {
-        return Some(path.to_path_buf());
+    if let Some(path) = resolve_local_video_path(url) {
+        return Some(path);
     }
     tracing::warn!("Unsupported video URL scheme or missing file: {}", url);
     None
+}
+
+#[allow(dead_code)]
+fn resolve_local_video_path(raw: &str) -> Option<PathBuf> {
+    let path = Path::new(raw);
+    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+        tracing::warn!("Rejecting video path with parent-directory components: {raw}");
+        return None;
+    }
+    if !is_video_file(path) {
+        tracing::warn!("Rejecting local video path with unsupported extension: {raw}");
+        return None;
+    }
+    path.is_file().then(|| path.to_path_buf())
 }
 
 /// Maximum decoded video payload size: 1 GB. Mirrors the audio cap to
@@ -151,7 +165,7 @@ async fn fetch_remote_video(url: &str) -> Option<PathBuf> {
         .rsplit_once('.')
         .map(|(_, ext)| ext.split('?').next().unwrap_or(ext).to_string())
         .unwrap_or_else(|| "mp4".to_string());
-    write_video_temp_file(&bytes, &ext).await
+    write_video_temp_file(&bytes, sanitize_video_extension(&ext)).await
 }
 
 #[allow(dead_code)]
@@ -173,6 +187,7 @@ fn infer_video_extension(metadata: &str) -> &str {
 async fn write_video_temp_file(bytes: &[u8], ext: &str) -> Option<PathBuf> {
     let dir = std::env::temp_dir();
     let unique = uuid::Uuid::new_v4();
+    let ext = sanitize_video_extension(ext);
     let path = dir.join(format!("mlxcel-video-{unique}.{ext}"));
     match tokio::fs::write(&path, bytes).await {
         Ok(()) => Some(path),
@@ -184,6 +199,21 @@ async fn write_video_temp_file(bytes: &[u8], ext: &str) -> Option<PathBuf> {
             );
             None
         }
+    }
+}
+
+#[allow(dead_code)]
+fn sanitize_video_extension(ext: &str) -> &'static str {
+    match ext.trim_start_matches('.').to_ascii_lowercase().as_str() {
+        "mp4" => "mp4",
+        "webm" => "webm",
+        "mkv" => "mkv",
+        "mov" => "mov",
+        "avi" => "avi",
+        "m4v" => "m4v",
+        "mpg" => "mpg",
+        "mpeg" => "mpeg",
+        _ => "mp4",
     }
 }
 

@@ -222,7 +222,8 @@ fn transform_youtu_vl_key(key: &str) -> String {
 
 fn build_processor(model_path: &Path, vision_config: &YoutuVisionConfig) -> YoutuVLProcessor {
     let mut processor =
-        YoutuVLProcessor::new(vision_config.patch_size, vision_config.spatial_merge_size);
+        YoutuVLProcessor::new(vision_config.patch_size, vision_config.spatial_merge_size)
+            .with_max_patches_per_image(vision_config.num_patches);
 
     // Try to read `preprocessor_config.json` for `image_mean`, `image_std`,
     // and any min/max pixel hints. Fail silently (use defaults) if anything
@@ -266,6 +267,9 @@ fn build_processor(model_path: &Path, vision_config: &YoutuVisionConfig) -> Yout
     let max_pixels = json.get("max_pixels").and_then(|v| v.as_u64());
     if let (Some(min_p), Some(max_p)) = (min_pixels, max_pixels) {
         processor = processor.with_pixel_bounds(min_p as usize, max_p as usize);
+    }
+    if let Some(num_patches) = json.get("num_patches").and_then(|v| v.as_u64()) {
+        processor = processor.with_max_patches_per_image(num_patches as usize);
     }
 
     processor

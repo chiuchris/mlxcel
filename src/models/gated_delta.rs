@@ -207,7 +207,9 @@ pub fn gated_delta_ops(
     // Metal kernel path: handles both T=1 and T>1 in a single GPU dispatch.
     // The kernel handles GQA internally via hk_idx = hv_idx / (Hv / Hk),
     // so q and k are passed with their original Hk heads (not repeated).
-    if mlxcel_core::gated_delta_kernel_available() {
+    if mlxcel_core::gated_delta_kernel_available()
+        && supports_metal_gated_delta_kernel(hk, hv, dk, dv)
+    {
         let mut output = mlxcel_core::UniquePtr::null();
         let mut new_state = mlxcel_core::UniquePtr::null();
         let mask_ptr: *const mlxcel_core::MlxArray = match mask {
@@ -232,7 +234,8 @@ pub fn gated_delta_ops(
         return (output, new_state);
     }
 
-    // Fallback: ops-based path for non-Metal devices
+    // Fallback: ops-based path for non-Metal devices and shapes outside the
+    // custom kernel contract.
     let mut current_state = current_state;
 
     // Compute repeat factor for GQA
@@ -357,6 +360,17 @@ pub fn gated_delta_ops(
     let y = stack_arrays(&ys, 1);
 
     (y, current_state)
+}
+
+/// Return whether the custom Metal gated-delta kernel supports this shape.
+///
+/// The kernel stores `Dk / 32` values in a compile-time stack array per SIMD
+/// lane, so `Dk` must cover at least one full SIMD group and be exactly
+/// divisible by 32. Its GQA mapping also requires an integral `Hv / Hk`.
+///
+/// Used by: Qwen3Next, Qwen3.5, KimiLinear
+fn supports_metal_gated_delta_kernel(hk: i32, hv: i32, dk: i32, dv: i32) -> bool {
+    hk > 0 && hv > 0 && dv > 0 && dk >= 32 && dk % 32 == 0 && hv >= hk && hv % hk == 0
 }
 
 /// Main gated delta update function.

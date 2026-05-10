@@ -2234,7 +2234,7 @@ fn use_bool_causal_mask_path() -> bool {
 /// invariant on [`crate::cache::BatchedAttentionMetadata`], which exists to
 /// prevent shape-changing storage state across batch grow / shrink).
 ///
-/// Used by: Llama3 batched decode, Qwen3 batched decode
+/// Used by: Llama3 batched decode, Qwen3 batched decode, Gemma3 batched decode, Llama4 batched decode
 pub fn fast_rope_batched(
     x: &MlxArray,
     dims: i32,

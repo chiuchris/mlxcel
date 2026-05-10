@@ -94,7 +94,8 @@ fn dequantize_moondream3_weight_restores_interleaved_uint4_rows() {
 
     let dequantized = dequantize_moondream3_weight(&packed, &scale, &zero, &[2, 128]);
     assert_eq!(mlxcel_core::array_shape(&dequantized), vec![2, 128]);
-    let total = mlxcel_core::sum_all(&dequantized);
+    mlxcel_core::eval(&dequantized);
+    let total = mlxcel_core::sum_all(&mlxcel_core::astype(&dequantized, dtype::FLOAT32));
     mlxcel_core::eval(&total);
     assert!(mlxcel_core::item_f32(&total) > 0.0);
 }

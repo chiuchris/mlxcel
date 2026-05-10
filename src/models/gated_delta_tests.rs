@@ -14,7 +14,7 @@
 
 use super::{
     GatedDeltaCache, RMSNormGated, compute_g, gated_delta_ops, gated_delta_step,
-    precise_swiglu_gate, restore_dtype,
+    precise_swiglu_gate, restore_dtype, supports_metal_gated_delta_kernel,
 };
 use mlxcel_core::dtype;
 
@@ -187,6 +187,21 @@ fn gated_delta_step_with_mask_updates_state_selectively() {
 }
 
 // Tests for gated_delta_ops
+
+#[test]
+fn metal_gated_delta_shape_gate_accepts_supported_contract() {
+    assert!(supports_metal_gated_delta_kernel(1, 1, 32, 2));
+    assert!(supports_metal_gated_delta_kernel(2, 4, 64, 8));
+}
+
+#[test]
+fn metal_gated_delta_shape_gate_rejects_unsupported_contracts() {
+    assert!(!supports_metal_gated_delta_kernel(1, 1, 2, 2));
+    assert!(!supports_metal_gated_delta_kernel(1, 1, 31, 2));
+    assert!(!supports_metal_gated_delta_kernel(1, 1, 33, 2));
+    assert!(!supports_metal_gated_delta_kernel(4, 2, 64, 2));
+    assert!(!supports_metal_gated_delta_kernel(3, 4, 64, 2));
+}
 
 #[test]
 #[ignore = "requires serial MLX execution"]

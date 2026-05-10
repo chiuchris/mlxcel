@@ -603,7 +603,10 @@ where
         VlmRuntimeRef::YoutuVL(youtu) => {
             // Preprocess images into the flattened-patch + spatial_shapes
             // contract that Youtu-VL's vision tower expects.
-            let (pixel_values, spatial_shapes) = youtu.processor.preprocess_with_spatial(images);
+            let (pixel_values, spatial_shapes) = youtu
+                .processor
+                .try_preprocess_with_spatial(images)
+                .map_err(|err| anyhow::anyhow!("Youtu-VL image preprocessing failed: {err}"))?;
 
             // Splice image-token runs into the prompt when they aren't already
             // present. We mirror the upstream `<vision_start> + image*N +

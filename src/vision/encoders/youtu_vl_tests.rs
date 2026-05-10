@@ -31,6 +31,7 @@ fn small_config() -> YoutuVisionConfig {
         num_hidden_layers: 2,
         num_attention_heads: 4,
         num_channels: 3,
+        num_patches: 1024,
         patch_size: 2,
         layer_norm_eps: 1e-6,
         spatial_merge_size: 2,

@@ -92,6 +92,52 @@ fn preprocess_concatenates_multi_image_batches() {
 }
 
 #[test]
+fn smart_resize_honors_num_patches_cap() {
+    let p = YoutuVLProcessor::new(16, 2)
+        .with_max_patches_per_image(4096)
+        .with_pixel_bounds(32 * 32, usize::MAX);
+    let shapes = p.compute_spatial_shapes(&[solid_image(4096, 4096, [1, 2, 3])]);
+    let (h_patches, w_patches) = shapes[0];
+    assert!(
+        (h_patches as usize) * (w_patches as usize) <= 4096,
+        "patch grid {:?} exceeds num_patches cap",
+        shapes[0]
+    );
+}
+
+#[test]
+fn try_preprocess_rejects_cap_below_alignment_floor() {
+    let p = YoutuVLProcessor::new(16, 2)
+        .with_max_patches_per_image(3)
+        .with_pixel_bounds(1, usize::MAX);
+    let err = match p.try_preprocess_with_spatial(&[solid_image(64, 64, [1, 2, 3])]) {
+        Ok(_) => panic!("expected preprocessing to reject a cap below the aligned patch floor"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        YoutuVLPreprocessError::TooManyPatches {
+            patches: 4,
+            max_patches: 3,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn try_preprocess_rejects_resize_factor_above_u32() {
+    let p = YoutuVLProcessor::new(u32::MAX as usize + 1, 1);
+    let err = match p.try_preprocess_with_spatial(&[]) {
+        Ok(_) => panic!("expected preprocessing to reject an oversized resize factor"),
+        Err(err) => err,
+    };
+    assert!(matches!(
+        err,
+        YoutuVLPreprocessError::DimensionTooLarge { .. }
+    ));
+}
+
+#[test]
 fn normalization_matches_siglip_default() {
     let p = synthetic_processor();
     // A pure mid-gray image should normalize close to zero (val - 0.5)/0.5.

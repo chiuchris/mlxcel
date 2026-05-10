@@ -78,6 +78,8 @@ pub struct YoutuVisionConfig {
     pub num_attention_heads: usize,
     #[serde(default = "default_num_channels")]
     pub num_channels: usize,
+    #[serde(default = "default_num_patches")]
+    pub num_patches: usize,
     #[serde(default = "default_patch_size")]
     pub patch_size: usize,
     #[serde(default = "default_layer_norm_eps")]
@@ -116,6 +118,9 @@ fn default_num_attention_heads() -> usize {
 }
 fn default_num_channels() -> usize {
     3
+}
+fn default_num_patches() -> usize {
+    4096
 }
 fn default_patch_size() -> usize {
     16
