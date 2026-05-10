@@ -28,6 +28,7 @@
 //!    c. Accept matching prefix, rewind caches for rejected tokens
 //!    d. Continue from the divergence point
 
+use crate::cache::can_trim_prompt_cache;
 use crate::ffi;
 use crate::ffi::MlxThreadLocalStream;
 use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
@@ -40,6 +41,14 @@ use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::borrow::Cow;
 use std::time::Instant;
+
+/// Default chunk size for chunked prefill in speculative decoding.
+///
+/// Mirrors the `prefill_step_size` default used by upstream mlx-lm
+/// `speculative_generate_step` (512 tokens). Processing the prompt in
+/// chunks reduces peak memory pressure for long prompts and ensures the
+/// loop can correctly reserve the last token for the first speculation step.
+const PREFILL_STEP_SIZE: usize = 512;
 
 /// Returns true when the current hardware is M5+ with a Neural Accelerator
 /// and tile-aligned verification batching should be applied.
@@ -160,6 +169,14 @@ impl SpeculativeGenerator {
     /// * `max_tokens` - Maximum number of tokens to generate
     /// * `num_draft` - Number of draft tokens to generate per speculation step
     /// * `sampling` - Sampling configuration
+    ///
+    /// # Panics
+    ///
+    /// Panics if any KV cache in the main model's caches is not trimmable,
+    /// since speculative decoding requires cache rewind on draft rejection.
+    /// All current `KVCache` variants are trimmable; this guard future-proofs
+    /// the code against non-trimmable cache types (mirrors upstream mlx-lm
+    /// `can_trim_prompt_cache` validation added in PR #1109 / commit `f56d997`).
     pub fn generate<M: LanguageModel, D: LanguageModel>(
         &mut self,
         main_model: &M,
@@ -170,6 +187,35 @@ impl SpeculativeGenerator {
         sampling: &SamplingConfig,
     ) -> (Vec<i32>, GenerationStats) {
         self.reset();
+
+        // Validate that all KV cache entries support trimming before we begin.
+        // Speculative decoding rewrites the cache on every rejected draft token,
+        // so a non-trimmable cache type would silently corrupt the state.
+        // Mirrors upstream mlx-lm `can_trim_prompt_cache` check added in
+        // PR #1109 / commit f56d997. All current KVCache mode variants are
+        // trimmable; this assertion fires only when a new non-trimmable type
+        // is introduced (fail fast rather than silent corruption).
+        assert!(
+            can_trim_prompt_cache(&self.main_caches),
+            "speculative decoding requires a trimmable prompt cache (main model). \
+             At least one KV cache entry does not support trimming. \
+             Use a standard (non-speculative) generation path or switch to a \
+             trimmable cache type."
+        );
+        assert!(
+            can_trim_prompt_cache(&self.draft_caches),
+            "speculative decoding requires a trimmable prompt cache (draft model). \
+             At least one KV cache entry does not support trimming."
+        );
+
+        // Guard against empty prompts: speculative decoding requires at least
+        // one token so the final forward pass (which produces the first
+        // generated token's logits) can run. An empty prompt would cause a
+        // `[1, 0]` tensor forward with undefined behaviour.
+        assert!(
+            !prompt_tokens.is_empty(),
+            "speculative generate requires at least one prompt token"
+        );
 
         // Axis B: compose target-only sampling once; draft sampling stays raw.
         // `target_cow` owns the merged config when a bias is active, otherwise
@@ -190,13 +236,59 @@ impl SpeculativeGenerator {
         let mut token_history = initial_token_history(prompt_tokens, needs_history);
 
         // PREFILL PHASE.
+        //
+        // Process the prompt in chunks of `PREFILL_STEP_SIZE`, always reserving
+        // the last token for the first speculation step. This mirrors the
+        // upstream mlx-lm fix in PR #1109 / commit f56d997:
+        //
+        //   while y.size > 1:
+        //       n_to_process = min(prefill_step_size, y.size - 1)
+        //
+        // The old single-shot prefill (`forward` over all tokens at once) worked
+        // for short prompts but could process every token, leaving none for the
+        // speculation bootstrap — causing output corruption when prompt length
+        // was an exact multiple of the step size.
         let prefill_start = Instant::now();
 
-        let input = ffi::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+        // Chunked prefill: process all but the last token in step-sized blocks,
+        // evaluating and clearing the memory cache between steps to bound peak
+        // memory usage for long prompts.
+        let n = prompt_tokens.len();
+        let mut consumed = 0usize;
+        while n - consumed > 1 {
+            let step = PREFILL_STEP_SIZE.min(n - consumed - 1);
+            let chunk = &prompt_tokens[consumed..consumed + step];
+            let chunk_input = ffi::from_slice_i32(chunk, &[1, step as i32]);
+            // Prefill both models with the chunk (logits discarded — we only
+            // need the KV cache state for the continuation).
+            let _main_chunk_logits =
+                main_model.forward(&chunk_input, &mut self.main_caches, None);
+            let _draft_chunk_logits =
+                draft_model.forward(&chunk_input, &mut self.draft_caches, None);
+            // Evaluate only the KV cache state so it is materialised before
+            // the next chunk. This mirrors the upstream mlx-lm pattern:
+            //   mx.eval([c.state for c in cache])
+            // Evaluating the full logit tensors (_main_chunk_logits /
+            // _draft_chunk_logits) would force the LM-head matmul and a
+            // peak allocation of ~3.5 GB per chunk for Llama-3 class models,
+            // defeating the memory-bounding goal of chunked prefill.
+            for cache in &self.main_caches {
+                cache.eval_state();
+            }
+            for cache in &self.draft_caches {
+                cache.eval_state();
+            }
+            consumed += step;
+            ffi::clear_memory_cache();
+        }
 
-        // Prefill both models
-        let main_logits = main_model.forward(&input, &mut self.main_caches, None);
-        let _draft_logits = draft_model.forward(&input, &mut self.draft_caches, None);
+        // Forward the final token through both models to get the logits used
+        // for sampling the first generated token. By construction `consumed < n`
+        // so there is always at least one remaining token here.
+        let last_chunk = &prompt_tokens[consumed..];
+        let last_input = ffi::from_slice_i32(last_chunk, &[1, last_chunk.len() as i32]);
+        let main_logits = main_model.forward(&last_input, &mut self.main_caches, None);
+        let _draft_logits = draft_model.forward(&last_input, &mut self.draft_caches, None);
 
         // Sample first token from main model (target: bias applied).
         let (first_token_arr, _) =
@@ -655,5 +747,57 @@ mod tests {
         let target = g.compose_target_sampling(&caller);
         assert!(matches!(target, Cow::Borrowed(_)));
         assert!(target.token_bias.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #589 — trimmable cache validation and last-token reservation
+    // ------------------------------------------------------------------
+
+    /// All freshly-constructed KVCache entries must report `is_trimmable()`.
+    /// This is the per-entry predicate consumed by `can_trim_prompt_cache`.
+    #[test]
+    fn kv_cache_is_trimmable_always_true() {
+        // Empty cache
+        let c = KVCache::new();
+        assert!(c.is_trimmable());
+
+        // Cache with accumulated state
+        let mut c = KVCache::new();
+        let k = ffi::ones(&[1, 2, 4, 4], dtype::FLOAT32);
+        let v = ffi::ones(&[1, 2, 4, 4], dtype::FLOAT32);
+        c.update(k, v);
+        assert!(c.is_trimmable());
+    }
+
+    /// `can_trim_prompt_cache` returns `true` for a slice of standard KVCaches.
+    #[test]
+    fn can_trim_prompt_cache_all_standard() {
+        use crate::cache::can_trim_prompt_cache;
+
+        let caches: Vec<KVCache> = (0..4).map(|_| KVCache::new()).collect();
+        assert!(can_trim_prompt_cache(&caches));
+    }
+
+    /// `can_trim_prompt_cache` returns `true` even for an empty slice
+    /// (vacuously: all members of the empty set satisfy the predicate).
+    #[test]
+    fn can_trim_prompt_cache_empty_slice() {
+        use crate::cache::can_trim_prompt_cache;
+
+        let caches: Vec<KVCache> = Vec::new();
+        assert!(can_trim_prompt_cache(&caches));
+    }
+
+    /// Verify that `PREFILL_STEP_SIZE` matches the upstream mlx-lm default.
+    /// If this constant is changed, the test must be updated deliberately so
+    /// reviewers are aware of the deviation from upstream behavior.
+    #[test]
+    fn prefill_step_size_matches_upstream_default() {
+        assert_eq!(
+            PREFILL_STEP_SIZE,
+            512,
+            "PREFILL_STEP_SIZE must match upstream mlx-lm default (512). \
+             Update this test if you intentionally deviate."
+        );
     }
 }

@@ -112,6 +112,22 @@ fn direct_prefill_cache_store_enabled() -> bool {
     std::env::var("MLXCEL_ENABLE_DIRECT_PREFILL_CACHE_STORE").is_ok()
 }
 
+/// Check that all `KVCache` entries in `caches` support cache trimming.
+///
+/// Mirrors the upstream mlx-lm `can_trim_prompt_cache` function
+/// (`mlx_lm/models/cache.py`). Speculative decoding requires a trimmable
+/// cache so it can rewind cache entries after a draft-token rejection.
+///
+/// All current `KVCache` mode variants (Fp16, Int8, Turbo4Asym, Turbo4,
+/// Turbo3Asym, Turbo4Delegated) return `true` from [`KVCache::is_trimmable`].
+/// This function exists so new non-trimmable cache types can be detected
+/// early — before the speculative decode loop silently corrupts the cache.
+///
+/// Used by: speculative decoding entry-point validation (`speculative.rs`)
+pub fn can_trim_prompt_cache(caches: &[KVCache]) -> bool {
+    caches.iter().all(|c| c.is_trimmable())
+}
+
 /// Storage mode for KV cache tensors.
 ///
 /// Controls the on-device representation of accumulated key/value tensors.
@@ -1856,6 +1872,20 @@ impl KVCache {
         // no host-side cached state to invalidate.
     }
 
+    /// Returns `true` if this cache entry supports trimming via [`KVCache::trim`].
+    ///
+    /// All `KVCache` variants (Fp16, Int8, Turbo4*, Turbo3Asym) support trim.
+    /// This method exists as a mirror of the upstream mlx-lm `is_trimmable()`
+    /// (`models/cache.py`) and is consumed by `can_trim_prompt_cache` to let
+    /// speculative decoding fail fast when a non-trimmable cache type would
+    /// otherwise silently corrupt the cache rewind logic.
+    ///
+    /// Used by: `can_trim_prompt_cache` (speculative decoding validation)
+    #[inline]
+    pub fn is_trimmable(&self) -> bool {
+        true
+    }
+
     /// Trim the last `n` entries from the cache.
     ///
     /// Returns the number of entries actually trimmed.
@@ -2347,6 +2377,50 @@ impl KVCache {
             + vr_bytes
             + kp_bytes
             + kn_bytes
+    }
+
+    /// Force MLX to materialise the KV cache state without touching the logit
+    /// tensors returned by the model's `forward` pass.
+    ///
+    /// Upstream mlx-lm evaluates `[c.state for c in cache]` after each
+    /// chunked-prefill step (see `mlx_lm/generate.py` ~line 583). This method
+    /// mirrors that pattern: it calls `ffi::eval` on every non-`None` tensor
+    /// field that contributes to the cache state (`keys`, `values`,
+    /// `key_scales`, `val_scales`, `v_packed`, `v_norms`, `v_rescale`,
+    /// `k_packed`, `k_norms`), then returns. Evaluating only the cache state
+    /// avoids forcing the LM-head matmul (and the resulting peak allocation)
+    /// that would follow from evaluating the full `[1, step, vocab_size]`
+    /// logits tensor.
+    ///
+    /// Used by: `SpeculativeGenerator::generate` (chunked prefill loop)
+    pub fn eval_state(&self) {
+        if let Some(k) = self.keys.as_ref() {
+            ffi::eval(k);
+        }
+        if let Some(v) = self.values.as_ref() {
+            ffi::eval(v);
+        }
+        if let Some(ks) = self.key_scales.as_ref() {
+            ffi::eval(ks);
+        }
+        if let Some(vs) = self.val_scales.as_ref() {
+            ffi::eval(vs);
+        }
+        if let Some(vp) = self.v_packed.as_ref() {
+            ffi::eval(vp);
+        }
+        if let Some(vn) = self.v_norms.as_ref() {
+            ffi::eval(vn);
+        }
+        if let Some(vr) = self.v_rescale.as_ref() {
+            ffi::eval(vr);
+        }
+        if let Some(kp) = self.k_packed.as_ref() {
+            ffi::eval(kp);
+        }
+        if let Some(kn) = self.k_norms.as_ref() {
+            ffi::eval(kn);
+        }
     }
 
     /// Returns `true` iff this cache holds a packed V (the Turbo4 family)

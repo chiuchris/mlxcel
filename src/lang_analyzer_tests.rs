@@ -791,3 +791,36 @@ fn b8_cxx_generator_with_token_bias_caches_map() {
     assert_eq!(g.token_bias().len(), 1);
     assert!(g.token_bias().contains(3));
 }
+
+// ============================================================================
+// Issue #589 — trimmable cache validation and last-token reservation
+// ============================================================================
+
+use mlxcel_core::cache::can_trim_prompt_cache;
+use mlxcel_core::layers::KVCache;
+
+/// All freshly-constructed KVCache entries report `is_trimmable() == true`.
+/// This is the per-entry predicate consumed by `can_trim_prompt_cache`.
+#[test]
+fn issue589_kv_cache_is_trimmable_always_true() {
+    // Empty cache
+    let c = KVCache::new();
+    assert!(c.is_trimmable());
+}
+
+/// `can_trim_prompt_cache` returns `true` for a standard slice of KVCaches.
+#[test]
+fn issue589_can_trim_prompt_cache_standard_caches() {
+    let caches: Vec<KVCache> = (0..4).map(|_| KVCache::new()).collect();
+    assert!(
+        can_trim_prompt_cache(&caches),
+        "standard KVCache slice must report trimmable"
+    );
+}
+
+/// `can_trim_prompt_cache` returns `true` for an empty slice (vacuously true).
+#[test]
+fn issue589_can_trim_prompt_cache_empty_slice() {
+    let caches: Vec<KVCache> = Vec::new();
+    assert!(can_trim_prompt_cache(&caches));
+}
