@@ -1023,10 +1023,19 @@ impl BatchScheduler {
                 options,
                 images,
                 audio,
+                videos,
                 response_tx,
                 cancelled,
             } => {
-                self.enqueue_request(prompt, options, images, audio, response_tx, cancelled);
+                self.enqueue_request(
+                    prompt,
+                    options,
+                    images,
+                    audio,
+                    videos,
+                    response_tx,
+                    cancelled,
+                );
                 false
             }
             ModelRequest::Shutdown => {
@@ -1042,6 +1051,7 @@ impl BatchScheduler {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
+        videos: Vec<(std::path::PathBuf, Option<f64>)>,
         response_tx: mpsc::Sender<GenerateEvent>,
         cancelled: Arc<AtomicBool>,
     ) {
@@ -1067,9 +1077,9 @@ impl BatchScheduler {
         // that refuses to pad/concatenate a cache with no tensors. VLM
         // requests may legitimately start with an empty token list (image
         // tokens are injected later by `prepare_request_vlm_embeddings`),
-        // so this guard only applies to pure-text requests without images
-        // or audio.
-        if prompt_tokens.is_empty() && images.is_empty() && audio.is_empty() {
+        // so this guard only applies to pure-text requests without images,
+        // audio, or videos.
+        if prompt_tokens.is_empty() && images.is_empty() && audio.is_empty() && videos.is_empty() {
             let _ = response_tx.send(GenerateEvent::Error(
                 "Empty prompt: request has no input tokens to process".to_string(),
             ));
@@ -1096,13 +1106,13 @@ impl BatchScheduler {
         // feature-disabled, no ctx, and race paths), fall through to the
         // cold-allocation path below.
         //
-        // VLM / audio requests opt out of the cache path entirely: their
-        // pre-injection token stream is not self-describing (image token
-        // placeholders expand later inside `prepare_request_vlm_embeddings`),
-        // so matching against it risks reusing a KV slice built for a
-        // different media payload. Support for image-aware cache keys is
-        // tracked separately in issue #425.
-        let is_multimodal = !images.is_empty() || !audio.is_empty();
+        // VLM / audio / video requests opt out of the cache path entirely:
+        // their pre-injection token stream is not self-describing (image
+        // and video frame placeholders expand later inside
+        // `prepare_request_vlm_embeddings`), so matching against it risks
+        // reusing a KV slice built for a different media payload. Support
+        // for image-aware cache keys is tracked separately in issue #425.
+        let is_multimodal = !images.is_empty() || !audio.is_empty() || !videos.is_empty();
         let ctx_ref = if is_multimodal {
             None
         } else {
@@ -1139,6 +1149,7 @@ impl BatchScheduler {
             &mut prompt_tokens,
             &images,
             &audio,
+            &videos,
             Some(self.vision_caches.as_ref()),
         ) {
             Ok(emb) => emb,

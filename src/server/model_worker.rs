@@ -483,9 +483,10 @@ pub(crate) fn prepare_request_vlm_embeddings(
     prompt_tokens: &mut Vec<i32>,
     images: &[Vec<u8>],
     audio: &[Vec<u8>],
+    videos: &[(std::path::PathBuf, Option<f64>)],
     vision_caches: Option<&ModelVisionCaches>,
 ) -> Result<Option<InputEmbeddings>> {
-    let has_media = !images.is_empty() || !audio.is_empty();
+    let has_media = !images.is_empty() || !audio.is_empty() || !videos.is_empty();
 
     if !has_media || !model.is_vlm() {
         // Moondream3 needs special prompt formatting even for text-only
@@ -506,6 +507,18 @@ pub(crate) fn prepare_request_vlm_embeddings(
             *prompt_tokens = prepared.tokens;
         }
         return Ok(None);
+    }
+
+    // Issue #596: video inputs route to the Gemma 4 video embedding path,
+    // mirroring the CLI dispatch in `commands/generate_vlm.rs::compute_vlm_embeddings`.
+    // Combining --video with --audio is rejected upstream and at the route
+    // layer; this branch additionally surfaces a clear error if those happen
+    // to coexist (defence in depth).
+    if !videos.is_empty() {
+        if !audio.is_empty() {
+            return Err(anyhow!("Combined video and audio inputs are not supported"));
+        }
+        return prepare_request_video_embeddings(model, prompt_tokens, images, videos);
     }
 
     // Audio-only or audio+images for Gemma4
@@ -682,6 +695,138 @@ fn prepare_gemma4_audio_embeddings(
         &processed_images,
         Some(&audio_features),
         Some(&audio_mask),
+    );
+
+    Ok(Some(embeddings))
+}
+
+/// Resolve `videos` into Gemma 4 video embeddings (issue #596).
+///
+/// Mirrors the CLI's `compute_gemma4_video_embeddings` in
+/// `src/commands/generate_vlm.rs`: probes for ffmpeg, decodes each video into
+/// a frame sequence, runs the Gemma 4 video processor, expands `<|video|>`
+/// placeholders in the prompt token stream, and dispatches the combined
+/// (images + video frames) tensor through the same vision tower path that
+/// powers static image inputs.
+///
+/// Routing-side guarantees (the route layer in `chat.rs` short-circuits
+/// non-Gemma 4 video requests with a 400):
+/// * The model is a `Gemma4VLM` — non-Gemma 4 models never reach this path.
+/// * The video paths have already been canonicalised and validated against
+///   `MLXCEL_VIDEO_DIR_ALLOWLIST` by [`crate::server::media::extract_chat_video_paths`].
+///
+/// Defence-in-depth: this function still rejects non-Gemma 4 models with a
+/// clean error so a future caller that bypasses the route guard cannot
+/// silently corrupt a non-VLM run.
+fn prepare_request_video_embeddings(
+    model: &LoadedModel,
+    prompt_tokens: &mut Vec<i32>,
+    images: &[Vec<u8>],
+    videos: &[(std::path::PathBuf, Option<f64>)],
+) -> Result<Option<InputEmbeddings>> {
+    use crate::multimodal::video;
+
+    let gemma4_vl = match model {
+        LoadedModel::Gemma4VLM(model) => model,
+        _ => {
+            return Err(anyhow!(
+                "video inputs are only supported by Gemma 4 VLM models in this build"
+            ));
+        }
+    };
+
+    if !video::ffmpeg_available() {
+        return Err(anyhow!(
+            "Video input requires `ffmpeg` on PATH. Install ffmpeg (e.g. `brew install ffmpeg` \
+             on macOS or `apt install ffmpeg` on Linux) and retry."
+        ));
+    }
+
+    // Decode each video honoring the per-video FPS override when supplied;
+    // otherwise fall back to `multimodal::video::DEFAULT_FPS`.
+    let mut decoded_videos: Vec<Vec<image::DynamicImage>> = Vec::with_capacity(videos.len());
+    let mut fps_per_video: Vec<f64> = Vec::with_capacity(videos.len());
+    for (path, fps_override) in videos.iter() {
+        let fps = fps_override.unwrap_or(video::DEFAULT_FPS);
+        let frames = video::load_video(path, Some(fps), None)
+            .map_err(|err| anyhow!("Failed to load video {:?}: {}", path, err))?;
+        decoded_videos.push(frames);
+        fps_per_video.push(fps);
+    }
+
+    let total_frames: usize = decoded_videos.iter().map(Vec::len).sum();
+    tracing::info!(
+        "video request: decoded {} video(s) ({} total frames after sampling)",
+        decoded_videos.len(),
+        total_frames
+    );
+
+    // Optional companion images (e.g. user passes both image_url and video_url).
+    let decoded_images: Vec<image::DynamicImage> = if images.is_empty() {
+        Vec::new()
+    } else {
+        decode_request_images(images)?
+    };
+
+    let processed_images = gemma4_vl.processor.preprocess(&decoded_images);
+    let image_soft_tokens: Vec<usize> = processed_images
+        .iter()
+        .map(|img| img.num_soft_tokens)
+        .collect();
+
+    let processed_videos = gemma4_vl
+        .processor
+        .process_videos(&decoded_videos, Some(&fps_per_video));
+
+    // Per-video soft-token-per-frame matrix, matching
+    // `commands/generate_vlm::compute_gemma4_video_embeddings`.
+    let video_frame_tokens: Vec<Vec<usize>> = processed_videos
+        .iter()
+        .map(|v| vec![v.num_soft_tokens_per_frame; v.num_frames()])
+        .collect();
+
+    // The CLI path uses `i32::MIN` as a sentinel that cannot appear in a
+    // tokenised prompt so the placeholder-replace branch of
+    // `expand_gemma4_video_tokens` is bypassed and the function takes its
+    // "splice after BOS" fallback. Server callers behave the same way today
+    // because chat templates do not yet emit a real video token id; future
+    // template upgrades that introduce one can pass the proper value via
+    // `vlm_runtime::expand_gemma4_video_tokens` directly.
+    let video_token_sentinel = i32::MIN;
+
+    if decoded_images.is_empty() {
+        crate::vlm_runtime::expand_gemma4_video_tokens(
+            prompt_tokens,
+            video_token_sentinel,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &video_frame_tokens,
+        )?;
+    } else {
+        crate::vlm_runtime::expand_gemma4_image_tokens_pub(
+            prompt_tokens,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &image_soft_tokens,
+        )?;
+        crate::vlm_runtime::expand_gemma4_video_tokens(
+            prompt_tokens,
+            video_token_sentinel,
+            gemma4_vl.image_token_id,
+            gemma4_vl.boi_token_id,
+            gemma4_vl.eoi_token_id,
+            &video_frame_tokens,
+        )?;
+    }
+
+    let input_ids_arr =
+        mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings = gemma4_vl.get_input_embeddings_with_videos(
+        &input_ids_arr,
+        &processed_images,
+        &processed_videos,
     );
 
     Ok(Some(embeddings))

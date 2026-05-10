@@ -63,4 +63,4 @@ pub use prompt_cache::{
     multimodal_digest_from_vecs,
 };
 pub use startup::{ServerStartupConfig, start_server};
-pub use state::{AppState, BatchMetrics, Metrics};
+pub use state::{AppState, BatchMetrics, Metrics, ModelMediaSupport};

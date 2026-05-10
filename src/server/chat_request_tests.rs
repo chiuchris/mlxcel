@@ -1215,3 +1215,84 @@ fn tool_call_message_history_round_trips_and_digests() {
         "tool reorder must change the digest"
     );
 }
+
+// ---------------------------------------------------------------------------
+// PR #600 review fix (HIGH-1): temp-file lifetime tied to PreparedChatRequest
+// ---------------------------------------------------------------------------
+
+/// A `data:video/...;base64,...` URL produces a server-owned temp file that
+/// must exist while `PreparedChatRequest` is alive and disappear once it
+/// drops. The previous wiring leaked the file because nothing held a Drop
+/// guard — every request added up to 1 GiB of `/tmp` debris.
+///
+/// This test does not require ffmpeg or a real video; it only checks the
+/// resolver-to-guard wiring. The cap-checking and ffmpeg path are exercised
+/// elsewhere.
+#[tokio::test]
+async fn chat_request_drops_temp_files_on_completion() {
+    use base64::Engine;
+
+    // Tiny payload — base64 of "hi" — is enough to trigger the temp-file
+    // write path without straining CI.
+    let payload = base64::engine::general_purpose::STANDARD.encode(b"hi");
+    let data_url = format!("data:video/mp4;base64,{payload}");
+
+    let request = ChatCompletionRequest {
+        model: "test-model".to_string(),
+        messages: vec![Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![ContentPart::VideoUrl {
+                video_url: crate::server::types::request::VideoUrl {
+                    url: data_url,
+                    fps: None,
+                },
+            }]),
+            name: None,
+            tool_call_id: None,
+            tool_calls: None,
+        }],
+        stream: false,
+        stream_options: None,
+        logprobs: None,
+        top_logprobs: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        chat_template_kwargs: None,
+        extra_body: None,
+        prompt_cache_key: None,
+        user: None,
+        extra_body_fields: serde_json::Map::new(),
+        response_format: None,
+        params: SamplingParams::default(),
+    };
+
+    // Render with a no-op template — we only care about the media plumbing.
+    let processor = ChatTemplateProcessor::with_template(
+        "{% for m in messages %}{{ m.content }}{% endfor %}".to_string(),
+    );
+    let prepared = prepare_chat_request(&processor, &request, None).await;
+
+    // Resolved: exactly one temp path, exactly one guard.
+    assert_eq!(prepared.video_paths.len(), 1, "data:video URL must resolve");
+    assert_eq!(
+        prepared.video_temp_guards.len(),
+        1,
+        "data:video URL must yield one Drop guard"
+    );
+    let temp_path = prepared.video_paths[0].0.clone();
+    assert!(
+        temp_path.exists(),
+        "temp file must exist while PreparedChatRequest is alive"
+    );
+
+    // Drop the prepared struct; the guard's Drop impl should remove the file.
+    drop(prepared);
+
+    // Drop is synchronous and the file removal happens inside Drop, so the
+    // file must be gone by the time we reach this line.
+    assert!(
+        !temp_path.exists(),
+        "temp file must be removed once PreparedChatRequest drops; remained at {temp_path:?}"
+    );
+}

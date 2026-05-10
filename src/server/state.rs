@@ -262,6 +262,21 @@ impl PromptCacheMetrics for BatchMetricsCacheAdapter {
     }
 }
 
+/// Static media-input capability flags resolved once at server startup
+/// (issue #596). Used by HTTP handlers to short-circuit unsupported requests
+/// with a clear 400 before reaching the model worker.
+///
+/// The flags reflect the model type detected from `config.json`, not the
+/// request payload — they describe what the loaded model could in principle
+/// process, not what any individual request asks for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelMediaSupport {
+    /// `true` when the loaded model supports `video_url` content blocks.
+    /// Currently this is exactly the Gemma 4 VLM family; expand the
+    /// detection logic alongside any new video-capable model.
+    pub video: bool,
+}
+
 /// Shared application state passed into route handlers.
 #[derive(Clone)]
 pub struct AppState {
@@ -272,6 +287,8 @@ pub struct AppState {
     pub tokenizer: Arc<MlxcelTokenizer>,
     /// Model directory path (for props/info).
     pub model_path: PathBuf,
+    /// Static media-input capability flags resolved once at startup (issue #596).
+    pub media_support: ModelMediaSupport,
     /// Batch-level metrics (active sequences, queue depth) for admission
     /// control and status reporting.
     pub batch_metrics: Arc<BatchMetrics>,
@@ -309,6 +326,7 @@ impl AppState {
             chat_template: Arc::new(chat_template),
             tokenizer: Arc::new(tokenizer),
             model_path,
+            media_support: ModelMediaSupport::default(),
             batch_metrics,
             batch_observability: Arc::new(BatchObservability::new()),
             metrics: Arc::new(Metrics::new()),
@@ -337,6 +355,7 @@ impl AppState {
             chat_template: Arc::new(chat_template),
             tokenizer: Arc::new(tokenizer),
             model_path,
+            media_support: ModelMediaSupport::default(),
             batch_metrics,
             batch_observability,
             metrics: Arc::new(Metrics::new()),
@@ -344,6 +363,15 @@ impl AppState {
             pp_tracer: None,
             prompt_cache: None,
         }
+    }
+
+    /// Override the static media-support flags resolved at startup. Used by
+    /// the startup pipeline to record whether the loaded model supports
+    /// `video_url` content blocks (issue #596).
+    #[must_use]
+    pub fn with_media_support(mut self, support: ModelMediaSupport) -> Self {
+        self.media_support = support;
+        self
     }
 
     /// Attach the shared prompt-prefix cache store. Pass `None` when the

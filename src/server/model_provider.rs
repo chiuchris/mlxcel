@@ -39,6 +39,13 @@ pub enum ModelRequest {
         images: Vec<Vec<u8>>,
         /// Raw audio bytes for audio-language models (empty for text/vision-only)
         audio: Vec<Vec<u8>>,
+        /// Resolved video file paths with optional per-video FPS overrides
+        /// (issue #596). Each entry is a path that has already been validated
+        /// against `MLXCEL_VIDEO_DIR_ALLOWLIST` at the HTTP edge — the worker
+        /// trusts the paths and just feeds them to ffmpeg via
+        /// [`crate::multimodal::video::load_video`]. Empty for non-video
+        /// requests.
+        videos: Vec<(PathBuf, Option<f64>)>,
         response_tx: mpsc::Sender<GenerateEvent>,
         /// Cancellation flag set by the SSE sender when the client disconnects.
         /// The `BatchScheduler` polls this to abort orphaned sequences.
@@ -560,7 +567,25 @@ impl ModelProvider {
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
     ) -> Result<GenerationResult> {
-        let response_rx = self.send_generate_request(prompt, options, images, audio)?;
+        self.generate_with_media_and_videos(prompt, options, images, audio, Vec::new())
+    }
+
+    /// Generate text with optional images, audio, and videos, returning the
+    /// full result (issue #596).
+    ///
+    /// Server video routes pass `videos` through here once the path-traversal
+    /// guard in [`crate::server::media::extract_chat_video_paths`] has cleared
+    /// each entry against `MLXCEL_VIDEO_DIR_ALLOWLIST`. Empty `videos` matches
+    /// pre-#596 behavior bit-for-bit.
+    pub fn generate_with_media_and_videos(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<(PathBuf, Option<f64>)>,
+    ) -> Result<GenerationResult> {
+        let response_rx = self.send_generate_request(prompt, options, images, audio, videos)?;
         drain_generation_events(response_rx, self.decode_hang_timeout, |_| {})
     }
 
@@ -588,7 +613,8 @@ impl ModelProvider {
     where
         F: FnMut(String),
     {
-        let response_rx = self.send_generate_request(prompt, options, images, Vec::new())?;
+        let response_rx =
+            self.send_generate_request(prompt, options, images, Vec::new(), Vec::new())?;
         drain_generation_events(response_rx, self.decode_hang_timeout, callback)
     }
 
@@ -608,7 +634,7 @@ impl ModelProvider {
     where
         F: FnMut(String, Option<TokenLogprobData>),
     {
-        let response_rx = self.send_generate_request(prompt, options, images, audio)?;
+        let response_rx = self.send_generate_request(prompt, options, images, audio, Vec::new())?;
         drain_generation_events_with_logprobs(response_rx, self.decode_hang_timeout, callback)
     }
 
@@ -631,6 +657,7 @@ impl ModelProvider {
         let response_rx = self.send_generate_request_with_cancellation(
             prompt,
             options,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             cancelled,
@@ -657,8 +684,36 @@ impl ModelProvider {
     where
         F: FnMut(String, Option<TokenLogprobData>),
     {
-        let response_rx = self
-            .send_generate_request_with_cancellation(prompt, options, images, audio, cancelled)?;
+        self.generate_streaming_with_logprobs_cancellable_videos(
+            prompt,
+            options,
+            images,
+            audio,
+            Vec::new(),
+            cancelled,
+            callback,
+        )
+    }
+
+    /// Like [`Self::generate_streaming_with_logprobs_cancellable`] but also
+    /// forwards resolved video paths to the worker (issue #596). Empty
+    /// `videos` is bit-exact with the no-video variant.
+    pub fn generate_streaming_with_logprobs_cancellable_videos<F>(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<(PathBuf, Option<f64>)>,
+        cancelled: Arc<AtomicBool>,
+        callback: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(String, Option<TokenLogprobData>),
+    {
+        let response_rx = self.send_generate_request_with_cancellation(
+            prompt, options, images, audio, videos, cancelled,
+        )?;
         drain_generation_events_with_logprobs(response_rx, self.decode_hang_timeout, callback)
     }
 
@@ -668,12 +723,14 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
+        videos: Vec<(PathBuf, Option<f64>)>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         self.send_generate_request_with_cancellation(
             prompt,
             options,
             images,
             audio,
+            videos,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -689,6 +746,7 @@ impl ModelProvider {
         options: ServerGenerateOptions,
         images: Vec<Vec<u8>>,
         audio: Vec<Vec<u8>>,
+        videos: Vec<(PathBuf, Option<f64>)>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();
@@ -699,6 +757,7 @@ impl ModelProvider {
                 options,
                 images,
                 audio,
+                videos,
                 response_tx,
                 cancelled,
             })

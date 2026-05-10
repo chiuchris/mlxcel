@@ -201,6 +201,22 @@ pub async fn chat_completions(
         .into_response();
     }
 
+    // Issue #596: reject `video_url` content blocks early for models that do
+    // not support video. Detected once at startup from `config.json` and
+    // cached on `AppState.media_support`. Returning a 400 keeps the client
+    // contract honest — silently dropping video frames would still consume
+    // tokens and produce a confusing reply.
+    if !state.media_support.video && request_has_video_blocks(&request) {
+        return ErrorResponse::new(
+            format!(
+                "video_url content blocks are not supported by model '{}'",
+                state.display_model_id()
+            ),
+            "invalid_request_error",
+        )
+        .into_response();
+    }
+
     // Validate tool_choice values
     if let Some(ref tc) = request.tool_choice {
         match tc {
@@ -366,14 +382,19 @@ async fn non_stream_chat_completion(
         };
     }
 
-    // Generate (blocking call handled by model provider's worker thread)
+    // Generate (blocking call handled by model provider's worker thread).
+    // Issue #596: forward resolved video paths alongside images and audio.
+    // For non-video models the route guard above already rejected the
+    // request, so `prepared.video_paths` is always empty here unless the
+    // model supports video.
     let result = state
         .model_provider
-        .generate_with_media(
+        .generate_with_media_and_videos(
             prepared.prompt,
             options,
             prepared.image_data,
             prepared.audio_data,
+            prepared.video_paths,
         )
         .map_err(|e| ErrorResponse::new(format!("Generation error: {e}"), "server_error"))?;
 
@@ -587,11 +608,12 @@ async fn stream_chat_completion(
 
         let result = state
             .model_provider
-            .generate_streaming_with_logprobs_cancellable(
+            .generate_streaming_with_logprobs_cancellable_videos(
                 prepared.prompt,
                 options,
                 prepared.image_data,
                 prepared.audio_data,
+                prepared.video_paths,
                 cancelled,
                 |token, lp_data| {
                     // Always accumulate raw text for tool call parsing
@@ -747,6 +769,14 @@ async fn stream_chat_completion(
     Sse::new(stream)
         .keep_alive(keepalive.into_inner())
         .into_response()
+}
+
+/// Returns `true` when the request body carries at least one `video_url`
+/// content part anywhere in `messages`. The check matches before the heavier
+/// `extract_chat_video_paths` resolution step so non-video-capable models
+/// can refuse the request without paying canonicalisation / disk-I/O cost.
+fn request_has_video_blocks(request: &ChatCompletionRequest) -> bool {
+    !request.video_urls().is_empty()
 }
 
 /// Maximum number of tools allowed in a single request.
@@ -957,5 +987,79 @@ mod tests {
             strip_unclosed_primed_thinking(content.clone(), raw, false),
             content
         );
+    }
+
+    // -- Issue #596: video_url block detection ---------------------------
+
+    use crate::server::types::request::{ImageUrl, VideoUrl};
+    use crate::server::types::{ContentPart, Message, MessageContent, Role, SamplingParams};
+
+    fn build_request(parts: Vec<ContentPart>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "test-model".to_string(),
+            messages: vec![Message {
+                role: Role::User,
+                content: MessageContent::Parts(parts),
+                name: None,
+                tool_call_id: None,
+                tool_calls: None,
+            }],
+            stream: false,
+            stream_options: None,
+            logprobs: None,
+            top_logprobs: None,
+            tools: None,
+            tool_choice: None,
+            parallel_tool_calls: None,
+            chat_template_kwargs: None,
+            extra_body: None,
+            prompt_cache_key: None,
+            user: None,
+            extra_body_fields: serde_json::Map::new(),
+            response_format: None,
+            params: SamplingParams::default(),
+        }
+    }
+
+    #[test]
+    fn request_has_video_blocks_returns_true_when_video_url_present() {
+        let req = build_request(vec![
+            ContentPart::Text {
+                text: "describe".to_string(),
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "file:///tmp/clip.mp4".to_string(),
+                    fps: None,
+                },
+            },
+        ]);
+        assert!(request_has_video_blocks(&req));
+    }
+
+    #[test]
+    fn request_has_video_blocks_returns_false_for_text_and_image_only() {
+        let req = build_request(vec![
+            ContentPart::Text {
+                text: "describe".to_string(),
+            },
+            ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: "data:image/png;base64,abc".to_string(),
+                },
+            },
+        ]);
+        assert!(!request_has_video_blocks(&req));
+    }
+
+    #[test]
+    fn request_has_video_blocks_returns_false_for_plain_text() {
+        let mut req = build_request(vec![ContentPart::Text {
+            text: "hi".to_string(),
+        }]);
+        // Replace with a plain-string MessageContent to cover the
+        // `MessageContent::Text` branch.
+        req.messages[0].content = MessageContent::Text("hi".to_string());
+        assert!(!request_has_video_blocks(&req));
     }
 }

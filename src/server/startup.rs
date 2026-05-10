@@ -37,6 +37,7 @@ use crate::distributed::{
 };
 
 use super::batch::BatchObservability;
+use super::state::ModelMediaSupport;
 use super::{
     AppState, BatchMetrics, ChatTemplateProcessor, ModelProvider, PipelineParallelRuntimeConfig,
     ServerConfig, ServerGenerateOptions, create_app,
@@ -398,6 +399,71 @@ pub(super) fn resolve_api_key(
         return Ok(Some(key));
     }
     Ok(None)
+}
+
+/// Walk the directories named in `MLXCEL_VIDEO_DIR_ALLOWLIST` once at
+/// startup and emit a `tracing::warn!` for any entry whose group or world
+/// write bits are set (issue #596 hardening / PR #600 follow-up).
+///
+/// Reads the env var via [`super::media::video_dir_allowlist_from_env`]
+/// and delegates the actual permission check to
+/// [`super::media::scan_insecure_allowlist_dirs`]. Both helpers fail closed
+/// when the env var is empty/unset, so this runs as a no-op for operators
+/// who haven't opted into the feature.
+///
+/// We log instead of refusing to start so that operators can still bring
+/// the server up with a loose-mode directory while they fix the
+/// permissions; the resolver itself is still safe against the static path
+/// checks (canonicalise + allowlist prefix + regular-file + extension).
+fn warn_on_insecure_video_allowlist() {
+    let allowlist = super::media::video_dir_allowlist_from_env();
+    if allowlist.is_empty() {
+        return;
+    }
+    let insecure = super::media::scan_insecure_allowlist_dirs(&allowlist);
+    for dir in insecure {
+        tracing::warn!(
+            "Allowlist directory '{}' is world/group-writable; this exposes a TOCTOU race. \
+             Restrict permissions to 0750 or stricter.",
+            dir.display()
+        );
+    }
+}
+
+/// Inspect the model's `config.json` and decide which media inputs the chat
+/// handler should accept (issue #596).
+///
+/// Failure modes are intentionally tolerant: if `config.json` is missing or
+/// the type cannot be determined, the loaded model would have failed earlier
+/// in startup; falling back to "no media support" here just means video
+/// requests get a 400, which is the safe default.
+fn detect_model_media_support(model_path: &Path) -> ModelMediaSupport {
+    use crate::models::ModelType;
+
+    let model_type = match crate::models::get_model_type(model_path) {
+        Ok(t) => t,
+        Err(err) => {
+            tracing::debug!(
+                "Could not determine model type from {:?} for media-support detection: {err}; \
+                 disabling media support",
+                model_path
+            );
+            return ModelMediaSupport::default();
+        }
+    };
+
+    // Currently only Gemma 4 VLM consumes `video_url` content blocks. Mirror
+    // the dispatch in `commands/generate_vlm::compute_vlm_embeddings` and add
+    // new variants here when more video-capable models land.
+    let video = matches!(model_type, ModelType::Gemma4VLM);
+    if video {
+        tracing::info!(
+            "model_type={:?}: enabling video_url content block support",
+            model_type
+        );
+    }
+
+    ModelMediaSupport { video }
 }
 
 /// Resolve chat template from override string, file, or model's tokenizer metadata.
@@ -1257,6 +1323,18 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         Arc::new(crate::distributed::pipeline::PpTracer::new(path.clone()))
     });
 
+    // Issue #596: detect static media-input capabilities once at startup so
+    // the chat handler can short-circuit unsupported requests with a 400.
+    let media_support = detect_model_media_support(&startup.model_path);
+
+    // Issue #596 hardening: scan the operator-provided
+    // `MLXCEL_VIDEO_DIR_ALLOWLIST` directories for world/group-writable
+    // entries. A loose-mode directory exposes the path-based file resolver
+    // to a TOCTOU race (attacker swaps the file between canonicalize and
+    // ffmpeg open). The full FD-passing fix is out of scope for this PR;
+    // the startup-time warning here gives operators an actionable signal.
+    warn_on_insecure_video_allowlist();
+
     let state = AppState::with_observability(
         model_provider,
         config,
@@ -1266,6 +1344,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         batch_metrics,
         batch_observability,
     )
+    .with_media_support(media_support)
     .with_pp_tracer(pp_tracer)
     .with_prompt_cache(prompt_cache_store);
     let app = create_app(state);
