@@ -791,6 +791,11 @@ impl TensorParallelGemma4Model {
         } else {
             models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?
         };
+        // Strip k_proj/v_proj/k_norm entries for KV-shared layers.  The
+        // quantized branch uses load_gemma4_text_weights_with_backing which
+        // does not apply the strip internally, so we must do it here on all
+        // paths before sharding the weight map.
+        crate::models::strip_gemma4_kv_shared_weights(&mut weights, &config_value);
         models::sanitize_tied_embeddings(&mut weights, &config_value);
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }

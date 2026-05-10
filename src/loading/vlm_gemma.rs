@@ -304,6 +304,12 @@ pub(crate) fn load_gemma4_vlm(model_path: &Path) -> Result<LoadedModel> {
     let args: models::gemma4::ModelArgs = parse_vlm_config(&config_str, "Gemma4 config")?;
     let (mut weights, weight_backing) = models::load_gemma4_vlm_weights_with_backing(model_path)
         .map_err(|e| anyhow::anyhow!("Failed to load Gemma4 VLM weights: {}", e))?;
+    // Drop k_proj/v_proj/k_norm weight entries for KV-shared layers before
+    // building the model.  The weight loader already materialized them via
+    // eval_all, but releasing the entries here prevents the model constructor
+    // from holding duplicate references and frees the backing VRAM after load.
+    // Mirrors upstream mlx-lm PR #1240 (commit df1d3f3).
+    models::strip_gemma4_kv_shared_weights(&mut weights, &full_config);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     // Sanitize audio conv weights (PyTorch -> MLX format)

@@ -594,6 +594,13 @@ enum AttentionProjection {
         k_proj: UnifiedLinear,
         v_proj: Option<UnifiedLinear>,
     },
+    /// KV-shared layers only compute Q; K/V come from a prior non-shared layer
+    /// via the `shared_kv` argument to `forward`. No k_proj, v_proj, or k_norm
+    /// are constructed for these layers. Mirrors the upstream `has_kv = False`
+    /// gate in Gemma4Attention.__init__ (mlx-lm PR #1158).
+    KvShared {
+        q_proj: UnifiedLinear,
+    },
 }
 
 pub(crate) trait CacheInterface {
@@ -667,7 +674,9 @@ pub struct Attention {
     projection: AttentionProjection,
     pub(crate) o_proj: UnifiedLinear,
     pub(crate) q_norm: RMSNorm,
-    pub(crate) k_norm: RMSNorm,
+    /// `None` for KV-shared layers — those layers never call `project_kv` and
+    /// therefore never need k_norm.  See `AttentionProjection::KvShared`.
+    pub(crate) k_norm: Option<RMSNorm>,
     pub(crate) v_norm: RMSNormNoScale,
     pub(crate) n_heads: i32,
     pub(crate) n_kv_heads: i32,
@@ -741,7 +750,8 @@ impl Attention {
                 let (q, _, _) = proj.forward(x);
                 q
             }
-            AttentionProjection::Separate { q_proj, .. } => q_proj.forward(x),
+            AttentionProjection::Separate { q_proj, .. }
+            | AttentionProjection::KvShared { q_proj } => q_proj.forward(x),
         };
 
         // Fast path: full-attention Gemma 4 layers run
@@ -861,12 +871,22 @@ impl Attention {
                 };
                 (raw_keys, raw_values)
             }
+            AttentionProjection::KvShared { .. } => {
+                unreachable!(
+                    "project_kv must not be called on a KV-shared layer; \
+                     forward() should have taken the early-return shared_kv path"
+                )
+            }
         };
 
         // Fast path: on full-attention layers the K branch is the same
         // `reshape -> norm -> transpose -> full-head ProportionalRoPE` shape
         // as the Q branch, so it reuses `compiled_q_path_proportional` with
         // `n_kv_heads` and the k_norm weight.
+        let k_norm = self
+            .k_norm
+            .as_ref()
+            .expect("k_norm must be Some for non-KV-shared layers");
         let keys = if let Some(ref freqs) = self.proportional_rope_freqs {
             let rotated_dims = 2
                 * ((self.proportional_partial_rotary_factor as f64 * self.head_dim as f64 / 2.0)
@@ -874,9 +894,9 @@ impl Attention {
                     .max(0);
             mlxcel_core::compiled_q_path_proportional(
                 &raw_keys,
-                &self.k_norm.weight,
+                &k_norm.weight,
                 freqs,
-                self.k_norm.eps,
+                k_norm.eps,
                 self.n_kv_heads,
                 self.head_dim,
                 rotated_dims,
@@ -884,7 +904,7 @@ impl Attention {
             )
         } else {
             let keys = mlxcel_core::reshape(&raw_keys, &[b, l, self.n_kv_heads, self.head_dim]);
-            let keys = self.k_norm.forward(&keys);
+            let keys = k_norm.forward(&keys);
             let keys = mlxcel_core::transpose_axes(&keys, &[0, 2, 1, 3]);
             self.apply_rope(&keys, offset)
         };
@@ -963,8 +983,24 @@ impl Attention {
         // Gemma 4 matches mlx-lm's separate Q/K/V projection path by default.
         // A concatenated QKV projection reduces QuantizedMatmul count, but on
         // 26B/31B decode it adds slice-heavy graphs and measures slower.
+        //
+        // KV-shared layers never compute their own K/V — they reuse the
+        // full-length cache entries from an earlier non-shared layer (passed
+        // in via the `shared_kv` argument to `forward`).  Constructing
+        // k_proj/v_proj/k_norm for these layers wastes VRAM and mirrors what
+        // upstream mlx-lm fixed in PR #1158 (commit 4f5cbd2).
         let enable_fused_qkv = std::env::var_os("MLXCEL_GEMMA4_ENABLE_FUSED_QKV").is_some();
-        let projection = if use_k_eq_v {
+        let projection = if is_kv_shared_layer {
+            // Only q_proj is needed; K/V come from the shared KV cache.
+            AttentionProjection::KvShared {
+                q_proj: UnifiedLinear::from_weights(
+                    weights,
+                    &format!("{}.q_proj", prefix),
+                    config.group_size(),
+                    config.bits(),
+                )?,
+            }
+        } else if use_k_eq_v {
             AttentionProjection::Separate {
                 q_proj: UnifiedLinear::from_weights(
                     weights,
@@ -1013,6 +1049,17 @@ impl Attention {
             }
         };
 
+        // k_norm is not needed for KV-shared layers: those layers never call
+        // project_kv() and use the shared K from an earlier layer's cache.
+        let k_norm = if is_kv_shared_layer {
+            None
+        } else {
+            Some(RMSNorm::new(
+                get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?,
+                config.rms_norm_eps,
+            ))
+        };
+
         Ok(Self {
             projection,
             o_proj: UnifiedLinear::from_weights(
@@ -1025,10 +1072,7 @@ impl Attention {
                 get_weight_copy(weights, &format!("{}.q_norm.weight", prefix))?,
                 config.rms_norm_eps,
             ),
-            k_norm: RMSNorm::new(
-                get_weight_copy(weights, &format!("{}.k_norm.weight", prefix))?,
-                config.rms_norm_eps,
-            ),
+            k_norm,
             v_norm: RMSNormNoScale::new(head_dim, config.rms_norm_eps),
             n_heads,
             n_kv_heads,
@@ -1777,6 +1821,12 @@ impl Gemma4Model {
                 super::sanitize::Gemma4WeightBacking::default(),
             )
         };
+        // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
+        // model constructor does not attempt to allocate them.  This applies
+        // on all loader paths including the quantized text-only path above,
+        // which bypasses load_and_sanitize_weights and therefore does not
+        // benefit from the strip already embedded in that function.
+        crate::models::strip_gemma4_kv_shared_weights(&mut weights, &config_value);
         crate::models::sanitize_tied_embeddings(&mut weights, &config_value);
         let mut model = Self::from_weights(&weights, &args)?;
         model._weight_backing = weight_backing;
@@ -1869,6 +1919,11 @@ impl Gemma4StageModel {
                 super::sanitize::Gemma4WeightBacking::default(),
             )
         };
+        // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
+        // model constructor does not attempt to allocate them.  Required on
+        // the quantized path because load_gemma4_text_weights_with_backing
+        // does not run the strip internally.
+        crate::models::strip_gemma4_kv_shared_weights(&mut weights, &config_value);
         crate::models::sanitize_tied_embeddings(&mut weights, &config_value);
         let mut effective_filter = filter.clone();
         if filter.has_lm_head {

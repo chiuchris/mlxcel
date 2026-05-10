@@ -382,6 +382,93 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
     }
 }
 
+/// Drop k_proj / v_proj / k_norm weight entries that belong to KV-shared
+/// layers so they are never materialized into MLX arrays.
+///
+/// Gemma 4 models have a suffix of `num_kv_shared_layers` layers that reuse
+/// the key/value projections from earlier non-shared layers.  The safetensors
+/// checkpoints may still contain those weight tensors (they are simply
+/// ignored at runtime), which needlessly inflate VRAM usage.
+///
+/// Upstream mlx-lm applied the same strip inside `Model.sanitize()` in
+/// PR #1240 (commit df1d3f3).
+///
+/// The `config` value is the parsed top-level `config.json`.  Both the
+/// text-only format (fields directly at the top level) and the VLM format
+/// (`text_config` sub-object) are handled.
+///
+/// Used by: load_and_sanitize_weights, load_gemma4_vlm (vlm_gemma.rs)
+pub(crate) fn strip_gemma4_kv_shared_weights(
+    weights: &mut mlxcel_core::weights::WeightMap,
+    config: &Value,
+) {
+    // Resolve the text_config sub-object when present (VLM layout), otherwise
+    // fall back to the top-level object (text-only layout).
+    let text_cfg = config.get("text_config").unwrap_or(config);
+
+    let num_hidden_layers = match text_cfg.get("num_hidden_layers").and_then(Value::as_u64) {
+        Some(n) => n as usize,
+        None => return, // Cannot determine layer count; skip stripping.
+    };
+    let num_kv_shared_layers = text_cfg
+        .get("num_kv_shared_layers")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+
+    if num_kv_shared_layers == 0 {
+        return;
+    }
+
+    let first_kv_shared = num_hidden_layers.saturating_sub(num_kv_shared_layers);
+
+    // Suffixes that must not exist for language-model KV-shared layers.
+    const KV_PROJ_SUFFIXES: &[&str] = &[
+        ".self_attn.k_proj",
+        ".self_attn.v_proj",
+        ".self_attn.k_norm",
+    ];
+
+    // Language-model layer key prefixes.  Keys belonging to vision_tower,
+    // audio_tower, or other sub-modules also contain "layers." and potentially
+    // share the same layer indices, so we must anchor the search to the
+    // language model namespace.
+    const LM_LAYER_PREFIXES: &[&str] = &["language_model.model.layers.", "model.layers."];
+
+    // Collect keys to remove up-front to satisfy the borrow checker.
+    let to_remove: Vec<String> = weights
+        .keys()
+        .filter(|k| {
+            // Only consider keys that live inside a language-model layer
+            // namespace to avoid accidentally stripping vision/audio encoder
+            // weights whose layer indices happen to overlap.
+            let layer_offset = LM_LAYER_PREFIXES
+                .iter()
+                .find_map(|prefix| k.strip_prefix(*prefix).map(|rest| (rest, *prefix)));
+            if let Some((after_prefix, _)) = layer_offset {
+                let idx_str = after_prefix.split('.').next().unwrap_or("");
+                if let Ok(layer_idx) = idx_str.parse::<usize>()
+                    && layer_idx >= first_kv_shared
+                {
+                    return KV_PROJ_SUFFIXES.iter().any(|suffix| k.contains(suffix));
+                }
+            }
+            false
+        })
+        .cloned()
+        .collect();
+
+    if !to_remove.is_empty() {
+        tracing::debug!(
+            count = to_remove.len(),
+            first_kv_shared,
+            "stripping k_proj/v_proj/k_norm weights for KV-shared layers"
+        );
+        for key in to_remove {
+            weights.remove(&key);
+        }
+    }
+}
+
 fn tensor_view_to_array(
     name: &str,
     tensor: &TensorView<'_>,
@@ -891,6 +978,15 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
 
     let mut is_quantized = false;
     if let Some(config) = parsed_config.as_ref() {
+        // Drop k_proj/v_proj/k_norm entries belonging to KV-shared layers
+        // before the model constructor tries to load them.  The tensors have
+        // already been loaded and materialized by this point; releasing them
+        // here prevents the model graph from retaining them and frees their
+        // VRAM after load, reducing steady-state memory on large Gemma 4
+        // models.  Mirrors upstream mlx-lm PR #1240 (commit df1d3f3).
+        if is_gemma4 {
+            strip_gemma4_kv_shared_weights(&mut weights, config);
+        }
         sanitize_tied_embeddings(&mut weights, config);
         is_quantized = config.get("quantization").is_some()
             || config
@@ -1284,5 +1380,189 @@ mod tests {
         normalize_nvfp4_keys(&mut weights);
         // The existing key should remain unchanged.
         assert!(weights.contains_key("language_model.model.layers.0.mlp.gate_proj.weight"));
+    }
+
+    // --- strip_gemma4_kv_shared_weights tests ---
+
+    fn make_gemma4_text_config(num_hidden_layers: u64, num_kv_shared_layers: u64) -> Value {
+        serde_json::json!({
+            "text_config": {
+                "num_hidden_layers": num_hidden_layers,
+                "num_kv_shared_layers": num_kv_shared_layers
+            }
+        })
+    }
+
+    #[test]
+    fn strip_gemma4_kv_shared_removes_kv_proj_for_shared_layers() {
+        // 4 total layers, 2 kv-shared => first_kv_shared = 2.
+        // Layers 2 and 3 are KV-shared and should have k_proj/v_proj/k_norm stripped.
+        let config = make_gemma4_text_config(4, 2);
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        // Non-shared layer — must stay.
+        weights.insert(
+            "language_model.model.layers.1.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // KV-shared layer k_proj — must be stripped.
+        weights.insert(
+            "language_model.model.layers.2.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // KV-shared layer v_proj — must be stripped.
+        weights.insert(
+            "language_model.model.layers.3.self_attn.v_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // KV-shared layer k_norm — must be stripped.
+        weights.insert(
+            "language_model.model.layers.2.self_attn.k_norm.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        strip_gemma4_kv_shared_weights(&mut weights, &config);
+        assert!(
+            weights.contains_key("language_model.model.layers.1.self_attn.k_proj.weight"),
+            "Non-shared layer k_proj must not be stripped"
+        );
+        assert!(
+            !weights.contains_key("language_model.model.layers.2.self_attn.k_proj.weight"),
+            "KV-shared layer k_proj must be stripped"
+        );
+        assert!(
+            !weights.contains_key("language_model.model.layers.3.self_attn.v_proj.weight"),
+            "KV-shared layer v_proj must be stripped"
+        );
+        assert!(
+            !weights.contains_key("language_model.model.layers.2.self_attn.k_norm.weight"),
+            "KV-shared layer k_norm must be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_gemma4_kv_shared_does_not_strip_vision_tower_layers() {
+        // Vision tower has its own layer numbering that may overlap with the
+        // first_kv_shared index.  Those must not be stripped.
+        let config = make_gemma4_text_config(35, 20); // first_kv_shared = 15
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        // Vision tower layer 15 — overlaps first_kv_shared but must stay.
+        weights.insert(
+            "vision_tower.encoder.layers.15.self_attn.k_proj.linear.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // LM layer 15 — must be stripped.
+        weights.insert(
+            "language_model.model.layers.15.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        strip_gemma4_kv_shared_weights(&mut weights, &config);
+        assert!(
+            weights.contains_key("vision_tower.encoder.layers.15.self_attn.k_proj.linear.weight"),
+            "Vision tower k_proj must not be stripped"
+        );
+        assert!(
+            !weights.contains_key("language_model.model.layers.15.self_attn.k_proj.weight"),
+            "LM KV-shared layer k_proj must be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_gemma4_kv_shared_noop_when_num_kv_shared_layers_is_zero() {
+        let config = make_gemma4_text_config(35, 0);
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "language_model.model.layers.30.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        strip_gemma4_kv_shared_weights(&mut weights, &config);
+        assert!(
+            weights.contains_key("language_model.model.layers.30.self_attn.k_proj.weight"),
+            "No stripping should occur when num_kv_shared_layers is 0"
+        );
+    }
+
+    #[test]
+    fn strip_gemma4_kv_shared_handles_top_level_text_config() {
+        // Text-only configs may have num_hidden_layers / num_kv_shared_layers
+        // directly at the top level, without a text_config sub-object.
+        let config = serde_json::json!({
+            "num_hidden_layers": 4,
+            "num_kv_shared_layers": 2
+        });
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        weights.insert(
+            "model.layers.2.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.layers.1.self_attn.k_proj.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        strip_gemma4_kv_shared_weights(&mut weights, &config);
+        assert!(
+            !weights.contains_key("model.layers.2.self_attn.k_proj.weight"),
+            "KV-shared layer k_proj at model.layers prefix must be stripped"
+        );
+        assert!(
+            weights.contains_key("model.layers.1.self_attn.k_proj.weight"),
+            "Non-shared layer must not be stripped"
+        );
+    }
+
+    #[test]
+    fn strip_gemma4_kv_shared_works_on_quantized_suffixes() {
+        // Quantized checkpoints store k_proj/v_proj/k_norm as three separate
+        // tensors with `.linear.weight`, `.linear.scales`, and `.linear.biases`
+        // suffixes.  The substring match in strip_gemma4_kv_shared_weights must
+        // still remove all three because it checks for the KV_PROJ_SUFFIXES
+        // substring anywhere in the key, not only as the key tail.
+        let config = serde_json::json!({
+            "num_hidden_layers": 4,
+            "num_kv_shared_layers": 2
+        });
+        let mut weights = mlxcel_core::weights::WeightMap::new();
+        // Quantized k_proj tensors for a KV-shared layer — all three must be stripped.
+        weights.insert(
+            "model.layers.2.self_attn.k_proj.linear.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.layers.2.self_attn.k_proj.linear.scales".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        weights.insert(
+            "model.layers.2.self_attn.k_proj.linear.biases".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // Quantized v_proj for a KV-shared layer — must also be stripped.
+        weights.insert(
+            "model.layers.3.self_attn.v_proj.linear.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        // Non-shared layer quantized k_proj — must stay.
+        weights.insert(
+            "model.layers.1.self_attn.k_proj.linear.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[1.0f32], &[1]),
+        );
+        strip_gemma4_kv_shared_weights(&mut weights, &config);
+        assert!(
+            !weights.contains_key("model.layers.2.self_attn.k_proj.linear.weight"),
+            "Quantized k_proj.linear.weight for KV-shared layer must be stripped"
+        );
+        assert!(
+            !weights.contains_key("model.layers.2.self_attn.k_proj.linear.scales"),
+            "Quantized k_proj.linear.scales for KV-shared layer must be stripped"
+        );
+        assert!(
+            !weights.contains_key("model.layers.2.self_attn.k_proj.linear.biases"),
+            "Quantized k_proj.linear.biases for KV-shared layer must be stripped"
+        );
+        assert!(
+            !weights.contains_key("model.layers.3.self_attn.v_proj.linear.weight"),
+            "Quantized v_proj.linear.weight for KV-shared layer must be stripped"
+        );
+        assert!(
+            weights.contains_key("model.layers.1.self_attn.k_proj.linear.weight"),
+            "Quantized k_proj for non-shared layer must not be stripped"
+        );
     }
 }

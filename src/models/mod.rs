@@ -170,7 +170,7 @@ pub use recurrent_gemma::GriffinModel;
 pub use rwkv7::Rwkv7;
 pub(crate) use sanitize::{
     Gemma4WeightBacking, load_gemma4_text_weights_with_backing,
-    load_gemma4_vlm_weights_with_backing,
+    load_gemma4_vlm_weights_with_backing, strip_gemma4_kv_shared_weights,
 };
 pub use sanitize::{
     convert_bf16_weights, load_and_sanitize_weights, sanitize_config_json,
