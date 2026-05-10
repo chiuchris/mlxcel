@@ -43,6 +43,20 @@ pub struct ChatTemplateProcessor {
     /// Cached result of `supports_tools()` introspection.
     /// `None` means not yet computed.
     supports_tools_cached: Option<bool>,
+    /// Default value for the `enable_thinking` Jinja kwarg when the request
+    /// (or its server-side merge with CLI/env defaults) does not provide one.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.apply_chat_template`'s
+    /// `enable_thinking=self.has_thinking` default added in mlx-lm PR #1114
+    /// (issue #590). Plumbed in by `server::startup::resolve_chat_template`
+    /// from [`crate::tokenizer::ThinkingMarkers::has_thinking`] right after
+    /// the tokenizer loads — so a thinking model defaults to `enable_thinking=true`
+    /// while a non-thinking model defaults to `false`.
+    ///
+    /// `false` is the conservative pre-#590 default and is kept for any
+    /// path that constructs a processor without a corresponding tokenizer
+    /// (template-string overrides, `Default`, tests).
+    default_enable_thinking: bool,
 }
 
 impl ChatTemplateProcessor {
@@ -94,6 +108,7 @@ impl ChatTemplateProcessor {
             eos_token,
             add_generation_prompt: true,
             supports_tools_cached: None,
+            default_enable_thinking: false,
         }))
     }
 
@@ -105,12 +120,38 @@ impl ChatTemplateProcessor {
             eos_token: String::new(),
             add_generation_prompt: true,
             supports_tools_cached: None,
+            default_enable_thinking: false,
         }
     }
 
     /// Set whether to add a generation prompt at the end
     pub fn set_add_generation_prompt(&mut self, add: bool) {
         self.add_generation_prompt = add;
+    }
+
+    /// Set the default value of the `enable_thinking` Jinja kwarg.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.apply_chat_template`'s
+    /// `enable_thinking=self.has_thinking` defaulting (mlx-lm PR #1114).
+    /// Callers should pass `true` when the underlying tokenizer recognizes
+    /// any think marker pair (single or multi token) — see
+    /// [`crate::tokenizer::ThinkingMarkers::has_thinking`].
+    ///
+    /// The default is `false` for backward compatibility with pre-#590
+    /// behavior so callers that do not explicitly enable this still see the
+    /// historic default; `server::startup` opts into the upstream-aligned
+    /// default for thinking models.
+    pub fn set_default_enable_thinking(&mut self, value: bool) {
+        self.default_enable_thinking = value;
+    }
+
+    /// Read the default value of the `enable_thinking` Jinja kwarg.
+    ///
+    /// Used by:
+    /// `server::chat_template::build_template_context` (chat-template
+    /// rendering path) and tests that verify the upstream-aligned default.
+    pub fn default_enable_thinking(&self) -> bool {
+        self.default_enable_thinking
     }
 
     /// Raw Jinja template source post-preprocessing.
@@ -158,10 +199,13 @@ impl ChatTemplateProcessor {
         if !self.add_generation_prompt || !self.enable_thinking_drops_priming() {
             return rendered;
         }
-        let thinking_on = kwargs
+        let thinking_on = match kwargs
             .get("enable_thinking")
             .and_then(serde_json::Value::as_bool)
-            == Some(true);
+        {
+            Some(v) => v,
+            None => self.default_enable_thinking,
+        };
         if !thinking_on {
             return rendered;
         }
@@ -333,6 +377,7 @@ impl ChatTemplateProcessor {
             self.add_generation_prompt,
             tools_val,
             kwargs,
+            self.default_enable_thinking,
         );
 
         let result = tmpl
@@ -394,6 +439,7 @@ impl ChatTemplateProcessor {
             self.add_generation_prompt,
             tools_val,
             kwargs,
+            self.default_enable_thinking,
         );
 
         let result = tmpl
@@ -411,10 +457,13 @@ impl ChatTemplateProcessor {
 /// `add_generation_prompt`, `tools`) are always present and are **reserved**
 /// from kwargs overlay — a request cannot overwrite the canonical conversation
 /// or tool list by smuggling those keys through `chat_template_kwargs`.
-/// `enable_thinking` defaults to `false` for backward compatibility but may be
-/// overridden by `kwargs` (the same mechanism that lets issue #410's
-/// `preserve_thinking` reach the template). Any other kwarg key — including
-/// future template-specific hints — is passed through unchanged.
+///
+/// `enable_thinking` defaults to `default_enable_thinking` (issue #590,
+/// upstream PR #1114) — `true` when the underlying tokenizer recognizes a
+/// think marker pair, `false` otherwise.  The default is overridable through
+/// `kwargs` (the same mechanism that lets issue #410's `preserve_thinking`
+/// reach the template).  Any other kwarg key — including future
+/// template-specific hints — is passed through unchanged.
 fn build_template_context(
     messages: minijinja::Value,
     bos_token: &str,
@@ -422,6 +471,7 @@ fn build_template_context(
     add_generation_prompt: bool,
     tools: minijinja::Value,
     kwargs: &ChatTemplateKwargs,
+    default_enable_thinking: bool,
 ) -> minijinja::Value {
     // Start with the default context fields.
     let mut ctx: std::collections::BTreeMap<&str, minijinja::Value> =
@@ -434,8 +484,13 @@ fn build_template_context(
         minijinja::Value::from(add_generation_prompt),
     );
     ctx.insert("tools", tools);
-    // Backward-compat default; may be overridden by kwargs below.
-    ctx.insert("enable_thinking", minijinja::Value::from(false));
+    // Tokenizer-derived default: `has_thinking` for thinking models, `false`
+    // otherwise (issue #590; upstream PR #1114). Overridden below by any
+    // matching kwarg from the request / server-default merge.
+    ctx.insert(
+        "enable_thinking",
+        minijinja::Value::from(default_enable_thinking),
+    );
 
     // Overlay kwargs. Canonical prompt-construction keys are reserved so a
     // client cannot smuggle a replacement `messages` array, swap `tools`, or
@@ -1381,6 +1436,93 @@ TOOL
         assert!(out.contains("flag=42"));
     }
 
+    // -- enable_thinking default plumbing (issue #590) -----------------------
+
+    #[test]
+    fn default_enable_thinking_defaults_to_false_for_back_compat() {
+        // Pre-#590 behavior: a freshly constructed processor leaves
+        // `enable_thinking` at `false` so callers that never opt in see the
+        // historic default.
+        let template = r#"{% if enable_thinking %}[THINK]{% else %}[NOTHINK]{% endif %}"#;
+        let processor = ChatTemplateProcessor::with_template(template.to_string());
+        assert!(!processor.default_enable_thinking());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let out = processor
+            .apply_with_kwargs(&messages, None, &ChatTemplateKwargs::new())
+            .unwrap();
+        assert!(
+            out.contains("[NOTHINK]"),
+            "back-compat default must keep enable_thinking=false; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn set_default_enable_thinking_flips_default_for_thinking_models() {
+        // Issue #590 / upstream PR #1114: when the tokenizer recognizes a
+        // think marker pair, the chat-template default flips to `true`. The
+        // request must then render the THINK branch without setting any
+        // kwarg.
+        let template = r#"{% if enable_thinking %}[THINK]{% else %}[NOTHINK]{% endif %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(template.to_string());
+        processor.set_default_enable_thinking(true);
+        assert!(processor.default_enable_thinking());
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let out = processor
+            .apply_with_kwargs(&messages, None, &ChatTemplateKwargs::new())
+            .unwrap();
+        assert!(
+            out.contains("[THINK]"),
+            "default_enable_thinking=true must flip the template default; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn kwargs_enable_thinking_false_overrides_default_true() {
+        // Even with the upstream-aligned default of `true`, an explicit
+        // kwarg `enable_thinking=false` must win. This is the reverse of
+        // `test_apply_with_kwargs_allows_overriding_enable_thinking` and
+        // guards the per-request override symmetry.
+        let template = r#"{% if enable_thinking %}[THINK]{% else %}[NOTHINK]{% endif %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(template.to_string());
+        processor.set_default_enable_thinking(true);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+        let kwargs = ChatTemplateKwargs::from_json_str(r#"{"enable_thinking": false}"#).unwrap();
+        let out = processor
+            .apply_with_kwargs(&messages, None, &kwargs)
+            .unwrap();
+        assert!(
+            out.contains("[NOTHINK]"),
+            "explicit kwarg must override the upstream-aligned default; got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn apply_raw_with_kwargs_honours_default_enable_thinking() {
+        // The multimodal raw-JSON path (`apply_raw_with_kwargs`) shares the
+        // build_template_context plumbing, so the upstream-aligned default
+        // must reach it too.
+        let template = r#"{% if enable_thinking %}[THINK]{% else %}[NOTHINK]{% endif %}"#;
+        let mut processor = ChatTemplateProcessor::with_template(template.to_string());
+        processor.set_default_enable_thinking(true);
+        let raw = serde_json::json!([{"role": "user", "content": "hi"}]);
+        let out = processor
+            .apply_raw_with_kwargs(&raw, None, &ChatTemplateKwargs::new())
+            .unwrap();
+        assert!(
+            out.contains("[THINK]"),
+            "default must reach raw-JSON rendering path too; got: {out:?}"
+        );
+    }
+
     #[test]
     fn test_apply_with_kwargs_allows_overriding_enable_thinking() {
         // enable_thinking defaults to false for backward compat. Confirm
@@ -1653,6 +1795,37 @@ TOOL
         assert!(
             !rendered_open.contains("<channel|>"),
             "the appended priming must be OPEN (no <channel|> close)"
+        );
+    }
+
+    #[test]
+    fn patch_gemma4_generation_prompt_uses_default_enable_thinking_when_kwarg_absent() {
+        // Regression guard for HIGH-1 (PR #613 review): when the server startup
+        // hook sets `default_enable_thinking=true` for a Gemma 4 thinking model,
+        // a request that arrives with empty kwargs must still trigger the
+        // `<|channel>thought\n` priming. Before the fix, `kwargs.get("enable_thinking")`
+        // returned `None` which was treated as `false`, so the patch was skipped and
+        // the model saw an unprimed `<|turn>model\n` — causing degenerate first-token
+        // output / broken tool-call emission.
+        let mut gemma4 = ChatTemplateProcessor::with_template(GEMMA4_LIKE_TEMPLATE.to_string());
+        gemma4.set_default_enable_thinking(true);
+        let messages = vec![ChatMessage {
+            role: "user".to_string(),
+            content: "hi".to_string(),
+        }];
+
+        // Empty kwargs — no "enable_thinking" key at all. The processor must
+        // fall back to `default_enable_thinking = true` and apply the patch.
+        let out = gemma4
+            .apply_with_kwargs(&messages, None, &ChatTemplateKwargs::new())
+            .unwrap();
+        assert!(
+            out.ends_with("<|channel>thought\n"),
+            "default_enable_thinking=true with empty kwargs must append open priming; got: {out:?}"
+        );
+        assert!(
+            !out.contains("<channel|>"),
+            "priming must be open (no <channel|> close); got: {out:?}"
         );
     }
 

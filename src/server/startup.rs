@@ -1259,12 +1259,45 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     if let Some(service_config) = distributed.remote_stage_service {
         return serve_remote_pipeline_stage(service_config).await;
     }
-    let chat_template = resolve_chat_template(
+    let mut chat_template = resolve_chat_template(
         startup.chat_template.as_deref(),
         startup.chat_template_file.as_deref(),
         &startup.model_path,
     )?;
     let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
+
+    // Issue #590: align the chat-template `enable_thinking` Jinja kwarg
+    // default with upstream `TokenizerWrapper.apply_chat_template`'s
+    // `enable_thinking=self.has_thinking` behavior. When the underlying
+    // tokenizer recognizes a think marker pair (single-token `<think>` /
+    // `</think>`, single-token `<longcat_think>` variants, or multi-token
+    // `<|channel>thought` / `<channel|>` for Gemma 4 and friends), the
+    // server-side default flips to `true` so a request that does not set
+    // `chat_template_kwargs.enable_thinking` still sees thinking enabled
+    // by default. Per-request kwargs and the existing CLI/env defaults
+    // (`--chat-template-kwargs`, `LLAMA_ARG_CHAT_TEMPLATE_KWARGS`)
+    // continue to win on conflict via `merge_server_and_request`.
+    let thinking_markers = tokenizer.infer_thinking_markers();
+    if thinking_markers.has_thinking() {
+        tracing::info!(
+            think_start = ?thinking_markers.think_start,
+            think_end = ?thinking_markers.think_end,
+            think_start_tokens_len = thinking_markers
+                .think_start_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            think_end_tokens_len = thinking_markers
+                .think_end_tokens
+                .as_ref()
+                .map(Vec::len)
+                .unwrap_or(0),
+            "Tokenizer recognizes a think marker pair; defaulting \
+             chat_template kwarg `enable_thinking=true` (issue #590, \
+             upstream PR #1114)"
+        );
+        chat_template.set_default_enable_thinking(true);
+    }
 
     // Create shared batch metrics and observability that both ModelProvider
     // and AppState read/write.

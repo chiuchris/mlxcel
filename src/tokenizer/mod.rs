@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod thinking;
 mod tiktoken;
 
 use anyhow::Result;
@@ -20,6 +21,7 @@ use sentencepiece::SentencePieceProcessor;
 use std::collections::HashMap;
 use std::path::Path;
 
+pub use thinking::{ThinkingMarkers, find_subseq, rfind_subseq};
 pub use tiktoken::TiktokenTokenizer;
 
 /// Unified tokenizer supporting HuggingFace (tokenizer.json), SentencePiece (tokenizer.model),
@@ -162,6 +164,160 @@ impl MlxcelTokenizer {
             // full re-decode path rather than per-piece inspection.
             Self::SentencePiece(_) | Self::Tiktoken(_) => None,
         }
+    }
+
+    /// Resolve think and tool-call markers from this tokenizer's vocab.
+    ///
+    /// Mirrors the upstream Python helper
+    /// `mlx_lm.tokenizer_utils._infer_thinking()` (PR #1114) and the
+    /// `tool_call_start_tokens` / `tool_call_end_tokens` encoding done in
+    /// `TokenizerWrapper.__init__`.  Recognizes:
+    ///
+    /// * **Single-token think pairs** — `<think>` / `</think>` (Qwen3.x,
+    ///   Exaone4, Hunyuan, GLM4, Nemotron-H, …) and
+    ///   `<longcat_think>` / `</longcat_think>`.
+    /// * **Multi-token think pair** — `<|channel>thought` (open) /
+    ///   `<channel|>` (close), used by Gemma 4 and any future model that
+    ///   adopts the same channel-priming convention.  The `thought`
+    ///   continuation is appended to the open marker because Gemma 4's
+    ///   reasoning channel is always primed with `<|channel>thought\n`;
+    ///   detecting just `<|channel>` would leak the priming literal back
+    ///   into the prompt downstream.
+    ///
+    /// `tool_call_start` / `tool_call_end` are encoded into id sequences
+    /// only when the caller passes both halves through
+    /// [`Self::with_tool_call_markers`].  This mirrors the upstream
+    /// `TokenizerWrapper(..., tool_call_start=..., tool_call_end=...)`
+    /// constructor — the wrapper itself does not auto-infer tool-call
+    /// markers from the chat template; the inference is done by the
+    /// model loader via `_infer_tool_parser`.  Today the streaming filter
+    /// in `server::tool_calls::stream_filter` already covers tool-call
+    /// markers via plain string matching on decoded text, so this method
+    /// returns `None` for the tool-call halves unless the caller threaded
+    /// markers through.  Once a full tool-parser registry exists the
+    /// caller will call [`Self::with_tool_call_markers`] to populate them.
+    ///
+    /// Returns an empty [`ThinkingMarkers`] for non-thinking models so
+    /// callers get a stable type they can pattern-match without `Option`
+    /// peeling.  [`ThinkingMarkers::has_thinking`] is the canonical
+    /// predicate for "is this a thinking model".
+    ///
+    /// Used by: `server::chat_template::ChatTemplateProcessor`
+    /// (default for the `enable_thinking` Jinja kwarg),
+    /// `server::tool_calls::stream_filter` (future hookup for token-id
+    /// based marker detection on top of today's text-based scan).
+    ///
+    /// Note: `server::thinking_budget::resolve_thinking_token_ids` currently
+    /// uses bare `<|channel>` / `<channel|>` single-token IDs directly rather
+    /// than consuming this method.  Migrating it to use the multi-token
+    /// sequences returned here is a separate follow-up task.
+    pub fn infer_thinking_markers(&self) -> ThinkingMarkers {
+        let Some(hf) = self.hf_tokenizer() else {
+            return ThinkingMarkers::default();
+        };
+
+        // Single-token modes — first hit wins (matches upstream's THINK_TOKENS
+        // ordering: `<think>` before `<longcat_think>`).
+        const SINGLE_TOKEN_PAIRS: &[(&str, &str)] = &[
+            ("<think>", "</think>"),
+            ("<longcat_think>", "</longcat_think>"),
+        ];
+        for (start, end) in SINGLE_TOKEN_PAIRS {
+            if let (Some(open_id), Some(close_id)) = (hf.token_to_id(start), hf.token_to_id(end)) {
+                return ThinkingMarkers {
+                    think_start: Some(start.to_string()),
+                    think_end: Some(end.to_string()),
+                    think_start_tokens: Some(vec![open_id]),
+                    think_end_tokens: Some(vec![close_id]),
+                    ..ThinkingMarkers::default()
+                };
+            }
+        }
+
+        // Multi-token mode (Gemma 4 / `<|channel>thought` family). Both
+        // halves of the pipe-delimited channel marker must be present in
+        // the vocab as added tokens; the trailing `thought` literal is
+        // tokenized through the regular encoder so we get whatever subword
+        // pieces the model uses.
+        if hf.token_to_id("<|channel>").is_some() && hf.token_to_id("<channel|>").is_some() {
+            let think_start = "<|channel>thought";
+            let think_end = "<channel|>";
+            let start_tokens = hf
+                .encode(think_start, false)
+                .ok()
+                .map(|enc| enc.get_ids().to_vec())
+                .unwrap_or_default();
+            let end_tokens = hf
+                .encode(think_end, false)
+                .ok()
+                .map(|enc| enc.get_ids().to_vec())
+                .unwrap_or_default();
+            // Defensive guard: if either side encoded to an empty sequence
+            // (e.g. a tokenizer that strips the marker entirely) we cannot
+            // safely treat this as a thinking model — fall through to the
+            // empty default.
+            if !start_tokens.is_empty() && !end_tokens.is_empty() {
+                return ThinkingMarkers {
+                    think_start: Some(think_start.to_string()),
+                    think_end: Some(think_end.to_string()),
+                    think_start_tokens: Some(start_tokens),
+                    think_end_tokens: Some(end_tokens),
+                    ..ThinkingMarkers::default()
+                };
+            }
+        }
+
+        ThinkingMarkers::default()
+    }
+
+    /// Encode an explicit tool-call start/end string pair into token-id
+    /// sequences and merge them onto an existing [`ThinkingMarkers`].
+    ///
+    /// Mirrors upstream `TokenizerWrapper.__init__`'s
+    /// `_tool_call_start_tokens = tuple(encode(tool_call_start, ...))`
+    /// behavior: the caller has already resolved the tool-parser family
+    /// (via the chat-template heuristic in `mlx_lm.tokenizer_utils
+    /// ._infer_tool_parser`) and now needs the token sequence for the
+    /// chosen markers.
+    ///
+    /// Returns the input markers unchanged when the tokenizer does not
+    /// support `encode` for the tool-call strings (e.g. SentencePiece /
+    /// Tiktoken paths) so callers can chain this on every load without a
+    /// guard.
+    ///
+    /// Currently consumed by unit tests; future wiring point for
+    /// `server::startup` after resolving a tool-call format — pass the
+    /// canonical start/end strings through here so the resulting
+    /// `ThinkingMarkers` can drive both the chat-template default and the
+    /// stream-filter token-id matching path.
+    pub fn with_tool_call_markers(
+        &self,
+        mut markers: ThinkingMarkers,
+        tool_call_start: &str,
+        tool_call_end: &str,
+    ) -> ThinkingMarkers {
+        let Some(hf) = self.hf_tokenizer() else {
+            return markers;
+        };
+        let Ok(start_enc) = hf.encode(tool_call_start, false) else {
+            return markers;
+        };
+        let Ok(end_enc) = hf.encode(tool_call_end, false) else {
+            return markers;
+        };
+        let start_ids = start_enc.get_ids().to_vec();
+        let end_ids = end_enc.get_ids().to_vec();
+        if start_ids.is_empty() || end_ids.is_empty() {
+            // A tokenizer that drops the marker entirely cannot be matched
+            // on an id basis. Leave the markers untouched so the text-based
+            // stream filter remains the single source of truth.
+            return markers;
+        }
+        markers.tool_call_start = Some(tool_call_start.to_string());
+        markers.tool_call_end = Some(tool_call_end.to_string());
+        markers.tool_call_start_tokens = Some(start_ids);
+        markers.tool_call_end_tokens = Some(end_ids);
+        markers
     }
 }
 
@@ -446,7 +602,10 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
 
 #[cfg(test)]
 mod tests {
-    use super::{remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type};
+    use super::{
+        MlxcelTokenizer, remote_tokenizer_repo_for_model, remote_tokenizer_repo_for_model_type,
+    };
+    use tokenizers::{AddedToken, Tokenizer, models::bpe::BPE};
 
     #[test]
     fn remote_tokenizer_repo_for_model_type_matches_moondream3() {
@@ -474,5 +633,233 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    // ------------------------------------------------------------------
+    // ThinkingMarkers / infer_thinking_markers (issue #590)
+    //
+    // We can't easily construct full `MlxcelTokenizer` instances backed by
+    // real model files inside unit tests, so these cases build minimal HF
+    // tokenizers with explicit added vocab. The shape mirrors what the
+    // production loader produces for each family:
+    //
+    // - Qwen3 / Exaone / GLM / Hunyuan / Nemotron-H — `<think>` and
+    //   `</think>` registered as added tokens.
+    // - longcat — `<longcat_think>` / `</longcat_think>` added tokens.
+    // - Gemma 4 — `<|channel>` / `<channel|>` added tokens; the literal
+    //   `thought` continuation goes through the BPE encoder, which we seed
+    //   with a vocab entry to keep the test deterministic.
+    // ------------------------------------------------------------------
+
+    fn mlxcel_with_added(tokens: &[&str]) -> MlxcelTokenizer {
+        // Minimal BPE base; the underlying model never produces tokens
+        // because the test only inspects added-vocab lookups.
+        let mut hf = Tokenizer::new(BPE::default());
+        let added: Vec<AddedToken> = tokens
+            .iter()
+            .map(|s| AddedToken::from(*s, /*special=*/ true))
+            .collect();
+        hf.add_tokens(&added);
+        MlxcelTokenizer::HuggingFace(hf)
+    }
+
+    #[test]
+    fn infer_thinking_markers_recognizes_single_token_qwen_think_pair() {
+        let tok = mlxcel_with_added(&["<think>", "</think>"]);
+        let markers = tok.infer_thinking_markers();
+        assert!(markers.has_thinking());
+        assert_eq!(markers.think_start.as_deref(), Some("<think>"));
+        assert_eq!(markers.think_end.as_deref(), Some("</think>"));
+        // Single-token markers come back as length-1 sequences.
+        assert_eq!(markers.think_start_tokens.as_ref().map(Vec::len), Some(1));
+        assert_eq!(markers.think_end_tokens.as_ref().map(Vec::len), Some(1));
+        // No tool-call markers were threaded through; halves stay None.
+        assert!(!markers.has_tool_calling());
+    }
+
+    #[test]
+    fn infer_thinking_markers_recognizes_longcat_pair() {
+        let tok = mlxcel_with_added(&["<longcat_think>", "</longcat_think>"]);
+        let markers = tok.infer_thinking_markers();
+        assert!(markers.has_thinking());
+        assert_eq!(markers.think_start.as_deref(), Some("<longcat_think>"));
+        assert_eq!(markers.think_end.as_deref(), Some("</longcat_think>"));
+        assert_eq!(markers.think_start_tokens.unwrap().len(), 1);
+        assert_eq!(markers.think_end_tokens.unwrap().len(), 1);
+    }
+
+    #[test]
+    fn infer_thinking_markers_prefers_qwen_pair_over_longcat() {
+        // Both pairs simultaneously is hypothetical, but the precedence
+        // contract must match upstream's THINK_TOKENS list order.
+        let tok =
+            mlxcel_with_added(&["<think>", "</think>", "<longcat_think>", "</longcat_think>"]);
+        let markers = tok.infer_thinking_markers();
+        assert_eq!(markers.think_start.as_deref(), Some("<think>"));
+        assert_eq!(markers.think_end.as_deref(), Some("</think>"));
+    }
+
+    #[test]
+    fn infer_thinking_markers_recognizes_multi_token_channel_pair() {
+        // Gemma 4 / `<|channel>thought` family: the channel delimiters are
+        // single tokens, but the open marker (`<|channel>thought`) is
+        // multi-token because `thought` falls through to the BPE encoder.
+        // We add `thought` as an added token so the encoder produces a
+        // deterministic id sequence.
+        let tok = mlxcel_with_added(&["<|channel>", "<channel|>", "thought"]);
+        let markers = tok.infer_thinking_markers();
+        assert!(markers.has_thinking());
+        assert_eq!(markers.think_start.as_deref(), Some("<|channel>thought"));
+        assert_eq!(markers.think_end.as_deref(), Some("<channel|>"));
+        let start = markers.think_start_tokens.expect("start tokens");
+        let end = markers.think_end_tokens.expect("end tokens");
+        // Gemma 4's open marker spans at least 2 tokens (`<|channel>` and
+        // the `thought` continuation) — explicitly assert the multi-token
+        // shape so a future tokenizer change that collapses it back to a
+        // single id is caught here.
+        assert!(
+            start.len() >= 2,
+            "<|channel>thought must be a multi-token sequence; got {start:?}"
+        );
+        assert_eq!(end.len(), 1, "<channel|> must remain single-token");
+    }
+
+    #[test]
+    fn infer_thinking_markers_returns_default_for_non_thinking_tokenizer() {
+        let tok = mlxcel_with_added(&["<|user|>", "<|assistant|>"]);
+        let markers = tok.infer_thinking_markers();
+        assert!(!markers.has_thinking());
+        assert!(markers.think_start.is_none());
+        assert!(markers.think_end_tokens.is_none());
+    }
+
+    #[test]
+    fn infer_thinking_markers_partial_channel_pair_does_not_resolve() {
+        // Only the open marker present; the loader must not pretend the
+        // pair exists.
+        let tok = mlxcel_with_added(&["<|channel>"]);
+        assert!(!tok.infer_thinking_markers().has_thinking());
+
+        // And the symmetric case — only the close marker.
+        let tok2 = mlxcel_with_added(&["<channel|>"]);
+        assert!(!tok2.infer_thinking_markers().has_thinking());
+    }
+
+    #[test]
+    fn with_tool_call_markers_threads_explicit_pair_through() {
+        // Hermes-style tool-call markers (`<tool_call>` / `</tool_call>`)
+        // are added tokens in the Qwen-coder family. The caller resolves
+        // the tool-parser family separately and passes the canonical
+        // strings through `with_tool_call_markers`.
+        let tok = mlxcel_with_added(&["<think>", "</think>", "<tool_call>", "</tool_call>"]);
+        let markers = tok.infer_thinking_markers();
+        let merged = tok.with_tool_call_markers(markers, "<tool_call>", "</tool_call>");
+        assert!(merged.has_tool_calling());
+        assert_eq!(merged.tool_call_start.as_deref(), Some("<tool_call>"));
+        assert_eq!(merged.tool_call_end.as_deref(), Some("</tool_call>"));
+        assert_eq!(
+            merged.tool_call_start_tokens.as_ref().map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(merged.tool_call_end_tokens.as_ref().map(Vec::len), Some(1));
+        // Think markers must survive the merge.
+        assert!(merged.has_thinking());
+    }
+
+    #[test]
+    fn with_tool_call_markers_preserves_input_when_tokenizer_lacks_hf() {
+        // SentencePiece path: hf_tokenizer() returns None so the helper
+        // must short-circuit and return the input unchanged.
+        let tok = MlxcelTokenizer::stub();
+        let markers = tok.infer_thinking_markers();
+        let merged = tok.with_tool_call_markers(markers.clone(), "<tool_call>", "</tool_call>");
+        assert_eq!(merged, markers);
+    }
+
+    // -- find_think_* / rfind_think_* via subseq helpers (#590) ----------
+    //
+    // The `find_subseq`/`rfind_subseq` helpers are the Rust analogue of
+    // upstream's `TokenizerWrapper.find_think_start` etc. These tests
+    // verify the tokenizer-side wiring: encode a Gemma-4-shaped input,
+    // resolve the markers, then locate them inside the encoded sequence.
+
+    // -- Real Gemma 4 tokenizer integration (#[ignore]) -------------------
+    //
+    // Exercises the actual `mlx-community/gemma-4-e4b-it-8bit` tokenizer
+    // shipped in `models/gemma-4-e4b-it-8bit/`. Skipped when the directory
+    // is missing so the test suite stays portable; run on demand with
+    // `cargo test -- --ignored` against a workspace that has the model
+    // downloaded (per `docs/testing.md`).
+
+    #[test]
+    #[ignore = "requires models/gemma-4-e4b-it-8bit/; run with --ignored"]
+    fn gemma4_real_tokenizer_resolves_multi_token_channel_marker() {
+        let model_dir = std::path::Path::new("models/gemma-4-e4b-it-8bit");
+        assert!(
+            model_dir.exists(),
+            "this --ignored test needs the Gemma 4 model under models/"
+        );
+        let tok = super::load_tokenizer(model_dir).expect("load Gemma 4 tokenizer");
+        let markers = tok.infer_thinking_markers();
+        assert!(
+            markers.has_thinking(),
+            "Gemma 4 tokenizer must register a thinking marker pair"
+        );
+        assert_eq!(markers.think_start.as_deref(), Some("<|channel>thought"));
+        assert_eq!(markers.think_end.as_deref(), Some("<channel|>"));
+        let start = markers.think_start_tokens.expect("start tokens");
+        let end = markers.think_end_tokens.expect("end tokens");
+        assert!(
+            start.len() >= 2,
+            "Gemma 4's <|channel>thought open marker must be multi-token; got len={} ids={:?}",
+            start.len(),
+            start
+        );
+        assert_eq!(
+            end.len(),
+            1,
+            "Gemma 4's <channel|> close marker must remain single-token; got ids={end:?}"
+        );
+
+        // Confirm the resolved id sequence actually matches the bytes the
+        // chat template will emit for the channel priming. Encoding the
+        // priming substring directly must produce the same prefix that
+        // `infer_thinking_markers` resolved; otherwise the stream filter /
+        // thinking-budget tracker would miss real markers.
+        let hf = tok.hf_tokenizer().unwrap();
+        let direct = hf
+            .encode("<|channel>thought", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+        assert_eq!(start, direct);
+    }
+
+    #[test]
+    fn find_think_start_locates_multi_token_channel_marker() {
+        let tok = mlxcel_with_added(&["<|channel>", "<channel|>", "thought"]);
+        let markers = tok.infer_thinking_markers();
+        let start_seq = markers.think_start_tokens.clone().unwrap();
+        let end_seq = markers.think_end_tokens.clone().unwrap();
+
+        // Encode a synthetic completion: "<|channel>thought<channel|>"
+        let hf = tok.hf_tokenizer().unwrap();
+        let body = hf
+            .encode("<|channel>thought<channel|>", false)
+            .unwrap()
+            .get_ids()
+            .to_vec();
+
+        // The open-marker subsequence must appear at the start (idx 0).
+        assert_eq!(super::find_subseq(&body, &start_seq, None, None), Some(0));
+        // The close-marker subsequence must appear after the open marker.
+        let close_idx = super::find_subseq(&body, &end_seq, None, None).unwrap();
+        assert!(close_idx >= start_seq.len());
+        // rfind variant returns the same index when there is exactly one
+        // occurrence.
+        assert_eq!(
+            super::rfind_subseq(&body, &end_seq, None, None),
+            Some(close_idx)
+        );
     }
 }
