@@ -310,7 +310,30 @@ pub(crate) const TURBO_DEFAULT_SEED: u32 = 0x7B4_70404; // "TUR" 0x474 + B2 issu
 pub struct KVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
     pub values: Option<UniquePtr<MlxArray>>,
+    /// Monotonically increasing absolute write position. Used as the RoPE
+    /// position for new K/Q tokens and as the upper bound of the live window.
+    /// Once a token has been written at position `p`, this value never
+    /// decreases through any operation that preserves on-device K — in
+    /// particular `trim_front` (issue #603) increments [`Self::live_start`]
+    /// instead of decrementing `offset`, so the relative position
+    /// `offset - i` between a cached K at monotonic slot `i` and a freshly
+    /// rotated Q stays invariant after the live window is bounded.
     pub offset: i32,
+    /// Monotonically increasing start position of the live window inside the
+    /// monotonic position space. Slot `i` in the on-device `keys` / `values`
+    /// buffer corresponds to monotonic position `live_start + i`. The live
+    /// window length is `offset - live_start`; attention reads only this
+    /// slice. Always `0` for callers that never trim the head — and **must**
+    /// stay `0` for Turbo4*/Turbo3* modes since the packed sidecars carry
+    /// per-token rotation state that head-trim cannot safely rebuild
+    /// (see [`Self::trim_front`]).
+    ///
+    /// Together with `offset`, this preserves the RoPE invariant under
+    /// the `--max-kv-size` cap (issue #603): K stored at buffer slot `i` was
+    /// rotated at monotonic position `live_start + i` *at write time*, Q is
+    /// rotated at the current monotonic `offset`, and attention sees the
+    /// correct relative position `offset - (live_start + i)`.
+    pub(crate) live_start: i32,
     step: i32,
     /// Quantization mode for stored keys/values.
     pub mode: KVCacheMode,
@@ -386,6 +409,7 @@ impl KVCache {
             keys: None,
             values: None,
             offset: 0,
+            live_start: 0,
             step: 256,
             mode: KVCacheMode::Fp16,
             key_scales: None,
@@ -432,6 +456,7 @@ impl KVCache {
             keys: None,
             values: None,
             offset: 0,
+            live_start: 0,
             step: 256,
             mode,
             key_scales: None,
@@ -553,17 +578,56 @@ impl KVCache {
         false
     }
 
-    /// Check if cache is empty
+    /// Check if cache is empty.
+    ///
+    /// Returns `true` only when no token has ever been written into the
+    /// cache (`self.offset == 0`). After [`Self::trim_front`] drops the
+    /// entire live window, the on-device buffers may be `None` but
+    /// `self.offset` stays at its monotonic value so callers that branch
+    /// on "is this the initial prefill?" (e.g. the fused causal prefill
+    /// fast path in dense models, which hard-codes RoPE positions to
+    /// `[0, l)`) do not silently engage on a post-trim cache where the
+    /// next Q is rotated at a non-zero position.
     pub fn is_empty(&self) -> bool {
         // Symmetric Turbo4 has no `keys` buffer (K is packed into
         // `k_packed`), so check both. The cache is empty iff neither the
-        // dense K buffer nor the packed K buffer is allocated.
-        self.keys.is_none() && self.k_packed.is_none()
+        // dense K buffer nor the packed K buffer is allocated AND no
+        // monotonic write has happened.
+        self.offset == 0 && self.keys.is_none() && self.k_packed.is_none()
     }
 
-    /// Get current sequence length in cache
+    /// Get current sequence length in cache.
+    ///
+    /// Reports the **live window length** — the number of tokens attention
+    /// will actually see on the next forward pass. After [`Self::trim_front`]
+    /// drops the oldest `n` tokens, this returns `offset - live_start`
+    /// rather than the monotonic `offset` so callers that build masks /
+    /// allocate per-token sidecars (e.g., paged accounting, server gauges,
+    /// detach handles) see the post-trim length. Pre-#603 callers that never
+    /// trim observe identical behaviour because `live_start == 0`.
     pub fn seq_len(&self) -> i32 {
-        self.offset
+        self.offset - self.live_start
+    }
+
+    /// Number of live tokens currently visible in the cache (alias of
+    /// [`Self::seq_len`], kept for call-sites that want to underline they
+    /// are interested in the post-trim length rather than the monotonic
+    /// position).
+    #[inline]
+    pub fn live_len(&self) -> i32 {
+        self.offset - self.live_start
+    }
+
+    /// Buffer slot index where the next K/V token will be written.
+    ///
+    /// Slot `i` in the on-device buffer maps to monotonic position
+    /// `live_start + i`; the next write lands at monotonic position
+    /// `self.offset`, i.e. buffer slot `self.offset - self.live_start`.
+    /// Pre-#603 callers (those that never trim) see this equal to
+    /// `self.offset` because `live_start == 0`.
+    #[inline]
+    fn buffer_idx(&self) -> i32 {
+        self.offset - self.live_start
     }
 
     /// Get the allocated buffer size (sequence dimension)
@@ -607,15 +671,23 @@ impl KVCache {
     }
 
     /// FP16 (standard) update path — original pre-allocated buffer logic.
+    ///
+    /// Operates in **buffer-slot** coordinates: `prev = self.offset
+    /// - self.live_start` is the slot index where the next K/V token is
+    /// written, and the slice-update upper bound is `prev + new_seq_len`
+    /// (i.e. `buffer_idx()` after the monotonic `self.offset` has been
+    /// advanced). The monotonic `self.offset` is incremented unconditionally
+    /// so RoPE positions for subsequent Q tokens stay correct after a
+    /// [`Self::trim_front`] has shifted `self.live_start` forward.
     fn update_fp16(&mut self, new_keys: UniquePtr<MlxArray>, new_values: UniquePtr<MlxArray>) {
         let key_shape = ffi::array_shape(&new_keys);
         let new_seq_len = key_shape[2];
-        let prev = self.offset;
+        let prev = self.buffer_idx();
 
         if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
             self.keys = Some(ffi::contiguous(&new_keys, false));
             self.values = Some(ffi::contiguous(&new_values, false));
-            self.offset = new_seq_len;
+            self.offset += new_seq_len;
             return;
         }
 
@@ -656,6 +728,7 @@ impl KVCache {
         }
 
         self.offset += new_seq_len;
+        let live_len = self.buffer_idx();
 
         let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
         let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
@@ -663,13 +736,13 @@ impl KVCache {
             self.keys.as_ref().unwrap(),
             &new_keys,
             &[0, 0, prev, 0],
-            &[k_shape[0], k_shape[1], self.offset, k_shape[3]],
+            &[k_shape[0], k_shape[1], live_len, k_shape[3]],
         ));
         self.values = Some(ffi::slice_update(
             self.values.as_ref().unwrap(),
             &new_values,
             &[0, 0, prev, 0],
-            &[v_shape[0], v_shape[1], self.offset, v_shape[3]],
+            &[v_shape[0], v_shape[1], live_len, v_shape[3]],
         ));
     }
 
@@ -690,14 +763,17 @@ impl KVCache {
 
         let key_shape = ffi::array_shape(&k_int8);
         let new_seq_len = key_shape[2];
-        let prev = self.offset;
+        // Use buffer-slot coordinates so `--max-kv-size` trim_front stays
+        // RoPE-correct (#603): `prev` is the slot where the next token is
+        // written, not the monotonic position.
+        let prev = self.buffer_idx();
 
         if prev == 0 && self.keys.is_none() && direct_prefill_cache_store_enabled() {
             self.keys = Some(ffi::contiguous(&k_int8, false));
             self.values = Some(ffi::contiguous(&v_int8, false));
             self.key_scales = Some(ffi::contiguous(&k_scale, false));
             self.val_scales = Some(ffi::contiguous(&v_scale, false));
-            self.offset = new_seq_len;
+            self.offset += new_seq_len;
             return;
         }
 
@@ -760,6 +836,7 @@ impl KVCache {
         }
 
         self.offset += new_seq_len;
+        let live_len = self.buffer_idx();
 
         let k_shape = ffi::array_shape(self.keys.as_ref().unwrap());
         let v_shape = ffi::array_shape(self.values.as_ref().unwrap());
@@ -770,25 +847,25 @@ impl KVCache {
             self.keys.as_ref().unwrap(),
             &k_int8,
             &[0, 0, prev, 0],
-            &[k_shape[0], k_shape[1], self.offset, k_shape[3]],
+            &[k_shape[0], k_shape[1], live_len, k_shape[3]],
         ));
         self.values = Some(ffi::slice_update(
             self.values.as_ref().unwrap(),
             &v_int8,
             &[0, 0, prev, 0],
-            &[v_shape[0], v_shape[1], self.offset, v_shape[3]],
+            &[v_shape[0], v_shape[1], live_len, v_shape[3]],
         ));
         self.key_scales = Some(ffi::slice_update(
             self.key_scales.as_ref().unwrap(),
             &k_scale,
             &[0, 0, prev, 0],
-            &[ks_shape[0], ks_shape[1], self.offset, 1],
+            &[ks_shape[0], ks_shape[1], live_len, 1],
         ));
         self.val_scales = Some(ffi::slice_update(
             self.val_scales.as_ref().unwrap(),
             &v_scale,
             &[0, 0, prev, 0],
-            &[vs_shape[0], vs_shape[1], self.offset, 1],
+            &[vs_shape[0], vs_shape[1], live_len, 1],
         ));
     }
 
@@ -1900,7 +1977,13 @@ impl KVCache {
     /// common short-rewind case.
     /// Used by: speculative decoding cache rewinds
     pub fn trim(&mut self, n: i32) -> i32 {
-        let n = n.min(self.offset);
+        // Clamp against the live window length, not the monotonic offset:
+        // after a `trim_front`-induced live_start advance we must not roll
+        // `self.offset` below `self.live_start`, otherwise the slot
+        // arithmetic in subsequent `update_*` calls breaks. With
+        // `live_start == 0` (the common case) this is bit-identical to
+        // clamping against `self.offset`.
+        let n = n.min(self.live_len());
         if n <= 0 {
             return 0;
         }
@@ -1918,7 +2001,15 @@ impl KVCache {
         if self.mode == KVCacheMode::Turbo4Delegated {
             self.cold_offset -= cold_trim;
         }
-        if self.offset == 0 {
+        // After `self.offset -= n`, the live window length is
+        // `self.offset - self.live_start`. Use that for the buffer-slot
+        // slice upper bound so trim stays consistent under a non-zero
+        // `live_start` (issue #603 + speculative-decode rewind composing).
+        // `live_start` stays at `0` for Turbo modes because `trim_front`
+        // refuses to advance it for them, so the Turbo branches below that
+        // still use `self.offset` continue to be correct.
+        let live_len_after = self.offset - self.live_start;
+        if live_len_after == 0 {
             self.keys = None;
             self.values = None;
             self.key_scales = None;
@@ -2001,13 +2092,17 @@ impl KVCache {
             let _ = hot_trim;
         } else {
             // Non-delegated modes: simple buffer-prefix trim.
+            // The slice upper bound is the post-trim *live* window length
+            // (`live_len_after`), not the monotonic `self.offset`. For
+            // Turbo modes `live_start == 0` so `live_len_after == self.offset`
+            // and behaviour is bit-identical to the pre-#603 implementation.
             // Trim keys (always present except in Turbo4Asym pre-init).
             if let Some(ref k) = self.keys {
                 let k_shape = ffi::array_shape(k);
                 self.keys = Some(ffi::slice(
                     k,
                     &[0, 0, 0, 0],
-                    &[k_shape[0], k_shape[1], self.offset, k_shape[3]],
+                    &[k_shape[0], k_shape[1], live_len_after, k_shape[3]],
                 ));
             }
             // Trim values for FP16/INT8 modes (Turbo4Asym keeps values None).
@@ -2016,7 +2111,7 @@ impl KVCache {
                 self.values = Some(ffi::slice(
                     v,
                     &[0, 0, 0, 0],
-                    &[v_shape[0], v_shape[1], self.offset, v_shape[3]],
+                    &[v_shape[0], v_shape[1], live_len_after, v_shape[3]],
                 ));
             }
             // Trim INT8 scale sidecars.
@@ -2026,7 +2121,7 @@ impl KVCache {
                     self.key_scales = Some(ffi::slice(
                         ks,
                         &[0, 0, 0, 0],
-                        &[ks_shape[0], ks_shape[1], self.offset, 1],
+                        &[ks_shape[0], ks_shape[1], live_len_after, 1],
                     ));
                 }
                 if let Some(ref vs) = self.val_scales {
@@ -2034,7 +2129,7 @@ impl KVCache {
                     self.val_scales = Some(ffi::slice(
                         vs,
                         &[0, 0, 0, 0],
-                        &[vs_shape[0], vs_shape[1], self.offset, 1],
+                        &[vs_shape[0], vs_shape[1], live_len_after, 1],
                     ));
                 }
             }
@@ -2099,6 +2194,142 @@ impl KVCache {
         n
     }
 
+    /// Drop the oldest `n` entries from the live window of the cache.
+    ///
+    /// This is the dual of [`KVCache::trim`] (which removes the *newest* `n`
+    /// entries for speculative-decode rewinds). `trim_front` is used by the
+    /// batch scheduler's `--max-kv-size` bound (issue #603) to cap the
+    /// memory footprint of a plain `KVCache` by evicting the oldest tokens
+    /// once the live size exceeds the configured cap. Sliding-window models
+    /// that already use [`RotatingKVCache`] manage their own circular
+    /// buffer and never go through this path.
+    ///
+    /// # Position invariant (the load-bearing reason for the live_start split)
+    ///
+    /// Unlike the previous implementation, this method **does not decrement
+    /// `self.offset`**. Decrementing the monotonic position would silently
+    /// break RoPE: K vectors at buffer slot `i` were rotated at their
+    /// original write-time monotonic position, and Q gets rotated at the
+    /// current `self.offset` on the next forward pass. If `offset` were
+    /// rolled back by `n`, the relative position `offset - i_rope` seen by
+    /// attention would shift by `-n` and the model output collapses the
+    /// moment the cap kicks in.
+    ///
+    /// Instead, this method:
+    /// 1. Physically slices the oldest `n` slots off the on-device buffers
+    ///    so memory shrinks (the actual point of `--max-kv-size`),
+    /// 2. **Advances `self.live_start` by `n`** so subsequent updates write
+    ///    at the right slot (`buffer_idx() = offset - live_start`) and
+    ///    [`Self::update_and_fetch`] returns only the live window
+    ///    `[live_start .. offset]`,
+    /// 3. **Leaves `self.offset` unchanged** so RoPE for the next Q stays
+    ///    rotated at the correct monotonic position.
+    ///
+    /// Upstream `RotatingKVCache` (`mlx_lm/models/cache.py:410-510`) uses
+    /// the same `offset` monotonic / `_idx` rotating split for the same
+    /// reason; the names differ but the invariant is identical.
+    ///
+    /// Returns the number of entries actually trimmed (clamped to
+    /// `[0, live_len]`).
+    ///
+    /// # Supported modes
+    ///
+    /// Only `KVCacheMode::Fp16` and `KVCacheMode::Int8` are supported by
+    /// this method. Calling `trim_front` on a `Turbo4*` / `Turbo3*` cache
+    /// is a no-op that returns `0` — the Turbo modes maintain per-token
+    /// rotation state in their sidecars (`turbo_params`, `v_packed`,
+    /// `v_norms`, `cold_offset`, etc.) that is not safe to truncate from
+    /// the head, and `--max-kv-size` is not supported in combination with
+    /// Turbo KV quantization in v1. The scheduler is expected to log a
+    /// warning when this combination is requested rather than silently
+    /// producing incorrect output. The `live_start` field is guaranteed
+    /// to stay at `0` for Turbo modes so the Turbo fetch paths that still
+    /// slice `[0..self.offset]` continue to be correct.
+    ///
+    /// Used by: [`crate::cache::CachePool`] consumers that need to enforce
+    /// a max KV size on otherwise-unbounded `KVCache` instances (server
+    /// batch scheduler, issue #603).
+    pub fn trim_front(&mut self, n: i32) -> i32 {
+        // Clamp against the live window length, not the monotonic offset:
+        // the live window is what attention sees, and that is what we are
+        // capping.
+        let live_len = self.buffer_idx();
+        let n = n.min(live_len).max(0);
+        if n == 0 {
+            return 0;
+        }
+
+        // Only Fp16 and Int8 are supported; Turbo modes carry rotation
+        // state in their sidecars that is not safe to truncate from the
+        // head. `live_start` must remain `0` for those modes so the Turbo
+        // fetch paths that still slice `[0..self.offset]` continue to be
+        // correct.
+        if !matches!(self.mode, KVCacheMode::Fp16 | KVCacheMode::Int8) {
+            return 0;
+        }
+
+        let new_live_len = live_len - n;
+
+        if new_live_len == 0 {
+            // Whole live window is being dropped — reset the buffers so
+            // subsequent updates reallocate from scratch with the correct
+            // `step` granularity. `self.offset` STAYS monotonic; only
+            // `live_start` jumps forward so the next-write slot is `0`
+            // (matching `offset - live_start == 0`).
+            self.live_start = self.offset;
+            self.keys = None;
+            self.values = None;
+            self.key_scales = None;
+            self.val_scales = None;
+            return n;
+        }
+
+        // Slice keys: drop buffer slots `[0, n)` (i.e. monotonic positions
+        // `[live_start, live_start + n)`). The new buffer slot `0` now
+        // corresponds to monotonic position `live_start + n`, which is the
+        // new `live_start`.
+        if let Some(ref k) = self.keys {
+            let k_shape = ffi::array_shape(k);
+            self.keys = Some(ffi::slice(
+                k,
+                &[0, 0, n, 0],
+                &[k_shape[0], k_shape[1], live_len, k_shape[3]],
+            ));
+        }
+        if let Some(ref v) = self.values {
+            let v_shape = ffi::array_shape(v);
+            self.values = Some(ffi::slice(
+                v,
+                &[0, 0, n, 0],
+                &[v_shape[0], v_shape[1], live_len, v_shape[3]],
+            ));
+        }
+        // Slice INT8 scale sidecars in lockstep.
+        if self.mode == KVCacheMode::Int8 {
+            if let Some(ref ks) = self.key_scales {
+                let ks_shape = ffi::array_shape(ks);
+                self.key_scales = Some(ffi::slice(
+                    ks,
+                    &[0, 0, n, 0],
+                    &[ks_shape[0], ks_shape[1], live_len, 1],
+                ));
+            }
+            if let Some(ref vs) = self.val_scales {
+                let vs_shape = ffi::array_shape(vs);
+                self.val_scales = Some(ffi::slice(
+                    vs,
+                    &[0, 0, n, 0],
+                    &[vs_shape[0], vs_shape[1], live_len, 1],
+                ));
+            }
+        }
+
+        // CRITICAL: do NOT modify `self.offset`. Advance `live_start` only.
+        // See the top-level doc comment for the RoPE rationale.
+        self.live_start += n;
+        n
+    }
+
     /// Update cache and return view of filled portion.
     ///
     /// In `KVCacheMode::Fp16` returns sliced FP16 keys/values directly.
@@ -2122,6 +2353,11 @@ impl KVCache {
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
         self.update(new_keys, new_values);
 
+        // After `update`, the live window length equals `buffer_idx()` —
+        // i.e. `self.offset - self.live_start`. For all callers that never
+        // trim (`live_start == 0`) this is bit-identical to the original
+        // `self.offset`-based slicing.
+        let live_len = self.buffer_idx();
         match self.mode {
             KVCacheMode::Int8 => {
                 // Dequantize the filled portion of the INT8 buffers
@@ -2135,14 +2371,12 @@ impl KVCache {
                 let kss = ffi::array_shape(k_scales);
                 let vss = ffi::array_shape(v_scales);
 
-                let k_slice =
-                    ffi::slice(k_int8, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]);
-                let v_slice =
-                    ffi::slice(v_int8, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]);
+                let k_slice = ffi::slice(k_int8, &[0, 0, 0, 0], &[ks[0], ks[1], live_len, ks[3]]);
+                let v_slice = ffi::slice(v_int8, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]);
                 let ks_slice =
-                    ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], self.offset, 1]);
+                    ffi::slice(k_scales, &[0, 0, 0, 0], &[kss[0], kss[1], live_len, 1]);
                 let vs_slice =
-                    ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], self.offset, 1]);
+                    ffi::slice(v_scales, &[0, 0, 0, 0], &[vss[0], vss[1], live_len, 1]);
 
                 (
                     dequantize(&k_slice, &ks_slice),
@@ -2225,8 +2459,8 @@ impl KVCache {
                 let ks = ffi::array_shape(k);
                 let vs = ffi::array_shape(v);
                 (
-                    ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], self.offset, ks[3]]),
-                    ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], self.offset, vs[3]]),
+                    ffi::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], live_len, ks[3]]),
+                    ffi::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]),
                 )
             }
         }
@@ -5003,6 +5237,459 @@ mod tests {
         assert_eq!(cache.trim(5), 2);
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.is_empty());
+    }
+
+    // Issue #603: `trim_front` drops the oldest `n` tokens from a KVCache's
+    // live window so the server scheduler can enforce a `--max-kv-size`
+    // bound on otherwise unbounded plain `KVCache` instances.
+    //
+    // CRITICAL: `self.offset` is the monotonic RoPE position and **never**
+    // decreases. `trim_front` advances `self.live_start` instead. The tests
+    // below assert the post-trim invariant pair `(offset, live_start)` so a
+    // future regression to "decrement offset on trim" (which silently breaks
+    // RoPE relative positions) is caught immediately. See
+    // [`KVCache::trim_front`] doc-comment for the full position invariant.
+    #[test]
+    fn kv_cache_trim_front_drops_oldest_entries_fp16() {
+        // Helper: read an MlxArray as Vec<f32>. Uses the same astype +
+        // raw-bytes pattern as `flatten_fp32` in `turbo_tests.rs` so cache
+        // tests stay independent of the FFI surface beyond the slice helpers
+        // already exercised here.
+        fn read_f32(arr: &ffi::MlxArray) -> Vec<f32> {
+            let a = ffi::astype(arr, dtype::FLOAT32);
+            ffi::eval(&a);
+            ffi::array_to_raw_bytes(&a)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        let mut cache = KVCache::new();
+        let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        cache.update(keys, values);
+        assert_eq!(cache.seq_len(), 4);
+        assert_eq!(cache.offset, 4);
+        assert_eq!(cache.live_start, 0);
+
+        // Drop the two oldest tokens; the visible window must keep the
+        // tail (tokens 3, 4 for keys / 7, 8 for values).
+        assert_eq!(cache.trim_front(2), 2);
+        assert_eq!(cache.seq_len(), 2);
+        // RoPE invariant: monotonic offset is unchanged after trim.
+        assert_eq!(cache.offset, 4);
+        // The dropped tokens are accounted for by advancing the live
+        // window start, not by rolling back the monotonic offset.
+        assert_eq!(cache.live_start, 2);
+        assert_eq!(cache.live_len(), 2);
+
+        let k_data = read_f32(cache.keys.as_ref().unwrap());
+        let v_data = read_f32(cache.values.as_ref().unwrap());
+        assert_eq!(k_data, vec![3.0, 4.0]);
+        assert_eq!(v_data, vec![7.0, 8.0]);
+    }
+
+    #[test]
+    fn kv_cache_trim_front_clears_buffers_when_dropping_all_entries() {
+        let mut cache = KVCache::new();
+        let keys = ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]);
+        let values = ffi::from_slice_f32(&[3.0, 4.0], &[1, 1, 2, 1]);
+        cache.update(keys, values);
+
+        assert_eq!(cache.trim_front(2), 2);
+        // Live window is empty but the monotonic position is preserved.
+        assert_eq!(cache.live_len(), 0);
+        assert_eq!(cache.offset, 2);
+        assert_eq!(cache.live_start, 2);
+        // On-device buffers are reset to free memory.
+        assert!(cache.keys.is_none());
+        assert!(cache.values.is_none());
+        // `is_empty` reports `false` because the monotonic offset is non-zero
+        // — this is load-bearing for the dense fused-causal-prefill fast
+        // path in `Llama3Attention` which hard-codes RoPE to `[0, l)` and
+        // therefore must not re-engage on a post-trim cache where the next
+        // Q is rotated at a non-zero position.
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn kv_cache_trim_front_clamps_negative_and_zero() {
+        let mut cache = KVCache::new();
+        let keys = ffi::from_slice_f32(&[1.0, 2.0], &[1, 1, 2, 1]);
+        let values = ffi::from_slice_f32(&[3.0, 4.0], &[1, 1, 2, 1]);
+        cache.update(keys, values);
+
+        assert_eq!(cache.trim_front(0), 0);
+        assert_eq!(cache.trim_front(-5), 0);
+        // Original window is preserved; live_start is still 0.
+        assert_eq!(cache.offset, 2);
+        assert_eq!(cache.live_start, 0);
+        assert_eq!(cache.live_len(), 2);
+    }
+
+    #[test]
+    fn kv_cache_trim_front_clamps_to_live_len_when_n_exceeds_size() {
+        let mut cache = KVCache::new();
+        let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0], &[1, 1, 3, 1]);
+        let values = ffi::from_slice_f32(&[4.0, 5.0, 6.0], &[1, 1, 3, 1]);
+        cache.update(keys, values);
+
+        // Requesting more than the live size clamps and clears the live
+        // window. Monotonic `offset` stays at 3; `live_start` jumps to 3.
+        assert_eq!(cache.trim_front(10), 3);
+        assert_eq!(cache.offset, 3);
+        assert_eq!(cache.live_start, 3);
+        assert_eq!(cache.live_len(), 0);
+        // Buffers freed (live window empty); `is_empty()` is still false
+        // because the monotonic offset is non-zero.
+        assert!(cache.keys.is_none());
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn kv_cache_trim_front_is_noop_for_turbo_modes() {
+        // Turbo modes maintain per-token rotation state in sidecars
+        // (`turbo_params`, `v_packed`, `v_norms`, …); head-trim is
+        // unsupported and must be a safe no-op. `--max-kv-size` is
+        // documented as incompatible with Turbo KV quantization in v1.
+        // `live_start` must stay at `0` for these modes so the Turbo fetch
+        // paths that still slice `[0..self.offset]` continue to be correct.
+        let mut cache = KVCache::new();
+        cache.mode = KVCacheMode::Turbo4Asym;
+        cache.offset = 5;
+        // Fabricate visible offset; no buffers attached because we never
+        // call update(). trim_front should refuse and return 0.
+        assert_eq!(cache.trim_front(2), 0);
+        assert_eq!(cache.offset, 5);
+        assert_eq!(cache.live_start, 0);
+    }
+
+    // Issue #603: `trim_front` must preserve the RoPE relative-position
+    // invariant after the live window is bounded — K at buffer slot `i`
+    // was rotated at monotonic position `live_start + i` at write time,
+    // and Q for the next decode step is rotated at the *current*
+    // monotonic `offset`. A naive `trim_front` that decrements `offset`
+    // would shift relative positions by `-n` and silently collapse the
+    // model output the moment the cap kicks in.
+    //
+    // This test exercises the invariant by writing N tokens, trimming `n`,
+    // writing one more token, and verifying:
+    //  - `cache.offset` is `N + 1` (monotonic, never rolled back).
+    //  - `cache.live_start` is `n` (advanced by trim_front).
+    //  - `cache.live_len()` is `(N + 1) - n` — the live window is
+    //    [trim..N+1] in monotonic-position space.
+    //  - The buffer holds the surviving live tokens plus the newest write,
+    //    written at slot `(live_len - 1)` (not at slot `offset`).
+    #[test]
+    fn kv_cache_trim_front_preserves_monotonic_offset_under_subsequent_writes() {
+        fn read_f32(arr: &ffi::MlxArray) -> Vec<f32> {
+            let a = ffi::astype(arr, dtype::FLOAT32);
+            ffi::eval(&a);
+            ffi::array_to_raw_bytes(&a)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        let mut cache = KVCache::new();
+        let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        cache.update(keys, values);
+        // Drop the two oldest tokens — live window is now [3, 4] / [7, 8].
+        assert_eq!(cache.trim_front(2), 2);
+        assert_eq!(cache.offset, 4);
+        assert_eq!(cache.live_start, 2);
+        assert_eq!(cache.live_len(), 2);
+
+        // Write one more token — must land at buffer slot 2 (live_len), not
+        // at slot 4 (monotonic offset). After the write `offset` becomes 5
+        // and `live_len` becomes 3.
+        let new_k = ffi::from_slice_f32(&[9.0], &[1, 1, 1, 1]);
+        let new_v = ffi::from_slice_f32(&[10.0], &[1, 1, 1, 1]);
+        cache.update(new_k, new_v);
+        assert_eq!(cache.offset, 5);
+        assert_eq!(cache.live_start, 2);
+        assert_eq!(cache.live_len(), 3);
+
+        let k_data = read_f32(cache.keys.as_ref().unwrap());
+        let v_data = read_f32(cache.values.as_ref().unwrap());
+        // Buffer slots [0, 1, 2] hold the live tokens at monotonic
+        // positions [2, 3, 4] respectively.
+        assert_eq!(&k_data[..3], &[3.0, 4.0, 9.0]);
+        assert_eq!(&v_data[..3], &[7.0, 8.0, 10.0]);
+    }
+
+    // Issue #603 correctness regression test — RoPE relative-position
+    // invariant under `--max-kv-size`.
+    //
+    // Builds two caches that should produce identical attention outputs:
+    //
+    //   - **Reference**: a fresh cache holding M tokens, with Q at
+    //     monotonic position `M` attending over K rotated at positions
+    //     `[0, M)`.
+    //   - **Capped**:  a cache that wrote N + M tokens and then trimmed
+    //     the oldest N. The surviving live window holds the same `M`
+    //     pre-rotation inputs but rotated at monotonic positions
+    //     `[N, N + M)`. Q is rotated at monotonic position `N + M`.
+    //
+    // Both setups see the **same relative positions** between Q and each K
+    // (`[M, M-1, ..., 1]`) because RoPE is a function of `q_pos - k_pos`
+    // and the absolute base `N` cancels. The attention outputs must
+    // therefore match within FP16 round-off.
+    //
+    // The pre-fix `trim_front` decremented `cache.offset` by N, which
+    // shifted Q's rotation position from `N + M` down to `M`. K vectors
+    // in the buffer were still rotated at their *original* monotonic
+    // positions `[N, N + M)`, so attention saw relative positions
+    // `[M - N, M - N - 1, ..., 1 - N]` — wrong sign at the head of the
+    // window, wrong magnitude everywhere. This test fails noisily on that
+    // regression (the RMS would be well above 0.1).
+    #[test]
+    fn kv_cache_trim_front_preserves_rope_relative_positions_under_attention() {
+        use crate as mlxcel_core;
+        // Tiny shapes — keep this test cheap so it can run on CI.
+        // [B, H, T, D] = [1, 1, M, head_dim]. head_dim must be even for RoPE.
+        const N: i32 = 3;
+        const M: i32 = 4;
+        const HEAD_DIM: i32 = 8;
+        let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+
+        // Helper: fixed pseudo-random K/V/Q vectors for a single token at
+        // the given seed. Deterministic so two callers produce identical
+        // pre-rotation inputs (the load-bearing property of this test).
+        fn unit_token(seed: u32) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+            // [1, 1, 1, HEAD_DIM] -- one token, one batch, one KV head.
+            let k_data: Vec<f32> = (0..HEAD_DIM as u32)
+                .map(|i| ((seed.wrapping_mul(7919).wrapping_add(i)) as f32 * 1.0e-3).sin())
+                .collect();
+            let v_data: Vec<f32> = (0..HEAD_DIM as u32)
+                .map(|i| ((seed.wrapping_mul(7901).wrapping_add(i)) as f32 * 1.0e-3).cos())
+                .collect();
+            (
+                ffi::from_slice_f32(&k_data, &[1, 1, 1, HEAD_DIM]),
+                ffi::from_slice_f32(&v_data, &[1, 1, 1, HEAD_DIM]),
+            )
+        }
+
+        // Apply rotation to a single-token K at `rope_pos`. Uses the same
+        // `fast_rope` primitive every dense model goes through, so this
+        // exercises the production path end-to-end.
+        fn rotate_at(arr: &MlxArray, rope_pos: i32) -> UniquePtr<MlxArray> {
+            mlxcel_core::fast_rope(arr, HEAD_DIM, false, 10_000.0, 1.0, rope_pos)
+        }
+
+        // Read an MlxArray (post-eval) to FP32 for RMS comparison.
+        fn to_f32(arr: &MlxArray) -> Vec<f32> {
+            let a = ffi::astype(arr, dtype::FLOAT32);
+            ffi::eval(&a);
+            ffi::array_to_raw_bytes(&a)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        // The same `M` pre-rotation K/V inputs feed both caches. Seeds are
+        // chosen so the rotated K/V is non-trivial (avoids degenerate
+        // all-zero attention outputs that would mask a regression).
+        let live_seeds: Vec<u32> = (0..M as u32).map(|i| 1_000 + i).collect();
+
+        // ──────────────────────────────────────────────────────────────
+        // Reference: a fresh cache holding M tokens at positions [0, M).
+        let mut cache_ref = KVCache::new();
+        for (i, &seed) in live_seeds.iter().enumerate() {
+            let (k, v) = unit_token(seed);
+            // Write at monotonic position `i`.
+            let k_rot = rotate_at(&k, i as i32);
+            cache_ref.update(k_rot, v);
+        }
+        assert_eq!(cache_ref.offset, M);
+        assert_eq!(cache_ref.live_start, 0);
+
+        // Q for the next decode step (a single fixed Q vector rotated at
+        // monotonic position `M`).
+        let (q_unrot, _) = unit_token(42);
+        let q_ref = rotate_at(&q_unrot, M);
+        let (k_ref, v_ref) = cache_ref.update_and_fetch(
+            rotate_at(&unit_token(99).0, M),
+            unit_token(99).1, // V is not rotated
+        );
+        // Recover the M live K/V (we wrote M+1 tokens; for attention parity
+        // we only care that the slice consumed by attention is consistent
+        // between ref and capped).
+        let out_ref = mlxcel_core::causal_attention(&q_ref, &k_ref, &v_ref, scale, 0.0, 0);
+        let out_ref_f32 = to_f32(&out_ref);
+
+        // ──────────────────────────────────────────────────────────────
+        // Capped: write N filler tokens at positions [0, N), then the same
+        // M live tokens at positions [N, N + M), then trim the oldest N.
+        let mut cache_cap = KVCache::new();
+        for i in 0..N as u32 {
+            // Filler seeds disjoint from `live_seeds` so the filler K/V
+            // cannot accidentally line up with the trimmed window.
+            let (k, v) = unit_token(50_000 + i);
+            let k_rot = rotate_at(&k, i as i32);
+            cache_cap.update(k_rot, v);
+        }
+        for (i, &seed) in live_seeds.iter().enumerate() {
+            let (k, v) = unit_token(seed);
+            let rope_pos = N + i as i32;
+            let k_rot = rotate_at(&k, rope_pos);
+            cache_cap.update(k_rot, v);
+        }
+        assert_eq!(cache_cap.offset, N + M);
+        assert_eq!(cache_cap.live_start, 0);
+
+        // Trim the oldest N tokens. Post-trim:
+        //   offset = N + M (monotonic, unchanged — load-bearing for RoPE)
+        //   live_start = N
+        //   live_len = M
+        // K @ buffer slot i was rotated at monotonic position `N + i`.
+        assert_eq!(cache_cap.trim_front(N), N);
+        assert_eq!(cache_cap.offset, N + M);
+        assert_eq!(cache_cap.live_start, N);
+        assert_eq!(cache_cap.live_len(), M);
+
+        // Q for the next decode step is rotated at monotonic position
+        // `N + M` (the current `cache_cap.offset`). The same Q-input as the
+        // reference, but rotated at a different absolute position.
+        let q_cap = rotate_at(&q_unrot, cache_cap.offset);
+        // Equivalent decode-step write to keep the symmetry with the
+        // reference (same M+1 tokens flow through update_and_fetch).
+        let (k_cap, v_cap) = cache_cap.update_and_fetch(
+            rotate_at(&unit_token(99).0, cache_cap.offset),
+            unit_token(99).1,
+        );
+        let out_cap = mlxcel_core::causal_attention(&q_cap, &k_cap, &v_cap, scale, 0.0, 0);
+        let out_cap_f32 = to_f32(&out_cap);
+
+        // ──────────────────────────────────────────────────────────────
+        // Compare attention outputs. RoPE is purely a function of
+        // `q_pos - k_pos`, so the two outputs should match within FP16
+        // round-off if and only if `trim_front` preserved the position
+        // invariant.
+        assert_eq!(
+            out_ref_f32.len(),
+            out_cap_f32.len(),
+            "attention output shape mismatch — different live window sizes?"
+        );
+        let mut sq_err = 0.0_f64;
+        for (a, b) in out_ref_f32.iter().zip(out_cap_f32.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sq_err += d * d;
+        }
+        let rms = (sq_err / out_ref_f32.len() as f64).sqrt();
+        // `1e-3` is the tolerance the project uses for fused-kernel parity
+        // tests on Apple Silicon FP16 (see e.g.
+        // `delegated_fused_kernel_matches_reference_over_200_steps`).
+        assert!(
+            rms < 1e-3,
+            "RoPE relative-position regression: trim_front shifted Q's rotation \
+             position away from K's write-time position. attention RMS = {rms}; \
+             expected < 1e-3. This usually means `trim_front` decremented \
+             `self.offset` instead of advancing `self.live_start`."
+        );
+    }
+
+    // Negative control for the regression test above: confirm that the
+    // RMS check actually fires when the position invariant is broken.
+    //
+    // We simulate the pre-fix `trim_front` by hand: write the trimmed
+    // cache exactly as before, but rotate Q at the (wrong) monotonic
+    // position `M` instead of `N + M`. Stored K's are still rotated at
+    // positions `[N, N + M)`. Q at `M` and K at `N + i` produce relative
+    // position `M - N - i` — wrong sign at the head of the window. If
+    // the RMS check ever stops catching this (e.g. tolerance loosened
+    // beyond the defect signal), this test fails.
+    #[test]
+    fn kv_cache_trim_front_simulated_offset_decrement_breaks_rope_attention() {
+        use crate as mlxcel_core;
+        const N: i32 = 3;
+        const M: i32 = 4;
+        const HEAD_DIM: i32 = 8;
+        let scale = 1.0_f32 / (HEAD_DIM as f32).sqrt();
+
+        fn unit_token(seed: u32) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+            let k_data: Vec<f32> = (0..HEAD_DIM as u32)
+                .map(|i| ((seed.wrapping_mul(7919).wrapping_add(i)) as f32 * 1.0e-3).sin())
+                .collect();
+            let v_data: Vec<f32> = (0..HEAD_DIM as u32)
+                .map(|i| ((seed.wrapping_mul(7901).wrapping_add(i)) as f32 * 1.0e-3).cos())
+                .collect();
+            (
+                ffi::from_slice_f32(&k_data, &[1, 1, 1, HEAD_DIM]),
+                ffi::from_slice_f32(&v_data, &[1, 1, 1, HEAD_DIM]),
+            )
+        }
+        fn rotate_at(arr: &MlxArray, rope_pos: i32) -> UniquePtr<MlxArray> {
+            mlxcel_core::fast_rope(arr, HEAD_DIM, false, 10_000.0, 1.0, rope_pos)
+        }
+        fn to_f32(arr: &MlxArray) -> Vec<f32> {
+            let a = ffi::astype(arr, dtype::FLOAT32);
+            ffi::eval(&a);
+            ffi::array_to_raw_bytes(&a)
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+
+        let live_seeds: Vec<u32> = (0..M as u32).map(|i| 1_000 + i).collect();
+
+        // Reference: K's rotated at positions `[0, M)`, Q rotated at `M`.
+        let mut cache_ref = KVCache::new();
+        for (i, &seed) in live_seeds.iter().enumerate() {
+            let (k, v) = unit_token(seed);
+            cache_ref.update(rotate_at(&k, i as i32), v);
+        }
+        let (q_unrot, _) = unit_token(42);
+        let q_ref = rotate_at(&q_unrot, M);
+        let (k_ref, v_ref) = cache_ref.update_and_fetch(
+            rotate_at(&unit_token(99).0, M),
+            unit_token(99).1,
+        );
+        let out_ref = mlxcel_core::causal_attention(&q_ref, &k_ref, &v_ref, scale, 0.0, 0);
+        let out_ref_f32 = to_f32(&out_ref);
+
+        // Simulated broken cache: K's rotated at `[N, N + M)` (correct
+        // write-time positions), but Q rotated at the **wrong** position
+        // `M` — this is what `cache.offset` would be after the pre-fix
+        // `trim_front` decremented it from `N + M` to `M`.
+        let mut cache_broken = KVCache::new();
+        for i in 0..N as u32 {
+            let (k, v) = unit_token(50_000 + i);
+            cache_broken.update(rotate_at(&k, i as i32), v);
+        }
+        for (i, &seed) in live_seeds.iter().enumerate() {
+            let (k, v) = unit_token(seed);
+            let rope_pos = N + i as i32;
+            cache_broken.update(rotate_at(&k, rope_pos), v);
+        }
+        // Real trim_front to get the right buffer contents (the post-fix
+        // behaviour). Then deliberately rotate Q at the (wrong) monotonic
+        // position `M` to simulate the pre-fix offset decrement.
+        assert_eq!(cache_broken.trim_front(N), N);
+        let q_broken = rotate_at(&q_unrot, M);
+        let (k_broken, v_broken) = cache_broken.update_and_fetch(
+            rotate_at(&unit_token(99).0, M),
+            unit_token(99).1,
+        );
+        let out_broken = mlxcel_core::causal_attention(&q_broken, &k_broken, &v_broken, scale, 0.0, 0);
+        let out_broken_f32 = to_f32(&out_broken);
+
+        let mut sq_err = 0.0_f64;
+        for (a, b) in out_ref_f32.iter().zip(out_broken_f32.iter()) {
+            let d = (*a as f64) - (*b as f64);
+            sq_err += d * d;
+        }
+        let rms = (sq_err / out_ref_f32.len() as f64).sqrt();
+        assert!(
+            rms > 1e-3,
+            "RoPE-defect simulator produced RMS = {rms}, which means the regression \
+             test's tolerance (< 1e-3) cannot distinguish the defect signal from \
+             FP16 round-off. Tighten the tolerance in \
+             `kv_cache_trim_front_preserves_rope_relative_positions_under_attention` \
+             or pick a more aggressive RoPE base to widen the position-vs-position \
+             differential."
+        );
     }
 
     #[test]

@@ -87,15 +87,20 @@ pub fn serialize_cache_state(state: &SerializableCacheState) -> Result<Vec<u8>> 
 ///
 /// Used by: prefill node when preparing cache state for transfer.
 pub fn extract_kv_cache_entry(cache: &mlxcel_core::cache::KVCache) -> SerializableCacheEntry {
+    // Use `live_len() = offset - live_start` (not the monotonic `offset`) so
+    // this remains correct after issue #603's `trim_front` has advanced
+    // `live_start`. With `live_start == 0` this is bit-identical to slicing
+    // at `cache.offset`.
+    let live_len = cache.live_len();
     match (&cache.keys, &cache.values) {
-        (Some(keys), Some(values)) if cache.offset > 0 => {
+        (Some(keys), Some(values)) if live_len > 0 => {
             // Slice to the filled portion only (buffer may be larger due to step allocation)
             let ks = mlxcel_core::array_shape(keys);
             let vs = mlxcel_core::array_shape(values);
             let filled_k =
-                mlxcel_core::slice(keys, &[0, 0, 0, 0], &[ks[0], ks[1], cache.offset, ks[3]]);
+                mlxcel_core::slice(keys, &[0, 0, 0, 0], &[ks[0], ks[1], live_len, ks[3]]);
             let filled_v =
-                mlxcel_core::slice(values, &[0, 0, 0, 0], &[vs[0], vs[1], cache.offset, vs[3]]);
+                mlxcel_core::slice(values, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]);
             let k_data = extract_mlx_array_data(&filled_k);
             let v_data = extract_mlx_array_data(&filled_v);
             SerializableCacheEntry {
@@ -175,7 +180,13 @@ pub fn serialize_sequence_cache_set(
 
     for cache in &cache_set.caches {
         entries.push(extract_kv_cache_entry(cache));
-        layer_offsets.push(cache.offset);
+        // Re-base the serialized offset to the live window length so the
+        // receiving node restores `(offset=live_len, live_start=0)` —
+        // equivalent in RoPE relative positions to the original
+        // `(offset, live_start)` pair, but without leaking the post-#603
+        // monotonic position through the wire format. With `live_start == 0`
+        // this is bit-identical to recording `cache.offset` directly.
+        layer_offsets.push(cache.live_len());
     }
 
     let metadata = CacheMetadata {

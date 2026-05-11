@@ -339,6 +339,41 @@ pub struct ServerConfig {
     /// take precedence (with the last layer forced to FP16 when
     /// `skip_last_layer == true`).
     pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
+
+    /// Issue #603: upper bound on the **live KV window** of plain
+    /// (non-sliding) `KVCache` instances.
+    ///
+    /// Mirrors upstream mlx-lm's
+    /// [`BatchGenerator(max_kv_size=...)`](https://github.com/ml-explore/mlx-lm/pull/1106)
+    /// parameter, with the same RoPE-faithful semantics as upstream's
+    /// `RotatingKVCache`: when set, the batch scheduler calls
+    /// [`mlxcel_core::cache::KVCache::trim_front`] after every prefill
+    /// chunk and every decode step on caches whose `live_len()` exceeds
+    /// the bound. `trim_front` advances `live_start` and physically slices
+    /// the buffer head — it **does not** decrement `offset`, so K vectors
+    /// rotated at write-time and Q vectors rotated at the current
+    /// monotonic offset continue to see the correct relative position
+    /// after the cap engages. See [`mlxcel_core::cache::KVCache::trim_front`]
+    /// for the full position invariant.
+    ///
+    /// Sliding-window models that build their own [`RotatingKVCache`]
+    /// internally (Gemma 3/4, Exaone 4, RecurrentGemma, Step 3.5, gpt-oss)
+    /// already enforce a model-specific window and are unaffected by this
+    /// cap. Models using KV quantization modes other than `Fp16` / `Int8`
+    /// (`Turbo4*` / `Turbo3*`) also bypass the cap — `--max-kv-size` is not
+    /// supported in combination with Turbo KV quantization in v1. The
+    /// startup warning emitted in
+    /// [`crate::server::batch::BatchScheduler::with_max_kv_size`] flags
+    /// both the legacy `kv_cache_mode` flag and the per-layer modes
+    /// resolved from `batch_kv_quant`.
+    ///
+    /// Resolved from `--max-kv-size` CLI flag and `LLAMA_ARG_MAX_KV_SIZE`
+    /// env var, then validated by
+    /// [`crate::server::cli_input::resolve_max_kv_size`] against the
+    /// accepted range (`0` = disabled, or
+    /// `[MAX_KV_SIZE_MIN, i32::MAX]`). `None` (the default) preserves
+    /// the legacy unbounded behaviour.
+    pub max_kv_size: Option<usize>,
 }
 
 impl Default for ServerConfig {
@@ -386,6 +421,7 @@ impl Default for ServerConfig {
             prompt_cache: crate::server::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
+            max_kv_size: None,
         }
     }
 }

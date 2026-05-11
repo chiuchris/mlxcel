@@ -427,6 +427,23 @@ pub(crate) struct ServeArgs {
     #[arg(long, default_value_t = 1)]
     max_batch_prefill: usize,
 
+    /// Maximum KV cache size for plain (non-sliding) caches (0 = unbounded, the default).
+    ///
+    /// When set to `N > 0`, the batch scheduler caps each per-sequence plain
+    /// `KVCache` to `N` tokens by dropping the oldest entries once `offset`
+    /// exceeds the bound. Mirrors upstream mlx-lm's
+    /// `BatchGenerator(max_kv_size=N)` parameter (PR #1106). Sliding-window
+    /// models (Gemma 3/4, Exaone 4, RecurrentGemma, Step 3.5, gpt-oss) keep
+    /// their model-specific window. Not supported with Turbo KV quantization.
+    /// Also reads `LLAMA_ARG_MAX_KV_SIZE`.
+    #[arg(
+        long = "max-kv-size",
+        env = "LLAMA_ARG_MAX_KV_SIZE",
+        default_value_t = 0,
+        value_name = "N"
+    )]
+    max_kv_size: usize,
+
     /// Request timeout in seconds
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,

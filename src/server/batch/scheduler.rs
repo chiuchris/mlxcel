@@ -189,6 +189,32 @@ pub struct BatchScheduler {
     /// (the default), the legacy path is bit-exact preserved.
     batch_kv_quant: BatchKvQuantConfig,
 
+    /// Issue #603: maximum KV cache size for plain (non-sliding) `KVCache`
+    /// instances managed by this scheduler's `CachePool`.
+    ///
+    /// When `Some(N)`, the scheduler enforces a hard cap on the **live KV
+    /// window** of each per-layer plain `KVCache`: after every prefill
+    /// chunk (full prefill, chunked prefill start, chunked prefill
+    /// continuation) and every decode step, [`KVCache::trim_front`] is
+    /// invoked on each cache whose `live_len()` exceeds `N`, dropping the
+    /// oldest excess tokens. **Crucially, the cache's monotonic `offset`
+    /// is never decremented** — `trim_front` advances `live_start` so
+    /// RoPE relative positions stay correct (issue #603, see
+    /// [`KVCache::trim_front`] for the position invariant).
+    ///
+    /// Sliding-window models that manage their own internal
+    /// `RotatingKVCache` go through a separate model-level code path and
+    /// are unaffected. `None` (the default) preserves the legacy unbounded
+    /// behaviour. Turbo-quantized caches (`Turbo4Asym` / `Turbo4` /
+    /// `Turbo4Delegated` / `Turbo3Asym`) are skipped by
+    /// [`KVCache::trim_front`] (which returns `0` for those modes) with a
+    /// one-time startup warning logged in [`Self::with_max_kv_size`] —
+    /// the warning inspects both `kv_cache_mode` and the per-layer modes
+    /// resolved from `batch_kv_quant` so the combination
+    /// `--kv-quant-scheme=turboquant --max-kv-size=M` is flagged even
+    /// when the legacy `--kv-cache-mode` flag is left at FP16.
+    max_kv_size: Option<usize>,
+
     // -- Vision feature cache --
     /// Per-model vision feature cache bundle. Contains LRU caches for
     /// post-projection image features so multi-turn VLM conversations can
@@ -356,6 +382,7 @@ impl BatchScheduler {
             prompt_cache_seq_ctx: std::collections::HashMap::new(),
             kv_cache_mode: KVCacheMode::Fp16,
             batch_kv_quant: BatchKvQuantConfig::default(),
+            max_kv_size: None,
         }
     }
 
@@ -396,6 +423,63 @@ impl BatchScheduler {
     /// tests).
     pub fn batch_kv_quant(&self) -> BatchKvQuantConfig {
         self.batch_kv_quant
+    }
+
+    /// Set the maximum KV cache size for plain (non-sliding) caches (issue #603).
+    ///
+    /// When `max_kv_size.is_some()`, the scheduler advances `live_start` on
+    /// every plain `KVCache` after each prefill chunk and each decode step
+    /// so the live window stays bounded. `self.offset` stays monotonic so
+    /// RoPE relative positions are preserved across the cap — see
+    /// [`KVCache::trim_front`] for the position invariant. Sliding-window
+    /// model caches (managed by the model itself as internal
+    /// `RotatingKVCache` instances, not via this pool's `Vec<KVCache>`)
+    /// are unaffected.
+    ///
+    /// Turbo-quantized caches (`Turbo4Asym` / `Turbo4` / `Turbo4Delegated`
+    /// / `Turbo3Asym`) are silently skipped by `KVCache::trim_front` — a
+    /// warning is emitted here so the operator knows the combination is
+    /// unsupported. **Issue #603 H3**: the warning now inspects *both* the
+    /// legacy `kv_cache_mode` flag *and* the per-layer modes resolved
+    /// from `batch_kv_quant` so the combination
+    /// `--kv-bits=N --kv-quant-scheme=turboquant --max-kv-size=M` is
+    /// flagged even when `kv_cache_mode` is the default `Fp16`.
+    ///
+    /// Mirrors upstream mlx-lm `BatchGenerator(max_kv_size=N)` (PR #1106).
+    pub fn with_max_kv_size(mut self, max_kv_size: Option<usize>) -> Self {
+        if max_kv_size.is_some() {
+            // Legacy `--kv-cache-mode`-driven path.
+            let legacy_is_turbo = Self::is_turbo_mode(self.kv_cache_mode);
+            // Issue #545 `--kv-bits` / `--kv-quant-scheme` path. When
+            // batch KV quant is enabled, `base_mode()` reports the
+            // effective per-layer mode driving the paged-layout
+            // selection; we treat any Turbo base mode the same way as
+            // the legacy Turbo flags.
+            let batched_is_turbo = self.batch_kv_quant.is_enabled()
+                && Self::is_turbo_mode(self.batch_kv_quant.base_mode());
+            if legacy_is_turbo || batched_is_turbo {
+                tracing::warn!(
+                    "--max-kv-size is set together with a Turbo KV quantization mode \
+                     (legacy_mode={:?}, batch_kv_quant_base_mode={:?}); Turbo-quantized \
+                     layers will NOT be capped — the cap only applies to plain Fp16/Int8 \
+                     KVCache layers. Consider omitting --max-kv-size or switching to a \
+                     non-Turbo KV cache mode.",
+                    self.kv_cache_mode,
+                    if self.batch_kv_quant.is_enabled() {
+                        Some(self.batch_kv_quant.base_mode())
+                    } else {
+                        None
+                    },
+                );
+            }
+        }
+        self.max_kv_size = max_kv_size;
+        self
+    }
+
+    /// Returns the configured maximum KV cache size (for tests).
+    pub fn max_kv_size(&self) -> Option<usize> {
+        self.max_kv_size
     }
 
     /// Replace the default vision feature cache with one sized per the server
@@ -955,6 +1039,66 @@ impl BatchScheduler {
         }
     }
 
+    /// Enforce the `--max-kv-size` cap on a sequence's KV caches (issue #603).
+    ///
+    /// Trims the oldest `live_len(cache) - max_kv_size` tokens from every
+    /// plain `KVCache` layer whose live window exceeds the configured
+    /// bound. Turbo-mode caches return `0` from `KVCache::trim_front`
+    /// (safe no-op — see [`KVCache::trim_front`] for the per-mode
+    /// support matrix). Sliding-window models manage their own internal
+    /// `RotatingKVCache` and are never stored in the pool's
+    /// `Vec<KVCache>`, so they are unaffected.
+    ///
+    /// **Issue #603 H1**: `max_kv_size` has already been validated to fit
+    /// in `i32` by [`crate::server::cli_input::resolve_max_kv_size`], so
+    /// the `i32::try_from` here is a defensive belt-and-suspenders fallback
+    /// — it returns silently rather than panicking, because the validation
+    /// at startup ensures we never reach the failure branch in practice.
+    /// We compare against `cache.live_len()` (not `cache.offset`) so the
+    /// cap is enforced on the **live window** — the monotonic `offset`
+    /// keeps growing past the cap by design.
+    ///
+    /// **Issue #603 H2**: called from every cache-mutating path:
+    /// [`Self::execute_full_prefill`], [`Self::start_chunked_prefill`],
+    /// [`Self::continue_chunked_prefill`], [`Self::decode_single_step`],
+    /// and [`Self::execute_batched_decode`].
+    fn enforce_max_kv_size_for(&mut self, seq_id: SequenceId) {
+        let Some(max) = self.max_kv_size else {
+            return;
+        };
+        // Defensive: even though `resolve_max_kv_size` already clamps this
+        // to `i32::MAX` at startup, a future caller that bypasses the CLI
+        // validation could still construct an out-of-range scheduler. Use
+        // `checked` arithmetic so the worst case is a no-op trim rather
+        // than a wraparound that corrupts every cache.
+        let Ok(max_i32) = i32::try_from(max) else {
+            tracing::error!(
+                "--max-kv-size value {max} does not fit in i32; skipping trim. \
+                 This should have been rejected by ServerStartupInput::into_startup_config — \
+                 please file a bug if you see this in production."
+            );
+            return;
+        };
+        let Some(caches) = self.cache_pool.get_caches_mut(seq_id) else {
+            return;
+        };
+        for cache in caches {
+            // `live_len() = offset - live_start`. We trim against the live
+            // window length (what attention sees), not the monotonic
+            // `offset` (which keeps growing by design — see #603 RoPE
+            // invariant in `KVCache::trim_front`).
+            let live_len = cache.live_len();
+            // `checked_sub` so a future arithmetic regression cannot
+            // silently wrap into a negative trim depth that produces a
+            // 4-billion-element slice and crashes Metal.
+            if let Some(excess) = live_len.checked_sub(max_i32)
+                && excess > 0
+            {
+                cache.trim_front(excess);
+            }
+        }
+    }
+
     fn sequence_state_layout_override(&self) -> Option<SequenceStateLayout> {
         if self.decode_storage_backend != DecodeStorageBackend::Paged {
             return None;
@@ -1005,15 +1149,30 @@ impl BatchScheduler {
         Some(SequenceStateLayout::paged_kv_cache(paged_layout))
     }
 
-    /// Whether the supplied KV cache mode requires Turbo4-aware paged
-    /// layout (per-page sidecar storage on `PagedBlockPool`).
+    /// Whether the supplied KV cache mode requires Turbo*-aware paged
+    /// layout (per-page sidecar storage on `PagedBlockPool`) and is
+    /// **incompatible** with the issue #603 `--max-kv-size` cap.
     ///
-    /// Used by: scheduler dispatch for sequence allocation (#508).
+    /// All Turbo modes carry per-token rotation state in their sidecars
+    /// (`turbo_params` / `turbo3_params` / `v_packed` / `v_norms` /
+    /// `cold_offset`) that `KVCache::trim_front` cannot safely truncate
+    /// from the head. Issue #603 H3: `Turbo3Asym` belongs in this set —
+    /// the 3-bit V sidecars (`v_packed` with 24-bit groups + `v_norms`)
+    /// have the same per-token contract as `Turbo4*`. Omitting it from
+    /// this match silently allowed `--max-kv-size` + `fp16+turbo3` to ship
+    /// without the operator-facing warning that the cap will not be
+    /// honoured on the V side.
+    ///
+    /// Used by: scheduler dispatch for sequence allocation (#508), the
+    /// `--max-kv-size` + Turbo combination warning (#603).
     #[inline]
     fn is_turbo_mode(mode: KVCacheMode) -> bool {
         matches!(
             mode,
-            KVCacheMode::Turbo4Asym | KVCacheMode::Turbo4 | KVCacheMode::Turbo4Delegated
+            KVCacheMode::Turbo4Asym
+                | KVCacheMode::Turbo4
+                | KVCacheMode::Turbo4Delegated
+                | KVCacheMode::Turbo3Asym
         )
     }
 
@@ -1771,6 +1930,13 @@ impl BatchScheduler {
         };
         self.sync_sequence_storage(seq.seq_id);
 
+        // Issue #603 H2: enforce the `--max-kv-size` cap at the end of a
+        // full prefill before the sequence transitions to decode. A long
+        // prompt can overshoot the cap during a single forward pass; without
+        // this trim the first decode step would start with a too-wide live
+        // window. With no cap configured this is a cheap early-return.
+        self.enforce_max_kv_size_for(seq.seq_id);
+
         mlxcel_core::clear_memory_cache();
         // `prefill_offset` is a cursor into `prompt_tokens`, so it must
         // include the adopted prefix even though those tokens bypassed the
@@ -1883,6 +2049,14 @@ impl BatchScheduler {
         }
         self.sync_sequence_storage(seq.seq_id);
 
+        // Issue #603 H2: enforce the `--max-kv-size` cap after each
+        // prefill chunk so the live window cannot grow unbounded across
+        // chunks of a long prompt. A 100k-token prompt with `--max-kv-size
+        // 4096` would otherwise see the cap engage only after the entire
+        // prefill completes — defeating the memory-bound the operator
+        // configured. With no cap configured this is a cheap early-return.
+        self.enforce_max_kv_size_for(seq.seq_id);
+
         mlxcel_core::clear_memory_cache();
         seq.prefill_offset = end;
 
@@ -1984,6 +2158,12 @@ impl BatchScheduler {
             logits
         };
         self.sync_sequence_storage(seq.seq_id);
+
+        // Issue #603 H2: enforce the `--max-kv-size` cap after each
+        // continuation chunk so a multi-chunk prefill stays bounded across
+        // all chunks, not just at the very end. Cheap early-return when no
+        // cap is configured.
+        self.enforce_max_kv_size_for(seq.seq_id);
 
         seq.prefill_offset = end;
 
@@ -2423,6 +2603,14 @@ impl BatchScheduler {
 
         let b = seq_ids.len();
 
+        // Issue #603: trim per-sequence plain KVCache layers before the batched
+        // forward pass so all sequences stay within the --max-kv-size bound.
+        // Sliding-window (model-internal RotatingKVCache) and Turbo-quantized
+        // caches are unaffected (trim_front returns 0 for Turbo modes).
+        for &seq_id in seq_ids {
+            self.enforce_max_kv_size_for(seq_id);
+        }
+
         let mut last_tokens: Vec<i32> = Vec::with_capacity(b);
 
         for &seq_id in seq_ids {
@@ -2639,6 +2827,13 @@ impl BatchScheduler {
             };
             *seq.generated_tokens.last().unwrap_or(&0)
         };
+
+        // Issue #603: trim the oldest tokens from plain KVCache layers so the
+        // live window stays within the configured --max-kv-size bound before
+        // each decode forward pass. Sliding-window layers are managed by the
+        // model and bypass this pool path; Turbo-quantized caches silently skip
+        // the trim (KVCache::trim_front returns 0 for Turbo modes).
+        self.enforce_max_kv_size_for(seq_id);
 
         let input = mlxcel_core::from_slice_i32(&[last_token], &[1, 1]);
         let logits = {

@@ -261,6 +261,30 @@ struct ServerArgs {
     #[arg(long = "max-batch-prefill", default_value_t = 1)]
     max_batch_prefill: usize,
 
+    /// Maximum KV cache size for plain (non-sliding) caches (0 = unbounded, the default).
+    ///
+    /// When set to `N > 0`, the batch scheduler caps each per-sequence plain
+    /// `KVCache` to `N` tokens by dropping the oldest entries once `offset`
+    /// exceeds the bound. Mirrors upstream mlx-lm's
+    /// `BatchGenerator(max_kv_size=N)` parameter (PR #1106).
+    ///
+    /// Sliding-window models that already build their own `RotatingKVCache`
+    /// (Gemma 3/4, Exaone 4, RecurrentGemma, Step 3.5, gpt-oss) are
+    /// unaffected: their model-specific window remains the source of truth.
+    ///
+    /// Not supported in combination with Turbo KV quantization
+    /// (`--kv-cache-mode turbo4*`); when both are set the cap is silently
+    /// skipped for the Turbo-quantized layers with a startup warning.
+    ///
+    /// Also reads `LLAMA_ARG_MAX_KV_SIZE`.
+    #[arg(
+        long = "max-kv-size",
+        env = "LLAMA_ARG_MAX_KV_SIZE",
+        default_value_t = 0,
+        value_name = "N"
+    )]
+    max_kv_size: usize,
+
     /// Override chat template (Jinja2 template string)
     #[arg(long = "chat-template", value_name = "TEMPLATE")]
     chat_template: Option<String>,
@@ -995,5 +1019,9 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         kv_group_size: args.batch_quant.kv_group_size,
         kv_quant_scheme: args.batch_quant.kv_quant_scheme,
         kv_skip_last_layer: args.batch_quant.kv_skip_last_layer,
+        // Issue #603: maximum KV cache size for plain (non-sliding) caches.
+        // clap reads `LLAMA_ARG_MAX_KV_SIZE` directly via the `env = ...`
+        // attribute on the flag, so no separate env-fallback helper is needed.
+        max_kv_size: args.max_kv_size,
     })
 }

@@ -15,10 +15,10 @@
 use std::path::PathBuf;
 
 use super::{
-    DecodeStorageBackend, ServerStartupInput, env_fallback_cache_type_k, env_fallback_cache_type_v,
-    env_fallback_kv_bits, env_fallback_kv_group_size, env_fallback_kv_quant_scheme,
-    env_fallback_kv_skip_last_layer, resolve_compat_toggle, resolve_kv_cache_mode,
-    resolve_prefill_chunk_size, resolve_seed,
+    DecodeStorageBackend, MAX_KV_SIZE_MIN, ServerStartupInput, env_fallback_cache_type_k,
+    env_fallback_cache_type_v, env_fallback_kv_bits, env_fallback_kv_group_size,
+    env_fallback_kv_quant_scheme, env_fallback_kv_skip_last_layer, resolve_compat_toggle,
+    resolve_kv_cache_mode, resolve_max_kv_size, resolve_prefill_chunk_size, resolve_seed,
 };
 use crate::lang_bias::LangBiasCliArgs;
 // Tests that mutate env vars (via `EnvGuard` or directly) must acquire the
@@ -127,6 +127,8 @@ fn sample_input() -> ServerStartupInput {
         kv_group_size: mlxcel_core::cache::DEFAULT_KV_GROUP_SIZE,
         kv_quant_scheme: None,
         kv_skip_last_layer: true,
+        // Issue #603: max KV cache size (0 = unbounded, the default).
+        max_kv_size: 0,
     }
 }
 
@@ -1259,4 +1261,99 @@ fn kv_skip_last_layer_both_unparseable_keeps_cli_default() {
         value,
         "value must remain at CLI default when all env vars are unparseable"
     );
+}
+
+// ── Issue #603 H1: `--max-kv-size` validation ───────────────────────────────
+
+#[test]
+fn resolve_max_kv_size_zero_is_disabled() {
+    assert_eq!(resolve_max_kv_size(0), Ok(None));
+}
+
+#[test]
+fn resolve_max_kv_size_accepts_default_min() {
+    assert_eq!(
+        resolve_max_kv_size(MAX_KV_SIZE_MIN),
+        Ok(Some(MAX_KV_SIZE_MIN))
+    );
+}
+
+#[test]
+fn resolve_max_kv_size_accepts_typical_value() {
+    assert_eq!(resolve_max_kv_size(4096), Ok(Some(4096)));
+}
+
+#[test]
+fn resolve_max_kv_size_accepts_i32_max() {
+    let max = i32::MAX as usize;
+    assert_eq!(resolve_max_kv_size(max), Ok(Some(max)));
+}
+
+#[test]
+fn resolve_max_kv_size_rejects_below_min() {
+    let err = resolve_max_kv_size(MAX_KV_SIZE_MIN - 1).expect_err("must reject");
+    assert!(
+        err.contains("below the minimum"),
+        "error must mention the minimum bound: got {err:?}"
+    );
+    // The smallest valid non-zero value is exactly `MAX_KV_SIZE_MIN`.
+    let err = resolve_max_kv_size(1).expect_err("must reject");
+    assert!(err.contains("below the minimum"));
+}
+
+#[test]
+fn resolve_max_kv_size_rejects_above_i32_max() {
+    let too_big = (i32::MAX as usize) + 1;
+    let err = resolve_max_kv_size(too_big).expect_err("must reject");
+    assert!(
+        err.contains("i32::MAX"),
+        "error must mention the i32 overflow: got {err:?}"
+    );
+}
+
+#[test]
+fn into_startup_config_rejects_overflowing_max_kv_size() {
+    let mut input = sample_input();
+    input.max_kv_size = (i32::MAX as usize) + 1;
+    let err = input
+        .into_startup_config()
+        .expect_err("overflowing --max-kv-size must be rejected at startup");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--max-kv-size"),
+        "error must mention the flag name: got {msg:?}"
+    );
+}
+
+#[test]
+fn into_startup_config_rejects_below_min_max_kv_size() {
+    let mut input = sample_input();
+    // A non-zero value below the minimum is rejected (`0` is the documented
+    // disabled sentinel and must keep being accepted).
+    input.max_kv_size = 32;
+    let err = input
+        .into_startup_config()
+        .expect_err("--max-kv-size below the minimum must be rejected at startup");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("--max-kv-size") && msg.contains("minimum"),
+        "error must explain the floor: got {msg:?}"
+    );
+}
+
+#[test]
+fn into_startup_config_accepts_zero_and_typical_max_kv_size() {
+    // `0` lowers to `None` (disabled) and must not produce an error.
+    let mut input = sample_input();
+    input.max_kv_size = 0;
+    let cfg = input.into_startup_config().expect("zero must be accepted");
+    assert!(cfg.max_kv_size.is_none());
+
+    // A typical non-zero value round-trips through `Option<usize>`.
+    let mut input = sample_input();
+    input.max_kv_size = 4096;
+    let cfg = input
+        .into_startup_config()
+        .expect("typical value must be accepted");
+    assert_eq!(cfg.max_kv_size, Some(4096));
 }

@@ -214,6 +214,8 @@ impl ModelProvider {
                 prompt_cache_store,
                 config.kv_cache_mode,
                 config.batch_kv_quant,
+                // Issue #603: forward the --max-kv-size cap to the scheduler.
+                config.max_kv_size,
                 batch_metrics,
                 batch_observability,
             )?;
@@ -355,6 +357,7 @@ impl ModelProvider {
             None,
             mlxcel_core::cache::KVCacheMode::Fp16,
             mlxcel_core::cache::BatchKvQuantConfig::default(),
+            None, // max_kv_size: unbounded (issue #603)
             batch_metrics,
             batch_observability,
         )
@@ -384,6 +387,9 @@ impl ModelProvider {
         prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
         kv_cache_mode: mlxcel_core::cache::KVCacheMode,
         batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
+        // Issue #603: maximum KV cache size for plain (non-sliding) caches.
+        // `None` preserves the legacy unbounded behaviour.
+        max_kv_size: Option<usize>,
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
@@ -416,6 +422,8 @@ impl ModelProvider {
             prompt_cache: prompt_cache_store.clone(),
             kv_cache_mode,
             batch_kv_quant,
+            // Issue #603: cap plain KVCache growth when configured.
+            max_kv_size,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -486,6 +494,7 @@ impl ModelProvider {
             prompt_cache: None,
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
+            max_kv_size: None, // issue #603: unbounded in minimal test path
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

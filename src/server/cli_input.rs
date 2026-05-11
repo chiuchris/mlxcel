@@ -314,6 +314,26 @@ pub struct ServerStartupInput {
     /// issue #545 acceptance criterion). Set to `false` to opt out
     /// for benchmarking.
     pub kv_skip_last_layer: bool,
+
+    // Issue #603: maximum KV cache size for plain (non-sliding) caches.
+    //
+    // Mirrors upstream mlx-lm's `--max-kv-size` flag on `BatchGenerator`.
+    // `0` (the default) preserves the legacy unbounded behaviour. Any
+    // value `> 0` causes the scheduler to cap each plain `KVCache`
+    // sequence's **live window** (`offset - live_start`) to that many
+    // tokens — the scheduler advances `KVCache::live_start` rather than
+    // decrementing `cache.offset`, so RoPE relative positions stay
+    // correct after the cap engages (see [`KVCache::trim_front`] for the
+    // position invariant). Sliding-window models that build their own
+    // `RotatingKVCache(window)` are unaffected. Also accepts
+    // `LLAMA_ARG_MAX_KV_SIZE`.
+    //
+    // H1 fix: values are validated by [`resolve_max_kv_size`] before
+    // being lowered into the semantic `Option<usize>` that downstream
+    // code consumes. Accepted range: `0` (disabled) or
+    // `[MAX_KV_SIZE_MIN, i32::MAX]`.
+    /// `--max-kv-size` value (`0` = disabled, the default).
+    pub max_kv_size: usize,
 }
 
 impl ServerStartupInput {
@@ -387,6 +407,18 @@ impl ServerStartupInput {
             self.kv_skip_last_layer,
         )
         .map_err(|e| anyhow::anyhow!("batch KV cache quant error: {e}"))?;
+
+        // Issue #603 H1: validate `--max-kv-size` bounds before we lower
+        // the raw `usize` into the semantic `Option<usize>` downstream.
+        //
+        // The scheduler casts this value to `i32` when computing
+        // `cache.offset - max_kv_size as i32` (per-layer trim arithmetic),
+        // and the underlying MLX FFI uses `i32` shapes for every cache
+        // slice. A value that does not round-trip through `i32` would
+        // silently overflow into a negative slice bound and corrupt the
+        // KV cache on every decode step.
+        let resolved_max_kv_size = resolve_max_kv_size(self.max_kv_size)
+            .map_err(|e| anyhow::anyhow!("--max-kv-size: {e}"))?;
 
         Ok(ServerStartupConfig {
             model_path: self.model_path,
@@ -467,9 +499,61 @@ impl ServerStartupInput {
             prompt_cache,
             kv_cache_mode,
             batch_kv_quant,
+            // Issue #603: lower the raw `usize` (0 = disabled) into a
+            // semantic `Option<usize>` after `resolve_max_kv_size` has
+            // validated upper and lower bounds (H1 fix).
+            max_kv_size: resolved_max_kv_size,
         })
     }
 }
+
+/// Issue #603 H1: validate `--max-kv-size` (and `LLAMA_ARG_MAX_KV_SIZE`)
+/// against the operational limits enforced by the scheduler.
+///
+/// Returns:
+/// - `Ok(None)` when the input is `0` (the documented "disabled" sentinel).
+/// - `Ok(Some(n))` when `MAX_KV_SIZE_MIN <= n <= i32::MAX as usize`.
+/// - `Err(...)` otherwise. The error string carries the offending value
+///   and the violated bound; `into_startup_config` wraps it in an
+///   `anyhow::Error` that the binary surfaces as an exit code rather than
+///   silently coercing into a degenerate config.
+///
+/// Why the bounds:
+/// - **Upper bound (`i32::MAX as usize`)**: the scheduler computes
+///   `cache.offset - max_kv_size as i32` and the MLX FFI uses `i32` for
+///   every shape, slice, and slot index. A value above `i32::MAX` would
+///   wrap into a negative slice bound and corrupt every subsequent cache
+///   write.
+/// - **Lower bound (`MAX_KV_SIZE_MIN`, 64)**: caps below the prefill
+///   step granularity (`KVCache::step` = 256) cause the cache to trim
+///   every decode step, which both wastes Metal kernel launches and is
+///   never what the operator wanted. 64 is the smallest size that
+///   meaningfully isolates the live window without thrashing.
+pub fn resolve_max_kv_size(raw: usize) -> Result<Option<usize>, String> {
+    if raw == 0 {
+        return Ok(None);
+    }
+    if raw < MAX_KV_SIZE_MIN {
+        return Err(format!(
+            "value {raw} is below the minimum supported size ({MAX_KV_SIZE_MIN}); \
+             use `--max-kv-size 0` to disable the cap or pick a value \
+             that gives the scheduler a usable live window"
+        ));
+    }
+    if i32::try_from(raw).is_err() {
+        return Err(format!(
+            "value {raw} exceeds i32::MAX ({}); the MLX FFI uses i32 for \
+             cache slice shapes so larger values would silently overflow",
+            i32::MAX
+        ));
+    }
+    Ok(Some(raw))
+}
+
+/// Minimum accepted `--max-kv-size`. See [`resolve_max_kv_size`] for the
+/// rationale. Exposed publicly so unit tests / downstream callers can
+/// reference the canonical threshold instead of hard-coding `64`.
+pub const MAX_KV_SIZE_MIN: usize = 64;
 
 // ── KV cache type split flags ────────────────────────────────────────────────
 //

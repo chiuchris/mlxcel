@@ -193,6 +193,10 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         kv_group_size: args.batch_quant.kv_group_size,
         kv_quant_scheme: args.batch_quant.kv_quant_scheme,
         kv_skip_last_layer: args.batch_quant.kv_skip_last_layer,
+        // Issue #603: maximum KV cache size for plain (non-sliding) caches.
+        // clap reads `LLAMA_ARG_MAX_KV_SIZE` directly via the `env = ...`
+        // attribute on the flag, so no separate env-fallback helper is needed.
+        max_kv_size: args.max_kv_size,
     })
 }
 

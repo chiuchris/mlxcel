@@ -457,15 +457,20 @@ impl Gemma3nAttention {
         // Compute KV (or get from cache for KV-shared layers)
         let (keys, values) = if self.is_kv_shared_layer {
             // For KV-shared layers, return slice view of filled portion only.
-            // cache.keys is a pre-allocated buffer; we must slice to cache.offset
-            // to avoid shape mismatch with the attention mask.
+            // cache.keys is a pre-allocated buffer; we must slice to the live
+            // window length (`live_len() = offset - live_start`) — NOT the
+            // monotonic `offset` — so this stays correct when issue #603's
+            // `--max-kv-size` trim_front advances `live_start`. With no trim
+            // (`live_start == 0`) this is bit-identical to slicing at
+            // `cache.offset`.
+            let live_len = cache.live_len();
             let k = cache.keys.as_ref().unwrap();
             let v = cache.values.as_ref().unwrap();
             let ks = mlxcel_core::array_shape(k);
             let vs = mlxcel_core::array_shape(v);
             (
-                mlxcel_core::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], cache.offset, ks[3]]),
-                mlxcel_core::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], cache.offset, vs[3]]),
+                mlxcel_core::slice(k, &[0, 0, 0, 0], &[ks[0], ks[1], live_len, ks[3]]),
+                mlxcel_core::slice(v, &[0, 0, 0, 0], &[vs[0], vs[1], live_len, vs[3]]),
             )
         } else {
             self.compute_kv(x, b, l, cache_offset, cache)

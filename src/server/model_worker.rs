@@ -93,6 +93,14 @@ pub(crate) struct WorkerSchedulerConfig {
     /// Defaults to a disabled config so existing deployments stay
     /// bit-exact.
     pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
+    /// Issue #603: maximum KV cache size for plain (non-sliding) caches.
+    ///
+    /// When `Some(N)`, the batch scheduler caps each per-sequence plain
+    /// `KVCache` to `N` tokens by trimming the oldest entries once
+    /// `offset > N`. Sliding-window models keep their model-specific
+    /// window and bypass this cap. `None` (the default) preserves the
+    /// legacy unbounded behaviour.
+    pub max_kv_size: Option<usize>,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -275,7 +283,9 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
         .with_prompt_cache(sched_config.prompt_cache)
         .with_kv_cache_mode(sched_config.kv_cache_mode)
-        .with_batch_kv_quant(sched_config.batch_kv_quant);
+        .with_batch_kv_quant(sched_config.batch_kv_quant)
+        // Issue #603: cap plain KVCache growth to --max-kv-size when set.
+        .with_max_kv_size(sched_config.max_kv_size);
         scheduler.run();
     })
 }

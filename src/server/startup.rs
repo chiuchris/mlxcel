@@ -263,6 +263,14 @@ pub struct ServerStartupConfig {
     /// stays at FP16 even when the nominal mode is quantized — preserving
     /// quality on deep models such as gemma-4-31b.
     pub batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
+
+    /// Issue #603: maximum KV cache size for plain (non-sliding) KVCache
+    /// instances. `None` preserves the legacy unbounded behaviour.
+    ///
+    /// Resolved from `--max-kv-size` / `LLAMA_ARG_MAX_KV_SIZE`. See the
+    /// corresponding field on [`crate::server::ServerConfig`] for full
+    /// semantics.
+    pub max_kv_size: Option<usize>,
 }
 
 impl Default for ServerStartupConfig {
@@ -346,6 +354,7 @@ impl Default for ServerStartupConfig {
             prompt_cache: super::prompt_cache::PromptCacheConfig::default(),
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
+            max_kv_size: None,
         }
     }
 }
@@ -613,6 +622,10 @@ pub(super) fn build_server_config(
         // the continuous-batching scheduler can apply per-layer modes
         // (with the last-layer skip) at sequence allocation time.
         batch_kv_quant: startup.batch_kv_quant,
+        // Issue #603: forward the resolved `--max-kv-size` so the scheduler
+        // can apply a head-trim policy to plain `KVCache` instances. `None`
+        // disables the cap and preserves the legacy unbounded behaviour.
+        max_kv_size: startup.max_kv_size,
     }
 }
 
