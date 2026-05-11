@@ -27,6 +27,7 @@ fn sample_args() -> crate::ServeArgs {
         api_key_file: Some(PathBuf::from("api.key")),
         n_parallel: 3,
         ctx_size: 8192,
+        max_kv_size: 0,
         n_predict: 128,
         draft_model: Some(PathBuf::from("models/draft")),
         draft_max: 4,
