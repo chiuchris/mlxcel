@@ -178,6 +178,169 @@ impl RadixTrie {
         }
         Some(m)
     }
+
+    /// Remove and return all entries stored at strict-prefix depths along
+    /// `tokens`. "Strict prefix" means depth in `[0, tokens.len())` — the
+    /// exact-match node at depth `tokens.len()` is **not** touched.
+    ///
+    /// This mirrors Python's `PromptTrie.pop_prefixes` (upstream PR #1078).
+    /// The upstream fix changed the loop from `range(len(tokens) - 1)` to
+    /// `enumerate(tokens)`, extending the walk so the IMMEDIATE-prefix node
+    /// (depth `tokens.len() - 1`) is also collected. The old code stopped
+    /// one step short, leaking that entry and causing stale state to surface
+    /// on subsequent requests with overlapping prefixes.
+    ///
+    /// In the path-compressed radix trie nodes live at cumulative edge-length
+    /// boundaries, not at individual token positions, so we walk iteratively
+    /// through edge spans and drain every node whose depth D < `tokens.len()`.
+    ///
+    /// # Implementation: two-pass iterative (stack-overflow safe)
+    ///
+    /// A recursive implementation stack-overflows on Tokio workers (2 MB stack)
+    /// when an adversarial token chain `[t₀,X₀], [t₀,t₁,X₁], …` defeats path
+    /// compression and creates one trie node per token (~10–20k tokens suffice).
+    ///
+    /// **Pass 1 — descent + drain:** Walk iteratively via `&mut self` re-binding.
+    /// At each strict-prefix node, drain `entries` into the result vec.  Track
+    /// per-level drain counts in a `Vec<usize>`.
+    ///
+    /// **Pass 2 — subtree_count repair:** Compute suffix sums over the per-level
+    /// drain counts.  Walk the same path top-down, subtracting `suffix_sum[level]`
+    /// from each node's `subtree_count`.
+    ///
+    /// Returns the drained entries in traversal order.
+    // Used by: PromptCacheStore (store.rs) — wired up when the store gains
+    // trimmable-cache awareness. Suppressed until then to keep clippy clean.
+    #[allow(dead_code)]
+    pub(super) fn pop_prefixes(&mut self, tokens: &[i32]) -> Vec<DigestAndLen> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+
+        // ------------------------------------------------------------------ //
+        // Pass 1: iterative descent, draining strict-prefix nodes.           //
+        //                                                                     //
+        // We track how many entries we drain at each level so Pass 2 can     //
+        // repair `subtree_count` without a second recursive walk.             //
+        //                                                                     //
+        // `drained_per_level[i]` = number of entries drained from the node   //
+        // at path position i (0 = root).                                      //
+        // `edge_lengths[i]` = edge length that was consumed to reach level i  //
+        // from level i-1 (0 for root because root has no incoming edge).      //
+        // ------------------------------------------------------------------ //
+        let mut collected: Vec<DigestAndLen> = Vec::new();
+        let mut drained_per_level: Vec<usize> = Vec::new();
+        let mut edge_lengths: Vec<usize> = Vec::new(); // edge consumed to reach each level
+
+        {
+            let mut remaining: &[i32] = tokens;
+            // SAFETY: we use raw pointers to navigate &mut TrieNode without
+            // triggering the borrow-checker's "aliased mutable reference" rule.
+            // At any point only one mutable reference (`node`) is live; we never
+            // alias it with another live mutable borrow.
+            let mut node: *mut TrieNode = &mut self.root;
+
+            loop {
+                // SAFETY: `node` always points to a valid TrieNode owned by
+                // `self`, reachable via the path we just walked.
+                let node_ref = unsafe { &mut *node };
+
+                // Drain strict-prefix node (remaining non-empty means we have
+                // more tokens to match, so this node is at depth < tokens.len()).
+                let n = if !remaining.is_empty() {
+                    let n = node_ref.entries.len();
+                    if n > 0 {
+                        collected.append(&mut node_ref.entries);
+                    }
+                    n
+                } else {
+                    // `remaining` is empty: this is the exact-match node — do NOT drain.
+                    0
+                };
+                drained_per_level.push(n);
+
+                if remaining.is_empty() {
+                    // Reached the exact-match depth; stop.
+                    break;
+                }
+
+                let next_tok = remaining[0];
+                // Validate the next edge: it must exist and its label must
+                // match the front of `remaining`.
+                let edge_len = match node_ref.children.get(&next_tok) {
+                    Some(child) => {
+                        let elen = child.edge.len();
+                        if remaining.len() < elen || remaining[..elen] != child.edge[..] {
+                            // Edge label doesn't match — walk ends here.
+                            break;
+                        }
+                        elen
+                    }
+                    None => break,
+                };
+
+                // Edge matches: advance.
+                remaining = &remaining[edge_len..];
+                edge_lengths.push(edge_len);
+                node = node_ref
+                    .children
+                    .get_mut(&next_tok)
+                    .expect("path validated above")
+                    .as_mut() as *mut TrieNode;
+            }
+        }
+
+        // Nothing was drained — bail early.
+        if drained_per_level.iter().all(|&d| d == 0) {
+            return collected;
+        }
+
+        // ------------------------------------------------------------------ //
+        // Pass 2: repair subtree_count along the same path.                  //
+        //                                                                     //
+        // suffix_sum[i] = total entries drained at levels i..total.          //
+        // Node at level i must have its subtree_count reduced by             //
+        // suffix_sum[i] (it lost all entries drained at or below its level). //
+        // ------------------------------------------------------------------ //
+        let total = drained_per_level.len();
+        let mut suffix_sum = vec![0usize; total + 1];
+        for i in (0..total).rev() {
+            suffix_sum[i] = suffix_sum[i + 1] + drained_per_level[i];
+        }
+
+        // Walk the path again top-down, updating subtree_count.
+        {
+            let mut remaining: &[i32] = tokens;
+            let mut node: *mut TrieNode = &mut self.root;
+
+            for (level, &edge_len) in std::iter::once(&0usize)
+                .chain(edge_lengths.iter())
+                .enumerate()
+            {
+                // SAFETY: same invariant as Pass 1 — single live mutable ref.
+                let node_ref = unsafe { &mut *node };
+                node_ref.subtree_count = node_ref.subtree_count.saturating_sub(suffix_sum[level]);
+
+                if level + 1 == total {
+                    break;
+                }
+
+                // Advance: skip `edge_len` tokens consumed for THIS level's
+                // incoming edge (0 for root), then look up the next child.
+                if level > 0 {
+                    remaining = &remaining[edge_len..];
+                }
+                let next_tok = remaining[0];
+                node = node_ref
+                    .children
+                    .get_mut(&next_tok)
+                    .expect("path persists from Pass 1")
+                    .as_mut() as *mut TrieNode;
+            }
+        }
+
+        collected
+    }
 }
 
 /// Successful longest-prefix walk result.

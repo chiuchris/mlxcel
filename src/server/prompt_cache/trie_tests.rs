@@ -187,3 +187,207 @@ fn deep_insert_scales_linearly_in_prefix_len() {
     assert!(t.remove(&tokens, digest(1)));
     assert_eq!(t.len(), 0);
 }
+
+// ---------------------------------------------------------------------------
+// pop_prefixes tests — ported from upstream mlx-lm PR #1078 regression suite
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pop_prefixes_empty_tokens_is_noop() {
+    // pop_prefixes([]) with entries present: nothing should be removed
+    // because there are no strict-prefix positions for the empty sequence.
+    let mut t = RadixTrie::new();
+    t.insert(&[], digest(1));
+    let removed = t.pop_prefixes(&[]);
+    assert!(
+        removed.is_empty(),
+        "pop_prefixes([]) must not drain anything"
+    );
+    assert_eq!(t.len(), 1, "root entry must remain after noop");
+}
+
+#[test]
+fn pop_prefixes_no_matching_prefix_entries() {
+    // Trie has [1,2,3]. pop_prefixes([1,2,3,4]) should return nothing because
+    // there are no entries at strict-prefix depths (0, 1, 2, 3) — only at
+    // depth 3, which is the exact-match depth for [1,2,3] in the INNER sense.
+    // Wait: [1,2,3] stored at depth 3; tokens=[1,2,3,4] has exact-match at 4.
+    // Depth 3 < 4, so [1,2,3] IS a strict prefix and should be collected.
+    let mut t = RadixTrie::new();
+    t.insert(&[1, 2, 3], digest(1));
+    let removed = t.pop_prefixes(&[1, 2, 3, 4]);
+    // [1,2,3] is a strict prefix of [1,2,3,4] — it should be removed.
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].digest, digest(1));
+    assert_eq!(t.len(), 0, "prefix entry must be gone");
+    // [1,2,3,4] path lookup should now miss.
+    assert!(t.find_longest_prefix(&[1, 2, 3, 4], 0).is_none());
+}
+
+#[test]
+fn pop_prefixes_exact_match_is_not_removed() {
+    // Upstream regression: pop_prefixes([1,2,3]) on a trie that has exactly
+    // [1,2,3] should leave the entry intact — the exact-match node must NOT
+    // be drained.
+    let mut t = RadixTrie::new();
+    t.insert(&[1, 2, 3], digest(1));
+    let removed = t.pop_prefixes(&[1, 2, 3]);
+    assert!(removed.is_empty(), "exact-match must not be drained");
+    assert_eq!(t.len(), 1, "entry must remain");
+}
+
+#[test]
+fn pop_prefixes_immediate_prefix_is_removed() {
+    // Core regression from upstream PR #1078: sequence A = [1, 2] is an
+    // IMMEDIATE prefix of B = [1, 2, 3].  pop_prefixes([1,2,3]) must collect
+    // A's entry — the old off-by-one `range(len-1)` stopped one step short
+    // and left A alive, which leaked stale cache state.
+    let mut t = RadixTrie::new();
+    t.insert(&[1, 2], digest(1)); // A — immediate prefix of B
+    t.insert(&[1, 2, 3], digest(2)); // B — the longer entry
+    assert_eq!(t.len(), 2);
+
+    let removed = t.pop_prefixes(&[1, 2, 3]);
+
+    // A must be evicted (immediate prefix at depth 2, strict prefix of [1,2,3]).
+    assert_eq!(removed.len(), 1, "immediate prefix must be collected");
+    assert_eq!(
+        removed[0].digest,
+        digest(1),
+        "digest(1) is the prefix entry"
+    );
+    assert_eq!(removed[0].token_len, 2);
+
+    // B (the exact-match entry) must NOT be removed.
+    assert_eq!(t.len(), 1, "exact-match entry must survive");
+    let m = t
+        .find_longest_prefix(&[1, 2, 3], 0)
+        .expect("B must still be reachable");
+    let mut found = Vec::new();
+    m.for_each_candidate(|d| found.push(d.digest));
+    assert!(
+        found.contains(&digest(2)),
+        "digest(2) must still be in trie"
+    );
+    assert!(!found.contains(&digest(1)), "digest(1) must be gone");
+}
+
+#[test]
+fn pop_prefixes_deeper_prefix_also_removed() {
+    // Three entries: [1] (depth 1), [1,2] (depth 2), [1,2,3] (depth 3).
+    // pop_prefixes([1,2,3]) must collect [1] and [1,2] but leave [1,2,3].
+    let mut t = RadixTrie::new();
+    t.insert(&[1], digest(1));
+    t.insert(&[1, 2], digest(2));
+    t.insert(&[1, 2, 3], digest(3));
+    assert_eq!(t.len(), 3);
+
+    let removed = t.pop_prefixes(&[1, 2, 3]);
+
+    let mut removed_digests: Vec<_> = removed.iter().map(|d| d.digest).collect();
+    removed_digests.sort_by_key(|d| d.0);
+    assert_eq!(removed_digests, vec![digest(1), digest(2)]);
+    assert_eq!(t.len(), 1);
+
+    // [1,2,3] must survive.
+    let m = t
+        .find_longest_prefix(&[1, 2, 3], 0)
+        .expect("exact match must survive");
+    let mut found = Vec::new();
+    m.for_each_candidate(|d| found.push(d.digest));
+    assert!(found.contains(&digest(3)));
+}
+
+#[test]
+fn pop_prefixes_sibling_branch_untouched() {
+    // A=[1,2] and C=[1,3] share root→[1] prefix. Inserting B=[1,2,3] and
+    // calling pop_prefixes([1,2,3]) should remove A but leave C intact.
+    let mut t = RadixTrie::new();
+    t.insert(&[1, 2], digest(1)); // A — immediate prefix of B
+    t.insert(&[1, 3], digest(2)); // C — sibling branch
+    t.insert(&[1, 2, 3], digest(3)); // B — the longer entry
+    assert_eq!(t.len(), 3);
+
+    let removed = t.pop_prefixes(&[1, 2, 3]);
+
+    assert_eq!(removed.len(), 1);
+    assert_eq!(removed[0].digest, digest(1));
+
+    // C must still be reachable.
+    assert_eq!(t.len(), 2);
+    let m = t
+        .find_longest_prefix(&[1, 3], 0)
+        .expect("sibling C must survive");
+    let mut found = Vec::new();
+    m.for_each_candidate(|d| found.push(d.digest));
+    assert!(found.contains(&digest(2)));
+}
+
+#[test]
+fn pop_prefixes_subtree_count_consistent_after_drain() {
+    // Verify that subtree_count on every node is consistent after pop_prefixes.
+    let mut t = RadixTrie::new();
+    t.insert(&[1, 2], digest(1));
+    t.insert(&[1, 2, 3], digest(2));
+    t.pop_prefixes(&[1, 2, 3]);
+    // Only digest(2) should remain.
+    assert_eq!(t.len(), 1);
+    // The trie's internal count must match: find_longest_prefix uses
+    // subtree_count as a short-circuit. A wrong count could cause a miss.
+    let m = t
+        .find_longest_prefix(&[1, 2, 3], 0)
+        .expect("must be findable");
+    assert_eq!(m.depth(), 3);
+}
+
+#[test]
+fn pop_prefixes_deep_branching_chain_does_not_overflow() {
+    // Regression test for stack-overflow DoS: an adversarial pattern
+    // `[t₀,X₀], [t₀,t₁,X₁], [t₀,t₁,t₂,X₂], …` defeats path compression
+    // because each sibling branch is unique, so the trie builds one node per
+    // token along the chain. The old recursive `pop_prefixes_from` would
+    // stack-overflow a Tokio worker (2 MB stack). The iterative two-pass
+    // implementation must handle N=16_384 without overflow.
+    //
+    // Strategy: build the trie on a large-stack thread (inserts are still
+    // recursive in `insert_into`), then ship the trie to a 2 MB thread —
+    // matching a Tokio worker — and call `pop_prefixes` there. If
+    // `pop_prefixes` is recursive it will overflow; if iterative it will not.
+    const N: i32 = 16_384;
+
+    // Phase 1: build the adversarial trie on a 32 MB thread so insert_into
+    // (which is still recursive) has enough headroom.
+    let trie = std::thread::Builder::new()
+        .stack_size(32 * 1024 * 1024) // 32 MB for recursive inserts
+        .spawn(move || {
+            let mut t = RadixTrie::new();
+            for d in 1..=N {
+                let chain: Vec<i32> = (0..d).collect();
+                t.insert(&chain, digest((d & 0xff) as u8));
+                // Sibling at this depth: diverges at the last token so path
+                // compression cannot collapse the chain into fewer nodes.
+                let mut sibling = chain.clone();
+                *sibling.last_mut().unwrap() = -(d + N); // guaranteed distinct
+                t.insert(&sibling, digest(((d.wrapping_neg()) & 0xff) as u8));
+            }
+            t
+        })
+        .expect("spawn failed")
+        .join()
+        .expect("build thread panicked");
+
+    // Phase 2: run pop_prefixes on a 2 MB stack (Tokio worker size).
+    // The old recursive pop_prefixes_from would overflow here; the new
+    // iterative implementation must complete successfully.
+    let chain: Vec<i32> = (0..N).collect();
+    let result = std::thread::Builder::new()
+        .stack_size(2 * 1024 * 1024) // 2 MB — matches Tokio worker default
+        .spawn(move || {
+            let mut t = trie;
+            let drained = t.pop_prefixes(&chain);
+            assert!(!drained.is_empty(), "must have drained strict prefixes");
+        })
+        .expect("spawn failed")
+        .join();
+    result.expect("pop_prefixes overflowed the 2 MB Tokio-worker-equivalent stack");
+}
