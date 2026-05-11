@@ -119,6 +119,22 @@ pub(super) struct TrieNode {
     children: HashMap<i32, Box<TrieNode>>,
 }
 
+impl Drop for TrieNode {
+    fn drop(&mut self) {
+        // Avoid recursive `Box<TrieNode>` drop on adversarially deep prompt
+        // tries. `pop_prefixes` itself is iterative, but after a deep trie is
+        // drained (or simply falls out of scope) Rust's default destructor
+        // would still recurse through `children` one node at a time and can
+        // overflow Tokio's ~2 MiB worker stacks. Drain descendants onto an
+        // explicit heap stack first; each boxed node then drops with an empty
+        // child map.
+        let mut stack: Vec<Box<TrieNode>> = self.children.drain().map(|(_, child)| child).collect();
+        while let Some(mut node) = stack.pop() {
+            stack.extend(node.children.drain().map(|(_, child)| child));
+        }
+    }
+}
+
 /// Root of the per-bucket radix trie.
 #[derive(Debug, Default)]
 pub(super) struct RadixTrie {

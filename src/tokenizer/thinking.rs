@@ -39,10 +39,10 @@
 //! | `wrapper._tool_call_start_tokens` | [`ThinkingMarkers::tool_call_start_tokens`]   |
 //! | `wrapper._tool_call_end_tokens`   | [`ThinkingMarkers::tool_call_end_tokens`]     |
 //! | `wrapper.has_thinking`            | [`ThinkingMarkers::has_thinking`]             |
-//! | `wrapper.find_think_start`        | [`find_subseq`] with `markers.think_start_tokens` |
-//! | `wrapper.rfind_think_start`       | [`rfind_subseq`] with `markers.think_start_tokens` |
-//! | `wrapper.find_think_end`          | [`find_subseq`] with `markers.think_end_tokens`   |
-//! | `wrapper.rfind_think_end`         | [`rfind_subseq`] with `markers.think_end_tokens`   |
+//! | `wrapper.find_think_start`        | [`ThinkingMarkers::find_think_start`]         |
+//! | `wrapper.rfind_think_start`       | [`ThinkingMarkers::rfind_think_start`]        |
+//! | `wrapper.find_think_end`          | [`ThinkingMarkers::find_think_end`]           |
+//! | `wrapper.rfind_think_end`         | [`ThinkingMarkers::rfind_think_end`]          |
 //!
 //! Used by: `tokenizer::MlxcelTokenizer`, `server::chat_template`,
 //! `server::thinking_budget`, `server::tool_calls::stream_filter`.
@@ -105,6 +105,120 @@ impl ThinkingMarkers {
     pub fn has_tool_calling(&self) -> bool {
         self.tool_call_start.is_some()
     }
+
+    /// Find the first occurrence of the resolved think-start token sequence.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.find_think_start`. Returns `None`
+    /// when this tokenizer has no recognized think-start marker.
+    pub fn find_think_start(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        find_marker(tokens, self.think_start_tokens.as_deref(), start, end)
+    }
+
+    /// Find the last occurrence of the resolved think-start token sequence.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.rfind_think_start`. Returns `None`
+    /// when this tokenizer has no recognized think-start marker.
+    pub fn rfind_think_start(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        rfind_marker(tokens, self.think_start_tokens.as_deref(), start, end)
+    }
+
+    /// Find the first occurrence of the resolved think-end token sequence.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.find_think_end`. Returns `None`
+    /// when this tokenizer has no recognized think-end marker.
+    pub fn find_think_end(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        find_marker(tokens, self.think_end_tokens.as_deref(), start, end)
+    }
+
+    /// Find the last occurrence of the resolved think-end token sequence.
+    ///
+    /// Mirrors upstream `TokenizerWrapper.rfind_think_end`. Returns `None`
+    /// when this tokenizer has no recognized think-end marker.
+    pub fn rfind_think_end(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        rfind_marker(tokens, self.think_end_tokens.as_deref(), start, end)
+    }
+
+    /// Find the first occurrence of the resolved tool-call start token
+    /// sequence. Returns `None` when no token sequence is registered.
+    pub fn find_tool_call_start(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        find_marker(tokens, self.tool_call_start_tokens.as_deref(), start, end)
+    }
+
+    /// Find the last occurrence of the resolved tool-call start token
+    /// sequence. Returns `None` when no token sequence is registered.
+    pub fn rfind_tool_call_start(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        rfind_marker(tokens, self.tool_call_start_tokens.as_deref(), start, end)
+    }
+
+    /// Find the first occurrence of the resolved tool-call end token
+    /// sequence. Returns `None` when no token sequence is registered.
+    pub fn find_tool_call_end(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        find_marker(tokens, self.tool_call_end_tokens.as_deref(), start, end)
+    }
+
+    /// Find the last occurrence of the resolved tool-call end token
+    /// sequence. Returns `None` when no token sequence is registered.
+    pub fn rfind_tool_call_end(
+        &self,
+        tokens: &[u32],
+        start: Option<usize>,
+        end: Option<usize>,
+    ) -> Option<usize> {
+        rfind_marker(tokens, self.tool_call_end_tokens.as_deref(), start, end)
+    }
+}
+
+fn find_marker(
+    haystack: &[u32],
+    needle: Option<&[u32]>,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Option<usize> {
+    needle.and_then(|needle| find_subseq(haystack, needle, start, end))
+}
+
+fn rfind_marker(
+    haystack: &[u32],
+    needle: Option<&[u32]>,
+    start: Option<usize>,
+    end: Option<usize>,
+) -> Option<usize> {
+    needle.and_then(|needle| rfind_subseq(haystack, needle, start, end))
 }
 
 /// Find the first index `i` in `haystack` where `needle` matches as a
@@ -300,5 +414,42 @@ mod tests {
         assert!(!m.has_tool_calling());
         m.tool_call_start = Some("<tool_call>".to_string());
         assert!(m.has_tool_calling());
+    }
+
+    #[test]
+    fn marker_find_methods_delegate_to_registered_sequences() {
+        let m = ThinkingMarkers {
+            think_start_tokens: Some(vec![10, 11]),
+            think_end_tokens: Some(vec![20]),
+            tool_call_start_tokens: Some(vec![30, 31]),
+            tool_call_end_tokens: Some(vec![40, 41]),
+            ..ThinkingMarkers::default()
+        };
+        let hay = [0, 10, 11, 1, 20, 10, 11, 30, 31, 2, 40, 41, 30, 31];
+
+        assert_eq!(m.find_think_start(&hay, None, None), Some(1));
+        assert_eq!(m.rfind_think_start(&hay, None, None), Some(5));
+        assert_eq!(m.find_think_end(&hay, None, None), Some(4));
+        assert_eq!(m.rfind_think_end(&hay, None, None), Some(4));
+
+        assert_eq!(m.find_tool_call_start(&hay, None, None), Some(7));
+        assert_eq!(m.rfind_tool_call_start(&hay, None, None), Some(12));
+        assert_eq!(m.find_tool_call_end(&hay, None, None), Some(10));
+        assert_eq!(m.rfind_tool_call_end(&hay, None, None), Some(10));
+    }
+
+    #[test]
+    fn marker_find_methods_return_none_for_missing_sequences() {
+        let m = ThinkingMarkers::default();
+        let hay = [1, 2, 3];
+
+        assert_eq!(m.find_think_start(&hay, None, None), None);
+        assert_eq!(m.rfind_think_start(&hay, None, None), None);
+        assert_eq!(m.find_think_end(&hay, None, None), None);
+        assert_eq!(m.rfind_think_end(&hay, None, None), None);
+        assert_eq!(m.find_tool_call_start(&hay, None, None), None);
+        assert_eq!(m.rfind_tool_call_start(&hay, None, None), None);
+        assert_eq!(m.find_tool_call_end(&hay, None, None), None);
+        assert_eq!(m.rfind_tool_call_end(&hay, None, None), None);
     }
 }

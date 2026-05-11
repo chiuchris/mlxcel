@@ -4309,9 +4309,19 @@ impl BatchedAttentionMetadata {
                     "query length must be non-negative for batched attention metadata, got {query_len}"
                 ));
             }
+            // `rope_offsets` must stay on the monotonic position axis so the
+            // newly-projected Q/K rows receive the same RoPE positions they
+            // would have seen before any `--max-kv-size` trim. `kv_lens`,
+            // however, describes the **visible** KV window passed to the
+            // attention kernel. After `KVCache::trim_front` advances
+            // `live_start`, the visible prefix is `live_len()` rather than the
+            // monotonic offset. Keeping `kv_lens = offset + query_len` after a
+            // trim would make paged/dense-compatible batched attention believe
+            // the cache arrays are much longer than they actually are.
             let offset = cache.offset;
+            let live_len = cache.live_len();
             rope_offsets.push(offset);
-            kv_lens.push(offset + query_len);
+            kv_lens.push(live_len + query_len);
         }
 
         Ok(Self {
@@ -6392,6 +6402,33 @@ mod tests {
         assert_eq!(metadata.rope_offsets, vec![3]);
         assert_eq!(metadata.kv_lens, vec![4]);
         assert_eq!(metadata.len(), 1);
+        metadata.assert_consistent().unwrap();
+    }
+
+    /// Issue #603 follow-up: `rope_offsets` live on the monotonic RoPE
+    /// position axis, but `kv_lens` must describe the visible cache window
+    /// after `KVCache::trim_front` advances `live_start`.
+    #[test]
+    fn batched_metadata_uses_live_len_for_kv_lens_after_trim_front() {
+        let mut cache = KVCache::new();
+        cache.offset = 10;
+        cache.live_start = 7; // visible window is 3 tokens, not 10.
+
+        let metadata = {
+            let caches = vec![&mut cache];
+            BatchedAttentionMetadata::uniform_kv_caches(&caches, 1, 0).unwrap()
+        };
+
+        assert_eq!(
+            metadata.rope_offsets,
+            vec![10],
+            "RoPE offset must remain monotonic after trim_front"
+        );
+        assert_eq!(
+            metadata.kv_lens,
+            vec![4],
+            "visible KV length must be live_len + query_len, not offset + query_len"
+        );
         metadata.assert_consistent().unwrap();
     }
 

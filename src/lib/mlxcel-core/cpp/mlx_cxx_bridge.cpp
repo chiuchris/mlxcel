@@ -815,7 +815,15 @@ std::unique_ptr<MlxArray> rms_norm(const MlxArray& x, const MlxArray& weight, fl
     auto mean_sq = mlx::core::mean(x_sq, -1, true);
     auto norm = mlx::core::rsqrt(mlx::core::add(mean_sq, array(eps)));
     auto normalized = mlx::core::multiply(x.inner, norm);
-    return std::make_unique<MlxArray>(mlx::core::multiply(normalized, weight.inner));
+    auto out = mlx::core::multiply(normalized, weight.inner);
+    // Keep the high-level fallback dtype-compatible with MLX fast::rms_norm:
+    // scalar eps arithmetic may promote bf16/f16 inputs to fp32, but model
+    // layers expect the normalization result to stay on the activation dtype
+    // to avoid extra memory traffic and copy kernels.
+    if (out.dtype() != x.inner.dtype()) {
+        out = mlx::core::astype(out, x.inner.dtype());
+    }
+    return std::make_unique<MlxArray>(out);
 }
 
 std::unique_ptr<MlxArray> layer_norm(const MlxArray& x, const MlxArray& weight,

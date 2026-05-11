@@ -866,10 +866,10 @@ mod tests {
 
     // -- find_think_* / rfind_think_* via subseq helpers (#590) ----------
     //
-    // The `find_subseq`/`rfind_subseq` helpers are the Rust analogue of
-    // upstream's `TokenizerWrapper.find_think_start` etc. These tests
-    // verify the tokenizer-side wiring: encode a Gemma-4-shaped input,
-    // resolve the markers, then locate them inside the encoded sequence.
+    // The `ThinkingMarkers::find_*` / `rfind_*` helpers are the Rust analogue
+    // of upstream's `TokenizerWrapper.find_think_start` etc. These tests verify
+    // the tokenizer-side wiring: encode a Gemma-4-shaped input, resolve the
+    // markers, then locate them inside the encoded sequence.
 
     // -- Real Gemma 4 tokenizer integration (#[ignore]) -------------------
     //
@@ -928,7 +928,6 @@ mod tests {
         let tok = mlxcel_with_added(&["<|channel>", "<channel|>", "thought"]);
         let markers = tok.infer_thinking_markers();
         let start_seq = markers.think_start_tokens.clone().unwrap();
-        let end_seq = markers.think_end_tokens.clone().unwrap();
 
         // Encode a synthetic completion: "<|channel>thought<channel|>"
         let hf = tok.hf_tokenizer().unwrap();
@@ -939,15 +938,12 @@ mod tests {
             .to_vec();
 
         // The open-marker subsequence must appear at the start (idx 0).
-        assert_eq!(super::find_subseq(&body, &start_seq, None, None), Some(0));
+        assert_eq!(markers.find_think_start(&body, None, None), Some(0));
         // The close-marker subsequence must appear after the open marker.
-        let close_idx = super::find_subseq(&body, &end_seq, None, None).unwrap();
+        let close_idx = markers.find_think_end(&body, None, None).unwrap();
         assert!(close_idx >= start_seq.len());
         // rfind variant returns the same index when there is exactly one
         // occurrence.
-        assert_eq!(
-            super::rfind_subseq(&body, &end_seq, None, None),
-            Some(close_idx)
-        );
+        assert_eq!(markers.rfind_think_end(&body, None, None), Some(close_idx));
     }
 }

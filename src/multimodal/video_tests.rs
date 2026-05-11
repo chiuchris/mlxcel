@@ -640,8 +640,10 @@ fn load_video_source_fd_variant_matches_path_variant_frame_count() {
         }
     };
 
-    // Path-based decode (baseline).
-    let path_frames = load_video(&video_path, Some(2.0), None)
+    // Path-based decode (baseline). Use a cap above the synthetic clip's
+    // 4-second duration so this parity test exercises fd-vs-path decoding
+    // rather than the unrelated max-duration guard.
+    let path_frames = load_video(&video_path, Some(5.0), None)
         .expect("path-based load_video must succeed for synthetic video");
 
     // Fd-based decode (the issue #601 path).
@@ -649,7 +651,7 @@ fn load_video_source_fd_variant_matches_path_variant_frame_count() {
     let owned_fd = std::os::fd::OwnedFd::from(std_file);
     let canonical = std::fs::canonicalize(&video_path).expect("canonicalise");
     let source = VideoSource::from_fd(owned_fd, canonical);
-    let fd_frames = load_video_source(&source, Some(2.0), None)
+    let fd_frames = load_video_source(&source, Some(5.0), None)
         .expect("fd-based load_video_source must succeed for the same synthetic video");
 
     let _ = std::fs::remove_file(&video_path);

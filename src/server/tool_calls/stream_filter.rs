@@ -316,9 +316,19 @@ impl StreamFilter {
     /// can count how many token positions (i.e. `feed()` calls) contributed
     /// to a given byte range when a delimiter is matched.
     pub fn feed(&mut self, fragment: &str) -> FilterOutput {
+        // Empty decoded fragments do not add bytes to the delimiter buffer,
+        // but they still represent one generated token position. Do not push
+        // a zero-length entry into `fragment_lengths`: it cannot satisfy the
+        // byte-sum invariant and would keep the caller's parallel lp_data
+        // queue from draining until some later non-empty fragment arrives.
+        if fragment.is_empty() {
+            return FilterOutput {
+                consumed_positions: 1,
+                ..FilterOutput::default()
+            };
+        }
+
         // Record the number of bytes this token contributes to the buffer.
-        // An empty fragment still counts as one token position so that callers
-        // do not lose position alignment when the tokenizer emits empty strings.
         self.fragment_lengths.push_back(fragment.len());
         self.buffer.push_str(fragment);
         self.drain_buffer()
@@ -568,7 +578,15 @@ mod tests {
     #[test]
     fn empty_fragment() {
         let mut f = StreamFilter::new();
-        assert_eq!(f.feed("").content, None);
+        let out = f.feed("");
+        assert_eq!(out.content, None);
+        assert_eq!(out.reasoning, None);
+        assert_eq!(out.suppressed_positions, 0);
+        assert_eq!(
+            out.consumed_positions, 1,
+            "empty decoded text still consumes one generated token position"
+        );
+        assert_eq!(f.flush(), FilterOutput::default());
     }
 
     // -- Thinking blocks --

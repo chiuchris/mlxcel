@@ -297,7 +297,7 @@ impl SpeculativeGenerator {
         let first_token = ffi::item_i32(&first_token_arr);
         let prefill_time = prefill_start.elapsed();
 
-        if eos_tokens.contains(&first_token) || max_tokens <= 1 {
+        if eos_tokens.contains(&first_token) || max_tokens == 0 {
             let stats = Self::build_stats(
                 prompt_tokens.len(),
                 self.generated_tokens.len(),
@@ -310,6 +310,16 @@ impl SpeculativeGenerator {
         self.generated_tokens.push(first_token);
         if needs_history {
             token_history.push(first_token);
+        }
+
+        if max_tokens <= 1 {
+            let stats = Self::build_stats(
+                prompt_tokens.len(),
+                self.generated_tokens.len(),
+                prefill_time,
+                std::time::Duration::ZERO,
+            );
+            return (self.generated_tokens.clone(), stats);
         }
 
         // DECODE PHASE.
@@ -799,5 +809,66 @@ mod tests {
             "PREFILL_STEP_SIZE must match upstream mlx-lm default (512). \
              Update this test if you intentionally deviate."
         );
+    }
+
+    struct FixedLogitModel {
+        preferred_token: usize,
+        eos_tokens: Vec<i32>,
+    }
+
+    impl LanguageModel for FixedLogitModel {
+        fn forward(
+            &self,
+            input_ids: &crate::ffi::MlxArray,
+            _caches: &mut [KVCache],
+            _mask: Option<&crate::ffi::MlxArray>,
+        ) -> UniquePtr<crate::ffi::MlxArray> {
+            let shape = ffi::array_shape(input_ids);
+            let batch = shape[0] as usize;
+            let seq_len = shape[1] as usize;
+            let vocab = 4usize;
+            let mut logits = vec![-10.0f32; batch * seq_len * vocab];
+            for b in 0..batch {
+                for s in 0..seq_len {
+                    logits[(b * seq_len + s) * vocab + self.preferred_token] = 10.0;
+                }
+            }
+            ffi::from_slice_f32(&logits, &[shape[0], shape[1], vocab as i32])
+        }
+
+        fn make_caches(&self) -> Vec<KVCache> {
+            vec![KVCache::new()]
+        }
+
+        fn num_layers(&self) -> usize {
+            1
+        }
+
+        fn eos_token_ids(&self) -> Vec<i32> {
+            self.eos_tokens.clone()
+        }
+    }
+
+    #[test]
+    fn speculative_generate_max_tokens_one_emits_first_non_eos_token() {
+        let main = FixedLogitModel {
+            preferred_token: 2,
+            eos_tokens: vec![3],
+        };
+        let draft = FixedLogitModel {
+            preferred_token: 2,
+            eos_tokens: vec![3],
+        };
+        let mut generator = SpeculativeGenerator::new(main.num_layers(), draft.num_layers());
+
+        let (tokens, stats) =
+            generator.generate(&main, &draft, &[42], 1, 1, &SamplingConfig::greedy());
+
+        assert_eq!(
+            tokens,
+            vec![2],
+            "max_tokens=1 must still return the first sampled non-EOS token"
+        );
+        assert_eq!(stats.generated_tokens, 1);
     }
 }
