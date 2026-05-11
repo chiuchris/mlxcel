@@ -230,9 +230,10 @@ pub struct NemotronHConfig {
     #[serde(default)]
     pub quantization: Option<Quantization>,
 
-    /// Fallback fields for time_step_limit construction.
-    /// When time_step_limit is absent, defaults to
-    /// (time_step_min.unwrap_or(0.0), time_step_max.unwrap_or(+inf)).
+    /// Softplus initialization bounds retained for config-schema parity with
+    /// upstream `mlx_lm/models/nemotron_h.py`. They do NOT participate in the
+    /// `time_step_limit` default (which is always `(0.0, +inf)` when absent;
+    /// see upstream PR #1026 / commit `6ddfdda`).
     #[serde(default)]
     pub time_step_min: Option<f32>,
 
@@ -253,17 +254,17 @@ impl NemotronHConfig {
     }
 
     /// Post-deserialization normalization (mirrors Python __post_init__).
-    /// - Builds time_step_limit from time_step_min/max when absent.
+    /// - Defaults time_step_limit to (0.0, +inf) when absent from the config.
     /// - Normalizes layers_block_type word names to single-char hybrid_override_pattern.
     /// - Sets num_hidden_layers from pattern length.
     pub fn post_init(&mut self) -> Result<(), String> {
-        // When time_step_limit is absent from the config, default to
-        // (time_step_min.unwrap_or(0.0), time_step_max.unwrap_or(+inf)).
-        // This matches upstream mlx-lm: `if time_step_limit is None: time_step_limit = (0.0, inf)`.
+        // When time_step_limit is absent from the config, default to (0.0, +inf).
+        // This matches upstream mlx-lm PR #1026 (commit 6ddfdda):
+        //   if time_step_limit is None: time_step_limit = (0.0, float("inf"))
+        // time_step_min / time_step_max are softplus initialisation bounds used in
+        // the forward path — they are NOT the dt clamp bounds.
         if self.time_step_limit.is_none() {
-            let ts_min = self.time_step_min.unwrap_or(0.0);
-            let ts_max = self.time_step_max.unwrap_or(f32::INFINITY);
-            self.time_step_limit = Some((ts_min, ts_max));
+            self.time_step_limit = Some((0.0, f32::INFINITY));
         }
 
         // Normalize layers_block_type word names to single-char codes

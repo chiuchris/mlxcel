@@ -262,18 +262,19 @@ fn post_init_no_time_step_fields_defaults_to_zero_inf() {
 }
 
 /// Config with only time_step_min: 0.001 (no time_step_limit, no time_step_max).
-/// After post_init, time_step_limit must be (0.001, +inf).
+/// After post_init, time_step_limit must be (0.0, +inf) — time_step_min is a
+/// softplus init bound, NOT the dt clamp lower bound (upstream PR #1026 fix).
 #[test]
-fn post_init_only_time_step_min_uses_min_and_inf() {
+fn post_init_only_time_step_min_defaults_to_zero_inf() {
     let json = minimal_config_json(r#", "time_step_min": 0.001"#);
     let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
     cfg.post_init().expect("post_init");
     let (lo, hi) = cfg
         .time_step_limit
         .expect("time_step_limit must be Some after post_init");
-    assert!(
-        (lo - 0.001_f32).abs() < 1e-7,
-        "lower bound must be 0.001, got {lo}"
+    assert_eq!(
+        lo, 0.0,
+        "lower bound must be 0.0 regardless of time_step_min"
     );
     assert!(
         hi.is_infinite() && hi.is_sign_positive(),
@@ -282,20 +283,58 @@ fn post_init_only_time_step_min_uses_min_and_inf() {
 }
 
 /// Config with only time_step_max: 0.1 (no time_step_limit, no time_step_min).
-/// After post_init, time_step_limit must be (0.0, 0.1).
-/// This was the primary broken case from issue #319.
+/// After post_init, time_step_limit must be (0.0, +inf) — time_step_max is a
+/// softplus init bound, NOT the dt clamp upper bound (upstream PR #1026 fix).
 #[test]
-fn post_init_only_time_step_max_uses_zero_and_max() {
+fn post_init_only_time_step_max_defaults_to_zero_inf() {
     let json = minimal_config_json(r#", "time_step_max": 0.1"#);
     let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
     cfg.post_init().expect("post_init");
     let (lo, hi) = cfg
         .time_step_limit
         .expect("time_step_limit must be Some after post_init");
-    assert_eq!(lo, 0.0, "lower bound must be 0.0 when time_step_min absent");
+    assert_eq!(
+        lo, 0.0,
+        "lower bound must be 0.0 regardless of time_step_min"
+    );
     assert!(
-        (hi - 0.1_f32).abs() < 1e-6,
-        "upper bound must be 0.1, got {hi}"
+        hi.is_infinite() && hi.is_sign_positive(),
+        "upper bound must be +inf regardless of time_step_max"
+    );
+}
+
+/// Config with both time_step_min: 0.001 and time_step_max: 0.1 set, but no
+/// time_step_limit. This is the typical real-world Nemotron-H config. After
+/// post_init, time_step_limit must be (0.0, +inf), NOT (0.001, 0.1).
+/// Regression test for issue #604.
+#[test]
+fn post_init_both_time_step_min_max_set_defaults_to_zero_inf() {
+    let json = minimal_config_json(r#", "time_step_min": 0.001, "time_step_max": 0.1"#);
+    let mut cfg: NemotronHConfig = serde_json::from_str(&json).expect("deserialize");
+    assert!(
+        cfg.time_step_limit.is_none(),
+        "time_step_limit must be None before post_init when absent from JSON"
+    );
+    cfg.post_init().expect("post_init");
+    let (lo, hi) = cfg
+        .time_step_limit
+        .expect("time_step_limit must be Some after post_init");
+    assert_eq!(
+        lo, 0.0,
+        "lower bound must be 0.0, not time_step_min ({lo}); see upstream PR #1026"
+    );
+    assert!(
+        hi.is_infinite() && hi.is_sign_positive(),
+        "upper bound must be +inf, not time_step_max; see upstream PR #1026"
+    );
+    // Verify time_step_min / time_step_max are still accessible for the forward path.
+    assert!(
+        (cfg.time_step_min.unwrap() - 0.001_f32).abs() < 1e-7,
+        "time_step_min must be preserved for softplus init"
+    );
+    assert!(
+        (cfg.time_step_max.unwrap() - 0.1_f32).abs() < 1e-6,
+        "time_step_max must be preserved for softplus init"
     );
 }
 
