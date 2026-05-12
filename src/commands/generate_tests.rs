@@ -131,6 +131,7 @@ fn sample_generate_args(model_path: PathBuf) -> crate::GenerateArgs {
             tp_lm_head_mode: "replicated".to_string(),
         },
         lang_bias: mlxcel::lang_bias::LangBiasCliArgs::default(),
+        speculative: mlxcel::cli::speculative_args::SpeculativeArgs::default(),
     }
 }
 

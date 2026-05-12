@@ -19,6 +19,7 @@
 //! rules live in `mlxcel::server::ServerStartupInput` so `main.rs` stays focused
 //! on schema and routing.
 
+use mlxcel::cli::speculative_args::{env_fallback_draft_block_size, env_fallback_draft_kind};
 use mlxcel::server::{
     ServerStartupInput, env_fallback_apc_block_size, env_fallback_apc_enabled,
     env_fallback_apc_hash, env_fallback_apc_num_blocks, env_fallback_cache_type_k,
@@ -85,6 +86,15 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
     env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme);
     env_fallback_kv_skip_last_layer(&mut args.batch_quant.kv_skip_last_layer);
 
+    // Issue #630: env-var fallbacks for the speculative-decoding selector
+    // flags. `clap` already reads `LLAMA_ARG_DRAFT_KIND` /
+    // `LLAMA_ARG_DRAFT_BLOCK_SIZE` via the `env = "..."` attr on each flag;
+    // the helpers below layer the mlxcel-native `MLXCEL_DRAFT_KIND` /
+    // `MLXCEL_DRAFT_BLOCK_SIZE` aliases on top with the same warn-on-conflict
+    // pattern shared with the other `MLXCEL_*` / `LLAMA_ARG_*` pairs.
+    env_fallback_draft_kind(&mut args.speculative.draft_kind);
+    env_fallback_draft_block_size(&mut args.speculative.draft_block_size);
+
     // Axis B Epic #362 (B8): resolve --lang-bias / --lang-bias-config early so
     // errors surface before the server starts. Empty resolution = None =
     // baseline bit-exact path.
@@ -107,6 +117,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         timeout: args.timeout,
         draft_model_path: args.draft_model,
         draft_max: args.draft_max,
+        // Issue #630: forward the speculative-decoding selector flags
+        // resolved above via env-var fallbacks. Reconciliation into a
+        // typed `DrafterKind` happens later, at the dispatch site.
+        draft_kind: args.speculative.draft_kind,
+        draft_block_size: args.speculative.draft_block_size,
         max_batch_size: args.max_batch_size,
         no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,

@@ -52,6 +52,16 @@ pub struct ServerStartupInput {
     pub timeout: u64,
     pub draft_model_path: Option<PathBuf>,
     pub draft_max: usize,
+    /// Issue #630: explicit drafter-kind override from `--draft-kind`.
+    /// `None` means "auto-detect from the drafter's `config.json`" when
+    /// `draft_model_path` is supplied; otherwise the field is inert and
+    /// the classic [`crate::SpeculativeGenerator`] path is used.
+    pub draft_kind: Option<String>,
+    /// Issue #630: explicit draft-block-size override from
+    /// `--draft-block-size`. `None` means "use the per-kind default"
+    /// ([`crate::cli::speculative_args::default_block_size_for_kind`])
+    /// once the kind has been resolved.
+    pub draft_block_size: Option<u32>,
     pub max_batch_size: Option<usize>,
     pub max_queue_depth: usize,
     pub prefill_chunk_size: usize,
@@ -445,6 +455,14 @@ impl ServerStartupInput {
             timeout: self.timeout,
             draft_model_path: self.draft_model_path,
             draft_max: self.draft_max,
+            // Issue #630: forward the new speculative-decoding selector
+            // flags through the normalization step verbatim. Parsing the
+            // raw `draft_kind` string into a `DrafterKind` and resolving
+            // it against the drafter's `config.json` happens later, at
+            // the dispatch site, because that is the only place that
+            // owns both the drafter path AND the resolved kind.
+            draft_kind: self.draft_kind,
+            draft_block_size: self.draft_block_size,
             max_batch_size: self.max_batch_size,
             max_queue_depth: self.max_queue_depth,
             prefill_chunk_size: resolution.prefill_chunk_size,

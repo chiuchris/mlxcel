@@ -242,6 +242,23 @@ pub struct ServerConfig {
     pub default_dry_penalty_last_n: usize,
     pub draft_model_path: Option<PathBuf>,
     pub num_draft_tokens: usize,
+    /// Issue #630: raw `--draft-kind` override string from the CLI / env
+    /// var (`LLAMA_ARG_DRAFT_KIND` / `MLXCEL_DRAFT_KIND`).
+    ///
+    /// `None` means the server should auto-detect the drafter kind from
+    /// `draft_model_path` via
+    /// [`mlxcel_core::drafter::resolve_drafter_kind`], OR run the
+    /// classic [`crate::SpeculativeGenerator`] path when no drafter is
+    /// configured. Stored as a raw `Option<String>` because parsing
+    /// only succeeds for `dflash` / `mtp` (the `internal-mtp` variant of
+    /// [`mlxcel_core::drafter::DrafterKind`] is auto-detected, not
+    /// user-selectable) and the parse error must surface at the
+    /// dispatch site where the operator-facing error message lives.
+    pub draft_kind: Option<String>,
+    /// Issue #630: explicit `--draft-block-size` override. `None` means
+    /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
+    /// [`crate::cli::speculative_args::default_block_size_for_kind`].
+    pub draft_block_size: Option<u32>,
     /// Maximum number of sequences in the active decode batch.
     /// Defaults to `n_parallel` (typically 1) for backwards compatibility.
     pub max_batch_size: usize,
@@ -403,6 +420,11 @@ impl Default for ServerConfig {
             default_dry_penalty_last_n: 0,
             draft_model_path: None,
             num_draft_tokens: 3,
+            // Issue #630: default to "auto-detect from drafter config"
+            // when a drafter is supplied; the classic
+            // `SpeculativeGenerator` path runs when no drafter is set.
+            draft_kind: None,
+            draft_block_size: None,
             max_batch_size: 1,
             max_queue_depth: 1024,
             prefill_chunk_size: 512,

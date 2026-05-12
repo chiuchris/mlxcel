@@ -95,6 +95,7 @@ fn sample_args() -> crate::ServeArgs {
         _cont_batching: false,
         turbo: mlxcel::cli::turbo_args::TurboKvCacheArgs::default(),
         batch_quant: mlxcel::cli::batch_quant_args::BatchKvQuantArgs::default(),
+        speculative: mlxcel::cli::speculative_args::SpeculativeArgs::default(),
         decode_storage_backend: None,
         vision_cache_size: 20,
         enable_elastic_pp: false,

@@ -43,6 +43,10 @@ fn sample_input() -> ServerStartupInput {
         timeout: 600,
         draft_model_path: Some(PathBuf::from("models/draft")),
         draft_max: 8,
+        // Issue #630: speculative-decoding selector flags default off
+        // (None = auto-detect at dispatch time when a drafter is set).
+        draft_kind: None,
+        draft_block_size: None,
         max_batch_size: Some(4),
         max_queue_depth: 32,
         prefill_chunk_size: 512,

@@ -16,6 +16,9 @@ use clap::{Args as ClapArgs, Parser, Subcommand};
 use std::path::PathBuf;
 
 use mlxcel::cli::batch_quant_args::BatchKvQuantArgs;
+use mlxcel::cli::speculative_args::{
+    SpeculativeArgs, env_fallback_draft_block_size, env_fallback_draft_kind,
+};
 use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::{DownloadArgs, DownloadOptions, download_repo};
 use mlxcel::lang_bias::LangBiasCliArgs;
@@ -700,6 +703,15 @@ struct ServerArgs {
     #[command(flatten)]
     batch_quant: BatchKvQuantArgs,
 
+    /// Speculative-decoding flag group (`--draft-kind`, `--draft-block-size`).
+    /// Defined once in `mlxcel::cli::speculative_args` so all three
+    /// binaries (`mlxcel generate`, `mlxcel serve`, `mlxcel-server`) expose
+    /// identical help text and parsing. The `--model-draft` /
+    /// `--draft` flags stay above on this struct because they have
+    /// llama-server-compatible naming on this binary.
+    #[command(flatten)]
+    speculative: SpeculativeArgs,
+
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. See `--lang-bias`, `--lang-bias-config`, `--lang-bias-policy`,
     /// and the `--lang-bias-include-*` family of flags.
@@ -940,6 +952,15 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
     env_fallback_kv_quant_scheme(&mut args.batch_quant.kv_quant_scheme);
     env_fallback_kv_skip_last_layer(&mut args.batch_quant.kv_skip_last_layer);
 
+    // Issue #630: env-var fallbacks for the speculative-decoding selector
+    // flags. `clap` already reads `LLAMA_ARG_DRAFT_KIND` /
+    // `LLAMA_ARG_DRAFT_BLOCK_SIZE` via the `env = "..."` attr on each flag;
+    // the helpers below layer the mlxcel-native `MLXCEL_DRAFT_KIND` /
+    // `MLXCEL_DRAFT_BLOCK_SIZE` aliases on top with the same warn-on-conflict
+    // pattern shared with the other `MLXCEL_*` / `LLAMA_ARG_*` pairs.
+    env_fallback_draft_kind(&mut args.speculative.draft_kind);
+    env_fallback_draft_block_size(&mut args.speculative.draft_block_size);
+
     // Axis B (B8): resolve once up-front so CLI errors surface before the
     // server starts listening. Baseline path returns `None` (bit-exact).
     let lang_bias_config = args
@@ -967,6 +988,11 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         timeout: args.timeout,
         draft_model_path: args.model_draft,
         draft_max: args.draft,
+        // Issue #630: forward the speculative-decoding selector flags
+        // resolved above via env-var fallbacks. Reconciliation into a
+        // typed `DrafterKind` happens later, at the dispatch site.
+        draft_kind: args.speculative.draft_kind,
+        draft_block_size: args.speculative.draft_block_size,
         max_batch_size: args.max_batch_size,
         no_batch: args.no_batch,
         max_queue_depth: args.max_queue_depth,

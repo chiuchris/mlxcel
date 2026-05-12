@@ -47,7 +47,9 @@ use mlxcel_core::generation_policy::{
 use mlxcel_core::lang_analyzer::LangBiasConfig;
 use mlxcel_core::sampling::{TokenBiasMap, sample_token_optimized};
 
+use mlxcel::cli::speculative_args::resolve_draft_block_size;
 use mlxcel::cli::turbo_args::resolve_kv_cache_mode;
+use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};
 
 use super::generate_vlm;
 use crate::GenerateArgs;
@@ -662,9 +664,94 @@ fn run_generation_mode<M: LanguageModel>(
     token_bias: TokenBiasMap,
 ) -> Result<(Vec<i32>, GenerationStats)> {
     let output = if let Some(ref draft_model_path) = args.model.draft_model {
+        // Issue #630: resolve the effective DrafterKind from
+        // (a) the explicit `--draft-kind` CLI flag, OR
+        // (b) the drafter's `config.json::model_type` auto-detection.
+        //
+        // When `--draft-kind` is unset AND the auto-detect maps to the
+        // default DFlash kind (no `model_type` or unknown `model_type`),
+        // we keep the classic `SpeculativeGenerator` path so all the
+        // existing offline speculative-decoding workflows continue to
+        // function bit-exactly. An explicit `--draft-kind` (or an
+        // auto-detected MTP shape) routes through the kind-specific
+        // generator path.
+        let explicit_kind = args
+            .speculative
+            .parse_kind()
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let resolved_kind = resolve_drafter_kind(draft_model_path, explicit_kind)
+            .map_err(|e| anyhow::anyhow!("--draft-kind / drafter config: {e}"))?;
+        let block_size = resolve_draft_block_size(args.speculative.draft_block_size, resolved_kind);
+        let user_requested_explicit_kind = explicit_kind.is_some();
+
         println!("Loading draft model from {:?}...", draft_model_path);
         let (draft_model, _draft_tokenizer) = load_model(draft_model_path)?;
         println!("Draft model loaded.");
+        println!(
+            "Resolved drafter kind: {} (block_size = {block_size}{})",
+            resolved_kind,
+            if args.speculative.draft_block_size.is_some() {
+                ", explicit"
+            } else {
+                ", default"
+            },
+        );
+
+        // Issue #630: when the operator explicitly opted into MTP /
+        // DFlash via `--draft-kind`, we MUST dispatch to the kind-specific
+        // generator. The concrete `MtpGenerator<T>` / `DFlashGenerator`
+        // round loops are wired in sub-6 / #629 and sub-12 / #636,
+        // respectively, but those round loops require model-specific
+        // `MtpTarget` / `SpeculativeTarget` impls that this offline CLI
+        // path does not yet provide. Surface a clear, actionable error
+        // that names the responsible sub-issue so an operator who passed
+        // `--draft-kind mtp` doesn't silently fall back to the classic
+        // path and miss the perf they were trying to validate. When
+        // `--draft-kind` was unset (auto-detect resolved to a kind),
+        // we instead log an info line and keep the classic path so the
+        // default `--draft-model some/dflash-drafter` workflow remains
+        // backward-compatible.
+        if user_requested_explicit_kind {
+            return Err(anyhow!(
+                "--draft-kind {kind} is plumbed end-to-end (issue #630) but \
+                 the offline `mlxcel generate` path does not yet construct the \
+                 kind-specific `{generator}` round loop on this target model. \
+                 The runtime wiring lands in {tracker}. For now, omit \
+                 `--draft-kind` to use the classic SpeculativeGenerator with \
+                 your `--draft-model` drafter.",
+                kind = resolved_kind,
+                generator = match resolved_kind {
+                    DrafterKind::Mtp => "MtpGenerator",
+                    DrafterKind::Dflash => "DFlashGenerator",
+                    DrafterKind::InternalMtp => "InternalMtpGenerator",
+                    // `DrafterKind` is `#[non_exhaustive]`; future variants
+                    // land in follow-up epics and surface a generic name
+                    // until they get their own tracker hint.
+                    _ => "speculative round loop",
+                },
+                tracker = match resolved_kind {
+                    DrafterKind::Mtp =>
+                        "issue #629 (MtpGenerator round loop) and the per-target MtpTarget impls",
+                    DrafterKind::Dflash =>
+                        "issue #636 (DFlashGenerator round loop) and the per-target SpeculativeTarget impls",
+                    DrafterKind::InternalMtp => "epic #647 sub-issues",
+                    _ => "follow-up speculative-decoding sub-issues",
+                },
+            ));
+        }
+        // Auto-detect resolved a kind but the operator didn't explicitly
+        // request it. Log the resolution for diagnostic purposes and
+        // fall through to the classic SpeculativeGenerator so the
+        // historical `--draft-model <path>` workflow remains
+        // bit-exactly the same as before this change.
+        tracing::info!(
+            drafter = %draft_model_path.display(),
+            resolved_kind = %resolved_kind,
+            block_size = block_size,
+            "Auto-detected drafter kind; using classic SpeculativeGenerator path \
+             (pass --draft-kind explicitly once the {} round loop is wired for this target)",
+            resolved_kind,
+        );
 
         let draft_num_layers = draft_model.num_layers();
         let main_num_layers = model.num_layers();

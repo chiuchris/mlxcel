@@ -74,6 +74,17 @@ pub struct ServerStartupConfig {
     // Speculative decoding
     pub draft_model_path: Option<PathBuf>,
     pub draft_max: usize,
+    /// Issue #630: raw `--draft-kind` value. `None` means
+    /// "auto-detect from the drafter `config.json::model_type`" when
+    /// `draft_model_path` is also supplied. Parsing into
+    /// [`mlxcel_core::drafter::DrafterKind`] and reconciliation against
+    /// the drafter config happens at the dispatch site via
+    /// [`mlxcel_core::drafter::resolve_drafter_kind`].
+    pub draft_kind: Option<String>,
+    /// Issue #630: explicit `--draft-block-size` override. `None` means
+    /// "use the per-kind default" — `4` for MTP, `16` for DFlash. See
+    /// [`crate::cli::speculative_args::default_block_size_for_kind`].
+    pub draft_block_size: Option<u32>,
 
     // Chat template
     pub chat_template: Option<String>,
@@ -307,6 +318,13 @@ impl Default for ServerStartupConfig {
             timeout: 600,
             draft_model_path: None,
             draft_max: 16,
+            // Issue #630: speculative-decoding selector defaults.
+            // `draft_kind = None` means "auto-detect when a drafter is
+            // supplied, otherwise inert"; `draft_block_size = None`
+            // means "fall back to the per-kind default once the kind
+            // has been resolved".
+            draft_kind: None,
+            draft_block_size: None,
             max_batch_size: None,
             max_queue_depth: 32,
             prefill_chunk_size: 512,
@@ -612,6 +630,14 @@ pub(super) fn build_server_config(
         default_dry_penalty_last_n: resolve_dry_penalty_last_n(startup.dry_penalty_last_n),
         draft_model_path: startup.draft_model_path.clone(),
         num_draft_tokens: startup.draft_max,
+        // Issue #630: forward the speculative-decoding selector flags
+        // verbatim. Reconciliation against the drafter `config.json`
+        // and dispatch into `MtpGenerator` / `DFlashGenerator` / the
+        // classic `SpeculativeGenerator` happens later inside the
+        // continuous-batching worker, when both the drafter path and
+        // the resolved kind are known.
+        draft_kind: startup.draft_kind.clone(),
+        draft_block_size: startup.draft_block_size,
         max_batch_size: startup.max_batch_size.unwrap_or(startup.n_parallel).max(1),
         max_queue_depth: startup.max_queue_depth,
         prefill_chunk_size: startup.prefill_chunk_size,

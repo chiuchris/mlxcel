@@ -18,6 +18,7 @@ use std::path::PathBuf;
 
 mod commands;
 use mlxcel::cli::batch_quant_args::BatchKvQuantArgs;
+use mlxcel::cli::speculative_args::SpeculativeArgs;
 use mlxcel::cli::turbo_args::TurboKvCacheArgs;
 use mlxcel::downloader::DownloadArgs;
 use mlxcel::lang_bias::LangBiasCliArgs;
@@ -91,6 +92,14 @@ pub(crate) struct GenerateArgs {
 
     #[command(flatten)]
     pub(crate) lang_bias: LangBiasCliArgs,
+
+    /// Speculative-decoding flag group (`--draft-kind`, `--draft-block-size`).
+    /// The `--draft-model` and `--num-draft-tokens` flags stay on
+    /// [`ModelOptions`] above to keep their existing scope and to preserve
+    /// the llama-server-compat naming on `mlxcel-server`. See
+    /// [`SpeculativeArgs`] for the rationale.
+    #[command(flatten)]
+    pub(crate) speculative: SpeculativeArgs,
 }
 
 /// Model loading options
@@ -821,6 +830,16 @@ pub(crate) struct ServeArgs {
     /// continuous-batching scheduler to feed.
     #[command(flatten)]
     batch_quant: BatchKvQuantArgs,
+
+    /// Speculative-decoding flag group (`--draft-kind`, `--draft-block-size`).
+    /// Defined once in `mlxcel::cli::speculative_args` so all three
+    /// binaries (`mlxcel generate`, `mlxcel serve`, `mlxcel-server`) expose
+    /// identical help text and parsing. The `--draft-model` /
+    /// `--draft-max` flags stay above on this struct because they have
+    /// different naming on `mlxcel-server` (`--model-draft`) for
+    /// llama-server CLI compatibility.
+    #[command(flatten)]
+    speculative: SpeculativeArgs,
 
     /// Axis B Epic #362 (B8): language-bias options for server-wide output
     /// steering. Mirrors the same flags exposed on the `generate` subcommand.
