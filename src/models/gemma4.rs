@@ -668,6 +668,124 @@ impl Cache {
             Self::Rotating(cache) => cache,
         }
     }
+
+    /// Trim the last `n` entries from this cache, dispatching to the
+    /// underlying `KVCache::trim` or `RotatingKVCache::trim`. Mirrors the
+    /// upstream Python `hasattr(c, "trim")` dispatch in
+    /// `Gemma4 LanguageModel.rollback_speculative_cache`.
+    ///
+    /// Used by: Gemma 4 MTP `rollback_speculative_cache` (issue #625).
+    pub(crate) fn trim_speculative(&mut self, n: i32) -> i32 {
+        match self {
+            Self::Standard(cache) => cache.trim(n),
+            Self::Rotating(cache) => cache.trim(n),
+        }
+    }
+
+    /// Per-row tail-zero of the rotating cache for partial-accept rows in a
+    /// batched verify pass. Mirrors the Python `hasattr(c, "_idx")` branch in
+    /// `rollback_speculative_cache` (references/mlx-vlm/mlx_vlm/models/gemma4
+    /// /language.py lines 637-645):
+    ///
+    /// ```text
+    /// kv_len = c._idx                       # post-trim write index
+    /// n = max(valid_ends)                   # == max(accepted) + 1
+    /// verify_start = kv_len - n
+    /// for bi in range(accepted.shape[0]):
+    ///     start = verify_start + valid_ends[bi]
+    ///     if start < kv_len:
+    ///         keys[bi, :, start:kv_len, :] = 0
+    ///         values[bi, :, start:kv_len, :] = 0
+    /// ```
+    ///
+    /// `valid_ends[bi]` is `accepted[bi] + 1` and `kv_len` is the current
+    /// rotating-buffer write index (`buffer_write_idx`). The `block_size`
+    /// parameter is retained for API parity with the Python signature; the
+    /// effective span to zero is derived from `n = max(valid_ends)`, exactly
+    /// as Python does. This step is a no-op for `Cache::Standard` (dense
+    /// `KVCache`) because Python's hook gates per-row zeroing on `_idx`,
+    /// which only `RotatingKVCache` exposes — the dense cache simply trims
+    /// its monotonic offset and the next decode write overwrites the
+    /// trimmed slot.
+    ///
+    /// Used by: Gemma 4 MTP `rollback_speculative_cache` (issue #625).
+    pub(crate) fn zero_partial_accept_tail(
+        &mut self,
+        valid_ends: &[i32],
+        block_size: i32,
+    ) -> Result<(), String> {
+        let cache = match self {
+            Self::Standard(_) => return Ok(()),
+            Self::Rotating(cache) => cache,
+        };
+        if cache.keys.is_none() || cache.values.is_none() {
+            return Ok(());
+        }
+        if valid_ends.is_empty() {
+            return Ok(());
+        }
+        let kv_len = cache.buffer_write_idx();
+        // n = max(valid_ends) — bit-identical to Python's `n = max_a + 1`
+        // where `max_a = accepted.max()` and `valid_ends = accepted + 1`.
+        let n = *valid_ends.iter().max().unwrap();
+        if n <= 0 {
+            // All rows rejected everything; nothing to zero (matches Python's
+            // `max_a > 0` guard).
+            return Ok(());
+        }
+        let verify_start = kv_len - n;
+        if verify_start < 0 {
+            return Err(format!(
+                "zero_partial_accept_tail: n ({n}) exceeds rotating-cache write index \
+                 ({kv_len}); refusing to zero a range that predates the verify pass \
+                 (block_size = {block_size})"
+            ));
+        }
+        let keys = cache.keys.as_ref().unwrap();
+        let values = cache.values.as_ref().unwrap();
+        let k_shape = mlxcel_core::array_shape(keys);
+        let v_shape = mlxcel_core::array_shape(values);
+        let batch = k_shape[0];
+        if batch != valid_ends.len() as i32 {
+            return Err(format!(
+                "zero_partial_accept_tail: rotating-cache batch ({batch}) does not match \
+                 accepted-row count ({})",
+                valid_ends.len()
+            ));
+        }
+
+        let k_dtype = mlxcel_core::array_dtype(keys);
+        let v_dtype = mlxcel_core::array_dtype(values);
+        // Walk rows individually so we can skip the no-op row (start == kv_len)
+        // and apply slice_update only where the row needs it.
+        let mut new_keys = mlxcel_core::copy(keys);
+        let mut new_values = mlxcel_core::copy(values);
+        for (bi, ve) in valid_ends.iter().copied().enumerate() {
+            let start = verify_start + ve;
+            if start >= kv_len {
+                continue;
+            }
+            let span = kv_len - start;
+            let bi_i = bi as i32;
+            let k_zero = mlxcel_core::zeros(&[1, k_shape[1], span, k_shape[3]], k_dtype);
+            let v_zero = mlxcel_core::zeros(&[1, v_shape[1], span, v_shape[3]], v_dtype);
+            new_keys = mlxcel_core::slice_update(
+                &new_keys,
+                &k_zero,
+                &[bi_i, 0, start, 0],
+                &[bi_i + 1, k_shape[1], kv_len, k_shape[3]],
+            );
+            new_values = mlxcel_core::slice_update(
+                &new_values,
+                &v_zero,
+                &[bi_i, 0, start, 0],
+                &[bi_i + 1, v_shape[1], kv_len, v_shape[3]],
+            );
+        }
+        cache.keys = Some(new_keys);
+        cache.values = Some(new_values);
+        Ok(())
+    }
 }
 
 pub struct Attention {
@@ -1460,6 +1578,71 @@ pub struct Gemma4TextModel {
     pub(crate) config: TextConfig,
 }
 
+/// Output sinks for the Gemma 4 MTP speculative-decoding target hooks
+/// (issue #625).
+///
+/// All fields are `Option` so callers that do not need a hook pay zero cost
+/// on the hot path — the `forward_with_speculative_sinks` consumer only
+/// allocates and assigns when the corresponding sink is requested.
+///
+/// - [`hidden_sink`](Self::hidden_sink): When `Some`, the target appends the
+///   last decoder layer's hidden state **before the final RMSNorm**
+///   (matching upstream HF `_can_record_outputs={"hidden_states":
+///   Gemma4TextDecoderLayer}` semantics). When the caller also supplies a
+///   non-empty `capture_layer_ids` list, the sink instead receives the
+///   captured layer outputs in iteration order (one entry per matching
+///   layer index). Shape per entry: `[B, L, hidden_size]`, preserving the
+///   model's native dtype (bf16/f16).
+///
+/// - [`shared_kv_sink`](Self::shared_kv_sink): When `Some`, the target
+///   inserts the K/V slabs of the **last** non-KV-shared full-attention
+///   layer (`"full_attention"` key) and the **last** non-KV-shared
+///   sliding-attention layer (`"sliding_attention"` key). These are the
+///   exact slabs the Gemma 4 MTP drafter binds against — its 4-layer
+///   assistant transformer reads them in lieu of a private KV cache. Shape
+///   per K and V: `[B, num_kv_heads, kv_len, head_dim]` in the model's
+///   native dtype.
+///
+/// Used by: future `Gemma4AssistantDraftModel` (issue #626) and
+/// `MtpGenerator` (issue #629).
+#[derive(Default)]
+pub struct Gemma4SpeculativeSinks {
+    pub hidden_sink: Option<Vec<UniquePtr<MlxArray>>>,
+    pub shared_kv_sink: Option<HashMap<String, (UniquePtr<MlxArray>, UniquePtr<MlxArray>)>>,
+}
+
+impl Gemma4SpeculativeSinks {
+    /// Sink set that captures the target's last layer hidden state (matches
+    /// `return_hidden=True` in the upstream Python signature).
+    #[must_use]
+    pub fn with_hidden() -> Self {
+        Self {
+            hidden_sink: Some(Vec::new()),
+            shared_kv_sink: None,
+        }
+    }
+
+    /// Sink set that captures the last full-attention + last sliding-
+    /// attention K/V slabs (matches `return_shared_kv=True` upstream).
+    #[must_use]
+    pub fn with_shared_kv() -> Self {
+        Self {
+            hidden_sink: None,
+            shared_kv_sink: Some(HashMap::new()),
+        }
+    }
+
+    /// Sink set that captures both hidden and shared K/V — the common
+    /// `Gemma4AssistantDraftModel.bind` call pattern.
+    #[must_use]
+    pub fn with_hidden_and_shared_kv() -> Self {
+        Self {
+            hidden_sink: Some(Vec::new()),
+            shared_kv_sink: Some(HashMap::new()),
+        }
+    }
+}
+
 impl Gemma4TextModel {
     pub fn forward(
         &self,
@@ -1468,6 +1651,52 @@ impl Gemma4TextModel {
         caches: &mut [Cache],
         mask: Option<&MlxArray>,
         per_layer_inputs: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        self.forward_with_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            caches,
+            mask,
+            per_layer_inputs,
+            None,
+            None,
+        )
+    }
+
+    /// Forward pass with optional speculative-decoding hooks for the Gemma 4
+    /// MTP target path (issue #625).
+    ///
+    /// When `sinks` is `None`, behaves exactly like [`Self::forward`] (zero
+    /// overhead beyond the wrapping struct).
+    ///
+    /// When `sinks` is `Some(&mut sinks)`:
+    /// - If `sinks.hidden_sink` is `Some` and `capture_layer_ids` is empty
+    ///   or `None`, the LAST decoder layer's pre-norm hidden state is
+    ///   appended exactly once (matching upstream Python semantics:
+    ///   `hidden_sink.append(h)` after the layer loop, before `self.norm`).
+    /// - If `sinks.hidden_sink` is `Some` and `capture_layer_ids` is
+    ///   non-empty, hidden states at the listed layer indices are appended
+    ///   in the order they are produced (the layer loop's natural ascending
+    ///   index order).
+    /// - If `sinks.shared_kv_sink` is `Some`, the K and V slabs returned by
+    ///   `Attention::forward` on the last non-KV-shared full-attention layer
+    ///   and the last non-KV-shared sliding-attention layer are inserted
+    ///   under the keys `"full_attention"` and `"sliding_attention"`. Each
+    ///   value is the `(K, V)` tuple in `[B, num_kv_heads, kv_len, head_dim]`
+    ///   shape and the model's native dtype.
+    ///
+    /// The hidden-state and shared-K/V captures intentionally preserve the
+    /// model's native bf16/f16 dtype — no f32 promotion (per
+    /// `docs/apple-silicon-precision.md`).
+    pub fn forward_with_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Cache],
+        mask: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        capture_layer_ids: Option<&[usize]>,
+        mut sinks: Option<&mut Gemma4SpeculativeSinks>,
     ) -> UniquePtr<MlxArray> {
         // When `input_embeddings` is supplied (e.g. from the VLM path where
         // vision/audio features have already been merged into the embedding
@@ -1535,6 +1764,14 @@ impl Gemma4TextModel {
         let profile_per_layer = std::env::var("MLXCEL_PROFILE_PER_LAYER").is_ok();
         let profile_layer_build = std::env::var("MLXCEL_PROFILE_LAYER_BUILD").is_ok();
         let profile_subops = std::env::var("MLXCEL_PROFILE_LAYER_SUBOPS").is_ok();
+
+        // Speculative-decoding capture (issue #625). The `capture_set` mirrors
+        // upstream's `set(capture_layer_ids)`; when non-empty the
+        // `hidden_sink` is appended to inside the loop at each matching idx,
+        // otherwise the sink receives the final pre-norm `h` after the loop.
+        let capture_set: Option<std::collections::HashSet<usize>> =
+            capture_layer_ids.map(|ids| ids.iter().copied().collect());
+        let has_capture_layers = capture_set.as_ref().is_some_and(|s| !s.is_empty());
 
         for (i, layer) in self.layers.iter().enumerate() {
             let cache = caches[i].as_interface();
@@ -1609,7 +1846,51 @@ impl Gemma4TextModel {
                 shared_kv_store.insert(i, (keys, values, pre_offset));
             }
 
+            // Per-layer hidden capture (`return_hidden` with explicit
+            // `capture_layer_ids`). Mirrors upstream Python's
+            // `if hidden_sink is not None and idx in capture_set:
+            //     hidden_sink.append(h)`. `mlxcel_core::copy` is a shallow
+            // MLX-array clone — it does not allocate device memory or
+            // promote dtype.
+            if has_capture_layers
+                && let Some(s) = sinks.as_mut()
+                && let Some(sink) = s.hidden_sink.as_mut()
+                && let Some(set) = capture_set.as_ref()
+                && set.contains(&i)
+            {
+                sink.push(mlxcel_core::copy(&h));
+            }
+
             pipeline_hint(&h, i, n_layers);
+        }
+
+        // Final hidden capture (`return_hidden=True` without
+        // `capture_layer_ids`). Matches HF's
+        // `_can_record_outputs={"hidden_states": Gemma4TextDecoderLayer}`
+        // contract — last decoder layer output captured BEFORE the final
+        // RMSNorm, in the model's native dtype.
+        if !has_capture_layers
+            && let Some(s) = sinks.as_mut()
+            && let Some(sink) = s.hidden_sink.as_mut()
+        {
+            sink.push(mlxcel_core::copy(&h));
+        }
+
+        // Shared K/V capture (`return_shared_kv=True`). The Rust path stores
+        // K/V only on the LAST non-KV-shared layer of each type (i.e. the
+        // sources that all KV-shared layers reference) — exactly the slabs
+        // the Gemma 4 MTP drafter binds against. Iterate `shared_kv_store`
+        // (small: at most two entries) and key the sink by the source
+        // layer's type string (`"full_attention"` / `"sliding_attention"`).
+        // The store is drained so we move ownership of the K/V handles into
+        // the sink rather than paying for a redundant `mlxcel_core::copy`.
+        if let Some(s) = sinks.as_mut()
+            && let Some(sink) = s.shared_kv_sink.as_mut()
+        {
+            for (idx, (keys, values, _ref_offset)) in shared_kv_store.drain() {
+                let layer_type = self.config.layer_type(idx).to_string();
+                sink.insert(layer_type, (keys, values));
+            }
         }
 
         self.norm.forward(&h)
@@ -1865,6 +2146,41 @@ impl Gemma4Model {
         let hidden =
             self.text_model
                 .forward(input_ids, input_embeddings, caches, mask, per_layer_inputs);
+        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        if let Some(cap) = self.config.final_logit_softcapping {
+            logits = mlxcel_core::compiled_softcap(&logits, cap);
+        }
+        logits
+    }
+
+    /// Sink-aware variant of [`Self::forward_with_caches_and_embeddings`]
+    /// used by the Gemma 4 MTP target path (issue #625). Delegates the
+    /// transformer pass to
+    /// [`Gemma4TextModel::forward_with_speculative_sinks`] then applies
+    /// the embedding tied LM head + optional final-logit softcap exactly
+    /// like the non-sink path — so callers get bit-identical logits when
+    /// `sinks` is `None`.
+    ///
+    /// Used by: [`Gemma4Wrapper::forward_with_speculative_sinks`].
+    fn forward_with_caches_and_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Cache],
+        mask: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        let hidden = self.text_model.forward_with_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            caches,
+            mask,
+            per_layer_inputs,
+            capture_layer_ids,
+            sinks,
+        );
         let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
@@ -2504,6 +2820,137 @@ impl Gemma4Wrapper {
     /// (see issue #317).
     pub fn hidden_size(&self) -> usize {
         self.model.config.hidden_size
+    }
+
+    /// Sink-aware forward used by the Gemma 4 MTP target path (issue #625).
+    ///
+    /// Mirrors [`Self::forward_with_inputs_and_sequence_id`] but additionally
+    /// captures the LAST decoder hidden state (or per-layer hidden states
+    /// matching `capture_layer_ids`) and / or the shared K/V slabs (last
+    /// full-attention + last sliding-attention) into the caller-provided
+    /// [`Gemma4SpeculativeSinks`]. Resolves to the per-`SequenceId` cache
+    /// slot via [`ModelOwnedSequenceState::with_or_create_sequence_state`]
+    /// — the same isolation the rest of Gemma 4 already uses for batched
+    /// decode (issue #542), so the speculative loop does not need to
+    /// allocate a side cache.
+    ///
+    /// When `sinks` is `None` and `capture_layer_ids` is `None`, this is
+    /// behaviorally equivalent to the non-sink wrapper path: logits with
+    /// optional final-logit softcap, zero allocation overhead beyond the
+    /// `Option`s.
+    ///
+    /// Used by: future `Gemma4AssistantDraftModel` consumer (issue #626) and
+    /// `MtpGenerator` (issue #629).
+    pub fn forward_with_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_with_caches_and_speculative_sinks(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    per_layer_inputs,
+                    capture_layer_ids,
+                    sinks,
+                )
+            },
+        )
+    }
+
+    /// Rewind the per-sequence target KV caches after a Gemma 4 MTP
+    /// speculative-decoding round (issue #625). Mirrors the upstream Python
+    /// hook
+    /// (`references/mlx-vlm/mlx_vlm/models/gemma4/language.py` lines
+    /// 608-646) bit-for-bit:
+    ///
+    /// 1. `n = max(accepted) + 1`, `trim = block_size - n`.
+    /// 2. If `trim > 0`, each cache is trimmed by `trim` via
+    ///    [`Cache::trim_speculative`] (dispatches to `KVCache::trim` for
+    ///    full-attention caches and `RotatingKVCache::trim` for
+    ///    sliding-attention caches).
+    /// 3. For batched verify with at least one row having `accepted > 0`,
+    ///    each rotating cache additionally gets per-row tail-zeroing via
+    ///    [`Cache::zero_partial_accept_tail`] — required because rows with
+    ///    different accept counts share the same KV buffer.
+    ///
+    /// The full-accept edge case (`accepted == block_size - 1` for every
+    /// row, equivalent to `n == block_size`) results in `trim == 0` and no
+    /// per-row zeroing (because every row's `start == kv_len`).
+    ///
+    /// Routes to the per-`SequenceId` cache slot (or the wrapper's internal
+    /// fallback slot when `seq_id` is `None`) — same isolation pattern as
+    /// the rest of `Gemma4Wrapper`.
+    ///
+    /// `gdn_states` is intentionally elided from the Rust signature: Gemma
+    /// 4 has no SSM/GDN state, and the Python API-parity placeholder is
+    /// unnecessary in the typed Rust API surface (the future hybrid-model
+    /// MTP wrappers will define their own analogue).
+    ///
+    /// Returns `Ok(())` on success, or an `Err` describing the failure
+    /// (e.g. mismatched batch shape between cache buffer and `accepted`,
+    /// or rotating-cache write index that predates the verify pass).
+    ///
+    /// Used by: future `MtpGenerator` Gemma 4 verify loop (issue #629).
+    pub fn rollback_speculative_cache(
+        &self,
+        seq_id: Option<SequenceId>,
+        accepted: &[i32],
+        block_size: i32,
+    ) -> Result<(), String> {
+        if accepted.is_empty() {
+            return Err("rollback_speculative_cache: accepted slice must be non-empty".into());
+        }
+        if block_size <= 0 {
+            return Err(format!(
+                "rollback_speculative_cache: block_size must be positive (got {block_size})"
+            ));
+        }
+        let max_a = *accepted.iter().max().unwrap();
+        if max_a < 0 {
+            return Err(format!(
+                "rollback_speculative_cache: accepted values must be non-negative \
+                 (got max = {max_a})"
+            ));
+        }
+        if max_a > block_size - 1 {
+            return Err(format!(
+                "rollback_speculative_cache: max(accepted) ({max_a}) cannot exceed \
+                 block_size - 1 ({})",
+                block_size - 1
+            ));
+        }
+        let n = max_a + 1;
+        let trim = block_size - n;
+        let is_batch = accepted.len() > 1;
+        // valid_ends[i] = accepted[i] + 1
+        let valid_ends: Vec<i32> = accepted.iter().map(|a| a + 1).collect();
+
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| -> Result<(), String> {
+                for cache in sequence_caches.iter_mut() {
+                    if trim > 0 {
+                        cache.trim_speculative(trim);
+                    }
+                    if is_batch && max_a > 0 {
+                        cache.zero_partial_accept_tail(&valid_ends, block_size)?;
+                    }
+                }
+                Ok(())
+            },
+        )
     }
 }
 

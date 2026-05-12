@@ -390,6 +390,65 @@ impl Gemma4VLModel {
             self.per_layer_inputs_state.bind_for_sequence(seq_id, value);
         }
     }
+
+    // -- Gemma 4 MTP speculative-decoding hooks (issue #625) --------------
+    //
+    // These pass-through methods give the future MTP drafter (issue #626) /
+    // generator (issue #629) the same opt-in sink + rollback surface on the
+    // VLM-wrapped Gemma 4 path as on the text-only path. The multimodal
+    // prefill (image / audio merge into the input embeddings) is unchanged —
+    // speculative decoding kicks in only AFTER the prefill tail, at which
+    // point the rotating + dense KV caches owned by the inner
+    // `Gemma4Wrapper` are the sole state the MTP loop touches. The vision
+    // tower and `per_layer_inputs_state` do not participate.
+
+    /// Sink-aware forward for the VLM-wrapped Gemma 4 text model.
+    ///
+    /// Delegates to [`crate::models::Gemma4Wrapper::forward_with_speculative_sinks`]
+    /// on the inner text model. The caller is responsible for routing the
+    /// VLM prefill through the existing
+    /// [`LanguageModel::forward_with_embeddings_and_sequence_id`] path
+    /// FIRST (which merges vision / audio features into `inputs_embeds`);
+    /// subsequent speculative decode steps consume `input_ids` only and
+    /// must pass `input_embeddings = None` exactly like the text-only
+    /// case. Mirrors the `gemma4_vl.py` __call__ → text_model.__call__
+    /// flow in `references/mlx-vlm`.
+    ///
+    /// Used by: future Gemma 4 VLM MTP consumer (issue #629).
+    pub fn forward_with_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut crate::models::Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model.forward_with_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            per_layer_inputs,
+            mask,
+            seq_id,
+            capture_layer_ids,
+            sinks,
+        )
+    }
+
+    /// Rewind the inner text model's per-sequence KV caches after a Gemma
+    /// 4 MTP verify pass. Pure pass-through to
+    /// [`crate::models::Gemma4Wrapper::rollback_speculative_cache`] — the
+    /// VLM wrapper holds no additional speculative state to undo.
+    pub fn rollback_speculative_cache(
+        &self,
+        seq_id: Option<SequenceId>,
+        accepted: &[i32],
+        block_size: i32,
+    ) -> Result<(), String> {
+        self.text_model
+            .rollback_speculative_cache(seq_id, accepted, block_size)
+    }
 }
 
 impl LanguageModel for Gemma4VLModel {

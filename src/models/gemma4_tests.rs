@@ -215,7 +215,7 @@ mod cache_isolation {
         weights
     }
 
-    fn build_wrapper() -> Gemma4Wrapper {
+    pub(super) fn build_wrapper() -> Gemma4Wrapper {
         let args = make_test_gemma4_args();
         let weights = make_test_gemma4_weight_map();
         Gemma4Wrapper::new(Gemma4Model::from_weights(&weights, &args).unwrap())
@@ -699,4 +699,287 @@ fn gemma4_proportional_rope_freqs_match_python_semantics() {
         freq_values[15],
         default_formula,
     );
+}
+
+// -----------------------------------------------------------------
+// Issue #625: Gemma 4 MTP target hooks — `rollback_speculative_cache`
+// + sink-aware forward.
+//
+// The tests below cover the cache-rewind primitives in isolation
+// (`RotatingKVCache::trim` + `Cache::zero_partial_accept_tail`) and
+// then exercise the sink path end-to-end through the synthetic
+// 1-layer Gemma 4 fixture defined in the `cache_isolation` sub-module
+// above (the same fixture issue #542's batching tests use). The
+// sink-path test is gated on serial MLX execution because the
+// fixture's forward pass touches the global MLX runtime.
+mod mtp_hooks {
+    use crate::models::gemma4::Cache;
+    use mlxcel_core::layers::{KVCache, RotatingKVCache};
+
+    /// `RotatingKVCache::trim(n)` must rewind both the monotonic
+    /// `offset` and the internal write index (`buffer_write_idx`)
+    /// — Python's `trim` rewinds both `self.offset` and `self._idx`.
+    /// Without rewinding `_idx`, a subsequent `update_and_fetch` would
+    /// overwrite the WRONG buffer slot after rollback.
+    #[test]
+    fn rotating_kv_cache_trim_rewinds_offset_and_idx() {
+        let mut cache = RotatingKVCache::new(32);
+        // Prefill 4 tokens via single-token updates (each goes through
+        // `update_in_place`, advancing `offset` and `idx` by 1 apiece).
+        let val = |x: f32| mlxcel_core::from_slice_f32(&[x], &[1, 1, 1, 1]);
+        cache.update_and_fetch(val(1.0), val(10.0));
+        cache.update_and_fetch(val(2.0), val(20.0));
+        cache.update_and_fetch(val(3.0), val(30.0));
+        cache.update_and_fetch(val(4.0), val(40.0));
+        assert_eq!(cache.offset, 4);
+        assert_eq!(cache.buffer_write_idx(), 4);
+
+        // Trim the last 3 tokens (mirrors a verify pass where only 1
+        // of 4 speculated tokens was accepted: trim = block_size - n =
+        // 4 - 1 = 3).
+        let n_trimmed = cache.trim(3);
+        assert_eq!(n_trimmed, 3);
+        assert_eq!(cache.offset, 1);
+        assert_eq!(
+            cache.buffer_write_idx(),
+            1,
+            "trim must rewind buffer_write_idx so the next update overwrites the correct slot"
+        );
+
+        // Trim more than what's live: clamps to the live window.
+        let n_trimmed = cache.trim(10);
+        assert_eq!(n_trimmed, 1);
+        assert_eq!(cache.offset, 0);
+        assert_eq!(cache.buffer_write_idx(), 0);
+
+        // Trim on an empty cache: no-op.
+        let n_trimmed = cache.trim(5);
+        assert_eq!(n_trimmed, 0);
+        assert_eq!(cache.offset, 0);
+        assert_eq!(cache.buffer_write_idx(), 0);
+
+        // Negative / zero argument: no-op (matches `if n <= 0` guard).
+        let mut cache2 = RotatingKVCache::new(32);
+        cache2.update_and_fetch(val(1.0), val(10.0));
+        cache2.update_and_fetch(val(2.0), val(20.0));
+        let pre_offset = cache2.offset;
+        let pre_idx = cache2.buffer_write_idx();
+        assert_eq!(cache2.trim(0), 0);
+        assert_eq!(cache2.trim(-3), 0);
+        assert_eq!(cache2.offset, pre_offset);
+        assert_eq!(cache2.buffer_write_idx(), pre_idx);
+    }
+
+    /// Read the dense scalar at index `[b, h, t, d]` from a 4-D MLX
+    /// array, casting to f32. The cache buffers in the tests below
+    /// live in fp16 (the default `KVCacheMode::Fp16` path); fetching
+    /// through f32 is the cheapest way to verify per-cell content
+    /// without depending on bf16/f16 binary representations.
+    fn at(arr: &mlxcel_core::MlxArray, indices: &[i32; 4]) -> f32 {
+        let stops = [
+            indices[0] + 1,
+            indices[1] + 1,
+            indices[2] + 1,
+            indices[3] + 1,
+        ];
+        let cell = mlxcel_core::slice(arr, indices, &stops);
+        let cell_f32 = mlxcel_core::astype(&cell, mlxcel_core::dtype::FLOAT32);
+        mlxcel_core::item_f32(&cell_f32)
+    }
+
+    /// Build a [B, H=1, max_size, D=1] rotating cache primed with
+    /// monotonically increasing values per row so we can detect which
+    /// cells got zeroed. Row 0 uses positive values (1..=max_size);
+    /// row 1 uses negative values (-1..=-max_size). The distinct sign
+    /// per row makes assertions readable.
+    ///
+    /// Strategy: drive `update_and_fetch` with junk values `write_idx`
+    /// times so the internal `idx` advances to the desired write
+    /// position (and the rotating-cache state machine is in a known
+    /// good state), then overwrite the now-allocated `keys` / `values`
+    /// buffers with our primed content. `idx == offset` while the
+    /// buffer hasn't wrapped (the common rollback regime), which is
+    /// what every Gemma 4 MTP rollback call hits.
+    fn build_primed_rotating_cache(max_size: i32, write_idx: i32, batch: i32) -> RotatingKVCache {
+        let total = (batch * max_size) as usize;
+        let mut k_vals: Vec<f32> = Vec::with_capacity(total);
+        let mut v_vals: Vec<f32> = Vec::with_capacity(total);
+        for bi in 0..batch {
+            for t in 0..max_size {
+                let sign: f32 = if bi == 0 { 1.0 } else { -1.0 };
+                k_vals.push(sign * (t as f32 + 1.0));
+                v_vals.push(sign * 10.0 * (t as f32 + 1.0));
+            }
+        }
+        let shape = [batch, 1, max_size, 1];
+
+        let mut warmed = RotatingKVCache::new(max_size);
+        let val = |x: f32| {
+            let v: Vec<f32> = vec![x; batch as usize];
+            mlxcel_core::from_slice_f32(&v, &[batch, 1, 1, 1])
+        };
+        for _ in 0..write_idx {
+            warmed.update_and_fetch(val(0.0), val(0.0));
+        }
+        warmed.keys = Some(mlxcel_core::from_slice_f32(&k_vals, &shape));
+        warmed.values = Some(mlxcel_core::from_slice_f32(&v_vals, &shape));
+        debug_assert_eq!(warmed.offset, write_idx);
+        debug_assert_eq!(warmed.buffer_write_idx(), write_idx);
+        warmed
+    }
+
+    /// Per-row tail-zero must zero ONLY rows whose accept count is
+    /// below `max(accepted)`. With block_size = 4, accepted = [3, 1]:
+    /// max_a = 3, n = 4, verify_start = kv_len - 4 = 0, ve = [4, 2].
+    /// Row 0: start = 0 + 4 = 4 == kv_len -> no zero (full-accept).
+    /// Row 1: start = 0 + 2 = 2 < 4 -> zero positions [2, 4) in row 1.
+    #[test]
+    #[ignore = "requires serial MLX execution"]
+    fn cache_zero_partial_accept_tail_zeros_only_partial_rows_in_rotating() {
+        let warmed = build_primed_rotating_cache(
+            /*max_size=*/ 8, /*write_idx=*/ 4, /*batch=*/ 2,
+        );
+        let mut cache = Cache::Rotating(warmed);
+        let valid_ends = vec![4i32, 2i32];
+        cache
+            .zero_partial_accept_tail(&valid_ends, /*block_size=*/ 4)
+            .expect("zero_partial_accept_tail must succeed on well-formed input");
+
+        let rotating = match &cache {
+            Cache::Rotating(c) => c,
+            _ => unreachable!(),
+        };
+        let keys = rotating.keys.as_ref().unwrap();
+        let values = rotating.values.as_ref().unwrap();
+
+        // Row 0: untouched — original values at positions 0..4 are
+        // 1.0, 2.0, 3.0, 4.0 in keys (positive sign).
+        for t in 0..4 {
+            let k = at(keys, &[0, 0, t, 0]);
+            let v = at(values, &[0, 0, t, 0]);
+            assert!(
+                (k - (t as f32 + 1.0)).abs() < 1e-3,
+                "row 0 K[{t}] must be unchanged, got {k}, expected {}",
+                t as f32 + 1.0
+            );
+            assert!(
+                (v - 10.0 * (t as f32 + 1.0)).abs() < 1e-3,
+                "row 0 V[{t}] must be unchanged, got {v}"
+            );
+        }
+        // Row 1: positions 0..2 untouched (still negative-signed),
+        // positions 2..4 zeroed.
+        for t in 0..2 {
+            let k = at(keys, &[1, 0, t, 0]);
+            let v = at(values, &[1, 0, t, 0]);
+            assert!(
+                (k - (-(t as f32 + 1.0))).abs() < 1e-3,
+                "row 1 K[{t}] must be unchanged (pre-verify), got {k}"
+            );
+            assert!(
+                (v - (-10.0 * (t as f32 + 1.0))).abs() < 1e-3,
+                "row 1 V[{t}] must be unchanged (pre-verify), got {v}"
+            );
+        }
+        for t in 2..4 {
+            let k = at(keys, &[1, 0, t, 0]);
+            let v = at(values, &[1, 0, t, 0]);
+            assert!(
+                k.abs() < 1e-3,
+                "row 1 K[{t}] must be zeroed (partial-accept tail), got {k}"
+            );
+            assert!(
+                v.abs() < 1e-3,
+                "row 1 V[{t}] must be zeroed (partial-accept tail), got {v}"
+            );
+        }
+    }
+
+    /// `Cache::Standard` (dense `KVCache`) must be a no-op for
+    /// `zero_partial_accept_tail` — Python's hook gates per-row
+    /// zeroing on `hasattr(c, "_idx")`, which only `RotatingKVCache`
+    /// exposes. The dense cache's monotonic trim is sufficient on its
+    /// own because subsequent decode steps overwrite the trimmed
+    /// slots.
+    #[test]
+    fn cache_zero_partial_accept_tail_is_no_op_for_standard_kv() {
+        let mut cache = Cache::Standard(KVCache::new());
+        // Empty standard cache: still a no-op (no err).
+        let valid_ends = vec![1i32, 2i32];
+        cache
+            .zero_partial_accept_tail(&valid_ends, 4)
+            .expect("Standard cache must accept zero_partial_accept_tail as a no-op");
+    }
+
+    /// Sink-aware forward must populate `hidden_sink` (last-layer
+    /// pre-norm) and `shared_kv_sink["sliding_attention"]` (the only
+    /// attention type in the synthetic 1-layer fixture). Asserts on
+    /// shapes only — the synthetic weights are not tuned for any
+    /// specific output value, but the shape contract is what the MTP
+    /// drafter binds against.
+    #[test]
+    #[ignore = "requires serial MLX execution"]
+    fn gemma4_speculative_sinks_populates_hidden_and_shared_kv() {
+        use super::cache_isolation::build_wrapper;
+        use crate::models::Gemma4SpeculativeSinks;
+        use mlxcel_core::cache::SequenceId;
+        use mlxcel_core::generate::LanguageModel;
+
+        let wrapper = build_wrapper();
+        let seq = SequenceId::from_raw(900);
+        wrapper.prepare_sequence_state(seq);
+
+        let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
+
+        // Prefill 3 tokens so the sliding-attention KV cache has 3
+        // entries to expose to the sink.
+        let prefill = mlxcel_core::from_slice_i32(&[3, 4, 5], &[1, 3]);
+        let logits = wrapper.forward_with_speculative_sinks(
+            &prefill,
+            /*input_embeddings=*/ None,
+            /*per_layer_inputs=*/ None,
+            /*mask=*/ None,
+            Some(seq),
+            /*capture_layer_ids=*/ None,
+            Some(&mut sinks),
+        );
+        mlxcel_core::eval(&logits);
+
+        // Logits shape: [B=1, L=3, vocab=8].
+        let logit_shape = mlxcel_core::array_shape(&logits);
+        assert_eq!(logit_shape, vec![1, 3, 8]);
+
+        // Hidden sink: last-layer pre-norm, [B=1, L=3, hidden=4].
+        let hidden = sinks
+            .hidden_sink
+            .as_ref()
+            .expect("hidden_sink must be Some when with_hidden_and_shared_kv");
+        assert_eq!(
+            hidden.len(),
+            1,
+            "with no capture_layer_ids, exactly one hidden capture (last layer pre-norm) is expected"
+        );
+        assert_eq!(mlxcel_core::array_shape(&hidden[0]), vec![1, 3, 4]);
+
+        // Shared K/V sink: sliding-attention only (the synthetic
+        // fixture has 0 full-attention layers).
+        let kv = sinks
+            .shared_kv_sink
+            .as_ref()
+            .expect("shared_kv_sink must be Some when with_hidden_and_shared_kv");
+        let (k, v) = kv
+            .get("sliding_attention")
+            .expect("sliding_attention K/V slab must be captured");
+        // Rotating cache buffer shape: [B=1, num_kv_heads=1, sliding_window=8, head_dim=2].
+        let k_shape = mlxcel_core::array_shape(k);
+        let v_shape = mlxcel_core::array_shape(v);
+        assert_eq!(k_shape[0], 1, "shared-K batch must be 1");
+        assert_eq!(k_shape[1], 1, "shared-K num_kv_heads must be 1");
+        assert_eq!(k_shape[3], 2, "shared-K head_dim must be 2");
+        assert_eq!(v_shape, k_shape, "shared-V shape must match shared-K");
+        assert!(
+            !kv.contains_key("full_attention"),
+            "fixture has zero full_attention layers, so the full_attention entry must be absent"
+        );
+    }
 }

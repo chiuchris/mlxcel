@@ -119,7 +119,7 @@ pub use gemma::GemmaModel;
 pub use gemma2::Gemma2Model;
 pub use gemma3::{Gemma3Model, Gemma3Wrapper};
 pub use gemma3n::Gemma3nModel;
-pub use gemma4::{Gemma4Model, Gemma4Wrapper};
+pub use gemma4::{Gemma4Model, Gemma4SpeculativeSinks, Gemma4Wrapper};
 pub use glm_moe_dsa::GlmMoeDsaModel;
 pub use glm4::Glm4Model;
 pub use glm4_moe::Glm4MoeModel;

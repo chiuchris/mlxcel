@@ -4019,6 +4019,44 @@ impl RotatingKVCache {
             self.idx.rem_euclid(visible_len)
         }
     }
+
+    /// Internal write position in the ring buffer.
+    ///
+    /// Mirrors Python `mlx_lm.models.cache.RotatingKVCache._idx`. Used by the
+    /// Gemma 4 MTP `rollback_speculative_cache` hook (issue #625) to compute
+    /// `kv_len` for per-row tail zeroing of partial-accept verify passes.
+    /// Equal to `self.offset` while the cache has not yet wrapped, and
+    /// otherwise tracks the next physical write slot in the rotating buffer.
+    pub fn buffer_write_idx(&self) -> i32 {
+        self.idx
+    }
+
+    /// Trim the last `n` entries from the rotating cache by rewinding the
+    /// monotonic offset and the buffer write index.
+    ///
+    /// Mirrors Python `mlx_lm.models.cache.RotatingKVCache.trim`
+    /// (`n = min(self.offset, n); self.offset -= n; self._idx -= n`). The
+    /// stored buffer is intentionally not re-sliced: subsequent
+    /// `update_and_fetch` calls overwrite the trimmed window in place at the
+    /// rewound `idx`, exactly matching the rotating-cache semantics in
+    /// upstream mlx-lm. The fetched `[..., :self.offset, :]` view returned
+    /// by the next update reflects only the live region.
+    ///
+    /// The function is bit-identical to Python's helper for non-wrapped
+    /// caches (the typical Gemma 4 MTP rollback case, where `n` is
+    /// `block_size - accepted - 1`, far below the sliding window's
+    /// `max_size`).
+    ///
+    /// Used by: Gemma 4 MTP `rollback_speculative_cache` (issue #625).
+    pub fn trim(&mut self, n: i32) -> i32 {
+        let n = n.min(self.offset);
+        if n <= 0 {
+            return 0;
+        }
+        self.offset -= n;
+        self.idx -= n;
+        n
+    }
 }
 
 impl Default for RotatingKVCache {
