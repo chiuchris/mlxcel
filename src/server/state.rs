@@ -26,7 +26,9 @@ use crate::distributed::pipeline::{PipelineObservability, PpTracer};
 use crate::tokenizer::MlxcelTokenizer;
 
 use super::batch::BatchObservability;
+use super::conversation_store::ConversationStore;
 use super::prompt_cache::{PromptCacheStore, metrics::PromptCacheMetrics};
+use super::responses_store::ResponsesStore;
 use super::{ChatTemplateProcessor, ModelProvider, ServerConfig};
 
 /// Server-wide metrics counters (atomic, lock-free).
@@ -308,6 +310,15 @@ pub struct AppState {
     /// publish and adopt detached caches. HTTP handlers may only call
     /// read-only observation methods on this store.
     pub prompt_cache: Option<Arc<PromptCacheStore>>,
+    /// Issue #622: in-memory store backing `POST /v1/responses` with
+    /// `store=true`, `GET /v1/responses/:id`, and `previous_response_id`
+    /// chaining. `None` when the operator passed
+    /// `--responses-store-max-entries 0`.
+    pub responses_store: Option<Arc<ResponsesStore>>,
+    /// Issue #622: in-memory conversation transcripts referenced by the
+    /// `conversation` field in Responses-API requests. `None` when the
+    /// store is disabled.
+    pub conversation_store: Option<Arc<ConversationStore>>,
 }
 
 impl AppState {
@@ -333,6 +344,8 @@ impl AppState {
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
             prompt_cache: None,
+            responses_store: None,
+            conversation_store: None,
         }
     }
 
@@ -362,6 +375,8 @@ impl AppState {
             pp_observability: Arc::new(PipelineObservability::new()),
             pp_tracer: None,
             prompt_cache: None,
+            responses_store: None,
+            conversation_store: None,
         }
     }
 
@@ -380,6 +395,24 @@ impl AppState {
     #[must_use]
     pub fn with_prompt_cache(mut self, store: Option<Arc<PromptCacheStore>>) -> Self {
         self.prompt_cache = store;
+        self
+    }
+
+    /// Attach the Responses-API in-memory response store (issue #622).
+    /// Pass `None` to disable response persistence (and reject any request
+    /// that depends on it: `GET /v1/responses/:id`, `previous_response_id`).
+    #[must_use]
+    pub fn with_responses_store(mut self, store: Option<Arc<ResponsesStore>>) -> Self {
+        self.responses_store = store;
+        self
+    }
+
+    /// Attach the Responses-API conversation store (issue #622). Pass
+    /// `None` to disable; requests referencing `conversation` will still
+    /// be accepted but will not be replayed against the missing transcript.
+    #[must_use]
+    pub fn with_conversation_store(mut self, store: Option<Arc<ConversationStore>>) -> Self {
+        self.conversation_store = store;
         self
     }
 

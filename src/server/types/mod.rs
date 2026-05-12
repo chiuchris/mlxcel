@@ -16,8 +16,14 @@
 
 pub mod request;
 pub mod response;
+pub mod responses_request;
+pub mod responses_response;
+pub mod responses_stream;
 pub mod stream;
 
 pub use request::*;
 pub use response::*;
+pub use responses_request::*;
+pub use responses_response::*;
+pub use responses_stream::*;
 pub use stream::*;

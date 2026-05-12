@@ -197,6 +197,13 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         // clap reads `LLAMA_ARG_MAX_KV_SIZE` directly via the `env = ...`
         // attribute on the flag, so no separate env-fallback helper is needed.
         max_kv_size: args.max_kv_size,
+        // Issue #622: Responses API in-memory store limits. clap reads the
+        // matching `LLAMA_ARG_*` env vars directly via the `env = ...`
+        // attributes on the flags.
+        responses_store_max_entries: args.responses_store_max_entries,
+        responses_store_ttl_secs: args.responses_store_ttl_secs,
+        conversation_store_max_entries: args.conversation_store_max_entries,
+        conversation_store_ttl_secs: args.conversation_store_ttl_secs,
     })
 }
 

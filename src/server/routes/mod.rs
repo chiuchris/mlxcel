@@ -27,6 +27,7 @@ pub mod metrics;
 pub mod models;
 pub mod native_completion;
 pub mod props;
+pub mod responses;
 pub mod slots;
 pub mod tokenize;
 
@@ -39,5 +40,6 @@ pub use metrics::metrics;
 pub use models::list_models;
 pub use native_completion::native_completion;
 pub use props::props;
+pub use responses::{cancel_response, create_response, delete_response, retrieve_response};
 pub use slots::slots;
 pub use tokenize::tokenize;

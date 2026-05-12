@@ -129,6 +129,11 @@ fn sample_input() -> ServerStartupInput {
         kv_skip_last_layer: true,
         // Issue #603: max KV cache size (0 = unbounded, the default).
         max_kv_size: 0,
+        // Issue #622: Responses API store defaults.
+        responses_store_max_entries: 1024,
+        responses_store_ttl_secs: 3600,
+        conversation_store_max_entries: 256,
+        conversation_store_ttl_secs: 3600,
     }
 }
 

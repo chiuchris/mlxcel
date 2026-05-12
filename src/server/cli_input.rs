@@ -334,6 +334,17 @@ pub struct ServerStartupInput {
     // `[MAX_KV_SIZE_MIN, i32::MAX]`.
     /// `--max-kv-size` value (`0` = disabled, the default).
     pub max_kv_size: usize,
+
+    /// Issue #622: `--responses-store-max-entries` value (`0` disables
+    /// the OpenAI Responses API response store entirely).
+    pub responses_store_max_entries: usize,
+    /// Issue #622: `--responses-store-ttl-secs` value (`0` disables TTL).
+    pub responses_store_ttl_secs: u64,
+    /// Issue #622: `--conversation-store-max-entries` value (`0` disables
+    /// the OpenAI Responses API conversation transcript store entirely).
+    pub conversation_store_max_entries: usize,
+    /// Issue #622: `--conversation-store-ttl-secs` value (`0` disables TTL).
+    pub conversation_store_ttl_secs: u64,
 }
 
 impl ServerStartupInput {
@@ -503,6 +514,11 @@ impl ServerStartupInput {
             // semantic `Option<usize>` after `resolve_max_kv_size` has
             // validated upper and lower bounds (H1 fix).
             max_kv_size: resolved_max_kv_size,
+            // Issue #622: forward the Responses-API store limits.
+            responses_store_max_entries: self.responses_store_max_entries,
+            responses_store_ttl_secs: self.responses_store_ttl_secs,
+            conversation_store_max_entries: self.conversation_store_max_entries,
+            conversation_store_ttl_secs: self.conversation_store_ttl_secs,
         })
     }
 }

@@ -444,6 +444,55 @@ pub(crate) struct ServeArgs {
     )]
     max_kv_size: usize,
 
+    /// Issue #622: maximum number of responses persisted by the OpenAI
+    /// `/v1/responses` store (in-memory). `0` disables persistence
+    /// entirely, in which case `GET /v1/responses/:id` and
+    /// `previous_response_id` chaining return 400.
+    /// Also reads `LLAMA_ARG_RESPONSES_STORE_MAX_ENTRIES`.
+    #[arg(
+        long = "responses-store-max-entries",
+        env = "LLAMA_ARG_RESPONSES_STORE_MAX_ENTRIES",
+        default_value_t = 1024,
+        value_name = "N"
+    )]
+    responses_store_max_entries: usize,
+
+    /// Issue #622: TTL (seconds) for in-memory Responses-API response
+    /// entries. `0` disables TTL — entries are evicted only when the
+    /// max-entries cap is hit.
+    /// Also reads `LLAMA_ARG_RESPONSES_STORE_TTL_SECS`.
+    #[arg(
+        long = "responses-store-ttl-secs",
+        env = "LLAMA_ARG_RESPONSES_STORE_TTL_SECS",
+        default_value_t = 3600,
+        value_name = "SECS"
+    )]
+    responses_store_ttl_secs: u64,
+
+    /// Issue #622: maximum number of conversation transcripts persisted
+    /// for the OpenAI Responses API `conversation` field. `0` disables
+    /// the conversation store; requests referencing `conversation` are
+    /// still accepted but operate against an empty transcript.
+    /// Also reads `LLAMA_ARG_CONVERSATION_STORE_MAX_ENTRIES`.
+    #[arg(
+        long = "conversation-store-max-entries",
+        env = "LLAMA_ARG_CONVERSATION_STORE_MAX_ENTRIES",
+        default_value_t = 256,
+        value_name = "N"
+    )]
+    conversation_store_max_entries: usize,
+
+    /// Issue #622: TTL (seconds) for conversation transcript entries.
+    /// `0` disables TTL.
+    /// Also reads `LLAMA_ARG_CONVERSATION_STORE_TTL_SECS`.
+    #[arg(
+        long = "conversation-store-ttl-secs",
+        env = "LLAMA_ARG_CONVERSATION_STORE_TTL_SECS",
+        default_value_t = 3600,
+        value_name = "SECS"
+    )]
+    conversation_store_ttl_secs: u64,
+
     /// Request timeout in seconds
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,

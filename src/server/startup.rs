@@ -271,6 +271,24 @@ pub struct ServerStartupConfig {
     /// corresponding field on [`crate::server::ServerConfig`] for full
     /// semantics.
     pub max_kv_size: Option<usize>,
+
+    /// Issue #622: maximum number of responses kept in the
+    /// [`crate::server::responses_store::ResponsesStore`]. `0` disables
+    /// response persistence entirely, in which case `GET /v1/responses/:id`
+    /// and `previous_response_id` return 400. Resolved from
+    /// `--responses-store-max-entries` / `LLAMA_ARG_RESPONSES_STORE_MAX_ENTRIES`.
+    pub responses_store_max_entries: usize,
+    /// Issue #622: TTL (seconds) for in-memory response store entries.
+    /// `0` disables TTL (entries are evicted only by capacity pressure).
+    /// Resolved from `--responses-store-ttl-secs` / `LLAMA_ARG_RESPONSES_STORE_TTL_SECS`.
+    pub responses_store_ttl_secs: u64,
+    /// Issue #622: capacity cap for the conversation transcript store.
+    /// `0` disables the store; requests referencing `conversation` still
+    /// succeed but operate as if the transcript is empty.
+    pub conversation_store_max_entries: usize,
+    /// Issue #622: TTL (seconds) for conversation transcripts. `0`
+    /// disables TTL.
+    pub conversation_store_ttl_secs: u64,
 }
 
 impl Default for ServerStartupConfig {
@@ -355,6 +373,10 @@ impl Default for ServerStartupConfig {
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None,
+            responses_store_max_entries: 1024,
+            responses_store_ttl_secs: 3600,
+            conversation_store_max_entries: 256,
+            conversation_store_ttl_secs: 3600,
         }
     }
 }
@@ -1420,6 +1442,41 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     // defence-in-depth.
     warn_on_insecure_video_allowlist();
 
+    // Issue #622: build the Responses-API stores from the resolved limits.
+    // `max_entries = 0` disables the store entirely; otherwise build with
+    // the configured TTL (a TTL of 0 means "no TTL" which we map to a
+    // very large duration so the sweep is a no-op).
+    let responses_store = if startup.responses_store_max_entries == 0 {
+        None
+    } else {
+        let ttl = if startup.responses_store_ttl_secs == 0 {
+            std::time::Duration::from_secs(u64::MAX / 2)
+        } else {
+            std::time::Duration::from_secs(startup.responses_store_ttl_secs)
+        };
+        Some(Arc::new(super::responses_store::ResponsesStore::new(
+            super::responses_store::ResponsesStoreConfig {
+                max_entries: startup.responses_store_max_entries,
+                ttl,
+            },
+        )))
+    };
+    let conversation_store = if startup.conversation_store_max_entries == 0 {
+        None
+    } else {
+        let ttl = if startup.conversation_store_ttl_secs == 0 {
+            std::time::Duration::from_secs(u64::MAX / 2)
+        } else {
+            std::time::Duration::from_secs(startup.conversation_store_ttl_secs)
+        };
+        Some(Arc::new(super::conversation_store::ConversationStore::new(
+            super::conversation_store::ConversationStoreConfig {
+                max_entries: startup.conversation_store_max_entries,
+                ttl,
+            },
+        )))
+    };
+
     let state = AppState::with_observability(
         model_provider,
         config,
@@ -1431,7 +1488,9 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     )
     .with_media_support(media_support)
     .with_pp_tracer(pp_tracer)
-    .with_prompt_cache(prompt_cache_store);
+    .with_prompt_cache(prompt_cache_store)
+    .with_responses_store(responses_store)
+    .with_conversation_store(conversation_store);
     let app = create_app(state);
 
     if startup.port == 0 {

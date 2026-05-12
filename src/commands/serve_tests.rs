@@ -115,6 +115,10 @@ fn sample_args() -> crate::ServeArgs {
         apc_block_size: None,
         apc_num_blocks: None,
         apc_hash: None,
+        responses_store_max_entries: 1024,
+        responses_store_ttl_secs: 3600,
+        conversation_store_max_entries: 256,
+        conversation_store_ttl_secs: 3600,
     }
 }
 

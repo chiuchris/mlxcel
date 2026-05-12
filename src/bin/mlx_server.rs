@@ -285,6 +285,50 @@ struct ServerArgs {
     )]
     max_kv_size: usize,
 
+    /// Issue #622: maximum number of responses persisted by the OpenAI
+    /// `/v1/responses` store (in-memory). `0` disables persistence
+    /// entirely. Also reads `LLAMA_ARG_RESPONSES_STORE_MAX_ENTRIES`.
+    #[arg(
+        long = "responses-store-max-entries",
+        env = "LLAMA_ARG_RESPONSES_STORE_MAX_ENTRIES",
+        default_value_t = 1024,
+        value_name = "N"
+    )]
+    responses_store_max_entries: usize,
+
+    /// Issue #622: TTL (seconds) for in-memory Responses-API response
+    /// entries. `0` disables TTL.
+    /// Also reads `LLAMA_ARG_RESPONSES_STORE_TTL_SECS`.
+    #[arg(
+        long = "responses-store-ttl-secs",
+        env = "LLAMA_ARG_RESPONSES_STORE_TTL_SECS",
+        default_value_t = 3600,
+        value_name = "SECS"
+    )]
+    responses_store_ttl_secs: u64,
+
+    /// Issue #622: maximum number of conversation transcripts persisted
+    /// for the OpenAI Responses API `conversation` field. `0` disables.
+    /// Also reads `LLAMA_ARG_CONVERSATION_STORE_MAX_ENTRIES`.
+    #[arg(
+        long = "conversation-store-max-entries",
+        env = "LLAMA_ARG_CONVERSATION_STORE_MAX_ENTRIES",
+        default_value_t = 256,
+        value_name = "N"
+    )]
+    conversation_store_max_entries: usize,
+
+    /// Issue #622: TTL (seconds) for conversation transcript entries.
+    /// `0` disables TTL.
+    /// Also reads `LLAMA_ARG_CONVERSATION_STORE_TTL_SECS`.
+    #[arg(
+        long = "conversation-store-ttl-secs",
+        env = "LLAMA_ARG_CONVERSATION_STORE_TTL_SECS",
+        default_value_t = 3600,
+        value_name = "SECS"
+    )]
+    conversation_store_ttl_secs: u64,
+
     /// Override chat template (Jinja2 template string)
     #[arg(long = "chat-template", value_name = "TEMPLATE")]
     chat_template: Option<String>,
@@ -1023,5 +1067,12 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         // clap reads `LLAMA_ARG_MAX_KV_SIZE` directly via the `env = ...`
         // attribute on the flag, so no separate env-fallback helper is needed.
         max_kv_size: args.max_kv_size,
+        // Issue #622: Responses API in-memory store limits. clap reads the
+        // matching `LLAMA_ARG_*` env vars directly via the `env = ...`
+        // attributes on the flags.
+        responses_store_max_entries: args.responses_store_max_entries,
+        responses_store_ttl_secs: args.responses_store_ttl_secs,
+        conversation_store_max_entries: args.conversation_store_max_entries,
+        conversation_store_ttl_secs: args.conversation_store_ttl_secs,
     })
 }
