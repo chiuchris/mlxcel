@@ -85,6 +85,12 @@ use std::fs;
 use std::path::Path;
 use std::sync::OnceLock;
 
+/// Centroid-routed sparse softmax LM head used by Gemma 4 E2B / E4B
+/// assistant drafters. Wired into `Gemma4AssistantDraftModel` in sub-3
+/// (#626) — landed here independently per issue #627 so the layer can
+/// be unit-tested in isolation before integration.
+pub mod masked_embedder;
+
 /// Drafter shapes recognised by mlxcel.
 ///
 /// Each variant selects a fundamentally different round-loop driver and a
