@@ -1811,6 +1811,7 @@ dependencies = [
  "minijinja",
  "mlxcel-core",
  "path-clean",
+ "percent-encoding",
  "reqwest",
  "safetensors",
  "sentencepiece",

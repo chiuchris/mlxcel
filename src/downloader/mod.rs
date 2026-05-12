@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! HuggingFace model repository downloader (issues #457, #648).
+//! HuggingFace model repository downloader (issues #457, #648, #650).
 //!
 //! Provides a single source of truth for downloading model snapshots from the
 //! HuggingFace Hub. Both the `mlxcel` CLI and the `mlxcel-server` binary call
@@ -26,7 +26,9 @@
 //!   model families work without code changes; non-MLX artifacts (`*.bin`,
 //!   `*.gguf`, ...) are skipped to save bandwidth and disk.
 //! - **Token resolution order** — explicit `--token` > `HF_TOKEN` env >
-//!   `HUGGING_FACE_HUB_TOKEN` env > anonymous.
+//!   `HUGGING_FACE_HUB_TOKEN` env > anonymous. Tokens are validated to be
+//!   pure printable-ASCII (no control chars) before they are used in an
+//!   `Authorization` header (issue #650, L3).
 //! - **Default destination** — `models/<repo_basename>` under the current
 //!   working directory, mirroring the `CLAUDE.md` "Testing Models" convention.
 //! - **Caching** — without `--force`, an existing snapshot with all expected
@@ -38,6 +40,37 @@
 //!   When bars are suppressed (CI, piped output, `MLXCEL_NO_PROGRESS=1`,
 //!   `NO_COLOR=1`), one stdout line per file is emitted instead so CI logs
 //!   remain golden-text-stable.
+//!
+//! # Hardening (issue #650)
+//!
+//! - **Plaintext-endpoint refusal** — if `HF_ENDPOINT` is set to a non-HTTPS
+//!   URL *and* a token is resolved, [`download_repo`] aborts with a clear
+//!   error so the bearer token is never leaked over plaintext HTTP. The
+//!   reqwest client is additionally built with `https_only(true)` when a
+//!   token is in use, so a same-host HTTPS→HTTP redirect cannot smuggle the
+//!   bearer header onto plaintext either. Set `MLXCEL_ALLOW_INSECURE_ENDPOINT=1`
+//!   to opt back out (intended for internal mirrors fronted by an
+//!   HTTPS-terminated reverse proxy on a trusted network).
+//! - **Network timeouts** — the shared `reqwest::Client` is built with
+//!   `connect_timeout(10s)` and `read_timeout(30s)`. A stalled mirror or
+//!   half-closed TCP connection therefore fails fast instead of hanging the
+//!   CLI/server indefinitely. Total elapsed download time is intentionally
+//!   unbounded (large files take time); only inactivity is bounded.
+//! - **URL segment encoding** — `repo_id`, `revision`, and `filename` are
+//!   percent-encoded per-segment when composing the GET/HEAD URL so that
+//!   adversarial repo metadata containing `?`, `#`, or other reserved
+//!   characters cannot smuggle a query string or fragment past the request.
+//! - **Symlink-safe tempfiles** — on Unix the partial-download tempfile is
+//!   opened with `O_CREAT|O_EXCL|O_NOFOLLOW`, so an attacker who pre-stages
+//!   a symlink at the predicted tempfile path cannot redirect our writes.
+//! - **Stale tempfile cleanup** — at the start of every download, partial
+//!   files named `.mlxcel-partial.*` older than one hour are removed
+//!   best-effort. Younger partials are left alone to avoid racing with a
+//!   concurrent `mlxcel` process targeting the same directory.
+//! - **Parallel HEAD prefetch** — per-file size discovery uses
+//!   `futures::stream::iter(...).buffer_unordered(8)` so progress bars and
+//!   aggregate totals are accurate without paying N sequential HEAD RTTs
+//!   before the first byte streams.
 
 mod cli;
 mod errors;
@@ -53,10 +86,60 @@ use anyhow::{Context, Result, anyhow};
 use futures::StreamExt;
 use hf_hub::api::sync::{Api, ApiBuilder};
 use hf_hub::{Repo, RepoType};
+use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant, SystemTime};
 use tokio::io::AsyncWriteExt;
+
+/// Characters NOT allowed in a single URL path segment.
+///
+/// We start from `CONTROLS` (RFC 3986 reserves all control chars in path
+/// components) and add every byte that is reserved or unsafe within a single
+/// path segment, namely the gen-delims `?`, `#`, `/`, `:`, `@`, `[`, `]`, the
+/// sub-delims `!`, `$`, `&`, `'`, `(`, `)`, `*`, `+`, `,`, `;`, `=`, plus
+/// `%`, `\`, `"`, `<`, `>`, ` `, `^`, `\``, `{`, `|`, `}`. The unreserved set
+/// per RFC 3986 (alphanumerics plus `-`, `.`, `_`, `~`) is preserved.
+///
+/// Used by [`file_url`] to encode each `/`-separated segment of `repo_id`,
+/// `revision`, and `filename` so adversarial metadata cannot smuggle a query
+/// string or fragment past the URL composition step.
+const SEGMENT_ENCODE_SET: &AsciiSet = &CONTROLS
+    .add(b' ')
+    .add(b'"')
+    .add(b'#')
+    .add(b'%')
+    .add(b'&')
+    .add(b'\'')
+    .add(b'(')
+    .add(b')')
+    .add(b'*')
+    .add(b'+')
+    .add(b',')
+    .add(b'/')
+    .add(b':')
+    .add(b';')
+    .add(b'<')
+    .add(b'=')
+    .add(b'>')
+    .add(b'?')
+    .add(b'@')
+    .add(b'[')
+    .add(b'\\')
+    .add(b']')
+    .add(b'^')
+    .add(b'`')
+    .add(b'{')
+    .add(b'|')
+    .add(b'}')
+    .add(b'!')
+    .add(b'$');
+
+/// Age threshold for `.mlxcel-partial.*` orphan cleanup (issue #650, L5).
+///
+/// Younger partial files are left in place to avoid racing against a concurrent
+/// `mlxcel` process that is mid-download in the same destination directory.
+const PARTIAL_TEMPFILE_STALE_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Resolved options for a download invocation.
 ///
@@ -111,7 +194,10 @@ impl DownloadOptions {
 ///
 /// Empty values from environment variables are treated as anonymous so that
 /// `HF_TOKEN=""` does not poison the request with a malformed `Authorization`
-/// header.
+/// header. Tokens containing non-ASCII bytes or ASCII control characters
+/// (issue #650, L3) are still returned here so the caller can produce a
+/// targeted error message that names the env var or flag — see
+/// [`validate_token`] which is invoked at HTTP-client construction time.
 pub fn resolve_token(explicit: Option<&str>) -> Option<String> {
     if let Some(t) = explicit {
         let trimmed = t.trim();
@@ -128,6 +214,27 @@ pub fn resolve_token(explicit: Option<&str>) -> Option<String> {
         }
     }
     None
+}
+
+/// Reject HF tokens containing non-ASCII bytes or ASCII control characters
+/// (issue #650, L3). Returns the original token slice on success.
+///
+/// `HeaderValue::from_str` would also reject these values, but we want a
+/// domain-specific error message (mentions HF token, env var, control chars)
+/// instead of reqwest's generic `InvalidHeaderValue`.
+fn validate_token(token: &str) -> Result<&str> {
+    if let Some((idx, ch)) = token
+        .chars()
+        .enumerate()
+        .find(|(_, c)| !c.is_ascii() || c.is_ascii_control())
+    {
+        return Err(anyhow!(
+            "HF token contains invalid characters (must be ASCII, no control chars): \
+             byte index {idx} is U+{:04X}",
+            ch as u32
+        ));
+    }
+    Ok(token)
 }
 
 /// Build a configured `hf-hub` [`Api`] honoring the resolved auth token.
@@ -164,9 +271,134 @@ fn hf_endpoint() -> String {
         .unwrap_or_else(|| "https://huggingface.co".to_string())
 }
 
+/// Env var that opts out of the M1 plaintext-endpoint refusal (issue #650).
+///
+/// When set to any non-empty value, [`require_secure_endpoint_for_token`]
+/// allows a `Bearer` token to be sent over a non-HTTPS endpoint. Intended
+/// for internal mirrors fronted by an HTTPS-terminated reverse proxy on a
+/// trusted network where the operator has audited the path.
+const INSECURE_ENDPOINT_OPT_OUT: &str = "MLXCEL_ALLOW_INSECURE_ENDPOINT";
+
+/// Return `true` when `MLXCEL_ALLOW_INSECURE_ENDPOINT` is set to a non-empty,
+/// non-whitespace value.
+///
+/// Shared between [`require_secure_endpoint_for_token`] (initial-scheme guard)
+/// and the reqwest client builder (`.https_only(true)` redirect guard) so both
+/// honor the same operator escape hatch.
+fn is_insecure_endpoint_opt_out() -> bool {
+    matches!(std::env::var(INSECURE_ENDPOINT_OPT_OUT), Ok(val) if !val.trim().is_empty())
+}
+
+/// Refuse plaintext endpoints when a token would be transmitted (M1).
+///
+/// Returns `Ok(())` for anonymous downloads regardless of scheme, and for
+/// authenticated downloads only when `endpoint` starts with `https://`
+/// (case-insensitive) or the operator has explicitly set
+/// `MLXCEL_ALLOW_INSECURE_ENDPOINT=<non-empty>`.
+fn require_secure_endpoint_for_token(endpoint: &str, token: Option<&str>) -> Result<()> {
+    if token.is_none() {
+        return Ok(());
+    }
+    let lower = endpoint.trim().to_ascii_lowercase();
+    if lower.starts_with("https://") {
+        return Ok(());
+    }
+    if is_insecure_endpoint_opt_out() {
+        eprintln!(
+            "[mlxcel download] warning: {INSECURE_ENDPOINT_OPT_OUT} is set; sending HF token over \
+             plaintext endpoint '{endpoint}'. The token can be intercepted on the network path."
+        );
+        return Ok(());
+    }
+    Err(anyhow!(
+        "HF_ENDPOINT '{endpoint}' must use HTTPS when an auth token is set. \
+         Set {INSECURE_ENDPOINT_OPT_OUT}=1 to override at your own risk."
+    ))
+}
+
+/// Best-effort cleanup of stale `.mlxcel-partial.*` orphans (issue #650, L5).
+///
+/// Walks `local_dir` (non-recursive) and removes regular files whose basename
+/// starts with `.mlxcel-partial.` and whose last-modified timestamp is older
+/// than [`PARTIAL_TEMPFILE_STALE_AGE`]. Any I/O error (including failure to
+/// read the directory) is logged to stderr and otherwise ignored — this is
+/// disk-hygiene, not a security boundary.
+fn cleanup_stale_partials(local_dir: &Path) {
+    let now = SystemTime::now();
+    let read_dir = match fs::read_dir(local_dir) {
+        Ok(d) => d,
+        Err(err) => {
+            eprintln!(
+                "[mlxcel download] warning: could not scan {} for stale partials: {err}",
+                local_dir.display()
+            );
+            return;
+        }
+    };
+    for entry in read_dir.flatten() {
+        let name = entry.file_name();
+        let name_str = match name.to_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        if !name_str.starts_with(".mlxcel-partial.") {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match fs::metadata(&path) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let modified = match metadata.modified() {
+            Ok(t) => t,
+            Err(_) => continue,
+        };
+        let age = match now.duration_since(modified) {
+            Ok(d) => d,
+            Err(_) => {
+                // Future-mtime — assume it is racing in-flight; skip.
+                continue;
+            }
+        };
+        if age < PARTIAL_TEMPFILE_STALE_AGE {
+            continue;
+        }
+        if let Err(err) = fs::remove_file(&path) {
+            eprintln!(
+                "[mlxcel download] warning: failed to remove stale partial {}: {err}",
+                path.display()
+            );
+        }
+    }
+}
+
+/// Percent-encode every `/`-separated segment of `path` using
+/// [`SEGMENT_ENCODE_SET`] and reassemble them with `/`.
+///
+/// Empty segments (e.g. from a leading or duplicate `/`) are preserved verbatim
+/// so the caller still gets back exactly the same number of segments.
+fn encode_path_segments(path: &str) -> String {
+    path.split('/')
+        .map(|seg| utf8_percent_encode(seg, SEGMENT_ENCODE_SET).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// Build the download URL for a single file in a HuggingFace repository.
+///
+/// Every path segment of `repo_id`, `revision`, and `filename` is
+/// percent-encoded (issue #650, L1) so adversarial metadata containing `?`,
+/// `#`, or other reserved characters cannot smuggle a query string or
+/// fragment past the URL composition step. `endpoint` is treated as a
+/// trusted base URL (env-controlled by the operator) and is not re-encoded.
 fn file_url(endpoint: &str, repo_id: &str, revision: &str, filename: &str) -> String {
-    format!("{endpoint}/{repo_id}/resolve/{revision}/{filename}")
+    let repo_enc = encode_path_segments(repo_id);
+    let rev_enc = encode_path_segments(revision);
+    let file_enc = encode_path_segments(filename);
+    format!("{endpoint}/{repo_enc}/resolve/{rev_enc}/{file_enc}")
 }
 
 /// Download a single file via reqwest streaming, ticking the per-file and
@@ -202,6 +434,51 @@ async fn stream_file(
     result
 }
 
+/// Open the partial-download tempfile in a symlink-safe way (issue #650, L2).
+///
+/// On Unix we open with `O_CREAT | O_EXCL | O_NOFOLLOW` (translated by
+/// `OpenOptions`: `create_new(true)` provides `O_CREAT|O_EXCL`, and the
+/// explicit `custom_flags(libc::O_NOFOLLOW)` adds belt-and-suspenders so that
+/// even if an attacker wins the EEXIST race by hardlinking, the open still
+/// refuses to traverse a symlink. `create_new(true)` is itself sufficient
+/// against the symlink case because `O_EXCL` fails on any existing path
+/// (including a symlink), but `O_NOFOLLOW` makes the intent explicit and
+/// closes any narrow window between metadata stat and open syscall.
+///
+/// On non-Unix targets mlxcel is not officially supported, so we fall back to
+/// the existing `create(truncate=true)` semantics with a comment.
+async fn open_tempfile_no_symlink(tmp: &Path) -> Result<tokio::fs::File> {
+    #[cfg(unix)]
+    {
+        // `tokio::fs::OpenOptions::custom_flags` is an inherent method (not the
+        // trait extension `std::os::unix::fs::OpenOptionsExt`), so it does not
+        // need an explicit `use` import.
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(tmp)
+            .await
+            .with_context(|| {
+                format!(
+                    "Failed to create tempfile at {} (O_CREAT|O_EXCL|O_NOFOLLOW). \
+                     If the path already exists as a symlink or regular file, \
+                     remove it manually and retry.",
+                    tmp.display()
+                )
+            })
+    }
+    #[cfg(not(unix))]
+    {
+        // mlxcel only targets macOS + Linux; this branch exists so the crate
+        // still compiles on Windows / WASM if someone tries. The hardening is
+        // a no-op there.
+        tokio::fs::File::create(tmp)
+            .await
+            .with_context(|| format!("Failed to create tempfile at {}", tmp.display()))
+    }
+}
+
 /// Inner implementation of [`stream_file`]: stream bytes into `tmp`, then
 /// atomically rename to `dest`. Callers are responsible for cleaning up `tmp`
 /// on error.
@@ -214,6 +491,13 @@ async fn stream_to_tempfile(
     file_pb: &indicatif::ProgressBar,
     aggregate_pb: &indicatif::ProgressBar,
 ) -> Result<u64> {
+    // Open the tempfile FIRST so that an adversary cannot pre-stage a symlink
+    // at `tmp` between the HTTP response and the actual write. `O_NOFOLLOW`
+    // + `O_EXCL` fail closed on any pre-existing path (issue #650, L2).
+    let mut out = open_tempfile_no_symlink(tmp)
+        .await
+        .with_context(|| format!("Failed to create tempfile for {filename}"))?;
+
     let response = client
         .get(url)
         .send()
@@ -228,10 +512,6 @@ async fn stream_to_tempfile(
              Check authentication (--token / HF_TOKEN) or that the repository exists."
         ));
     }
-
-    let mut out = tokio::fs::File::create(tmp)
-        .await
-        .with_context(|| format!("Failed to create tempfile for {filename}"))?;
 
     let mut stream = response.bytes_stream();
     let mut bytes_written: u64 = 0;
@@ -272,6 +552,15 @@ async fn stream_to_tempfile(
 pub fn download_repo(opts: DownloadOptions) -> Result<()> {
     let local_dir = opts.resolve_local_dir();
     let token = resolve_token(opts.token.as_deref());
+    let endpoint = hf_endpoint();
+
+    // M1 — refuse plaintext endpoints when a token would be sent over the
+    // wire (issue #650). A bearer token sent over `http://` exposes the
+    // long-lived credential to anyone on-path. The opt-out env var exists
+    // for operators who genuinely run an HTTPS-terminated reverse proxy
+    // in front of an internal HTTP mirror on a trusted network.
+    require_secure_endpoint_for_token(&endpoint, token.as_deref())?;
+
     let api = build_api(token.clone())?;
     let repo = build_repo_handle(&opts.repo_id, opts.revision.as_deref());
     let api_repo = api.repo(repo);
@@ -314,6 +603,13 @@ pub fn download_repo(opts: DownloadOptions) -> Result<()> {
         )
     })?;
 
+    // L5 — opportunistic cleanup of stale `.mlxcel-partial.*` orphans
+    // (issue #650). Best-effort: any I/O error here is logged but does
+    // not fail the download. Only files older than `PARTIAL_TEMPFILE_STALE_AGE`
+    // are removed so concurrent in-flight downloads from a sibling process
+    // are not disturbed.
+    cleanup_stale_partials(&local_dir);
+
     if opts.force {
         println!("[mlxcel download] --force: refreshing every file");
     } else if snapshot_complete(&local_dir, &wanted) {
@@ -334,54 +630,90 @@ pub fn download_repo(opts: DownloadOptions) -> Result<()> {
     let show_bars = should_show_progress();
 
     // Build the reqwest client once and share across all file downloads.
+    //
+    // Timeouts (issue #650, M2): `connect_timeout(10s)` aborts the TCP/TLS
+    // handshake if a mirror is unreachable. `read_timeout(30s)` aborts when
+    // the response body stalls for 30s — the correct semantics for a long
+    // download where total elapsed time is unbounded but any 30s window of
+    // dead air is a clear stall. Total `timeout(...)` is intentionally NOT
+    // set because legitimate large weight files take more than the global
+    // default.
+    //
+    // Redirect downgrade defense (issue #650, M1 reinforcement): reqwest's
+    // default `remove_sensitive_headers` only strips `Authorization` on
+    // cross-host redirects, NOT on same-host scheme downgrades. Without
+    // `https_only(true)` a malicious HTTPS->HTTP 302 on the same host would
+    // forward the bearer token over plaintext. The `require_secure_endpoint_*`
+    // guard above only validates the initial scheme; `https_only(true)` makes
+    // the redirect path enforce HTTPS too. Operators who opt out via
+    // `MLXCEL_ALLOW_INSECURE_ENDPOINT` already accepted the plaintext risk,
+    // so we honor their decision here as well.
+    let enforce_https = token.is_some() && !is_insecure_endpoint_opt_out();
     let rt = tokio::runtime::Runtime::new().context("Failed to create tokio runtime")?;
     let client = rt.block_on(async {
         let mut headers = reqwest::header::HeaderMap::new();
         if let Some(ref tok) = token {
+            // L3 (issue #650): reject non-ASCII or control-char tokens with
+            // a domain-specific error instead of the panic that the prior
+            // `.expect("token must be ASCII")` would produce. `validate_token`
+            // also rejects more characters than `HeaderValue::from_str` would
+            // strictly need (e.g., embedded `\r\n`), making it harder to
+            // smuggle header-injection payloads through a malformed env var.
+            validate_token(tok)?;
             let auth_val = format!("Bearer {tok}");
             headers.insert(
                 reqwest::header::AUTHORIZATION,
-                reqwest::header::HeaderValue::from_str(&auth_val).expect("token must be ASCII"),
+                reqwest::header::HeaderValue::from_str(&auth_val).with_context(
+                    || "HF token contains invalid characters (must be ASCII, no control chars)",
+                )?,
             );
         }
-        reqwest::Client::builder()
-            .default_headers(headers)
-            .build()
-            .context("Failed to create HTTP client")
+        let mut builder = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .read_timeout(Duration::from_secs(30))
+            .default_headers(headers);
+        if enforce_https {
+            builder = builder.https_only(true);
+        }
+        builder.build().context("Failed to create HTTP client")
     })?;
 
-    let endpoint = hf_endpoint();
     let revision = opts.revision.as_deref().unwrap_or("main");
 
     // Build per-file sizes map for accurate bar lengths. `hf-hub 0.5` does
     // not expose per-file sizes in the manifest (Siblings only has `rfilename`),
-    // so we issue sequential HEAD requests here — N RTTs before the first byte
-    // streams. For typical 5-15 file snapshots this adds ~1-2s of pre-stream
-    // wallclock; converting to `futures::stream::iter(...).buffer_unordered(N)`
-    // is a worthwhile follow-up if HEAD latency proves bothersome. Sizes are
-    // best-effort: if a HEAD fails we fall back to 0 (indeterminate bar).
-    // We skip the HEAD pass entirely for cached files (handled below) and when
-    // progress bars are suppressed.
+    // so we issue concurrent HEAD requests here. Issue #650, L6: previously
+    // sequential (N RTTs before the first byte streamed); now bounded-parallel
+    // via `futures::stream::iter(...).buffer_unordered(8)` so total pre-stream
+    // wallclock is roughly one RTT for a small repo. 8 is well below any HF
+    // rate limit. Sizes are best-effort: if a HEAD fails we fall back to 0
+    // (indeterminate bar). We skip the HEAD pass entirely when progress bars
+    // are suppressed.
     let size_map: std::collections::HashMap<String, u64> = if show_bars {
         rt.block_on(async {
-            let mut map = std::collections::HashMap::new();
-            for filename in &wanted {
-                let url = file_url(&endpoint, &opts.repo_id, revision, filename);
-                let size = client
-                    .head(&url)
-                    .send()
-                    .await
-                    .ok()
-                    .and_then(|r| {
-                        r.headers()
-                            .get(reqwest::header::CONTENT_LENGTH)
-                            .and_then(|v| v.to_str().ok())
-                            .and_then(|s| s.parse::<u64>().ok())
-                    })
-                    .unwrap_or(0);
-                map.insert(filename.clone(), size);
-            }
-            map
+            let client_ref = &client;
+            let endpoint_ref = &endpoint;
+            let repo_id_ref = &opts.repo_id;
+            futures::stream::iter(wanted.iter().cloned())
+                .map(move |filename| async move {
+                    let url = file_url(endpoint_ref, repo_id_ref, revision, &filename);
+                    let size = client_ref
+                        .head(&url)
+                        .send()
+                        .await
+                        .ok()
+                        .and_then(|r| {
+                            r.headers()
+                                .get(reqwest::header::CONTENT_LENGTH)
+                                .and_then(|v| v.to_str().ok())
+                                .and_then(|s| s.parse::<u64>().ok())
+                        })
+                        .unwrap_or(0);
+                    (filename, size)
+                })
+                .buffer_unordered(8)
+                .collect::<std::collections::HashMap<String, u64>>()
+                .await
         })
     } else {
         std::collections::HashMap::new()

@@ -16,6 +16,7 @@
 
 use super::*;
 use std::path::PathBuf;
+use std::time::{Duration, SystemTime};
 // Env-var-sensitive tests must serialize through the crate-wide `ENV_LOCK`
 // (issue #573); without it, two test threads can call `setenv`/`getenv`
 // concurrently — undefined behavior under Rust 2024's unsafe env contract.
@@ -421,4 +422,323 @@ fn live_download_smoke_test() {
     };
     download_repo(opts).expect("live download should succeed");
     assert!(dir.path().join("config.json").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Hardening tests (issue #650)
+// ---------------------------------------------------------------------------
+
+/// L1 — Adversarial filenames containing reserved URL characters must be
+/// percent-encoded when composing the GET/HEAD URL so they cannot smuggle a
+/// query string (`?`) or fragment (`#`) past the request.
+#[test]
+fn file_url_percent_encodes_reserved_characters_in_filename() {
+    let endpoint = "https://huggingface.co";
+    let url = file_url(
+        endpoint,
+        "mlx-community/Qwen3-4B-4bit",
+        "main",
+        "model.safetensors?foo=bar.safetensors",
+    );
+    // The `?` MUST be encoded so the HF backend treats the whole string as a
+    // single path segment and not as a query string.
+    assert!(
+        url.contains("%3F"),
+        "expected `?` to be percent-encoded as %3F in URL, got: {url}"
+    );
+    // And the literal `?` MUST NOT appear in the URL after the resolve/<rev>/
+    // segment.
+    assert!(
+        !url.contains("safetensors?foo"),
+        "raw `?` leaked into URL: {url}"
+    );
+    // Similarly for `#`.
+    let url_hash = file_url(endpoint, "owner/repo", "main", "evil#fragment.json");
+    assert!(url_hash.contains("%23"));
+    assert!(!url_hash.contains("evil#fragment"));
+}
+
+#[test]
+fn file_url_preserves_safe_subdir_paths() {
+    // Legitimate nested filenames like `vision/preprocessor_config.json`
+    // must still produce a normal URL — only segment-internal reserved chars
+    // get encoded, not the inter-segment `/`.
+    let url = file_url(
+        "https://huggingface.co",
+        "mlx-community/Qwen3-4B-4bit",
+        "main",
+        "vision/preprocessor_config.json",
+    );
+    assert_eq!(
+        url,
+        "https://huggingface.co/mlx-community/Qwen3-4B-4bit/resolve/main/vision/preprocessor_config.json"
+    );
+}
+
+#[test]
+fn file_url_encodes_repo_id_and_revision() {
+    // Defensive: even though `repo_id` and `revision` are CLI-controlled,
+    // encode them for consistency so a stray space in `--revision` does not
+    // break the URL.
+    let url = file_url(
+        "https://huggingface.co",
+        "owner/repo with space",
+        "branch with space",
+        "model.safetensors",
+    );
+    assert!(
+        url.contains("%20"),
+        "expected space to be percent-encoded as %20, got: {url}"
+    );
+}
+
+/// L3 — Tokens containing non-ASCII or control characters must produce a
+/// clean `anyhow::Error` that names the issue, not a panic.
+#[test]
+fn download_repo_rejects_non_ascii_token() {
+    let _env_guard = env_lock();
+    let prev_hf = std::env::var("HF_TOKEN").ok();
+    let prev_alt = std::env::var("HUGGING_FACE_HUB_TOKEN").ok();
+    let prev_endpoint = std::env::var("HF_ENDPOINT").ok();
+    let prev_optout = std::env::var("MLXCEL_ALLOW_INSECURE_ENDPOINT").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+    unsafe {
+        std::env::set_var("HF_TOKEN", "hé");
+        std::env::remove_var("HUGGING_FACE_HUB_TOKEN");
+        std::env::remove_var("HF_ENDPOINT");
+        std::env::remove_var("MLXCEL_ALLOW_INSECURE_ENDPOINT");
+    }
+    // Resolve goes through the same path `download_repo` uses; assert the
+    // validator catches the bad char before it can panic in
+    // `HeaderValue::from_str`.
+    let tok = resolve_token(None).expect("HF_TOKEN should resolve");
+    let err = validate_token(&tok).expect_err("non-ASCII token must be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid characters"),
+        "expected error to mention 'invalid characters', got: {msg}"
+    );
+    restore_env("HF_TOKEN", prev_hf);
+    restore_env("HUGGING_FACE_HUB_TOKEN", prev_alt);
+    restore_env("HF_ENDPOINT", prev_endpoint);
+    restore_env("MLXCEL_ALLOW_INSECURE_ENDPOINT", prev_optout);
+}
+
+#[test]
+fn validate_token_rejects_control_chars() {
+    // CR / LF embedded in a token would let an attacker smuggle header
+    // injection if the validator did not reject control chars.
+    let err =
+        validate_token("hf_token\r\nX-Evil: yes").expect_err("control chars must be rejected");
+    assert!(err.to_string().contains("invalid characters"));
+
+    let err_tab = validate_token("hf_token\twith_tab").expect_err("tab is a control char");
+    assert!(err_tab.to_string().contains("invalid characters"));
+
+    // And confirm the happy path: a normal ASCII token passes.
+    assert!(validate_token("hf_AbCdEf-_.123").is_ok());
+}
+
+/// M1 — Plaintext `HF_ENDPOINT` + token combination is refused unless the
+/// operator explicitly opts out.
+#[test]
+fn require_secure_endpoint_refuses_plaintext_with_token() {
+    let err = require_secure_endpoint_for_token("http://mirror.internal/", Some("hf_xxx"))
+        .expect_err("plaintext endpoint with token must error");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("HTTPS") || msg.contains("https"),
+        "expected error to mention HTTPS, got: {msg}"
+    );
+    assert!(
+        msg.contains("MLXCEL_ALLOW_INSECURE_ENDPOINT"),
+        "expected error to mention the opt-out env var, got: {msg}"
+    );
+}
+
+#[test]
+fn require_secure_endpoint_allows_https_with_token() {
+    require_secure_endpoint_for_token("https://huggingface.co", Some("hf_xxx"))
+        .expect("HTTPS + token must succeed");
+    // Case-insensitive scheme check.
+    require_secure_endpoint_for_token("HTTPS://huggingface.co", Some("hf_xxx"))
+        .expect("HTTPS (uppercase) + token must succeed");
+}
+
+#[test]
+fn require_secure_endpoint_allows_plaintext_anonymous() {
+    // No token = no exposure, plaintext is fine.
+    require_secure_endpoint_for_token("http://mirror.internal/", None)
+        .expect("anonymous + plaintext must succeed");
+}
+
+#[test]
+fn require_secure_endpoint_honors_opt_out() {
+    let _env_guard = env_lock();
+    let prev = std::env::var("MLXCEL_ALLOW_INSECURE_ENDPOINT").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+    unsafe {
+        std::env::set_var("MLXCEL_ALLOW_INSECURE_ENDPOINT", "1");
+    }
+    let result = require_secure_endpoint_for_token("http://mirror.internal/", Some("hf_xxx"));
+    assert!(
+        result.is_ok(),
+        "opt-out env var must allow plaintext + token"
+    );
+    restore_env("MLXCEL_ALLOW_INSECURE_ENDPOINT", prev);
+}
+
+#[test]
+fn require_secure_endpoint_treats_empty_opt_out_as_unset() {
+    let _env_guard = env_lock();
+    let prev = std::env::var("MLXCEL_ALLOW_INSECURE_ENDPOINT").ok();
+    // SAFETY: serialized via the crate-wide ENV_LOCK acquired above.
+    unsafe {
+        std::env::set_var("MLXCEL_ALLOW_INSECURE_ENDPOINT", "  ");
+    }
+    let result = require_secure_endpoint_for_token("http://mirror.internal/", Some("hf_xxx"));
+    assert!(
+        result.is_err(),
+        "whitespace-only opt-out must NOT allow plaintext + token"
+    );
+    restore_env("MLXCEL_ALLOW_INSECURE_ENDPOINT", prev);
+}
+
+/// L2 — Tempfile creation must fail closed when a symlink (or any pre-existing
+/// path) already exists at the predicted tempfile location. `create_new(true)`
+/// provides `O_CREAT|O_EXCL`, and on Unix we add `O_NOFOLLOW`. Either alone
+/// would fail on a pre-staged symlink, but the test confirms the combined
+/// behavior.
+#[cfg(unix)]
+#[tokio::test]
+async fn open_tempfile_no_symlink_refuses_pre_staged_symlink() {
+    let dir = tempfile::tempdir().unwrap();
+    let target_dir = tempfile::tempdir().unwrap();
+    let target_file = target_dir.path().join("victim.txt");
+    std::fs::write(&target_file, b"original contents").unwrap();
+
+    let tmp_path = dir.path().join(".mlxcel-partial.99999.0");
+    // Pre-stage a symlink at the path mlxcel would write to.
+    std::os::unix::fs::symlink(&target_file, &tmp_path)
+        .expect("test setup: symlink creation should succeed");
+
+    let result = open_tempfile_no_symlink(&tmp_path).await;
+    assert!(
+        result.is_err(),
+        "open_tempfile_no_symlink should refuse a pre-staged symlink, got Ok"
+    );
+
+    // Crucially, the victim file behind the symlink MUST still contain the
+    // original bytes — i.e., the open did not follow through and truncate it.
+    let bytes = std::fs::read(&target_file).expect("victim should still be readable");
+    assert_eq!(
+        bytes, b"original contents",
+        "victim file behind symlink was clobbered — O_NOFOLLOW / O_EXCL failed"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_tempfile_no_symlink_refuses_pre_existing_regular_file() {
+    // `create_new(true)` semantics: even a regular file at the target path
+    // must cause EEXIST.
+    let dir = tempfile::tempdir().unwrap();
+    let tmp_path = dir.path().join(".mlxcel-partial.99999.0");
+    std::fs::write(&tmp_path, b"squatted").unwrap();
+
+    let result = open_tempfile_no_symlink(&tmp_path).await;
+    assert!(
+        result.is_err(),
+        "open_tempfile_no_symlink should refuse a pre-existing regular file"
+    );
+
+    // And the squatter contents are preserved.
+    let bytes = std::fs::read(&tmp_path).unwrap();
+    assert_eq!(bytes, b"squatted");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn open_tempfile_no_symlink_succeeds_on_clean_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let tmp_path = dir.path().join(".mlxcel-partial.99999.0");
+    let result = open_tempfile_no_symlink(&tmp_path).await;
+    assert!(
+        result.is_ok(),
+        "open_tempfile_no_symlink should succeed on a clean path, got: {:?}",
+        result.err()
+    );
+    // The file should now exist on disk.
+    assert!(tmp_path.exists());
+}
+
+/// L5 — Stale `.mlxcel-partial.*` orphans older than the threshold are
+/// removed at the start of `download_repo`. Younger partials are left alone.
+#[test]
+fn cleanup_stale_partials_removes_aged_orphans() {
+    let dir = tempfile::tempdir().unwrap();
+
+    // Create a stale partial (modified > 1 hour ago).
+    let stale = dir.path().join(".mlxcel-partial.42.0");
+    std::fs::write(&stale, b"orphan").unwrap();
+    let stale_file = std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .expect("re-open stale partial for set_modified");
+    // set_modified is stable since 1.75.
+    let old = SystemTime::now() - Duration::from_secs(2 * 60 * 60);
+    stale_file
+        .set_modified(old)
+        .expect("set_modified backdates the mtime");
+    drop(stale_file);
+
+    // Create a fresh partial (modified just now) — must NOT be removed.
+    let fresh = dir.path().join(".mlxcel-partial.43.0");
+    std::fs::write(&fresh, b"in-flight").unwrap();
+
+    // And a non-partial file — must always be left alone.
+    let unrelated = dir.path().join("config.json");
+    std::fs::write(&unrelated, b"{}").unwrap();
+
+    cleanup_stale_partials(dir.path());
+
+    assert!(
+        !stale.exists(),
+        "stale .mlxcel-partial.* > 1h must be removed"
+    );
+    assert!(
+        fresh.exists(),
+        "fresh .mlxcel-partial.* (< 1h) must NOT be removed"
+    );
+    assert!(unrelated.exists(), "unrelated files must NOT be removed");
+}
+
+#[test]
+fn cleanup_stale_partials_handles_missing_dir_gracefully() {
+    // Pass a path that does not exist — must not panic, must not crash.
+    let bogus = PathBuf::from("/nonexistent/path/that/should/not/exist/anywhere");
+    cleanup_stale_partials(&bogus);
+    // (no assertion needed; if it panicked or aborted, the test runner notices)
+}
+
+#[test]
+fn cleanup_stale_partials_ignores_directories() {
+    let dir = tempfile::tempdir().unwrap();
+    // Create a *directory* whose name matches the partial prefix; must not be
+    // removed even when stale.
+    let pseudo = dir.path().join(".mlxcel-partial.bogus.0");
+    std::fs::create_dir(&pseudo).unwrap();
+    cleanup_stale_partials(dir.path());
+    assert!(pseudo.exists(), "must not remove directories");
+}
+
+/// L6 — `encode_path_segments` is a private helper but is exercised end-to-end
+/// by the `file_url_*` tests above. This test sanity-checks the helper in
+/// isolation.
+#[test]
+fn encode_path_segments_handles_empty_input() {
+    assert_eq!(encode_path_segments(""), "");
+    assert_eq!(encode_path_segments("/"), "/");
+    assert_eq!(encode_path_segments("a/b/c"), "a/b/c");
+    assert_eq!(encode_path_segments("a b/c d"), "a%20b/c%20d");
 }

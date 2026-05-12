@@ -70,6 +70,12 @@ base64 = "0.22"
 glob = "0.3.2"
 path-clean = "1.0.1"
 minijinja = { version = "2.5", features = ["loop_controls"] }
+# Used by `src/downloader/mod.rs::file_url` to percent-encode `repo_id` /
+# `revision` / `filename` path segments before composing the HF download URL
+# (issue #650, L1). Already transitively present via reqwest -> url; promoting
+# to a direct dep so the downloader can call into it without depending on
+# reqwest's transitive re-export.
+percent-encoding = "2"
 
 # Structured outputs / constrained decoding (issue #550).
 #
