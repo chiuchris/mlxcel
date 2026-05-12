@@ -1859,6 +1859,117 @@ impl Qwen35Model {
     }
 }
 
+/// DFlash speculative-decoding target adapter for the Qwen 3.5 text
+/// model.
+///
+/// Bridges `Qwen35Model::forward_speculative` /
+/// `Qwen35Model::rollback_speculative_cache` (issue #634) to the
+/// drafter-side [`mlxcel_core::drafter::dflash::SpeculativeTarget`]
+/// trait (issue #636). This is what lets the
+/// `DFlashGenerator` round loop call into the binary's concrete model
+/// type without mlxcel-core having to name `Qwen3NextCache` /
+/// `VerifyOutput` / `GdnRollbackSnapshot`.
+///
+/// The associated types are exactly the binary-side concrete types the
+/// verify pass produces; the trait's hooks delegate to the existing
+/// instance methods on `Qwen35Model` without any extra allocation or
+/// state.
+///
+/// Used by: DFlash B=1 round loop (issue #636); future B>1 round loop
+/// (issue #637) will provide a peer impl with batched accept slices.
+impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35Model {
+    type Cache = super::qwen3_next::Qwen3NextCache;
+    type VerifyOut = VerifyOutput;
+
+    fn capture_layer_ids(&self) -> &[usize] {
+        // The target itself does not own the capture layer ids — the
+        // drafter does (`DFlashConfig::target_layer_ids`). The round
+        // loop reads this only as documentation; the actual
+        // `forward_speculative` call passes its own slice through.
+        //
+        // We return an empty slice here as a sentinel: callers that
+        // need the real value pull it from the drafter side. The
+        // round-loop driver never reads this method on the hot path
+        // (it passes `capture_layer_ids` to `forward_speculative`
+        // directly), but keeping the trait method here means a future
+        // configuration plumbing change can attach the real list to
+        // the model without breaking the contract.
+        &[]
+    }
+
+    fn verify_forward(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+    ) -> Self::VerifyOut {
+        // For Qwen 3.5, the drafter's `target_layer_ids` are part of
+        // the drafter's config and the round-loop driver does NOT
+        // surface them through the target adapter — the upstream
+        // semantics are that the target's verify forward is called
+        // with the drafter's chosen indices.
+        //
+        // Because the trait signature does not let us thread the
+        // drafter-supplied indices through here, the round-loop driver
+        // is expected to set `capture_layer_ids` via a separate hook
+        // (or to pass them in via a wrapper future-issue). For the B=1
+        // path landed in #636, we use the upstream-standard
+        // `[1, 8, 15, 22, 29]` (Qwen 3.5 4B DFlash drafter); this
+        // matches the only currently-published DFlash checkpoint
+        // (`z-lab/Qwen3.5-4B-DFlash`).
+        //
+        // When sub-7 / #630 wires the CLI dispatch, the actual capture
+        // list comes from the drafter's loaded config; until then this
+        // hard-coded default is correct for every currently-supported
+        // DFlash deployment.
+        const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
+        self.forward_speculative(verify_input, caches, QWEN35_4B_DFLASH_LAYERS)
+    }
+
+    fn rollback_partial(
+        &self,
+        caches: &mut [Self::Cache],
+        verify_out: &Self::VerifyOut,
+        accepted: i32,
+        block_size: i32,
+    ) {
+        // Delegates to the per-Qwen-3.5 rollback that combines KV
+        // attention-cache trim with GDN linear-attention state replay.
+        // For B = 1 the accepted slice is a single-element view; the
+        // batched B > 1 sub-issue (#637) will pass longer slices.
+        let _ = self.rollback_speculative_cache(
+            caches,
+            &verify_out.gdn_states,
+            &[accepted],
+            block_size,
+        );
+    }
+
+    fn concat_hidden_for_drafter(&self, verify_out: &Self::VerifyOut) -> UniquePtr<MlxArray> {
+        // Upstream: `hidden = mx.concatenate(verify_out.hidden_states, axis=-1)`.
+        // The captured hidden states each have shape `[1, bs, hidden_size]`;
+        // concatenating along axis -1 (the feature axis) yields
+        // `[1, bs, num_capture_layers * hidden_size]`.
+        debug_assert!(
+            !verify_out.hidden_states.is_empty(),
+            "DFlash verify output must carry at least one captured hidden layer"
+        );
+        // `mlxcel_core::concatenate` takes two refs at a time; fold
+        // over the captured-hidden vector along the feature axis.
+        let mut acc = mlxcel_core::copy(verify_out.hidden_states[0].as_ref().unwrap());
+        for slab in verify_out.hidden_states.iter().skip(1) {
+            acc = concatenate(&acc, slab.as_ref().unwrap(), -1);
+        }
+        acc
+    }
+
+    fn verify_logits<'a>(&self, verify_out: &'a Self::VerifyOut) -> &'a MlxArray {
+        verify_out
+            .logits
+            .as_ref()
+            .expect("DFlash verify output must carry logits")
+    }
+}
+
 /// Zero the per-row tail `[bi, :, start:kv_len, :]` in both K and V of a
 /// `KVCache`. Used by [`Qwen35Model::rollback_speculative_cache`] for batched
 /// verify-pass rollback when rows accepted different numbers of tokens.

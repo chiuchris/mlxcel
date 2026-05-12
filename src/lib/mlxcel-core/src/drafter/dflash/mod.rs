@@ -64,6 +64,9 @@ pub mod drafter;
 pub mod layer;
 pub mod mlp;
 pub mod model;
+/// DFlash speculative-decoding round-loop driver (issue #636 / epic #633
+/// sub-12). B=1 only; batched DFlash is sub-13 / #637.
+pub mod round_loop;
 
 pub use attention::DFlashAttention;
 pub use cache::DFlashKVCache;
@@ -72,3 +75,6 @@ pub use drafter::DFlashDrafter;
 pub use layer::DFlashDecoderLayer;
 pub use mlp::DFlashMlp;
 pub use model::DFlashDraftModel;
+pub use round_loop::{
+    DFlashGenerator, DFlashRunOutput, SpeculativeTarget, DEFAULT_BLOCK_SIZE, DEFAULT_MASK_TOKEN_ID,
+};

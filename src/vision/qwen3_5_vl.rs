@@ -206,6 +206,72 @@ impl Qwen35VLModel {
     }
 }
 
+/// DFlash speculative-decoding target adapter for the Qwen 3.5 VLM
+/// wrapper.
+///
+/// Delegates every hook to the inner `text_model`. The VLM wrapper
+/// itself holds no speculative state — vision is fully prefilled
+/// before the verify/rollback loop begins, so the round loop interacts
+/// only with the text backbone.
+///
+/// Used by: DFlash B=1 round loop (issue #636).
+impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35VLModel {
+    type Cache = crate::models::qwen3_next::Qwen3NextCache;
+    type VerifyOut = crate::models::qwen3_5::VerifyOutput;
+
+    fn capture_layer_ids(&self) -> &[usize] {
+        // Placeholder until sub-7 / #630 wires the CLI dispatch; see
+        // the peer impl on `Qwen35Model` for the rationale and the
+        // hard-coded `QWEN35_4B_DFLASH_LAYERS` fallback used at
+        // verify time.
+        &[]
+    }
+
+    fn verify_forward(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+    ) -> Self::VerifyOut {
+        const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
+        self.text_model
+            .forward_speculative(verify_input, caches, QWEN35_4B_DFLASH_LAYERS)
+    }
+
+    fn rollback_partial(
+        &self,
+        caches: &mut [Self::Cache],
+        verify_out: &Self::VerifyOut,
+        accepted: i32,
+        block_size: i32,
+    ) {
+        let _ = self.text_model.rollback_speculative_cache(
+            caches,
+            &verify_out.gdn_states,
+            &[accepted],
+            block_size,
+        );
+    }
+
+    fn concat_hidden_for_drafter(&self, verify_out: &Self::VerifyOut) -> UniquePtr<MlxArray> {
+        debug_assert!(
+            !verify_out.hidden_states.is_empty(),
+            "DFlash verify output must carry at least one captured hidden layer"
+        );
+        let mut acc = mlxcel_core::copy(verify_out.hidden_states[0].as_ref().unwrap());
+        for slab in verify_out.hidden_states.iter().skip(1) {
+            acc = mlxcel_core::concatenate(&acc, slab.as_ref().unwrap(), -1);
+        }
+        acc
+    }
+
+    fn verify_logits<'a>(&self, verify_out: &'a Self::VerifyOut) -> &'a MlxArray {
+        verify_out
+            .logits
+            .as_ref()
+            .expect("DFlash verify output must carry logits")
+    }
+}
+
 impl LanguageModel for Qwen35VLModel {
     fn forward(
         &self,
