@@ -75,6 +75,8 @@
 //! sub-issue, so calling code gets a clear actionable message instead of
 //! an opaque `unimplemented!` panic.
 
+pub mod masks;
+
 use crate::ffi::MlxArray;
 use crate::generate::LanguageModel;
 use crate::layers::KVCache;
