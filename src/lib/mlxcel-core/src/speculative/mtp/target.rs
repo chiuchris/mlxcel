@@ -54,6 +54,8 @@ use crate::ffi::MlxArray;
 use crate::generate::SamplingConfig;
 use cxx::UniquePtr;
 
+use crate::drafter::DrafterError;
+
 /// Captured target state from [`MtpTarget::verify_forward`].
 ///
 /// Opaque to the round-loop: the round-loop only forwards this back to
@@ -280,4 +282,182 @@ pub trait MtpTarget {
     /// EOS token ids of the target. The round-loop checks every emitted
     /// token against this set to honor the standard stop condition.
     fn eos_token_ids(&self) -> Vec<i32>;
+
+    // ------------------------------------------------------------
+    // Batched MTP path (B > 1) — issue #631.
+    // ------------------------------------------------------------
+    //
+    // The trait carries default impls that error out so existing single-batch
+    // targets keep compiling. Real batched targets (Gemma 4 wrapper, future
+    // VLM wrappers) override these alongside their per-row rollback hook.
+
+    /// Combined prefill + seed capture for B > 1 rows.
+    ///
+    /// `prompt_tokens_per_row[r]` is row `r`'s prompt token sequence; rows
+    /// may have **different prompt lengths**, so the implementation is
+    /// responsible for left-padding into a `[B, max_prompt_len]` tensor and
+    /// populating the per-row prefill caches accordingly.
+    ///
+    /// Returns `(first_bonus_per_row, seed)` where:
+    /// - `first_bonus_per_row[r]` is row `r`'s sampled first bonus.
+    /// - `seed` is a [`MtpBatchedVerifyOutput`] carrying the per-row hidden
+    ///   plus the batched shared K/V slabs and per-row metadata (`kv_offset`,
+    ///   `bonus_position`, `kv_valid_len`, `left_padding`).
+    ///
+    /// Default impl returns
+    /// [`DrafterError::DraftFailed`] so non-batched targets (mock or
+    /// single-batch concrete) fail fast when accidentally driven into the
+    /// batched path.
+    #[allow(unused_variables)]
+    fn prefill_and_seed_batched(
+        &self,
+        prompt_tokens_per_row: &[Vec<i32>],
+        sampler: &SamplingConfig,
+    ) -> Result<(Vec<i32>, MtpBatchedVerifyOutput), DrafterError> {
+        Err(DrafterError::DraftFailed {
+            reason: "MtpTarget::prefill_and_seed_batched not implemented; target must \
+                     override for B > 1"
+                .to_string(),
+        })
+    }
+
+    /// First-phase batched verify: forward `verify_input_per_row` through the
+    /// target with sink-aware semantics and produce per-row target-tokens +
+    /// captured state for finalize.
+    ///
+    /// `verify_input_per_row[r]` has length `block_size` for every row (the
+    /// caller flattens rows into a `[B, block_size]` tensor before
+    /// forwarding through the target). Implementations that prefer raw
+    /// `MlxArray` access can flatten themselves.
+    ///
+    /// Returns target argmax (per row, per position) plus a
+    /// [`VerifyCaptured`] opaque to the round-loop.
+    #[allow(unused_variables)]
+    fn verify_forward_batched(
+        &self,
+        verify_input_per_row: &[Vec<i32>],
+        sampler: &SamplingConfig,
+    ) -> Result<MtpBatchedVerifyForwardOutput, DrafterError> {
+        Err(DrafterError::DraftFailed {
+            reason: "MtpTarget::verify_forward_batched not implemented; target must \
+                     override for B > 1"
+                .to_string(),
+        })
+    }
+
+    /// Second-phase batched verify: per-row tail-zero rollback +
+    /// re-slice + next-round inputs.
+    ///
+    /// `accepted_per_row[r]` is row `r`'s accept count from the batched walk.
+    /// The implementation MUST trim the caches by `block_size - max(accepted) - 1`
+    /// (the global trim amount) and per-row zero the tail for rows whose
+    /// accept count is below `max(accepted)`. This mirrors the Gemma 4
+    /// `Cache::zero_partial_accept_tail` hook (issue #655) and the
+    /// `rollback_speculative_cache(..., accepted: &[i32], block_size)` API.
+    #[allow(unused_variables)]
+    fn verify_finalize_batched(
+        &self,
+        accepted_per_row: &[usize],
+        block_size: usize,
+        captured: VerifyCaptured,
+    ) -> Result<MtpBatchedVerifyOutput, DrafterError> {
+        Err(DrafterError::DraftFailed {
+            reason: "MtpTarget::verify_finalize_batched not implemented; target must \
+                     override for B > 1"
+                .to_string(),
+        })
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Batched MTP types (issue #631)
+// ---------------------------------------------------------------------------
+
+/// Output of [`MtpTarget::verify_forward_batched`] — per-row target argmax
+/// plus captured state for finalize.
+///
+/// Per-row argmax is materialized as `Vec<Vec<i32>>` so the batched walk
+/// can iterate cell-by-cell without re-entering MLX. The captured state is
+/// opaque to the round-loop and forwarded into
+/// [`MtpTarget::verify_finalize_batched`] verbatim.
+pub struct MtpBatchedVerifyForwardOutput {
+    /// `target_tokens_per_row[r][s]` = argmax of the target's logits at
+    /// position `s` of row `r`. Outer length `B`, inner length `block_size`.
+    pub target_tokens_per_row: Vec<Vec<i32>>,
+    /// Opaque captured state forwarded to finalize.
+    pub captured: VerifyCaptured,
+}
+
+impl std::fmt::Debug for MtpBatchedVerifyForwardOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtpBatchedVerifyForwardOutput")
+            .field("batch_size", &self.target_tokens_per_row.len())
+            .field("captured", &self.captured)
+            .finish()
+    }
+}
+
+/// Output of [`MtpTarget::prefill_and_seed_batched`] and
+/// [`MtpTarget::verify_finalize_batched`].
+///
+/// Mirrors [`MtpVerifyOutput`] but carries per-row scalar metadata so the
+/// drafter can be rebound with per-row positions and left-padding extents.
+///
+/// - `next_hidden`: target's last-layer pre-norm hidden at each accepted
+///   position. Shape `[B, 1, backbone]` in the model's native dtype.
+/// - `next_shared_kv`: batched shared K/V slabs for the next round. Layout
+///   matches [`crate::drafter::SharedKv`]'s convention (2 or 4 tensors).
+///   Each tensor's leading dim is `B`; the seq-len axis covers the
+///   per-row valid prefix plus any left-padding slack.
+/// - `kv_offset_per_row`: absolute KV cache offset per row (post-rollback,
+///   equal to `prompt_cache[0].offset[r]`).
+/// - `bonus_position_per_row`: per-row bonus token absolute position.
+/// - `kv_valid_len_per_row`: per-row valid prefix length in the shared K/V
+///   seq-len axis. Used to build the `kv_valid_len` BatchScalar handed to
+///   [`crate::drafter::masks::normalize_batched_shared_kv_states`].
+/// - `left_padding_per_row`: per-row left-padding extent in the shared K/V
+///   seq-len axis. Each row's valid prefix begins at this offset.
+pub struct MtpBatchedVerifyOutput {
+    pub next_hidden: UniquePtr<MlxArray>,
+    pub next_shared_kv: Vec<UniquePtr<MlxArray>>,
+    pub kv_offset_per_row: Vec<usize>,
+    pub bonus_position_per_row: Vec<usize>,
+    pub kv_valid_len_per_row: Vec<usize>,
+    pub left_padding_per_row: Vec<usize>,
+}
+
+impl std::fmt::Debug for MtpBatchedVerifyOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MtpBatchedVerifyOutput")
+            .field("batch_size", &self.kv_offset_per_row.len())
+            .field("next_shared_kv_len", &self.next_shared_kv.len())
+            .field("kv_offset_per_row", &self.kv_offset_per_row)
+            .field("bonus_position_per_row", &self.bonus_position_per_row)
+            .field("kv_valid_len_per_row", &self.kv_valid_len_per_row)
+            .field("left_padding_per_row", &self.left_padding_per_row)
+            .finish()
+    }
+}
+
+impl MtpBatchedVerifyOutput {
+    /// Materialise a borrow vector suitable for constructing a
+    /// [`crate::drafter::SharedKv`].
+    ///
+    /// Same idiom as [`MtpVerifyOutput::shared_kv_refs`] — see that doc
+    /// comment for the lifetime rationale.
+    pub fn shared_kv_refs(&self) -> Vec<&MlxArray> {
+        self.next_shared_kv
+            .iter()
+            .map(|ptr| {
+                ptr.as_ref()
+                    .expect("MtpBatchedVerifyOutput: non-null shared_kv ptr")
+            })
+            .collect()
+    }
+
+    /// Batch size derived from the per-row metadata. Tests and the
+    /// round-loop driver use this to gate batched-only invariants.
+    pub fn batch_size(&self) -> usize {
+        self.kv_offset_per_row.len()
+    }
 }

@@ -264,6 +264,81 @@ impl OwnedSharedKv {
         Ok(owned)
     }
 
+    /// Batched-MTP-only constructor that runs the per-row left-padding
+    /// normalization documented in [`crate::drafter::masks::normalize_batched_shared_kv_states`]
+    /// before storing.
+    ///
+    /// Mirrors upstream Python's `_batch_cache_left_padding`-then-store
+    /// shape: the drafter receives the target's shared K/V slabs as if
+    /// they were prefix-valid against the drafter's "single row each
+    /// occupies `[0, kv_valid_len[b]), tail zeroed" invariant.
+    ///
+    /// The current scalar `left_padding` arg from the trait is broadcast
+    /// across rows. A follow-up will accept per-row `left_padding` vectors
+    /// directly (tracked alongside the batched MTP wiring); until then,
+    /// the round-loop driver collapses per-row `left_padding` to its max
+    /// and the masks helper handles the (defensive) broadcast.
+    fn from_shared_kv_normalized(
+        shared: &SharedKv<'_>,
+        left_padding: usize,
+    ) -> Result<Self, DrafterError> {
+        use crate::drafter::masks::{
+            normalize_batched_shared_kv_states, BatchScalar, LayerType,
+        };
+        use std::collections::HashMap;
+
+        // Build the `LayerType -> (K, V)` map the masks helper expects.
+        let (k_full, v_full, k_swa, v_swa) = match shared.tensors.len() {
+            2 => (shared.tensors[0], shared.tensors[1], None, None),
+            4 => (
+                shared.tensors[0],
+                shared.tensors[1],
+                Some(shared.tensors[2]),
+                Some(shared.tensors[3]),
+            ),
+            n => {
+                return Err(DrafterError::SharedKvShape {
+                    got: n,
+                    expected: &[2, 4],
+                });
+            }
+        };
+
+        // Each K/V tensor is shape [B, n_kv_heads, kv_len, head_dim]. The
+        // valid prefix length per row is `kv_len - left_padding` (defensive
+        // clip to non-negative). Pass scalar broadcasts; the masks helper
+        // re-broadcasts to per-row internally.
+        let kv_len = {
+            let shape = ffi::array_shape(k_full);
+            if shape.len() == 4 {
+                shape[2]
+            } else {
+                0
+            }
+        };
+        let kv_valid_len = kv_len.saturating_sub(left_padding as i32);
+
+        let mut map: HashMap<LayerType, (&MlxArray, &MlxArray)> = HashMap::new();
+        map.insert(LayerType::FullAttention, (k_full, v_full));
+        if let (Some(ks), Some(vs)) = (k_swa, v_swa) {
+            map.insert(LayerType::SlidingWindowAttention, (ks, vs));
+        }
+
+        let valid_scalar = BatchScalar::Scalar(kv_valid_len);
+        let left_scalar = BatchScalar::Scalar(left_padding as i32);
+        let normalized =
+            normalize_batched_shared_kv_states(&map, &valid_scalar, Some(&left_scalar));
+
+        let take_pair = |layer: LayerType| -> Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)> {
+            normalized.get(&layer).map(|(k, v)| (ffi::copy(k), ffi::copy(v)))
+        };
+
+        Ok(Self {
+            full_attention: take_pair(LayerType::FullAttention),
+            sliding_attention: take_pair(LayerType::SlidingWindowAttention),
+        })
+    }
+
     fn for_layer_type(&self, layer_type: &str) -> Result<(&MlxArray, &MlxArray), DrafterError> {
         let pair = match layer_type {
             "full_attention" => self.full_attention.as_ref(),
@@ -661,16 +736,28 @@ impl Drafter for Gemma4AssistantDraftModel {
         shared_kv: SharedKv<'_>,
         kv_offset: usize,
         position: usize,
-        _left_padding: usize,
+        left_padding: usize,
     ) -> Result<(), DrafterError> {
-        // TODO(#628): when sibling PR lands, pipe `left_padding` through
-        // `normalize_batched_shared_kv_states` before storing. For the
-        // unbatched MVP `left_padding == 0` and the normalize call is a
-        // no-op, so dropping it on the floor today is bit-identical to the
-        // real round-loop's `if left_padding is not None: normalize(...)`
-        // gate. Documented `_left_padding` rather than `left_padding` to
-        // silence dead-arg lints.
-        self.shared_kv = Some(OwnedSharedKv::from_shared_kv(&shared_kv)?);
+        // Per issue #631 (batched MTP): when the round-loop is running B > 1
+        // with left-padded shared K/V, the drafter normalizes each row so
+        // the cross-attention forward sees the simpler invariant: each
+        // row's real keys occupy `[0, kv_valid_len)` and the tail is
+        // zeroed. Routes through
+        // [`crate::drafter::masks::normalize_batched_shared_kv_states`].
+        //
+        // For B = 1 (or `left_padding == 0`), we skip the normalization
+        // path entirely — it is a no-op on the unbatched MVP shape and
+        // would only add an unnecessary tensor copy. The bit-identity test
+        // in `tests.rs` (`round_loop_full_accept_emits_all_proposals_plus_bonus_per_round`)
+        // pins the no-normalize path's behaviour.
+        if left_padding > 0 {
+            self.shared_kv = Some(OwnedSharedKv::from_shared_kv_normalized(
+                &shared_kv,
+                left_padding,
+            )?);
+        } else {
+            self.shared_kv = Some(OwnedSharedKv::from_shared_kv(&shared_kv)?);
+        }
         self.kv_offset = kv_offset as i32;
         self.position = position as i32;
         Ok(())
@@ -682,6 +769,94 @@ impl Drafter for Gemma4AssistantDraftModel {
         // default trait impl already returns an empty Vec, so the override
         // here is only to be explicit about intent.
         Vec::new()
+    }
+
+    fn draft_block_batched(
+        &mut self,
+        last_bonus: &[i32],
+        hidden: Option<&MlxArray>,
+        block_size: usize,
+        sampler: &SamplingConfig,
+    ) -> Result<Vec<Vec<i32>>, DrafterError> {
+        // Batched autoregressive draft (issue #631). Performs `K-1` small
+        // forwards with `[B, 1, ...]` shapes, sampling one token per row
+        // each step. Mirrors the B = 1 path in [`Self::draft_block`] but
+        // keeps the batch dim throughout.
+        //
+        // The drafter MUST have been `bind`()-ed and `set_shared_kv`()-ed
+        // before reaching this point (the round-loop driver enforces
+        // both). The shared K/V's batch dim has to match `last_bonus.len()`
+        // for the cross-attention forward to produce the right per-row
+        // outputs.
+        if self.shared_kv.is_none() {
+            return Err(DrafterError::SetSharedKvNotCalled);
+        }
+        if self.lm_head.is_none() {
+            return Err(DrafterError::BindNotCalled);
+        }
+        if block_size == 0 || last_bonus.is_empty() {
+            return Ok(last_bonus.iter().map(|_| Vec::new()).collect());
+        }
+        let hidden = hidden.ok_or(DrafterError::DraftBlockMissingHidden)?;
+
+        let batch_size = last_bonus.len();
+        let proposals = (block_size as i32).saturating_sub(1).max(0);
+        if proposals == 0 {
+            return Ok((0..batch_size).map(|_| Vec::new()).collect());
+        }
+
+        // Per-row token-stream accumulators.
+        let mut tokens_per_row: Vec<Vec<i32>> =
+            (0..batch_size).map(|_| Vec::with_capacity(proposals as usize)).collect();
+
+        // Per-step recurrent state: `h_prev` starts at the caller's
+        // [B, 1, backbone] target hidden; `last_tokens` starts at the
+        // per-row bonus slice.
+        let mut h_prev = ffi::copy(hidden);
+        let mut last_tokens: Vec<i32> = last_bonus.to_vec();
+
+        for _ in 0..proposals {
+            // Per-row embed: build a [B, 1] token-id tensor, embed, scale.
+            let tok_ids = ffi::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
+            let tok_embed = self.inner.embed_tokens.forward(&tok_ids);
+            let tok_embed = if self.target_embed.is_some() {
+                crate::multiply_scalar(&tok_embed, self.target_embed_scale)
+            } else {
+                tok_embed
+            };
+
+            // [B, 1, hidden] + [B, 1, backbone] → [B, 1, 2 * backbone]
+            let inputs_embeds = crate::concatenate(&tok_embed, &h_prev, -1);
+
+            let (next_hidden, logits) = self.forward(&inputs_embeds)?;
+
+            // Per-row argmax (or sampled) tokens. Greedy at temp=0 is the
+            // load-bearing correctness path; non-greedy is the
+            // quality-loss path the round-loop owns.
+            let last_logits = ffi::slice_last_logits(&logits);
+            let sampled = ffi::fused_sample(
+                &last_logits,
+                sampler.temperature,
+                sampler.top_k,
+                sampler.top_p,
+                sampler.min_p,
+            );
+            ffi::eval(&sampled);
+
+            // Materialize each row's sampled token. Shape of `sampled`
+            // is `[B]` (one int per batch row).
+            for r in 0..batch_size {
+                let cell = ffi::slice(&sampled, &[r as i32], &[(r as i32) + 1]);
+                let scalar = ffi::reshape(&cell, &[]);
+                let tok = ffi::item_i32(&scalar);
+                tokens_per_row[r].push(tok);
+                last_tokens[r] = tok;
+            }
+
+            h_prev = next_hidden;
+        }
+
+        Ok(tokens_per_row)
     }
 
     fn draft_block(

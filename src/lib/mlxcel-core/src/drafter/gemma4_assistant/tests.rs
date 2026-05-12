@@ -478,3 +478,153 @@ fn gemma4_assistant_drafter_is_object_safe_via_box_dyn() {
     let boxed: Box<dyn Drafter> = Box::new(model);
     assert_eq!(boxed.kind(), DrafterKind::Mtp);
 }
+
+// ── Batched draft path (issue #631) ──────────────────────────────────────
+
+/// `draft_block_batched` produces `B` rows of `block_size - 1` proposals
+/// each. Pins the shape contract.
+///
+/// This test exercises the actual forward path; the test fixture's
+/// default config uses `hidden_size != backbone_hidden_size` which
+/// breaks the `pre_projection` matmul. We rebuild a corrected weight
+/// set sized for `hidden == backbone` so the forward runs.
+#[test]
+fn draft_block_batched_returns_b_rows_of_k_minus_one_proposals() {
+    // Build a corrected config where `hidden_size == backbone_hidden_size`
+    // so pre_projection in_dim = 2 * backbone matches `tok_embed + h_prev`.
+    let mut cfg = make_test_config(2, true);
+    cfg.backbone_hidden_size = 64; // match text_config.hidden_size = 64
+    let backbone = cfg.backbone_hidden_size as i32;
+
+    // Rebuild weights with the corrected `2 * backbone` pre_projection in.
+    let mut weights = make_test_weights(&cfg);
+    weights.remove("pre_projection.weight");
+    weights.remove("post_projection.weight");
+    insert_zeros(&mut weights, "pre_projection.weight", &[64, 2 * backbone]);
+    insert_zeros(&mut weights, "post_projection.weight", &[backbone, 64]);
+
+    let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg).expect("load");
+    let target = MockLanguageModel::new(16, 64);
+    model.bind(&target).expect("bind");
+
+    // Build a 4-tensor shared K/V at [B=3, n_kv=1, kv_len=8, head_dim=32].
+    let batch_size = 3;
+    let kv_len = 8;
+    let head_dim = 32;
+    let n_kv = 1;
+    let k_full = ffi::zeros(
+        &[batch_size, n_kv, kv_len, head_dim],
+        crate::dtype::FLOAT32,
+    );
+    let v_full = ffi::zeros(
+        &[batch_size, n_kv, kv_len, head_dim],
+        crate::dtype::FLOAT32,
+    );
+    let k_swa = ffi::zeros(
+        &[batch_size, n_kv, kv_len, head_dim],
+        crate::dtype::FLOAT32,
+    );
+    let v_swa = ffi::zeros(
+        &[batch_size, n_kv, kv_len, head_dim],
+        crate::dtype::FLOAT32,
+    );
+    let tensors: Vec<&MlxArray> = vec![
+        k_full.as_ref().unwrap(),
+        v_full.as_ref().unwrap(),
+        k_swa.as_ref().unwrap(),
+        v_swa.as_ref().unwrap(),
+    ];
+    let shared = SharedKv::new(&tensors);
+    model
+        .set_shared_kv(shared, 0, 0, 0)
+        .expect("set_shared_kv");
+
+    // hidden tensor: [B, 1, backbone].
+    let hidden = ffi::zeros(&[batch_size, 1, backbone], crate::dtype::FLOAT32);
+    let last_bonus = vec![1_i32, 2, 3];
+    let sampler = SamplingConfig::greedy();
+    let out = model
+        .draft_block_batched(&last_bonus, Some(hidden.as_ref().unwrap()), 4, &sampler)
+        .expect("draft_block_batched must succeed");
+
+    assert_eq!(out.len(), batch_size as usize, "B rows expected");
+    for (r, row) in out.iter().enumerate() {
+        assert_eq!(
+            row.len(),
+            3,
+            "row {r}: must produce block_size - 1 = 3 proposals"
+        );
+    }
+}
+
+/// `draft_block_batched` rejects empty bonus vector with empty output
+/// (defensive: matches the B = 1 path's `block_size == 0` handling).
+#[test]
+fn draft_block_batched_rejects_block_size_zero_with_empty_rows() {
+    let cfg = make_test_config(2, true);
+    let weights = make_test_weights(&cfg);
+    let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg).expect("load");
+    let target = MockLanguageModel::new(16, 64);
+    model.bind(&target).expect("bind");
+
+    // 2 tensors = full-attention only.
+    let k = ffi::zeros(&[2, 1, 4, 32], crate::dtype::FLOAT32);
+    let v = ffi::zeros(&[2, 1, 4, 32], crate::dtype::FLOAT32);
+    let tensors: Vec<&MlxArray> = vec![k.as_ref().unwrap(), v.as_ref().unwrap()];
+    let shared = SharedKv::new(&tensors);
+    model
+        .set_shared_kv(shared, 0, 0, 0)
+        .expect("set_shared_kv");
+
+    let last_bonus = vec![1_i32, 2];
+    let sampler = SamplingConfig::greedy();
+    let out = model
+        .draft_block_batched(&last_bonus, None, 0, &sampler)
+        .expect("block_size = 0 returns empty rows");
+    assert_eq!(out.len(), 2);
+    assert!(out[0].is_empty());
+    assert!(out[1].is_empty());
+}
+
+/// `draft_block_batched` rejects calls before `set_shared_kv`.
+#[test]
+fn draft_block_batched_rejects_call_before_set_shared_kv() {
+    let cfg = make_test_config(2, true);
+    let weights = make_test_weights(&cfg);
+    let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg).expect("load");
+    let target = MockLanguageModel::new(16, 64);
+    model.bind(&target).expect("bind");
+
+    let last_bonus = vec![1_i32, 2];
+    let sampler = SamplingConfig::greedy();
+    let err = model
+        .draft_block_batched(&last_bonus, None, 4, &sampler)
+        .expect_err("must fail");
+    match err {
+        DrafterError::SetSharedKvNotCalled => {}
+        other => panic!("expected SetSharedKvNotCalled, got {other:?}"),
+    }
+}
+
+/// `set_shared_kv` with `left_padding > 0` routes through the masks
+/// normalizer (issue #631). Pins the path: drafter accepts the call
+/// without trying to forward through invalid shared K/V buffers.
+#[test]
+fn set_shared_kv_with_left_padding_routes_through_normalizer() {
+    let cfg = make_test_config(2, true);
+    let weights = make_test_weights(&cfg);
+    let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg).expect("load");
+    let target = MockLanguageModel::new(16, 64);
+    model.bind(&target).expect("bind");
+
+    // B=2, kv_len=8 — non-trivial enough to make the normalizer's roll
+    // observable.
+    let kv_len = 8_i32;
+    let k = ffi::zeros(&[2, 1, kv_len, 32], crate::dtype::FLOAT32);
+    let v = ffi::zeros(&[2, 1, kv_len, 32], crate::dtype::FLOAT32);
+    let tensors: Vec<&MlxArray> = vec![k.as_ref().unwrap(), v.as_ref().unwrap()];
+    let shared = SharedKv::new(&tensors);
+    model
+        .set_shared_kv(shared, 0, 0, /* left_padding */ 3)
+        .expect("set_shared_kv with left_padding must succeed");
+}

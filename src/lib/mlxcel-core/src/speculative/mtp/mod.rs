@@ -47,6 +47,7 @@
 //!   forcing this crate to depend on the outer `mlxcel` crate.
 
 pub mod generator;
+pub mod round_loop_batched;
 pub mod target;
 pub mod walk;
 
@@ -54,5 +55,8 @@ pub mod walk;
 mod tests;
 
 pub use generator::MtpGenerator;
-pub use target::{MtpTarget, MtpVerifyOutput};
-pub use walk::speculative_walk;
+pub use round_loop_batched::{MtpBatchedGenerator, MtpBatchedRunOutput};
+pub use target::{
+    MtpBatchedVerifyForwardOutput, MtpBatchedVerifyOutput, MtpTarget, MtpVerifyOutput,
+};
+pub use walk::{speculative_walk, speculative_walk_batched};

@@ -142,6 +142,89 @@ pub fn speculative_walk(
     }
 }
 
+/// Per-row exact-greedy speculative walk (B >= 1) for the batched MTP path.
+///
+/// Mirrors upstream `_speculative_walk_batch` in
+/// `references/mlx-vlm/mlx_vlm/generate.py`. Given per-row drafter proposals
+/// (`draft_tokens[r]` is row `r`'s `K-1` proposals) and per-row target argmax
+/// (`target_tokens[r]` is row `r`'s `K` argmax tokens), plus per-row budgets,
+/// produces:
+///
+/// - `accepted[r]`: per-row accept count, in range `0..=draft_tokens[r].len()`.
+/// - `new_tokens[r]`: per-row emitted tokens, length `<= budgets[r]`.
+///
+/// Semantics are the natural lifting of [`speculative_walk`] over independent
+/// rows: each row is walked in isolation; rows in different speculative-walk
+/// states share the same verify-forward but diverge on what they emit. This
+/// is the load-bearing per-row divergence test in the batched MTP path.
+///
+/// # Greedy parity
+///
+/// At `temp=0.0`, this is byte-identical to calling [`speculative_walk`] once
+/// per row with the row's `(draft, target, budget)` triple. The test
+/// [`tests::walk_batched_equivalent_to_per_row_speculative_walk`] pins that
+/// invariant.
+///
+/// # Arguments
+///
+/// - `draft_tokens`: per-row drafter proposals, outer length `B`. Each
+///   `draft_tokens[r]` has length `K-1`.
+/// - `target_tokens`: per-row target argmax tokens, outer length `B`. Each
+///   `target_tokens[r]` has length exactly `draft_tokens[r].len() + 1`.
+/// - `budgets`: per-row emission caps. `budgets[r] == 0` is allowed (defensive
+///   for finished rows still passed through the walk for shape stability) and
+///   produces an empty row.
+pub fn speculative_walk_batched(
+    draft_tokens: &[Vec<i32>],
+    target_tokens: &[Vec<i32>],
+    budgets: &[usize],
+) -> (Vec<usize>, Vec<Vec<i32>>) {
+    let b = draft_tokens.len();
+    debug_assert_eq!(
+        target_tokens.len(),
+        b,
+        "speculative_walk_batched: draft and target row counts must match"
+    );
+    debug_assert_eq!(
+        budgets.len(),
+        b,
+        "speculative_walk_batched: budgets row count must match"
+    );
+
+    let mut accepted_per_row: Vec<usize> = Vec::with_capacity(b);
+    let mut new_tokens_per_row: Vec<Vec<i32>> = Vec::with_capacity(b);
+
+    for r in 0..b {
+        let d = &draft_tokens[r];
+        let t = &target_tokens[r];
+        debug_assert_eq!(
+            t.len(),
+            d.len() + 1,
+            "speculative_walk_batched: row {r} target_tokens length must be draft + 1"
+        );
+
+        let n_draft = d.len();
+        let accepted = (0..n_draft).find(|&i| d[i] != t[i]).unwrap_or(n_draft);
+
+        // Match scalar `speculative_walk`'s budget-aware emission shape:
+        // emit_len = (accepted + 1).min(budget); drop bonus when accepted ==
+        // budget.
+        let emit_len = (accepted + 1).min(budgets[r]);
+        let mut new_tokens: Vec<i32> = Vec::with_capacity(emit_len);
+        for &tok in &d[..accepted.min(emit_len)] {
+            new_tokens.push(tok);
+        }
+        if new_tokens.len() < emit_len {
+            new_tokens.push(t[accepted]);
+        }
+
+        accepted_per_row.push(accepted);
+        new_tokens_per_row.push(new_tokens);
+    }
+
+    (accepted_per_row, new_tokens_per_row)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,5 +324,101 @@ mod tests {
         let r = speculative_walk(&[10, 11, 99, 13], &[10, 11, 12, 20, 21], 16);
         assert_eq!(r.accepted, 2);
         assert_eq!(r.new_tokens, vec![10, 11, 12]);
+    }
+
+    // ============================================================
+    // Batched walk tests
+    // ============================================================
+
+    #[test]
+    fn walk_batched_all_rows_full_accept() {
+        let draft = vec![vec![10, 11, 12], vec![20, 21, 22]];
+        let target = vec![vec![10, 11, 12, 13], vec![20, 21, 22, 23]];
+        let budgets = vec![100, 100];
+        let (accepted, new_tokens) = speculative_walk_batched(&draft, &target, &budgets);
+        assert_eq!(accepted, vec![3, 3]);
+        assert_eq!(
+            new_tokens,
+            vec![vec![10, 11, 12, 13], vec![20, 21, 22, 23]]
+        );
+    }
+
+    #[test]
+    fn walk_batched_per_row_divergence() {
+        // Acceptance criterion: per-row accept counts diverge in the
+        // same batch. Row 0 full-accepts, row 1 mismatches at index 1,
+        // row 2 mismatches at index 0.
+        let draft = vec![
+            vec![10, 11, 12],
+            vec![20, 99, 22],
+            vec![99, 31, 32],
+        ];
+        let target = vec![
+            vec![10, 11, 12, 13],
+            vec![20, 21, 22, 23],
+            vec![30, 31, 32, 33],
+        ];
+        let budgets = vec![100, 100, 100];
+        let (accepted, new_tokens) = speculative_walk_batched(&draft, &target, &budgets);
+        assert_eq!(accepted, vec![3, 1, 0]);
+        assert_eq!(
+            new_tokens,
+            vec![vec![10, 11, 12, 13], vec![20, 21], vec![30]],
+        );
+    }
+
+    #[test]
+    fn walk_batched_per_row_budget_truncation() {
+        // Row 0 has tight budget 2, row 1 has plenty.
+        let draft = vec![vec![10, 11, 12], vec![20, 21, 22]];
+        let target = vec![vec![10, 11, 12, 13], vec![20, 21, 22, 23]];
+        let budgets = vec![2, 4];
+        let (_acc, new_tokens) = speculative_walk_batched(&draft, &target, &budgets);
+        assert_eq!(new_tokens, vec![vec![10, 11], vec![20, 21, 22, 23]]);
+    }
+
+    #[test]
+    fn walk_batched_zero_budget_emits_empty() {
+        // Defensive: finished rows pass through with budget=0 and emit
+        // nothing.
+        let draft = vec![vec![10, 11, 12]];
+        let target = vec![vec![10, 11, 12, 13]];
+        let budgets = vec![0];
+        let (accepted, new_tokens) = speculative_walk_batched(&draft, &target, &budgets);
+        assert_eq!(accepted, vec![3]);
+        assert_eq!(new_tokens, vec![Vec::<i32>::new()]);
+    }
+
+    #[test]
+    fn walk_batched_equivalent_to_per_row_speculative_walk() {
+        // Greedy parity gate: the batched walk MUST be byte-identical
+        // to calling `speculative_walk` once per row with the same
+        // arguments.
+        let draft = vec![
+            vec![10, 11, 12],
+            vec![20, 99, 22],
+            vec![99, 31, 32],
+            vec![41, 42, 43],
+        ];
+        let target = vec![
+            vec![10, 11, 12, 13],
+            vec![20, 21, 22, 23],
+            vec![30, 31, 32, 33],
+            vec![41, 42, 43, 44],
+        ];
+        let budgets = vec![16, 7, 5, 3];
+        let (batched_accepted, batched_new) = speculative_walk_batched(&draft, &target, &budgets);
+
+        for r in 0..draft.len() {
+            let reference = speculative_walk(&draft[r], &target[r], budgets[r]);
+            assert_eq!(
+                batched_accepted[r], reference.accepted,
+                "row {r}: batched accepted count must match per-row walk"
+            );
+            assert_eq!(
+                batched_new[r], reference.new_tokens,
+                "row {r}: batched new_tokens must match per-row walk"
+            );
+        }
     }
 }
