@@ -92,6 +92,7 @@ use std::sync::OnceLock;
 /// (#626) — landed here independently per issue #627 so the layer can
 /// be unit-tested in isolation before integration.
 pub mod masked_embedder;
+pub mod dflash;
 
 /// Drafter shapes recognised by mlxcel.
 ///
@@ -203,7 +204,12 @@ pub fn drafter_kind_by_model_type() -> &'static HashMap<&'static str, DrafterKin
 }
 
 /// Errors that can occur during drafter resolution / loading.
+///
+/// Marked `#[non_exhaustive]` so adding new failure modes for future
+/// drafter shapes (e.g. quantization mismatches for an MoE-flavored
+/// drafter) does not break downstream `match` exhaustiveness.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum DrafterError {
     /// User passed an unknown drafter kind string on the CLI.
     #[error("unknown drafter kind {got:?}; known: {}", known.join(", "))]
@@ -234,6 +240,23 @@ pub enum DrafterError {
     /// follow the trail.
     #[error("drafter kind {kind} is not yet implemented; tracked by issue #{issue}")]
     NotYetImplemented { kind: DrafterKind, issue: u32 },
+
+    /// Weight loading or model construction failed (missing key,
+    /// quantization mismatch, etc.). Carries the underlying reason for
+    /// operator triage.
+    #[error("drafter load failed: {reason}")]
+    LoadFailed { reason: String },
+
+    /// The drafter could not be bound to the supplied target (e.g. the
+    /// target lacks an `embed_tokens` capability that the drafter
+    /// requires).
+    #[error("drafter bind failed: {reason}")]
+    BindFailed { reason: String },
+
+    /// `draft_block` could not complete (e.g. missing target hidden,
+    /// out-of-range `block_size`, sampling failure).
+    #[error("drafter draft_block failed: {reason}")]
+    DraftFailed { reason: String },
 }
 
 /// Subset of the drafter's `config.json` that [`resolve_drafter_kind`]
@@ -548,15 +571,18 @@ pub type LoadedDrafter = (Box<dyn Drafter>, DrafterKind);
 pub fn load_drafter(path: &Path, kind: Option<DrafterKind>) -> Result<LoadedDrafter, DrafterError> {
     let resolved = resolve_drafter_kind(path, kind)?;
     match resolved {
-        // Concrete implementations land in their respective sub-issues.
-        // Returning a typed error rather than `unimplemented!()` here is
-        // load-bearing: the round-loop driver and CLI plumbing depend on
-        // this signature compiling today, and a typed error gives users
-        // an actionable hint instead of a panic.
-        DrafterKind::Dflash => Err(DrafterError::NotYetImplemented {
-            kind: resolved,
-            issue: 635,
-        }),
+        DrafterKind::Dflash => {
+            // Wired in by #635: load weights, sanitize, build the model,
+            // hand back the boxed trait object.
+            let drafter = dflash::drafter::DFlashDrafter::load(path)?;
+            Ok((Box::new(drafter), resolved))
+        }
+        // Concrete implementations for the remaining variants land in
+        // their respective sub-issues. Returning a typed error rather
+        // than `unimplemented!()` here is load-bearing: the round-loop
+        // driver and CLI plumbing depend on this signature compiling
+        // today, and a typed error gives users an actionable hint
+        // instead of a panic.
         DrafterKind::Mtp => Err(DrafterError::NotYetImplemented {
             kind: resolved,
             issue: 626,
@@ -788,16 +814,27 @@ mod tests {
     // ----- load_drafter ---------------------------------------------------
 
     #[test]
-    fn load_drafter_returns_typed_not_yet_implemented_for_dflash() {
+    fn load_drafter_dflash_fails_without_weights_with_typed_load_error() {
+        // The stub `config.json` is present but no safetensors files
+        // accompany it. `DFlashDrafter::load` must surface a typed
+        // `LoadFailed` (not `NotYetImplemented` — DFlash is wired in
+        // by #635). Pin this to make sure a future re-stub of the
+        // `Dflash` arm cannot silently regress to `NotYetImplemented`.
         let dir = tempdir().unwrap();
         write_drafter_config(&dir, None);
-        let err = load_drafter(dir.path(), Some(DrafterKind::Dflash)).expect_err("stub");
+        let err = load_drafter(dir.path(), Some(DrafterKind::Dflash)).expect_err(
+            "load_drafter must fail on a config-only fixture with no safetensors",
+        );
         match err {
-            DrafterError::NotYetImplemented { kind, issue } => {
-                assert_eq!(kind, DrafterKind::Dflash);
-                assert_eq!(issue, 635);
+            DrafterError::LoadFailed { reason } => {
+                // Reason is implementation-defined; the typed variant
+                // is what matters for the contract.
+                assert!(!reason.is_empty(), "LoadFailed reason must not be empty");
             }
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            DrafterError::NotYetImplemented { .. } => {
+                panic!("DFlash must NOT be NotYetImplemented after #635 lands");
+            }
+            other => panic!("expected LoadFailed, got {other:?}"),
         }
     }
 
