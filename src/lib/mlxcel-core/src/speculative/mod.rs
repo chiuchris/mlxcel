@@ -27,6 +27,17 @@
 //!    b. Verify: forward [current + draft tokens] through main model
 //!    c. Accept matching prefix, rewind caches for rejected tokens
 //!    d. Continue from the divergence point
+//!
+//! ## Sibling modules
+//!
+//! - [`mtp`] — Multi-Token Prediction (MTP) round-loop generator for the
+//!   Gemma 4 assistant drafter family. Peer code path to
+//!   [`SpeculativeGenerator`] with fundamentally different semantics
+//!   (drafter has no own KV cache; verify is a single forward over the
+//!   whole draft block; rollback uses per-row tail-zero rather than
+//!   `trim_caches`). See [`mtp::MtpGenerator`].
+
+pub mod mtp;
 
 use crate::cache::can_trim_prompt_cache;
 use crate::ffi;
