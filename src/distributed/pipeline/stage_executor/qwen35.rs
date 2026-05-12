@@ -12,6 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Pipeline-parallel stage executor for Qwen 3.5.
+//!
+//! Speculative-decoding hooks (`forward_speculative`,
+//! `rollback_speculative_cache` — issue #634) are **NOT** propagated through
+//! this stage executor in epic #633's Phase 1. Rationale:
+//!
+//! - The DFlash drafter must run against a *single coherent* target. The
+//!   speculative round loop needs the verify-pass logits, per-layer hidden
+//!   captures, and per-GDN-layer rollback snapshots within the same forward
+//!   pass — splitting that across pipeline stages would require cross-stage
+//!   plumbing of hidden-state and GDN-state snapshots that does not exist
+//!   today.
+//! - mlxcel's pipeline-parallel runner currently does not support speculative
+//!   decoding for *any* model family, so opening the door specifically for
+//!   Qwen 3.5 would create an isolated, untested code path.
+//!
+//! Follow-up: when speculative + pipeline-parallel becomes a supported combo,
+//! reopen this file and surface a `forward_speculative_stage` analog that
+//! emits and consumes hidden / GDN snapshots over the stage boundary. Until
+//! then, callers that need DFlash on Qwen 3.5 must use the non-pipeline
+//! `Qwen35Model::forward_speculative` path.
+
 use std::path::Path;
 
 use anyhow::Result;

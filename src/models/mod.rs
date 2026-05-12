@@ -161,7 +161,7 @@ pub use qwen2::Qwen2Model;
 pub use qwen2_moe::Qwen2MoeModel;
 pub use qwen2_vl::Qwen2VLModel;
 pub use qwen3::Qwen3Model;
-pub use qwen3_5::Qwen35Model;
+pub use qwen3_5::{GdnRollbackSnapshot, Qwen35Model, VerifyOutput};
 pub use qwen3_moe::Qwen3MoeModel;
 pub use qwen3_next::Qwen3NextModel;
 pub use qwen3_vl::Qwen3VLModel;
@@ -330,3 +330,7 @@ mod sanitize_tests;
 #[cfg(test)]
 #[path = "qwen_vl_position_tests.rs"]
 mod qwen_vl_position_tests;
+
+#[cfg(test)]
+#[path = "qwen3_5_tests.rs"]
+mod qwen3_5_tests;

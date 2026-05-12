@@ -465,6 +465,210 @@ impl Qwen35GatedDeltaNet {
         mlxcel_core::reshape(&out, &[b, s, -1])
     }
 
+    /// Variant of [`forward_hidden_internal`] that also captures a
+    /// per-layer snapshot suitable for `rollback_speculative_cache`.
+    ///
+    /// Mirrors the `gdn_sink` parameter in upstream
+    /// `mlx-vlm/mlx_vlm/models/qwen3_5/language.py:Qwen3_5GatedDeltaNet`
+    /// (issue #634). The snapshot is captured *before* `gated_delta_update`
+    /// runs, holding the same per-step inputs and the pre-block recurrent
+    /// state — exactly what is needed to replay the block over a truncated
+    /// `[B, n]` slice during DFlash rollback.
+    ///
+    /// Apple Silicon precision (issue #634, `docs/apple-silicon-precision.md`):
+    /// captured `q/k/v/a/b/conv_input` retain their bf16/f16 dtype from the
+    /// projections; `init_state`, when present, stays float32. The rollback
+    /// path must preserve these dtypes to avoid numerical drift from the
+    /// cold-pass reference the drafter was trained against.
+    ///
+    /// Used by: `Qwen35Model::forward_speculative` (issue #634)
+    fn forward_hidden_internal_with_capture(
+        &self,
+        layer_idx: usize,
+        inputs: &MlxArray,
+        mask: Option<&MlxArray>,
+        mut cache: Option<&mut GatedDeltaCache>,
+        snapshot_sink: &mut Vec<GdnRollbackSnapshot>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(inputs);
+        let b = shape[0];
+        let s = shape[1];
+
+        // Projections — keep bf16/f16 throughout.
+        let qkv = self.in_proj_qkv.forward(inputs);
+        let z = self.in_proj_z.forward(inputs);
+        let z = mlxcel_core::reshape(&z, &[b, s, self.num_v_heads as i32, self.head_v_dim as i32]);
+        let b_proj = self.in_proj_b.forward(inputs);
+        let a = self.in_proj_a.forward(inputs);
+
+        let input_dtype = mlxcel_core::array_dtype(&qkv);
+
+        // Reproduce the conv-state handling from `forward_hidden_internal`.
+        let conv_state = if let Some(ref c) = cache {
+            c.conv_state
+                .as_ref()
+                .and_then(|s| {
+                    let s_ref = s.as_ref().unwrap();
+                    let state_shape = mlxcel_core::array_shape(s_ref);
+                    if state_shape[0] != b {
+                        None
+                    } else {
+                        Some(mlxcel_core::copy(s_ref))
+                    }
+                })
+                .unwrap_or_else(|| {
+                    mlxcel_core::zeros(
+                        &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
+                        input_dtype,
+                    )
+                })
+        } else {
+            mlxcel_core::zeros(
+                &[b, (self.conv_kernel_size - 1) as i32, self.conv_dim as i32],
+                input_dtype,
+            )
+        };
+
+        let guarded_mask = mask.filter(|m| {
+            let mask_shape = mlxcel_core::array_shape(m);
+            mask_shape[0] == b
+        });
+
+        // Apply mask to qkv (matches non-capture path).
+        let qkv = if let Some(m) = guarded_mask {
+            let m_exp = mlxcel_core::expand_dims(m, -1);
+            let zero = mlxcel_core::full_f32(&[1], 0.0, input_dtype);
+            mlxcel_core::where_cond(&m_exp, &qkv, &zero)
+        } else {
+            qkv
+        };
+
+        // Build the full conv input. The snapshot stores this in its entirety
+        // so rollback can re-derive `conv_state` from any acceptance window.
+        let conv_input = concatenate(&conv_state, &qkv, 1);
+
+        // Update the cache's `conv_state` from the verify-pass tail — same as
+        // the non-capture path; if the drafter later rejects this block, the
+        // rollback path will overwrite this with the per-row trimmed window.
+        if let Some(c) = cache.as_deref_mut() {
+            let n_keep = (self.conv_kernel_size - 1) as i32;
+            let conv_shape = mlxcel_core::array_shape(&conv_input);
+            let conv_len = conv_shape[1];
+            let tail = mlxcel_core::slice(
+                &conv_input,
+                &[0, conv_len - n_keep, 0],
+                &[b, conv_len, self.conv_dim as i32],
+            );
+            c.conv_state = Some(mlxcel_core::contiguous(&tail, false));
+        }
+
+        // Conv1d + SiLU.
+        let conv_out = mlxcel_core::conv1d(
+            &conv_input,
+            &self.conv1d_weight,
+            1,
+            0,
+            1,
+            self.conv_dim as i32,
+        );
+        let conv_out = silu(&conv_out);
+
+        let conv_out_shape = mlxcel_core::array_shape(&conv_out);
+        let conv_seq = conv_out_shape[1];
+        let q_out = mlxcel_core::slice(&conv_out, &[0, 0, 0], &[b, conv_seq, self.key_dim as i32]);
+        let k_out = mlxcel_core::slice(
+            &conv_out,
+            &[0, 0, self.key_dim as i32],
+            &[b, conv_seq, (2 * self.key_dim) as i32],
+        );
+        let v_out = mlxcel_core::slice(
+            &conv_out,
+            &[0, 0, (2 * self.key_dim) as i32],
+            &[b, conv_seq, self.conv_dim as i32],
+        );
+
+        let q = mlxcel_core::reshape(
+            &q_out,
+            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+        );
+        let k = mlxcel_core::reshape(
+            &k_out,
+            &[b, s, self.num_k_heads as i32, self.head_k_dim as i32],
+        );
+        let v = mlxcel_core::reshape(
+            &v_out,
+            &[b, s, self.num_v_heads as i32, self.head_v_dim as i32],
+        );
+
+        // Pre-block recurrent state (float32 when present), guarded against
+        // continuous-batching dim mismatch — identical to the non-capture path.
+        let init_state = cache.as_ref().and_then(|c| {
+            c.state_cache.as_ref().and_then(|s| {
+                let s_ref = s.as_ref().unwrap();
+                let state_shape = mlxcel_core::array_shape(s_ref);
+                if state_shape[0] != b {
+                    None
+                } else {
+                    Some(mlxcel_core::copy(s_ref))
+                }
+            })
+        });
+
+        // RMSNorm scaling for q and k (preserves the verify-pass dtype).
+        let inv_scale = (self.head_k_dim as f32).powf(-0.5);
+        let q_dtype = mlxcel_core::array_dtype(&q);
+        let eps_arr = mlxcel_core::full_f32(&[1], 1e-6, q_dtype);
+
+        let q_sq = mlxcel_core::square(&q);
+        let q_sq_mean = mlxcel_core::mean_axis(&q_sq, -1, true);
+        let q_rms = mlxcel_core::sqrt(&mlxcel_core::add(&q_sq_mean, &eps_arr));
+        let scale_q = mlxcel_core::full_f32(&[1], inv_scale * inv_scale, q_dtype);
+        let q = mlxcel_core::multiply(&mlxcel_core::divide(&q, &q_rms), &scale_q);
+
+        let k_sq = mlxcel_core::square(&k);
+        let k_sq_mean = mlxcel_core::mean_axis(&k_sq, -1, true);
+        let k_rms = mlxcel_core::sqrt(&mlxcel_core::add(&k_sq_mean, &eps_arr));
+        let scale_k = mlxcel_core::full_f32(&[1], inv_scale, q_dtype);
+        let k = mlxcel_core::multiply(&mlxcel_core::divide(&k, &k_rms), &scale_k);
+
+        // Capture the snapshot BEFORE the gated_delta_update consumes/mutates
+        // the recurrent state. The drafter uses these to replay over the
+        // accepted prefix.
+        let snapshot_init_state = init_state.as_ref().map(|s| mlxcel_core::copy(s));
+        snapshot_sink.push(GdnRollbackSnapshot {
+            layer_idx,
+            q: mlxcel_core::copy(&q),
+            k: mlxcel_core::copy(&k),
+            v: mlxcel_core::copy(&v),
+            a: mlxcel_core::copy(&a),
+            b: mlxcel_core::copy(&b_proj),
+            init_state: snapshot_init_state,
+            conv_input: mlxcel_core::copy(&conv_input),
+        });
+
+        // Run gated_delta_update for the full verify block.
+        let (out, new_state) = gated_delta_update(
+            &q,
+            &k,
+            &v,
+            &a,
+            &b_proj,
+            &self.a_log,
+            &self.dt_bias,
+            init_state.as_deref(),
+            guarded_mask,
+        );
+
+        if let Some(c) = cache {
+            c.state_cache = Some(new_state);
+            c.advance(s);
+        }
+
+        let out = self.norm.forward(&out, Some(&z));
+        let reshaped = mlxcel_core::reshape(&out, &[b, s, -1]);
+        self.out_proj.forward(&reshaped)
+    }
+
     #[cfg(test)]
     pub(crate) fn debug_prefill_no_cache(
         &self,
@@ -727,6 +931,57 @@ impl Qwen35DecoderLayer {
         mlxcel_core::add(&h, &mlp_out)
     }
 
+    /// Speculative-capture variant of [`Self::forward`]. When this layer is
+    /// linear-attention, also pushes a [`GdnRollbackSnapshot`] into
+    /// `snapshot_sink`; attention layers behave identically to `forward`.
+    ///
+    /// Issue #634: used by `Qwen35Model::forward_speculative` to drive the
+    /// DFlash drafter without duplicating the prefill / decode forward path.
+    fn forward_with_capture(
+        &self,
+        layer_idx: usize,
+        x: &MlxArray,
+        mask: Option<&MlxArray>,
+        cache: &mut Qwen3NextCache,
+        position_ids: Option<&MlxArray>,
+        snapshot_sink: &mut Vec<GdnRollbackSnapshot>,
+    ) -> UniquePtr<MlxArray> {
+        let normed = self.input_layernorm.forward(x);
+
+        let r = match (&self.attention, cache) {
+            (Qwen35AttentionVariant::Linear(attn), Qwen3NextCache::Linear(c)) => attn
+                .forward_hidden_internal_with_capture(
+                    layer_idx,
+                    &normed,
+                    mask,
+                    Some(c),
+                    snapshot_sink,
+                ),
+            (Qwen35AttentionVariant::Linear(attn), _) => attn.forward_hidden_internal_with_capture(
+                layer_idx,
+                &normed,
+                mask,
+                None,
+                snapshot_sink,
+            ),
+            (Qwen35AttentionVariant::FullAttention(attn), Qwen3NextCache::Attention(c)) => {
+                attn.forward_with_position_ids(&normed, c, mask, position_ids)
+            }
+            (Qwen35AttentionVariant::FullAttention(attn), _) => {
+                let mut temp_cache = KVCache::new();
+                attn.forward_with_position_ids(&normed, &mut temp_cache, mask, position_ids)
+            }
+        };
+
+        let h = mlxcel_core::add(x, &r);
+
+        let mlp_out = match &self.mlp {
+            Qwen35MLPVariant::Dense(mlp) => mlp.forward(&self.post_attention_layernorm.forward(&h)),
+            Qwen35MLPVariant::MoE(moe) => moe.forward(&self.post_attention_layernorm.forward(&h)),
+        };
+        mlxcel_core::add(&h, &mlp_out)
+    }
+
     fn from_weights(
         weights: &WeightMap,
         config: &Qwen35Config,
@@ -782,6 +1037,58 @@ impl Qwen35DecoderLayer {
             post_attention_layernorm: RMSNorm::new(post_norm_weight, config.rms_norm_eps),
         })
     }
+}
+
+// Speculative Decoding Hooks.
+/// Per-GDN-layer snapshot captured during a verify-pass forward.
+///
+/// Stores everything needed to replay [`gated_delta_update`] against the same
+/// inputs but truncated to the accepted prefix, so the recurrent linear-attention
+/// state can be rolled back to the position of the last accepted token.
+///
+/// Field shapes (with batch `B`, verify-pass block length `S`):
+/// - `q`, `k`: `[B, S, num_k_heads, head_k_dim]` — already RMSNorm-scaled.
+/// - `v`: `[B, S, num_v_heads, head_v_dim]`.
+/// - `a`, `b`: `[B, S, num_v_heads]` — pre-sigmoid `b`, raw `a`.
+/// - `init_state`: `[B, num_v_heads, head_v_dim, head_k_dim]` (float32) or `None`
+///   when the layer entered the block with no recurrent state.
+/// - `conv_input`: `[B, S + conv_kernel_size - 1, conv_dim]` — concatenated
+///   prev-conv-state + qkv. Used to recover the post-rollback `conv_state` window.
+/// - `layer_idx`: which decoder layer this snapshot belongs to (for replay).
+///
+/// Dtype policy (issue #634, Apple Silicon precision rules — `docs/apple-silicon-precision.md`):
+/// the captured tensors retain the dtype produced by the verify-pass kernels
+/// (typically bf16 / f16 for activations; float32 for `init_state`). The rollback
+/// path must NOT promote them to float32, otherwise the rewound state diverges
+/// from the cold-pass result that DFlash's drafter expects.
+///
+/// Used by: `Qwen35Model::forward_speculative`, `Qwen35Model::rollback_speculative_cache`
+pub struct GdnRollbackSnapshot {
+    pub layer_idx: usize,
+    pub q: UniquePtr<MlxArray>,
+    pub k: UniquePtr<MlxArray>,
+    pub v: UniquePtr<MlxArray>,
+    pub a: UniquePtr<MlxArray>,
+    pub b: UniquePtr<MlxArray>,
+    pub init_state: Option<UniquePtr<MlxArray>>,
+    pub conv_input: UniquePtr<MlxArray>,
+}
+
+/// Verify-pass output for the speculative path.
+///
+/// Returned by [`Qwen35Model::forward_speculative`]. The `hidden_states` vector
+/// is ordered to match the `capture_layer_ids` argument so the DFlash drafter
+/// can directly call `concat(hidden_states, axis=-1)` to obtain its
+/// `5 * hidden_size`-wide projection input. The `gdn_states` vector is ordered
+/// by layer index over linear-attention layers only (skipping full-attention
+/// layers), matching the per-position correspondence used by upstream
+/// `rollback_speculative_cache` in `mlx-vlm/mlx_vlm/models/qwen3_5/language.py`.
+///
+/// Used by: DFlash round loop (sub-12), `Qwen35Model::rollback_speculative_cache`
+pub struct VerifyOutput {
+    pub logits: UniquePtr<MlxArray>,
+    pub hidden_states: Vec<UniquePtr<MlxArray>>,
+    pub gdn_states: Vec<GdnRollbackSnapshot>,
 }
 
 // Qwen3.5 Model.
@@ -1249,6 +1556,380 @@ impl Qwen35Model {
             }
         }
     }
+
+    /// Forward pass that captures DFlash-target hooks: per-layer hidden
+    /// states at `capture_layer_ids` and per-GDN-layer rollback snapshots.
+    ///
+    /// This is the verify-pass hot path consumed by the DFlash drafter
+    /// round loop (epic #633, sub-12). It mirrors upstream
+    /// `mlx-vlm/mlx_vlm/models/qwen3_5/language.py::LanguageModel.__call__`
+    /// when called with `capture_layer_ids` set, with two changes:
+    ///   1. `return_hidden` is implied by `capture_layer_ids.is_some()` —
+    ///      the upstream `return_hidden` flag is redundant on Qwen 3.5 since
+    ///      the DFlash drafter always wants a *specific* set of layer captures.
+    ///   2. The returned `gdn_states` carries enough verify-pass tensor state
+    ///      that [`Self::rollback_speculative_cache`] can later rewind both
+    ///      KV (attention) caches and GDN (linear-attention) caches to the
+    ///      accepted position.
+    ///
+    /// Apple Silicon precision (issue #634, `docs/apple-silicon-precision.md`):
+    /// captured hidden tensors keep the verify-pass dtype (bf16/f16); GDN
+    /// snapshot tensors keep their per-field dtype. Do not promote to f32.
+    ///
+    /// Used by: DFlash drafter round loop (epic #633, sub-12).
+    pub fn forward_speculative(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Qwen3NextCache],
+        capture_layer_ids: &[usize],
+    ) -> VerifyOutput {
+        let h0 = self.embed_tokens.forward(input_ids);
+
+        let shape = mlxcel_core::array_shape(&h0);
+        let seq_len = shape[1];
+
+        // Build the full-attention causal mask using the first full-attention
+        // layer's cache offset, matching `forward_internal`.
+        let fa_idx = self.config.full_attention_interval - 1;
+        let fa_mask = if seq_len > 1 {
+            let offset = if fa_idx < caches.len() {
+                caches[fa_idx].offset()
+            } else {
+                0
+            };
+            Some(create_causal_mask(seq_len, offset))
+        } else {
+            None
+        };
+
+        // Order-preserving membership check for capture_layer_ids. We need the
+        // *index in capture_layer_ids* so DFlash's drafter sees its layers in
+        // the order it requested (the concat-axis ordering is load-bearing).
+        let mut hidden_slots: Vec<Option<UniquePtr<MlxArray>>> =
+            (0..capture_layer_ids.len()).map(|_| None).collect();
+
+        let mut gdn_states: Vec<GdnRollbackSnapshot> = Vec::new();
+        let mut h = h0;
+        for (i, (layer, cache)) in self.layers.iter().zip(caches.iter_mut()).enumerate() {
+            let mask = if layer.is_linear {
+                None
+            } else {
+                fa_mask.as_deref()
+            };
+            h = layer.forward_with_capture(i, &h, mask, cache, None, &mut gdn_states);
+
+            // Capture the post-block hidden state for any requested layer index.
+            // The check is O(capture_layer_ids.len()) per layer; for DFlash's
+            // typical k=5 captures that is negligible.
+            for (slot_idx, &want_idx) in capture_layer_ids.iter().enumerate() {
+                if want_idx == i {
+                    hidden_slots[slot_idx] = Some(mlxcel_core::copy(&h));
+                }
+            }
+        }
+
+        // Materialize hidden states in capture_layer_ids order. Missing slots
+        // (out-of-range indices) are filled with zeros to keep the resulting
+        // vector length-aligned with the request, but in practice the drafter
+        // configures `target_layer_ids` against the model so all entries must
+        // resolve.
+        let hidden_states: Vec<UniquePtr<MlxArray>> = hidden_slots
+            .into_iter()
+            .map(|opt| {
+                opt.unwrap_or_else(|| {
+                    mlxcel_core::zeros(
+                        &[shape[0], seq_len, self.config.hidden_size as i32],
+                        mlxcel_core::array_dtype(&h),
+                    )
+                })
+            })
+            .collect();
+
+        // Final norm + LM head — same as `forward_internal`.
+        let h = self.norm.forward(&h);
+        let logits = if let Some(ref lm_head) = self.lm_head {
+            lm_head.forward(&h)
+        } else {
+            self.embed_tokens.as_linear(&h)
+        };
+
+        VerifyOutput {
+            logits,
+            hidden_states,
+            gdn_states,
+        }
+    }
+
+    /// Rewind both KV (attention) and GDN (linear-attention) caches to the
+    /// position of the last accepted token after a DFlash verify-pass block.
+    ///
+    /// Mirrors upstream
+    /// `mlx-vlm/mlx_vlm/models/qwen3_5/language.py::LanguageModel.rollback_speculative_cache`
+    /// (issue #634). Returns `max(accepted)`.
+    ///
+    /// Arguments:
+    ///   * `caches` — the per-layer cache slice the verify pass just mutated.
+    ///   * `gdn_states` — the `gdn_states` field of [`VerifyOutput`] from the
+    ///     SAME verify pass. Ordered by linear-attention layer index.
+    ///   * `accepted` — per-row accepted count `a_i` (i.e. the prefix
+    ///     `[0..a_i]` is kept). For `B == 1` this is a single-element slice.
+    ///   * `block_size` — the verify-block length (typically the drafter's
+    ///     `block_size` config). Used to compute the trim amount:
+    ///     `trim = block_size - (max(accepted) + 1)`.
+    ///
+    /// Per-row tail zeroing for `B > 1`: rows with smaller accept counts have
+    /// their KV-cache tail zeroed and their GDN state re-derived from the
+    /// per-row prefix length. Rows that fully accept the block (i.e.
+    /// `accepted == block_size - 1`) keep both cache types as the verify-pass
+    /// produced them.
+    ///
+    /// Apple Silicon precision (issue #634, `docs/apple-silicon-precision.md`):
+    /// GDN replay re-uses the captured `q/k/v/a/b` and `init_state` tensors
+    /// at their original dtype (bf16/f16/float32 as captured). Do not promote
+    /// to f32 — the drafter's reference forward stays in the activation dtype.
+    ///
+    /// Used by: DFlash drafter round loop (epic #633, sub-12).
+    pub fn rollback_speculative_cache(
+        &self,
+        caches: &mut [Qwen3NextCache],
+        gdn_states: &[GdnRollbackSnapshot],
+        accepted: &[i32],
+        block_size: i32,
+    ) -> i32 {
+        if accepted.is_empty() {
+            return 0;
+        }
+        let max_a = *accepted.iter().max().unwrap_or(&0);
+        let n = max_a + 1;
+        let trim = block_size - n;
+        let is_batch = accepted.len() > 1;
+
+        // Attention caches: trim by `trim`. Per-row tail zeroing for batched.
+        for cache in caches.iter_mut() {
+            if let Qwen3NextCache::Attention(kv) = cache {
+                if trim > 0 {
+                    kv.trim(trim);
+                }
+                if is_batch && max_a > 0 {
+                    let kv_len = kv.offset;
+                    let verify_start = kv_len - n;
+                    for (bi, &acc) in accepted.iter().enumerate() {
+                        let valid_end = acc + 1;
+                        let start = verify_start + valid_end;
+                        if start < kv_len {
+                            // Zero the per-row tail in both K and V. We rebuild
+                            // each tensor by concatenating the head + zero tail
+                            // along the seq axis for this row only, then
+                            // assembling the batch via copy-slice-replace.
+                            zero_per_row_kv_tail(kv, bi as i32, start, kv_len);
+                        }
+                    }
+                }
+            }
+        }
+
+        // GDN caches: replay the captured block over `[:, :n]` so the
+        // post-block state matches the accepted-prefix position.
+        let mut snapshot_iter = gdn_states.iter();
+        for (layer_idx, cache) in caches.iter_mut().enumerate() {
+            let Qwen3NextCache::Linear(linear_cache) = cache else {
+                continue;
+            };
+            let snap = match snapshot_iter.next() {
+                Some(s) => s,
+                None => continue,
+            };
+            // Sanity check: the snapshot must come from this layer.
+            debug_assert_eq!(snap.layer_idx, layer_idx);
+
+            let layer = match &self.layers[layer_idx].attention {
+                Qwen35AttentionVariant::Linear(linear) => linear,
+                _ => continue,
+            };
+
+            // Re-run gated_delta_update with the first n tokens. We always
+            // pass `mask = None`: mlxcel's verify-pass does not maintain an
+            // SSM mask, mirroring `forward_hidden_internal`. (The upstream
+            // batched-replay mask is also a no-op when `accepted` is uniform.)
+            let q_n = mlxcel_core::slice(
+                &snap.q,
+                &[0, 0, 0, 0],
+                &[
+                    mlxcel_core::array_shape(&snap.q)[0],
+                    n,
+                    mlxcel_core::array_shape(&snap.q)[2],
+                    mlxcel_core::array_shape(&snap.q)[3],
+                ],
+            );
+            let k_n = mlxcel_core::slice(
+                &snap.k,
+                &[0, 0, 0, 0],
+                &[
+                    mlxcel_core::array_shape(&snap.k)[0],
+                    n,
+                    mlxcel_core::array_shape(&snap.k)[2],
+                    mlxcel_core::array_shape(&snap.k)[3],
+                ],
+            );
+            let v_n = mlxcel_core::slice(
+                &snap.v,
+                &[0, 0, 0, 0],
+                &[
+                    mlxcel_core::array_shape(&snap.v)[0],
+                    n,
+                    mlxcel_core::array_shape(&snap.v)[2],
+                    mlxcel_core::array_shape(&snap.v)[3],
+                ],
+            );
+            let a_n = mlxcel_core::slice(
+                &snap.a,
+                &[0, 0, 0],
+                &[
+                    mlxcel_core::array_shape(&snap.a)[0],
+                    n,
+                    mlxcel_core::array_shape(&snap.a)[2],
+                ],
+            );
+            let b_n = mlxcel_core::slice(
+                &snap.b,
+                &[0, 0, 0],
+                &[
+                    mlxcel_core::array_shape(&snap.b)[0],
+                    n,
+                    mlxcel_core::array_shape(&snap.b)[2],
+                ],
+            );
+
+            let (_y, replayed_state) = gated_delta_update(
+                &q_n,
+                &k_n,
+                &v_n,
+                &a_n,
+                &b_n,
+                &layer.a_log,
+                &layer.dt_bias,
+                snap.init_state.as_deref(),
+                None,
+            );
+
+            linear_cache.state_cache = Some(replayed_state);
+
+            // Recover conv_state from the captured conv_input.
+            // For B=1: cache[0] = conv_input[:, a0+1 : a0+K]  (K = conv_kernel_size).
+            // For B>1: per-row slicing because each row may have accepted a
+            //          different count. We assemble the per-row conv_state
+            //          window first, then concat to a [B, K-1, conv_dim] tensor.
+            let k_kernel = layer.conv_kernel_size as i32;
+            let conv_shape = mlxcel_core::array_shape(&snap.conv_input);
+            let conv_dim = conv_shape[2];
+            if is_batch {
+                let mut rows: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(accepted.len());
+                for (bi, &acc) in accepted.iter().enumerate() {
+                    let row = mlxcel_core::slice(
+                        &snap.conv_input,
+                        &[bi as i32, acc + 1, 0],
+                        &[bi as i32 + 1, acc + k_kernel, conv_dim],
+                    );
+                    rows.push(row);
+                }
+                // Stack along batch axis 0.
+                let mut concatenated = mlxcel_core::copy(rows[0].as_ref().unwrap());
+                for row in rows.iter().skip(1) {
+                    concatenated = concatenate(&concatenated, row.as_ref().unwrap(), 0);
+                }
+                linear_cache.conv_state = Some(mlxcel_core::contiguous(&concatenated, false));
+            } else {
+                let a0 = accepted[0];
+                let row = mlxcel_core::slice(
+                    &snap.conv_input,
+                    &[0, a0 + 1, 0],
+                    &[conv_shape[0], a0 + k_kernel, conv_dim],
+                );
+                linear_cache.conv_state = Some(mlxcel_core::contiguous(&row, false));
+            }
+
+            // Roll the linear cache offset back by `trim` so subsequent decode
+            // steps see the cache at the accepted position.
+            if trim > 0 {
+                linear_cache.offset -= trim;
+            }
+        }
+
+        max_a
+    }
+}
+
+/// Zero the per-row tail `[bi, :, start:kv_len, :]` in both K and V of a
+/// `KVCache`. Used by [`Qwen35Model::rollback_speculative_cache`] for batched
+/// verify-pass rollback when rows accepted different numbers of tokens.
+///
+/// Apple Silicon precision (issue #634): the zero buffer is built with the
+/// same dtype as the K/V tensors so no implicit f32 promotion happens.
+///
+/// Used by: `Qwen35Model::rollback_speculative_cache`
+pub(crate) fn zero_per_row_kv_tail(kv: &mut KVCache, bi: i32, start: i32, kv_len: i32) {
+    let Some(keys_ref) = kv.keys.as_ref().map(|k| k.as_ref().unwrap()) else {
+        return;
+    };
+    let Some(vals_ref) = kv.values.as_ref().map(|v| v.as_ref().unwrap()) else {
+        return;
+    };
+    let k_shape = mlxcel_core::array_shape(keys_ref);
+    let v_shape = mlxcel_core::array_shape(vals_ref);
+    let k_dtype = mlxcel_core::array_dtype(keys_ref);
+    let v_dtype = mlxcel_core::array_dtype(vals_ref);
+
+    // For each tensor, build a copy where the tail of row `bi` is zeroed.
+    // We reconstruct the tensor by concatenating: rows-before + zeroed-row + rows-after,
+    // each split per the batch axis. The zeroed-row itself is head + zero-tail per the
+    // seq axis. All zero tensors keep the original dtype to honor the no-f32-promotion
+    // rule from `docs/apple-silicon-precision.md`.
+    kv.keys = Some(rebuild_with_zero_tail(
+        keys_ref, &k_shape, bi, start, kv_len, k_dtype,
+    ));
+    kv.values = Some(rebuild_with_zero_tail(
+        vals_ref, &v_shape, bi, start, kv_len, v_dtype,
+    ));
+}
+
+/// Reconstruct a 4D KV tensor `[B, H, S, D]` where row `bi`'s
+/// `[H, start:kv_len, D]` slab is replaced with zeros of the same dtype.
+pub(crate) fn rebuild_with_zero_tail(
+    tensor: &MlxArray,
+    shape: &[i32],
+    bi: i32,
+    start: i32,
+    kv_len: i32,
+    dtype: i32,
+) -> UniquePtr<MlxArray> {
+    let batch = shape[0];
+    let heads = shape[1];
+    let head_dim = shape[3];
+
+    // Row-bi slice with head + zero-tail along the seq axis.
+    let mut head = mlxcel_core::slice(tensor, &[bi, 0, 0, 0], &[bi + 1, heads, start, head_dim]);
+    let zero_tail_len = kv_len - start;
+    if zero_tail_len > 0 {
+        let zero_tail = mlxcel_core::zeros(&[1, heads, zero_tail_len, head_dim], dtype);
+        head = concatenate(&head, &zero_tail, 2);
+    }
+
+    // Assemble the batch: rows-before, fixed row bi, rows-after.
+    let mut out = if bi > 0 {
+        let before = mlxcel_core::slice(tensor, &[0, 0, 0, 0], &[bi, heads, kv_len, head_dim]);
+        concatenate(&before, &head, 0)
+    } else {
+        head
+    };
+    if bi + 1 < batch {
+        let after = mlxcel_core::slice(
+            tensor,
+            &[bi + 1, 0, 0, 0],
+            &[batch, heads, kv_len, head_dim],
+        );
+        out = concatenate(&out, &after, 0);
+    }
+    mlxcel_core::contiguous(&out, false)
 }
 
 pub(crate) struct Qwen35StageModel {

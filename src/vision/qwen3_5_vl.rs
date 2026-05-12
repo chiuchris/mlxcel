@@ -19,6 +19,8 @@
 
 use super::{encoders, merge, processors};
 use crate::LanguageModel;
+use crate::models::qwen3_5::{GdnRollbackSnapshot, VerifyOutput};
+use crate::models::qwen3_next::Qwen3NextCache;
 use mlxcel_core::cache::SequenceId;
 use mlxcel_core::generate::DecodeBatchContext;
 use mlxcel_core::layers::KVCache;
@@ -79,6 +81,40 @@ impl Qwen35VLModel {
         self.text_model.set_mrope_state(position_ids, rope_deltas);
 
         merged
+    }
+
+    /// Speculative-decode verify pass that mirrors the text model's
+    /// [`Qwen35Model::forward_speculative`].
+    ///
+    /// Issue #634: DFlash's drafter consumes per-layer hidden captures and
+    /// per-GDN-layer rollback snapshots. The VLM wrapper exposes the same
+    /// hooks so multimodal prefill + speculative tail can compose. The
+    /// vision pathway runs in the standard prefill before this method is
+    /// invoked, so the verify pass only needs the text-side caches.
+    ///
+    /// Used by: DFlash drafter round loop (epic #633, sub-12).
+    pub fn forward_speculative(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [Qwen3NextCache],
+        capture_layer_ids: &[usize],
+    ) -> VerifyOutput {
+        self.text_model
+            .forward_speculative(input_ids, caches, capture_layer_ids)
+    }
+
+    /// Rewind both attention and GDN caches to the accepted-prefix
+    /// position. Delegates to the text model — the VLM wrapper holds no
+    /// cache state of its own (see issue #634).
+    pub fn rollback_speculative_cache(
+        &self,
+        caches: &mut [Qwen3NextCache],
+        gdn_states: &[GdnRollbackSnapshot],
+        accepted: &[i32],
+        block_size: i32,
+    ) -> i32 {
+        self.text_model
+            .rollback_speculative_cache(caches, gdn_states, accepted, block_size)
     }
 
     /// Compute 3D position IDs [T, H, W] for mixed text+image sequences
