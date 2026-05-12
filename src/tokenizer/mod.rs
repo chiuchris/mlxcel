@@ -822,7 +822,7 @@ mod tests {
             merged
                 .tool_call_start_tokens
                 .as_ref()
-                .map_or(false, |v| !v.is_empty())
+                .is_some_and(|v| !v.is_empty())
         );
 
         // End marker must NOT be populated (no tool→normal transition).
@@ -854,13 +854,13 @@ mod tests {
             merged
                 .tool_call_start_tokens
                 .as_ref()
-                .map_or(false, |v| !v.is_empty())
+                .is_some_and(|v| !v.is_empty())
         );
         assert!(
             merged
                 .tool_call_end_tokens
                 .as_ref()
-                .map_or(false, |v| !v.is_empty())
+                .is_some_and(|v| !v.is_empty())
         );
     }
 
