@@ -101,6 +101,7 @@ tower = { version = "0.4", features = ["util"] }
 hyper = { version = "1.1", features = ["server"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+indicatif = "0.18"
 async-stream = "0.3"
 fancy-regex = "0.17.0"
 toml = "0.8"

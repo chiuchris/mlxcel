@@ -355,6 +355,55 @@ fn snapshot_complete_rejects_zero_byte_files() {
     assert!(!snapshot_complete(dir.path(), &wanted));
 }
 
+/// Verify that `stream_file` removes the partial tempfile on error.
+///
+/// A server that immediately drops the TCP connection after accept triggers a
+/// reqwest stream error, which should cause `stream_file` to clean up the
+/// `.mlxcel-partial.*` file it created (or attempted to create) before
+/// propagating the error.
+#[tokio::test]
+async fn stream_file_cleans_up_tempfile_on_error() {
+    use tokio::net::TcpListener;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("model.safetensors");
+
+    // Spawn a server that immediately drops connections — induces a stream error.
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        if let Ok((stream, _)) = listener.accept().await {
+            drop(stream);
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let url = format!("http://{addr}/x");
+    let mp = indicatif::MultiProgress::with_draw_target(indicatif::ProgressDrawTarget::hidden());
+    let file_pb = mp.add(indicatif::ProgressBar::hidden());
+    let agg_pb = mp.add(indicatif::ProgressBar::hidden());
+
+    let result = stream_file(&client, &url, &dest, "model.safetensors", &file_pb, &agg_pb).await;
+    assert!(
+        result.is_err(),
+        "expected stream_file to return Err on dropped connection"
+    );
+
+    // Crucially: no tempfile should remain after the error.
+    let leftover: Vec<_> = std::fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(".mlxcel-partial.")
+        })
+        .collect();
+    assert!(
+        leftover.is_empty(),
+        "expected no tempfile leftover, found {leftover:?}"
+    );
+}
+
 // Integration test that hits the real Hugging Face Hub. Marked `#[ignore]`
 // per the issue acceptance criteria so CI does not depend on network access.
 #[test]

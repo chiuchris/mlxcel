@@ -1803,6 +1803,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "image",
+ "indicatif",
  "libc",
  "llguidance",
  "lz4_flex",
