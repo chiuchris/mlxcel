@@ -26,9 +26,11 @@ tokenizers = "0.22.2"
 bincode = "1"
 dirs = "5"
 libm = "0.2"
+tracing = "0.1"
 
 [dev-dependencies]
 tempfile = "3"
+tracing-test = "0.2"
 
 [build-dependencies]
 cxx-build = "1.0"

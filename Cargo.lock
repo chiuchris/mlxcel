@@ -1850,6 +1850,7 @@ dependencies = [
  "smallvec",
  "thiserror 2.0.18",
  "tokenizers 0.22.2",
+ "tracing",
  "unicode-script",
 ]
 
