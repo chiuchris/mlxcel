@@ -608,6 +608,45 @@ pub trait Drafter {
         sampler: &crate::generate::SamplingConfig,
     ) -> Result<Vec<i32>, DrafterError>;
 
+    /// Produce a batched draft block of proposal tokens (B > 1).
+    ///
+    /// Mirrors [`Self::draft_block`] but accepts a per-row bonus slice and
+    /// a `[B, T, dim]` hidden tensor. Returns a per-row proposal matrix:
+    /// `out[r]` is the proposal sequence for row `r`, with length
+    /// `block_size - 1` (DFlash) or `block_size` (MTP / InternalMtp).
+    ///
+    /// **Issue #637 (DFlash B>1 path)**: implemented by `DFlashDrafter`.
+    /// MTP / InternalMtp drafters return [`DrafterError::DraftFailed`] by
+    /// default — their batched paths land in their own respective sub-issues.
+    ///
+    /// - `last_bonus`: per-row bonus tokens, length `B`.
+    /// - `hidden`: optional target-hidden input with leading batch dim
+    ///   `B`. `None` is permitted at bring-up time for tests; concrete
+    ///   batched drafters reject `None` if their kind requires the
+    ///   hidden state.
+    /// - `block_size`: caller's target draft block length.
+    /// - `sampler`: sampling configuration applied to each proposal step.
+    ///
+    /// Default implementation returns
+    /// [`DrafterError::DraftFailed`] with a "batched-not-implemented"
+    /// message so drafters opt in to batched support explicitly.
+    #[allow(unused_variables)]
+    fn draft_block_batched(
+        &mut self,
+        last_bonus: &[i32],
+        hidden: Option<&MlxArray>,
+        block_size: usize,
+        sampler: &crate::generate::SamplingConfig,
+    ) -> Result<Vec<Vec<i32>>, DrafterError> {
+        Err(DrafterError::DraftFailed {
+            reason: format!(
+                "draft_block_batched not implemented for kind = {:?}; \
+                 B > 1 path requires per-drafter override",
+                self.kind()
+            ),
+        })
+    }
+
     /// Drop weight keys that this drafter kind must not carry into
     /// runtime (mutates `weights` in place).
     ///

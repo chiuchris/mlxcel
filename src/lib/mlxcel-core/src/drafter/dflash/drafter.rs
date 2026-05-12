@@ -262,6 +262,56 @@ impl Drafter for DFlashDrafter {
         sample_block_per_position(&logits, block_size, sampler)
     }
 
+    fn draft_block_batched(
+        &mut self,
+        last_bonus: &[i32],
+        hidden: Option<&MlxArray>,
+        block_size: usize,
+        sampler: &SamplingConfig,
+    ) -> Result<Vec<Vec<i32>>, DrafterError> {
+        let target_hidden = hidden.ok_or_else(|| DrafterError::DraftFailed {
+            reason: "DFlash drafter (batched) requires a target hidden state \
+                     (target_layer_ids concatenation); got hidden = None"
+                .to_string(),
+        })?;
+
+        if block_size < 2 {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "DFlash drafter requires block_size >= 2 (got {block_size}); \
+                     block_size 1 has no masked positions to sample"
+                ),
+            });
+        }
+        if last_bonus.is_empty() {
+            return Err(DrafterError::DraftFailed {
+                reason: "DFlash drafter (batched) requires B >= 1 bonus tokens".to_string(),
+            });
+        }
+
+        let batch_size = last_bonus.len();
+        let mask_id = self.model.config.mask_token_id;
+
+        // Build the per-row block layout: row r = [bonus[r], mask, mask, ..., mask].
+        // Final tensor shape is [B, block_size]. We materialize the entire
+        // [B * block_size] buffer in i32 then hand it to from_slice_i32.
+        let mut block: Vec<i32> = Vec::with_capacity(batch_size * block_size);
+        for &bonus in last_bonus {
+            block.push(bonus);
+            for _ in 1..block_size {
+                block.push(mask_id);
+            }
+        }
+        let inputs = ffi::from_slice_i32(&block, &[batch_size as i32, block_size as i32]);
+
+        // The model's forward already handles [B, L] inputs (issue #635); the
+        // returned logits are [B, L, vocab].
+        let logits = self.model.forward(&inputs, target_hidden, &mut self.caches);
+
+        // Sample one token per (row, masked-position) pair.
+        sample_block_per_position_batched(&logits, batch_size, block_size, sampler)
+    }
+
     fn sanitize(&mut self, weights: &mut WeightMap) -> Result<(), DrafterError> {
         // The trait contract is "drop weight keys this drafter must not
         // carry into runtime". For DFlash, that's the upstream
@@ -274,6 +324,71 @@ impl Drafter for DFlashDrafter {
     fn kind(&self) -> DrafterKind {
         DrafterKind::Dflash
     }
+}
+
+/// Per-row, per-position sampling helper for the batched DFlash draft.
+///
+/// Given `logits` of shape `[B, block_size, vocab]` and a sampler config,
+/// sample one token from each (row, masked-position) cell. Returns
+/// `Vec<Vec<i32>>` with shape `[B][block_size - 1]`.
+///
+/// Greedy (temperature == 0.0 OR `top_k == 1`) uses per-position argmax.
+/// Stochastic uses `fused_sample` per position over the `[1, vocab]`
+/// slice for that position.
+///
+/// Used by: `DFlashDrafter::draft_block_batched` (issue #637).
+fn sample_block_per_position_batched(
+    logits: &MlxArray,
+    batch_size: usize,
+    block_size: usize,
+    sampler: &SamplingConfig,
+) -> Result<Vec<Vec<i32>>, DrafterError> {
+    let shape = ffi::array_shape(logits);
+    if shape.len() != 3
+        || shape[0] != batch_size as i32
+        || shape[1] != block_size as i32
+    {
+        return Err(DrafterError::DraftFailed {
+            reason: format!(
+                "DFlash drafter (batched) expected logits shape \
+                 [{batch_size}, {block_size}, vocab]; got {shape:?}"
+            ),
+        });
+    }
+    let vocab = shape[2];
+    let n = block_size - 1;
+    let mut out: Vec<Vec<i32>> = (0..batch_size).map(|_| Vec::with_capacity(n)).collect();
+
+    let greedy = sampler.temperature == 0.0 || sampler.top_k == 1;
+
+    for b in 0..batch_size as i32 {
+        for i in 0..n {
+            // Row `(b, i+1)` of the [B, L, V] logits.
+            let pos = (i + 1) as i32;
+            let row = ffi::slice(
+                logits,
+                &[b, pos, 0_i32],
+                &[b + 1, pos + 1, vocab],
+            );
+            // Drop the seq axis so we get a `[1, vocab]` 2D slice (fused_sample
+            // / argmax expect `[batch, vocab]`).
+            let row = ffi::reshape(&row, &[1_i32, vocab]);
+            let token = if greedy {
+                ffi::argmax_last_axis(&row)
+            } else {
+                ffi::fused_sample(
+                    &row,
+                    sampler.temperature,
+                    sampler.top_k,
+                    sampler.top_p,
+                    sampler.min_p,
+                )
+            };
+            ffi::eval(&token);
+            out[b as usize].push(ffi::item_i32(&token));
+        }
+    }
+    Ok(out)
 }
 
 /// Per-position sampling helper.

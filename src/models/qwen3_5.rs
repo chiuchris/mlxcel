@@ -1935,13 +1935,34 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35Model {
         // Delegates to the per-Qwen-3.5 rollback that combines KV
         // attention-cache trim with GDN linear-attention state replay.
         // For B = 1 the accepted slice is a single-element view; the
-        // batched B > 1 sub-issue (#637) will pass longer slices.
+        // batched B > 1 path uses `rollback_partial_batched` (#637).
         let _ = self.rollback_speculative_cache(
             caches,
             &verify_out.gdn_states,
             &[accepted],
             block_size,
         );
+    }
+
+    fn rollback_partial_batched(
+        &self,
+        caches: &mut [Self::Cache],
+        verify_out: &Self::VerifyOut,
+        accepted: &[i32],
+        block_size: i32,
+    ) {
+        // For B > 1 the rollback path uses the same `rollback_speculative_cache`
+        // entrypoint with a multi-element `accepted` slice. The per-row
+        // KV tail-zeroing and per-row GDN-state replay (with per-row
+        // conv_state slicing) already lives inside that method (issue #634);
+        // we just thread the slice through.
+        //
+        // Apple Silicon precision (issue #634, `docs/apple-silicon-precision.md`):
+        // both the KV per-row tail zero buffer and the GDN replay tensors
+        // keep their captured dtype (bf16/f16 activations + float32
+        // init_state); no f32 promotion.
+        let _ =
+            self.rollback_speculative_cache(caches, &verify_out.gdn_states, accepted, block_size);
     }
 
     fn concat_hidden_for_drafter(&self, verify_out: &Self::VerifyOut) -> UniquePtr<MlxArray> {

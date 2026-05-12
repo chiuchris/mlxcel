@@ -185,19 +185,63 @@ pub trait SpeculativeTarget {
         block_size: i32,
     );
 
+    /// Rewind the target's caches to per-row accepted-prefix positions
+    /// (B > 1 path).
+    ///
+    /// Mirrors `rollback_partial` but accepts a `&[i32]` of length `B`
+    /// where `accepted[r]` is the per-row accept count for row `r`. The
+    /// implementation MUST:
+    ///
+    /// 1. Trim the attention-layer KV caches by
+    ///    `block_size - (max(accepted) + 1)` (the global trim amount).
+    /// 2. Per-row tail-zero each attention KV row whose `accepted[r] <
+    ///    max(accepted)` (so its K/V positions past `accepted[r] + 1`
+    ///    are zeroed in that row only — sibling rows keep their tails).
+    /// 3. Replay each linear-attention layer's GDN state per row, using
+    ///    the per-row `accepted[r]` to determine the replay length.
+    ///
+    /// For Qwen 3.5 this delegates directly to
+    /// `Qwen35Model::rollback_speculative_cache(caches, verify_out.gdn_states, accepted, block_size)`,
+    /// which already supports a per-row `accepted` slice (issue #634).
+    ///
+    /// The default implementation delegates to [`Self::rollback_partial`]
+    /// when `accepted.len() == 1` so single-row targets don't need a
+    /// separate impl. For B > 1, every implementation MUST override.
+    fn rollback_partial_batched(
+        &self,
+        caches: &mut [Self::Cache],
+        verify_out: &Self::VerifyOut,
+        accepted: &[i32],
+        block_size: i32,
+    ) {
+        debug_assert!(
+            !accepted.is_empty(),
+            "rollback_partial_batched must be called with B >= 1"
+        );
+        if accepted.len() == 1 {
+            self.rollback_partial(caches, verify_out, accepted[0], block_size);
+        } else {
+            panic!(
+                "rollback_partial_batched: target must override for B > 1 (got B = {})",
+                accepted.len()
+            );
+        }
+    }
+
     /// Build the drafter's per-round hidden input by concatenating the
     /// captured per-layer hidden states along the feature axis.
     ///
-    /// Returned tensor has shape `[1, block_size, num_capture_layers * hidden_size]`.
+    /// Returned tensor has shape `[B, block_size, num_capture_layers * hidden_size]`.
+    /// For B = 1 (and the B = 1 round loop) this is `[1, bs, dim]`.
     /// For the Qwen 3.5 4B DFlash drafter with
     /// `target_layer_ids = [1, 8, 15, 22, 29]` and `hidden_size = 2560`,
-    /// the full tensor is `[1, bs, 12800]`.
+    /// the full tensor is `[B, bs, 12800]`.
     ///
-    /// The round loop slices this tensor to `[1, accepted + 1, dim]` on
-    /// partial-accept rounds (mirroring upstream
-    /// `hidden = hidden[:, :accepted + 1, :]`); on full-accept rounds
-    /// the loop forwards the full block. The target trait stays simple
-    /// and the slice logic lives in one place.
+    /// The round loop slices this tensor to `[B, max(accepted) + 1, dim]`
+    /// on partial-accept rounds (mirroring upstream
+    /// `hidden = hidden[:, :max_a + 1, :]`); on full-accept rounds the
+    /// loop forwards the full block. The target trait stays simple and
+    /// the slice logic lives in one place.
     fn concat_hidden_for_drafter(
         &self,
         verify_out: &Self::VerifyOut,
@@ -205,6 +249,7 @@ pub trait SpeculativeTarget {
 
     /// Read the per-position logits out of `verify_out` for use by the
     /// round loop's argmax pass. Returned tensor has shape
+    /// `[B, block_size, vocab]`. For the B = 1 path this is
     /// `[1, block_size, vocab]`.
     fn verify_logits<'a>(&self, verify_out: &'a Self::VerifyOut) -> &'a MlxArray;
 }
