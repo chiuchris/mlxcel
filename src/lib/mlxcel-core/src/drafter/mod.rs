@@ -93,6 +93,9 @@ use std::sync::OnceLock;
 /// be unit-tested in isolation before integration.
 pub mod masked_embedder;
 pub mod dflash;
+/// Concrete Gemma 4 MTP "assistant" drafter implementation. Wired into
+/// [`load_drafter`]'s `Mtp` arm in issue #626.
+pub mod gemma4_assistant;
 
 /// Drafter shapes recognised by mlxcel.
 ///
@@ -243,7 +246,7 @@ pub enum DrafterError {
 
     /// Weight loading or model construction failed (missing key,
     /// quantization mismatch, etc.). Carries the underlying reason for
-    /// operator triage.
+    /// operator triage. Used by the DFlash drafter load path (#635).
     #[error("drafter load failed: {reason}")]
     LoadFailed { reason: String },
 
@@ -257,6 +260,85 @@ pub enum DrafterError {
     /// out-of-range `block_size`, sampling failure).
     #[error("drafter draft_block failed: {reason}")]
     DraftFailed { reason: String },
+
+    /// Config-layer error surfaced from
+    /// [`Gemma4AssistantConfig::normalize`](crate::drafter::gemma4_assistant::Gemma4AssistantConfig::normalize)
+    /// and friends. Wraps a free-form reason string to keep the
+    /// concrete-drafter modules free of new `thiserror` variants.
+    #[error("drafter config error: {0}")]
+    Config(String),
+
+    /// Failure while loading drafter weights (missing tensor, malformed
+    /// safetensors, etc.). Used by the Gemma 4 assistant drafter
+    /// [`Gemma4AssistantDraftModel::from_weights`](crate::drafter::gemma4_assistant::Gemma4AssistantDraftModel::from_weights)
+    /// path (#626). Sibling of [`Self::LoadFailed`], kept distinct so the
+    /// two drafter families surface different operator hints.
+    #[error("drafter weight load failed: {reason}")]
+    WeightLoad { reason: String },
+
+    /// Caller invoked [`Drafter::set_shared_kv`] with a tensor count outside
+    /// the documented set. The drafter currently accepts 2 (full-only) or 4
+    /// (full + sliding) tensors per [`SharedKv`]'s documented layout.
+    #[error(
+        "shared_kv has {got} tensors but the Gemma 4 drafter expects one of {expected:?}; \
+         see the `SharedKv` doc for the canonical layout"
+    )]
+    SharedKvShape {
+        got: usize,
+        expected: &'static [usize],
+    },
+
+    /// Drafter encountered a layer with a `layer_type` string that does not
+    /// map to any shared-K/V bucket the round-loop set up. The two known
+    /// buckets are `"full_attention"` and `"sliding_attention"`.
+    #[error(
+        "drafter saw unknown layer_type {got:?}; expected full_attention or sliding_attention"
+    )]
+    UnknownLayerType { got: String },
+
+    /// Drafter has a layer of the named layer-type but the round-loop did
+    /// not supply matching shared K/V tensors. Typically means the target's
+    /// shared K/V capture (issue #625) and the drafter's `layer_types` field
+    /// are out of sync.
+    #[error(
+        "drafter layer needs shared K/V for layer_type {layer_type:?} but the round-loop \
+         did not provide it; expected the target to capture both full_attention and \
+         sliding_attention slabs"
+    )]
+    MissingSharedKvForLayerType { layer_type: String },
+
+    /// The target language model does not expose a feature the drafter
+    /// needs. Most commonly: `embed_tokens` was never overridden (the
+    /// default trait impl returns `None`).
+    #[error("target language model is missing required feature: {feature}")]
+    TargetMissingFeature { feature: &'static str },
+
+    /// [`Drafter::draft_block`] was called before [`Drafter::bind`]. The
+    /// upstream Python code asserts the same precondition with a runtime
+    /// error.
+    #[error(
+        "Gemma 4 assistant drafter requires bind(target_model) to be called before \
+         draft_block() so the drafter can use the target's input embeddings"
+    )]
+    BindNotCalled,
+
+    /// [`Drafter::draft_block`] was called before [`Drafter::set_shared_kv`].
+    /// The MTP round-loop must arm the drafter with the target's shared K/V
+    /// at the start of each draft block.
+    #[error(
+        "Gemma 4 assistant drafter requires the MTP round-loop, but no shared K/V was set \
+         before draft_block() — this typically means the DFlash round-loop ran instead. \
+         Pass --draft-kind mtp on the CLI (or MLX_VLM_DRAFT_KIND=mtp on the server)"
+    )]
+    SetSharedKvNotCalled,
+
+    /// [`Drafter::draft_block`] requires a `hidden` input for the MTP path
+    /// (the target's last hidden, projected through `post_projection` on
+    /// subsequent steps). The trait signature uses `Option<&MlxArray>` so
+    /// DFlash callers that never need this argument can pass `None`; the
+    /// MTP path rejects `None` here.
+    #[error("Gemma 4 assistant drafter requires `hidden` to be Some(_) for the MTP path")]
+    DraftBlockMissingHidden,
 }
 
 /// Subset of the drafter's `config.json` that [`resolve_drafter_kind`]
@@ -577,16 +659,14 @@ pub fn load_drafter(path: &Path, kind: Option<DrafterKind>) -> Result<LoadedDraf
             let drafter = dflash::drafter::DFlashDrafter::load(path)?;
             Ok((Box::new(drafter), resolved))
         }
-        // Concrete implementations for the remaining variants land in
-        // their respective sub-issues. Returning a typed error rather
-        // than `unimplemented!()` here is load-bearing: the round-loop
-        // driver and CLI plumbing depend on this signature compiling
-        // today, and a typed error gives users an actionable hint
-        // instead of a panic.
-        DrafterKind::Mtp => Err(DrafterError::NotYetImplemented {
-            kind: resolved,
-            issue: 626,
-        }),
+        DrafterKind::Mtp => {
+            // Wired in by issue #626 — Gemma 4 MTP assistant drafter.
+            let model = gemma4_assistant::Gemma4AssistantDraftModel::from_path(path)?;
+            Ok((Box::new(model), resolved))
+        }
+        // Remaining variant lands in peer epic #647 — returning a typed
+        // error rather than `unimplemented!()` here gives users an
+        // actionable hint instead of a panic.
         DrafterKind::InternalMtp => Err(DrafterError::NotYetImplemented {
             kind: resolved,
             issue: 640,
@@ -839,16 +919,27 @@ mod tests {
     }
 
     #[test]
-    fn load_drafter_returns_typed_not_yet_implemented_for_mtp() {
+    fn load_drafter_routes_mtp_to_gemma4_assistant() {
+        // The Mtp arm is wired by issue #626. With a fixture that has the
+        // gemma4_assistant `model_type` but no full text_config, the
+        // factory should reach into Gemma4AssistantDraftModel::from_path
+        // and fail at config parsing (no text_config) rather than the
+        // earlier NotYetImplemented short-circuit. That proves the arm
+        // now dispatches into the concrete impl.
         let dir = tempdir().unwrap();
         write_drafter_config(&dir, Some("gemma4_assistant"));
-        let err = load_drafter(dir.path(), None).expect_err("stub");
+        let err = load_drafter(dir.path(), None).expect_err("stub config has no text_config");
         match err {
-            DrafterError::NotYetImplemented { kind, issue } => {
-                assert_eq!(kind, DrafterKind::Mtp);
-                assert_eq!(issue, 626);
+            DrafterError::NotYetImplemented { .. } => panic!(
+                "Mtp arm should no longer return NotYetImplemented; \
+                 issue #626 wired the concrete loader"
+            ),
+            DrafterError::ConfigParse { .. } | DrafterError::Config(_) => {
+                // Expected: factory got past the stub gate and into the
+                // concrete loader, where the bare fixture fails parse /
+                // normalize.
             }
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            other => panic!("expected ConfigParse / Config after Mtp dispatch, got {other:?}"),
         }
     }
 
