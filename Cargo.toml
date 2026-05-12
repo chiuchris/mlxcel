@@ -16,6 +16,15 @@ path = "src/main.rs"
 name = "mlxcel-server"
 path = "src/bin/mlx_server.rs"
 
+# Perf benchmark harness for the speculative drafter pairings shipped by
+# epic #633 / issue #632. Captures no-drafter baseline tok/s and scaffolds
+# the speculative numerator rows that follow-up #666 will fill in. See
+# `src/bin/speculative_bench.rs` for the module docs and `docs/model_tests.md`
+# (`Speculative drafters (epic #633)`) for the deferral matrix.
+[[bin]]
+name = "speculative_bench"
+path = "src/bin/speculative_bench.rs"
+
 [features]
 default = []
 metal = ["mlxcel-core/metal"]
