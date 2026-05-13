@@ -181,6 +181,17 @@ impl ModelProvider {
         // warning so an operator typo never silently expires every request.
         let decode_hang_timeout = validated_decode_hang_timeout(config.timeout_seconds);
 
+        // Issue #666: resolve the speculative-decoding dispatch once
+        // from the `ServerConfig::{draft_model_path, draft_kind,
+        // draft_block_size}` fields. The resolution reads the drafter's
+        // `config.json` so it must happen on the main thread before we
+        // hand the resolved value to the worker thread. Failures are
+        // surfaced as `anyhow::Error` here so the operator gets a clear
+        // startup-time error rather than a per-request 5xx.
+        let speculative_dispatch = crate::server::SpeculativeDispatch::resolve(config).map_err(
+            |e| anyhow::anyhow!("Speculative decoding dispatch resolution failed: {e}"),
+        )?;
+
         if config.no_batch {
             let mut provider = Self::new_with_legacy_worker(
                 model_path,
@@ -195,9 +206,25 @@ impl ModelProvider {
             // be able to observe it via the model provider handle.
             provider.prompt_cache = prompt_cache_store;
             provider.decode_hang_timeout = decode_hang_timeout;
+            // Issue #666: log a warning if the operator asked for
+            // speculative decoding but selected `--no-batch`. The legacy
+            // sequential worker bypasses the BatchScheduler entirely so
+            // the dispatch is inactive on this path.
+            if !matches!(
+                speculative_dispatch,
+                crate::server::SpeculativeDispatch::Disabled
+            ) {
+                tracing::warn!(
+                    "Speculative decoding requested ({}) but --no-batch \
+                     is enabled; the legacy sequential worker does not \
+                     run the speculative dispatch. Drop --no-batch to \
+                     enable speculative decoding.",
+                    speculative_dispatch.summary(),
+                );
+            }
             Ok(provider)
         } else {
-            let mut provider = Self::new_with_full_config_and_prompt_cache(
+            let mut provider = Self::new_with_full_config_and_speculative_dispatch(
                 model_path,
                 adapter_path,
                 config.max_batch_size,
@@ -216,6 +243,7 @@ impl ModelProvider {
                 config.batch_kv_quant,
                 // Issue #603: forward the --max-kv-size cap to the scheduler.
                 config.max_kv_size,
+                speculative_dispatch,
                 batch_metrics,
                 batch_observability,
             )?;
@@ -393,6 +421,65 @@ impl ModelProvider {
         batch_metrics: Arc<BatchMetrics>,
         batch_observability: Arc<BatchObservability>,
     ) -> Result<Self> {
+        // Issue #666: backward-compatible wrapper that defaults the
+        // speculative dispatch to `Disabled`. Callers wiring `--draft-model`
+        // / `--draft-kind` use the `_with_speculative_dispatch` variant
+        // below.
+        Self::new_with_full_config_and_speculative_dispatch(
+            model_path,
+            adapter_path,
+            max_batch_size,
+            max_queue_depth,
+            prefill_chunk_size,
+            enable_preemption,
+            preemption_policy,
+            max_batch_prefill,
+            decode_storage_backend,
+            pipeline_parallel_runtime,
+            vision_cache_size,
+            lang_bias_config,
+            reasoning_budget,
+            prompt_cache_store,
+            kv_cache_mode,
+            batch_kv_quant,
+            max_kv_size,
+            crate::server::SpeculativeDispatch::Disabled,
+            batch_metrics,
+            batch_observability,
+        )
+    }
+
+    /// Issue #666: variant that also accepts the resolved
+    /// [`crate::server::SpeculativeDispatch`].
+    ///
+    /// Use this from `new_with_server_config_and_prompt_cache` so the
+    /// `--draft-model` / `--draft-kind` flags actually reach the worker
+    /// thread. The default [`crate::server::SpeculativeDispatch::Disabled`]
+    /// preserves bit-exact baseline behaviour for the non-speculative
+    /// path.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_full_config_and_speculative_dispatch(
+        model_path: PathBuf,
+        adapter_path: Option<PathBuf>,
+        max_batch_size: usize,
+        max_queue_depth: usize,
+        prefill_chunk_size: usize,
+        enable_preemption: bool,
+        preemption_policy: crate::server::config::PreemptionPolicy,
+        max_batch_prefill: usize,
+        decode_storage_backend: crate::server::DecodeStorageBackend,
+        pipeline_parallel_runtime: Option<crate::server::PipelineParallelRuntimeConfig>,
+        vision_cache_size: usize,
+        lang_bias_config: Option<mlxcel_core::lang_analyzer::LangBiasConfig>,
+        reasoning_budget: Option<crate::server::thinking_budget::ThinkingBudget>,
+        prompt_cache_store: Option<Arc<crate::server::prompt_cache::PromptCacheStore>>,
+        kv_cache_mode: mlxcel_core::cache::KVCacheMode,
+        batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig,
+        max_kv_size: Option<usize>,
+        speculative_dispatch: crate::server::SpeculativeDispatch,
+        batch_metrics: Arc<BatchMetrics>,
+        batch_observability: Arc<BatchObservability>,
+    ) -> Result<Self> {
         let model_id = model_path
             .file_name()
             .map(|s| s.to_string_lossy().to_string())
@@ -424,6 +511,8 @@ impl ModelProvider {
             batch_kv_quant,
             // Issue #603: cap plain KVCache growth when configured.
             max_kv_size,
+            // Issue #666: forward the resolved speculative dispatch.
+            speculative_dispatch,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(
@@ -495,6 +584,10 @@ impl ModelProvider {
             kv_cache_mode: mlxcel_core::cache::KVCacheMode::Fp16,
             batch_kv_quant: mlxcel_core::cache::BatchKvQuantConfig::default(),
             max_kv_size: None, // issue #603: unbounded in minimal test path
+            // Issue #666: minimal test path has no drafter; the dispatch
+            // defaults to `Disabled` which short-circuits the scheduler
+            // hot path to the classic decode loop.
+            speculative_dispatch: crate::server::SpeculativeDispatch::Disabled,
         };
 
         let worker_handle = model_worker::spawn_model_worker_with_batch_config(

@@ -264,6 +264,32 @@ pub struct BatchScheduler {
     /// request layer again. Dropped automatically when the sequence is
     /// removed from the map on finish / error.
     prompt_cache_seq_ctx: std::collections::HashMap<SequenceId, PromptCacheRequestContext>,
+
+    /// Issue #666: resolved speculative-decoding dispatch shape.
+    ///
+    /// Defaults to [`crate::server::SpeculativeDispatch::Disabled`]
+    /// (constructed by [`Self::with_config`]). When the scheduler is
+    /// driven by a worker that wires `--draft-model` /
+    /// `--draft-kind` / `--draft-block-size`, the matching kind-specific
+    /// variant is attached via
+    /// [`Self::with_speculative_dispatch`].
+    ///
+    /// **Hot-path semantics**: every per-request decode-tick first
+    /// inspects `self.speculative_dispatch` via [`Self::should_dispatch_speculative`].
+    /// When the dispatch is `Disabled` (the default), the inspect is a
+    /// single match-arm short-circuit so the bit-exact classic decode
+    /// path stays zero-overhead. When the dispatch is a kind-specific
+    /// variant AND the per-request preconditions hold (single active
+    /// sequence, target supports the matching trait), the scheduler
+    /// delegates to the speculative round-loop driver — see the
+    /// per-kind dispatch hooks scheduled to land alongside this field.
+    /// Until those hooks land, the field is plumbed end-to-end and the
+    /// scheduler logs the auto-detected dispatch once at startup, but
+    /// still falls back to classic decode at request time. This is the
+    /// minimum-viable architectural foundation; full B=1 / B>1 decode
+    /// integration completes in the peer follow-up sketched in the
+    /// issue #666 implementation plan.
+    speculative_dispatch: crate::server::SpeculativeDispatch,
 }
 
 impl BatchScheduler {
@@ -383,6 +409,11 @@ impl BatchScheduler {
             kv_cache_mode: KVCacheMode::Fp16,
             batch_kv_quant: BatchKvQuantConfig::default(),
             max_kv_size: None,
+            // Issue #666: dispatch defaults to Disabled so the scheduler's
+            // hot path stays bit-exact for the non-speculative case. The
+            // worker thread overrides this via `with_speculative_dispatch`
+            // when the operator passed `--draft-model`.
+            speculative_dispatch: crate::server::SpeculativeDispatch::Disabled,
         }
     }
 
@@ -480,6 +511,86 @@ impl BatchScheduler {
     /// Returns the configured maximum KV cache size (for tests).
     pub fn max_kv_size(&self) -> Option<usize> {
         self.max_kv_size
+    }
+
+    /// Attach the resolved speculative-decoding dispatch (issue #666).
+    ///
+    /// Default (constructed by [`Self::with_config`]) is
+    /// [`crate::server::SpeculativeDispatch::Disabled`], so callers that
+    /// don't pass `--draft-model` keep the bit-exact classic decode path
+    /// with zero overhead.
+    ///
+    /// When `dispatch` is one of [`crate::server::SpeculativeDispatch::Mtp`],
+    /// [`crate::server::SpeculativeDispatch::DFlash`], or
+    /// [`crate::server::SpeculativeDispatch::Classic`], the scheduler logs
+    /// the dispatch at the next decode tick and (in a follow-up issue)
+    /// constructs the matching round-loop driver per request when the
+    /// per-request preconditions hold.
+    ///
+    /// **Preconditions for the kind-specific dispatch (Mtp / DFlash)**:
+    ///
+    /// 1. The active batch has size exactly 1 (continuous batching at
+    ///    B>1 is incompatible with the existing self-contained round-loop
+    ///    drivers — they own the full round loop, not a single tick — so
+    ///    the integration falls back to classic decode at B>1 and logs a
+    ///    one-time warning at worker startup; see `model_worker.rs`).
+    /// 2. The target wraps a model that implements the matching
+    ///    [`mlxcel_core::speculative::mtp::target::MtpTarget`] trait (for
+    ///    MTP) or
+    ///    [`mlxcel_core::drafter::dflash::SpeculativeTarget`] (for
+    ///    DFlash). Today that means:
+    ///    - **MTP**: `Gemma4Wrapper` / `Gemma4VLModel` — see the
+    ///      `MtpTarget` impls in
+    ///      [`crate::models::gemma4_mtp_target`].
+    ///    - **DFlash**: `Qwen35Model` / `Qwen35VLModel` — see the
+    ///      `SpeculativeTarget` impl in `crate::models::qwen3_5`.
+    /// 3. The drafter weights are loadable at the recorded
+    ///    `draft_model_path`. Drafter loading itself happens lazily on
+    ///    the worker thread the first time the dispatch arm is selected
+    ///    (so a never-used drafter never costs anything beyond the
+    ///    config-file parse already done at startup).
+    pub fn with_speculative_dispatch(
+        mut self,
+        dispatch: crate::server::SpeculativeDispatch,
+    ) -> Self {
+        self.speculative_dispatch = dispatch;
+        self
+    }
+
+    /// Returns the configured speculative-decoding dispatch (for tests
+    /// and operator-visible diagnostic endpoints).
+    pub fn speculative_dispatch(&self) -> &crate::server::SpeculativeDispatch {
+        &self.speculative_dispatch
+    }
+
+    /// Whether the scheduler should attempt the kind-specific
+    /// speculative dispatch at the current decode tick (issue #666).
+    ///
+    /// Returns `true` only when ALL of the following hold:
+    /// 1. `self.speculative_dispatch` is one of the kind-specific
+    ///    variants ([`crate::server::SpeculativeDispatch::Mtp`] /
+    ///    [`crate::server::SpeculativeDispatch::DFlash`]).
+    /// 2. The active batch has exactly one sequence (continuous batching
+    ///    at B>1 is incompatible with the self-contained round-loop
+    ///    drivers — see [`Self::with_speculative_dispatch`] docs).
+    ///
+    /// The downstream call site is also expected to verify that the
+    /// target model implements the matching trait — this method
+    /// intentionally does NOT do that check, because the
+    /// [`crate::LoadedModel`] surface does not let us cheaply ask "does
+    /// the inner concrete model implement `MtpTarget`?" without a
+    /// dedicated trait-object accessor. The dispatch hook lands the
+    /// concrete-model match-arm.
+    ///
+    /// **Today's behaviour**: the scheduler's `decode_single_step` does
+    /// NOT yet call this method — the per-tick speculative round-loop
+    /// integration is a follow-up scheduled with the per-target hook
+    /// matrix. The method is exposed publicly so the worker-side
+    /// observability surface can use it to publish the dispatch state
+    /// without breaking encapsulation, and so unit tests can pin the
+    /// invariant.
+    pub fn should_dispatch_speculative(&self) -> bool {
+        self.speculative_dispatch.is_kind_specific() && self.active_batch.len() == 1
     }
 
     /// Replace the default vision feature cache with one sized per the server

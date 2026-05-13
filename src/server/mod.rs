@@ -29,6 +29,7 @@ mod request_options;
 pub mod responses_store;
 pub mod responses_translator;
 pub mod routes;
+pub mod speculative_dispatch;
 mod startup;
 mod state;
 mod streaming;
@@ -58,6 +59,7 @@ pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
     RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
 };
+pub use speculative_dispatch::{SpeculativeDispatch, SpeculativeDispatchError};
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use prompt_cache::{
     ApcBlockHash, ApcConfig, ApcHashAlgo, BlockHashChain, CacheEntry, DEFAULT_APC_BLOCK_SIZE,

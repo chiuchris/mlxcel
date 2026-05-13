@@ -252,6 +252,30 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35VLModel {
         );
     }
 
+    /// Batched B > 1 rollback for the VLM wrapper. Issue #666 — overrides
+    /// the trait default (which panics for B > 1) so the batched DFlash
+    /// round loop can drive a Qwen 3.5 VLM target with batched-prefill
+    /// served by the continuous-batching scheduler.
+    ///
+    /// Mirrors the inner text-model `rollback_partial_batched`: the
+    /// per-row K/V tail-zero and per-row GDN replay live inside
+    /// `Qwen35Model::rollback_speculative_cache`, which already accepts a
+    /// multi-element `accepted` slice (issue #634).
+    fn rollback_partial_batched(
+        &self,
+        caches: &mut [Self::Cache],
+        verify_out: &Self::VerifyOut,
+        accepted: &[i32],
+        block_size: i32,
+    ) {
+        let _ = self.text_model.rollback_speculative_cache(
+            caches,
+            &verify_out.gdn_states,
+            accepted,
+            block_size,
+        );
+    }
+
     fn concat_hidden_for_drafter(&self, verify_out: &Self::VerifyOut) -> UniquePtr<MlxArray> {
         debug_assert!(
             !verify_out.hidden_states.is_empty(),

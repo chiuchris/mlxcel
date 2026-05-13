@@ -101,6 +101,20 @@ pub(crate) struct WorkerSchedulerConfig {
     /// window and bypass this cap. `None` (the default) preserves the
     /// legacy unbounded behaviour.
     pub max_kv_size: Option<usize>,
+    /// Issue #666: resolved speculative-decoding dispatch shape.
+    ///
+    /// Constructed once at worker construction (or
+    /// [`crate::server::SpeculativeDispatch::Disabled`] when the operator
+    /// did not pass `--draft-model`). The scheduler logs the summary at
+    /// startup and consumes the variant per request to decide whether to
+    /// run classic decode (the default and only currently-wired path
+    /// inside the scheduler) or one of the kind-specific speculative
+    /// round loops (MTP / DFlash) once the round-loop dispatch hook lands
+    /// in [`crate::server::batch::BatchScheduler`]. For
+    /// [`crate::server::SpeculativeDispatch::Disabled`] the hot path
+    /// short-circuits in [`BatchScheduler::decode_single_step`] with no
+    /// overhead.
+    pub speculative_dispatch: crate::server::SpeculativeDispatch,
 }
 
 pub(crate) fn spawn_model_worker_with_batch_config(
@@ -243,12 +257,43 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         } else {
             String::new()
         };
+        // Issue #666: log the resolved speculative dispatch once at
+        // startup. This makes the operator-visible "which path is
+        // active" explicit in the worker log without forcing the
+        // scheduler to log per request.
+        let spec_info =
+            if !matches!(sched_config.speculative_dispatch, crate::server::SpeculativeDispatch::Disabled) {
+                format!(", {}", sched_config.speculative_dispatch.summary())
+            } else {
+                String::new()
+            };
         tracing::info!(
             "Starting BatchScheduler (max_batch_size={}, \
-             max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info}{lang_bias_info})",
+             max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info}{lang_bias_info}{spec_info})",
             sched_config.max_batch_size,
             sched_config.max_queue_depth,
         );
+
+        // Issue #666: when the operator requested a kind-specific
+        // speculative path but the scheduler-side dispatch is not yet
+        // wired for B>1, emit a one-time warning so the operator knows
+        // why their requested speedup isn't materializing. The wiring
+        // happens inside `BatchScheduler::decode_single_step` (issue
+        // #666 follow-up; this PR lands the dispatch resolution + the
+        // per-target `MtpTarget` adapter and the scheduler-side
+        // round-loop integration completes in a peer issue).
+        if sched_config.speculative_dispatch.is_kind_specific()
+            && sched_config.max_batch_size > 1
+        {
+            tracing::warn!(
+                "Speculative decoding requested ({}) with max_batch_size={} > 1: \
+                 the batched (B>1) speculative round loop is not yet integrated \
+                 with the continuous-batching scheduler. Single-row requests will \
+                 still benefit; multi-row decode currently falls back to classic.",
+                sched_config.speculative_dispatch.summary(),
+                sched_config.max_batch_size,
+            );
+        }
 
         // Issue #409: resolve the thinking-token id pair once, after the
         // tokenizer is loaded. For models without `<think>`/`</think>` tokens
@@ -285,7 +330,11 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         .with_kv_cache_mode(sched_config.kv_cache_mode)
         .with_batch_kv_quant(sched_config.batch_kv_quant)
         // Issue #603: cap plain KVCache growth to --max-kv-size when set.
-        .with_max_kv_size(sched_config.max_kv_size);
+        .with_max_kv_size(sched_config.max_kv_size)
+        // Issue #666: attach the resolved speculative dispatch so the
+        // scheduler can branch per-request once the round-loop dispatch
+        // hook is wired in `decode_single_step`.
+        .with_speculative_dispatch(sched_config.speculative_dispatch);
         scheduler.run();
     })
 }

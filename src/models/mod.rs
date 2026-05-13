@@ -45,6 +45,7 @@ pub mod gemma2;
 pub mod gemma3;
 pub mod gemma3n;
 pub mod gemma4;
+pub mod gemma4_mtp_target;
 pub mod glm4;
 pub mod glm4_moe;
 pub mod glm4_moe_lite;
