@@ -284,6 +284,23 @@ impl UnifiedEmbedding {
     pub fn is_quantized(&self) -> bool {
         matches!(self, Self::Quantized(_))
     }
+
+    /// Return the raw weight tensor (the `[vocab_size, hidden_size]` matrix).
+    ///
+    /// For non-quantized embeddings this is the plain f32/bf16/f16 tensor.
+    /// For quantized embeddings this is the packed quantized weight (not yet
+    /// dequantized). Callers that need the dequantized weight for a matmul
+    /// should use [`Self::as_linear`] instead; this accessor is provided for
+    /// use-cases that need to pass the weight reference to an external op
+    /// (e.g. [`crate::drafter::masked_embedder::MaskedEmbedder::forward`]).
+    ///
+    /// Used by: Gemma4AssistantDraftModel (centroid/MaskedEmbedder LM head path)
+    pub fn weight(&self) -> &MlxArray {
+        match self {
+            Self::Quantized(e) => e.weight.as_ref().expect("non-null quantized weight"),
+            Self::Regular(e) => e.weight.as_ref().expect("non-null embedding weight"),
+        }
+    }
 }
 
 /// RMS Normalization layer

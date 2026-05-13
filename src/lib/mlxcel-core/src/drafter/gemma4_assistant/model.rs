@@ -34,22 +34,11 @@
 //!    optional `left_padding` for batched MTP.
 //! 4. **Draft block.** [`Gemma4AssistantDraftModel::draft_block`] runs `K`
 //!    autoregressive steps, returning `block_size - 1` proposal tokens.
-//!
-//! ## What is delegated to sibling sub-issues
-//!
-//! - **`MaskedEmbedder` centroid LM head (#627).** When the sibling PR lands,
-//!   replace [`MaskedEmbedderStub`] with the real module. The stub keeps the
-//!   non-sparse `tied_dense` path compilable today; the sparse path is gated
-//!   on `config.use_ordered_embeddings == true` and returns an explicit error
-//!   until the real `MaskedEmbedder` lands.
-//! - **Drafter bidirectional masks (#628).** When the sibling PR lands,
-//!   replace [`make_drafter_masks_stub`] with the real helper from
-//!   `crate::drafter::masks`. The stub returns `None` masks, which is the
-//!   correct unbatched-B=1 behaviour the round-loop hits in the common case
-//!   (full attention always `None`; SWA `None` when `kv_len <= window`).
 
 use crate::drafter::gemma4_assistant::config::{DrafterTextConfig, Gemma4AssistantConfig};
 use crate::drafter::gemma4_assistant::layer::DraftDecoderLayer;
+use crate::drafter::masked_embedder::MaskedEmbedder;
+use crate::drafter::masks::{make_drafter_masks, BatchScalar, LayerType};
 use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
@@ -58,86 +47,6 @@ use crate::weights::WeightMap;
 use cxx::UniquePtr;
 use std::collections::HashMap;
 use std::path::Path;
-
-// ---------------------------------------------------------------------------
-// Sibling-PR stubs (delete after #627 / #628 merge)
-// ---------------------------------------------------------------------------
-//
-// These stubs let issue #626 compile and ship its tied-dense path standalone.
-// When #627 (MaskedEmbedder) and #628 (drafter masks) merge into main, the
-// orchestrator will rebase this PR and the follow-up cleanup is:
-//
-// 1. Replace [`MaskedEmbedderStub`] usage in `lm_head_fn` with
-//    `crate::drafter::masked_embedder::MaskedEmbedder`.
-// 2. Replace [`make_drafter_masks_stub`] with the real
-//    `crate::drafter::masks::make_drafter_masks`.
-// 3. Delete this entire stub block.
-
-/// TODO(#627): replace with `crate::drafter::masked_embedder::MaskedEmbedder`
-/// once the sibling PR merges.
-///
-/// Placeholder fields mirror the upstream Python `MaskedEmbedder.__init__`
-/// surface so that downstream weight-key references (`masked_embedding.
-/// token_ordering`, `masked_embedding.centroids.weight`) compile today.
-#[allow(dead_code)]
-pub(crate) struct MaskedEmbedderStub {
-    /// `[hidden_size, num_centroids]` — projects drafter hidden states to
-    /// per-centroid scores.
-    centroids: Linear,
-    /// `[vocab_size]` i32 lookup table from a position-in-cluster index to
-    /// the canonical token ID. Stored as i32 (upstream casts from int64).
-    token_ordering: UniquePtr<MlxArray>,
-    hidden_size: usize,
-    vocab_size: usize,
-    num_centroids: usize,
-    top_k: usize,
-}
-
-impl MaskedEmbedderStub {
-    #[allow(dead_code)]
-    pub(crate) fn from_weights(
-        weights: &WeightMap,
-        cfg: &Gemma4AssistantConfig,
-    ) -> Result<Self, String> {
-        let text_cfg = cfg.text_config();
-        Ok(Self {
-            centroids: Linear::from_weights(weights, "masked_embedding.centroids")?,
-            token_ordering: weights
-                .get("masked_embedding.token_ordering")
-                .map(|w| ffi::copy(w))
-                .ok_or_else(|| "Weight not found: masked_embedding.token_ordering".to_string())?,
-            hidden_size: text_cfg.hidden_size,
-            vocab_size: text_cfg.vocab_size,
-            num_centroids: cfg.num_centroids,
-            top_k: cfg.centroid_intermediate_top_k,
-        })
-    }
-}
-
-/// TODO(#628): replace with `crate::drafter::masks::make_drafter_masks` once
-/// the sibling PR merges. The B=1, single-step (`query_len=1`) draft path
-/// produces `None` masks in both layer-type buckets because:
-///
-/// - Full-attention: `bidirectional_full_mask` returns `None` when
-///   `kv_valid_len >= kv_len`, which is the common B=1 case.
-/// - SWA: `bidirectional_swa_mask` returns `None` when
-///   `kv_len <= sliding_window`, which is the only regime
-///   `RotatingKVCache` ever produces.
-///
-/// So this stub is BIT-IDENTICAL to the real helper in the unbatched MVP
-/// path. Long-prompt batched MTP needs the real masks before it can light
-/// up (see upstream `masks.py` for the full surface).
-#[allow(dead_code)]
-fn make_drafter_masks_stub(layer_types: &[String]) -> HashMap<String, Option<UniquePtr<MlxArray>>> {
-    let mut masks = HashMap::new();
-    masks.insert("full_attention".to_string(), None);
-    masks.insert("sliding_attention".to_string(), None);
-    // Defensive: also map any unknown layer-type to None.
-    for lt in layer_types {
-        masks.entry(lt.clone()).or_insert(None);
-    }
-    masks
-}
 
 // ---------------------------------------------------------------------------
 // LM head dispatch
@@ -150,16 +59,16 @@ fn make_drafter_masks_stub(layer_types: &[String]) -> HashMap<String, Option<Uni
 ///   26B-A4B / 31B drafter case.
 /// - `Linear` — explicit `lm_head` with its own `[vocab_size, hidden_size]`
 ///   weight matrix (when `tie_word_embeddings=False`).
-/// - `Centroid` — sparse softmax via `MaskedEmbedder`. Gated on
-///   `use_ordered_embeddings=True` (E2B / E4B drafters). Until #627 lands the
-///   centroid path returns an explicit `DrafterError::NotYetImplemented`.
-#[allow(dead_code)] // `Centroid` is gated behind sibling PR #627; constructed by `resolve_lm_head` once `MaskedEmbedder` lands.
+/// - `Centroid` — sparse softmax via `MaskedEmbedder`. Active on
+///   `use_ordered_embeddings=True` (E2B / E4B drafters).
 enum LmHead {
     Tied,
     Linear(Linear),
-    /// Sibling-PR stub. Until #627 merges, calling `lm_head_forward` with
-    /// this variant returns `DrafterError::NotYetImplemented { issue: 627 }`.
-    Centroid(MaskedEmbedderStub),
+    /// Centroid-routed sparse softmax LM head. Used by E2B / E4B drafters
+    /// (`use_ordered_embeddings=True`). The `MaskedEmbedder::forward` call
+    /// requires the tied embed-tokens weight as its `lm_head_weight` input,
+    /// which the drafter's `forward` supplies from `inner.embed_tokens`.
+    Centroid(MaskedEmbedder),
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +266,52 @@ impl OwnedSharedKv {
             v.as_ref().expect("non-null V"),
         ))
     }
+
+    /// Build a `HashMap<LayerType, (&MlxArray, &MlxArray)>` from the owned
+    /// shared K/V, as required by [`make_drafter_masks`]. Only layer types
+    /// with data present are included, matching the number of tensors
+    /// provided at `set_shared_kv()` time (2 or 4).
+    fn as_layer_type_map(&self) -> HashMap<LayerType, (&MlxArray, &MlxArray)> {
+        let mut map = HashMap::new();
+        if let Some((k, v)) = &self.full_attention {
+            map.insert(
+                LayerType::FullAttention,
+                (
+                    k.as_ref().expect("non-null K"),
+                    v.as_ref().expect("non-null V"),
+                ),
+            );
+        }
+        if let Some((k, v)) = &self.sliding_attention {
+            map.insert(
+                LayerType::SlidingWindowAttention,
+                (
+                    k.as_ref().expect("non-null K"),
+                    v.as_ref().expect("non-null V"),
+                ),
+            );
+        }
+        map
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a string layer-type key to the `LayerType` enum.
+///
+/// The drafter layers carry their type as `&str` (from `DraftDecoderLayer::layer_type()`),
+/// while `make_drafter_masks` and `OwnedSharedKv::as_layer_type_map` use the
+/// `LayerType` enum. This bridge keeps the string ↔ enum conversion in one place.
+fn str_to_layer_type(s: &str) -> Result<LayerType, DrafterError> {
+    match s {
+        "full_attention" => Ok(LayerType::FullAttention),
+        "sliding_attention" => Ok(LayerType::SlidingWindowAttention),
+        other => Err(DrafterError::UnknownLayerType {
+            got: other.to_string(),
+        }),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +333,11 @@ pub struct Gemma4AssistantDraftModel {
     /// means the LM head is one of the tied / centroid variants resolved by
     /// `bind()`.
     lm_head_weight: Option<Linear>,
+    /// Pre-built centroid LM head for E-series drafters (`use_ordered_embeddings=true`).
+    /// Constructed in `from_weights` when the checkpoint carries
+    /// `masked_embedding.*` weights, then consumed by `resolve_lm_head` at
+    /// `bind()` time. `None` for the 26B-A4B / 31B tied-dense paths.
+    centroid_lm_head: Option<MaskedEmbedder>,
     /// LM head dispatch — finalised by `bind()`. Until then, callers that
     /// invoke `draft_block()` get an explicit "must call bind() first" error.
     lm_head: Option<LmHead>,
@@ -414,6 +374,7 @@ impl std::fmt::Debug for Gemma4AssistantDraftModel {
             .field("tie_word_embeddings", &self.config.tie_word_embeddings)
             .field("use_ordered_embeddings", &self.config.use_ordered_embeddings)
             .field("num_layers", &self.inner.layers.len())
+            .field("centroid_lm_head_ready", &self.centroid_lm_head.is_some())
             .field("bound", &self.lm_head.is_some())
             .field("shared_kv_set", &self.shared_kv.is_some())
             .field("kv_offset", &self.kv_offset)
@@ -494,12 +455,34 @@ impl Gemma4AssistantDraftModel {
             )
         };
 
+        // Pre-build the centroid LM head for E-series drafters. Must happen
+        // here while the WeightMap is still available (before it is consumed
+        // or dropped). For 26B-A4B / 31B drafters (`use_ordered_embeddings ==
+        // false`) this branch is a no-op.
+        let centroid_lm_head = if config.use_ordered_embeddings {
+            let embedder = MaskedEmbedder::from_weights(
+                &weights,
+                "masked_embedding",
+                text_cfg.hidden_size,
+                text_cfg.vocab_size,
+                config.num_centroids,
+                config.centroid_intermediate_top_k,
+            )
+            .map_err(|e| DrafterError::WeightLoad {
+                reason: format!("MaskedEmbedder load failed: {e}"),
+            })?;
+            Some(embedder)
+        } else {
+            None
+        };
+
         Ok(Self {
             config,
             inner,
             pre_projection,
             post_projection,
             lm_head_weight,
+            centroid_lm_head,
             lm_head: None,
             target_embed: None,
             target_embed_scale: 1.0,
@@ -525,22 +508,47 @@ impl Gemma4AssistantDraftModel {
             weights.remove("lm_head.scales");
             weights.remove("lm_head.biases");
         }
-        // TODO(#627): cast `masked_embedding.token_ordering` to int32 here
-        // once the real `MaskedEmbedder` is wired in. The dtype cast is a
-        // no-op on already-int32 buffers, so the runtime path will keep
-        // working even if a stale checkpoint ships with int64. Mirrors
-        // upstream `if k == "masked_embedding.token_ordering": v = v.astype(mx.int32)`.
+        // Cast `masked_embedding.token_ordering` to int32. HuggingFace
+        // checkpoints ship this as int64; mlxcel uses int32 throughout for
+        // indexing efficiency and to match the dtype that `take` /
+        // `put_along_axis` expect. No-op on already-int32 buffers and on
+        // 26B-A4B / 31B drafters that carry no centroid table.
+        // Mirrors upstream `if k == "masked_embedding.token_ordering": v = v.astype(mx.int32)`.
+        crate::drafter::masked_embedder::sanitize_token_ordering(weights, "masked_embedding");
     }
 
     /// Configure the LM head dispatch based on the drafter's config and
     /// captured weights. Called from [`Self::bind`].
     fn resolve_lm_head(&mut self) -> Result<(), DrafterError> {
         let head = if self.config.use_ordered_embeddings {
-            // Centroid LM head — needs MaskedEmbedder from #627.
-            return Err(DrafterError::NotYetImplemented {
-                kind: DrafterKind::Mtp,
-                issue: 627,
-            });
+            // Centroid LM head — construct the real `MaskedEmbedder` from
+            // the already-loaded and sanitized weight map. The weights were
+            // loaded in `from_weights` and sanitized in `sanitize_weights`
+            // (token_ordering cast to int32). We cannot go back to the weight
+            // map at this point, so we reconstruct from the config metadata.
+            // The actual weight tensors were placed in `lm_head_weight` slot
+            // only when `tie_word_embeddings == false`. For the E-series
+            // drafters `tie_word_embeddings == true`, so we re-derive from
+            // the config parameters that were loaded at construction time.
+            //
+            // MaskedEmbedder::from_weights needs the WeightMap, but we don't
+            // hold it at bind()-time. Instead, we stash the constructed
+            // `MaskedEmbedder` in `lm_head_weight`-adjacent storage via
+            // a dedicated `centroid_lm_head` field on the model. Since we
+            // can't reach the weights here, the centroid head is pre-built
+            // during `from_weights` (via `centroid_lm_head: Option<MaskedEmbedder>`)
+            // and this method just takes it out.
+            let centroid = self
+                .centroid_lm_head
+                .take()
+                .ok_or_else(|| DrafterError::WeightLoad {
+                    reason: "use_ordered_embeddings=true but MaskedEmbedder was not pre-built \
+                             during from_weights; ensure the checkpoint contains \
+                             masked_embedding.centroids.weight and \
+                             masked_embedding.token_ordering"
+                        .into(),
+                })?;
+            LmHead::Centroid(centroid)
         } else if self.config.tie_word_embeddings {
             LmHead::Tied
         } else {
@@ -668,17 +676,38 @@ impl Gemma4AssistantDraftModel {
         // pre_projection: [1, 1, 2 * backbone] → [1, 1, drafter_hidden]
         let mut h = self.pre_projection.forward(inputs_embeds);
 
-        // Build masks. The stub returns None for both layer types — bit-
-        // identical to the real `make_drafter_masks` helper in the B=1,
-        // query_len=1 regime the round-loop hits per-step.
-        // TODO(#628): replace with `crate::drafter::masks::make_drafter_masks`.
-        let layer_types = &self.config.text_config().layer_types;
-        let masks = make_drafter_masks_stub(layer_types);
+        // Build the per-layer-type mask map via the real `make_drafter_masks`
+        // helper. This replaces the old `make_drafter_masks_stub` — the real
+        // helper uses `HashMap<LayerType, ...>` keys and handles both the B=1
+        // fast path (returns `None` masks when query_offset >= kv_len and
+        // kv_len <= sliding_window) and the batched path.
+        //
+        // `query_offset == self.position` mirrors the upstream Python's
+        // `kv_valid_len = query_offset` convention used inside
+        // `make_drafter_masks`: the drafter queries from position `self.position`
+        // (the bonus-token absolute position), and every key before that
+        // position is valid.
+        let shared_kv_map = shared.as_layer_type_map();
+        let query_offset = BatchScalar::Scalar(self.position);
+        let sliding_window = self.config.text_config().sliding_window as i32;
+        let dtype = ffi::array_dtype(inputs_embeds);
+        let masks = make_drafter_masks(
+            &shared_kv_map,
+            /*query_len=*/ 1,
+            &query_offset,
+            sliding_window,
+            dtype,
+        );
 
         // Run each drafter layer with shared K/V and the frozen RoPE offset.
         for layer in &self.inner.layers {
             let (k, v) = shared.for_layer_type(layer.layer_type())?;
-            let mask_opt = masks.get(layer.layer_type()).and_then(|m| m.as_deref());
+            // Convert the string layer_type to the `LayerType` enum to look
+            // up in the `HashMap<LayerType, ...>` returned by `make_drafter_masks`.
+            let layer_type_enum = str_to_layer_type(layer.layer_type())?;
+            let mask_opt = masks
+                .get(&layer_type_enum)
+                .and_then(|m| m.as_deref());
             h = layer.forward(&h, mask_opt, k, v, self.position);
         }
 
@@ -687,15 +716,19 @@ impl Gemma4AssistantDraftModel {
         let last_hidden = self.post_projection.forward(&h);
 
         // LM head: tied dense uses drafter's `embed_tokens.as_linear`,
-        // explicit linear uses its own weight, centroid is gated to #627.
+        // explicit linear uses its own weight, centroid uses the
+        // `MaskedEmbedder` with the drafter's tied embed-tokens weight as
+        // the `lm_head_weight` input (upstream ties the embed table).
         let logits = match lm_head {
             LmHead::Tied => self.inner.embed_tokens.as_linear(&h),
             LmHead::Linear(linear) => linear.forward(&h),
-            LmHead::Centroid(_) => {
-                return Err(DrafterError::NotYetImplemented {
-                    kind: DrafterKind::Mtp,
-                    issue: 627,
-                });
+            LmHead::Centroid(embedder) => {
+                // Centroid path: the MaskedEmbedder needs the tied
+                // `embed_tokens.weight` as its `lm_head_weight` argument.
+                // The drafter's embed table is shared with the LM head by
+                // construction on E-series drafters (`tie_word_embeddings=true`).
+                let embed_weight = self.inner.embed_tokens.weight();
+                embedder.forward(&h, embed_weight)
             }
         };
 

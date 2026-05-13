@@ -120,6 +120,7 @@ fn make_test_weights(config: &Gemma4AssistantConfig) -> WeightMap {
     let head_dim = tc.head_dim as i32;
     let n_kv = tc.num_key_value_heads as i32;
     let backbone = config.backbone_hidden_size as i32;
+    let num_centroids = config.num_centroids as i32;
 
     let mut w = WeightMap::new();
 
@@ -140,6 +141,23 @@ fn make_test_weights(config: &Gemma4AssistantConfig) -> WeightMap {
     if !config.tie_word_embeddings {
         // lm_head.weight: [vocab, hidden].
         insert_zeros(&mut w, "lm_head.weight", &[vocab, hidden]);
+    }
+
+    // Centroid LM head weights — only for E-series (use_ordered_embeddings=true).
+    if config.use_ordered_embeddings {
+        // masked_embedding.centroids.weight: [num_centroids, hidden].
+        insert_zeros(
+            &mut w,
+            "masked_embedding.centroids.weight",
+            &[num_centroids, hidden],
+        );
+        // masked_embedding.token_ordering: [vocab] (int32).
+        // Use sequential ordering so tests can verify basic correctness.
+        let ordering: Vec<i32> = (0..vocab).collect();
+        w.insert(
+            "masked_embedding.token_ordering".to_string(),
+            ffi::from_slice_i32(&ordering, &[vocab]),
+        );
     }
 
     // Per-layer weights.
@@ -413,27 +431,105 @@ fn bind_rejects_target_without_embed_tokens_override() {
     }
 }
 
-// ── Centroid LM head gating (sibling PR #627) ────────────────────────────
+// ── Centroid LM head (MaskedEmbedder, issue #627) ───────────────────────
 
 #[test]
-fn bind_rejects_centroid_lm_head_until_627_lands() {
+fn bind_accepts_centroid_lm_head_via_masked_embedder() {
     // E2B / E4B drafters: `use_ordered_embeddings=true` selects the centroid
-    // (MaskedEmbedder) LM head. Until #627 lands, this path returns
-    // NotYetImplemented { issue: 627 } so callers get a clear actionable
-    // message.
+    // (MaskedEmbedder) LM head. With #627 and #628 merged, this path must
+    // now succeed — `bind()` constructs the real `MaskedEmbedder` from the
+    // pre-built centroid head and sets `lm_head = Some(LmHead::Centroid(...))`.
     let mut cfg = make_test_config(2, true);
     cfg.use_ordered_embeddings = true;
+    // make_test_weights automatically adds masked_embedding.* when
+    // use_ordered_embeddings is true.
     let weights = make_test_weights(&cfg);
     let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg).expect("load");
 
     let target = MockLanguageModel::new(16, 64);
-    let err = model.bind(&target).expect_err("must fail until #627 lands");
-    match err {
-        DrafterError::NotYetImplemented { kind, issue } => {
-            assert_eq!(kind, DrafterKind::Mtp);
-            assert_eq!(issue, 627);
-        }
-        other => panic!("expected NotYetImplemented(627), got {other:?}"),
+    model
+        .bind(&target)
+        .expect("bind must succeed when MaskedEmbedder is wired in (#627)");
+}
+
+/// Full E-series Centroid path: `bind` → `set_shared_kv` → `draft_block`.
+///
+/// Asserts:
+/// 1. `bind()` succeeds for a synthetic E-series config.
+/// 2. `draft_block()` returns exactly `block_size - 1` proposals.
+/// 3. All sampled token ids are within `[0, vocab_size)`.
+///
+/// Value correctness is not asserted — the test fixture uses zero weights,
+/// which drive the centroid logits and embed matmul through zero → the
+/// `MaskedEmbedder` scatter fills with equal values → `argmax` (greedy) is
+/// deterministic but not meaningful. Shape and range suffice for this test.
+#[test]
+fn centroid_path_bind_set_shared_kv_draft_block_end_to_end() {
+    // Build a config where hidden_size == backbone_hidden_size so that
+    // pre_projection's matmul shapes are consistent with the forward call.
+    let mut cfg = make_test_config(2, true);
+    cfg.use_ordered_embeddings = true;
+    cfg.backbone_hidden_size = 64; // match text_config.hidden_size = 64
+
+    // Must satisfy vocab_size % num_centroids == 0.
+    // Default num_centroids = 8, vocab_size = 16 → 16 % 8 == 0. OK.
+    assert_eq!(cfg.num_centroids, 8, "test relies on num_centroids == 8");
+    let tc = cfg.text_config();
+    let vocab = tc.vocab_size;
+    let backbone = cfg.backbone_hidden_size as i32;
+    assert_eq!(vocab % cfg.num_centroids, 0, "vocab must be divisible by num_centroids");
+
+    // Rebuild pre/post projection weights for the corrected backbone size.
+    let mut weights = make_test_weights(&cfg);
+    weights.remove("pre_projection.weight");
+    weights.remove("post_projection.weight");
+    insert_zeros(&mut weights, "pre_projection.weight", &[64, 2 * backbone]);
+    insert_zeros(&mut weights, "post_projection.weight", &[backbone, 64]);
+
+    let mut model = Gemma4AssistantDraftModel::from_weights(weights, cfg.clone()).expect("load");
+
+    let target = MockLanguageModel::new(vocab as i32, 64);
+    model.bind(&target).expect("bind must succeed for centroid path");
+
+    // Set up shared K/V: 4 tensors (full + SWA) at [B=1, n_kv=1, kv=4, head=32].
+    let kv_shape = &[1_i32, 1, 4, 32];
+    let k_full = ffi::zeros(kv_shape, crate::dtype::FLOAT32);
+    let v_full = ffi::zeros(kv_shape, crate::dtype::FLOAT32);
+    let k_swa = ffi::zeros(kv_shape, crate::dtype::FLOAT32);
+    let v_swa = ffi::zeros(kv_shape, crate::dtype::FLOAT32);
+    let tensors: Vec<&crate::ffi::MlxArray> = vec![
+        k_full.as_ref().unwrap(),
+        v_full.as_ref().unwrap(),
+        k_swa.as_ref().unwrap(),
+        v_swa.as_ref().unwrap(),
+    ];
+    let shared = crate::drafter::SharedKv::new(&tensors);
+    model
+        .set_shared_kv(shared, /*kv_offset=*/ 0, /*position=*/ 0, /*left_padding=*/ 0)
+        .expect("set_shared_kv");
+
+    // Build a hidden tensor [1, 1, backbone].
+    let hidden = ffi::zeros(&[1, 1, backbone], crate::dtype::FLOAT32);
+    let sampler = crate::generate::SamplingConfig::greedy();
+    let block_size = cfg.block_size; // 4
+
+    let proposals = model
+        .draft_block(0, Some(hidden.as_ref().unwrap()), block_size, &sampler)
+        .expect("draft_block must succeed for centroid path");
+
+    // Shape: block_size - 1 proposals.
+    assert_eq!(
+        proposals.len(),
+        block_size - 1,
+        "centroid path must emit block_size - 1 proposals"
+    );
+
+    // Range: every token id must be in [0, vocab_size).
+    for (i, &tok) in proposals.iter().enumerate() {
+        assert!(
+            tok >= 0 && tok < vocab as i32,
+            "proposal[{i}] = {tok} is out of [0, {vocab})"
+        );
     }
 }
 
