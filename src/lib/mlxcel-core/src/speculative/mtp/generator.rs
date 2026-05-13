@@ -118,6 +118,18 @@ impl<T: MtpTarget> MtpGenerator<T> {
         self.drafter.as_ref()
     }
 
+    /// Consume the generator and return the boxed drafter handle.
+    ///
+    /// Used by the server-side speculative burst path (issue #670) so a
+    /// loaded drafter can be reused across multiple requests on the same
+    /// worker thread without re-loading from disk. The caller is
+    /// expected to [`Drafter::reset`] the returned handle before the
+    /// next burst so per-run drafter state (KV cache, accept counters)
+    /// is cleared.
+    pub fn into_drafter(self) -> Box<dyn Drafter> {
+        self.drafter
+    }
+
     /// Run the full MTP generate cycle.
     ///
     /// # Arguments

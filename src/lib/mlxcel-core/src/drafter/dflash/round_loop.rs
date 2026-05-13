@@ -346,6 +346,18 @@ impl DFlashGenerator {
         self.drafter.as_mut()
     }
 
+    /// Consume the generator and return the boxed drafter handle.
+    ///
+    /// Used by the server-side speculative burst path (issue #670) so a
+    /// loaded drafter can be reused across multiple requests on the same
+    /// worker thread without re-loading from disk. The caller is
+    /// expected to [`Drafter::reset`] the returned handle before the
+    /// next burst so per-run drafter state (DFlash's own KV cache) is
+    /// cleared.
+    pub fn into_drafter(self) -> Box<dyn Drafter> {
+        self.drafter
+    }
+
     /// Resets per-run state on the generator (token buffer + accept-len
     /// history). Does NOT reset the drafter — that is the caller's
     /// responsibility via [`Drafter::reset`] because reset needs a

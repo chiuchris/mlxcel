@@ -290,6 +290,16 @@ pub struct BatchScheduler {
     /// integration completes in the peer follow-up sketched in the
     /// issue #666 implementation plan.
     speculative_dispatch: crate::server::SpeculativeDispatch,
+
+    /// Issue #670: lazy-loaded drafter handle for the speculative burst
+    /// path. Constructed empty alongside the dispatch; the drafter's
+    /// weights are loaded from disk on the **first** speculative
+    /// request and cached for subsequent requests on the same worker
+    /// (mandate 2 of issue #670). For
+    /// [`crate::server::SpeculativeDispatch::Disabled`] this slot stays
+    /// empty for the worker's lifetime and the burst path is never
+    /// entered.
+    speculative_drafter_slot: super::speculative_burst::WorkerDrafterSlot,
 }
 
 impl BatchScheduler {
@@ -414,6 +424,13 @@ impl BatchScheduler {
             // worker thread overrides this via `with_speculative_dispatch`
             // when the operator passed `--draft-model`.
             speculative_dispatch: crate::server::SpeculativeDispatch::Disabled,
+            // Issue #670: empty slot, populated lazily on the first
+            // speculative request when `speculative_dispatch` is
+            // kind-specific. `with_speculative_dispatch` rebuilds this
+            // slot from the dispatch passed by the worker.
+            speculative_drafter_slot: super::speculative_burst::WorkerDrafterSlot::from_dispatch(
+                &crate::server::SpeculativeDispatch::Disabled,
+            ),
         }
     }
 
@@ -553,6 +570,12 @@ impl BatchScheduler {
         mut self,
         dispatch: crate::server::SpeculativeDispatch,
     ) -> Self {
+        // Issue #670: rebuild the (still-empty) drafter slot to carry
+        // the path + kind from the new dispatch. The drafter weights
+        // are NOT loaded here — `ensure_loaded` on the first
+        // speculative request is what reads from disk.
+        self.speculative_drafter_slot =
+            super::speculative_burst::WorkerDrafterSlot::from_dispatch(&dispatch);
         self.speculative_dispatch = dispatch;
         self
     }
@@ -563,34 +586,35 @@ impl BatchScheduler {
         &self.speculative_dispatch
     }
 
-    /// Whether the scheduler should attempt the kind-specific
-    /// speculative dispatch at the current decode tick (issue #666).
+    /// Whether the scheduler has a kind-specific speculative dispatch
+    /// configured (issue #666; issue #670 wired this into the actual
+    /// runtime dispatch).
     ///
-    /// Returns `true` only when ALL of the following hold:
-    /// 1. `self.speculative_dispatch` is one of the kind-specific
-    ///    variants ([`crate::server::SpeculativeDispatch::Mtp`] /
-    ///    [`crate::server::SpeculativeDispatch::DFlash`]).
-    /// 2. The active batch has exactly one sequence (continuous batching
-    ///    at B>1 is incompatible with the self-contained round-loop
-    ///    drivers — see [`Self::with_speculative_dispatch`] docs).
+    /// Returns `true` when [`Self::speculative_dispatch`] is one of the
+    /// kind-specific variants ([`crate::server::SpeculativeDispatch::Mtp`]
+    /// or [`crate::server::SpeculativeDispatch::DFlash`]).
     ///
-    /// The downstream call site is also expected to verify that the
-    /// target model implements the matching trait — this method
-    /// intentionally does NOT do that check, because the
-    /// [`crate::LoadedModel`] surface does not let us cheaply ask "does
-    /// the inner concrete model implement `MtpTarget`?" without a
-    /// dedicated trait-object accessor. The dispatch hook lands the
-    /// concrete-model match-arm.
+    /// **Semantics (issue #670)**: a `true` return only means a
+    /// speculative *path* is configured — the actual per-request
+    /// decision happens inside [`Self::execute_prefill`] via
+    /// [`super::speculative_burst::should_burst_for_sequence`], which
+    /// adds per-sequence preconditions (no VLM embeddings, no
+    /// structured-output constraint, no adopted prompt-cache prefix).
+    /// The active-batch size is NOT consulted by this gate any more:
+    /// the burst takes the full request lifecycle (prefill + decode)
+    /// in one tick, so it never enters [`Self::active_batch`] and the
+    /// B-size of concurrent classic requests is independent of whether
+    /// this gate fires for a speculative request.
     ///
-    /// **Today's behaviour**: the scheduler's `decode_single_step` does
-    /// NOT yet call this method — the per-tick speculative round-loop
-    /// integration is a follow-up scheduled with the per-target hook
-    /// matrix. The method is exposed publicly so the worker-side
-    /// observability surface can use it to publish the dispatch state
-    /// without breaking encapsulation, and so unit tests can pin the
-    /// invariant.
+    /// Backwards compatibility: pre-#670 callers (the worker-startup
+    /// log and the integration tests in #669) used this method as a
+    /// "would we dispatch?" probe. The semantics remain compatible:
+    /// `true` ↔ "speculative is on and a future request could enter
+    /// the burst path"; `false` ↔ "every request takes the classic
+    /// path." The active-batch-size restriction was a pre-#670
+    /// over-approximation that the burst design removes.
     pub fn should_dispatch_speculative(&self) -> bool {
-        self.speculative_dispatch.is_kind_specific() && self.active_batch.len() == 1
+        self.speculative_dispatch.is_kind_specific()
     }
 
     /// Replace the default vision feature cache with one sized per the server
@@ -1668,11 +1692,77 @@ impl BatchScheduler {
             return;
         }
 
-        let mut seq = match self.prefill_queue.dequeue() {
+        let seq = match self.prefill_queue.dequeue() {
             Some(s) => s,
             None => return,
         };
 
+        // Issue #670: speculative-decoding burst path.
+        //
+        // Why: the existing speculative round loops
+        // (`MtpGenerator::generate`, `DFlashGenerator::run`) are
+        // self-contained drive loops that own prefill + decode + finish
+        // in a single function call. Folding them into the scheduler's
+        // tick-based decode_single_step would require refactoring every
+        // generator (Mtp, DFlash, batched variants) into a per-tick
+        // step API — a much larger and riskier change than this
+        // issue's scope. Instead, we run the entire speculative request
+        // lifecycle as one "burst" right at prefill time, bypassing the
+        // standard prefill → finish_prefill → active_batch → decode
+        // pipeline. The classic non-speculative path is bit-exact
+        // preserved (the gate's per-sequence preconditions also
+        // include: no VLM embeddings, no structured output, no adopted
+        // prompt-cache prefix — see
+        // `speculative_burst::should_burst_for_sequence`).
+        let seq = if super::speculative_burst::should_burst_for_sequence(
+            &self.speculative_dispatch,
+            &seq,
+        ) {
+            let ctx = super::speculative_burst::BurstContext {
+                model: &self.model,
+                tokenizer: &self.tokenizer,
+                drafter_slot: &mut self.speculative_drafter_slot,
+                dispatch: &self.speculative_dispatch,
+            };
+            match super::speculative_burst::try_run_burst_b1(ctx, seq) {
+                Ok(super::speculative_burst::BurstFinalized {
+                    seq_id,
+                    tokens_generated,
+                }) => {
+                    // Burst handled the full request lifecycle inline.
+                    // Release the pre-allocated cache slot so the next
+                    // request can reuse it. The burst's own per-layer
+                    // cache vec (DFlash on Qwen 3.5) was allocated and
+                    // dropped inside the burst; the scheduler-tracked
+                    // cache pool entry (and any model-owned per-seq
+                    // state for Gemma 4 / Qwen 3.5) is released here
+                    // for symmetry with `finalize_completed`.
+                    self.prompt_cache_seq_ctx.remove(&seq_id);
+                    self.release_sequence_caches(seq_id);
+                    // Mirror the classic path's per-sequence metric
+                    // recording (see `finalize_completed` /
+                    // `scheduler.rs` ~line 3268) so Prometheus
+                    // counters cover burst completions too. Without
+                    // this call the per-sequence token histogram
+                    // misses every speculative request.
+                    self.batch_metrics
+                        .record_sequence_completed(tokens_generated);
+                    self.batch_observability.record_sequence_completed();
+                    self.publish_metrics();
+                    return;
+                }
+                Err(rejected_seq) => {
+                    // Burst declined (e.g. unsupported model variant);
+                    // fall through to the classic prefill path with
+                    // the returned sequence.
+                    rejected_seq
+                }
+            }
+        } else {
+            seq
+        };
+
+        let mut seq = seq;
         if let Err(err) = Self::begin_prefill(&mut seq) {
             tracing::error!("State transition error: {err}");
             self.abort_sequence(seq, &err);

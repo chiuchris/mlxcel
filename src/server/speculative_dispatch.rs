@@ -237,12 +237,13 @@ impl SpeculativeDispatch {
         // Auto-detect (or reconcile against the explicit kind) from the
         // drafter's `config.json`. This is the same call the offline CLI
         // path makes in `src/commands/generate.rs`.
-        let resolved_kind = resolve_drafter_kind(&draft_model_path, explicit_kind).map_err(
-            |e| SpeculativeDispatchError::DrafterConfig {
-                path: draft_model_path.clone(),
-                message: e.to_string(),
-            },
-        )?;
+        let resolved_kind =
+            resolve_drafter_kind(&draft_model_path, explicit_kind).map_err(|e| {
+                SpeculativeDispatchError::DrafterConfig {
+                    path: draft_model_path.clone(),
+                    message: e.to_string(),
+                }
+            })?;
 
         let user_requested_explicit_kind = explicit_kind.is_some();
         let block_size = resolve_draft_block_size(config.draft_block_size, resolved_kind);

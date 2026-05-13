@@ -188,9 +188,8 @@ impl ModelProvider {
         // hand the resolved value to the worker thread. Failures are
         // surfaced as `anyhow::Error` here so the operator gets a clear
         // startup-time error rather than a per-request 5xx.
-        let speculative_dispatch = crate::server::SpeculativeDispatch::resolve(config).map_err(
-            |e| anyhow::anyhow!("Speculative decoding dispatch resolution failed: {e}"),
-        )?;
+        let speculative_dispatch = crate::server::SpeculativeDispatch::resolve(config)
+            .map_err(|e| anyhow::anyhow!("Speculative decoding dispatch resolution failed: {e}"))?;
 
         if config.no_batch {
             let mut provider = Self::new_with_legacy_worker(

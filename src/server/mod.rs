@@ -59,7 +59,6 @@ pub use config::{
     DecodeStorageBackend, PipelineParallelRuntimeConfig, PreemptionPolicy,
     RemotePipelineStageConfig, ServerConfig, ServerGenerateOptions,
 };
-pub use speculative_dispatch::{SpeculativeDispatch, SpeculativeDispatchError};
 pub use model_provider::{GenerationResult, ModelProvider};
 pub use prompt_cache::{
     ApcBlockHash, ApcConfig, ApcHashAlgo, BlockHashChain, CacheEntry, DEFAULT_APC_BLOCK_SIZE,
@@ -68,5 +67,6 @@ pub use prompt_cache::{
     detect_hybrid_ssm_from_path, is_hybrid_ssm_model_type, multimodal_digest,
     multimodal_digest_from_vecs,
 };
+pub use speculative_dispatch::{SpeculativeDispatch, SpeculativeDispatchError};
 pub use startup::{ServerStartupConfig, start_server};
 pub use state::{AppState, BatchMetrics, Metrics, ModelMediaSupport};

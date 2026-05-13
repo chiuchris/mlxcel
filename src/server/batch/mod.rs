@@ -33,6 +33,13 @@ pub(crate) mod scheduler;
 #[cfg(test)]
 mod scheduler_prompt_cache_tests;
 mod sequence;
+/// Issue #670: speculative-decoding burst driver. Folded into the
+/// scheduler's `execute_prefill` dispatch when the worker's
+/// [`crate::server::SpeculativeDispatch`] is kind-specific and the
+/// per-request preconditions hold.
+pub(crate) mod speculative_burst;
+#[cfg(test)]
+mod speculative_burst_tests;
 
 pub use active::ActiveBatch;
 pub use observability::{BatchObservability, ObservabilitySnapshot};

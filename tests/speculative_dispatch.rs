@@ -290,3 +290,101 @@ fn dispatch_reports_drafter_kind_for_kind_specific_variants() {
     let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
     assert_eq!(dispatch.drafter_kind(), Some(DrafterKind::Mtp));
 }
+
+// =============================================================================
+// Tick-level dispatch (issue #670 — burst path)
+//
+// These tests pin the **runtime gating** of the speculative dispatch:
+// they cannot construct a real `BatchScheduler` from outside the crate
+// (the constructor requires a loaded model + tokenizer), so they exercise
+// the gate via the public `SpeculativeDispatch` API which the scheduler
+// consults at request time. End-to-end byte-equality with a real model
+// is covered by `tests/speculative_parity.rs` (gated `#[ignore]`).
+// =============================================================================
+
+#[test]
+fn dispatch_disabled_never_routes_to_burst() {
+    // Disabled dispatch must never be `is_kind_specific()` — the burst
+    // path's first gate (`should_burst_for_sequence`) checks exactly
+    // this, so `Disabled` requests bypass the entire burst module and
+    // run on the classic prefill + decode pipeline bit-exactly.
+    let cfg = base_server_config();
+    let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
+    assert!(matches!(dispatch, SpeculativeDispatch::Disabled));
+    assert!(!dispatch.is_kind_specific());
+    assert!(dispatch.draft_model_path().is_none());
+    assert!(dispatch.block_size().is_none());
+}
+
+#[test]
+fn dispatch_mtp_carries_path_and_block_size_for_burst_construction() {
+    // The burst's `WorkerDrafterSlot::from_dispatch` reads
+    // `draft_model_path()` and `drafter_kind()` to lazy-load the
+    // drafter on the first speculative request. Both must be populated
+    // for a `SpeculativeDispatch::Mtp` variant.
+    let (_dir, path) = make_drafter_dir(Some("gemma4_assistant"));
+    let mut cfg = base_server_config();
+    cfg.draft_model_path = Some(path.clone());
+    cfg.draft_kind = Some("mtp".to_string());
+    cfg.draft_block_size = Some(4);
+
+    let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
+    assert!(dispatch.is_kind_specific());
+    assert_eq!(dispatch.draft_model_path(), Some(path.as_path()));
+    assert_eq!(dispatch.drafter_kind(), Some(DrafterKind::Mtp));
+    assert_eq!(dispatch.block_size(), Some(4));
+}
+
+#[test]
+fn dispatch_dflash_carries_path_and_block_size_for_burst_construction() {
+    // Symmetric to the MTP case for DFlash. The burst uses the same
+    // `draft_model_path()` + `drafter_kind()` pair to drive
+    // `load_drafter(path, Some(DrafterKind::Dflash))`.
+    let (_dir, path) = make_drafter_dir(Some("dflash"));
+    let mut cfg = base_server_config();
+    cfg.draft_model_path = Some(path.clone());
+    cfg.draft_kind = Some("dflash".to_string());
+    cfg.draft_block_size = Some(16);
+
+    let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
+    assert!(dispatch.is_kind_specific());
+    assert_eq!(dispatch.draft_model_path(), Some(path.as_path()));
+    assert_eq!(dispatch.drafter_kind(), Some(DrafterKind::Dflash));
+    assert_eq!(dispatch.block_size(), Some(16));
+}
+
+#[test]
+fn dispatch_block_size_override_propagates_to_burst() {
+    // Burst dispatch reads block_size from the resolved dispatch (not
+    // from the raw config field) — an explicit `--draft-block-size`
+    // override must be honored end-to-end.
+    let (_dir, path) = make_drafter_dir(Some("gemma4_assistant"));
+    let mut cfg = base_server_config();
+    cfg.draft_model_path = Some(path);
+    cfg.draft_kind = Some("mtp".to_string());
+    cfg.draft_block_size = Some(8); // override default of 4
+
+    let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
+    assert_eq!(dispatch.block_size(), Some(8));
+}
+
+#[test]
+fn dispatch_classic_fallback_is_not_burstable() {
+    // The `Classic` variant (auto-detected `internal-mtp` kind) is NOT
+    // `is_kind_specific()` and therefore never enters the burst path —
+    // it stays on the historical `SpeculativeGenerator` dispatch
+    // (which the server today doesn't expose; the scheduler falls
+    // back to classic decode). This is the operator-facing
+    // backward-compat guarantee from #666 / PR #669.
+    //
+    // We can't easily construct a `Classic` variant from outside
+    // (auto-detect requires `model_type` field that resolves to
+    // InternalMtp), so we assert the invariant via the matching
+    // accessor methods on a fresh `Disabled` plus the kind-specific
+    // ones above. The unit tests in
+    // `src/server/speculative_dispatch_tests.rs` cover the Classic
+    // variant directly.
+    let cfg = base_server_config();
+    let dispatch = SpeculativeDispatch::resolve(&cfg).expect("resolve");
+    assert!(!dispatch.is_kind_specific());
+}

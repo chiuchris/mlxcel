@@ -261,12 +261,14 @@ pub(crate) fn spawn_model_worker_with_batch_config(
         // startup. This makes the operator-visible "which path is
         // active" explicit in the worker log without forcing the
         // scheduler to log per request.
-        let spec_info =
-            if !matches!(sched_config.speculative_dispatch, crate::server::SpeculativeDispatch::Disabled) {
-                format!(", {}", sched_config.speculative_dispatch.summary())
-            } else {
-                String::new()
-            };
+        let spec_info = if !matches!(
+            sched_config.speculative_dispatch,
+            crate::server::SpeculativeDispatch::Disabled
+        ) {
+            format!(", {}", sched_config.speculative_dispatch.summary())
+        } else {
+            String::new()
+        };
         tracing::info!(
             "Starting BatchScheduler (max_batch_size={}, \
              max_queue_depth={}{chunk_info}{batch_prefill_info}{decode_storage_info}{lang_bias_info}{spec_info})",
@@ -274,22 +276,32 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.max_queue_depth,
         );
 
-        // Issue #666: when the operator requested a kind-specific
-        // speculative path but the scheduler-side dispatch is not yet
-        // wired for B>1, emit a one-time warning so the operator knows
-        // why their requested speedup isn't materializing. The wiring
-        // happens inside `BatchScheduler::decode_single_step` (issue
-        // #666 follow-up; this PR lands the dispatch resolution + the
-        // per-target `MtpTarget` adapter and the scheduler-side
-        // round-loop integration completes in a peer issue).
-        if sched_config.speculative_dispatch.is_kind_specific()
-            && sched_config.max_batch_size > 1
-        {
-            tracing::warn!(
-                "Speculative decoding requested ({}) with max_batch_size={} > 1: \
-                 the batched (B>1) speculative round loop is not yet integrated \
-                 with the continuous-batching scheduler. Single-row requests will \
-                 still benefit; multi-row decode currently falls back to classic.",
+        // Issue #670: B=1 speculative dispatch is wired end-to-end via
+        // the burst path in `BatchScheduler::execute_prefill`. When the
+        // operator runs the server with `max_batch_size > 1`, each
+        // speculative request still runs *as a single B=1 burst* — the
+        // burst occupies the worker thread for the duration of the
+        // entire request (prefill + ALL decode rounds), so concurrent
+        // classic-decode rows on the same worker DO NOT advance during
+        // the burst — they head-of-line-block behind it. This is the
+        // accurate operator-facing wording (cycle 2 fix to PR #671):
+        // the previous "continue under continuous batching" claim was
+        // factually incorrect on the single-threaded scheduler.
+        // Multi-row BATCHED speculative (true B>1 continuous batching
+        // driving `MtpBatchedGenerator` / `DFlashBatchedGenerator` per
+        // tick) is a separate follow-up tracked outside this issue
+        // (priority:high — head-of-line blocking on long generations
+        // is the primary motivator).
+        if sched_config.speculative_dispatch.is_kind_specific() && sched_config.max_batch_size > 1 {
+            tracing::info!(
+                "Speculative decoding active ({}) with max_batch_size={}: \
+                 each speculative request runs as a B=1 burst that occupies \
+                 the worker thread for its full duration, pausing any \
+                 concurrent classic-decode rows until the burst completes. \
+                 Long generations (e.g. > 4096 output tokens) may cause \
+                 noticeable head-of-line blocking on this worker. True \
+                 batched-speculative dispatch (B>1 per-tick) is tracked as \
+                 a follow-up.",
                 sched_config.speculative_dispatch.summary(),
                 sched_config.max_batch_size,
             );

@@ -43,7 +43,8 @@ fn slice_shared_kv_with_zero_rejected_is_identity() {
     // since `rejected == 0` the slice helper must return them unchanged.
     let _runtime = crate::initialize_runtime();
 
-    let make = || mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 2, 2, 2]);
+    let make =
+        || mlxcel_core::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[1, 2, 2, 2]);
     let tensors: Vec<UniquePtr<MlxArray>> = vec![make(), make(), make(), make()];
     let original_shapes: Vec<Vec<i32>> = tensors
         .iter()
@@ -96,10 +97,8 @@ fn argmax_per_position_returns_one_id_per_position() {
 
     let data: Vec<f32> = vec![
         // row 0
-        0.1, 0.2, 0.9, 0.3,
-        // row 1
-        0.9, 0.1, 0.2, 0.3,
-        // row 2
+        0.1, 0.2, 0.9, 0.3, // row 1
+        0.9, 0.1, 0.2, 0.3, // row 2
         0.1, 0.2, 0.3, 0.9,
     ];
     let logits = mlxcel_core::from_slice_f32(&data, &[1, 3, 4]);

@@ -194,7 +194,7 @@ fn pairing_kind_resolution_matches_declaration() {
 ///   - The target wraps a `LoadedModel::Qwen35` variant (the only currently
 ///     supported DFlash target family in mlxcel).
 #[test]
-#[ignore = "real-model heavy; full end-to-end greedy parity deferred to #666"]
+#[ignore = "real-model heavy (loads Qwen3.5-4B target + drafter); runs in CI hardware lane only"]
 fn greedy_parity_dflash_qwen35_4b() {
     use mlxcel::{LoadedModel, initialize_runtime, load_model};
     use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};
@@ -340,7 +340,7 @@ fn greedy_parity_dflash_qwen35_4b() {
 /// "preserves the model's native bf16/f16 dtype — no f32 promotion" note
 /// on `Gemma4SpeculativeSinks`).
 #[test]
-#[ignore = "real-model heavy; full end-to-end greedy parity deferred to #666"]
+#[ignore = "real-model heavy (loads Gemma-4-31B target + drafter); runs in CI hardware lane only"]
 fn greedy_parity_mtp_gemma4_31b() {
     use mlxcel::{LoadedModel, initialize_runtime, load_model};
     use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};

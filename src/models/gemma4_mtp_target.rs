@@ -277,8 +277,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         _sampler: &SamplingConfig,
     ) -> VerifyForwardOutput {
         // Sink-aware forward over `[bonus, draft_0, …, draft_{K-2}]`.
-        let verify_arr =
-            mlxcel_core::from_slice_i32(verify_input, &[1, verify_input.len() as i32]);
+        let verify_arr = mlxcel_core::from_slice_i32(verify_input, &[1, verify_input.len() as i32]);
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
         let logits = self.wrapper.forward_with_speculative_sinks(
             &verify_arr,
@@ -356,9 +355,9 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // `rollback_speculative_cache` is a no-op when `accepted.len() == 1`.
         let accepted_i32 = accepted as i32;
         let block_size_i32 = block_size as i32;
-        let _ = self
-            .wrapper
-            .rollback_speculative_cache(self.seq_id, &[accepted_i32], block_size_i32);
+        let _ =
+            self.wrapper
+                .rollback_speculative_cache(self.seq_id, &[accepted_i32], block_size_i32);
 
         // Slice the captured shared K/V to the post-rollback length.
         let rejected = block_size - accepted - 1;

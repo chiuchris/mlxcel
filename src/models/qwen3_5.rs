@@ -1174,6 +1174,25 @@ impl Qwen35Model {
             .collect()
     }
 
+    /// Construct a fresh heterogeneous cache vec for the DFlash
+    /// speculative round loop (issue #670).
+    ///
+    /// Distinct name from the trait
+    /// [`LanguageModel::make_caches`] (which returns `Vec<KVCache>` —
+    /// empty for Qwen 3.5 because the model owns its caches
+    /// internally) so callers outside this module can pick the right
+    /// variant unambiguously. The speculative round-loop driver needs
+    /// `Vec<Qwen3NextCache>` (the heterogeneous attention +
+    /// linear-attention cache shape that `forward_speculative` /
+    /// `rollback_speculative_cache` expect).
+    ///
+    /// Used by:
+    /// [`crate::server::batch::speculative_burst::run_dflash_on_qwen35`]
+    /// (issue #670 DFlash burst path).
+    pub(crate) fn make_speculative_caches(&self) -> Vec<Qwen3NextCache> {
+        self.make_internal_caches()
+    }
+
     fn visible_len(cache: &Qwen3NextCache) -> usize {
         match cache {
             Qwen3NextCache::Attention(kv) => kv.seq_len().max(0) as usize,
