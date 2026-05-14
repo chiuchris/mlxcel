@@ -177,6 +177,55 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
         }
         out
     }
+
+    /// Compute per-position [`mlxcel_core::sampling::TokenLogprobData`]
+    /// for a `[1, block_size, vocab]` verify-logits tensor, one entry
+    /// per position aligned 1:1 with `target_tokens` (issue #678).
+    ///
+    /// The verify forward is greedy-only today (`temperature == 0`,
+    /// pure argmax — see [`Self::argmax_per_position`]), so the
+    /// per-position logits ARE the penalty-adjusted logits the classic
+    /// decode path would feed `compute_logprobs`: no temperature
+    /// scaling, no history-dependent penalty applied during verify.
+    /// That makes the resulting logprobs byte-identical to the classic
+    /// path's decode-token logprobs for greedy sampling.
+    ///
+    /// Returns `None` when `logprobs_config.enabled` is false (the
+    /// zero-overhead path — no slicing, no log-softmax).
+    fn per_position_logprobs(
+        logits: &MlxArray,
+        target_tokens: &[i32],
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> Option<Vec<mlxcel_core::sampling::TokenLogprobData>> {
+        if !logprobs_config.enabled {
+            return None;
+        }
+        let shape = mlxcel_core::array_shape(logits);
+        debug_assert!(shape.len() == 3, "expected [1, block_size, vocab] logits");
+        let vocab = shape[2];
+        let mut out: Vec<mlxcel_core::sampling::TokenLogprobData> =
+            Vec::with_capacity(target_tokens.len());
+        for (pos, &tok) in target_tokens.iter().enumerate() {
+            // Slice position `pos` to a `[1, vocab]` tensor — the shape
+            // `compute_logprobs` expects.
+            let pos_i32 = pos as i32;
+            let pos_logits_3d =
+                mlxcel_core::slice(logits, &[0, pos_i32, 0], &[1, pos_i32 + 1, vocab]);
+            let pos_logits = mlxcel_core::reshape(&pos_logits_3d, &[1, vocab]);
+            // `compute_logprobs` returns `Some` here because
+            // `logprobs_config.enabled` is true (checked above); the
+            // `unwrap_or` is a defensive fallback that should never
+            // fire.
+            let lp = mlxcel_core::sampling::compute_logprobs(&pos_logits, tok, logprobs_config)
+                .unwrap_or(mlxcel_core::sampling::TokenLogprobData {
+                    token_id: tok,
+                    logprob: 0.0,
+                    top_alternatives: Vec::new(),
+                });
+            out.push(lp);
+        }
+        Some(out)
+    }
 }
 
 impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
@@ -185,7 +234,12 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
         token_history: &[i32],
-    ) -> (i32, MtpVerifyOutput) {
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<mlxcel_core::sampling::TokenLogprobData>,
+    ) {
         let prompt_arr =
             mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
 
@@ -209,11 +263,17 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // (repetition / frequency / presence / DRY) so the first bonus
         // is byte-identical to the classic decode path's first token
         // (issue #677). `sample_token_optimized` returns
-        // `(token_arr, adjusted_logits)` — for the seed sample we only
-        // need the token.
-        let (token_arr, _) = sample_token_optimized(&logits, sampler, token_history);
+        // `(token_arr, adjusted_logits)`; `adjusted_logits` is the
+        // penalty-adjusted `[1, vocab]` slice the bonus was sampled
+        // from, and feeds `compute_logprobs` so the first-bonus logprob
+        // is byte-identical to the classic path's first-token logprob
+        // (issue #678).
+        let (token_arr, adjusted_logits) =
+            sample_token_optimized(&logits, sampler, token_history);
         mlxcel_core::eval(&token_arr);
         let first_bonus = mlxcel_core::item_i32(&token_arr);
+        let first_bonus_lp =
+            mlxcel_core::sampling::compute_logprobs(&adjusted_logits, first_bonus, logprobs_config);
 
         // Build the seed MtpVerifyOutput from the captured sinks.
         // `next_hidden` is the last entry in the hidden-sink (since we
@@ -256,7 +316,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             kv_offset,
             bonus_position,
         };
-        (first_bonus, seed)
+        (first_bonus, seed, first_bonus_lp)
     }
 
     fn embed_token(&self, token_id: i32) -> UniquePtr<MlxArray> {
@@ -280,6 +340,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         &self,
         verify_input: &[i32],
         _sampler: &SamplingConfig,
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
     ) -> VerifyForwardOutput {
         // Sink-aware forward over `[bonus, draft_0, …, draft_{K-2}]`.
         let verify_arr = mlxcel_core::from_slice_i32(verify_input, &[1, verify_input.len() as i32]);
@@ -302,6 +363,13 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // through per-position; the round-loop driver's perf-sensitive
         // path is greedy, so we keep argmax-only for now.
         let target_tokens = Self::argmax_per_position(&logits);
+
+        // Per-position log-probability data, aligned 1:1 with
+        // `target_tokens`. `None` (zero-overhead) when logprobs are
+        // disabled; the round loop forwards the entries for accepted
+        // positions on to `finalize_burst_success` (issue #678).
+        let target_logprobs =
+            Self::per_position_logprobs(&logits, &target_tokens, logprobs_config);
 
         // Capture the hidden + pre-slice shared K/V for the finalize step.
         let hidden_sink = sinks
@@ -328,6 +396,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
 
         VerifyForwardOutput {
             target_tokens,
+            target_logprobs,
             captured: VerifyCaptured {
                 tensors: captured_tensors,
                 // No per-step scalar metadata used today; the per-row
@@ -434,9 +503,14 @@ impl<'a> MtpTarget for Gemma4VLMtpTargetAdapter<'a> {
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
         token_history: &[i32],
-    ) -> (i32, MtpVerifyOutput) {
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<mlxcel_core::sampling::TokenLogprobData>,
+    ) {
         self.inner
-            .prefill_and_seed(prompt_tokens, sampler, token_history)
+            .prefill_and_seed(prompt_tokens, sampler, token_history, logprobs_config)
     }
 
     fn embed_token(&self, token_id: i32) -> UniquePtr<MlxArray> {
@@ -447,8 +521,10 @@ impl<'a> MtpTarget for Gemma4VLMtpTargetAdapter<'a> {
         &self,
         verify_input: &[i32],
         sampler: &SamplingConfig,
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
     ) -> VerifyForwardOutput {
-        self.inner.verify_forward(verify_input, sampler)
+        self.inner
+            .verify_forward(verify_input, sampler, logprobs_config)
     }
 
     fn verify_finalize(

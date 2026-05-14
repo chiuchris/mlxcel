@@ -31,6 +31,7 @@ use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::SamplingConfig;
 use crate::weights::WeightMap;
+use crate::sampling::LogprobsConfig;
 use cxx::UniquePtr;
 use std::cell::RefCell;
 use std::sync::atomic::AtomicBool;
@@ -120,13 +121,27 @@ impl MtpTarget for MockMtpTarget {
         _prompt_tokens: &[i32],
         _sampler: &SamplingConfig,
         _token_history: &[i32],
-    ) -> (i32, MtpVerifyOutput) {
+        logprobs_config: &crate::sampling::LogprobsConfig,
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<crate::sampling::TokenLogprobData>,
+    ) {
         *self.call_count.borrow_mut() += 1;
         // Seed: fresh shared K/V at offset 1 (the bonus token's
         // position). Caller passes `with_first_bonus` to control the
         // bonus token; default is 100.
         let seed = self.build_verify_output(1);
-        (self.first_bonus, seed)
+        // Synthetic first-bonus logprob: `None` when logprobs are
+        // disabled (the existing tests' path), a dummy entry otherwise.
+        let first_bonus_lp = logprobs_config.enabled.then(|| {
+            crate::sampling::TokenLogprobData {
+                token_id: self.first_bonus,
+                logprob: 0.0,
+                top_alternatives: Vec::new(),
+            }
+        });
+        (self.first_bonus, seed, first_bonus_lp)
     }
 
     fn embed_token(&self, _token_id: i32) -> UniquePtr<MlxArray> {
@@ -137,6 +152,7 @@ impl MtpTarget for MockMtpTarget {
         &self,
         _verify_input: &[i32],
         _sampler: &SamplingConfig,
+        logprobs_config: &crate::sampling::LogprobsConfig,
     ) -> VerifyForwardOutput {
         *self.call_count.borrow_mut() += 1;
         // Pop the next scripted target tokens. If the queue is
@@ -154,6 +170,18 @@ impl MtpTarget for MockMtpTarget {
                 vec![0]
             }
         };
+        // Synthetic per-position logprobs aligned 1:1 with
+        // `target_tokens`. `None` when logprobs are disabled.
+        let target_logprobs = logprobs_config.enabled.then(|| {
+            target_tokens
+                .iter()
+                .map(|&tok| crate::sampling::TokenLogprobData {
+                    token_id: tok,
+                    logprob: 0.0,
+                    top_alternatives: Vec::new(),
+                })
+                .collect()
+        });
         // Captured state: empty for the mock (the finalize call doesn't
         // need to inspect it for the unit-test contract). Real Gemma 4
         // wrapper stashes hidden_full + pre-slice shared K/V here.
@@ -163,6 +191,7 @@ impl MtpTarget for MockMtpTarget {
         };
         VerifyForwardOutput {
             target_tokens,
+            target_logprobs,
             captured,
         }
     }
@@ -316,7 +345,7 @@ fn round_loop_full_accept_emits_all_proposals_plus_bonus_per_round() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1, 2, 3], 13, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, stats) = gen_.generate(&[1, 2, 3], 13, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(
         tokens,
         vec![100, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33],
@@ -369,7 +398,7 @@ fn round_loop_partial_accept_rolls_back_by_block_size_minus_accepted_minus_one()
     // (seed + round-1's 2 accepted + round-2's 1 bonus). Larger
     // max_tokens would force more rounds against the reused scripted
     // entries, which is not what this test is measuring.
-    let (tokens, _stats) = gen_.generate(&[1, 2, 3], 4, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, _stats) = gen_.generate(&[1, 2, 3], 4, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(tokens, vec![100, 10, 11, 20]);
 
     // Pin the rollback bookkeeping: `verify_finalize` must receive
@@ -412,7 +441,7 @@ fn round_loop_respects_max_tokens_cap_on_full_accept() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1, 2, 3], 6, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, stats) = gen_.generate(&[1, 2, 3], 6, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(tokens.len(), 6, "must cap at max_tokens=6");
     assert_eq!(tokens[0], 100, "seed bonus is first");
     assert_eq!(stats.generated_tokens, 6);
@@ -427,7 +456,7 @@ fn round_loop_stops_on_eos_token() {
     let drafter = MockMtpDrafter::new(vec![vec![10, 11, 12]]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, _stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, _stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(tokens, vec![100, 10, 11, 12]);
 }
 
@@ -439,7 +468,7 @@ fn round_loop_first_bonus_eos_short_circuits_seed() {
     let drafter = MockMtpDrafter::new(vec![]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(tokens, vec![100]);
     assert_eq!(stats.generated_tokens, 1);
 }
@@ -450,7 +479,7 @@ fn round_loop_max_tokens_one_emits_only_seed_bonus() {
     let drafter = MockMtpDrafter::new(vec![]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, _) = gen_.generate(&[1], 1, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (tokens, _logprobs, _) = gen_.generate(&[1], 1, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     assert_eq!(tokens, vec![100]);
 }
 
@@ -480,7 +509,7 @@ fn round_loop_rebinds_drafter_after_each_round() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (_tokens, _stats) = gen_.generate(&[1], 9, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (_tokens, _logprobs, _stats) = gen_.generate(&[1], 9, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
 
     // The drafter is owned by the generator behind `Box<dyn Drafter>`,
     // so we cannot downcast to read the log. Instead we exercise the
@@ -547,7 +576,7 @@ fn greedy_parity_perfect_drafter_matches_no_drafter_baseline_32_tokens() {
     let drafter = MockMtpDrafter::new(scripted_draft);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (mtp_tokens, _) = gen_.generate(&[1], max_tokens, &SamplingConfig::greedy(), &[], &AtomicBool::new(false));
+    let (mtp_tokens, _logprobs, _) = gen_.generate(&[1], max_tokens, &SamplingConfig::greedy(), &[], &AtomicBool::new(false), &LogprobsConfig::default());
     let baseline_tokens = greedy_baseline(&scripted_target, first_bonus, max_tokens);
 
     assert_eq!(

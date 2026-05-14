@@ -52,6 +52,7 @@
 
 use crate::ffi::MlxArray;
 use crate::generate::SamplingConfig;
+use crate::sampling::{LogprobsConfig, TokenLogprobData};
 use cxx::UniquePtr;
 
 use crate::drafter::DrafterError;
@@ -100,6 +101,14 @@ pub struct VerifyForwardOutput {
     /// At temperature 0 these are pure argmax; at temperature > 0 the
     /// trait impl samples from the per-position logits.
     pub target_tokens: Vec<i32>,
+    /// Per-position log-probability data, aligned 1:1 with
+    /// `target_tokens`. `None` when the caller's [`LogprobsConfig`] is
+    /// disabled (zero-overhead path); `Some(vec)` with one entry per
+    /// verify position when logprobs are requested (issue #678). The
+    /// round loop forwards the entries for *accepted* positions on to
+    /// the burst's `finalize_burst_success` so speculative responses
+    /// carry the same `TokenWithLogprobs` payload as the classic path.
+    pub target_logprobs: Option<Vec<TokenLogprobData>>,
     /// Opaque captured state for the finalize call.
     pub captured: VerifyCaptured,
 }
@@ -108,6 +117,10 @@ impl std::fmt::Debug for VerifyForwardOutput {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("VerifyForwardOutput")
             .field("target_tokens", &self.target_tokens)
+            .field(
+                "has_target_logprobs",
+                &self.target_logprobs.is_some(),
+            )
             .field("captured", &self.captured)
             .finish()
     }
@@ -209,6 +222,14 @@ pub trait MtpTarget {
     /// the first bonus is byte-identical to the classic decode path's
     /// first token; callers with no penalty configured pass `&[]`.
     ///
+    /// `logprobs_config` controls first-bonus log-probability capture.
+    /// When [`LogprobsConfig::enabled`] is false the returned
+    /// `Option<TokenLogprobData>` is `None` (zero-overhead path); when
+    /// true it carries the first bonus's log-probability data computed
+    /// from the same penalty-adjusted logits the bonus was sampled from
+    /// — byte-identical to the classic decode path's first-token
+    /// logprobs (issue #678).
+    ///
     /// **Cache state on return**: the target's per-sequence cache has
     /// `prompt.len()` entries (the prompt prefill). The bonus token is
     /// NOT yet in the cache — it will be forwarded as the first slot of
@@ -226,7 +247,8 @@ pub trait MtpTarget {
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
         token_history: &[i32],
-    ) -> (i32, MtpVerifyOutput);
+        logprobs_config: &LogprobsConfig,
+    ) -> (i32, MtpVerifyOutput, Option<TokenLogprobData>);
 
     /// Embed a token id through the target's embedding table. Equivalent
     /// to `LanguageModel::embed_tokens(...)` on the trait, but lifted
@@ -239,7 +261,9 @@ pub trait MtpTarget {
     /// semantics and produce:
     ///
     /// 1. `target_tokens`: argmax (or sampled at temp>0) per position.
-    /// 2. `captured`: the captured `hidden_full` and pre-slice shared
+    /// 2. `target_logprobs`: per-position log-probability data when
+    ///    `logprobs_config.enabled`, else `None`.
+    /// 3. `captured`: the captured `hidden_full` and pre-slice shared
     ///    K/V slabs, opaque to the round-loop.
     ///
     /// **Cache state on return**: the target's per-sequence cache has
@@ -250,10 +274,17 @@ pub trait MtpTarget {
     /// `sampler` controls how target tokens are produced from the
     /// verify logits. At temperature 0 the impl MUST use argmax to
     /// preserve the greedy-parity invariant.
+    ///
+    /// `logprobs_config` controls per-position log-probability capture.
+    /// When disabled the impl MUST leave `VerifyForwardOutput::target_logprobs`
+    /// as `None` (zero-overhead path); when enabled it populates one
+    /// [`TokenLogprobData`] per verify position, aligned 1:1 with
+    /// `target_tokens` (issue #678).
     fn verify_forward(
         &self,
         verify_input: &[i32],
         sampler: &SamplingConfig,
+        logprobs_config: &LogprobsConfig,
     ) -> VerifyForwardOutput;
 
     /// Second-phase verify: apply the per-row tail-zero rollback to the

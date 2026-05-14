@@ -260,8 +260,17 @@ fn burst_allowed_for_dry_penalty() {
     );
 }
 
+// `logprobs_config.enabled` is NO LONGER a decline-to-classic gate
+// (issue #678): the burst threads `logprobs_config` through
+// `MtpGenerator::generate` / `DFlashGenerator::run` and emits
+// `TokenWithLogprobs` events from `finalize_burst_success`. The test
+// below (formerly `burst_declined_when_logprobs_enabled`) now asserts
+// the gate stays OPEN. The logprobs threading itself is pinned by
+// `drive_mtp_generator_round_loop_threads_logprobs_through_to_emitted_tokens`
+// further down; full byte-equality against the classic path lives in
+// the real-model `tests/speculative_parity.rs` lane.
 #[test]
-fn burst_declined_when_logprobs_enabled() {
+fn burst_allowed_when_logprobs_enabled() {
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
     seq.logprobs_config = LogprobsConfig {
@@ -269,9 +278,9 @@ fn burst_declined_when_logprobs_enabled() {
         top_k: 5,
     };
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "logprobs_config.enabled=true must fall back to classic decode \
-         (burst path does not yet emit TokenWithLogprobs)"
+        should_burst_for_sequence(&dispatch, &seq),
+        "logprobs_config.enabled=true must NOT decline to classic — the burst \
+         now threads logprobs through and emits TokenWithLogprobs (issue #678)"
     );
 }
 
@@ -337,6 +346,23 @@ fn dummy_tensor() -> UniquePtr<MlxArray> {
     from_slice_f32(&[0.0, 0.0, 0.0, 0.0], &[1, 1, 4])
 }
 
+/// Deterministic synthetic [`mlxcel_core::sampling::TokenLogprobData`]
+/// for a token id — `logprob = -(token_id as f32) * 0.01`. The mock
+/// `MtpTarget` returns this from `prefill_and_seed` / `verify_forward`
+/// so the issue #678 logprobs-threading test can assert the *right*
+/// logprob (the one keyed to a given token) reached
+/// `finalize_burst_success` unchanged. A real Gemma 4 / Qwen 3.5
+/// target computes the value from log-softmax of the verify logits;
+/// the byte-equality-against-classic check belongs in the real-model
+/// `tests/speculative_parity.rs` lane.
+fn synthetic_logprob(token_id: i32) -> mlxcel_core::sampling::TokenLogprobData {
+    mlxcel_core::sampling::TokenLogprobData {
+        token_id,
+        logprob: -(token_id as f32) * 0.01,
+        top_alternatives: Vec::new(),
+    }
+}
+
 struct MockMtpTarget {
     first_bonus: i32,
     scripted_target_tokens: RefCell<Vec<Vec<i32>>>,
@@ -389,12 +415,20 @@ impl MtpTarget for MockMtpTarget {
         _prompt_tokens: &[i32],
         _sampler: &SamplingConfig,
         token_history: &[i32],
-    ) -> (i32, MtpVerifyOutput) {
+        logprobs_config: &LogprobsConfig,
+    ) -> (i32, MtpVerifyOutput, Option<mlxcel_core::sampling::TokenLogprobData>) {
         // Record what the generator handed us so the issue #677 test can
         // assert the burst threaded the real token_history through.
         *self.seen_token_history.borrow_mut() = Some(token_history.to_vec());
         let seed = self.build_verify_output(1);
-        (self.first_bonus, seed)
+        // Synthetic first-bonus logprob: `None` when disabled; otherwise
+        // a deterministic function of the token id (`synthetic_logprob`)
+        // so the issue #678 test can assert the right logprob reached
+        // the right token.
+        let first_bonus_lp = logprobs_config
+            .enabled
+            .then(|| synthetic_logprob(self.first_bonus));
+        (self.first_bonus, seed, first_bonus_lp)
     }
 
     fn embed_token(&self, _token_id: i32) -> UniquePtr<MlxArray> {
@@ -405,6 +439,7 @@ impl MtpTarget for MockMtpTarget {
         &self,
         _verify_input: &[i32],
         _sampler: &SamplingConfig,
+        logprobs_config: &LogprobsConfig,
     ) -> VerifyForwardOutput {
         let target_tokens = {
             let mut q = self.scripted_target_tokens.borrow_mut();
@@ -416,8 +451,17 @@ impl MtpTarget for MockMtpTarget {
                 vec![0]
             }
         };
+        // Synthetic per-position logprobs aligned 1:1 with
+        // `target_tokens`. `None` when disabled.
+        let target_logprobs = logprobs_config.enabled.then(|| {
+            target_tokens
+                .iter()
+                .map(|&tok| synthetic_logprob(tok))
+                .collect()
+        });
         VerifyForwardOutput {
             target_tokens,
+            target_logprobs,
             captured: VerifyCaptured {
                 tensors: Vec::new(),
                 scalars: Vec::new(),
@@ -618,8 +662,14 @@ fn drive_mtp_generator_round_loop_produces_more_than_one_token_when_drafter_is_b
     let sampling = SamplingConfig::greedy();
     // Not cancelled — exercise the full round loop.
     let cancel = AtomicBool::new(false);
-    let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
+    let (emitted, _logprobs, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &[],
+        &cancel,
+        &LogprobsConfig::default(),
+    );
 
     // We expect 8 tokens before EOS (4 per round, 2 rounds):
     // [100, 10, 11, 12, 13, 20, 21, 22]. Then the 9999 EOS in round 2's
@@ -677,8 +727,14 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_drafter_is_unbound() {
     // Not cancelled — the early-out we are pinning here is the unbound
     // drafter, not cancellation.
     let cancel = AtomicBool::new(false);
-    let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
+    let (emitted, _logprobs, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &[],
+        &cancel,
+        &LogprobsConfig::default(),
+    );
 
     // CRITICAL invariant — without bind, the round loop breaks on the
     // first draft_block call and we get exactly the seed bonus.
@@ -757,8 +813,14 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_cancelled_before_first_
     // Pre-flag cancellation BEFORE the generator runs — mirrors a client
     // that disconnected while the request was still queued / prefilling.
     let cancel = AtomicBool::new(true);
-    let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
+    let (emitted, _logprobs, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &[],
+        &cancel,
+        &LogprobsConfig::default(),
+    );
 
     // The prefill + seed-bonus emission happen unconditionally; the
     // per-round cancellation check fires at the TOP of the round loop,
@@ -833,12 +895,13 @@ fn drive_mtp_generator_round_loop_threads_token_history_into_prefill_and_seed() 
     // for a repetition/frequency/presence/DRY-bearing request.
     let token_history = vec![1, 2, 3];
     let cancel = AtomicBool::new(false);
-    let (_emitted, _stats) = generator.generate(
+    let (_emitted, _logprobs, _stats) = generator.generate(
         &prompt,
         /* max_tokens= */ 16,
         &sampling,
         &token_history,
         &cancel,
+        &LogprobsConfig::default(),
     );
 
     // The generator must have forwarded the caller's token_history
@@ -856,6 +919,150 @@ fn drive_mtp_generator_round_loop_threads_token_history_into_prefill_and_seed() 
         seen, token_history,
         "MtpGenerator::generate must forward the caller's token_history \
          into MtpTarget::prefill_and_seed unchanged (issue #677); got {seen:?}"
+    );
+}
+
+// =============================================================================
+// Logprobs through the burst — issue #678
+//
+// PR #671 (issue #670) gated `logprobs_config.enabled` requests to the
+// classic decode path because `finalize_burst_success` emitted plain
+// `Token(text)` events. Issue #678 threads `logprobs_config` through
+// `MtpGenerator::generate` → `MtpTarget::prefill_and_seed` /
+// `verify_forward` (and through `DFlashGenerator::run` on the DFlash
+// side), returns a per-token `Vec<Option<TokenLogprobData>>` aligned
+// with the emitted tokens, and `finalize_burst_success` emits
+// `TokenWithLogprobs` events.
+//
+// The gate change is pinned by `burst_allowed_when_logprobs_enabled`
+// above. The plumbing — that the generator actually returns one logprob
+// per emitted token, index-aligned, with the right value keyed to the
+// right token — is pinned below: the mock target returns deterministic
+// `synthetic_logprob(token)` entries, and the test asserts the
+// generator's returned `logprobs` vec matches. Full byte-equality
+// between the burst's logprobs and the classic path's logprobs
+// (acceptance criterion 2) requires a real Gemma 4 / Qwen 3.5 target
+// and lives in the `tests/speculative_parity.rs` real-model lane.
+// =============================================================================
+
+#[test]
+fn drive_mtp_generator_round_loop_threads_logprobs_through_to_emitted_tokens() {
+    use mlxcel_core::speculative::mtp::MtpGenerator;
+
+    let (target, drafter_scripts) = make_two_round_target_and_drafter();
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut drafter = TrackingMockDrafter::new(drafter_scripts, events.clone());
+    let lm = MinimalLm;
+    drafter
+        .bind(&lm)
+        .expect("bind must succeed on tracking mock");
+
+    let boxed: Box<dyn Drafter> = Box::new(drafter);
+    let mut generator = MtpGenerator::new(target, boxed, /* block_size= */ 4);
+
+    let prompt = vec![1, 2, 3];
+    let sampling = SamplingConfig::greedy();
+    let cancel = AtomicBool::new(false);
+    // Logprobs ENABLED — exercise the issue #678 capture path.
+    let logprobs_config = LogprobsConfig {
+        enabled: true,
+        top_k: 0,
+    };
+    let (emitted, logprobs, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &[],
+        &cancel,
+        &logprobs_config,
+    );
+
+    // The scripted two-round target emits [100, 10, 11, 12, 13, 20, 21,
+    // 22, 9999]: the seed bonus 100, two full-accept rounds of 4 tokens
+    // each, and the round-2 EOS (9999). `MtpGenerator::generate` pushes
+    // each walk token to `emitted` BEFORE its EOS check fires, so the
+    // EOS token itself IS part of the emitted sequence.
+    assert_eq!(
+        emitted,
+        vec![100, 10, 11, 12, 13, 20, 21, 22, 9999],
+        "scripted two-round target must emit the hand-computed sequence"
+    );
+
+    // The generator must return exactly one logprob entry per emitted
+    // token, index-aligned. If it dropped entries (or returned an empty
+    // vec despite logprobs being enabled), a speculative response would
+    // silently lose its `TokenWithLogprobs` payload.
+    assert_eq!(
+        logprobs.len(),
+        emitted.len(),
+        "with logprobs enabled, generate() must return one logprob entry \
+         per emitted token (index-aligned); got {} entries for {} tokens",
+        logprobs.len(),
+        emitted.len(),
+    );
+
+    // Every entry must be `Some` and carry the deterministic synthetic
+    // logprob keyed to *that* token — proving the right logprob reached
+    // the right position through the round loop's walk + emit (issue
+    // #678).
+    for (i, (&tok, lp)) in emitted.iter().zip(logprobs.iter()).enumerate() {
+        let lp = lp.as_ref().unwrap_or_else(|| {
+            panic!("logprobs[{i}] must be Some for token {tok} when logprobs enabled")
+        });
+        assert_eq!(
+            lp.token_id, tok,
+            "logprobs[{i}].token_id must match emitted[{i}]"
+        );
+        let expected = synthetic_logprob(tok);
+        assert_eq!(
+            lp.logprob, expected.logprob,
+            "logprobs[{i}].logprob for token {tok} must be the synthetic value \
+             threaded from the mock target (issue #678)"
+        );
+    }
+}
+
+#[test]
+fn drive_mtp_generator_round_loop_returns_empty_logprobs_when_disabled() {
+    use mlxcel_core::speculative::mtp::MtpGenerator;
+
+    // The zero-overhead path: with logprobs disabled, `generate()` must
+    // return an EMPTY logprobs vec — no allocation, no per-token
+    // `compute_logprobs` work — and `finalize_burst_success` falls
+    // through to plain `Token` events.
+    let (target, drafter_scripts) = make_two_round_target_and_drafter();
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut drafter = TrackingMockDrafter::new(drafter_scripts, events.clone());
+    let lm = MinimalLm;
+    drafter
+        .bind(&lm)
+        .expect("bind must succeed on tracking mock");
+    let boxed: Box<dyn Drafter> = Box::new(drafter);
+    let mut generator = MtpGenerator::new(target, boxed, /* block_size= */ 4);
+
+    let prompt = vec![1, 2, 3];
+    let sampling = SamplingConfig::greedy();
+    let cancel = AtomicBool::new(false);
+    let (emitted, logprobs, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &[],
+        &cancel,
+        // Disabled — the default.
+        &LogprobsConfig::default(),
+    );
+
+    assert!(
+        !emitted.is_empty(),
+        "sanity: the round loop should still emit tokens"
+    );
+    assert!(
+        logprobs.is_empty(),
+        "with logprobs disabled, generate() must return an EMPTY logprobs \
+         vec (zero-overhead path); got {} entries",
+        logprobs.len(),
     );
 }
 

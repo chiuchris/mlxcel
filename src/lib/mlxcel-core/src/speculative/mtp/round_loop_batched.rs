@@ -615,7 +615,12 @@ mod tests {
             _prompt_tokens: &[i32],
             _sampler: &SamplingConfig,
             _token_history: &[i32],
-        ) -> (i32, MtpVerifyOutput) {
+            _logprobs_config: &crate::sampling::LogprobsConfig,
+        ) -> (
+            i32,
+            MtpVerifyOutput,
+            Option<crate::sampling::TokenLogprobData>,
+        ) {
             panic!("BatchedMockTarget should not be driven through the B=1 path");
         }
 
@@ -627,6 +632,7 @@ mod tests {
             &self,
             _verify_input: &[i32],
             _sampler: &SamplingConfig,
+            _logprobs_config: &crate::sampling::LogprobsConfig,
         ) -> VerifyForwardOutput {
             panic!("BatchedMockTarget should not be driven through the B=1 path");
         }
@@ -1095,9 +1101,21 @@ mod tests {
                 _prompt_tokens: &[i32],
                 _sampler: &SamplingConfig,
                 _token_history: &[i32],
-            ) -> (i32, MtpVerifyOutput) {
+                logprobs_config: &crate::sampling::LogprobsConfig,
+            ) -> (
+                i32,
+                MtpVerifyOutput,
+                Option<crate::sampling::TokenLogprobData>,
+            ) {
                 let seed = self.build_verify_output(1);
-                (self.first_bonus, seed)
+                let first_bonus_lp = logprobs_config.enabled.then(|| {
+                    crate::sampling::TokenLogprobData {
+                        token_id: self.first_bonus,
+                        logprob: 0.0,
+                        top_alternatives: Vec::new(),
+                    }
+                });
+                (self.first_bonus, seed, first_bonus_lp)
             }
             fn embed_token(&self, _token_id: i32) -> UniquePtr<MlxArray> {
                 Self::dummy_tensor()
@@ -1106,6 +1124,7 @@ mod tests {
                 &self,
                 _verify_input: &[i32],
                 _sampler: &SamplingConfig,
+                logprobs_config: &crate::sampling::LogprobsConfig,
             ) -> VerifyForwardOutput {
                 let target_tokens = {
                     let mut q = self.script.borrow_mut();
@@ -1117,8 +1136,19 @@ mod tests {
                         vec![0]
                     }
                 };
+                let target_logprobs = logprobs_config.enabled.then(|| {
+                    target_tokens
+                        .iter()
+                        .map(|&tok| crate::sampling::TokenLogprobData {
+                            token_id: tok,
+                            logprob: 0.0,
+                            top_alternatives: Vec::new(),
+                        })
+                        .collect()
+                });
                 VerifyForwardOutput {
                     target_tokens,
+                    target_logprobs,
                     captured: VerifyCaptured {
                         tensors: Vec::new(),
                         scalars: Vec::new(),
@@ -1202,12 +1232,13 @@ mod tests {
                 script: RefCell::new(drafter_script),
             };
             let mut gen_ = MtpGenerator::new(target, Box::new(drafter), block_size);
-            let (tokens, _) = gen_.generate(
+            let (tokens, _logprobs, _) = gen_.generate(
                 &[1, 2, 3],
                 max_new_tokens,
                 &SamplingConfig::greedy(),
                 &[],
                 &AtomicBool::new(false),
+                &crate::sampling::LogprobsConfig::default(),
             );
             reference_tokens.push(tokens);
         }

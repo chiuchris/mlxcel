@@ -97,8 +97,6 @@
 //! - The request adopted a prompt-cache prefix (`prefill_start_offset > 0`):
 //!   a burst owns the cache for its full lifetime; mixing an adopted prefix
 //!   would double-prefill the leading tokens.
-//! - The request asked for logprobs: the burst path streams `Token(text)`
-//!   only, not `TokenWithLogprobs`.
 //! - Thinking-budget enforcement is active: the burst path does not yet
 //!   implement forced `</think>` injection on budget exceeded.
 //!
@@ -107,6 +105,11 @@
 //! `initial_token_history(&prompt, ..)` into the first-bonus sample so a
 //! penalty-bearing request's first bonus is byte-identical to the
 //! classic decode path (issue #677).
+//!
+//! Logprobs are **not** a gate: the burst threads `logprobs_config`
+//! through `MtpGenerator::generate` / `DFlashGenerator::run` and emits
+//! `TokenWithLogprobs` events from `finalize_burst_success` — the same
+//! payload the classic decode path produces (issue #678).
 //!
 //! Each declined request is logged at `debug` level with the gate reason.
 //!
@@ -129,6 +132,7 @@ use mlxcel_core::drafter::dflash::DFlashGenerator;
 use mlxcel_core::drafter::{Drafter, DrafterKind, load_drafter};
 use mlxcel_core::generate::{LanguageModel, SamplingConfig};
 use mlxcel_core::generation_policy::{initial_token_history, merged_eos_token_ids};
+use mlxcel_core::sampling::TokenLogprobData;
 use mlxcel_core::speculative::mtp::MtpGenerator;
 
 use crate::LoadedModel;
@@ -260,11 +264,7 @@ impl WorkerDrafterSlot {
 ///    A speculative burst owns the cache for its full lifetime; mixing
 ///    an adopted prefix with the burst's own prefill would double-prefill
 ///    the leading tokens.
-/// 5. `seq.logprobs_config.enabled == false` — the burst path streams
-///    `GenerateEvent::Token(text)` only and does not emit
-///    `TokenWithLogprobs`. Routing the request to classic decode
-///    preserves the API contract.
-/// 6. `seq.thinking` is disabled — the burst path does not implement
+/// 5. `seq.thinking` is disabled — the burst path does not implement
 ///    forced `</think>` injection on budget exceeded. Routing to classic
 ///    preserves the budget enforcement.
 ///
@@ -273,6 +273,11 @@ impl WorkerDrafterSlot {
 /// threads `initial_token_history(&prompt, ..)` into the first-bonus
 /// sample, so a penalty-bearing request's first bonus is byte-identical
 /// to the classic decode path.
+///
+/// `logprobs_config.enabled` is likewise **no longer** a gate (issue
+/// #678): the burst threads `logprobs_config` through the round-loop
+/// drivers and emits `TokenWithLogprobs` events from
+/// `finalize_burst_success`, the same payload the classic path produces.
 ///
 /// Each gate-out logs at debug level so an operator can correlate a
 /// "spec request fell back to classic" with the reason. The gates run
@@ -314,14 +319,12 @@ pub(crate) fn should_burst_for_sequence(
     // bonus is byte-identical to the classic decode path. The
     // subsequent round-loop tokens come from the target's greedy
     // argmax, which carries no history dependence.
-    if seq.logprobs_config.enabled {
-        tracing::debug!(
-            "speculative burst declined for seq {}: logprobs_config.enabled=true \
-             (burst path does not yet emit TokenWithLogprobs)",
-            seq.seq_id,
-        );
-        return false;
-    }
+    //
+    // `logprobs_config.enabled` is likewise NO LONGER a gate (issue
+    // #678). The burst threads `logprobs_config` through
+    // `MtpGenerator::generate` / `DFlashGenerator::run` and emits
+    // `TokenWithLogprobs` events from `finalize_burst_success` — the
+    // same payload the classic decode path produces.
     if !seq.thinking.is_disabled() {
         tracing::debug!(
             "speculative burst declined for seq {}: thinking-budget enforcement active \
@@ -415,6 +418,7 @@ pub(crate) fn try_run_burst_b1(
     match result {
         Ok(BurstSuccess {
             tokens,
+            logprobs,
             prefill_time_ms,
             decode_time_ms,
         }) => {
@@ -430,7 +434,7 @@ pub(crate) fn try_run_burst_b1(
             }
             let seq_id = seq.seq_id;
             let tokens_generated =
-                finalize_burst_success(ctx, seq, tokens, prefill_time_ms, decode_time_ms);
+                finalize_burst_success(ctx, seq, tokens, logprobs, prefill_time_ms, decode_time_ms);
             Ok(BurstFinalized {
                 seq_id,
                 tokens_generated,
@@ -467,6 +471,14 @@ pub(crate) fn try_run_burst_b1(
 /// Successful burst output.
 struct BurstSuccess {
     tokens: Vec<i32>,
+    /// Per-token log-probability data, index-aligned 1:1 with
+    /// [`Self::tokens`]. Empty when `seq.logprobs_config.enabled` is
+    /// false (zero-overhead path); otherwise one
+    /// `Option<TokenLogprobData>` per token, forwarded to
+    /// `finalize_burst_success` which emits `TokenWithLogprobs` events
+    /// so speculative responses carry the same logprob payload as the
+    /// classic decode path (issue #678).
+    logprobs: Vec<Option<TokenLogprobData>>,
     prefill_time_ms: f64,
     decode_time_ms: f64,
 }
@@ -630,6 +642,12 @@ fn run_mtp_burst(
     // and the generator bails out after the current round instead of
     // running the whole `max_tokens` budget (issue #672).
     let cancel: &AtomicBool = &seq.cancelled;
+    // Per-token log-probability capture control. When enabled, the
+    // generator returns one logprob entry per emitted token; the burst
+    // forwards them through `finalize_burst_success` which emits
+    // `TokenWithLogprobs` events so speculative responses carry the
+    // same payload as the classic decode path (issue #678).
+    let logprobs_config = seq.logprobs_config.clone();
     let (output, stats) = match ctx.model {
         LoadedModel::Gemma4(wrapper) => {
             let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq.seq_id));
@@ -642,6 +660,7 @@ fn run_mtp_burst(
                 &token_history,
                 block_size,
                 cancel,
+                &logprobs_config,
             )
         }
         LoadedModel::Gemma4VLM(vlm) => {
@@ -658,6 +677,7 @@ fn run_mtp_burst(
                 &token_history,
                 block_size,
                 cancel,
+                &logprobs_config,
             )
         }
         // Unreachable: the hoisted variant check above already
@@ -682,6 +702,7 @@ fn run_mtp_burst(
 
     Ok(BurstSuccess {
         tokens: output.emitted,
+        logprobs: output.logprobs,
         prefill_time_ms: stats.prefill_time_ms,
         decode_time_ms: stats.decode_time_ms,
     })
@@ -699,6 +720,10 @@ fn run_mtp_burst(
 /// is feasible without a real `LoadedModel`.
 struct DriveMtpOutput {
     emitted: Vec<i32>,
+    /// Per-token log-probability data, index-aligned 1:1 with
+    /// [`Self::emitted`]. Empty when the caller's `LogprobsConfig` is
+    /// disabled (issue #678).
+    logprobs: Vec<Option<TokenLogprobData>>,
     recovered_drafter: Box<dyn Drafter>,
 }
 
@@ -723,6 +748,11 @@ struct DriveMtpOutput {
 /// [`MtpGenerator::generate`]; it is checked once per round so a
 /// disconnected client's burst stops occupying the worker thread
 /// (issue #672).
+///
+/// `logprobs_config` is forwarded to [`MtpGenerator::generate`]; when
+/// enabled the returned [`DriveMtpOutput::logprobs`] carries one
+/// `Option<TokenLogprobData>` per emitted token, index-aligned with
+/// [`DriveMtpOutput::emitted`] (issue #678).
 #[allow(clippy::too_many_arguments)]
 fn drive_mtp_generator<T>(
     target: T,
@@ -733,19 +763,27 @@ fn drive_mtp_generator<T>(
     token_history: &[i32],
     block_size: usize,
     cancel: &AtomicBool,
+    logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
 ) -> (DriveMtpOutput, mlxcel_core::generate::GenerationStats)
 where
     T: mlxcel_core::speculative::mtp::target::MtpTarget,
 {
     let mut generator = MtpGenerator::new(target, drafter, block_size);
-    let (emitted, stats) =
-        generator.generate(prompt, max_tokens, sampling, token_history, cancel);
+    let (emitted, logprobs, stats) = generator.generate(
+        prompt,
+        max_tokens,
+        sampling,
+        token_history,
+        cancel,
+        logprobs_config,
+    );
     // `MtpGenerator` owns the drafter by value; recover it via
     // `into_drafter` for slot-restoration.
     let recovered_drafter = generator.into_drafter();
     (
         DriveMtpOutput {
             emitted,
+            logprobs,
             recovered_drafter,
         },
         stats,
@@ -816,11 +854,17 @@ fn run_dflash_burst(
     // and the generator bails out after the current round instead of
     // running the whole `max_tokens` budget (issue #672).
     let cancel: &AtomicBool = &seq.cancelled;
+    // Per-token log-probability capture control. When enabled, the
+    // burst returns one logprob entry per emitted token; the burst
+    // forwards them through `finalize_burst_success` which emits
+    // `TokenWithLogprobs` events so speculative responses carry the
+    // same payload as the classic decode path (issue #678).
+    let logprobs_config = seq.logprobs_config.clone();
 
     // DFlash supports Qwen35 (text) today. The variant gate above
     // already rejected anything else, so the inner match is total.
     let prefill_start = Instant::now();
-    let (tokens, decode_time_ms) = match ctx.model {
+    let (tokens, logprobs, decode_time_ms) = match ctx.model {
         LoadedModel::Qwen35(qwen) | LoadedModel::Qwen35Moe(qwen) => run_dflash_on_qwen35(
             qwen,
             &prompt,
@@ -832,6 +876,7 @@ fn run_dflash_burst(
             max_tokens,
             ctx.drafter_slot,
             cancel,
+            &logprobs_config,
         )?,
         _ => {
             // Unreachable per the variant gate above. Defensive arm
@@ -851,6 +896,7 @@ fn run_dflash_burst(
     let prefill_time_ms = (total_burst - decode_time_ms).max(0.0);
     Ok(BurstSuccess {
         tokens,
+        logprobs,
         prefill_time_ms,
         decode_time_ms,
     })
@@ -871,6 +917,14 @@ fn run_dflash_burst(
 /// [`DFlashGenerator::run`]; it is checked once per round so a
 /// disconnected client's burst stops occupying the worker thread
 /// (issue #672).
+///
+/// `logprobs_config` controls per-token log-probability capture. When
+/// enabled, the returned `Vec<Option<TokenLogprobData>>` carries one
+/// entry per emitted token (index-aligned with the returned tokens):
+/// the first-bonus logprob is computed here from the same
+/// penalty-adjusted logits the bonus was sampled from, and the
+/// round-loop tokens' logprobs come back in `DFlashRunOutput::logprobs`
+/// (issue #678).
 #[allow(clippy::too_many_arguments)]
 fn run_dflash_on_qwen35(
     qwen: &crate::models::Qwen35Model,
@@ -883,7 +937,8 @@ fn run_dflash_on_qwen35(
     max_tokens: usize,
     drafter_slot: &mut WorkerDrafterSlot,
     cancel: &AtomicBool,
-) -> Result<(Vec<i32>, f64), BurstOutcome> {
+    logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+) -> Result<(Vec<i32>, Vec<Option<TokenLogprobData>>, f64), BurstOutcome> {
     // Build a fresh per-layer cache vector for this request. We do NOT
     // touch the scheduler-owned `sequence_state` map — the speculative
     // burst's caches are independent of the prompt-cache adoption
@@ -925,10 +980,19 @@ fn run_dflash_on_qwen35(
     // #677). The subsequent round-loop tokens are produced by the
     // target's greedy argmax inside `DFlashGenerator::run` (DFlash is
     // greedy-only today), which carries no history dependence.
-    let (first_bonus_arr, _) =
+    // `adjusted_logits` is the penalty-adjusted `[1, vocab]` slice the
+    // bonus was sampled from; it feeds `compute_logprobs` so the
+    // first-bonus logprob is byte-identical to the classic path's
+    // first-token logprob (issue #678).
+    let (first_bonus_arr, first_bonus_adjusted_logits) =
         mlxcel_core::sampling::sample_token_optimized(&last_logits, sampling, token_history);
     mlxcel_core::eval(&first_bonus_arr);
     let first_bonus = mlxcel_core::item_i32(&first_bonus_arr);
+    let first_bonus_lp = mlxcel_core::sampling::compute_logprobs(
+        &first_bonus_adjusted_logits,
+        first_bonus,
+        logprobs_config,
+    );
 
     // Build first_hidden = concat(hidden_states, axis=-1)[:, last_pos:last_pos+1, :].
     // The DFlash round loop expects shape [1, 1, num_layers * hidden_size].
@@ -983,6 +1047,7 @@ fn run_dflash_on_qwen35(
         eos_token_ids,
         max_tokens,
         cancel,
+        logprobs_config,
     );
 
     // Whatever the round-loop's outcome, recover the drafter so the
@@ -995,7 +1060,23 @@ fn run_dflash_on_qwen35(
             let mut tokens = Vec::with_capacity(output.tokens.len() + 1);
             tokens.push(first_bonus);
             tokens.extend(output.tokens);
-            Ok((tokens, output.stats.decode_time_ms))
+            // Assemble the per-token logprobs the same way as `tokens`:
+            // the first-bonus logprob (computed above from the prefill's
+            // adjusted logits) prepended to the round loop's per-token
+            // logprobs. Stays empty when logprobs are disabled — the
+            // round loop returns an empty `output.logprobs` and
+            // `first_bonus_lp` is `None`, so the burst's
+            // `finalize_burst_success` falls through to plain `Token`
+            // events (issue #678).
+            let logprobs: Vec<Option<TokenLogprobData>> = if logprobs_config.enabled {
+                let mut lp = Vec::with_capacity(output.logprobs.len() + 1);
+                lp.push(first_bonus_lp);
+                lp.extend(output.logprobs);
+                lp
+            } else {
+                Vec::new()
+            };
+            Ok((tokens, logprobs, output.stats.decode_time_ms))
         }
         Err(e) => Err(BurstOutcome::Error(format!(
             "DFlash round loop failed: {e}"
@@ -1018,6 +1099,7 @@ fn finalize_burst_success(
     ctx: BurstContext<'_>,
     mut seq: SequenceInfo,
     tokens: Vec<i32>,
+    logprobs: Vec<Option<TokenLogprobData>>,
     _prefill_time_ms: f64,
     _decode_time_ms: f64,
 ) -> usize {
@@ -1030,8 +1112,16 @@ fn finalize_burst_success(
     let max_tokens = seq.max_tokens.max(1);
     let mut hit_eos = false;
 
+    // When `seq.logprobs_config.enabled` the burst's generator returned
+    // one logprob entry per emitted token, index-aligned with `tokens`.
+    // We emit `GenerateEvent::TokenWithLogprobs` in that case so a
+    // speculative response carries the same payload as the classic
+    // decode path's `decode_single_step` (issue #678). The empty-vec
+    // case (logprobs disabled) falls through to plain `Token` events.
+    let logprobs_enabled = seq.logprobs_config.enabled && !logprobs.is_empty();
+
     seq.first_token_time = Some(Instant::now());
-    for token in tokens.iter().copied() {
+    for (idx, token) in tokens.iter().copied().enumerate() {
         if seq.generated_tokens.len() >= max_tokens {
             break;
         }
@@ -1044,7 +1134,20 @@ fn finalize_burst_success(
         }
         seq.generated_tokens.push(token);
         if let Some(new_text) = seq.decode_state.on_token(token, ctx.tokenizer) {
-            let _ = seq.response_tx.send(GenerateEvent::Token(new_text));
+            // `logprobs[idx]` mirrors the classic path's per-token
+            // `compute_logprobs(...)` result: `Some(lp)` → emit
+            // `TokenWithLogprobs`, `None` → emit plain `Token` (the
+            // classic path does the same when `compute_logprobs`
+            // returns `None`, e.g. on a sampler override).
+            let event = if logprobs_enabled {
+                match logprobs.get(idx).and_then(|lp| lp.clone()) {
+                    Some(lp) => GenerateEvent::TokenWithLogprobs(new_text, lp),
+                    None => GenerateEvent::Token(new_text),
+                }
+            } else {
+                GenerateEvent::Token(new_text)
+            };
+            let _ = seq.response_tx.send(event);
         }
     }
 

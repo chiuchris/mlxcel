@@ -436,6 +436,15 @@ pub struct DFlashRunOutput {
     /// Tokens emitted by the round loop, not including the first bonus
     /// token the caller passed into [`DFlashGenerator::run`].
     pub tokens: Vec<i32>,
+    /// Per-token log-probability data, index-aligned 1:1 with
+    /// [`Self::tokens`]. Empty when the caller's [`LogprobsConfig`] is
+    /// disabled (zero-overhead path); otherwise one
+    /// `Option<TokenLogprobData>` per emitted token. The server burst
+    /// path forwards this (prepended with the first bonus's logprob,
+    /// which the caller computes) to `finalize_burst_success` so
+    /// speculative responses carry the same `TokenWithLogprobs` payload
+    /// as the classic decode path (issue #678).
+    pub logprobs: Vec<Option<crate::sampling::TokenLogprobData>>,
     /// Per-round accept counts for diagnostic logging and tests.
     pub accept_lens: Vec<u32>,
     /// Wall-clock decode statistics. Prefill stats are the caller's
@@ -476,11 +485,22 @@ impl DFlashGenerator {
     ///   a client disconnect mid-burst stops occupying the worker thread
     ///   (issue #672). The offline CLI path passes
     ///   `&AtomicBool::new(false)`.
+    /// - `logprobs_config` — per-token log-probability capture control.
+    ///   When [`LogprobsConfig::enabled`] is false the returned
+    ///   [`DFlashRunOutput::logprobs`] vec is empty (zero-overhead
+    ///   path); when true it carries one `Option<TokenLogprobData>` per
+    ///   emitted token, index-aligned with [`DFlashRunOutput::tokens`].
+    ///   The round loop is greedy-only today, so the per-position logits
+    ///   ARE the penalty-adjusted logits the classic decode path feeds
+    ///   `compute_logprobs` — making the resulting logprobs
+    ///   byte-identical to the classic path for greedy sampling (issue
+    ///   #678).
     ///
     /// # Returns
     ///
     /// A [`DFlashRunOutput`] carrying the emitted tokens (excludes
-    /// `first_bonus`) and per-round accept counts.
+    /// `first_bonus`), the index-aligned per-token logprobs, and the
+    /// per-round accept counts.
     ///
     /// # Errors
     ///
@@ -491,12 +511,12 @@ impl DFlashGenerator {
     /// rest of mlxcel-core's FFI-backed model paths).
     // Each argument here represents a distinct piece of generation
     // state (target, target-LM, caches, first bonus, first hidden,
-    // EOS, budget, cancel) that cannot be folded together without
-    // losing clarity at the only call site (the binary's `generate`
-    // command). The classic `SpeculativeGenerator::generate` similarly
-    // carries 6 args; the DFlash-side `run` is the same shape with the
-    // added `target_lm` + `first_hidden` + `cancel` that DFlash
-    // specifically needs.
+    // EOS, budget, cancel, logprobs) that cannot be folded together
+    // without losing clarity at the only call site (the binary's
+    // `generate` command). The classic `SpeculativeGenerator::generate`
+    // similarly carries 6 args; the DFlash-side `run` is the same shape
+    // with the added `target_lm` + `first_hidden` + `cancel` +
+    // `logprobs_config` that DFlash specifically needs.
     #[allow(clippy::too_many_arguments)]
     pub fn run<T: SpeculativeTarget>(
         &mut self,
@@ -508,6 +528,7 @@ impl DFlashGenerator {
         eos_token_ids: &[i32],
         max_tokens: usize,
         cancel: &AtomicBool,
+        logprobs_config: &crate::sampling::LogprobsConfig,
     ) -> Result<DFlashRunOutput, DrafterError> {
         self.reset_run_state();
 
@@ -521,6 +542,7 @@ impl DFlashGenerator {
             // First bonus is the caller's own; we have no further work.
             return Ok(DFlashRunOutput {
                 tokens: Vec::new(),
+                logprobs: Vec::new(),
                 accept_lens: Vec::new(),
                 stats: build_zero_stats(),
             });
@@ -536,6 +558,11 @@ impl DFlashGenerator {
         // `emitted` from 0 → 1 conceptually (the first bonus is
         // emitted before we enter the loop).
         let mut emitted: usize = 1;
+        // Per-token logprobs, index-aligned with `self.generated_tokens`
+        // (which EXCLUDES the first bonus — that token's logprob is the
+        // caller's responsibility). Stays empty (no allocation) when
+        // logprobs are disabled.
+        let mut logprobs: Vec<Option<crate::sampling::TokenLogprobData>> = Vec::new();
 
         loop {
             if emitted >= max_tokens {
@@ -582,8 +609,18 @@ impl DFlashGenerator {
             // ---- Argmax sample of target's per-position logits ----
             // Greedy at temp=0.0 / top_k=1 — the only mode this sub-issue
             // gates parity on. Stochastic sampling for DFlash is sub-9 / #632.
-            let target_tokens =
-                argmax_logits_to_vec(target.verify_logits(&verify_out), bs as i32);
+            let verify_logits = target.verify_logits(&verify_out);
+            let target_tokens = argmax_logits_to_vec(verify_logits, bs as i32);
+
+            // Per-position log-probability data, aligned 1:1 with
+            // `target_tokens`. `None` (zero-overhead — no slicing, no
+            // log-softmax) when logprobs are disabled. Greedy-only round
+            // loop ⇒ the per-position verify logits ARE the
+            // penalty-adjusted logits the classic decode path feeds
+            // `compute_logprobs`, so these logprobs are byte-identical
+            // to the classic path for greedy sampling (issue #678).
+            let target_logprobs =
+                per_position_logprobs(verify_logits, &target_tokens, logprobs_config);
 
             // ---- Walk ----
             let budget = max_tokens.saturating_sub(emitted);
@@ -594,10 +631,25 @@ impl DFlashGenerator {
             // ---- Emit ----
             // Track EOS in the same loop body so we can stop early
             // exactly the way the upstream `for tok in new_tokens` yields
-            // tokens one at a time.
+            // tokens one at a time. `new_tokens[i] == target_tokens[i]`
+            // for every `i` (accepted draft tokens matched the target by
+            // construction; the final entry is the target's bonus), so
+            // `target_logprobs[i]` is the correct log-probability for
+            // `new_tokens[i]` (issue #678).
             let mut hit_eos = false;
-            for tok in &new_tokens {
+            for (i, tok) in new_tokens.iter().enumerate() {
                 self.generated_tokens.push(*tok);
+                if logprobs_config.enabled {
+                    // Defensive `.get(i)`: `target_logprobs` is aligned
+                    // 1:1 with `target_tokens` (length `bs`) and
+                    // `new_tokens.len() <= bs`, so `i` is always in
+                    // range — a missing entry degrades to `None` rather
+                    // than panicking.
+                    let lp = target_logprobs
+                        .as_ref()
+                        .and_then(|v| v.get(i).cloned());
+                    logprobs.push(lp);
+                }
                 emitted += 1;
                 if eos_token_ids.contains(tok) {
                     hit_eos = true;
@@ -690,6 +742,7 @@ impl DFlashGenerator {
 
         Ok(DFlashRunOutput {
             tokens: std::mem::take(&mut self.generated_tokens),
+            logprobs,
             accept_lens: std::mem::take(&mut self.accept_lens),
             stats,
         })
@@ -723,6 +776,54 @@ fn argmax_logits_to_vec(logits: &MlxArray, seq_len: i32) -> Vec<i32> {
         out.push(ffi::item_i32(&scalar));
     }
     out
+}
+
+/// Compute per-position [`crate::sampling::TokenLogprobData`] for a
+/// `[1, seq_len, vocab]` verify-logits tensor, one entry per position
+/// aligned 1:1 with `target_tokens` (issue #678).
+///
+/// The DFlash round loop is greedy-only today (`temperature == 0`, pure
+/// argmax — see [`argmax_logits_to_vec`]), so the per-position verify
+/// logits ARE the penalty-adjusted logits the classic decode path feeds
+/// `compute_logprobs`: no temperature scaling, no history-dependent
+/// penalty applied during verify. That makes the resulting logprobs
+/// byte-identical to the classic path's decode-token logprobs for
+/// greedy sampling.
+///
+/// Returns `None` when `logprobs_config.enabled` is false (the
+/// zero-overhead path — no slicing, no log-softmax).
+fn per_position_logprobs(
+    logits: &MlxArray,
+    target_tokens: &[i32],
+    logprobs_config: &crate::sampling::LogprobsConfig,
+) -> Option<Vec<crate::sampling::TokenLogprobData>> {
+    if !logprobs_config.enabled {
+        return None;
+    }
+    let shape = ffi::array_shape(logits);
+    debug_assert!(shape.len() == 3, "expected [1, seq_len, vocab] logits");
+    let vocab = shape[2];
+    let mut out: Vec<crate::sampling::TokenLogprobData> =
+        Vec::with_capacity(target_tokens.len());
+    for (pos, &tok) in target_tokens.iter().enumerate() {
+        // Slice position `pos` to a `[1, vocab]` tensor — the shape
+        // `compute_logprobs` expects.
+        let pos_i32 = pos as i32;
+        let pos_logits_3d = ffi::slice(logits, &[0, pos_i32, 0], &[1, pos_i32 + 1, vocab]);
+        let pos_logits = ffi::reshape(&pos_logits_3d, &[1, vocab]);
+        // `compute_logprobs` returns `Some` here because
+        // `logprobs_config.enabled` is true (checked above); the
+        // `unwrap_or` is a defensive fallback that should never fire.
+        let lp = crate::sampling::compute_logprobs(&pos_logits, tok, logprobs_config).unwrap_or(
+            crate::sampling::TokenLogprobData {
+                token_id: tok,
+                logprob: 0.0,
+                top_alternatives: Vec::new(),
+            },
+        );
+        out.push(lp);
+    }
+    Some(out)
 }
 
 /// Zero generation stats, used when [`DFlashGenerator::run`] short-circuits
@@ -1184,6 +1285,7 @@ mod tests {
                 &[],
                 max_tokens,
                 &AtomicBool::new(false),
+                &crate::sampling::LogprobsConfig::default(),
             )
             .expect("synthetic round loop must not fail");
         let rollback_events = target.rollback_events();
@@ -1546,6 +1648,7 @@ mod tests {
                 /*eos_token_ids=*/ &[104],
                 /*max_tokens=*/ 100,
                 /*cancel=*/ &AtomicBool::new(false),
+                /*logprobs_config=*/ &crate::sampling::LogprobsConfig::default(),
             )
             .expect("synthetic round loop");
 

@@ -41,6 +41,7 @@
 use crate::drafter::{Drafter, SharedKv};
 use crate::generate::{GenerationStats, SamplingConfig};
 use crate::generation_policy::merged_eos_token_ids;
+use crate::sampling::{LogprobsConfig, TokenLogprobData};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
@@ -157,12 +158,22 @@ impl<T: MtpTarget> MtpGenerator<T> {
     ///   path passes `&seq.cancelled` so a client disconnect mid-burst
     ///   stops occupying the worker thread (issue #672). The offline CLI
     ///   path passes `&AtomicBool::new(false)`.
+    /// - `logprobs_config`: per-token log-probability capture control.
+    ///   When [`LogprobsConfig::enabled`] is false the returned logprobs
+    ///   vec is empty (zero-overhead path); when true it carries one
+    ///   `Option<TokenLogprobData>` per emitted token, index-aligned
+    ///   with the returned `tokens` vec. The server burst path forwards
+    ///   this to `finalize_burst_success` so speculative responses carry
+    ///   the same `TokenWithLogprobs` payload as the classic decode
+    ///   path (issue #678).
     ///
     /// # Returns
     ///
-    /// `(tokens, stats)` where `tokens` is the emitted sequence
-    /// (including the first bonus at index 0) and `stats` contains
-    /// the prefill + decode timing breakdown.
+    /// `(tokens, logprobs, stats)` where `tokens` is the emitted
+    /// sequence (including the first bonus at index 0), `logprobs` is
+    /// the index-aligned per-token log-probability data (empty when
+    /// `logprobs_config.enabled` is false), and `stats` contains the
+    /// prefill + decode timing breakdown.
     pub fn generate(
         &mut self,
         prompt_tokens: &[i32],
@@ -170,7 +181,8 @@ impl<T: MtpTarget> MtpGenerator<T> {
         sampling: &SamplingConfig,
         token_history: &[i32],
         cancel: &AtomicBool,
-    ) -> (Vec<i32>, GenerationStats) {
+        logprobs_config: &LogprobsConfig,
+    ) -> (Vec<i32>, Vec<Option<TokenLogprobData>>, GenerationStats) {
         assert!(
             !prompt_tokens.is_empty(),
             "MtpGenerator: prompt_tokens must be non-empty",
@@ -181,9 +193,14 @@ impl<T: MtpTarget> MtpGenerator<T> {
             merged_eos_token_ids(self.target.eos_token_ids(), &sampling.stop_token_ids);
 
         let mut emitted: Vec<i32> = Vec::with_capacity(max_tokens);
+        // `logprobs` is kept index-aligned with `emitted`: a push to one
+        // is always paired with a push to the other. Stays empty (no
+        // allocation) when `logprobs_config.enabled` is false.
+        let mut logprobs: Vec<Option<TokenLogprobData>> = Vec::new();
         if max_tokens == 0 {
             return (
                 emitted,
+                logprobs,
                 Self::build_stats(prompt_len, 0, std::time::Duration::ZERO, std::time::Duration::ZERO),
             );
         }
@@ -195,18 +212,22 @@ impl<T: MtpTarget> MtpGenerator<T> {
         // and capture hidden + shared K/V for the drafter's first
         // round.
         let prefill_start = Instant::now();
-        let (first_bonus, mut verify_out) =
+        let (first_bonus, mut verify_out, first_bonus_lp) =
             self.target
-                .prefill_and_seed(prompt_tokens, sampling, token_history);
+                .prefill_and_seed(prompt_tokens, sampling, token_history, logprobs_config);
         let prefill_time = prefill_start.elapsed();
 
         // Emit the first bonus and short-circuit if it's EOS or
         // max_tokens=1.
         emitted.push(first_bonus);
+        if logprobs_config.enabled {
+            logprobs.push(first_bonus_lp);
+        }
         if eos_tokens.contains(&first_bonus) || max_tokens == 1 {
             let gen_count = emitted.len();
             return (
                 emitted,
+                logprobs,
                 Self::build_stats(prompt_len, gen_count, prefill_time, std::time::Duration::ZERO),
             );
         }
@@ -271,7 +292,9 @@ impl<T: MtpTarget> MtpGenerator<T> {
             // `bs` longer than before the call. We have target_tokens
             // for the walk; the captured state holds hidden + shared
             // K/V slabs for the finalize step.
-            let forward_out = self.target.verify_forward(&verify_input, sampling);
+            let forward_out =
+                self.target
+                    .verify_forward(&verify_input, sampling, logprobs_config);
 
             // Walk the draft against the target's argmax tokens.
             let budget = max_tokens - emitted.len();
@@ -279,21 +302,39 @@ impl<T: MtpTarget> MtpGenerator<T> {
 
             // Phase 2: rollback the cache + slice shared K/V based on
             // the walk's accepted count. This consumes the captured
-            // state from phase 1.
+            // state from phase 1. `target_logprobs` is pulled out
+            // *before* `forward_out` is moved into `verify_finalize`.
+            let target_logprobs = forward_out.target_logprobs;
             verify_out = self.target.verify_finalize(
                 walk.accepted,
                 actual_bs,
                 forward_out.captured,
             );
 
-            // Emit accepted tokens.
-            for &tok in &walk.new_tokens {
+            // Emit accepted tokens. `walk.new_tokens[i] == target_tokens[i]`
+            // for every `i` (accepted draft tokens matched the target by
+            // construction; the final entry is the target's bonus), so
+            // `target_logprobs[i]` is the correct log-probability for
+            // `walk.new_tokens[i]` (issue #678).
+            for (i, &tok) in walk.new_tokens.iter().enumerate() {
                 emitted.push(tok);
+                if logprobs_config.enabled {
+                    // Defensive `.get(i)`: `target_logprobs` is aligned
+                    // 1:1 with `target_tokens` (length `actual_bs`) and
+                    // `walk.new_tokens.len() <= actual_bs`, so `i` is
+                    // always in range — but a missing entry degrades to
+                    // `None` rather than panicking.
+                    let lp = target_logprobs
+                        .as_ref()
+                        .and_then(|v| v.get(i).cloned());
+                    logprobs.push(lp);
+                }
                 if eos_tokens.contains(&tok) {
                     let decode_time = decode_start.elapsed();
                     let gen_count = emitted.len();
                     return (
                         emitted,
+                        logprobs,
                         Self::build_stats(prompt_len, gen_count, prefill_time, decode_time),
                     );
                 }
@@ -302,6 +343,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
                     let gen_count = emitted.len();
                     return (
                         emitted,
+                        logprobs,
                         Self::build_stats(prompt_len, gen_count, prefill_time, decode_time),
                     );
                 }
@@ -324,6 +366,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
         let gen_count = emitted.len();
         (
             emitted,
+            logprobs,
             Self::build_stats(prompt_len, gen_count, prefill_time, decode_time),
         )
     }
