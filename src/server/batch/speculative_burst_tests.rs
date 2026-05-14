@@ -1317,3 +1317,179 @@ fn burst_finalized_error_outcome_has_empty_donate_payload() {
     );
     assert_eq!(errored.tokens_generated, 0);
 }
+
+#[test]
+fn batched_burst_module_exports_required_for_scheduler_integration_compile() {
+    // Issue #674: the batched-burst entry point and its result type must
+    // stay exported under their current names — `BatchScheduler::try_speculative_burst`
+    // depends on both. A re-org that renames either breaks this at
+    // compile time before runtime tests fire.
+    let _ = std::mem::size_of::<super::speculative_burst::BatchedBurstFinalized>();
+    // `try_run_burst_batched` is the load-bearing entry; reference it as
+    // a function item so a rename is a compile error.
+    let _f: fn(
+        super::speculative_burst::BurstContext<'_>,
+        Vec<SequenceInfo>,
+    ) -> Result<super::speculative_burst::BatchedBurstFinalized, Vec<SequenceInfo>> =
+        super::speculative_burst::try_run_burst_batched;
+    let _ = _f;
+}
+
+// =============================================================================
+// sampling_config_eq (issue #674 — batched-window admission predicate)
+// =============================================================================
+
+#[test]
+fn sampling_config_eq_identical_default_configs_are_equal() {
+    let a = SamplingConfig::default();
+    let b = SamplingConfig::default();
+    assert!(
+        super::speculative_burst::sampling_config_eq(&a, &b),
+        "two default sampling configs must compare equal"
+    );
+}
+
+#[test]
+fn sampling_config_eq_distinguishes_temperature() {
+    let a = SamplingConfig::default();
+    let b = SamplingConfig {
+        temperature: a.temperature + 0.5,
+        ..SamplingConfig::default()
+    };
+    assert!(
+        !super::speculative_burst::sampling_config_eq(&a, &b),
+        "a temperature difference must make the configs unequal"
+    );
+}
+
+#[test]
+fn sampling_config_eq_distinguishes_top_k_top_p_min_p() {
+    let base = SamplingConfig::default();
+
+    let top_k_diff = SamplingConfig {
+        top_k: base.top_k + 7,
+        ..SamplingConfig::default()
+    };
+    assert!(!super::speculative_burst::sampling_config_eq(&base, &top_k_diff));
+
+    let top_p_diff = SamplingConfig {
+        top_p: (base.top_p - 0.1).max(0.0),
+        ..SamplingConfig::default()
+    };
+    assert!(!super::speculative_burst::sampling_config_eq(&base, &top_p_diff));
+
+    let min_p_diff = SamplingConfig {
+        min_p: base.min_p + 0.2,
+        ..SamplingConfig::default()
+    };
+    assert!(!super::speculative_burst::sampling_config_eq(&base, &min_p_diff));
+}
+
+#[test]
+fn sampling_config_eq_distinguishes_stop_token_ids() {
+    let a = SamplingConfig::default();
+    let b = SamplingConfig {
+        stop_token_ids: vec![99],
+        ..SamplingConfig::default()
+    };
+    assert!(
+        !super::speculative_burst::sampling_config_eq(&a, &b),
+        "a per-row stop-token set difference must make the configs unequal — \
+         the batched round loop computes one merged-EOS set per window"
+    );
+}
+
+#[test]
+fn sampling_config_eq_distinguishes_seed() {
+    let a = SamplingConfig {
+        seed: Some(1),
+        ..SamplingConfig::default()
+    };
+    let b = SamplingConfig {
+        seed: Some(2),
+        ..SamplingConfig::default()
+    };
+    assert!(!super::speculative_burst::sampling_config_eq(&a, &b));
+}
+
+#[test]
+fn sampling_config_eq_requires_empty_token_bias_on_both_sides() {
+    use mlxcel_core::sampling::TokenBiasMap;
+    let a = SamplingConfig::default();
+    // Give `b` a non-empty token-bias map. `sampling_config_eq` requires
+    // BOTH sides to carry an empty bias, so a request with logit_bias
+    // never joins a batched window.
+    let mut bias = TokenBiasMap::new();
+    bias.insert(7, 1.5);
+    let b = SamplingConfig {
+        token_bias: bias,
+        ..SamplingConfig::default()
+    };
+    assert!(
+        !super::speculative_burst::sampling_config_eq(&a, &b),
+        "a non-empty token_bias on either side must make the configs unequal"
+    );
+    // Sanity: the empty-bias default on both sides is equal.
+    assert!(super::speculative_burst::sampling_config_eq(
+        &SamplingConfig::default(),
+        &SamplingConfig::default()
+    ));
+}
+
+#[test]
+fn sampling_config_eq_excludes_history_dependent_penalty_configs() {
+    // Issue #682 lets penalty-bearing requests enter the burst path
+    // (the B=1 burst threads token history). But the BATCHED path
+    // samples each row's first bonus with an empty token history, so
+    // `sampling_config_eq` (the batched-window admission gate) must
+    // reject any config that `needs_token_history()`. A penalty
+    // request therefore never joins a batched window — it runs as a
+    // B=1 burst, which honors its penalties correctly.
+    let base = SamplingConfig::default();
+
+    // Even when both sides carry the SAME penalty, they must not be
+    // batched together (the batched first sample ignores history).
+    let both_rep = SamplingConfig {
+        repetition_penalty: 1.1,
+        ..SamplingConfig::default()
+    };
+    let both_rep2 = SamplingConfig {
+        repetition_penalty: 1.1,
+        ..SamplingConfig::default()
+    };
+    assert!(
+        !super::speculative_burst::sampling_config_eq(&both_rep, &both_rep2),
+        "two identical repetition-penalty configs must NOT be batched — \
+         the batched first sample ignores token history"
+    );
+
+    // A penalty on either side alone also excludes the pair.
+    for penalised in [
+        SamplingConfig {
+            repetition_penalty: 1.2,
+            ..SamplingConfig::default()
+        },
+        SamplingConfig {
+            frequency_penalty: 0.5,
+            ..SamplingConfig::default()
+        },
+        SamplingConfig {
+            presence_penalty: 0.3,
+            ..SamplingConfig::default()
+        },
+        SamplingConfig {
+            dry_multiplier: 0.8,
+            ..SamplingConfig::default()
+        },
+    ] {
+        assert!(
+            !super::speculative_burst::sampling_config_eq(&base, &penalised),
+            "a history-dependent penalty on one side must exclude the pair \
+             from a batched window"
+        );
+        assert!(
+            !super::speculative_burst::sampling_config_eq(&penalised, &base),
+            "penalty exclusion must be symmetric"
+        );
+    }
+}

@@ -1697,27 +1697,203 @@ impl BatchScheduler {
             None => return,
         };
 
-        // Issue #670: speculative-decoding burst path.
+        // Issue #670 / #674: speculative-decoding burst path.
         //
         // Why: the existing speculative round loops
-        // (`MtpGenerator::generate`, `DFlashGenerator::run`) are
-        // self-contained drive loops that own prefill + decode + finish
-        // in a single function call. Folding them into the scheduler's
-        // tick-based decode_single_step would require refactoring every
-        // generator (Mtp, DFlash, batched variants) into a per-tick
-        // step API — a much larger and riskier change than this
-        // issue's scope. Instead, we run the entire speculative request
-        // lifecycle as one "burst" right at prefill time, bypassing the
-        // standard prefill → finish_prefill → active_batch → decode
-        // pipeline. The classic non-speculative path is bit-exact
-        // preserved (the gate's per-sequence preconditions also
-        // include: no VLM embeddings, no structured output, no adopted
-        // prompt-cache prefix — see
+        // (`MtpGenerator::generate`, `DFlashGenerator::run`, plus their
+        // batched B>1 peers) are self-contained drive loops that own
+        // prefill + decode + finish in a single function call. Folding
+        // them into the scheduler's tick-based decode_single_step would
+        // require refactoring every generator into a per-tick step API —
+        // a much larger and riskier change. Instead, we run the entire
+        // speculative request lifecycle as one "burst" right at prefill
+        // time, bypassing the standard prefill → finish_prefill →
+        // active_batch → decode pipeline. The classic non-speculative
+        // path is bit-exact preserved (the gate's per-sequence
+        // preconditions also include: no VLM embeddings, no structured
+        // output, no adopted prompt-cache prefix — see
         // `speculative_burst::should_burst_for_sequence`).
-        let seq = if super::speculative_burst::should_burst_for_sequence(
-            &self.speculative_dispatch,
-            &seq,
-        ) {
+        //
+        // Issue #674 adds the B>1 batched burst: when `max_batch_size >
+        // 1` and the dequeued head sequence is speculative-eligible, the
+        // scheduler collects an equal-prompt-length window of additional
+        // eligible requests and drives them all through the batched
+        // round-loop driver in one tick. A window of size 1 falls back
+        // to the B=1 burst.
+        let seq = match self.try_speculative_burst(seq) {
+            // Burst (B=1 or batched) handled the request(s) end-to-end.
+            None => return,
+            // Burst declined; route the returned head sequence through
+            // the classic prefill path. Any sibling rows that were
+            // collected into a declined window were re-routed by
+            // `try_speculative_burst` already.
+            Some(rejected_seq) => rejected_seq,
+        };
+
+        let mut seq = seq;
+        if let Err(err) = Self::begin_prefill(&mut seq) {
+            tracing::error!("State transition error: {err}");
+            self.abort_sequence(seq, &err);
+            return;
+        }
+
+        let prompt_len = seq.prompt_tokens.len();
+
+        // Decide: chunked vs full prefill
+        if self.prefill_chunk_size > 0 && prompt_len > self.prefill_chunk_size {
+            // Start chunked prefill: process first chunk
+            self.start_chunked_prefill(seq);
+        } else {
+            // Full-prompt prefill (original path)
+            self.execute_full_prefill(seq);
+        }
+    }
+
+    /// Attempt to handle the dequeued head sequence through the
+    /// speculative-decoding burst path (issue #670 B=1 / issue #674
+    /// batched B>1).
+    ///
+    /// Returns:
+    /// - `None` — a burst (B=1 or batched) handled the request(s)
+    ///   end-to-end. The caller must `return` immediately; the
+    ///   sequence(s) are already finalized and their caches released.
+    /// - `Some(seq)` — the burst declined (or the head was not
+    ///   speculative-eligible). The caller routes `seq` through the
+    ///   classic prefill path. If a batched window had been collected
+    ///   and then declined, the sibling rows were re-enqueued onto the
+    ///   prefill queue here so they retry on the next tick.
+    ///
+    /// ## Batched-window collection
+    ///
+    /// When `max_batch_size > 1` and the head is speculative-eligible,
+    /// this method drains an *equal-prompt-length* window of additional
+    /// eligible requests from the front of the head's priority lane (via
+    /// [`super::queue::PrefillQueue::drain_matching_window`]). The
+    /// batched MTP target adapter requires a rectangular `[B, L]`
+    /// prefill, and equal-length prompts make the batched prefill
+    /// byte-identical to B separate B=1 prefills (acceptance item 1 of
+    /// issue #674). The window also requires matching `max_tokens` and
+    /// sampling config so the single per-window sampler / budget the
+    /// batched round loop takes is correct for every row. A window that
+    /// collapses to size 1 falls back to the B=1 burst.
+    fn try_speculative_burst(&mut self, seq: SequenceInfo) -> Option<SequenceInfo> {
+        // Fast path: speculative dispatch off, or the head fails the
+        // per-sequence gate (VLM embeddings / structured output /
+        // adopted cache prefix / penalty sampling / logprobs / thinking
+        // budget). Route straight to classic.
+        if !super::speculative_burst::should_burst_for_sequence(&self.speculative_dispatch, &seq) {
+            return Some(seq);
+        }
+
+        // Try to assemble a B>1 batched window. The window head is
+        // `seq`; siblings must (1) be speculative-eligible, (2) have the
+        // same prompt length, (3) have the same `max_tokens`, and (4)
+        // share the same sampling config — the batched round loop takes
+        // one sampler and one per-row budget for the whole window. The
+        // window cap is the configured `max_batch_size`, surfaced via
+        // the active batch's capacity (the scheduler constructs
+        // `ActiveBatch::new(max_batch_size)`).
+        let max_batch_size = self.active_batch.max_size();
+        let window: Vec<SequenceInfo> = if max_batch_size > 1 {
+            let head_prompt_len = seq.prompt_tokens.len();
+            let head_max_tokens = seq.max_tokens;
+            let head_sampling = seq.sampling.clone();
+            let head_lane = seq.priority;
+            // Reserve one slot for the head itself.
+            let max_extra = max_batch_size.saturating_sub(1);
+            let dispatch = &self.speculative_dispatch;
+            let extra = self.prefill_queue.drain_matching_window(
+                head_lane,
+                max_extra,
+                |candidate| {
+                    candidate.prompt_tokens.len() == head_prompt_len
+                        && candidate.max_tokens == head_max_tokens
+                        && super::speculative_burst::sampling_config_eq(
+                            &candidate.sampling,
+                            &head_sampling,
+                        )
+                        && super::speculative_burst::should_burst_for_sequence(
+                            dispatch, candidate,
+                        )
+                },
+            );
+            let mut window = Vec::with_capacity(extra.len() + 1);
+            window.push(seq);
+            window.extend(extra);
+            window
+        } else {
+            vec![seq]
+        };
+
+        if window.len() >= 2 {
+            // ---- Batched B>1 burst ----
+            let ctx = super::speculative_burst::BurstContext {
+                model: &self.model,
+                tokenizer: &self.tokenizer,
+                drafter_slot: &mut self.speculative_drafter_slot,
+                dispatch: &self.speculative_dispatch,
+            };
+            match super::speculative_burst::try_run_burst_batched(ctx, window) {
+                Ok(super::speculative_burst::BatchedBurstFinalized { rows }) => {
+                    // Every row handled inline. Release each row's cache
+                    // slot and record each row's per-sequence metric —
+                    // the batched analogue of the B=1 cleanup below.
+                    //
+                    // Unlike the B=1 arm, the batched path does NOT call
+                    // `donate_finished_sequence_cache`: `BatchedBurstFinalized`
+                    // intentionally carries only `(seq_id, tokens_generated)`
+                    // per row, not the prompt/committed token vectors the
+                    // donate key needs. This is correct today — both
+                    // batched-eligible model families (Gemma 4 / MTP and
+                    // Qwen 3.5 / DFlash) are `SequenceStateBackend::ModelOwned`
+                    // with heterogeneous caches for which
+                    // `donate_finished_sequence_cache` is a guarded no-op
+                    // anyway (it returns early at the `backend != DenseKvCache`
+                    // check), so the batched arm's `remove` + `release` is
+                    // functionally identical to running the donate. Surfacing
+                    // per-row donate data so a future dense-KV batched-eligible
+                    // model could donate is a documented follow-up on #674.
+                    for (seq_id, tokens_generated) in rows {
+                        self.prompt_cache_seq_ctx.remove(&seq_id);
+                        self.release_sequence_caches(seq_id);
+                        self.batch_metrics.record_sequence_completed(tokens_generated);
+                        self.batch_observability.record_sequence_completed();
+                    }
+                    self.publish_metrics();
+                    None
+                }
+                Err(mut rejected_window) => {
+                    // The batched burst declined the whole window (e.g.
+                    // unsupported model variant). The head goes back to
+                    // the caller for the classic path; the sibling rows
+                    // are re-enqueued so they retry next tick (they
+                    // re-evaluate as their own potential window heads).
+                    let head = rejected_window.remove(0);
+                    for sibling in rejected_window {
+                        let sibling_id = sibling.seq_id;
+                        if let Err(boxed) = self.prefill_queue.enqueue(sibling) {
+                            // Queue full: the sibling cannot be retried.
+                            // Abort it with a clear error rather than
+                            // dropping it silently. This is extremely
+                            // unlikely — the sibling was just dequeued
+                            // from this same queue.
+                            tracing::warn!(
+                                "speculative burst window declined and prefill queue \
+                                 full; aborting sibling seq {sibling_id}"
+                            );
+                            self.prompt_cache_seq_ctx.remove(&sibling_id);
+                            self.abort_sequence(
+                                *boxed,
+                                "speculative burst declined and prefill queue full",
+                            );
+                        }
+                    }
+                    Some(head)
+                }
+            }
+        } else {
+            // ---- B=1 burst (window collapsed to the head only) ----
+            let seq = window.into_iter().next().expect("window has the head");
             let ctx = super::speculative_burst::BurstContext {
                 model: &self.model,
                 tokenizer: &self.tokenizer,
@@ -1737,85 +1913,44 @@ impl BatchScheduler {
                     // Issue #673: donate the finished sequence's KV
                     // cache back to the prompt-cache store BEFORE the
                     // `remove`/`release` below — `donate_finished_sequence_cache`
-                    // both consumes the `prompt_cache_seq_ctx` entry
-                    // and needs the cache slot still attached. This
-                    // mirrors the classic path's `finalize_completed`
-                    // (~line 3266), keeping the burst and classic
-                    // donate paths symmetric. The donate helper is
-                    // hard-gated on a dense KV-cache backend; the two
-                    // burst-eligible model families today — Qwen 3.5
-                    // (DFlash) and Gemma 4 (MTP) — are both
-                    // `SequenceStateBackend::ModelOwned` with
+                    // both consumes the `prompt_cache_seq_ctx` entry and
+                    // needs the cache slot still attached. This mirrors
+                    // the classic path's `finalize_completed`, keeping
+                    // the burst and classic donate paths symmetric. The
+                    // donate helper is hard-gated on a dense KV-cache
+                    // backend; the two burst-eligible model families
+                    // today — Qwen 3.5 (DFlash) and Gemma 4 (MTP) — are
+                    // both `SequenceStateBackend::ModelOwned` with
                     // heterogeneous attention+recurrent caches that the
-                    // `DetachedCacheSet` (`Vec<KVCache>`) handoff
-                    // cannot represent, so the donate is a guarded
-                    // no-op for them — *identical* to the classic
-                    // path's no-op for those same model families
-                    // (`donate_finished_sequence_cache` returns early
-                    // at the `backend != DenseKvCache` check for both
-                    // paths). Wiring it in removes the structural
-                    // asymmetry between the two paths and future-proofs
-                    // the burst for any dense-KV-cache model that later
-                    // becomes burst-eligible.
+                    // `DetachedCacheSet` handoff cannot represent, so the
+                    // donate is a guarded no-op for them — identical to
+                    // the classic path's no-op for those same families.
+                    // Wiring it in removes the structural asymmetry
+                    // between the two paths and future-proofs the burst
+                    // for any dense-KV-cache model that later becomes
+                    // burst-eligible.
                     self.donate_finished_sequence_cache(
                         seq_id,
                         &prompt_tokens,
                         &generated_tokens,
                         healthy_finish,
                     );
-                    // Release the pre-allocated cache slot so the next
-                    // request can reuse it. The burst's own per-layer
-                    // cache vec (DFlash on Qwen 3.5) was allocated and
-                    // dropped inside the burst; the scheduler-tracked
-                    // cache pool entry (and any model-owned per-seq
-                    // state for Gemma 4 / Qwen 3.5) is released here
-                    // for symmetry with `finalize_completed`.
-                    // `donate_finished_sequence_cache` already removed
-                    // the `prompt_cache_seq_ctx` entry on the donate
-                    // path; the `remove` here is the defensive
-                    // non-donate cleanup (matches `finalize_completed`
-                    // ~line 3276).
+                    // Release the pre-allocated cache slot for symmetry
+                    // with `finalize_completed`, and mirror the classic
+                    // path's per-sequence metric recording so Prometheus
+                    // counters cover burst completions too. The `remove`
+                    // here is the defensive non-donate cleanup (the
+                    // donate path above already removed the
+                    // `prompt_cache_seq_ctx` entry on the dense-KV path).
                     self.prompt_cache_seq_ctx.remove(&seq_id);
                     self.release_sequence_caches(seq_id);
-                    // Mirror the classic path's per-sequence metric
-                    // recording (see `finalize_completed` /
-                    // `scheduler.rs` ~line 3268) so Prometheus
-                    // counters cover burst completions too. Without
-                    // this call the per-sequence token histogram
-                    // misses every speculative request.
-                    self.batch_metrics
-                        .record_sequence_completed(tokens_generated);
+                    self.batch_metrics.record_sequence_completed(tokens_generated);
                     self.batch_observability.record_sequence_completed();
                     self.publish_metrics();
-                    return;
+                    None
                 }
-                Err(rejected_seq) => {
-                    // Burst declined (e.g. unsupported model variant);
-                    // fall through to the classic prefill path with
-                    // the returned sequence.
-                    rejected_seq
-                }
+                Err(rejected_seq) => Some(rejected_seq),
             }
-        } else {
-            seq
-        };
-
-        let mut seq = seq;
-        if let Err(err) = Self::begin_prefill(&mut seq) {
-            tracing::error!("State transition error: {err}");
-            self.abort_sequence(seq, &err);
-            return;
-        }
-
-        let prompt_len = seq.prompt_tokens.len();
-
-        // Decide: chunked vs full prefill
-        if self.prefill_chunk_size > 0 && prompt_len > self.prefill_chunk_size {
-            // Start chunked prefill: process first chunk
-            self.start_chunked_prefill(seq);
-        } else {
-            // Full-prompt prefill (original path)
-            self.execute_full_prefill(seq);
         }
     }
 

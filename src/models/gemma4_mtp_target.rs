@@ -48,15 +48,19 @@
 //! in a peer follow-up — see the worker-startup warning in
 //! `src/server/model_worker.rs`.
 
+use std::cell::RefCell;
+
 use mlxcel_core::cache::SequenceId;
+use mlxcel_core::drafter::DrafterError;
 use mlxcel_core::generate::SamplingConfig;
 use mlxcel_core::sampling::sample_token_optimized;
 use mlxcel_core::speculative::mtp::target::{
-    MtpTarget, MtpVerifyOutput, VerifyCaptured, VerifyForwardOutput,
+    MtpBatchedVerifyForwardOutput, MtpBatchedVerifyOutput, MtpTarget, MtpVerifyOutput,
+    VerifyCaptured, VerifyForwardOutput,
 };
 use mlxcel_core::{MlxArray, UniquePtr};
 
-use crate::models::gemma4::{Gemma4SpeculativeSinks, Gemma4Wrapper};
+use crate::models::gemma4::{Cache, Gemma4SpeculativeSinks, Gemma4Wrapper};
 
 /// MTP target adapter binding a [`Gemma4Wrapper`] to a specific
 /// per-sequence cache slot.
@@ -543,6 +547,634 @@ impl<'a> MtpTarget for Gemma4VLMtpTargetAdapter<'a> {
     fn eos_token_ids(&self) -> Vec<i32> {
         self.inner.eos_token_ids()
     }
+}
+
+// ===========================================================================
+// Batched MTP target adapter (B > 1) — issue #674
+// ===========================================================================
+
+/// Drafter-requested capture-layer ids for the batched verify path.
+///
+/// `None` means "capture the last decoder layer's pre-norm hidden state
+/// only" — which is exactly the seed/verify contract the B = 1 adapter
+/// uses (it passes `capture_layer_ids: None` to
+/// `forward_with_speculative_sinks`). The batched MTP path reuses that
+/// shape: `MtpBatchedVerifyOutput::next_hidden` is the last-layer hidden
+/// at the accepted position, `[B, 1, backbone]`.
+const BATCHED_CAPTURE_LAYER_IDS: Option<&[usize]> = None;
+
+/// Batched MTP target adapter binding a [`Gemma4Wrapper`] to a
+/// **caller-owned** `[B, ...]` cache vector (issue #674).
+///
+/// ## Why this is a distinct struct from [`Gemma4MtpTargetAdapter`]
+///
+/// The B = 1 adapter routes every trait call through the wrapper's
+/// per-[`SequenceId`] cache slot. That slot model is single-row by
+/// construction — one `Vec<Cache>` per `SequenceId` — so it cannot
+/// express a `[B, ...]` verify forward where all `B` rows advance
+/// through one MLX dispatch. The batched adapter instead owns a single
+/// `Vec<Cache>` (every per-layer cache carries a leading batch dim `B`)
+/// and drives it through
+/// [`Gemma4Wrapper::forward_with_speculative_sinks_explicit_cache`].
+///
+/// ## Interior mutability
+///
+/// [`MtpTarget`]'s trait methods take `&self` (the round-loop driver
+/// holds the target by shared reference for the burst's lifetime), but
+/// the batched verify forward MUST mutate the `[B, ...]` cache in place.
+/// The cache is therefore held behind a [`RefCell`]. The scheduler is
+/// single-threaded (every MLX dispatch goes through the same stream), so
+/// a `RefCell` is sufficient — no `Mutex` is needed. Each trait method
+/// borrows the cache mutably for the duration of one forward; the borrow
+/// is released before the method returns, so no two borrows ever
+/// overlap.
+///
+/// ## Scope: equal-length prompts within a burst window
+///
+/// `prefill_and_seed_batched` forwards the `[B, max_prompt_len]` prompt
+/// batch in one pass. When every row's prompt is the **same length**,
+/// the 2-D causal masks (`create_causal_mask(L, 0)`) broadcast cleanly
+/// across the batch and the result is byte-identical to running B
+/// separate B = 1 prefills. Variable-length prompts would need a per-row
+/// left-padding mask that the current Gemma 4 speculative forward does
+/// not build; the scheduler's burst-window collector
+/// ([`crate::server::batch::speculative_burst`]) only groups
+/// equal-length-prompt speculative requests into a batched window for
+/// this reason. The verify rounds are always uniform width (`block_size`
+/// per row) so they are unconditionally batched.
+pub struct Gemma4MtpBatchedTargetAdapter<'a> {
+    /// Borrowed target wrapper. The wrapper owns its weights; this
+    /// adapter owns the per-burst `[B, ...]` cache separately.
+    wrapper: &'a Gemma4Wrapper,
+    /// The caller-owned `[B, ...]` per-layer cache for this burst. Starts
+    /// empty; the first `prefill_and_seed_batched` grows every per-layer
+    /// cache with a leading batch dim `B`. Held behind a `RefCell` so the
+    /// `&self` trait methods can mutate it in place — see the struct
+    /// docstring.
+    caches: RefCell<Vec<Cache>>,
+    /// Batch size. Set at construction; every trait call's per-row
+    /// vectors must match this length.
+    batch_size: usize,
+}
+
+impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
+    /// Construct a batched adapter for a `batch_size`-row burst.
+    ///
+    /// The adapter allocates a fresh `[B, ...]` cache vector via
+    /// [`Gemma4Wrapper::make_speculative_caches`]; the cache is empty
+    /// until the first `prefill_and_seed_batched` call.
+    pub fn new(wrapper: &'a Gemma4Wrapper, batch_size: usize) -> Self {
+        assert!(
+            batch_size >= 1,
+            "Gemma4MtpBatchedTargetAdapter: batch_size must be >= 1",
+        );
+        Self {
+            wrapper,
+            caches: RefCell::new(wrapper.make_speculative_caches()),
+            batch_size,
+        }
+    }
+
+    /// Batch size accessor (test / diagnostic).
+    pub fn batch_size(&self) -> usize {
+        self.batch_size
+    }
+
+    /// Build a `[B, width]` i32 tensor from per-row token slices that all
+    /// have the same `width`. Returns an `Err` if any row's width
+    /// differs from the first (the batched verify forward requires a
+    /// rectangular input).
+    fn rectangular_input(
+        per_row: &[Vec<i32>],
+        expected_batch: usize,
+    ) -> Result<(UniquePtr<MlxArray>, i32), DrafterError> {
+        if per_row.len() != expected_batch {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "Gemma4 batched MTP target: expected {expected_batch} rows, got {}",
+                    per_row.len()
+                ),
+            });
+        }
+        if per_row.is_empty() {
+            return Err(DrafterError::DraftFailed {
+                reason: "Gemma4 batched MTP target: empty batch".to_string(),
+            });
+        }
+        let width = per_row[0].len();
+        if width == 0 {
+            return Err(DrafterError::DraftFailed {
+                reason: "Gemma4 batched MTP target: rows must be non-empty".to_string(),
+            });
+        }
+        for (r, row) in per_row.iter().enumerate() {
+            if row.len() != width {
+                return Err(DrafterError::DraftFailed {
+                    reason: format!(
+                        "Gemma4 batched MTP target: row {r} has width {} but row 0 has \
+                         width {width}; the batched verify forward requires a \
+                         rectangular [B, width] input (equal-length rows)",
+                        row.len()
+                    ),
+                });
+            }
+        }
+        let mut flat: Vec<i32> = Vec::with_capacity(expected_batch * width);
+        for row in per_row {
+            flat.extend_from_slice(row);
+        }
+        let arr = mlxcel_core::from_slice_i32(&flat, &[expected_batch as i32, width as i32]);
+        Ok((arr, width as i32))
+    }
+
+    /// Per-row argmax over a `[B, width, vocab]` logits tensor.
+    ///
+    /// Returns `out[r][s]` = argmax of `logits[r, s, :]`. Materialises a
+    /// nested `Vec<Vec<i32>>` so the batched walk can iterate without
+    /// re-entering MLX per cell. Mirrors `argmax_logits_per_row` in the
+    /// DFlash batched round loop.
+    fn argmax_per_row(logits: &MlxArray, batch_size: i32, width: i32) -> Vec<Vec<i32>> {
+        let shape = mlxcel_core::array_shape(logits);
+        debug_assert_eq!(shape.len(), 3, "expected [B, width, vocab] logits");
+        let argmax = mlxcel_core::argmax_last_axis(logits);
+        mlxcel_core::eval(&argmax);
+        let mut out: Vec<Vec<i32>> = Vec::with_capacity(batch_size as usize);
+        for r in 0..batch_size {
+            let mut row: Vec<i32> = Vec::with_capacity(width as usize);
+            for s in 0..width {
+                let cell = mlxcel_core::slice(&argmax, &[r, s], &[r + 1, s + 1]);
+                let scalar = mlxcel_core::reshape(&cell, &[]);
+                row.push(mlxcel_core::item_i32(&scalar));
+            }
+            out.push(row);
+        }
+        out
+    }
+
+    /// Slice the captured shared K/V slabs to the post-rollback length.
+    ///
+    /// Batched analogue of [`Gemma4MtpTargetAdapter::slice_shared_kv`]:
+    /// crops every slab along the `kv_len` axis (axis 2 of
+    /// `[B, num_kv_heads, kv_len, head_dim]`) by `rejected`. `rejected ==
+    /// 0` short-circuits so the full-accept case pays zero overhead.
+    fn slice_shared_kv_batched(
+        tensors: Vec<UniquePtr<MlxArray>>,
+        rejected: usize,
+    ) -> Vec<UniquePtr<MlxArray>> {
+        if rejected == 0 {
+            return tensors;
+        }
+        tensors
+            .into_iter()
+            .map(|ptr| {
+                let array = ptr.as_ref().expect("shared K/V slab must be non-null");
+                let shape = mlxcel_core::array_shape(array);
+                debug_assert!(
+                    shape.len() == 4,
+                    "shared K/V slab must be 4-D, got shape {:?}",
+                    shape
+                );
+                let kv_len = shape[2];
+                let new_kv_len = kv_len - rejected as i32;
+                debug_assert!(
+                    new_kv_len >= 0,
+                    "slice_shared_kv_batched: rejected ({rejected}) exceeds kv_len ({kv_len})",
+                );
+                let starts: Vec<i32> = vec![0, 0, 0, 0];
+                let stops: Vec<i32> = vec![shape[0], shape[1], new_kv_len, shape[3]];
+                mlxcel_core::slice(array, &starts, &stops)
+            })
+            .collect()
+    }
+
+    /// Run the sink-aware `[B, width]` forward and return the logits plus
+    /// the captured hidden (last entry, `[B, width, hidden]`) and the
+    /// canonical-order shared K/V vector (`[k_full, v_full, k_swa,
+    /// v_swa]`).
+    ///
+    /// Borrows the adapter's `[B, ...]` cache mutably for the duration of
+    /// the forward. The borrow is released before this returns.
+    fn batched_sink_forward(
+        &self,
+        input_arr: &MlxArray,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, Vec<UniquePtr<MlxArray>>) {
+        let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
+        let logits = {
+            let mut caches = self.caches.borrow_mut();
+            self.wrapper.forward_with_speculative_sinks_explicit_cache(
+                input_arr,
+                None,
+                None,
+                None,
+                &mut caches,
+                BATCHED_CAPTURE_LAYER_IDS,
+                Some(&mut sinks),
+            )
+        };
+
+        let hidden_sink = sinks
+            .hidden_sink
+            .expect("with_hidden_and_shared_kv installs the hidden sink");
+        let hidden_full = hidden_sink
+            .into_iter()
+            .next_back()
+            .expect("hidden sink must carry at least one entry after a forward pass");
+
+        let shared_kv_map = sinks
+            .shared_kv_sink
+            .expect("with_hidden_and_shared_kv installs the shared K/V sink");
+        let mut shared_kv: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(4);
+        if let Some((k_full, v_full)) = shared_kv_map.get("full_attention") {
+            shared_kv.push(mlxcel_core::copy(k_full.as_ref().unwrap()));
+            shared_kv.push(mlxcel_core::copy(v_full.as_ref().unwrap()));
+        }
+        if let Some((k_swa, v_swa)) = shared_kv_map.get("sliding_attention") {
+            shared_kv.push(mlxcel_core::copy(k_swa.as_ref().unwrap()));
+            shared_kv.push(mlxcel_core::copy(v_swa.as_ref().unwrap()));
+        }
+
+        (logits, hidden_full, shared_kv)
+    }
+
+    /// Slice the `[B, T, *]` hidden tensor down to its last position,
+    /// yielding `[B, 1, *]`.
+    fn last_position_hidden(hidden_full: &MlxArray) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(hidden_full);
+        debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, hidden]");
+        let last = shape[1] - 1;
+        mlxcel_core::slice(
+            hidden_full,
+            &[0, last, 0],
+            &[shape[0], last + 1, shape[2]],
+        )
+    }
+}
+
+impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
+    // The B = 1 surface is required by the trait but never driven on the
+    // batched adapter — the batched round-loop driver only calls the
+    // `*_batched` methods. We panic rather than silently mis-routing so a
+    // wiring bug surfaces loudly in tests. (`token_history` is part of
+    // the B = 1 signature since issue #682 and `logprobs_config` since
+    // issue #678; the batched path's history-aware and logprobs-aware
+    // sampling is gated at the scheduler's window collector — see
+    // `prefill_and_seed_batched` below.)
+    fn prefill_and_seed(
+        &self,
+        _prompt_tokens: &[i32],
+        _sampler: &SamplingConfig,
+        _token_history: &[i32],
+        _logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<mlxcel_core::sampling::TokenLogprobData>,
+    ) {
+        panic!(
+            "Gemma4MtpBatchedTargetAdapter must be driven through the B > 1 \
+             (`*_batched`) MtpTarget methods, not the B = 1 surface"
+        );
+    }
+
+    fn embed_token(&self, token_id: i32) -> UniquePtr<MlxArray> {
+        // Embedding is row-independent; the batched drafter calls this
+        // per row. Delegate to the same wrapper accessor the B = 1
+        // adapter uses.
+        let input_ids = mlxcel_core::from_slice_i32(&[token_id], &[1, 1]);
+        <Gemma4Wrapper as mlxcel_core::generate::LanguageModel>::embed_tokens(
+            self.wrapper,
+            &input_ids,
+        )
+        .expect("Gemma4Wrapper exposes its embed_tokens table")
+    }
+
+    fn verify_forward(
+        &self,
+        _verify_input: &[i32],
+        _sampler: &SamplingConfig,
+        _logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> VerifyForwardOutput {
+        panic!(
+            "Gemma4MtpBatchedTargetAdapter must be driven through \
+             verify_forward_batched, not the B = 1 verify_forward"
+        );
+    }
+
+    fn verify_finalize(
+        &self,
+        _accepted: usize,
+        _block_size: usize,
+        _captured: VerifyCaptured,
+    ) -> MtpVerifyOutput {
+        panic!(
+            "Gemma4MtpBatchedTargetAdapter must be driven through \
+             verify_finalize_batched, not the B = 1 verify_finalize"
+        );
+    }
+
+    fn num_layers(&self) -> usize {
+        self.wrapper.num_layers_value()
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        self.wrapper.eos_token_ids_value()
+    }
+
+    // --- Batched surface (the actual implementation) -----------------
+
+    fn prefill_and_seed_batched(
+        &self,
+        prompt_tokens_per_row: &[Vec<i32>],
+        sampler: &SamplingConfig,
+    ) -> Result<(Vec<i32>, MtpBatchedVerifyOutput), DrafterError> {
+        // Build the rectangular [B, L] prompt batch. `rectangular_input`
+        // rejects variable-length rows — the burst-window collector only
+        // groups equal-length prompts for the batched path (see the
+        // struct docstring).
+        let (prompt_arr, prompt_len) =
+            Self::rectangular_input(prompt_tokens_per_row, self.batch_size)?;
+
+        // Sink-aware prefill. The adapter's [B, ...] cache now holds
+        // `prompt_len` entries per row.
+        let (logits, hidden_full, shared_kv) = self.batched_sink_forward(&prompt_arr);
+
+        // Sample the per-row first bonus. `sample_token_optimized`
+        // internally slices the last position of the [B, prompt_len,
+        // vocab] logits down to [B, vocab] and returns one token per
+        // row — the exact op sequence the B = 1 adapter
+        // (`Gemma4MtpTargetAdapter::prefill_and_seed`) uses, so at
+        // temperature 0 each row's bonus is byte-identical to the B = 1
+        // seed sample.
+        let (token_arr, _) = sample_token_optimized(&logits, sampler, &[]);
+        mlxcel_core::eval(&token_arr);
+        let first_bonus_per_row = scalar_tokens_per_row(&token_arr, self.batch_size);
+
+        // Build the seed MtpBatchedVerifyOutput. After prefill every row
+        // has `prompt_len` cache entries; the bonus token is NOT yet in
+        // the cache, so each row's `kv_offset` / `bonus_position` is
+        // `prompt_len`. With equal-length prompts there is no
+        // left-padding, and the K/V valid length equals `prompt_len`.
+        let next_hidden = Self::last_position_hidden(&hidden_full);
+        let prompt_len_usize = prompt_len as usize;
+        let kv_offset_per_row = vec![prompt_len_usize; self.batch_size];
+        let bonus_position_per_row = vec![prompt_len_usize; self.batch_size];
+        let kv_valid_len_per_row = vec![prompt_len_usize; self.batch_size];
+        let left_padding_per_row = vec![0_usize; self.batch_size];
+
+        let seed = MtpBatchedVerifyOutput {
+            next_hidden,
+            next_shared_kv: shared_kv,
+            kv_offset_per_row,
+            bonus_position_per_row,
+            kv_valid_len_per_row,
+            left_padding_per_row,
+        };
+        Ok((first_bonus_per_row, seed))
+    }
+
+    fn verify_forward_batched(
+        &self,
+        verify_input_per_row: &[Vec<i32>],
+        _sampler: &SamplingConfig,
+    ) -> Result<MtpBatchedVerifyForwardOutput, DrafterError> {
+        // Build the rectangular [B, block_size] verify batch.
+        let (verify_arr, width) =
+            Self::rectangular_input(verify_input_per_row, self.batch_size)?;
+
+        // Sink-aware verify forward. The [B, ...] cache grows by `width`
+        // entries per row; `verify_finalize_batched` trims it back.
+        let (logits, hidden_full, shared_kv) = self.batched_sink_forward(&verify_arr);
+
+        // Greedy-parity: per-row argmax over the [B, width, vocab]
+        // logits. At temperature 0 this matches the drafter-less
+        // target's own argmax extension, identically to the B = 1
+        // adapter's `argmax_per_position`.
+        let target_tokens_per_row =
+            Self::argmax_per_row(&logits, self.batch_size as i32, width);
+
+        // Stash the captured hidden + shared K/V for finalize. Index 0 =
+        // hidden_full ([B, width, hidden]), indices 1.. = shared K/V
+        // slabs in [k_full, v_full, k_swa, v_swa] order — same
+        // convention as the B = 1 adapter's `VerifyCaptured`.
+        let mut tensors: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(5);
+        tensors.push(hidden_full);
+        tensors.extend(shared_kv);
+
+        Ok(MtpBatchedVerifyForwardOutput {
+            target_tokens_per_row,
+            captured: VerifyCaptured {
+                tensors,
+                scalars: Vec::new(),
+            },
+        })
+    }
+
+    fn verify_finalize_batched(
+        &self,
+        accepted_per_row: &[usize],
+        block_size: usize,
+        captured: VerifyCaptured,
+    ) -> Result<MtpBatchedVerifyOutput, DrafterError> {
+        if accepted_per_row.len() != self.batch_size {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "Gemma4 batched MTP target: verify_finalize_batched expected \
+                     {} accept counts, got {}",
+                    self.batch_size,
+                    accepted_per_row.len()
+                ),
+            });
+        }
+
+        // Pop the captured hidden out (index 0); indices 1.. are the
+        // pre-slice shared K/V slabs.
+        let mut tensors = captured.tensors;
+        if tensors.is_empty() {
+            return Err(DrafterError::DraftFailed {
+                reason: "Gemma4 batched MTP target: VerifyCaptured must carry the \
+                         hidden tensor at index 0"
+                    .to_string(),
+            });
+        }
+        let hidden_full = tensors.remove(0);
+        let next_hidden = Self::last_position_hidden(&hidden_full);
+
+        // Per-row tail-zero rollback on the adapter's own [B, ...] cache.
+        // `rollback_speculative_cache_explicit` trims by `block_size -
+        // max(accepted) - 1` and per-row zeros the tails for rows below
+        // max — the per-row early-EOS / partial-accept contract.
+        let accepted_i32: Vec<i32> = accepted_per_row.iter().map(|&a| a as i32).collect();
+        {
+            let mut caches = self.caches.borrow_mut();
+            self.wrapper
+                .rollback_speculative_cache_explicit(
+                    &mut caches,
+                    &accepted_i32,
+                    block_size as i32,
+                )
+                .map_err(|e| DrafterError::DraftFailed {
+                    reason: format!("Gemma4 batched MTP rollback failed: {e}"),
+                })?;
+        }
+
+        // Slice the captured shared K/V to the post-rollback length. The
+        // global trim amount is `block_size - max(accepted) - 1`; this
+        // matches the cache trim above.
+        let max_accepted = accepted_per_row.iter().copied().max().unwrap_or(0);
+        let rejected = block_size.saturating_sub(max_accepted).saturating_sub(1);
+        let next_shared_kv = Self::slice_shared_kv_batched(tensors, rejected);
+
+        // Post-rollback per-row metadata. The round-loop driver tracks
+        // the absolute KV offset itself (it adds the returned delta to
+        // the running offset — see `MtpBatchedGenerator`'s rebind).
+        // We report the per-row delta `accepted[r] + 1`.
+        let kv_offset_per_row: Vec<usize> =
+            accepted_per_row.iter().map(|&a| a + 1).collect();
+        let bonus_position_per_row = kv_offset_per_row.clone();
+        // With equal-length prompts and uniform verify width there is no
+        // left-padding; the K/V valid length per row equals the
+        // post-rollback length `max_accepted + 1`.
+        let kv_valid_len_per_row = vec![max_accepted + 1; self.batch_size];
+        let left_padding_per_row = vec![0_usize; self.batch_size];
+
+        Ok(MtpBatchedVerifyOutput {
+            next_hidden,
+            next_shared_kv,
+            kv_offset_per_row,
+            bonus_position_per_row,
+            kv_valid_len_per_row,
+            left_padding_per_row,
+        })
+    }
+}
+
+/// Batched MTP target adapter for the Gemma 4 VLM wrapper.
+///
+/// Reuses [`Gemma4MtpBatchedTargetAdapter`] internally by delegating to
+/// the VLM wrapper's inner text model. Same rationale as the B = 1
+/// [`Gemma4VLMtpTargetAdapter`]: vision features are fully prefilled
+/// before the MTP round loop begins, so the round loop only interacts
+/// with the text backbone.
+pub struct Gemma4VLMtpBatchedTargetAdapter<'a> {
+    inner: Gemma4MtpBatchedTargetAdapter<'a>,
+}
+
+impl<'a> Gemma4VLMtpBatchedTargetAdapter<'a> {
+    /// Construct a batched adapter routing every trait call through the
+    /// inner text model's own `[B, ...]` cache.
+    pub fn new(vlm: &'a crate::vision::Gemma4VLModel, batch_size: usize) -> Self {
+        Self {
+            inner: Gemma4MtpBatchedTargetAdapter::new(&vlm.text_model, batch_size),
+        }
+    }
+
+    /// Batch size accessor (test / diagnostic).
+    pub fn batch_size(&self) -> usize {
+        self.inner.batch_size()
+    }
+}
+
+impl<'a> MtpTarget for Gemma4VLMtpBatchedTargetAdapter<'a> {
+    // The B = 1 surface forwards to the inner batched adapter, whose B = 1
+    // stubs panic — the batched VLM adapter is only ever driven through
+    // the `*_batched` methods. `token_history` (issue #682) and
+    // `logprobs_config` (issue #678) are forwarded verbatim so the
+    // signature matches the trait even though the inner panics.
+    fn prefill_and_seed(
+        &self,
+        prompt_tokens: &[i32],
+        sampler: &SamplingConfig,
+        token_history: &[i32],
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<mlxcel_core::sampling::TokenLogprobData>,
+    ) {
+        self.inner
+            .prefill_and_seed(prompt_tokens, sampler, token_history, logprobs_config)
+    }
+
+    fn embed_token(&self, token_id: i32) -> UniquePtr<MlxArray> {
+        self.inner.embed_token(token_id)
+    }
+
+    fn verify_forward(
+        &self,
+        verify_input: &[i32],
+        sampler: &SamplingConfig,
+        logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
+    ) -> VerifyForwardOutput {
+        self.inner
+            .verify_forward(verify_input, sampler, logprobs_config)
+    }
+
+    fn verify_finalize(
+        &self,
+        accepted: usize,
+        block_size: usize,
+        captured: VerifyCaptured,
+    ) -> MtpVerifyOutput {
+        self.inner.verify_finalize(accepted, block_size, captured)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.inner.num_layers()
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        self.inner.eos_token_ids()
+    }
+
+    fn prefill_and_seed_batched(
+        &self,
+        prompt_tokens_per_row: &[Vec<i32>],
+        sampler: &SamplingConfig,
+    ) -> Result<(Vec<i32>, MtpBatchedVerifyOutput), DrafterError> {
+        self.inner
+            .prefill_and_seed_batched(prompt_tokens_per_row, sampler)
+    }
+
+    fn verify_forward_batched(
+        &self,
+        verify_input_per_row: &[Vec<i32>],
+        sampler: &SamplingConfig,
+    ) -> Result<MtpBatchedVerifyForwardOutput, DrafterError> {
+        self.inner
+            .verify_forward_batched(verify_input_per_row, sampler)
+    }
+
+    fn verify_finalize_batched(
+        &self,
+        accepted_per_row: &[usize],
+        block_size: usize,
+        captured: VerifyCaptured,
+    ) -> Result<MtpBatchedVerifyOutput, DrafterError> {
+        self.inner
+            .verify_finalize_batched(accepted_per_row, block_size, captured)
+    }
+}
+
+/// Materialise a per-row `Vec<i32>` from a `[B]` / `[B, 1]` token tensor
+/// produced by `sample_token_optimized`. The sampler returns one token
+/// per batch row; we extract them cell-by-cell.
+fn scalar_tokens_per_row(token_arr: &MlxArray, batch_size: usize) -> Vec<i32> {
+    let shape = mlxcel_core::array_shape(token_arr);
+    // `sample_token_optimized` may return `[B]`, `[B, 1]`, or `[B, 1, 1]`
+    // depending on the input rank; reshape to a flat `[B]` so the
+    // per-row extraction is uniform.
+    let flat = mlxcel_core::reshape(token_arr, &[batch_size as i32]);
+    debug_assert!(
+        shape.iter().product::<i32>() == batch_size as i32,
+        "sample output must carry exactly batch_size tokens, got shape {shape:?}"
+    );
+    let mut out: Vec<i32> = Vec::with_capacity(batch_size);
+    for r in 0..batch_size as i32 {
+        let cell = mlxcel_core::slice(&flat, &[r], &[r + 1]);
+        let scalar = mlxcel_core::reshape(&cell, &[]);
+        out.push(mlxcel_core::item_i32(&scalar));
+    }
+    out
 }
 
 #[cfg(test)]

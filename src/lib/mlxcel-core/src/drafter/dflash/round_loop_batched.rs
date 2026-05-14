@@ -269,6 +269,17 @@ impl DFlashBatchedGenerator {
         self.drafter.as_mut()
     }
 
+    /// Consume the generator and return the boxed drafter handle.
+    ///
+    /// Used by the server-side batched speculative burst path (issue
+    /// #674) so a loaded drafter can be reused across multiple batched
+    /// bursts on the same worker thread without re-loading from disk.
+    /// Mirrors [`super::round_loop::DFlashGenerator::into_drafter`] for
+    /// the B > 1 driver.
+    pub fn into_drafter(self) -> Box<dyn Drafter> {
+        self.drafter
+    }
+
     /// Run the batched DFlash round loop.
     ///
     /// # Arguments

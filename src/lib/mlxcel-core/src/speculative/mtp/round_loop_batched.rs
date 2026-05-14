@@ -162,6 +162,19 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
         self.drafter.as_ref()
     }
 
+    /// Consume the generator and return the boxed drafter handle.
+    ///
+    /// Used by the server-side batched speculative burst path (issue
+    /// #674) so a loaded drafter can be reused across multiple batched
+    /// bursts on the same worker thread without re-loading from disk.
+    /// The caller is expected to [`Drafter::reset`] the returned handle
+    /// before the next burst so per-run drafter state is cleared. Mirrors
+    /// [`super::generator::MtpGenerator::into_drafter`] for the B > 1
+    /// driver.
+    pub fn into_drafter(self) -> Box<dyn Drafter> {
+        self.drafter
+    }
+
     /// Run the batched MTP round loop.
     ///
     /// # Arguments

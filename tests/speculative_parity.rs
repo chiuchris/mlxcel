@@ -623,6 +623,159 @@ async fn greedy_parity_mtp_gemma4_31b() {
     assert_server_byte_equality(pairing, &target_path, &draft_path).await;
 }
 
+/// Issue #674 acceptance item 1: a B = 4 batched MTP burst produces
+/// per-row token streams that are **byte-identical** to running the
+/// B = 1 MTP burst in isolation on each row's prompt.
+///
+/// This is the load-bearing correctness gate for the batched MTP
+/// dispatch. The batched MTP target adapter
+/// (`Gemma4MtpBatchedTargetAdapter`) forwards the `[B, L]` prompt batch
+/// in one pass; with equal-length prompts the 2-D causal masks broadcast
+/// cleanly across the batch, so every row's verify forward sees exactly
+/// the logits it would see in an isolated B = 1 run. The test drives:
+///
+/// 1. Four B = 1 runs via `MtpGenerator` + `Gemma4MtpTargetAdapter`,
+///    one per row's prompt — the per-row reference streams.
+/// 2. One B = 4 run via `MtpBatchedGenerator` +
+///    `Gemma4MtpBatchedTargetAdapter` over all four prompts.
+///
+/// and asserts each batched row equals its B = 1 reference token-for-token.
+///
+/// Gated `#[ignore]` (real-model heavy: loads the Gemma-4-31B target +
+/// bf16 drafter, which exceeds the dev-machine stream-idle watchdog) —
+/// runs in the CI hardware lane.
+#[test]
+#[ignore = "real-model heavy (Gemma-4-31B target + drafter, B=4 batched run); CI hardware lane only"]
+fn greedy_parity_mtp_gemma4_batched_b4_matches_b1() {
+    use mlxcel::models::gemma4_mtp_target::{
+        Gemma4MtpBatchedTargetAdapter, Gemma4MtpTargetAdapter,
+    };
+    use mlxcel::{LoadedModel, initialize_runtime, load_model};
+    use mlxcel_core::drafter::{DrafterKind, load_drafter};
+    use mlxcel_core::generate::SamplingConfig;
+    use mlxcel_core::speculative::mtp::{MtpBatchedGenerator, MtpGenerator};
+
+    let pairing = &REACHABLE_PAIRINGS[1];
+    let (target_path, draft_path, present) = pairing_present(pairing);
+    if !present {
+        eprintln!(
+            "Skipping {} (batched B=4): target={:?} draft={:?}",
+            pairing.name, target_path, draft_path,
+        );
+        return;
+    }
+
+    let _runtime = initialize_runtime();
+    mlxcel_core::synchronize_default();
+    mlxcel_core::clear_memory_cache();
+
+    let (loaded_target, _tok) = load_model(&target_path).expect("target model must load");
+    // The batched MTP adapter binds against the text-only `Gemma4Wrapper`.
+    // The 31B checkpoints can be published as either the text-only or VLM
+    // variant; resolve the inner text wrapper for both.
+    let wrapper: &mlxcel::models::Gemma4Wrapper = match &loaded_target {
+        LoadedModel::Gemma4(w) => w,
+        LoadedModel::Gemma4VLM(vlm) => &vlm.text_model,
+        _ => panic!("MTP batched pairing requires a Gemma 4 family target"),
+    };
+
+    let block_size = pairing.block_size as usize;
+    let sampling = SamplingConfig::greedy();
+    let max_tokens = 24_usize;
+
+    // Equal-length prompts (the batched MTP adapter requires a
+    // rectangular [B, L] prefill — see its docstring). Four distinct
+    // 6-token prompts.
+    let prompts: Vec<Vec<i32>> = vec![
+        vec![2, 105, 2364, 107, 9259, 108],
+        vec![2, 105, 2364, 107, 1596, 108],
+        vec![2, 105, 2364, 107, 6176, 108],
+        vec![2, 105, 2364, 107, 3030, 108],
+    ];
+
+    // ---- B = 1 reference runs ----
+    let mut reference: Vec<Vec<i32>> = Vec::with_capacity(prompts.len());
+    for (row, prompt) in prompts.iter().enumerate() {
+        // Each B=1 run gets a fresh per-sequence cache slot via a unique
+        // SequenceId so the runs do not alias each other's KV cache.
+        let seq_id = mlxcel_core::cache::SequenceId::from_raw(1000 + row as u64);
+        let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
+        let (mut drafter, kind) = load_drafter(&draft_path, Some(DrafterKind::Mtp))
+            .expect("MTP drafter must load");
+        assert_eq!(kind, DrafterKind::Mtp);
+        drafter
+            .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+            .expect("drafter bind");
+        let mut generator = MtpGenerator::new(adapter, drafter, block_size);
+        // Offline test: greedy sampling needs no token history (issue
+        // #682's `token_history` parameter is `&[]` for a config where
+        // `needs_token_history()` is false), no cooperative
+        // cancellation (issue #672 / PR #681 added the `cancel`
+        // parameter; the offline path passes a never-set flag, matching
+        // `src/commands/generate.rs`), and no logprobs (issue #678 / PR
+        // #686 added the `logprobs_config` parameter; this byte-parity
+        // test compares only token streams, so a disabled-default
+        // `LogprobsConfig` keeps the zero-overhead path).
+        let no_cancel = std::sync::atomic::AtomicBool::new(false);
+        let logprobs_config = mlxcel_core::sampling::LogprobsConfig::default();
+        let (tokens, _logprobs, _stats) = generator.generate(
+            prompt,
+            max_tokens,
+            &sampling,
+            &[],
+            &no_cancel,
+            &logprobs_config,
+        );
+        eprintln!(
+            "[batched B=4] B=1 reference row {row}: {} tokens",
+            tokens.len()
+        );
+        reference.push(tokens);
+    }
+
+    // ---- B = 4 batched run ----
+    let batch_adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, prompts.len());
+    let (mut batched_drafter, _kind) = load_drafter(&draft_path, Some(DrafterKind::Mtp))
+        .expect("MTP drafter must load for the batched run");
+    batched_drafter
+        .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
+        .expect("batched drafter bind");
+    let mut batched_generator =
+        MtpBatchedGenerator::new(batch_adapter, batched_drafter, block_size);
+    let run = batched_generator
+        .run_batched(&prompts, &sampling, max_tokens)
+        .expect("batched MTP run must succeed");
+
+    // ---- Byte-equality assertion ----
+    assert_eq!(
+        run.tokens.len(),
+        reference.len(),
+        "batched run must produce one token stream per row"
+    );
+    for (row, (batched_row, reference_row)) in
+        run.tokens.iter().zip(reference.iter()).enumerate()
+    {
+        assert_eq!(
+            batched_row.len(),
+            reference_row.len(),
+            "row {row}: batched emitted {} tokens, B=1 reference emitted {}",
+            batched_row.len(),
+            reference_row.len(),
+        );
+        for (i, (got, want)) in batched_row.iter().zip(reference_row.iter()).enumerate() {
+            assert_eq!(
+                got, want,
+                "row {row} token {i}: B=4 batched ({got}) != B=1 isolated ({want}) \
+                 — greedy-parity violation in the batched MTP dispatch",
+            );
+        }
+    }
+    eprintln!(
+        "[batched B=4] PASS: all {} rows byte-identical to B=1 isolated bursts",
+        run.tokens.len()
+    );
+}
+
 /// Sanity that the test discovery against `models/` finds at least one of
 /// the reachable pairings on hosts that have downloaded the checkpoints,
 /// and cleanly skips with a log line on hosts that have not.

@@ -276,32 +276,31 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             sched_config.max_queue_depth,
         );
 
-        // Issue #670: B=1 speculative dispatch is wired end-to-end via
-        // the burst path in `BatchScheduler::execute_prefill`. When the
-        // operator runs the server with `max_batch_size > 1`, each
-        // speculative request still runs *as a single B=1 burst* — the
-        // burst occupies the worker thread for the duration of the
-        // entire request (prefill + ALL decode rounds), so concurrent
-        // classic-decode rows on the same worker DO NOT advance during
-        // the burst — they head-of-line-block behind it. This is the
-        // accurate operator-facing wording (cycle 2 fix to PR #671):
-        // the previous "continue under continuous batching" claim was
-        // factually incorrect on the single-threaded scheduler.
-        // Multi-row BATCHED speculative (true B>1 continuous batching
-        // driving `MtpBatchedGenerator` / `DFlashBatchedGenerator` per
-        // tick) is a separate follow-up tracked outside this issue
-        // (priority:high — head-of-line blocking on long generations
-        // is the primary motivator).
+        // Issue #670 / #674: speculative dispatch is wired end-to-end via
+        // the burst path in `BatchScheduler::execute_prefill`. With
+        // `max_batch_size > 1` the scheduler assembles an
+        // equal-prompt-length window of concurrently-queued speculative
+        // requests and drives them through the batched round-loop driver
+        // (`MtpBatchedGenerator` / `DFlashBatchedGenerator`) in one tick
+        // — true B>1 batched speculative decoding (issue #674). A
+        // speculative request whose prompt length, `max_tokens`, or
+        // sampling config does not match the current window head, or
+        // that arrives alone, still runs as a B=1 burst; in that case
+        // the burst occupies the worker thread for its full duration and
+        // concurrent classic-decode rows head-of-line-block behind it
+        // until it completes. The previous PR-#671 wording described the
+        // B=1-only behaviour; this reflects the #674 batched path.
         if sched_config.speculative_dispatch.is_kind_specific() && sched_config.max_batch_size > 1 {
             tracing::info!(
                 "Speculative decoding active ({}) with max_batch_size={}: \
-                 each speculative request runs as a B=1 burst that occupies \
-                 the worker thread for its full duration, pausing any \
-                 concurrent classic-decode rows until the burst completes. \
-                 Long generations (e.g. > 4096 output tokens) may cause \
-                 noticeable head-of-line blocking on this worker. True \
-                 batched-speculative dispatch (B>1 per-tick) is tracked as \
-                 a follow-up.",
+                 concurrently-queued speculative requests that share a \
+                 prompt length, max_tokens, and sampling config are driven \
+                 as a single B>1 batched burst (issue #674). A speculative \
+                 request that does not match the current window head, or \
+                 that arrives alone, runs as a B=1 burst and head-of-line-\
+                 blocks concurrent classic-decode rows for its full \
+                 duration. Variable-length-prompt batched bursts are a \
+                 documented follow-up.",
                 sched_config.speculative_dispatch.summary(),
                 sched_config.max_batch_size,
             );

@@ -82,6 +82,17 @@ impl ActiveBatch {
         self.sequences.len()
     }
 
+    /// Capacity limit of the batch — the configured `max_batch_size`.
+    ///
+    /// Issue #674: the speculative-burst scheduler uses this to decide
+    /// whether to attempt a B > 1 batched burst window. The scheduler
+    /// constructs `ActiveBatch::new(max_batch_size)`, so this accessor
+    /// surfaces the same `max_batch_size` without storing it twice on
+    /// the scheduler.
+    pub fn max_size(&self) -> usize {
+        self.max_size
+    }
+
     /// Returns `true` if no sequences are in the batch.
     pub fn is_empty(&self) -> bool {
         self.sequences.is_empty()

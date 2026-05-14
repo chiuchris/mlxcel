@@ -131,15 +131,17 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use mlxcel_core::drafter::dflash::DFlashGenerator;
+use mlxcel_core::drafter::dflash::{DFlashBatchedGenerator, DFlashGenerator};
 use mlxcel_core::drafter::{Drafter, DrafterKind, load_drafter};
 use mlxcel_core::generate::{LanguageModel, SamplingConfig};
 use mlxcel_core::generation_policy::{initial_token_history, merged_eos_token_ids};
 use mlxcel_core::sampling::TokenLogprobData;
-use mlxcel_core::speculative::mtp::MtpGenerator;
+use mlxcel_core::speculative::mtp::{MtpBatchedGenerator, MtpGenerator};
 
 use crate::LoadedModel;
-use crate::models::gemma4_mtp_target::Gemma4MtpTargetAdapter;
+use crate::models::gemma4_mtp_target::{
+    Gemma4MtpBatchedTargetAdapter, Gemma4MtpTargetAdapter, Gemma4VLMtpBatchedTargetAdapter,
+};
 use crate::server::model_provider::GenerateEvent;
 
 use super::sequence::{FinishReason, SequenceInfo, SequenceState};
@@ -1373,6 +1375,553 @@ fn emit_error_and_finalize(_ctx: BurstContext<'_>, seq: SequenceInfo, msg: &str)
         .send(GenerateEvent::Error(format!("Speculative burst: {msg}")));
     drop(seq);
     let _ = msg;
+}
+
+// ===========================================================================
+// Batched burst (B > 1) — issue #674
+// ===========================================================================
+//
+// The B = 1 burst above runs the full prefill + decode lifecycle of ONE
+// speculative request as a single scheduler tick. The batched burst
+// generalises that to a *window* of B speculative requests that the
+// scheduler collected together: every row runs its prefill + decode
+// through the batched round-loop driver
+// (`MtpBatchedGenerator::run_batched` / `DFlashBatchedGenerator::run_batched`)
+// in one logical tick.
+//
+// ## Window admission (equal-length prompts)
+//
+// The batched MTP target adapter forwards the `[B, max_prompt_len]`
+// prompt batch in one pass. With equal-length prompts the 2-D causal
+// masks broadcast cleanly across the batch and the result is
+// byte-identical to running B separate B = 1 prefills (acceptance item 1
+// of issue #674). The scheduler's window collector
+// (`BatchScheduler::execute_speculative_burst`) therefore only groups
+// speculative-eligible requests of the *same prompt length* into one
+// batched window. A request whose prompt length differs from the window
+// head stays queued and is served on the next tick (possibly as its own
+// window head).
+//
+// ## Per-row early-EOS
+//
+// The batched round-loop drivers already implement per-row early-EOS
+// (a row that hits EOS or saturates `max_new_tokens` freezes in place;
+// its `bs` no longer participates in the per-round block-size minimum so
+// it does not stall its siblings). The burst's per-row finalize
+// (`finalize_batched_burst_success`) classifies each row independently:
+// `FinishReason::Stop` at the first EOS, `FinishReason::Length` at the
+// budget, `FinishReason::Stop` otherwise.
+
+/// Successful batched-burst outcome returned to the scheduler.
+///
+/// Carries the per-row `(seq_id, tokens_generated)` so the scheduler can
+/// release each row's cache slot and record each row's per-sequence
+/// Prometheus metric — the batched analogue of [`BurstFinalized`].
+#[derive(Debug, Clone)]
+pub(crate) struct BatchedBurstFinalized {
+    /// Per-row `(seq_id, tokens_generated)`. Same length / order as the
+    /// window the scheduler handed to [`try_run_burst_batched`].
+    pub rows: Vec<(mlxcel_core::cache::SequenceId, usize)>,
+}
+
+/// Run a speculative burst for a *window* of `seqs` (B = `seqs.len()`),
+/// producing every token each row will emit, streaming them via each
+/// row's `response_tx`, and finalizing every sequence inline.
+///
+/// Returns `Ok(BatchedBurstFinalized)` when the batched burst handled the
+/// window end-to-end. Returns `Err(rejected_seqs)` when the window
+/// declines (e.g. the model variant is not supported by the dispatch
+/// kind, or the drafter load failed) — the scheduler then re-routes
+/// every rejected sequence through the classic non-speculative path.
+///
+/// **Caller contract**: every sequence in `seqs` MUST already have
+/// passed [`should_burst_for_sequence`] AND have an identical
+/// `prompt_tokens.len()` (the batched MTP adapter requires a rectangular
+/// `[B, L]` prefill — see its docstring). The scheduler's window
+/// collector enforces both.
+//
+// `result_large_err`: the `Err` variant carries the full window so the
+// scheduler can route every rejected sequence into the classic prefill
+// path without a `Box` round-trip. The hot path (`Ok`) is tiny.
+#[allow(clippy::result_large_err)]
+pub(crate) fn try_run_burst_batched(
+    mut ctx: BurstContext<'_>,
+    mut seqs: Vec<SequenceInfo>,
+) -> Result<BatchedBurstFinalized, Vec<SequenceInfo>> {
+    let burst_start = Instant::now();
+    let batch_size = seqs.len();
+    debug_assert!(batch_size >= 2, "try_run_burst_batched requires B >= 2");
+
+    // Defensive: every row must have a non-empty prompt and all prompts
+    // must be the same length (the scheduler's window collector
+    // guarantees this; re-assert so a future caller bug fails loudly
+    // rather than corrupting a verify forward).
+    let prompt_len = seqs[0].prompt_tokens.len();
+    if prompt_len == 0 || seqs.iter().any(|s| s.prompt_tokens.len() != prompt_len) {
+        return Err(seqs);
+    }
+
+    // Mark every row's prefill timer; do NOT transition state yet — the
+    // burst may decline on the model variant, in which case the rows
+    // fall back to the classic prefill path which itself transitions
+    // Queued -> Prefilling.
+    for seq in seqs.iter_mut() {
+        seq.prefill_start = Some(burst_start);
+    }
+
+    let result = match ctx.dispatch {
+        crate::server::SpeculativeDispatch::Mtp { block_size, .. } => {
+            let bs = *block_size;
+            run_mtp_burst_batched(ctx.reborrow(), &mut seqs, bs)
+        }
+        crate::server::SpeculativeDispatch::DFlash { block_size, .. } => {
+            let bs = *block_size;
+            run_dflash_burst_batched(ctx.reborrow(), &mut seqs, bs)
+        }
+        crate::server::SpeculativeDispatch::Disabled
+        | crate::server::SpeculativeDispatch::Classic { .. } => {
+            Err(BurstOutcome::DeclineToClassic)
+        }
+    };
+
+    match result {
+        Ok(rows_tokens) => {
+            debug_assert_eq!(rows_tokens.len(), batch_size);
+            let mut finalized_rows = Vec::with_capacity(batch_size);
+            for (seq, tokens) in seqs.into_iter().zip(rows_tokens.into_iter()) {
+                let seq_id = seq.seq_id;
+                // Transition Queued -> Prefilling now that the burst
+                // owned the row's lifecycle.
+                let mut seq = seq;
+                if let Err(err) = seq.state.transition_to(SequenceState::Prefilling) {
+                    emit_error_and_finalize(
+                        ctx.reborrow(),
+                        seq,
+                        &format!("State transition error: {err}"),
+                    );
+                    finalized_rows.push((seq_id, 0));
+                    continue;
+                }
+                // The batched round-loop drivers do not capture per-row
+                // logprobs (`run_batched` returns tokens only), so the
+                // batched burst threads an empty `logprobs` vec into the
+                // shared finalize path — `finalize_burst_success` then
+                // emits plain `Token` events for every row. The batched
+                // window-admission gate (`sampling_config_eq`, added in a
+                // follow-up commit on this branch) rejects any
+                // logprobs-enabled request so it falls back to the B = 1
+                // burst, which captures logprobs correctly (issue #678).
+                let finalized = finalize_burst_success(
+                    ctx.reborrow(),
+                    seq,
+                    tokens,
+                    Vec::new(),
+                    /* prefill_time_ms */ 0.0,
+                    /* decode_time_ms */ 0.0,
+                );
+                finalized_rows.push((seq_id, finalized.tokens_generated));
+            }
+            Ok(BatchedBurstFinalized {
+                rows: finalized_rows,
+            })
+        }
+        Err(BurstOutcome::DeclineToClassic) => {
+            // Every row is still in `Queued`. Clear the burst timer so
+            // the classic path's measurement starts fresh.
+            for seq in seqs.iter_mut() {
+                seq.prefill_start = None;
+            }
+            Err(seqs)
+        }
+        Err(BurstOutcome::Error(msg)) => {
+            // The batched burst attempted the window but failed
+            // mid-flight (drafter load failed, round loop bailed). No
+            // row was transitioned to Prefilling. Surface the error to
+            // every row's client and finalize.
+            let mut finalized_rows = Vec::with_capacity(batch_size);
+            for seq in seqs.into_iter() {
+                let seq_id = seq.seq_id;
+                emit_error_and_finalize(ctx.reborrow(), seq, &msg);
+                finalized_rows.push((seq_id, 0));
+            }
+            Ok(BatchedBurstFinalized {
+                rows: finalized_rows,
+            })
+        }
+    }
+}
+
+/// Per-row emitted-token output of a batched burst dispatch arm.
+type BatchedBurstTokens = Vec<Vec<i32>>;
+
+/// MTP batched burst — Gemma 4 / Gemma 4 VLM target (B > 1).
+///
+/// Mirrors [`run_mtp_burst`] but drives [`MtpBatchedGenerator`] over the
+/// batched MTP target adapter
+/// ([`Gemma4MtpBatchedTargetAdapter`] / [`Gemma4VLMtpBatchedTargetAdapter`]).
+/// The variant gate runs before drafter IO and the drafter bind happens
+/// before generator construction — same contracts as the B = 1 path.
+fn run_mtp_burst_batched(
+    ctx: BurstContext<'_>,
+    seqs: &mut [SequenceInfo],
+    block_size: u32,
+) -> Result<BatchedBurstTokens, BurstOutcome> {
+    let block_size = block_size as usize;
+    if block_size < 2 {
+        return Err(BurstOutcome::Error(format!(
+            "MTP batched burst: block_size={block_size} < 2 produces no draft proposals"
+        )));
+    }
+    let batch_size = seqs.len();
+
+    // HOIST: variant gate before any drafter IO.
+    let target_lm: &dyn LanguageModel = match ctx.model {
+        LoadedModel::Gemma4(wrapper) => wrapper as &dyn LanguageModel,
+        LoadedModel::Gemma4VLM(vlm) => vlm as &dyn LanguageModel,
+        _ => {
+            tracing::warn!(
+                "MTP batched speculative dispatch declined: target is {:?}, expected \
+                 Gemma 4 (text or VLM); falling back to classic decode",
+                model_variant_label(ctx.model),
+            );
+            return Err(BurstOutcome::DeclineToClassic);
+        }
+    };
+
+    ctx.drafter_slot
+        .ensure_loaded()
+        .map_err(BurstOutcome::Error)?;
+    let mut owned_drafter = ctx
+        .drafter_slot
+        .take()
+        .ok_or_else(|| BurstOutcome::Error("drafter slot empty after ensure_loaded".to_string()))?;
+
+    // CRITICAL: bind before constructing the generator — same contract
+    // as `run_mtp_burst`. `MtpBatchedGenerator::run_batched` does NOT
+    // bind internally; without this the first `draft_block_batched`
+    // returns `BindNotCalled`.
+    if let Err(e) = owned_drafter.bind(target_lm) {
+        return Err(BurstOutcome::Error(format!(
+            "MTP batched drafter bind failed: {e}"
+        )));
+    }
+
+    // Per-row prompts + the shared sampler / max_tokens. The batched
+    // round loop takes a single sampler; the scheduler's window
+    // collector only groups requests that share sampling config (see
+    // `execute_speculative_burst`). `max_new_tokens` is the per-row
+    // budget; the collector also requires equal `max_tokens` so one
+    // window value is correct for every row.
+    let prompts: Vec<Vec<i32>> = seqs.iter().map(|s| s.prompt_tokens.clone()).collect();
+    let sampling = seqs[0].sampling.clone();
+    let max_tokens = seqs[0].max_tokens.max(1);
+
+    let (tokens_per_row, recovered_drafter) = match ctx.model {
+        LoadedModel::Gemma4(wrapper) => {
+            let adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, batch_size);
+            drive_mtp_batched_generator(adapter, owned_drafter, &prompts, max_tokens, &sampling, block_size)?
+        }
+        LoadedModel::Gemma4VLM(vlm) => {
+            let adapter = Gemma4VLMtpBatchedTargetAdapter::new(vlm, batch_size);
+            drive_mtp_batched_generator(adapter, owned_drafter, &prompts, max_tokens, &sampling, block_size)?
+        }
+        _ => {
+            return Err(BurstOutcome::Error(format!(
+                "MTP batched burst: unsupported target {:?} after variant gate",
+                model_variant_label(ctx.model),
+            )));
+        }
+    };
+
+    ctx.drafter_slot.return_drafter(recovered_drafter, target_lm);
+    Ok(tokens_per_row)
+}
+
+/// Generator-shape-agnostic helper that drives an [`MtpBatchedGenerator`]
+/// over a `T: MtpTarget` (batched adapter) and a pre-bound drafter.
+///
+/// Returns the per-row emitted tokens and the recovered drafter handle.
+/// Mirrors [`drive_mtp_generator`] for the B > 1 path; kept generic so a
+/// future `#[cfg(test)]` mock can drive it without a real `LoadedModel`.
+fn drive_mtp_batched_generator<T>(
+    target: T,
+    drafter: Box<dyn Drafter>,
+    prompts: &[Vec<i32>],
+    max_tokens: usize,
+    sampling: &SamplingConfig,
+    block_size: usize,
+) -> Result<(BatchedBurstTokens, Box<dyn Drafter>), BurstOutcome>
+where
+    T: mlxcel_core::speculative::mtp::target::MtpTarget,
+{
+    let mut generator = MtpBatchedGenerator::new(target, drafter, block_size);
+    let run = generator
+        .run_batched(prompts, sampling, max_tokens)
+        .map_err(|e| BurstOutcome::Error(format!("MTP batched round loop failed: {e}")))?;
+    // `MtpBatchedGenerator` does not expose `into_drafter` today; the
+    // batched generators are constructed fresh per burst, so the drafter
+    // is consumed by value. We recover it via the `into_parts`-style
+    // accessor added alongside this issue.
+    let recovered = generator.into_drafter();
+    Ok((run.tokens, recovered))
+}
+
+/// DFlash batched burst — Qwen 3.5 target (B > 1).
+///
+/// Mirrors [`run_dflash_burst`] / [`run_dflash_on_qwen35`] but drives
+/// [`DFlashBatchedGenerator`]. The variant gate runs before drafter IO;
+/// the drafter bind happens **inside** `DFlashBatchedGenerator::run_batched`
+/// (same asymmetry as the B = 1 path — do NOT add a manual bind here).
+fn run_dflash_burst_batched(
+    ctx: BurstContext<'_>,
+    seqs: &mut [SequenceInfo],
+    block_size: u32,
+) -> Result<BatchedBurstTokens, BurstOutcome> {
+    // HOIST: variant gate before drafter IO.
+    match ctx.model {
+        LoadedModel::Qwen35(_) | LoadedModel::Qwen35Moe(_) => {}
+        _ => {
+            tracing::warn!(
+                "DFlash batched speculative dispatch declined: target is {:?}, expected \
+                 Qwen 3.5 text-only; falling back to classic decode",
+                model_variant_label(ctx.model),
+            );
+            return Err(BurstOutcome::DeclineToClassic);
+        }
+    }
+
+    ctx.drafter_slot
+        .ensure_loaded()
+        .map_err(BurstOutcome::Error)?;
+    let owned_drafter = ctx
+        .drafter_slot
+        .take()
+        .ok_or_else(|| BurstOutcome::Error("drafter slot empty after ensure_loaded".to_string()))?;
+
+    let sampling = seqs[0].sampling.clone();
+    let max_tokens = seqs[0].max_tokens.max(1);
+    let eos_token_ids = merged_eos_token_ids(ctx.model.eos_token_ids(), &sampling.stop_token_ids);
+    let prompts: Vec<Vec<i32>> = seqs.iter().map(|s| s.prompt_tokens.clone()).collect();
+
+    match ctx.model {
+        LoadedModel::Qwen35(qwen) | LoadedModel::Qwen35Moe(qwen) => run_dflash_batched_on_qwen35(
+            qwen,
+            &prompts,
+            &sampling,
+            &eos_token_ids,
+            owned_drafter,
+            block_size,
+            max_tokens,
+            ctx.drafter_slot,
+        ),
+        _ => {
+            // Defensive: unreachable per the variant gate above. Restore
+            // the drafter to the slot since we took it without using it.
+            ctx.drafter_slot.drafter = Some(owned_drafter);
+            Err(BurstOutcome::Error(format!(
+                "DFlash batched burst: unsupported target {:?} after variant gate",
+                model_variant_label(ctx.model),
+            )))
+        }
+    }
+}
+
+/// DFlash batched burst on `Qwen35Model` — `[B, L]` prefill, per-row
+/// first-bonus + first-hidden extraction, and `DFlashBatchedGenerator::run_batched`.
+///
+/// Mirrors [`run_dflash_on_qwen35`] for the B > 1 path. The prompts are
+/// equal length (window-collector contract) so the `[B, L]` prefill is
+/// byte-identical to B separate `[1, L]` prefills.
+#[allow(clippy::too_many_arguments)]
+fn run_dflash_batched_on_qwen35(
+    qwen: &crate::models::Qwen35Model,
+    prompts: &[Vec<i32>],
+    sampling: &SamplingConfig,
+    eos_token_ids: &[i32],
+    owned_drafter: Box<dyn Drafter>,
+    block_size: u32,
+    max_tokens: usize,
+    drafter_slot: &mut WorkerDrafterSlot,
+) -> Result<BatchedBurstTokens, BurstOutcome> {
+    let batch_size = prompts.len();
+    let prompt_len = prompts[0].len();
+
+    // Build the `[B, ...]` per-layer cache vector. As with the B = 1
+    // path, we do NOT touch the scheduler-owned `sequence_state` map.
+    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_speculative_caches();
+
+    // `[B, L]` prefill through the target's speculative forward.
+    const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
+    let mut flat_prompt: Vec<i32> = Vec::with_capacity(batch_size * prompt_len);
+    for row in prompts {
+        flat_prompt.extend_from_slice(row);
+    }
+    let prompt_arr =
+        mlxcel_core::from_slice_i32(&flat_prompt, &[batch_size as i32, prompt_len as i32]);
+    let verify_out = qwen.forward_speculative(&prompt_arr, &mut caches, QWEN35_4B_DFLASH_LAYERS);
+
+    // Per-row first bonus from the `[B, prompt_len, vocab]` last-position
+    // logits.
+    let logits_shape = mlxcel_core::array_shape(&verify_out.logits);
+    let last_pos = prompt_len as i32 - 1;
+    let vocab = logits_shape[2];
+    let last_logits = mlxcel_core::slice(
+        &verify_out.logits,
+        &[0, last_pos, 0],
+        &[logits_shape[0], last_pos + 1, vocab],
+    );
+    let (first_bonus_arr, _) =
+        mlxcel_core::sampling::sample_token_optimized(&last_logits, sampling, &[]);
+    mlxcel_core::eval(&first_bonus_arr);
+    let first_bonus_per_row = scalar_tokens_from_array(&first_bonus_arr, batch_size);
+
+    // Build `first_hidden` = concat(hidden_states, axis=-1)[:, last:last+1, :]
+    // at shape `[B, 1, num_layers * hidden_size]`.
+    if verify_out.hidden_states.is_empty() {
+        drafter_slot.drafter = Some(owned_drafter);
+        return Err(BurstOutcome::Error(
+            "DFlash batched prefill returned no captured hidden layers".to_string(),
+        ));
+    }
+    let mut concatenated = mlxcel_core::copy(
+        verify_out.hidden_states[0]
+            .as_ref()
+            .expect("hidden state must be non-null"),
+    );
+    for slab in verify_out.hidden_states.iter().skip(1) {
+        concatenated = mlxcel_core::concatenate(
+            &concatenated,
+            slab.as_ref().expect("hidden state must be non-null"),
+            -1,
+        );
+    }
+    let concatenated_shape = mlxcel_core::array_shape(&concatenated);
+    debug_assert_eq!(concatenated_shape.len(), 3, "concatenated hidden must be 3-D");
+    let feature_dim = concatenated_shape[2];
+    let first_hidden = mlxcel_core::slice(
+        &concatenated,
+        &[0, last_pos, 0],
+        &[concatenated_shape[0], last_pos + 1, feature_dim],
+    );
+
+    // Drive the batched round loop. `run_batched` returns per-row tokens
+    // EXCLUDING the first bonus; we prepend each row's bonus on success.
+    let mut generator = DFlashBatchedGenerator::new(
+        owned_drafter,
+        sampling.clone(),
+        block_size,
+        mlxcel_core::drafter::dflash::round_loop::DEFAULT_MASK_TOKEN_ID,
+    );
+    let run = generator.run_batched(
+        qwen,
+        qwen as &dyn LanguageModel,
+        &mut caches,
+        &first_bonus_per_row,
+        first_hidden,
+        eos_token_ids,
+        max_tokens,
+    );
+
+    // Recover the drafter so the slot is consistent for the next burst.
+    let recovered = generator.into_drafter();
+    drafter_slot.return_drafter(recovered, qwen as &dyn LanguageModel);
+
+    match run {
+        Ok(output) => {
+            debug_assert_eq!(output.tokens.len(), batch_size);
+            let mut rows: BatchedBurstTokens = Vec::with_capacity(batch_size);
+            for (r, row_tokens) in output.tokens.into_iter().enumerate() {
+                let mut full = Vec::with_capacity(row_tokens.len() + 1);
+                full.push(first_bonus_per_row[r]);
+                full.extend(row_tokens);
+                rows.push(full);
+            }
+            Ok(rows)
+        }
+        Err(e) => Err(BurstOutcome::Error(format!(
+            "DFlash batched round loop failed: {e}"
+        ))),
+    }
+}
+
+/// Materialise a per-row `Vec<i32>` from a `[B]` / `[B, 1]` token tensor
+/// produced by `sample_token_optimized`. Mirrors the helper in
+/// `gemma4_mtp_target.rs`; duplicated rather than re-exported because the
+/// burst module is binary-side glue and the helper is a single-call
+/// utility.
+fn scalar_tokens_from_array(token_arr: &mlxcel_core::MlxArray, batch_size: usize) -> Vec<i32> {
+    let flat = mlxcel_core::reshape(token_arr, &[batch_size as i32]);
+    let mut out: Vec<i32> = Vec::with_capacity(batch_size);
+    for r in 0..batch_size as i32 {
+        let cell = mlxcel_core::slice(&flat, &[r], &[r + 1]);
+        let scalar = mlxcel_core::reshape(&cell, &[]);
+        out.push(mlxcel_core::item_i32(&scalar));
+    }
+    out
+}
+
+/// Whether two [`SamplingConfig`]s would drive the speculative round
+/// loop identically — used by the scheduler's batched-window collector
+/// to decide whether a candidate request can ride on the head's window.
+///
+/// [`SamplingConfig`] does not derive `PartialEq` (it carries `Vec` and
+/// `TokenBiasMap` fields), and even if it did, a full structural
+/// equality would be too strict here: the batched MTP/DFlash round
+/// loops only consult a *subset* of the config. This helper compares
+/// exactly that subset:
+///
+/// - The four sampling-shape fields (`temperature`, `top_k`, `top_p`,
+///   `min_p`) — they decide every token the per-row argmax/sample
+///   produces. At `temperature == 0` (the greedy-parity gate) these
+///   four must match or two rows in the same window would sample under
+///   different laws.
+/// - `seed` — affects the stochastic path; equal seeds keep the window
+///   reproducible.
+/// - `stop_token_ids` — the batched round loop computes ONE merged-EOS
+///   set per window (`merged_eos_token_ids(target.eos, sampler.stop)`),
+///   so a per-row stop set that differs would mis-terminate siblings.
+/// - `token_bias` — applied before sampling; a per-row bias that
+///   differs would skew that row's distribution under the shared
+///   sampler. [`TokenBiasMap`](mlxcel_core::sampling::TokenBiasMap) does
+///   not derive `PartialEq`, so rather than a structural comparison we
+///   require **both** configs to carry an empty bias map. A request
+///   that sets `logit_bias` therefore never joins a batched window — it
+///   falls back to the B=1 burst, which is correct (just not batched).
+///   The empty-bias case is the overwhelmingly common one.
+///
+/// ## History-dependent penalties are excluded from the batched window
+///
+/// Issue #682 removed the `should_burst_for_sequence` decline gates for
+/// the four history-dependent penalty fields (`repetition_penalty`,
+/// `frequency_penalty`, `presence_penalty`, `dry_*`) — the **B=1** burst
+/// now threads `initial_token_history(&prompt, ..)` into its first-bonus
+/// sample so a penalty-bearing request is byte-identical to classic
+/// decode.
+///
+/// The **batched** path, however, samples each row's first bonus with an
+/// empty token history (`prefill_and_seed_batched` /
+/// `run_dflash_batched_on_qwen35` pass `&[]`): the batched `MtpTarget`
+/// trait method and `MtpBatchedGenerator` do not yet thread per-row
+/// token history. So `sampling_config_eq` requires **both** configs to
+/// have `needs_token_history() == false`. A penalty-bearing request
+/// therefore never joins a batched window — it falls back to the B=1
+/// burst, which honors its penalties correctly. Threading per-row token
+/// history through the batched round loop is a documented follow-up.
+pub(crate) fn sampling_config_eq(a: &SamplingConfig, b: &SamplingConfig) -> bool {
+    a.temperature.to_bits() == b.temperature.to_bits()
+        && a.top_k == b.top_k
+        && a.top_p.to_bits() == b.top_p.to_bits()
+        && a.min_p.to_bits() == b.min_p.to_bits()
+        && a.seed == b.seed
+        && a.stop_token_ids == b.stop_token_ids
+        && a.token_bias.is_empty()
+        && b.token_bias.is_empty()
+        // The batched path's first-bonus sample uses an empty token
+        // history; a penalty-bearing request must not join a batched
+        // window (it runs as a B=1 burst, which threads token history
+        // correctly since #682).
+        && !a.needs_token_history()
+        && !b.needs_token_history()
 }
 
 /// Best-effort diagnostic name for a [`LoadedModel`] variant, used in

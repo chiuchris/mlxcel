@@ -101,6 +101,54 @@ impl PrefillQueue {
             .or_else(|| self.low.pop_front())
     }
 
+    /// Drain up to `max_extra` additional sequences from the front of the
+    /// `lane` priority lane for which `predicate` returns `true`, stopping
+    /// at the first sequence that does not match.
+    ///
+    /// Issue #674: used by the speculative-burst scheduler to assemble a
+    /// B > 1 batched-burst window. The caller dequeues the head sequence
+    /// normally via [`Self::dequeue`], then calls this with the head's
+    /// priority lane and a predicate that matches "speculative-eligible
+    /// AND same prompt length as the head". Scanning stops at the first
+    /// non-match so FIFO order within the lane is preserved for the
+    /// sequences left behind — a request that cannot join the current
+    /// burst window stays at the front of its lane and is served on the
+    /// next tick.
+    ///
+    /// Only the single `lane` is scanned (not lower-priority lanes): the
+    /// head sequence already established the lane, and mixing priorities
+    /// into one burst window would let a normal-priority request ride on
+    /// a high-priority burst's tick budget.
+    pub fn drain_matching_window<F>(
+        &mut self,
+        lane: RequestPriority,
+        max_extra: usize,
+        mut predicate: F,
+    ) -> Vec<SequenceInfo>
+    where
+        F: FnMut(&SequenceInfo) -> bool,
+    {
+        let deque = match lane {
+            RequestPriority::High => &mut self.high,
+            RequestPriority::Normal => &mut self.normal,
+            RequestPriority::Low => &mut self.low,
+        };
+        let mut collected = Vec::new();
+        while collected.len() < max_extra {
+            match deque.front() {
+                Some(front) if predicate(front) => {
+                    // `pop_front` cannot return `None` here — `front()`
+                    // just returned `Some`.
+                    if let Some(seq) = deque.pop_front() {
+                        collected.push(seq);
+                    }
+                }
+                _ => break,
+            }
+        }
+        collected
+    }
+
     /// Peek at the priority of the next sequence that would be dequeued.
     pub fn peek_priority(&self) -> Option<RequestPriority> {
         if !self.high.is_empty() {
@@ -470,5 +518,97 @@ mod tests {
         assert_eq!(queue.len(), 1);
         let remaining = queue.dequeue().unwrap();
         assert_eq!(remaining.seq_id.as_u64(), 2);
+    }
+
+    // -----------------------------------------------------------------
+    // drain_matching_window (issue #674 — batched speculative burst)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn drain_matching_window_collects_leading_matches() {
+        let mut queue = PrefillQueue::new();
+        for id in [10, 20, 30] {
+            let (s, _r) = make_test_sequence(id);
+            queue.enqueue(s).unwrap();
+        }
+        // Predicate matches everything; drain up to 2 extras.
+        let window =
+            queue.drain_matching_window(RequestPriority::Normal, 2, |_| true);
+        let ids: Vec<u64> = window.iter().map(|s| s.seq_id.as_u64()).collect();
+        assert_eq!(ids, vec![10, 20], "must collect the 2 leading matches in FIFO order");
+        // The third sequence stays in the queue.
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 30);
+    }
+
+    #[test]
+    fn drain_matching_window_stops_at_first_non_match() {
+        let mut queue = PrefillQueue::new();
+        for id in [10, 20, 30, 40] {
+            let (s, _r) = make_test_sequence(id);
+            queue.enqueue(s).unwrap();
+        }
+        // Predicate matches ids 10 and 20 but not 30; scanning must stop
+        // at 30 so 30 and 40 stay queued in FIFO order.
+        let window = queue.drain_matching_window(RequestPriority::Normal, 10, |s| {
+            s.seq_id.as_u64() < 30
+        });
+        let ids: Vec<u64> = window.iter().map(|s| s.seq_id.as_u64()).collect();
+        assert_eq!(ids, vec![10, 20]);
+        assert_eq!(queue.len(), 2);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 30);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 40);
+    }
+
+    #[test]
+    fn drain_matching_window_respects_max_extra_cap() {
+        let mut queue = PrefillQueue::new();
+        for id in [1, 2, 3, 4, 5] {
+            let (s, _r) = make_test_sequence(id);
+            queue.enqueue(s).unwrap();
+        }
+        // Even though every sequence matches, only 3 may be drained.
+        let window =
+            queue.drain_matching_window(RequestPriority::Normal, 3, |_| true);
+        assert_eq!(window.len(), 3);
+        assert_eq!(queue.len(), 2);
+    }
+
+    #[test]
+    fn drain_matching_window_zero_max_extra_collects_nothing() {
+        let mut queue = PrefillQueue::new();
+        let (s, _r) = make_test_sequence(1);
+        queue.enqueue(s).unwrap();
+        let window =
+            queue.drain_matching_window(RequestPriority::Normal, 0, |_| true);
+        assert!(window.is_empty());
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn drain_matching_window_only_scans_named_lane() {
+        let mut queue = PrefillQueue::new();
+        // High lane has 2 matches; normal lane has 1.
+        let (h1, _r1) = make_test_sequence_with_priority(1, RequestPriority::High);
+        let (h2, _r2) = make_test_sequence_with_priority(2, RequestPriority::High);
+        let (n1, _r3) = make_test_sequence_with_priority(3, RequestPriority::Normal);
+        queue.enqueue(h1).unwrap();
+        queue.enqueue(h2).unwrap();
+        queue.enqueue(n1).unwrap();
+        // Draining the High lane must not touch the Normal lane.
+        let window =
+            queue.drain_matching_window(RequestPriority::High, 10, |_| true);
+        assert_eq!(window.len(), 2, "only the High lane is scanned");
+        // The normal-lane sequence is untouched.
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.dequeue().unwrap().seq_id.as_u64(), 3);
+    }
+
+    #[test]
+    fn drain_matching_window_empty_lane_returns_empty() {
+        let mut queue = PrefillQueue::new();
+        let window =
+            queue.drain_matching_window(RequestPriority::Low, 5, |_| true);
+        assert!(window.is_empty());
     }
 }

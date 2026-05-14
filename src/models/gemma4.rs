@@ -2868,6 +2868,63 @@ impl Gemma4Wrapper {
         )
     }
 
+    /// Sink-aware forward against a **caller-owned** `[B, ...]` cache
+    /// vector (issue #674, batched MTP dispatch).
+    ///
+    /// Unlike [`Self::forward_with_speculative_sinks`], this variant does
+    /// NOT resolve the cache through [`ModelOwnedSequenceState`] /
+    /// `SequenceId`. The batched MTP target adapter
+    /// ([`crate::models::gemma4_mtp_target::Gemma4MtpBatchedTargetAdapter`])
+    /// owns a single `Vec<Cache>` whose every per-layer cache carries a
+    /// leading batch dim `B` and drives all `B` rows through one forward
+    /// pass. The per-`SequenceId` slot model is single-row by
+    /// construction (one `Vec<Cache>` per `SequenceId`), so it cannot
+    /// express a `[B, ...]` verify forward — hence the explicit-cache
+    /// entrypoint.
+    ///
+    /// Behaviourally identical to the seq-id variant once the cache is
+    /// resolved: same masks, same sink capture, same per-layer-input
+    /// projection.
+    ///
+    /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpBatchedTargetAdapter`].
+    pub fn forward_with_speculative_sinks_explicit_cache(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        caches: &mut [Cache],
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+    ) -> UniquePtr<MlxArray> {
+        self.model.forward_with_caches_and_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            caches,
+            mask,
+            per_layer_inputs,
+            capture_layer_ids,
+            sinks,
+        )
+    }
+
+    /// Allocate a fresh per-layer cache vector for a batched MTP burst
+    /// (issue #674). Every cache starts empty; the batched verify pass
+    /// grows them with a leading batch dim `B` once the first `[B, L]`
+    /// prefill flows through
+    /// [`Self::forward_with_speculative_sinks_explicit_cache`].
+    ///
+    /// Distinct from the [`LanguageModel::make_caches`] trait method
+    /// (which returns an empty `Vec<KVCache>` because Gemma 4 owns its
+    /// caches internally) — this returns the heterogeneous
+    /// `Vec<Cache>` (`KVCache | RotatingKVCache`) the speculative
+    /// forward actually consumes.
+    ///
+    /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpBatchedTargetAdapter`].
+    pub fn make_speculative_caches(&self) -> Vec<Cache> {
+        self.model.make_caches()
+    }
+
     /// Rewind the per-sequence target KV caches after a Gemma 4 MTP
     /// speculative-decoding round (issue #625). Mirrors the upstream Python
     /// hook
@@ -2951,6 +3008,69 @@ impl Gemma4Wrapper {
                 Ok(())
             },
         )
+    }
+
+    /// Per-row tail-zero rollback against a **caller-owned** `[B, ...]`
+    /// cache vector (issue #674, batched MTP dispatch).
+    ///
+    /// Identical trim + per-row tail-zero logic as
+    /// [`Self::rollback_speculative_cache`], but operates on an explicit
+    /// `&mut [Cache]` instead of resolving through the per-`SequenceId`
+    /// slot. The batched MTP adapter owns its `[B, ...]` caches directly,
+    /// so it bypasses [`ModelOwnedSequenceState`].
+    ///
+    /// `accepted` is the per-row accept slice from the batched
+    /// speculative walk (length `B`). The global trim amount is
+    /// `block_size - (max(accepted) + 1)`; rows whose accept count is
+    /// below `max(accepted)` get their KV tail per-row zeroed via
+    /// [`Cache::zero_partial_accept_tail`].
+    ///
+    /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpBatchedTargetAdapter`].
+    pub fn rollback_speculative_cache_explicit(
+        &self,
+        caches: &mut [Cache],
+        accepted: &[i32],
+        block_size: i32,
+    ) -> Result<(), String> {
+        if accepted.is_empty() {
+            return Err(
+                "rollback_speculative_cache_explicit: accepted slice must be non-empty".into(),
+            );
+        }
+        if block_size <= 0 {
+            return Err(format!(
+                "rollback_speculative_cache_explicit: block_size must be positive \
+                 (got {block_size})"
+            ));
+        }
+        let max_a = *accepted.iter().max().unwrap();
+        if max_a < 0 {
+            return Err(format!(
+                "rollback_speculative_cache_explicit: accepted values must be non-negative \
+                 (got max = {max_a})"
+            ));
+        }
+        if max_a > block_size - 1 {
+            return Err(format!(
+                "rollback_speculative_cache_explicit: max(accepted) ({max_a}) cannot exceed \
+                 block_size - 1 ({})",
+                block_size - 1
+            ));
+        }
+        let n = max_a + 1;
+        let trim = block_size - n;
+        let is_batch = accepted.len() > 1;
+        let valid_ends: Vec<i32> = accepted.iter().map(|a| a + 1).collect();
+
+        for cache in caches.iter_mut() {
+            if trim > 0 {
+                cache.trim_speculative(trim);
+            }
+            if is_batch && max_a > 0 {
+                cache.zero_partial_accept_tail(&valid_ends, block_size)?;
+            }
+        }
+        Ok(())
     }
 }
 
