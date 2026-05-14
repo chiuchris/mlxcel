@@ -34,22 +34,22 @@
 //!   B>1 path too). The published upstream `z-lab/Qwen3.5-4B-DFlash`
 //!   checkpoint omits `embed_tokens.weight`; issue #675 ported upstream's
 //!   lazy-bind shape so the drafter loads with a tombstone and resolves
-//!   its embedding from the target during `Drafter::bind`. This test
-//!   loads both models, asserts the speculative-target trait wiring is
-//!   exposed correctly, and pins that the DFlash drafter loads + binds
-//!   against the published checkpoint. The end-to-end byte-equality
-//!   assertion is layered on by follow-up #676 (single-request server,
-//!   fixed prompt, drafter vs no-drafter at temp=0).
+//!   its embedding from the target during `Drafter::bind`. The
+//!   `greedy_parity_dflash_qwen35_4b` test runs the structural load +
+//!   bind pin *and* the issue #676 end-to-end byte-equality phase
+//!   (`mlxcel-server` with vs without `--draft-kind dflash` at temp=0).
 //!
 //! - **Gemma 4 31B + MTP assistant** (`models/gemma-4-31b-it-4bit` target,
 //!   drafter `models/gemma-4-31B-it-assistant-bf16`, `block_size = 4`). The
 //!   MTP drafter is loadable via
-//!   `mlxcel_core::drafter::gemma4_assistant::Gemma4AssistantDraftModel::from_path`
-//!   and `Gemma4Wrapper` already exposes the underlying primitives
-//!   (`forward_with_speculative_sinks`, `rollback_speculative_cache`). The
-//!   `MtpTarget` trait impl for `Gemma4Wrapper` itself is intentionally
-//!   deferred to follow-up #666 alongside the server-scheduler integration,
-//!   per the deferral note in PRs #663, #664, and #665.
+//!   `mlxcel_core::drafter::gemma4_assistant::Gemma4AssistantDraftModel::from_path`,
+//!   `Gemma4Wrapper` exposes the underlying primitives
+//!   (`forward_with_speculative_sinks`, `rollback_speculative_cache`), and
+//!   the server-side MTP burst dispatch + `MtpTarget` adapter were wired
+//!   by issues #666 / #670 / #671. The `greedy_parity_mtp_gemma4_31b`
+//!   test runs the structural load pin *and* the issue #676 end-to-end
+//!   byte-equality phase (`mlxcel-server` with vs without `--draft-kind
+//!   mtp` at temp=0).
 //!
 //! ## Deferred pairings (drafter checkpoint not on disk)
 //!
@@ -59,6 +59,29 @@
 //!   by follow-up #660.
 //! - **Gemma 4 26B-A4B** — drafter checkpoint (`gemma-4-26B-A4B-it-assistant-bf16`)
 //!   is not on local disk. Skipped pending checkpoint availability.
+//!
+//! ## End-to-end byte-equality (issue #676)
+//!
+//! `greedy_parity_dflash_qwen35_4b` and `greedy_parity_mtp_gemma4_31b` each
+//! run a two-phase check:
+//!
+//! 1. **Structural phase** (in-process): load the target, assert the model
+//!    variant, resolve the drafter kind, load the drafter, and — for
+//!    DFlash — `bind()` the drafter to the target (the issue #675
+//!    lazy-bind pin). The in-process models are then dropped and the MLX
+//!    memory cache cleared before phase 2.
+//! 2. **Byte-equality phase** (subprocess): spawn `mlxcel-server` twice
+//!    against the same target — once with `--model-draft --draft-kind
+//!    --draft-block-size` (speculative) and once without (drafter-less
+//!    baseline) — submit the same fixed prompt to `/v1/chat/completions`
+//!    at `temperature = 0`, and assert the two responses are
+//!    byte-identical (same `message.content` *and* same
+//!    `usage.completion_tokens`). The two servers run sequentially so
+//!    only one target's worth of GPU memory is resident at a time.
+//!
+//! This is the load-bearing correctness gate: at `temperature = 0` the
+//! speculative round loop MUST emit a token sequence byte-identical to
+//! the drafter-less greedy pass through the target.
 //!
 //! ## Invocation
 //!
@@ -72,10 +95,214 @@
 //!
 //! `--test-threads=1` is required because real-model tests share GPU memory
 //! and concurrent loads will OOM on smaller (32-48 GB) Apple Silicon hosts.
+//! The `#[ignore]`-gated real-model tests additionally spawn `mlxcel-server`
+//! subprocesses; they are run by the CI hardware lane on a fixed cadence
+//! and skipped by default on dev machines.
 
 mod common;
 
-use common::repo_model_dir;
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, Instant};
+
+use common::{repo_binary_path, repo_model_dir};
+
+/// Fixed prompt submitted to both the speculative and the drafter-less
+/// server in the byte-equality phase. Deterministic content, no system
+/// prompt, so the only variable between the two runs is whether the
+/// drafter is attached.
+const BYTE_EQUALITY_PROMPT: &str = "List the first five prime numbers.";
+
+/// Decode budget for the byte-equality phase. Large enough that the
+/// speculative round loop runs many draft/verify rounds (so a parity bug
+/// has room to surface), small enough to keep the CI hardware lane fast.
+const BYTE_EQUALITY_MAX_TOKENS: u32 = 96;
+
+/// Reserve an ephemeral localhost port by binding and immediately
+/// releasing it. There is a benign TOCTOU window before the server
+/// rebinds; in practice the CI hardware lane runs these tests
+/// `--test-threads=1` so nothing else races for the port.
+fn reserve_port() -> u16 {
+    let listener =
+        std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port for test server");
+    let port = listener.local_addr().expect("read local addr").port();
+    drop(listener);
+    port
+}
+
+/// Spawn `mlxcel-server` with the given CLI args. stdout/stderr are
+/// silenced — the test asserts on the HTTP response, not server logs.
+fn spawn_server(args: &[&str]) -> Child {
+    Command::new(repo_binary_path("mlxcel-server"))
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn mlxcel-server binary")
+}
+
+/// Kill the server child and reap it so the next phase's server can bind
+/// a fresh port without a lingering process holding GPU memory.
+fn stop_server(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Poll `/health` until the server is ready. Real-model loads (especially
+/// the 31B Gemma 4 target) can take a while, so the deadline is generous.
+async fn wait_for_health(client: &reqwest::Client, base_url: &str) {
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while Instant::now() < deadline {
+        if let Ok(response) = client.get(format!("{base_url}/health")).send().await
+            && response.status().is_success()
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!("mlxcel-server did not become healthy at {base_url} within the deadline");
+}
+
+/// Submit [`BYTE_EQUALITY_PROMPT`] to `/v1/chat/completions` at
+/// `temperature = 0` and return the `(message.content, usage.completion_tokens)`
+/// pair. The completion-token count is part of the byte-equality
+/// assertion: a parity bug that produces the same prefix but a different
+/// length is still a regression.
+async fn chat_content_and_token_count(client: &reqwest::Client, base_url: &str) -> (String, u64) {
+    let resp = client
+        .post(format!("{base_url}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "speculative-parity",
+            "messages": [{"role": "user", "content": BYTE_EQUALITY_PROMPT}],
+            "max_tokens": BYTE_EQUALITY_MAX_TOKENS,
+            "temperature": 0.0,
+        }))
+        .send()
+        .await
+        .expect("send /v1/chat/completions request");
+    assert!(
+        resp.status().is_success(),
+        "/v1/chat/completions returned non-success status {}",
+        resp.status(),
+    );
+    let body: serde_json::Value = resp.json().await.expect("parse chat completion response");
+    let content = body["choices"][0]["message"]["content"]
+        .as_str()
+        .expect("chat response must carry choices[0].message.content")
+        .to_string();
+    let completion_tokens = body["usage"]["completion_tokens"]
+        .as_u64()
+        .expect("chat response must carry usage.completion_tokens");
+    (content, completion_tokens)
+}
+
+/// Run one server-spawn round: bring `mlxcel-server` up with `extra_args`
+/// appended to the shared base flags, wait for health, submit the fixed
+/// prompt, tear the server down, and return the
+/// `(content, completion_tokens)` pair.
+///
+/// The server is always stopped before this function returns (including
+/// on the panic paths inside the helpers it calls — the `Child` is owned
+/// locally and `stop_server` runs before the value is asserted on), so
+/// the next round can reuse the GPU without two targets resident at once.
+async fn server_round(
+    pairing_name: &str,
+    label: &str,
+    target_path: &std::path::Path,
+    extra_args: &[&str],
+) -> (String, u64) {
+    let port = reserve_port();
+    let base_url = format!("http://127.0.0.1:{port}");
+    let port_str = port.to_string();
+    let target_str = target_path.to_string_lossy().to_string();
+
+    let mut args: Vec<&str> = vec![
+        "--model",
+        &target_str,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port_str,
+        "--no-warmup",
+    ];
+    args.extend_from_slice(extra_args);
+
+    eprintln!("[{pairing_name}] {label}: spawning mlxcel-server with args {args:?}");
+    let mut child = spawn_server(&args);
+
+    let client = reqwest::Client::new();
+    wait_for_health(&client, &base_url).await;
+    eprintln!("[{pairing_name}] {label}: server healthy, submitting fixed prompt");
+
+    let result = chat_content_and_token_count(&client, &base_url).await;
+
+    stop_server(&mut child);
+    eprintln!(
+        "[{pairing_name}] {label}: completion_tokens={}, content.len()={}",
+        result.1,
+        result.0.len(),
+    );
+    result
+}
+
+/// Issue #676 byte-equality phase: spawn `mlxcel-server` twice against the
+/// same `target_path` — once speculative (drafter attached via
+/// `--model-draft --draft-kind --draft-block-size`), once drafter-less —
+/// and assert the `/v1/chat/completions` responses are byte-identical.
+///
+/// The two servers run **sequentially** (the speculative one is fully
+/// stopped before the baseline one starts) so a 32-48 GB Apple Silicon
+/// host only ever holds one target's worth of weights at a time.
+async fn assert_server_byte_equality(
+    pairing: &Pairing,
+    target_path: &std::path::Path,
+    draft_path: &std::path::Path,
+) {
+    let draft_str = draft_path.to_string_lossy().to_string();
+    let block_size_str = pairing.block_size.to_string();
+
+    // Round 1: speculative — drafter attached.
+    let (spec_content, spec_tokens) = server_round(
+        pairing.name,
+        "speculative",
+        target_path,
+        &[
+            "--model-draft",
+            &draft_str,
+            "--draft-kind",
+            pairing.kind,
+            "--draft-block-size",
+            &block_size_str,
+        ],
+    )
+    .await;
+
+    // Round 2: drafter-less baseline — no `--draft-*` / `--model-draft`.
+    let (baseline_content, baseline_tokens) =
+        server_round(pairing.name, "baseline", target_path, &[]).await;
+
+    // Byte-equality: at temperature = 0 the speculative round loop must
+    // emit a token sequence byte-identical to the drafter-less greedy
+    // pass. Compare both the decoded text and the completion-token count.
+    assert_eq!(
+        spec_tokens, baseline_tokens,
+        "[{}] speculative completion_tokens ({spec_tokens}) != baseline ({baseline_tokens}); \
+         the speculative round loop diverged from the drafter-less greedy pass at temp=0",
+        pairing.name,
+    );
+    assert_eq!(
+        spec_content, baseline_content,
+        "[{}] speculative /v1/chat/completions content is NOT byte-identical to the \
+         drafter-less baseline at temp=0 — this is a speculative-decoding parity bug.\n\
+         speculative: {spec_content:?}\n\
+         baseline:    {baseline_content:?}",
+        pairing.name,
+    );
+    eprintln!(
+        "[{}] byte-equality phase passed: speculative output is byte-identical to the \
+         drafter-less baseline ({spec_tokens} completion tokens)",
+        pairing.name,
+    );
+}
 
 /// Reachable pairings whose drafter checkpoint is present on disk in the
 /// canonical `models/` directory (resolved via [`repo_model_dir`]). The
@@ -175,31 +402,29 @@ fn pairing_kind_resolution_matches_declaration() {
 
 /// Greedy parity for the Qwen 3.5 4B + DFlash pairing.
 ///
-/// **Status:** loads + binds; full byte-equality assertion deferred to #676.
+/// **Status:** end-to-end byte-equality (issue #676).
 ///
-/// The DFlash B=1 round loop (`mlxcel_core::drafter::dflash::round_loop::DFlashGenerator`)
-/// requires a `&mut [Qwen3NextCache]` slice from the test harness, but
-/// `Qwen35Model::make_caches` is `pub(crate)` today — there is no public
-/// API to construct that cache type outside the binary crate. The trait
-/// `LanguageModel::make_caches` returns `Vec<KVCache>` (empty for Qwen 3.5
-/// because the model owns its own sequence state internally), so an
-/// integration-test crate cannot drive the speculative pipeline directly.
+/// Two-phase test (see the module docstring):
 ///
-/// Follow-up #676 wires the real-model byte-equality end-to-end check
-/// (single-request server, fixed prompt, drafter vs no-drafter at temp=0).
+/// 1. **Structural phase** (in-process): loads the target, asserts it is
+///    a Qwen 3.5 family variant, resolves the drafter kind to
+///    `DrafterKind::Dflash`, loads the DFlash drafter against the
+///    published upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint — which
+///    omits `embed_tokens.weight` — and `bind()`s it to the target,
+///    resolving `embed_tokens` lazily from the target (the issue #675
+///    pin). The in-process models are then dropped.
+/// 2. **Byte-equality phase** (subprocess): spawns `mlxcel-server` with
+///    `--model-draft --draft-kind dflash --draft-block-size 16` and again
+///    without any `--draft-*` flag, submits the same fixed prompt to
+///    `/v1/chat/completions` at `temperature = 0`, and asserts the two
+///    responses are byte-identical.
 ///
-/// What the test asserts today:
-///   - Both target and drafter directories load successfully.
-///   - The drafter's resolved kind is exactly `DrafterKind::Dflash`.
-///   - The target wraps a `LoadedModel::Qwen35` variant (the only currently
-///     supported DFlash target family in mlxcel).
-///   - The DFlash drafter LOADS against the published upstream
-///     `z-lab/Qwen3.5-4B-DFlash` checkpoint — which omits
-///     `embed_tokens.weight` — *and* BINDS to the Qwen 3.5 target,
-///     resolving its `embed_tokens` lazily from the target (issue #675).
-#[test]
-#[ignore = "real-model heavy (loads Qwen3.5-4B target + drafter); runs in CI hardware lane only"]
-fn greedy_parity_dflash_qwen35_4b() {
+/// `#[ignore]`-gated as real-model heavy: it loads the Qwen 3.5 4B target
+/// + DFlash drafter and spawns `mlxcel-server` subprocesses. The CI
+/// hardware lane runs it on a fixed cadence; dev runs skip it by default.
+#[tokio::test]
+#[ignore = "real-model heavy (loads Qwen3.5-4B target + drafter, spawns mlxcel-server); runs in CI hardware lane only"]
+async fn greedy_parity_dflash_qwen35_4b() {
     use mlxcel::{LoadedModel, initialize_runtime, load_model};
     use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};
 
@@ -213,117 +438,107 @@ fn greedy_parity_dflash_qwen35_4b() {
         return;
     }
 
-    let _runtime = initialize_runtime();
-    mlxcel_core::synchronize_default();
-    mlxcel_core::clear_memory_cache();
+    // ---- Phase 1: structural check (in-process) ----
+    {
+        let _runtime = initialize_runtime();
+        mlxcel_core::synchronize_default();
+        mlxcel_core::clear_memory_cache();
 
-    eprintln!("[{}] Loading target from {:?}", pairing.name, target_path);
-    let (loaded_target, _target_tokenizer) =
-        load_model(&target_path).expect("target model must load");
+        eprintln!("[{}] Loading target from {:?}", pairing.name, target_path);
+        let (loaded_target, _target_tokenizer) =
+            load_model(&target_path).expect("target model must load");
 
-    // Qwen 3.5 4B checkpoints from `mlx-community` are published as
-    // `Qwen3_5ForConditionalGeneration` (VLM variant) even for the text-only
-    // 4B checkpoint, so the variant we expect is `Qwen35VLM` /
-    // `Qwen35MoeVLM` for the VLM-wrapped variants and `Qwen35` / `Qwen35Moe`
-    // for the pure text-only variants (less common in `mlx-community`).
-    let target_is_qwen35 = matches!(
-        loaded_target,
-        LoadedModel::Qwen35(_)
-            | LoadedModel::Qwen35Moe(_)
-            | LoadedModel::Qwen35VLM(_)
-            | LoadedModel::Qwen35MoeVLM(_)
-    );
-    assert!(
-        target_is_qwen35,
-        "DFlash pairing requires a Qwen 3.5 target but load_model returned a different variant; \
-         check the pairing target_dir matches a Qwen 3.5 4-bit checkpoint",
-    );
-    eprintln!(
-        "[{}] Target loaded as Qwen 3.5 family (Qwen35Model / Qwen35VLModel)",
-        pairing.name
-    );
-
-    eprintln!("[{}] Loading drafter from {:?}", pairing.name, draft_path);
-    let resolved_kind =
-        resolve_drafter_kind(&draft_path, None).expect("drafter config.json must be readable");
-    assert_eq!(resolved_kind, DrafterKind::Dflash);
-
-    // The drafter itself loads through `load_drafter` which constructs the
-    // full DFlashDrafter (including weight loading + sanitize). This is the
-    // load-bearing structural check: if the drafter cannot be constructed
-    // against its own checkpoint, no amount of round-loop wiring downstream
-    // will help.
-    //
-    // The upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint does NOT ship
-    // `embed_tokens.weight` — upstream Python sets `self.embed_tokens =
-    // None` at construction and `bind`s to the target's `embed_tokens`
-    // later
-    // (`references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
-    // lines 88, 92-108). Issue #675 ported that lazy-bind shape: the Rust
-    // loader builds the drafter with an `embed_tokens = None` tombstone
-    // when the safetensors index omits the table, and resolves it from
-    // the target during `Drafter::bind` via
-    // `LanguageModel::embed_tokens_module`. So `load_drafter` MUST now
-    // succeed on the published checkpoint — a `LoadFailed` here is a
-    // regression of #675.
-    let (mut drafter, drafter_kind) =
-        mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Dflash)).expect(
-            "DFlash drafter must load against the published z-lab/Qwen3.5-4B-DFlash \
-             checkpoint (issue #675: embed_tokens.weight is absent and the loader \
-             builds a lazy-bind tombstone instead of failing)",
+        // Qwen 3.5 4B checkpoints from `mlx-community` are published as
+        // `Qwen3_5ForConditionalGeneration` (VLM variant) even for the
+        // text-only 4B checkpoint, so the variant we expect is `Qwen35VLM`
+        // / `Qwen35MoeVLM` for the VLM-wrapped variants and `Qwen35` /
+        // `Qwen35Moe` for the pure text-only variants (less common in
+        // `mlx-community`).
+        let target_is_qwen35 = matches!(
+            loaded_target,
+            LoadedModel::Qwen35(_)
+                | LoadedModel::Qwen35Moe(_)
+                | LoadedModel::Qwen35VLM(_)
+                | LoadedModel::Qwen35MoeVLM(_)
         );
-    assert_eq!(drafter_kind, DrafterKind::Dflash);
-    eprintln!(
-        "[{}] Drafter loaded successfully; block_size={}",
-        pairing.name, pairing.block_size,
-    );
+        assert!(
+            target_is_qwen35,
+            "DFlash pairing requires a Qwen 3.5 target but load_model returned a different \
+             variant; check the pairing target_dir matches a Qwen 3.5 4-bit checkpoint",
+        );
+        eprintln!(
+            "[{}] Target loaded as Qwen 3.5 family (Qwen35Model / Qwen35VLModel)",
+            pairing.name
+        );
 
-    // Bind the drafter to the Qwen 3.5 target. For the published lazy-bind
-    // checkpoint this is the load-bearing step from issue #675: `bind`
-    // resolves the drafter's `embed_tokens` from the target's embedding
-    // module (`LanguageModel::embed_tokens_module`, implemented by the
-    // Qwen 3.5 family). A `BindFailed` here means either the target does
-    // not expose `embed_tokens_module` or the lazy-bind tombstone was not
-    // wired — both are #675 regressions.
-    drafter
-        .bind(&loaded_target)
-        .expect("DFlash drafter must bind to the Qwen 3.5 target (issue #675 lazy-bind)");
-    eprintln!(
-        "[{}] Drafter bound to target; embed_tokens resolved via lazy-bind",
-        pairing.name,
-    );
+        eprintln!("[{}] Loading drafter from {:?}", pairing.name, draft_path);
+        let resolved_kind =
+            resolve_drafter_kind(&draft_path, None).expect("drafter config.json must be readable");
+        assert_eq!(resolved_kind, DrafterKind::Dflash);
 
-    // FULL BYTE-EQUALITY TEST DEFERRED TO #676:
-    // The full byte-equality assertion needs a public way to construct
-    // `Qwen3NextCache` from outside the binary crate so this test can
-    // drive `DFlashGenerator::run(...)`, or — per #676 — a single-request
-    // server harness that submits a fixed prompt with and without
-    // `--draft-kind dflash` at temp=0 and asserts byte-identical token
-    // sequences. The load + bind pin above is the structural gate that
-    // #675 unblocks; #676 layers the end-to-end check on top.
-    eprintln!(
-        "[{}] Load + bind check passed; full byte-equality assertion deferred to #676",
-        pairing.name,
-    );
+        // `load_drafter` constructs the full DFlashDrafter (weight loading
+        // + sanitize). The upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint
+        // does NOT ship `embed_tokens.weight`; issue #675 ported upstream's
+        // lazy-bind shape so the loader builds an `embed_tokens = None`
+        // tombstone instead of failing. A `LoadFailed` here is a #675
+        // regression.
+        let (mut drafter, drafter_kind) =
+            mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Dflash)).expect(
+                "DFlash drafter must load against the published z-lab/Qwen3.5-4B-DFlash \
+                 checkpoint (issue #675: embed_tokens.weight is absent and the loader \
+                 builds a lazy-bind tombstone instead of failing)",
+            );
+        assert_eq!(drafter_kind, DrafterKind::Dflash);
+        eprintln!(
+            "[{}] Drafter loaded successfully; block_size={}",
+            pairing.name, pairing.block_size,
+        );
+
+        // `bind` resolves the drafter's `embed_tokens` from the target's
+        // embedding module (`LanguageModel::embed_tokens_module`,
+        // implemented by the Qwen 3.5 family — issue #675). A `BindFailed`
+        // here means either the target does not expose
+        // `embed_tokens_module` or the lazy-bind tombstone was not wired.
+        drafter
+            .bind(&loaded_target)
+            .expect("DFlash drafter must bind to the Qwen 3.5 target (issue #675 lazy-bind)");
+        eprintln!(
+            "[{}] Drafter bound to target; embed_tokens resolved via lazy-bind",
+            pairing.name,
+        );
+
+        // Drop the in-process target + drafter and clear the MLX memory
+        // cache before phase 2 so the spawned servers do not contend with
+        // these weights for GPU memory.
+        drop(drafter);
+        drop(loaded_target);
+        mlxcel_core::synchronize_default();
+        mlxcel_core::clear_memory_cache();
+    }
+
+    // ---- Phase 2: end-to-end byte-equality (subprocess) ----
+    assert_server_byte_equality(pairing, &target_path, &draft_path).await;
 }
 
 /// Greedy parity for the Gemma 4 31B + MTP assistant pairing.
 ///
-/// **Status:** scaffolded; full byte-equality assertion deferred to #666.
+/// **Status:** end-to-end byte-equality (issue #676).
 ///
-/// The MTP B=1 round loop (`mlxcel_core::speculative::mtp::MtpGenerator`)
-/// requires a `&dyn MtpTarget` implementation on the target wrapper. The
-/// underlying primitives (`Gemma4Wrapper::forward_with_speculative_sinks`,
-/// `Gemma4Wrapper::rollback_speculative_cache`) are all public, but the
-/// `MtpTarget` trait impl itself is intentionally deferred to follow-up
-/// #666 per the explicit deferral note in PR #665.
+/// Two-phase test (see the module docstring):
 ///
-/// What the test asserts today:
-///   - Both target and drafter directories load successfully.
-///   - The drafter's resolved kind is exactly `DrafterKind::Mtp` (which
-///     auto-detects from `model_type: "gemma4_assistant"` in the drafter
-///     config.json).
-///   - The target wraps a `LoadedModel::Gemma4` variant.
+/// 1. **Structural phase** (in-process): loads the target, asserts it is
+///    a Gemma 4 family variant, resolves the drafter kind to
+///    `DrafterKind::Mtp` (auto-detected from `model_type:
+///    "gemma4_assistant"` in the drafter `config.json`), and loads the
+///    MTP assistant drafter from its checkpoint. The in-process models
+///    are then dropped.
+/// 2. **Byte-equality phase** (subprocess): spawns `mlxcel-server` with
+///    `--model-draft --draft-kind mtp --draft-block-size 4` and again
+///    without any `--draft-*` flag, submits the same fixed prompt to
+///    `/v1/chat/completions` at `temperature = 0`, and asserts the two
+///    responses are byte-identical. The server-side MTP burst dispatch
+///    and the `MtpTarget` adapter for `Gemma4Wrapper` were wired by
+///    issues #666 / #670 / #671.
 ///
 /// Note on dtype: this pairing uses a 4-bit quantized target with a bf16
 /// drafter. The 4-bit target keeps bf16 scales/biases as-is per
@@ -332,9 +547,13 @@ fn greedy_parity_dflash_qwen35_4b() {
 /// captured hidden + shared K/V slab dtypes (which it does — see the
 /// "preserves the model's native bf16/f16 dtype — no f32 promotion" note
 /// on `Gemma4SpeculativeSinks`).
-#[test]
-#[ignore = "real-model heavy (loads Gemma-4-31B target + drafter); runs in CI hardware lane only"]
-fn greedy_parity_mtp_gemma4_31b() {
+///
+/// `#[ignore]`-gated as real-model heavy: it loads the Gemma 4 31B target
+/// + MTP drafter and spawns `mlxcel-server` subprocesses. The CI hardware
+/// lane runs it on a fixed cadence; dev runs skip it by default.
+#[tokio::test]
+#[ignore = "real-model heavy (loads Gemma-4-31B target + drafter, spawns mlxcel-server); runs in CI hardware lane only"]
+async fn greedy_parity_mtp_gemma4_31b() {
     use mlxcel::{LoadedModel, initialize_runtime, load_model};
     use mlxcel_core::drafter::{DrafterKind, resolve_drafter_kind};
 
@@ -348,57 +567,60 @@ fn greedy_parity_mtp_gemma4_31b() {
         return;
     }
 
-    let _runtime = initialize_runtime();
-    mlxcel_core::synchronize_default();
-    mlxcel_core::clear_memory_cache();
+    // ---- Phase 1: structural check (in-process) ----
+    {
+        let _runtime = initialize_runtime();
+        mlxcel_core::synchronize_default();
+        mlxcel_core::clear_memory_cache();
 
-    eprintln!("[{}] Loading target from {:?}", pairing.name, target_path);
-    let (loaded_target, _target_tokenizer) =
-        load_model(&target_path).expect("target model must load");
+        eprintln!("[{}] Loading target from {:?}", pairing.name, target_path);
+        let (loaded_target, _target_tokenizer) =
+            load_model(&target_path).expect("target model must load");
 
-    // Gemma 4 31B checkpoints are typically published as
-    // `Gemma4ForConditionalGeneration` (VLM variant), so we accept either the
-    // text-only `Gemma4` wrapper or the `Gemma4VLM` VLM wrapper. The MTP
-    // path operates on the inner text model in both cases (the vision tower
-    // is bypassed when no image tokens are present in the prompt).
-    let target_is_gemma4 = matches!(
-        loaded_target,
-        LoadedModel::Gemma4(_) | LoadedModel::Gemma4VLM(_)
-    );
-    assert!(
-        target_is_gemma4,
-        "MTP pairing requires a Gemma 4 target but load_model returned a different variant; \
-         check the pairing target_dir matches a Gemma 4 4-bit checkpoint",
-    );
-    eprintln!(
-        "[{}] Target loaded as Gemma 4 family (Gemma4Wrapper / Gemma4VLModel)",
-        pairing.name
-    );
+        // Gemma 4 31B checkpoints are typically published as
+        // `Gemma4ForConditionalGeneration` (VLM variant), so we accept
+        // either the text-only `Gemma4` wrapper or the `Gemma4VLM` VLM
+        // wrapper. The MTP path operates on the inner text model in both
+        // cases (the vision tower is bypassed when no image tokens are
+        // present in the prompt).
+        let target_is_gemma4 = matches!(
+            loaded_target,
+            LoadedModel::Gemma4(_) | LoadedModel::Gemma4VLM(_)
+        );
+        assert!(
+            target_is_gemma4,
+            "MTP pairing requires a Gemma 4 target but load_model returned a different variant; \
+             check the pairing target_dir matches a Gemma 4 4-bit checkpoint",
+        );
+        eprintln!(
+            "[{}] Target loaded as Gemma 4 family (Gemma4Wrapper / Gemma4VLModel)",
+            pairing.name
+        );
 
-    eprintln!("[{}] Loading drafter from {:?}", pairing.name, draft_path);
-    let resolved_kind =
-        resolve_drafter_kind(&draft_path, None).expect("drafter config.json must be readable");
-    assert_eq!(resolved_kind, DrafterKind::Mtp);
+        eprintln!("[{}] Loading drafter from {:?}", pairing.name, draft_path);
+        let resolved_kind =
+            resolve_drafter_kind(&draft_path, None).expect("drafter config.json must be readable");
+        assert_eq!(resolved_kind, DrafterKind::Mtp);
 
-    let (_drafter, _kind) = mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Mtp))
-        .expect("Gemma 4 MTP assistant drafter must load from checkpoint");
-    eprintln!(
-        "[{}] Drafter loaded; block_size={}",
-        pairing.name, pairing.block_size
-    );
+        let (drafter, _kind) =
+            mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Mtp))
+                .expect("Gemma 4 MTP assistant drafter must load from checkpoint");
+        eprintln!(
+            "[{}] Drafter loaded; block_size={}",
+            pairing.name, pairing.block_size
+        );
 
-    // FULL TEST DEFERRED TO #666:
-    // The full byte-equality assertion needs an `MtpTarget` impl on
-    // `Gemma4Wrapper`. The Gemma 4 wrapper has all the required hooks
-    // (`forward_with_speculative_sinks`, `rollback_speculative_cache`); the
-    // adapter struct that wires those hooks to the `MtpTarget` trait
-    // signatures (`prefill_and_seed`, `verify_forward`, `verify_finalize`)
-    // is the missing piece. See the module docstring for the deferral
-    // rationale.
-    eprintln!(
-        "[{}] Structural check passed; full byte-equality assertion deferred to #666",
-        pairing.name,
-    );
+        // Drop the in-process target + drafter and clear the MLX memory
+        // cache before phase 2 so the spawned servers do not contend with
+        // these weights for GPU memory.
+        drop(drafter);
+        drop(loaded_target);
+        mlxcel_core::synchronize_default();
+        mlxcel_core::clear_memory_cache();
+    }
+
+    // ---- Phase 2: end-to-end byte-equality (subprocess) ----
+    assert_server_byte_equality(pairing, &target_path, &draft_path).await;
 }
 
 /// Sanity that the test discovery against `models/` finds at least one of
