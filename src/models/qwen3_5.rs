@@ -2557,6 +2557,15 @@ impl LanguageModel for Qwen35Model {
         Some(self.embed_tokens.forward(input_ids))
     }
 
+    /// Hand out a shared-buffer handle to the input embedding table for
+    /// the DFlash drafter's lazy-bind path. The upstream
+    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`
+    /// and resolves it from this Qwen 3.5 target during
+    /// `mlxcel_core::drafter::Drafter::bind` (issue #675).
+    fn embed_tokens_module(&self) -> Option<UnifiedEmbedding> {
+        Some(self.embed_tokens.clone_shared())
+    }
+
     fn make_caches(&self) -> Vec<KVCache> {
         Vec::new()
     }

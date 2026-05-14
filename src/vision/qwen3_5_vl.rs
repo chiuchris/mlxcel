@@ -408,6 +408,15 @@ impl LanguageModel for Qwen35VLModel {
         Some(self.text_model.get_embed_tokens(input_ids))
     }
 
+    /// Delegate to the inner text model so a DFlash drafter can lazy-bind
+    /// the Qwen 3.5 embedding table even when the target is a VLM-wrapped
+    /// Qwen 3.5 checkpoint (issue #675). The vision tower owns no token
+    /// embedding of its own — token embedding always lives on the text
+    /// model.
+    fn embed_tokens_module(&self) -> Option<mlxcel_core::layers::UnifiedEmbedding> {
+        mlxcel_core::generate::LanguageModel::embed_tokens_module(&self.text_model)
+    }
+
     fn make_caches(&self) -> Vec<KVCache> {
         self.text_model.make_caches()
     }

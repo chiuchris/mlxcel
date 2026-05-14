@@ -48,11 +48,15 @@ use super::model::DFlashDraftModel;
 /// ## Lifecycle
 ///
 /// 1. `DFlashDrafter::load(path)` — load + sanitize weights, build
-///    the model, allocate the per-layer cache slice.
-/// 2. `bind(target)` — verify the target exposes `embed_tokens`
-///    (smoke test of the binding contract; the actual embedding tied
-///    to the drafter's `embed_tokens` table is loaded from the
-///    drafter's own checkpoint).
+///    the model, allocate the per-layer cache slice. The published
+///    `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`,
+///    so the model is built with an `embed_tokens = None` tombstone.
+/// 2. `bind(target)` — resolve the binding contract. For the lazy-bind
+///    checkpoint this installs a shared-buffer handle to the *target's*
+///    `embed_tokens` module into the tombstone (matching upstream
+///    Python's `self.embed_tokens = target.embed_tokens`); for a
+///    self-contained checkpoint that shipped its own table this is just
+///    a capability smoke-test that the target can embed at all.
 /// 3. `set_target_hidden(hidden)` (optional pre-flight) — store the
 ///    target-hidden buffer for the next `draft_block` call. The
 ///    trait-level `draft_block` signature takes `hidden: Option<&MlxArray>`
@@ -184,24 +188,54 @@ fn convert_bf16_to_f16_non_quantized(weights: &mut WeightMap) {
 
 impl Drafter for DFlashDrafter {
     fn bind(&mut self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
-        // Smoke-test the target's `embed_tokens` capability by calling
-        // it with a 1-element dummy id array. The actual embed_tokens
-        // tensor used by `DFlashDraftModel::forward` was loaded from
-        // the drafter's own checkpoint at `Self::load` time; this
-        // smoke-test verifies the target is at least *capable* of
-        // embedding (which is what the sub-12 round-loop driver will
-        // need for parity with Python's `bind`).
-        let dummy = ffi::from_slice_i32(&[0_i32], &[1, 1]);
-        let embedded = target.embed_tokens(&dummy);
-        if embedded.is_none() {
-            return Err(DrafterError::BindFailed {
-                reason: format!(
-                    "target model does not expose embed_tokens; \
-                     DFlash drafter requires a target with a working \
-                     embed_tokens method (kind = {})",
-                    self.kind()
-                ),
-            });
+        // Two cases, mirroring upstream Python's lazy-bind shape
+        // (`references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
+        // lines 88, 92-108):
+        //
+        // 1. Lazy-bind checkpoint (the published `z-lab/Qwen3.5-4B-DFlash`):
+        //    the drafter shipped NO `embed_tokens.weight`, so
+        //    `DFlashDraftModel::from_weights` left `embed_tokens = None`.
+        //    Resolve it now from the target's embedding *module* via
+        //    `LanguageModel::embed_tokens_module` and install it into the
+        //    tombstone. This is the load-bearing fix for the published
+        //    checkpoint — without it `forward()` panics on the unbound
+        //    embedding.
+        //
+        // 2. Self-contained checkpoint: the drafter shipped its own
+        //    `embed_tokens.weight`. We only need the legacy capability
+        //    smoke-test — confirm the target can embed at all — so the
+        //    binding contract still fails fast on a target that does not
+        //    expose `embed_tokens` (e.g. a non-Qwen-3.5 model fed in by
+        //    mistake).
+        if self.model.needs_embed_binding() {
+            let embed = target.embed_tokens_module().ok_or_else(|| {
+                DrafterError::BindFailed {
+                    reason: format!(
+                        "DFlash drafter checkpoint omits embed_tokens.weight \
+                         and the target does not expose embed_tokens_module(); \
+                         a lazy-bind DFlash drafter requires a target that \
+                         hands out its embedding table (the Qwen 3.5 family \
+                         does — check the target is a Qwen 3.5 checkpoint) \
+                         (kind = {})",
+                        self.kind()
+                    ),
+                }
+            })?;
+            self.model.bind_target_embedding(embed);
+        } else {
+            // Legacy capability smoke-test for self-contained checkpoints:
+            // a 1-element dummy id array proves the target can embed.
+            let dummy = ffi::from_slice_i32(&[0_i32], &[1, 1]);
+            if target.embed_tokens(&dummy).is_none() {
+                return Err(DrafterError::BindFailed {
+                    reason: format!(
+                        "target model does not expose embed_tokens; \
+                         DFlash drafter requires a target with a working \
+                         embed_tokens method (kind = {})",
+                        self.kind()
+                    ),
+                });
+            }
         }
         self.bound = true;
         Ok(())

@@ -31,13 +31,15 @@
 //!   is loadable via `mlxcel_core::drafter::dflash::DFlashDrafter::load`
 //!   and `Qwen35Model` implements
 //!   `mlxcel_core::drafter::dflash::SpeculativeTarget` (PR #663 wired the
-//!   B>1 path too). The full pipeline cannot run via the integration-test
-//!   crate today because `Qwen35Model::make_caches` is `pub(crate)`; the
-//!   structural part of this test loads both models and asserts the
-//!   speculative-target trait wiring is exposed correctly, deferring the
-//!   end-to-end byte-equality assertion to follow-up #666 which wires the
-//!   server-side scheduler dispatch and ships the public cache-construction
-//!   API the test harness needs.
+//!   B>1 path too). The published upstream `z-lab/Qwen3.5-4B-DFlash`
+//!   checkpoint omits `embed_tokens.weight`; issue #675 ported upstream's
+//!   lazy-bind shape so the drafter loads with a tombstone and resolves
+//!   its embedding from the target during `Drafter::bind`. This test
+//!   loads both models, asserts the speculative-target trait wiring is
+//!   exposed correctly, and pins that the DFlash drafter loads + binds
+//!   against the published checkpoint. The end-to-end byte-equality
+//!   assertion is layered on by follow-up #676 (single-request server,
+//!   fixed prompt, drafter vs no-drafter at temp=0).
 //!
 //! - **Gemma 4 31B + MTP assistant** (`models/gemma-4-31b-it-4bit` target,
 //!   drafter `models/gemma-4-31B-it-assistant-bf16`, `block_size = 4`). The
@@ -173,7 +175,7 @@ fn pairing_kind_resolution_matches_declaration() {
 
 /// Greedy parity for the Qwen 3.5 4B + DFlash pairing.
 ///
-/// **Status:** scaffolded; full byte-equality assertion deferred to #666.
+/// **Status:** loads + binds; full byte-equality assertion deferred to #676.
 ///
 /// The DFlash B=1 round loop (`mlxcel_core::drafter::dflash::round_loop::DFlashGenerator`)
 /// requires a `&mut [Qwen3NextCache]` slice from the test harness, but
@@ -183,16 +185,18 @@ fn pairing_kind_resolution_matches_declaration() {
 /// because the model owns its own sequence state internally), so an
 /// integration-test crate cannot drive the speculative pipeline directly.
 ///
-/// Follow-up #666 wires the server-side scheduler dispatch and is the
-/// natural home for the public cache-construction API the test harness
-/// needs. Once #666 lands, this test body flips to a real greedy-parity
-/// assertion over ≥32 tokens against a no-drafter baseline.
+/// Follow-up #676 wires the real-model byte-equality end-to-end check
+/// (single-request server, fixed prompt, drafter vs no-drafter at temp=0).
 ///
 /// What the test asserts today:
 ///   - Both target and drafter directories load successfully.
 ///   - The drafter's resolved kind is exactly `DrafterKind::Dflash`.
 ///   - The target wraps a `LoadedModel::Qwen35` variant (the only currently
 ///     supported DFlash target family in mlxcel).
+///   - The DFlash drafter LOADS against the published upstream
+///     `z-lab/Qwen3.5-4B-DFlash` checkpoint — which omits
+///     `embed_tokens.weight` — *and* BINDS to the Qwen 3.5 target,
+///     resolving its `embed_tokens` lazily from the target (issue #675).
 #[test]
 #[ignore = "real-model heavy (loads Qwen3.5-4B target + drafter); runs in CI hardware lane only"]
 fn greedy_parity_dflash_qwen35_4b() {
@@ -249,67 +253,56 @@ fn greedy_parity_dflash_qwen35_4b() {
     // load-bearing structural check: if the drafter cannot be constructed
     // against its own checkpoint, no amount of round-loop wiring downstream
     // will help.
-    // KNOWN ISSUE (DFlash loader): the upstream `z-lab/Qwen3.5-4B-DFlash`
-    // checkpoint does NOT ship `embed_tokens.weight` — upstream Python sets
-    // `self.embed_tokens = None` at construction and `bind`s to the
-    // target's `embed_tokens` later
+    //
+    // The upstream `z-lab/Qwen3.5-4B-DFlash` checkpoint does NOT ship
+    // `embed_tokens.weight` — upstream Python sets `self.embed_tokens =
+    // None` at construction and `bind`s to the target's `embed_tokens`
+    // later
     // (`references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
-    // lines 88, 92-108). The current Rust loader in
-    // `mlxcel_core::drafter::dflash::DFlashDrafter::load` requires the
-    // weight to be present at construction time
-    // (`UnifiedEmbedding::from_weights("embed_tokens", ...)` in
-    // `dflash::model::DFlashDraftModel::from_weights`). This causes a
-    // `LoadFailed { reason: "Weight not found: embed_tokens.weight" }` on
-    // the published checkpoint.
-    //
-    // Filed as a follow-up alongside #666's DFlash wiring: the loader
-    // must construct the drafter with a tombstone `embed_tokens = None`
-    // and resolve it during `bind()`, matching upstream's lazy-bind shape.
-    //
-    // The structural part of this test still proves:
-    //   - Target loads as Qwen 3.5 family.
-    //   - Drafter config.json::model_type auto-detects to DFlash (the
-    //     fallback default, since DFlash configs omit `model_type`).
-    //   - The drafter LOADER is reachable; we capture and surface its
-    //     current failure mode so a future fix is testable here without
-    //     refactoring the test scaffolding.
-    let drafter_load_result =
-        mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Dflash));
-    match drafter_load_result {
-        Ok(_) => {
-            eprintln!(
-                "[{}] Drafter loaded successfully; block_size={}",
-                pairing.name, pairing.block_size,
-            );
-        }
-        Err(e) => {
-            // We expect this to fail today on the published `z-lab/Qwen3.5-4B-DFlash`
-            // checkpoint per the known-issue note above. Log clearly and
-            // surface the diagnostic; this is the failure-mode pin that lets
-            // a future DFlash loader fix get caught here by flipping the
-            // assertion. Until the loader is fixed, do NOT fail the test —
-            // the structural pin (kind resolution + variant assertion)
-            // already passed above.
-            eprintln!(
-                "[{}] DFlash drafter loader returned error (known issue; \
-                 upstream checkpoint omits embed_tokens.weight, awaiting \
-                 lazy-bind fix in #666): {}",
-                pairing.name, e,
-            );
-        }
-    }
-
-    // FULL TEST DEFERRED TO #666:
-    // Even once the loader bug above is fixed, the full byte-equality
-    // assertion needs a public way to construct `Qwen3NextCache` from
-    // outside the binary crate so this test can drive
-    // `DFlashGenerator::run(target, target_lm, caches, first_bonus,
-    // first_hidden, eos, max_tokens)`. The structural part of the test
-    // (load + kind resolution + drafter loader-error capture) is the only
-    // thing checkable from an integration test today. See the module
-    // docstring.
+    // lines 88, 92-108). Issue #675 ported that lazy-bind shape: the Rust
+    // loader builds the drafter with an `embed_tokens = None` tombstone
+    // when the safetensors index omits the table, and resolves it from
+    // the target during `Drafter::bind` via
+    // `LanguageModel::embed_tokens_module`. So `load_drafter` MUST now
+    // succeed on the published checkpoint — a `LoadFailed` here is a
+    // regression of #675.
+    let (mut drafter, drafter_kind) =
+        mlxcel_core::drafter::load_drafter(&draft_path, Some(DrafterKind::Dflash)).expect(
+            "DFlash drafter must load against the published z-lab/Qwen3.5-4B-DFlash \
+             checkpoint (issue #675: embed_tokens.weight is absent and the loader \
+             builds a lazy-bind tombstone instead of failing)",
+        );
+    assert_eq!(drafter_kind, DrafterKind::Dflash);
     eprintln!(
-        "[{}] Structural check passed; full byte-equality assertion deferred to #666",
+        "[{}] Drafter loaded successfully; block_size={}",
+        pairing.name, pairing.block_size,
+    );
+
+    // Bind the drafter to the Qwen 3.5 target. For the published lazy-bind
+    // checkpoint this is the load-bearing step from issue #675: `bind`
+    // resolves the drafter's `embed_tokens` from the target's embedding
+    // module (`LanguageModel::embed_tokens_module`, implemented by the
+    // Qwen 3.5 family). A `BindFailed` here means either the target does
+    // not expose `embed_tokens_module` or the lazy-bind tombstone was not
+    // wired — both are #675 regressions.
+    drafter
+        .bind(&loaded_target)
+        .expect("DFlash drafter must bind to the Qwen 3.5 target (issue #675 lazy-bind)");
+    eprintln!(
+        "[{}] Drafter bound to target; embed_tokens resolved via lazy-bind",
+        pairing.name,
+    );
+
+    // FULL BYTE-EQUALITY TEST DEFERRED TO #676:
+    // The full byte-equality assertion needs a public way to construct
+    // `Qwen3NextCache` from outside the binary crate so this test can
+    // drive `DFlashGenerator::run(...)`, or — per #676 — a single-request
+    // server harness that submits a fixed prompt with and without
+    // `--draft-kind dflash` at temp=0 and asserts byte-identical token
+    // sequences. The load + bind pin above is the structural gate that
+    // #675 unblocks; #676 layers the end-to-end check on top.
+    eprintln!(
+        "[{}] Load + bind check passed; full byte-equality assertion deferred to #676",
         pairing.name,
     );
 }

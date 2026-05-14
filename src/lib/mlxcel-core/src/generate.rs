@@ -188,6 +188,29 @@ pub trait LanguageModel {
         None // default: not supported
     }
 
+    /// Hand out a shared-buffer handle to this model's input embedding
+    /// table for speculative drafters that lazy-bind it.
+    ///
+    /// Unlike [`Self::embed_tokens`] (which applies the embedding to a
+    /// given id tensor), this returns the embedding *module* itself so a
+    /// drafter can use it both as an embedding lookup and as a tied LM
+    /// head (`UnifiedEmbedding::as_linear`). The returned
+    /// [`UnifiedEmbedding`] shares the underlying MLX buffers with the
+    /// target (lazy-array share via `UnifiedEmbedding::clone_shared` — no
+    /// element copy) and stays valid for the lifetime of the speculative
+    /// session.
+    ///
+    /// The default returns `None`; only targets that can pair with a
+    /// lazy-bind drafter override it. Concretely, the upstream
+    /// `z-lab/Qwen3.5-4B-DFlash` checkpoint omits `embed_tokens.weight`
+    /// and the Rust DFlash drafter resolves it here during
+    /// [`crate::drafter::Drafter::bind`].
+    ///
+    /// Used by: DFlash drafter lazy-bind path; Qwen 3.5 target family
+    fn embed_tokens_module(&self) -> Option<crate::layers::UnifiedEmbedding> {
+        None // default: not supported
+    }
+
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases,
     /// e.g. Phi4MM unfuses vision LoRA so decode uses base weights.

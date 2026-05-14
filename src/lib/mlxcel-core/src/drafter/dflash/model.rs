@@ -59,12 +59,28 @@ enum LmHead {
 pub struct DFlashDraftModel {
     pub config: DFlashConfig,
 
-    /// Token embedding table. Always loaded from the drafter's own
-    /// checkpoint at construction time. The published checkpoint ships
-    /// `embed_tokens.weight` and uses it both as the input embedder and
-    /// (via [`LmHead::Tied`]) as the LM head when
-    /// `tie_word_embeddings = true`.
-    pub embed_tokens: UnifiedEmbedding,
+    /// Token embedding table.
+    ///
+    /// **Lazy-bind tombstone.** The upstream `z-lab/Qwen3.5-4B-DFlash`
+    /// checkpoint does NOT ship `embed_tokens.weight` — upstream Python
+    /// sets `self.embed_tokens = None` at construction and binds it to
+    /// the target's `embed_tokens` later via `bind()`
+    /// (`references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`,
+    /// lines 88, 92-108). This field mirrors that shape:
+    ///
+    /// - `Some(_)` — a drafter checkpoint that *did* ship its own
+    ///   `embed_tokens.weight` (used both as the input embedder and, via
+    ///   [`LmHead::Tied`], as the LM head when `tie_word_embeddings = true`).
+    /// - `None` — the published lazy-bind checkpoint. [`Self::bind_target_embedding`]
+    ///   installs a shared-buffer handle to the *target's* embedding
+    ///   during the drafter's `bind()` call, before the first
+    ///   [`Self::forward`].
+    ///
+    /// [`Self::forward`] panics if this is still `None` at call time —
+    /// the round-loop driver always `bind()`s before `draft_block`, so a
+    /// `None` here at forward time is a wiring bug, not a recoverable
+    /// runtime state.
+    pub embed_tokens: Option<UnifiedEmbedding>,
 
     /// Per-target-layer projection: maps the
     /// `5 * hidden_size`-dim concatenation to `hidden_size`.
@@ -102,8 +118,27 @@ impl DFlashDraftModel {
         let group_size = 64;
         let bits = 4;
 
-        let embed_tokens =
-            UnifiedEmbedding::from_weights(weights, "embed_tokens", group_size, bits)?;
+        // Lazy-bind tombstone: the published `z-lab/Qwen3.5-4B-DFlash`
+        // checkpoint omits `embed_tokens.weight` (and its `.scales` for a
+        // hypothetical quantized variant). When the embedding is absent
+        // from the index we construct the model with `embed_tokens = None`
+        // and resolve it from the target during `DFlashDrafter::bind` via
+        // [`Self::bind_target_embedding`], mirroring upstream Python's
+        // `self.embed_tokens = None` construction shape. A drafter
+        // checkpoint that *does* ship its own table loads it eagerly here
+        // (no regression for self-contained DFlash checkpoints).
+        let has_embed_tokens = weights.contains_key("embed_tokens.weight")
+            || weights.contains_key("embed_tokens.scales");
+        let embed_tokens = if has_embed_tokens {
+            Some(UnifiedEmbedding::from_weights(
+                weights,
+                "embed_tokens",
+                group_size,
+                bits,
+            )?)
+        } else {
+            None
+        };
         let fc = Linear::from_weights(weights, "fc")?;
 
         let hidden_norm_w = weights
@@ -128,7 +163,11 @@ impl DFlashDraftModel {
 
         // LM head: present iff the checkpoint ships `lm_head.weight`.
         // `tie_word_embeddings = true` (the default) means no `lm_head.weight`
-        // and we route through `embed_tokens.as_linear` instead.
+        // and we route through `embed_tokens.as_linear` instead. For the
+        // published lazy-bind checkpoint (`tie_word_embeddings = true`, no
+        // `lm_head.weight`, no `embed_tokens.weight`) the `Tied` arm is
+        // still correct — the tied head resolves through the *bound*
+        // target embedding once [`Self::bind_target_embedding`] runs.
         let lm_head = if weights.contains_key("lm_head.weight") {
             LmHead::Own(Linear::from_weights(weights, "lm_head")?)
         } else if config.tie_word_embeddings {
@@ -150,6 +189,57 @@ impl DFlashDraftModel {
             norm,
             lm_head,
         })
+    }
+
+    /// Install the target's embedding table into the lazy-bind tombstone.
+    ///
+    /// Called from [`super::drafter::DFlashDrafter::bind`] when the drafter
+    /// checkpoint omitted its own `embed_tokens.weight` (the published
+    /// `z-lab/Qwen3.5-4B-DFlash` shape). `embed` is a shared-buffer handle
+    /// to the target's `UnifiedEmbedding` (via
+    /// [`crate::layers::UnifiedEmbedding::clone_shared`] — lazy-array
+    /// share, no element copy), obtained through
+    /// [`crate::generate::LanguageModel::embed_tokens_module`].
+    ///
+    /// Mirrors upstream Python's `bind()` lazy assignment
+    /// (`self.embed_tokens = target.embed_tokens`). Idempotent: re-binding
+    /// (e.g. on `reset()` between generation calls) simply overwrites the
+    /// handle with a fresh shared view, which is harmless because the
+    /// underlying buffer is identical.
+    ///
+    /// A drafter that *did* ship its own `embed_tokens.weight` keeps its
+    /// own table — `DFlashDrafter::bind` only calls this when
+    /// [`Self::needs_embed_binding`] is `true`.
+    pub fn bind_target_embedding(&mut self, embed: UnifiedEmbedding) {
+        self.embed_tokens = Some(embed);
+    }
+
+    /// Whether this drafter still needs its `embed_tokens` table resolved
+    /// from the target.
+    ///
+    /// `true` for the published lazy-bind checkpoint until
+    /// [`Self::bind_target_embedding`] runs; `false` for a self-contained
+    /// drafter checkpoint that shipped its own `embed_tokens.weight`.
+    pub fn needs_embed_binding(&self) -> bool {
+        self.embed_tokens.is_none()
+    }
+
+    /// Borrow the resolved embedding table.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the embedding has not been bound yet (lazy-bind
+    /// checkpoint whose `bind()` has not run). The round-loop driver
+    /// always `bind()`s before `draft_block`, so a panic here is a wiring
+    /// bug rather than a recoverable runtime condition — the message
+    /// names the fix.
+    fn embed(&self) -> &UnifiedEmbedding {
+        self.embed_tokens.as_ref().expect(
+            "DFlash drafter embed_tokens is not bound — the published \
+             z-lab/Qwen3.5-4B-DFlash checkpoint omits embed_tokens.weight \
+             and the drafter must resolve it from the target via \
+             DFlashDrafter::bind() before the first forward()",
+        )
     }
 
     /// Construct fresh per-layer K/V caches, one per drafter layer.
@@ -190,7 +280,10 @@ impl DFlashDraftModel {
         );
 
         // h = embed_tokens(inputs)  →  [B, L, hidden_size]
-        let mut h = self.embed_tokens.forward(inputs);
+        // `embed()` panics with a fix-naming message if the lazy-bind
+        // tombstone was never resolved (see `Self::embed`).
+        let embed = self.embed();
+        let mut h = embed.forward(inputs);
 
         // h_ctx = hidden_norm(fc(target_hidden))  →  [B, T, hidden_size]
         let fc_out = self.fc.forward(target_hidden);
@@ -201,11 +294,12 @@ impl DFlashDraftModel {
             h = layer.forward(&h, &h_ctx, c);
         }
 
-        // Final norm + LM head.
+        // Final norm + LM head. The `Tied` arm routes through the same
+        // (possibly target-bound) embedding table.
         let h = self.norm.forward(&h);
         match &self.lm_head {
             LmHead::Own(linear) => linear.forward(&h),
-            LmHead::Tied => self.embed_tokens.as_linear(&h),
+            LmHead::Tied => embed.as_linear(&h),
         }
     }
 
@@ -321,6 +415,152 @@ mod tests {
                 LmHead::Tied => "tied",
             }
         }
+    }
+
+    /// Build a minimal `DFlashConfig` with a single decoder layer and tiny
+    /// dimensions so `from_weights` is cheap to drive in a unit test.
+    fn tiny_config() -> DFlashConfig {
+        DFlashConfig {
+            hidden_size: 4,
+            intermediate_size: 8,
+            num_hidden_layers: 1,
+            num_attention_heads: 2,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            vocab_size: 8,
+            num_target_layers: 4,
+            target_layer_ids: vec![0, 1, 2, 3],
+            ..DFlashConfig::default()
+        }
+    }
+
+    /// Populate every weight `DFlashDraftModel::from_weights` requires for
+    /// [`tiny_config`] *except* `embed_tokens.weight` and `lm_head.weight`
+    /// (the caller decides whether to add those). Shapes only have to be
+    /// 2D/1D parseable tensors — `from_weights` does construction, not a
+    /// forward pass, so the exact values are irrelevant here.
+    fn tiny_weights_without_embed() -> WeightMap {
+        let mut w: WeightMap = std::collections::HashMap::new();
+        // fc: [hidden, num_target_layers * hidden] = [4, 16]
+        w.insert("fc.weight".to_string(), ffi::zeros(&[4, 16], dtype::FLOAT32));
+        w.insert("hidden_norm.weight".to_string(), ffi::zeros(&[4], dtype::FLOAT32));
+        w.insert("norm.weight".to_string(), ffi::zeros(&[4], dtype::FLOAT32));
+        // Layer 0 projections. q out = n_heads*head_dim = 4; k/v out =
+        // n_kv_heads*head_dim = 2; o in = 4.
+        w.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            ffi::zeros(&[4, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.self_attn.k_proj.weight".to_string(),
+            ffi::zeros(&[2, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.self_attn.v_proj.weight".to_string(),
+            ffi::zeros(&[2, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.self_attn.o_proj.weight".to_string(),
+            ffi::zeros(&[4, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.self_attn.q_norm.weight".to_string(),
+            ffi::zeros(&[2], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.self_attn.k_norm.weight".to_string(),
+            ffi::zeros(&[2], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.mlp.gate_proj.weight".to_string(),
+            ffi::zeros(&[8, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.mlp.up_proj.weight".to_string(),
+            ffi::zeros(&[8, 4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.mlp.down_proj.weight".to_string(),
+            ffi::zeros(&[4, 8], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.input_layernorm.weight".to_string(),
+            ffi::zeros(&[4], dtype::FLOAT32),
+        );
+        w.insert(
+            "layers.0.post_attention_layernorm.weight".to_string(),
+            ffi::zeros(&[4], dtype::FLOAT32),
+        );
+        w
+    }
+
+    /// The published `z-lab/Qwen3.5-4B-DFlash` shape: no `embed_tokens.weight`
+    /// in the index, `tie_word_embeddings = true`, no `lm_head.weight`.
+    /// `from_weights` must succeed (no `LoadFailed`) and leave the model
+    /// with an `embed_tokens = None` lazy-bind tombstone.
+    #[test]
+    fn from_weights_builds_tombstone_when_embed_tokens_absent() {
+        let weights = tiny_weights_without_embed();
+        let model = DFlashDraftModel::from_weights(&weights, tiny_config())
+            .expect("lazy-bind checkpoint (no embed_tokens.weight) must still construct");
+        assert!(
+            model.embed_tokens.is_none(),
+            "embed_tokens must be a None tombstone when the index omits the table",
+        );
+        assert!(
+            model.needs_embed_binding(),
+            "needs_embed_binding() must report true before bind()",
+        );
+    }
+
+    /// A self-contained DFlash checkpoint that *does* ship its own
+    /// `embed_tokens.weight` must eager-load it — no tombstone, no
+    /// regression to the pre-#675 behavior.
+    #[test]
+    fn from_weights_eager_loads_when_embed_tokens_present() {
+        let mut weights = tiny_weights_without_embed();
+        // embed_tokens: [vocab, hidden] = [8, 4]
+        weights.insert(
+            "embed_tokens.weight".to_string(),
+            ffi::zeros(&[8, 4], dtype::FLOAT32),
+        );
+        let model = DFlashDraftModel::from_weights(&weights, tiny_config())
+            .expect("self-contained checkpoint must construct");
+        assert!(
+            model.embed_tokens.is_some(),
+            "embed_tokens must be eager-loaded when the index ships the table",
+        );
+        assert!(
+            !model.needs_embed_binding(),
+            "needs_embed_binding() must report false for a self-contained checkpoint",
+        );
+    }
+
+    /// `bind_target_embedding` installs the resolved embedding into the
+    /// tombstone, flipping `needs_embed_binding()` to `false`. This is the
+    /// lazy-bind assignment the DFlash drafter performs in `bind()`.
+    #[test]
+    fn bind_target_embedding_resolves_the_tombstone() {
+        let weights = tiny_weights_without_embed();
+        let mut model = DFlashDraftModel::from_weights(&weights, tiny_config())
+            .expect("lazy-bind checkpoint must construct");
+        assert!(model.needs_embed_binding());
+
+        // Stand-in for the target's embedding table — a regular
+        // [vocab, hidden] tensor, the same shape Qwen 3.5 hands out.
+        let target_embed = crate::layers::UnifiedEmbedding::Regular(
+            crate::layers::Embedding::new(ffi::zeros(&[8, 4], dtype::FLOAT32)),
+        );
+        model.bind_target_embedding(target_embed);
+
+        assert!(
+            model.embed_tokens.is_some(),
+            "bind_target_embedding must install the resolved embedding",
+        );
+        assert!(
+            !model.needs_embed_binding(),
+            "needs_embed_binding() must report false after bind_target_embedding",
+        );
     }
 
     /// Sanitize strips the `model.` prefix from keys without losing data.
