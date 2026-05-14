@@ -614,6 +614,7 @@ mod tests {
             &self,
             _prompt_tokens: &[i32],
             _sampler: &SamplingConfig,
+            _token_history: &[i32],
         ) -> (i32, MtpVerifyOutput) {
             panic!("BatchedMockTarget should not be driven through the B=1 path");
         }
@@ -1093,6 +1094,7 @@ mod tests {
                 &self,
                 _prompt_tokens: &[i32],
                 _sampler: &SamplingConfig,
+                _token_history: &[i32],
             ) -> (i32, MtpVerifyOutput) {
                 let seed = self.build_verify_output(1);
                 (self.first_bonus, seed)
@@ -1204,6 +1206,7 @@ mod tests {
                 &[1, 2, 3],
                 max_new_tokens,
                 &SamplingConfig::greedy(),
+                &[],
                 &AtomicBool::new(false),
             );
             reference_tokens.push(tokens);

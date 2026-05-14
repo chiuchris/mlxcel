@@ -201,47 +201,62 @@ fn burst_declined_for_adopted_prompt_cache_prefix() {
     );
 }
 
+// History-dependent sampling penalties are NO LONGER a decline-to-classic
+// gate (issue #677): the burst threads `initial_token_history(&prompt, ..)`
+// into the first-bonus sample, so a penalty-bearing request's first bonus
+// is byte-identical to the classic decode path. The four tests below
+// (formerly `burst_declined_for_{repetition,frequency,presence,dry}_penalty`)
+// now assert the gate stays OPEN for each penalty config. The
+// `token_history` threading itself is pinned by
+// `drive_mtp_generator_round_loop_threads_token_history_into_prefill_and_seed`
+// further down; full byte-equality against the classic path lives in the
+// real-model `tests/speculative_parity.rs` lane.
+
 #[test]
-fn burst_declined_for_repetition_penalty() {
+fn burst_allowed_for_repetition_penalty() {
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
     seq.sampling.repetition_penalty = 1.1;
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "repetition_penalty != 1.0 must fall back to classic decode"
+        should_burst_for_sequence(&dispatch, &seq),
+        "repetition_penalty != 1.0 must NOT decline to classic — the burst \
+         now threads token_history into the first-bonus sample (issue #677)"
     );
 }
 
 #[test]
-fn burst_declined_for_frequency_penalty() {
+fn burst_allowed_for_frequency_penalty() {
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
     seq.sampling.frequency_penalty = 0.5;
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "frequency_penalty != 0.0 must fall back to classic decode"
+        should_burst_for_sequence(&dispatch, &seq),
+        "frequency_penalty != 0.0 must NOT decline to classic — the burst \
+         now threads token_history into the first-bonus sample (issue #677)"
     );
 }
 
 #[test]
-fn burst_declined_for_presence_penalty() {
+fn burst_allowed_for_presence_penalty() {
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
     seq.sampling.presence_penalty = 0.25;
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "presence_penalty != 0.0 must fall back to classic decode"
+        should_burst_for_sequence(&dispatch, &seq),
+        "presence_penalty != 0.0 must NOT decline to classic — the burst \
+         now threads token_history into the first-bonus sample (issue #677)"
     );
 }
 
 #[test]
-fn burst_declined_for_dry_penalty() {
+fn burst_allowed_for_dry_penalty() {
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
     seq.sampling.dry_multiplier = 0.8;
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "dry_multiplier != 0.0 must fall back to classic decode"
+        should_burst_for_sequence(&dispatch, &seq),
+        "dry_multiplier != 0.0 must NOT decline to classic — the burst \
+         now threads token_history into the first-bonus sample (issue #677)"
     );
 }
 
@@ -327,6 +342,11 @@ struct MockMtpTarget {
     scripted_target_tokens: RefCell<Vec<Vec<i32>>>,
     eos: Vec<i32>,
     cumulative_offset: RefCell<usize>,
+    /// `token_history` slice the most recent `prefill_and_seed` call
+    /// received. `None` until `prefill_and_seed` runs. Used by
+    /// `drive_mtp_generator_round_loop_threads_token_history_into_prefill_and_seed`
+    /// to pin the issue #677 plumbing.
+    seen_token_history: RefCell<Option<Vec<i32>>>,
 }
 
 impl MockMtpTarget {
@@ -336,6 +356,7 @@ impl MockMtpTarget {
             scripted_target_tokens: RefCell::new(scripted),
             eos,
             cumulative_offset: RefCell::new(0),
+            seen_token_history: RefCell::new(None),
         }
     }
 
@@ -367,7 +388,11 @@ impl MtpTarget for MockMtpTarget {
         &self,
         _prompt_tokens: &[i32],
         _sampler: &SamplingConfig,
+        token_history: &[i32],
     ) -> (i32, MtpVerifyOutput) {
+        // Record what the generator handed us so the issue #677 test can
+        // assert the burst threaded the real token_history through.
+        *self.seen_token_history.borrow_mut() = Some(token_history.to_vec());
         let seed = self.build_verify_output(1);
         (self.first_bonus, seed)
     }
@@ -594,7 +619,7 @@ fn drive_mtp_generator_round_loop_produces_more_than_one_token_when_drafter_is_b
     // Not cancelled — exercise the full round loop.
     let cancel = AtomicBool::new(false);
     let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
 
     // We expect 8 tokens before EOS (4 per round, 2 rounds):
     // [100, 10, 11, 12, 13, 20, 21, 22]. Then the 9999 EOS in round 2's
@@ -653,7 +678,7 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_drafter_is_unbound() {
     // drafter, not cancellation.
     let cancel = AtomicBool::new(false);
     let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
 
     // CRITICAL invariant — without bind, the round loop breaks on the
     // first draft_block call and we get exactly the seed bonus.
@@ -733,7 +758,7 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_cancelled_before_first_
     // that disconnected while the request was still queued / prefilling.
     let cancel = AtomicBool::new(true);
     let (emitted, _stats) =
-        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &[], &cancel);
 
     // The prefill + seed-bonus emission happen unconditionally; the
     // per-round cancellation check fires at the TOP of the round loop,
@@ -761,6 +786,76 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_cancelled_before_first_
         !events_snapshot.contains(&"draft_block"),
         "draft_block must NOT run when cancellation is pre-flagged — the \
          round loop breaks before reaching it: {events_snapshot:?}"
+    );
+}
+
+// =============================================================================
+// History-dependent sampling penalties through the burst — issue #677
+//
+// PR #671 (issue #670) gated penalty-bearing requests
+// (repetition / frequency / presence / DRY) to the classic decode path
+// because the burst's first-bonus sample passed `&[]` for token_history.
+// Issue #677 threads `initial_token_history(&prompt, ..)` through
+// `MtpGenerator::generate` → `MtpTarget::prefill_and_seed` (and through
+// `sample_token_optimized` on the DFlash side), and removes the four
+// decline-to-classic gate predicates.
+//
+// The gate change is pinned by `burst_allowed_for_{repetition,frequency,
+// presence,dry}_penalty` above. The plumbing — that the generator
+// actually forwards the caller's token_history to `prefill_and_seed`
+// rather than dropping it — is pinned below by recording the slice the
+// mock target received. Full byte-equality between the burst's first
+// bonus and the classic path's first token (acceptance criterion 2)
+// requires a real Gemma 4 / Qwen 3.5 target and lives in the
+// `tests/speculative_parity.rs` real-model lane.
+// =============================================================================
+
+#[test]
+fn drive_mtp_generator_round_loop_threads_token_history_into_prefill_and_seed() {
+    use mlxcel_core::speculative::mtp::MtpGenerator;
+
+    let (target, drafter_scripts) = make_two_round_target_and_drafter();
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut drafter = TrackingMockDrafter::new(drafter_scripts, events.clone());
+    let lm = MinimalLm;
+    drafter
+        .bind(&lm)
+        .expect("bind must succeed on tracking mock");
+
+    let boxed: Box<dyn Drafter> = Box::new(drafter);
+    let mut generator = MtpGenerator::new(target, boxed, /* block_size= */ 4);
+
+    let prompt = vec![1, 2, 3];
+    let sampling = SamplingConfig::greedy();
+    // A non-empty token_history — what the burst computes via
+    // `initial_token_history(&prompt, sampling.needs_token_history())`
+    // for a repetition/frequency/presence/DRY-bearing request.
+    let token_history = vec![1, 2, 3];
+    let cancel = AtomicBool::new(false);
+    let (_emitted, _stats) = generator.generate(
+        &prompt,
+        /* max_tokens= */ 16,
+        &sampling,
+        &token_history,
+        &cancel,
+    );
+
+    // The generator must have forwarded the caller's token_history
+    // verbatim into `MtpTarget::prefill_and_seed` — if it dropped it (or
+    // re-passed `&[]`), penalty-bearing requests would silently diverge
+    // from the classic decode path. This is the load-bearing issue #677
+    // plumbing assertion.
+    let seen = generator
+        .target()
+        .seen_token_history
+        .borrow()
+        .clone()
+        .expect("prefill_and_seed must have been called exactly once");
+    assert_eq!(
+        seen, token_history,
+        "MtpGenerator::generate must forward the caller's token_history \
+         into MtpTarget::prefill_and_seed unchanged (issue #677); got {seen:?}"
     );
 }
 

@@ -184,6 +184,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         &self,
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
+        token_history: &[i32],
     ) -> (i32, MtpVerifyOutput) {
         let prompt_arr =
             mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
@@ -204,9 +205,13 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         );
 
         // Sample the first bonus from the last-position logits.
-        // `sample_token_optimized` returns `(token_arr, adjusted_logits)`
-        // — for the seed sample we only need the token.
-        let (token_arr, _) = sample_token_optimized(&logits, sampler, &[]);
+        // `token_history` carries the history-dependent-penalty context
+        // (repetition / frequency / presence / DRY) so the first bonus
+        // is byte-identical to the classic decode path's first token
+        // (issue #677). `sample_token_optimized` returns
+        // `(token_arr, adjusted_logits)` — for the seed sample we only
+        // need the token.
+        let (token_arr, _) = sample_token_optimized(&logits, sampler, token_history);
         mlxcel_core::eval(&token_arr);
         let first_bonus = mlxcel_core::item_i32(&token_arr);
 
@@ -428,8 +433,10 @@ impl<'a> MtpTarget for Gemma4VLMtpTargetAdapter<'a> {
         &self,
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
+        token_history: &[i32],
     ) -> (i32, MtpVerifyOutput) {
-        self.inner.prefill_and_seed(prompt_tokens, sampler)
+        self.inner
+            .prefill_and_seed(prompt_tokens, sampler, token_history)
     }
 
     fn embed_token(&self, token_id: i32) -> UniquePtr<MlxArray> {

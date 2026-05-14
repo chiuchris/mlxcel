@@ -203,6 +203,12 @@ pub trait MtpTarget {
     /// carries the captured last-token hidden and the last full/SWA
     /// shared K/V slabs.
     ///
+    /// `token_history` is the history-dependent-penalty context for the
+    /// first-bonus sample (repetition / frequency / presence / DRY). The
+    /// server burst path passes `initial_token_history(&prompt, ..)` so
+    /// the first bonus is byte-identical to the classic decode path's
+    /// first token; callers with no penalty configured pass `&[]`.
+    ///
     /// **Cache state on return**: the target's per-sequence cache has
     /// `prompt.len()` entries (the prompt prefill). The bonus token is
     /// NOT yet in the cache — it will be forwarded as the first slot of
@@ -219,6 +225,7 @@ pub trait MtpTarget {
         &self,
         prompt_tokens: &[i32],
         sampler: &SamplingConfig,
+        token_history: &[i32],
     ) -> (i32, MtpVerifyOutput);
 
     /// Embed a token id through the target's embedding table. Equivalent

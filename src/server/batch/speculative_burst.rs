@@ -97,13 +97,16 @@
 //! - The request adopted a prompt-cache prefix (`prefill_start_offset > 0`):
 //!   a burst owns the cache for its full lifetime; mixing an adopted prefix
 //!   would double-prefill the leading tokens.
-//! - The sampling config has any history-dependent penalty active
-//!   (repetition, frequency, presence, DRY): the burst's first-token sample
-//!   uses an empty token history, which would silently skew the distribution.
 //! - The request asked for logprobs: the burst path streams `Token(text)`
 //!   only, not `TokenWithLogprobs`.
 //! - Thinking-budget enforcement is active: the burst path does not yet
 //!   implement forced `</think>` injection on budget exceeded.
+//!
+//! History-dependent sampling penalties (repetition / frequency /
+//! presence / DRY) are **not** a gate: the burst threads
+//! `initial_token_history(&prompt, ..)` into the first-bonus sample so a
+//! penalty-bearing request's first bonus is byte-identical to the
+//! classic decode path (issue #677).
 //!
 //! Each declined request is logged at `debug` level with the gate reason.
 //!
@@ -125,7 +128,7 @@ use std::time::Instant;
 use mlxcel_core::drafter::dflash::DFlashGenerator;
 use mlxcel_core::drafter::{Drafter, DrafterKind, load_drafter};
 use mlxcel_core::generate::{LanguageModel, SamplingConfig};
-use mlxcel_core::generation_policy::merged_eos_token_ids;
+use mlxcel_core::generation_policy::{initial_token_history, merged_eos_token_ids};
 use mlxcel_core::speculative::mtp::MtpGenerator;
 
 use crate::LoadedModel;
@@ -257,20 +260,19 @@ impl WorkerDrafterSlot {
 ///    A speculative burst owns the cache for its full lifetime; mixing
 ///    an adopted prefix with the burst's own prefill would double-prefill
 ///    the leading tokens.
-/// 5. `seq.sampling` uses no history-dependent penalty modes that the
-///    burst path's first-token sampler does not yet thread through
-///    (repetition_penalty != 1.0, frequency_penalty != 0.0,
-///    presence_penalty != 0.0, dry_multiplier != 0.0). The burst's
-///    first-bonus sample today passes `&[]` for `token_history` so any
-///    penalty-bearing request would silently produce a different token
-///    distribution than the classic path.
-/// 6. `seq.logprobs_config.enabled == false` — the burst path streams
+/// 5. `seq.logprobs_config.enabled == false` — the burst path streams
 ///    `GenerateEvent::Token(text)` only and does not emit
 ///    `TokenWithLogprobs`. Routing the request to classic decode
 ///    preserves the API contract.
-/// 7. `seq.thinking` is disabled — the burst path does not implement
+/// 6. `seq.thinking` is disabled — the burst path does not implement
 ///    forced `</think>` injection on budget exceeded. Routing to classic
 ///    preserves the budget enforcement.
+///
+/// History-dependent sampling penalties (repetition / frequency /
+/// presence / DRY) are **no longer** a gate (issue #677): the burst
+/// threads `initial_token_history(&prompt, ..)` into the first-bonus
+/// sample, so a penalty-bearing request's first bonus is byte-identical
+/// to the classic decode path.
 ///
 /// Each gate-out logs at debug level so an operator can correlate a
 /// "spec request fell back to classic" with the reason. The gates run
@@ -304,32 +306,14 @@ pub(crate) fn should_burst_for_sequence(
         );
         return false;
     }
-    // Sampling-config gates: the burst's first-token sample uses
-    // `&[]` for token_history, so any history-dependent penalty
-    // (repetition / frequency / presence / DRY) would silently produce
-    // a different distribution than the classic path. Threading the
-    // full token_history through is tracked as a follow-up; gate-out
-    // is the safe default until then.
-    let sampling = &seq.sampling;
-    #[allow(clippy::float_cmp)]
-    let repetition_active = sampling.repetition_penalty != 1.0;
-    #[allow(clippy::float_cmp)]
-    let frequency_active = sampling.frequency_penalty != 0.0;
-    #[allow(clippy::float_cmp)]
-    let presence_active = sampling.presence_penalty != 0.0;
-    let dry_active = sampling.dry_multiplier != 0.0;
-    if repetition_active || frequency_active || presence_active || dry_active {
-        tracing::debug!(
-            "speculative burst declined for seq {}: history-dependent penalty active \
-             (repetition={}, frequency={}, presence={}, dry={})",
-            seq.seq_id,
-            sampling.repetition_penalty,
-            sampling.frequency_penalty,
-            sampling.presence_penalty,
-            sampling.dry_multiplier,
-        );
-        return false;
-    }
+    // History-dependent sampling penalties (repetition / frequency /
+    // presence / DRY) are NO LONGER a decline-to-classic gate (issue
+    // #677). The burst now threads `initial_token_history(&prompt, ..)`
+    // into the first-bonus sample via `MtpTarget::prefill_and_seed` /
+    // `sample_token_optimized`, so a penalty-bearing request's first
+    // bonus is byte-identical to the classic decode path. The
+    // subsequent round-loop tokens come from the target's greedy
+    // argmax, which carries no history dependence.
     if seq.logprobs_config.enabled {
         tracing::debug!(
             "speculative burst declined for seq {}: logprobs_config.enabled=true \
@@ -630,6 +614,16 @@ fn run_mtp_burst(
     let max_tokens = seq.max_tokens.max(1);
     let prompt = seq.prompt_tokens.clone();
 
+    // History-dependent-penalty context for the first-bonus sample
+    // (repetition / frequency / presence / DRY). `initial_token_history`
+    // returns the prompt tokens when any such penalty is active and an
+    // empty vec otherwise — exactly what the classic decode path seeds
+    // its first-token sample with (`scheduler.rs::finish_prefill`). This
+    // is what makes the burst's first bonus byte-identical to the
+    // classic path for penalty-bearing requests (issue #677).
+    let token_history =
+        initial_token_history(&prompt, sampling.needs_token_history());
+
     // Cooperative-cancellation flag plumbed into the round-loop driver.
     // The burst owns the worker thread for its full lifetime; on a
     // client disconnect mid-burst the scheduler flips `seq.cancelled`
@@ -645,6 +639,7 @@ fn run_mtp_burst(
                 &prompt,
                 max_tokens,
                 &sampling,
+                &token_history,
                 block_size,
                 cancel,
             )
@@ -660,6 +655,7 @@ fn run_mtp_burst(
                 &prompt,
                 max_tokens,
                 &sampling,
+                &token_history,
                 block_size,
                 cancel,
             )
@@ -717,16 +713,24 @@ struct DriveMtpOutput {
 /// without needing a `&dyn LanguageModel` parameter — keeping the
 /// signature mockable.
 ///
+/// `token_history` is the history-dependent-penalty context forwarded
+/// to [`MtpGenerator::generate`] (then on to
+/// [`mlxcel_core::speculative::mtp::target::MtpTarget::prefill_and_seed`])
+/// for the first-bonus sample, so a penalty-bearing request's first
+/// bonus is byte-identical to the classic decode path (issue #677).
+///
 /// `cancel` is the cooperative-cancellation flag forwarded to
 /// [`MtpGenerator::generate`]; it is checked once per round so a
 /// disconnected client's burst stops occupying the worker thread
 /// (issue #672).
+#[allow(clippy::too_many_arguments)]
 fn drive_mtp_generator<T>(
     target: T,
     drafter: Box<dyn Drafter>,
     prompt: &[i32],
     max_tokens: usize,
     sampling: &SamplingConfig,
+    token_history: &[i32],
     block_size: usize,
     cancel: &AtomicBool,
 ) -> (DriveMtpOutput, mlxcel_core::generate::GenerationStats)
@@ -734,7 +738,8 @@ where
     T: mlxcel_core::speculative::mtp::target::MtpTarget,
 {
     let mut generator = MtpGenerator::new(target, drafter, block_size);
-    let (emitted, stats) = generator.generate(prompt, max_tokens, sampling, cancel);
+    let (emitted, stats) =
+        generator.generate(prompt, max_tokens, sampling, token_history, cancel);
     // `MtpGenerator` owns the drafter by value; recover it via
     // `into_drafter` for slot-restoration.
     let recovered_drafter = generator.into_drafter();
@@ -795,6 +800,16 @@ fn run_dflash_burst(
     let prompt = seq.prompt_tokens.clone();
     let eos_token_ids = merged_eos_token_ids(ctx.model.eos_token_ids(), &sampling.stop_token_ids);
 
+    // History-dependent-penalty context for the first-bonus sample
+    // (repetition / frequency / presence / DRY). `initial_token_history`
+    // returns the prompt tokens when any such penalty is active and an
+    // empty vec otherwise — exactly what the classic decode path seeds
+    // its first-token sample with (`scheduler.rs::finish_prefill`). This
+    // is what makes the burst's first bonus byte-identical to the
+    // classic path for penalty-bearing requests (issue #677).
+    let token_history =
+        initial_token_history(&prompt, sampling.needs_token_history());
+
     // Cooperative-cancellation flag plumbed into the round-loop driver.
     // The burst owns the worker thread for its full lifetime; on a
     // client disconnect mid-burst the scheduler flips `seq.cancelled`
@@ -810,6 +825,7 @@ fn run_dflash_burst(
             qwen,
             &prompt,
             &sampling,
+            &token_history,
             &eos_token_ids,
             owned_drafter,
             block_size,
@@ -843,6 +859,14 @@ fn run_dflash_burst(
 /// DFlash burst on `Qwen35Model` — handles prefill, first-bonus + first-hidden
 /// extraction, and `DFlashGenerator::run` driving.
 ///
+/// `token_history` is the history-dependent-penalty context for the
+/// first-bonus sample (repetition / frequency / presence / DRY); it is
+/// forwarded to `sample_token_optimized` so a penalty-bearing request's
+/// first bonus is byte-identical to the classic decode path (issue
+/// #677). The round loop itself runs greedy at temp=0 today, so the
+/// per-round target argmax is unaffected — only the first bonus reads
+/// the history.
+///
 /// `cancel` is the cooperative-cancellation flag forwarded to
 /// [`DFlashGenerator::run`]; it is checked once per round so a
 /// disconnected client's burst stops occupying the worker thread
@@ -852,6 +876,7 @@ fn run_dflash_on_qwen35(
     qwen: &crate::models::Qwen35Model,
     prompt_tokens: &[i32],
     sampling: &SamplingConfig,
+    token_history: &[i32],
     eos_token_ids: &[i32],
     owned_drafter: Box<dyn Drafter>,
     block_size: u32,
@@ -894,8 +919,14 @@ fn run_dflash_on_qwen35(
         &[0, last_pos, 0],
         &[logits_shape[0], last_pos + 1, vocab],
     );
+    // `token_history` carries the history-dependent-penalty context
+    // (repetition / frequency / presence / DRY) so the first bonus is
+    // byte-identical to the classic decode path's first token (issue
+    // #677). The subsequent round-loop tokens are produced by the
+    // target's greedy argmax inside `DFlashGenerator::run` (DFlash is
+    // greedy-only today), which carries no history dependence.
     let (first_bonus_arr, _) =
-        mlxcel_core::sampling::sample_token_optimized(&last_logits, sampling, &[]);
+        mlxcel_core::sampling::sample_token_optimized(&last_logits, sampling, token_history);
     mlxcel_core::eval(&first_bonus_arr);
     let first_bonus = mlxcel_core::item_i32(&first_bonus_arr);
 

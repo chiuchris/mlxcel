@@ -144,6 +144,12 @@ impl<T: MtpTarget> MtpGenerator<T> {
     /// - `sampling`: sampling config. **Greedy parity requires
     ///   `temperature == 0`** — this is the load-bearing correctness
     ///   gate of the MTP path (see issue #629).
+    /// - `token_history`: history-dependent-penalty context forwarded to
+    ///   [`MtpTarget::prefill_and_seed`] for the first-bonus sample
+    ///   (repetition / frequency / presence / DRY). The server burst
+    ///   path passes `initial_token_history(&prompt, ..)` so the first
+    ///   bonus is byte-identical to the classic decode path; callers
+    ///   with no penalty configured pass `&[]` (issue #677).
     /// - `cancel`: cooperative-cancellation flag. Checked **once per
     ///   round** (not per token) at the top of the round loop; when set,
     ///   the generator returns early with whatever tokens it has already
@@ -162,6 +168,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
+        token_history: &[i32],
         cancel: &AtomicBool,
     ) -> (Vec<i32>, GenerationStats) {
         assert!(
@@ -189,7 +196,8 @@ impl<T: MtpTarget> MtpGenerator<T> {
         // round.
         let prefill_start = Instant::now();
         let (first_bonus, mut verify_out) =
-            self.target.prefill_and_seed(prompt_tokens, sampling);
+            self.target
+                .prefill_and_seed(prompt_tokens, sampling, token_history);
         let prefill_time = prefill_start.elapsed();
 
         // Emit the first bonus and short-circuit if it's EOS or
