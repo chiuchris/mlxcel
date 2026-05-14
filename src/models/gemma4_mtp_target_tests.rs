@@ -180,8 +180,7 @@ fn batched_argmax_per_row_returns_b_by_width_ids() {
         0.9, 0.1, 0.2, 0.3, // pos 2 -> 0
     ];
     let logits = mlxcel_core::from_slice_f32(&data, &[2, 3, 4]);
-    let argmax =
-        Gemma4MtpBatchedTargetAdapter::argmax_per_row(logits.as_ref().unwrap(), 2, 3);
+    let argmax = Gemma4MtpBatchedTargetAdapter::argmax_per_row(logits.as_ref().unwrap(), 2, 3);
     assert_eq!(argmax, vec![vec![2, 0, 3], vec![1, 3, 0]]);
 }
 
@@ -236,7 +235,11 @@ fn batched_last_position_hidden_slices_to_b_by_one() {
     let hidden = mlxcel_core::from_slice_f32(&data, &[2, 4, 3]);
     let last = Gemma4MtpBatchedTargetAdapter::last_position_hidden(hidden.as_ref().unwrap());
     let shape = mlxcel_core::array_shape(last.as_ref().unwrap());
-    assert_eq!(shape, vec![2, 1, 3], "must slice [B, T, H] down to [B, 1, H]");
+    assert_eq!(
+        shape,
+        vec![2, 1, 3],
+        "must slice [B, T, H] down to [B, 1, H]"
+    );
 }
 
 #[test]

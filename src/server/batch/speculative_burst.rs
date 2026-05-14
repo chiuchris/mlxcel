@@ -711,8 +711,7 @@ fn run_mtp_burst(
     // its first-token sample with (`scheduler.rs::finish_prefill`). This
     // is what makes the burst's first bonus byte-identical to the
     // classic path for penalty-bearing requests (issue #677).
-    let token_history =
-        initial_token_history(&prompt, sampling.needs_token_history());
+    let token_history = initial_token_history(&prompt, sampling.needs_token_history());
 
     // Cooperative-cancellation flag plumbed into the round-loop driver.
     // The burst owns the worker thread for its full lifetime; on a
@@ -923,8 +922,7 @@ fn run_dflash_burst(
     // its first-token sample with (`scheduler.rs::finish_prefill`). This
     // is what makes the burst's first bonus byte-identical to the
     // classic path for penalty-bearing requests (issue #677).
-    let token_history =
-        initial_token_history(&prompt, sampling.needs_token_history());
+    let token_history = initial_token_history(&prompt, sampling.needs_token_history());
 
     // Cooperative-cancellation flag plumbed into the round-loop driver.
     // The burst owns the worker thread for its full lifetime; on a
@@ -1265,8 +1263,7 @@ fn finalize_burst_success(
         // make the token text and logprob metadata inconsistent. The
         // classic path drops the logprob in exactly this case
         // (`scheduler.rs::decode_single_step`).
-        let (final_token, override_fired) =
-            apply_burst_thinking_budget(&mut seq.thinking, token);
+        let (final_token, override_fired) = apply_burst_thinking_budget(&mut seq.thinking, token);
 
         // EOS check before recording the token so EOS is reported as
         // FinishReason::Stop, not Length, matching the classic
@@ -1412,16 +1409,58 @@ fn emit_error_and_finalize(_ctx: BurstContext<'_>, seq: SequenceInfo, msg: &str)
 // `FinishReason::Stop` at the first EOS, `FinishReason::Length` at the
 // budget, `FinishReason::Stop` otherwise.
 
+/// One finalized row of a batched burst — the per-row analogue of
+/// [`BurstFinalized`].
+///
+/// Issue #674: originally `BatchedBurstFinalized.rows` carried only
+/// `(seq_id, tokens_generated)`, so the scheduler's batched arm could
+/// release each row's cache slot and record its Prometheus metric, but
+/// it had no handle on the prompt / committed token vectors a
+/// prompt-cache donate needs. Issue #688 widens each row to the same
+/// donate-payload shape as the B = 1 [`BurstFinalized`] so the batched
+/// arm can call
+/// [`crate::server::batch::scheduler::BatchScheduler::donate_finished_sequence_cache`]
+/// per row, symmetric with the B = 1 burst arm and the classic
+/// `finalize_completed` path. As with the B = 1 path the donate helper
+/// is hard-gated on a dense KV-cache backend, so for today's
+/// batched-eligible model families — Gemma 4 (MTP) and Qwen 3.5
+/// (DFlash), both `SequenceStateBackend::ModelOwned` — the donate is a
+/// guarded no-op; wiring it in removes a latent multi-turn cache-reuse
+/// regression for any dense-KV-cache model that later becomes
+/// batched-burst-eligible.
+#[derive(Debug, Clone)]
+pub(crate) struct BatchedBurstRow {
+    pub seq_id: mlxcel_core::cache::SequenceId,
+    /// Total tokens streamed to this row's client. Mirrors
+    /// [`BurstFinalized::tokens_generated`].
+    pub tokens_generated: usize,
+    /// This row's full prompt token stream, forwarded so the scheduler
+    /// can compose the prompt-cache donate key. Empty on the error /
+    /// transition-failure rows (no healthy cache to donate). Mirrors
+    /// [`BurstFinalized::prompt_tokens`].
+    pub prompt_tokens: Vec<i32>,
+    /// The tokens this row actually committed to the sequence (post
+    /// early-EOS truncation). Joined with `prompt_tokens` by the
+    /// scheduler to form the donate entry's token key. Empty on the
+    /// error rows. Mirrors [`BurstFinalized::generated_tokens`].
+    pub generated_tokens: Vec<i32>,
+    /// Whether this row reached a healthy finish (`Stop` / `Length`).
+    /// `false` on the error / transition-failure rows. Mirrors
+    /// [`BurstFinalized::healthy_finish`].
+    pub healthy_finish: bool,
+}
+
 /// Successful batched-burst outcome returned to the scheduler.
 ///
-/// Carries the per-row `(seq_id, tokens_generated)` so the scheduler can
-/// release each row's cache slot and record each row's per-sequence
-/// Prometheus metric — the batched analogue of [`BurstFinalized`].
+/// Carries one [`BatchedBurstRow`] per window row so the scheduler can
+/// donate each row's KV cache back to the prompt-cache store, release
+/// each row's cache slot, and record each row's per-sequence Prometheus
+/// metric — the batched analogue of [`BurstFinalized`].
 #[derive(Debug, Clone)]
 pub(crate) struct BatchedBurstFinalized {
-    /// Per-row `(seq_id, tokens_generated)`. Same length / order as the
-    /// window the scheduler handed to [`try_run_burst_batched`].
-    pub rows: Vec<(mlxcel_core::cache::SequenceId, usize)>,
+    /// Per-row finalize payloads. Same length / order as the window the
+    /// scheduler handed to [`try_run_burst_batched`].
+    pub rows: Vec<BatchedBurstRow>,
 }
 
 /// Run a speculative burst for a *window* of `seqs` (B = `seqs.len()`),
@@ -1479,9 +1518,7 @@ pub(crate) fn try_run_burst_batched(
             run_dflash_burst_batched(ctx.reborrow(), &mut seqs, bs)
         }
         crate::server::SpeculativeDispatch::Disabled
-        | crate::server::SpeculativeDispatch::Classic { .. } => {
-            Err(BurstOutcome::DeclineToClassic)
-        }
+        | crate::server::SpeculativeDispatch::Classic { .. } => Err(BurstOutcome::DeclineToClassic),
     };
 
     match result {
@@ -1499,7 +1536,16 @@ pub(crate) fn try_run_burst_batched(
                         seq,
                         &format!("State transition error: {err}"),
                     );
-                    finalized_rows.push((seq_id, 0));
+                    // Transition failure is an error outcome — no
+                    // healthy cache to donate (issue #688, mirrors the
+                    // B = 1 arm's transition-failure `BurstFinalized`).
+                    finalized_rows.push(BatchedBurstRow {
+                        seq_id,
+                        tokens_generated: 0,
+                        prompt_tokens: Vec::new(),
+                        generated_tokens: Vec::new(),
+                        healthy_finish: false,
+                    });
                     continue;
                 }
                 // The batched round-loop drivers do not capture per-row
@@ -1519,7 +1565,17 @@ pub(crate) fn try_run_burst_batched(
                     /* prefill_time_ms */ 0.0,
                     /* decode_time_ms */ 0.0,
                 );
-                finalized_rows.push((seq_id, finalized.tokens_generated));
+                // Surface the per-row prompt + committed token vectors
+                // and the healthy-finish flag so the scheduler can
+                // mirror the B = 1 arm's prompt-cache donate per row
+                // (issue #688).
+                finalized_rows.push(BatchedBurstRow {
+                    seq_id,
+                    tokens_generated: finalized.tokens_generated,
+                    prompt_tokens: finalized.prompt_tokens,
+                    generated_tokens: finalized.generated_tokens,
+                    healthy_finish: finalized.healthy_finish,
+                });
             }
             Ok(BatchedBurstFinalized {
                 rows: finalized_rows,
@@ -1542,7 +1598,17 @@ pub(crate) fn try_run_burst_batched(
             for seq in seqs.into_iter() {
                 let seq_id = seq.seq_id;
                 emit_error_and_finalize(ctx.reborrow(), seq, &msg);
-                finalized_rows.push((seq_id, 0));
+                // Error outcome: every row's KV cache is assumed
+                // tainted, so no donate — empty/false payload (issue
+                // #688, mirrors the B = 1 arm's `BurstOutcome::Error`
+                // `BurstFinalized`).
+                finalized_rows.push(BatchedBurstRow {
+                    seq_id,
+                    tokens_generated: 0,
+                    prompt_tokens: Vec::new(),
+                    generated_tokens: Vec::new(),
+                    healthy_finish: false,
+                });
             }
             Ok(BatchedBurstFinalized {
                 rows: finalized_rows,
@@ -1619,11 +1685,25 @@ fn run_mtp_burst_batched(
     let (tokens_per_row, recovered_drafter) = match ctx.model {
         LoadedModel::Gemma4(wrapper) => {
             let adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, batch_size);
-            drive_mtp_batched_generator(adapter, owned_drafter, &prompts, max_tokens, &sampling, block_size)?
+            drive_mtp_batched_generator(
+                adapter,
+                owned_drafter,
+                &prompts,
+                max_tokens,
+                &sampling,
+                block_size,
+            )?
         }
         LoadedModel::Gemma4VLM(vlm) => {
             let adapter = Gemma4VLMtpBatchedTargetAdapter::new(vlm, batch_size);
-            drive_mtp_batched_generator(adapter, owned_drafter, &prompts, max_tokens, &sampling, block_size)?
+            drive_mtp_batched_generator(
+                adapter,
+                owned_drafter,
+                &prompts,
+                max_tokens,
+                &sampling,
+                block_size,
+            )?
         }
         _ => {
             return Err(BurstOutcome::Error(format!(
@@ -1633,7 +1713,8 @@ fn run_mtp_burst_batched(
         }
     };
 
-    ctx.drafter_slot.return_drafter(recovered_drafter, target_lm);
+    ctx.drafter_slot
+        .return_drafter(recovered_drafter, target_lm);
     Ok(tokens_per_row)
 }
 
@@ -1796,7 +1877,11 @@ fn run_dflash_batched_on_qwen35(
         );
     }
     let concatenated_shape = mlxcel_core::array_shape(&concatenated);
-    debug_assert_eq!(concatenated_shape.len(), 3, "concatenated hidden must be 3-D");
+    debug_assert_eq!(
+        concatenated_shape.len(),
+        3,
+        "concatenated hidden must be 3-D"
+    );
     let feature_dim = concatenated_shape[2];
     let first_hidden = mlxcel_core::slice(
         &concatenated,

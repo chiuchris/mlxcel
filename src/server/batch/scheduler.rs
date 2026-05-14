@@ -1802,21 +1802,19 @@ impl BatchScheduler {
             // Reserve one slot for the head itself.
             let max_extra = max_batch_size.saturating_sub(1);
             let dispatch = &self.speculative_dispatch;
-            let extra = self.prefill_queue.drain_matching_window(
-                head_lane,
-                max_extra,
-                |candidate| {
-                    candidate.prompt_tokens.len() == head_prompt_len
-                        && candidate.max_tokens == head_max_tokens
-                        && super::speculative_burst::sampling_config_eq(
-                            &candidate.sampling,
-                            &head_sampling,
-                        )
-                        && super::speculative_burst::should_burst_for_sequence(
-                            dispatch, candidate,
-                        )
-                },
-            );
+            let extra =
+                self.prefill_queue
+                    .drain_matching_window(head_lane, max_extra, |candidate| {
+                        candidate.prompt_tokens.len() == head_prompt_len
+                            && candidate.max_tokens == head_max_tokens
+                            && super::speculative_burst::sampling_config_eq(
+                                &candidate.sampling,
+                                &head_sampling,
+                            )
+                            && super::speculative_burst::should_burst_for_sequence(
+                                dispatch, candidate,
+                            )
+                    });
             let mut window = Vec::with_capacity(extra.len() + 1);
             window.push(seq);
             window.extend(extra);
@@ -1835,28 +1833,53 @@ impl BatchScheduler {
             };
             match super::speculative_burst::try_run_burst_batched(ctx, window) {
                 Ok(super::speculative_burst::BatchedBurstFinalized { rows }) => {
-                    // Every row handled inline. Release each row's cache
-                    // slot and record each row's per-sequence metric —
-                    // the batched analogue of the B=1 cleanup below.
+                    // Every row handled inline. For each row: donate the
+                    // finished sequence's KV cache back to the
+                    // prompt-cache store, release its cache slot, and
+                    // record its per-sequence metric — the batched
+                    // analogue of the B=1 cleanup below.
                     //
-                    // Unlike the B=1 arm, the batched path does NOT call
-                    // `donate_finished_sequence_cache`: `BatchedBurstFinalized`
-                    // intentionally carries only `(seq_id, tokens_generated)`
-                    // per row, not the prompt/committed token vectors the
-                    // donate key needs. This is correct today — both
-                    // batched-eligible model families (Gemma 4 / MTP and
-                    // Qwen 3.5 / DFlash) are `SequenceStateBackend::ModelOwned`
-                    // with heterogeneous caches for which
-                    // `donate_finished_sequence_cache` is a guarded no-op
-                    // anyway (it returns early at the `backend != DenseKvCache`
-                    // check), so the batched arm's `remove` + `release` is
-                    // functionally identical to running the donate. Surfacing
-                    // per-row donate data so a future dense-KV batched-eligible
-                    // model could donate is a documented follow-up on #674.
-                    for (seq_id, tokens_generated) in rows {
+                    // Issue #688: `BatchedBurstRow` now carries the
+                    // per-row prompt/committed token vectors and the
+                    // healthy-finish flag, so the batched arm calls
+                    // `donate_finished_sequence_cache` per row BEFORE
+                    // the `remove`/`release` — symmetric with the B=1
+                    // arm and the classic `finalize_completed` path.
+                    // The donate helper is hard-gated on a dense
+                    // KV-cache backend; both batched-eligible model
+                    // families today — Gemma 4 (MTP) and Qwen 3.5
+                    // (DFlash) — are `SequenceStateBackend::ModelOwned`
+                    // with heterogeneous attention+recurrent caches, so
+                    // the donate is a guarded no-op for them, identical
+                    // to the B=1 arm's no-op for those same families.
+                    // Wiring it in removes the structural asymmetry
+                    // between the two burst arms and future-proofs the
+                    // batched path for any dense-KV-cache model that
+                    // later becomes batched-burst-eligible. Error /
+                    // transition-failure rows carry an empty/`false`
+                    // payload so the donate is a guaranteed no-op on
+                    // those tainted-cache rows.
+                    for super::speculative_burst::BatchedBurstRow {
+                        seq_id,
+                        tokens_generated,
+                        prompt_tokens,
+                        generated_tokens,
+                        healthy_finish,
+                    } in rows
+                    {
+                        self.donate_finished_sequence_cache(
+                            seq_id,
+                            &prompt_tokens,
+                            &generated_tokens,
+                            healthy_finish,
+                        );
+                        // Defensive non-donate cleanup: the donate path
+                        // above already removed the `prompt_cache_seq_ctx`
+                        // entry on the dense-KV path.
                         self.prompt_cache_seq_ctx.remove(&seq_id);
                         self.release_sequence_caches(seq_id);
-                        self.batch_metrics.record_sequence_completed(tokens_generated);
+                        self.batch_metrics
+                            .record_sequence_completed(tokens_generated);
                         self.batch_observability.record_sequence_completed();
                     }
                     self.publish_metrics();
@@ -1944,7 +1967,8 @@ impl BatchScheduler {
                     // `prompt_cache_seq_ctx` entry on the dense-KV path).
                     self.prompt_cache_seq_ctx.remove(&seq_id);
                     self.release_sequence_caches(seq_id);
-                    self.batch_metrics.record_sequence_completed(tokens_generated);
+                    self.batch_metrics
+                        .record_sequence_completed(tokens_generated);
                     self.batch_observability.record_sequence_completed();
                     self.publish_metrics();
                     None

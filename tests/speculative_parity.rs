@@ -700,8 +700,8 @@ fn greedy_parity_mtp_gemma4_batched_b4_matches_b1() {
         // SequenceId so the runs do not alias each other's KV cache.
         let seq_id = mlxcel_core::cache::SequenceId::from_raw(1000 + row as u64);
         let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq_id));
-        let (mut drafter, kind) = load_drafter(&draft_path, Some(DrafterKind::Mtp))
-            .expect("MTP drafter must load");
+        let (mut drafter, kind) =
+            load_drafter(&draft_path, Some(DrafterKind::Mtp)).expect("MTP drafter must load");
         assert_eq!(kind, DrafterKind::Mtp);
         drafter
             .bind(wrapper as &dyn mlxcel_core::generate::LanguageModel)
@@ -752,9 +752,7 @@ fn greedy_parity_mtp_gemma4_batched_b4_matches_b1() {
         reference.len(),
         "batched run must produce one token stream per row"
     );
-    for (row, (batched_row, reference_row)) in
-        run.tokens.iter().zip(reference.iter()).enumerate()
-    {
+    for (row, (batched_row, reference_row)) in run.tokens.iter().zip(reference.iter()).enumerate() {
         assert_eq!(
             batched_row.len(),
             reference_row.len(),

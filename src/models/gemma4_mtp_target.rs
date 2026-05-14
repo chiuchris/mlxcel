@@ -272,8 +272,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // from, and feeds `compute_logprobs` so the first-bonus logprob
         // is byte-identical to the classic path's first-token logprob
         // (issue #678).
-        let (token_arr, adjusted_logits) =
-            sample_token_optimized(&logits, sampler, token_history);
+        let (token_arr, adjusted_logits) = sample_token_optimized(&logits, sampler, token_history);
         mlxcel_core::eval(&token_arr);
         let first_bonus = mlxcel_core::item_i32(&token_arr);
         let first_bonus_lp =
@@ -372,8 +371,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // `target_tokens`. `None` (zero-overhead) when logprobs are
         // disabled; the round loop forwards the entries for accepted
         // positions on to `finalize_burst_success` (issue #678).
-        let target_logprobs =
-            Self::per_position_logprobs(&logits, &target_tokens, logprobs_config);
+        let target_logprobs = Self::per_position_logprobs(&logits, &target_tokens, logprobs_config);
 
         // Capture the hidden + pre-slice shared K/V for the finalize step.
         let hidden_sink = sinks
@@ -757,7 +755,11 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
     fn batched_sink_forward(
         &self,
         input_arr: &MlxArray,
-    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, Vec<UniquePtr<MlxArray>>) {
+    ) -> (
+        UniquePtr<MlxArray>,
+        UniquePtr<MlxArray>,
+        Vec<UniquePtr<MlxArray>>,
+    ) {
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
         let logits = {
             let mut caches = self.caches.borrow_mut();
@@ -802,11 +804,7 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         let shape = mlxcel_core::array_shape(hidden_full);
         debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, hidden]");
         let last = shape[1] - 1;
-        mlxcel_core::slice(
-            hidden_full,
-            &[0, last, 0],
-            &[shape[0], last + 1, shape[2]],
-        )
+        mlxcel_core::slice(hidden_full, &[0, last, 0], &[shape[0], last + 1, shape[2]])
     }
 }
 
@@ -938,8 +936,7 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         _sampler: &SamplingConfig,
     ) -> Result<MtpBatchedVerifyForwardOutput, DrafterError> {
         // Build the rectangular [B, block_size] verify batch.
-        let (verify_arr, width) =
-            Self::rectangular_input(verify_input_per_row, self.batch_size)?;
+        let (verify_arr, width) = Self::rectangular_input(verify_input_per_row, self.batch_size)?;
 
         // Sink-aware verify forward. The [B, ...] cache grows by `width`
         // entries per row; `verify_finalize_batched` trims it back.
@@ -949,8 +946,7 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         // logits. At temperature 0 this matches the drafter-less
         // target's own argmax extension, identically to the B = 1
         // adapter's `argmax_per_position`.
-        let target_tokens_per_row =
-            Self::argmax_per_row(&logits, self.batch_size as i32, width);
+        let target_tokens_per_row = Self::argmax_per_row(&logits, self.batch_size as i32, width);
 
         // Stash the captured hidden + shared K/V for finalize. Index 0 =
         // hidden_full ([B, width, hidden]), indices 1.. = shared K/V
@@ -1007,11 +1003,7 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         {
             let mut caches = self.caches.borrow_mut();
             self.wrapper
-                .rollback_speculative_cache_explicit(
-                    &mut caches,
-                    &accepted_i32,
-                    block_size as i32,
-                )
+                .rollback_speculative_cache_explicit(&mut caches, &accepted_i32, block_size as i32)
                 .map_err(|e| DrafterError::DraftFailed {
                     reason: format!("Gemma4 batched MTP rollback failed: {e}"),
                 })?;
@@ -1028,8 +1020,7 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         // the absolute KV offset itself (it adds the returned delta to
         // the running offset — see `MtpBatchedGenerator`'s rebind).
         // We report the per-row delta `accepted[r] + 1`.
-        let kv_offset_per_row: Vec<usize> =
-            accepted_per_row.iter().map(|&a| a + 1).collect();
+        let kv_offset_per_row: Vec<usize> = accepted_per_row.iter().map(|&a| a + 1).collect();
         let bonus_position_per_row = kv_offset_per_row.clone();
         // With equal-length prompts and uniform verify width there is no
         // left-padding; the K/V valid length per row equals the

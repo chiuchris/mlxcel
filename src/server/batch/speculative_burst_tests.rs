@@ -424,7 +424,11 @@ impl MtpTarget for MockMtpTarget {
         _sampler: &SamplingConfig,
         token_history: &[i32],
         logprobs_config: &LogprobsConfig,
-    ) -> (i32, MtpVerifyOutput, Option<mlxcel_core::sampling::TokenLogprobData>) {
+    ) -> (
+        i32,
+        MtpVerifyOutput,
+        Option<mlxcel_core::sampling::TokenLogprobData>,
+    ) {
         // Record what the generator handed us so the issue #677 test can
         // assert the burst threaded the real token_history through.
         *self.seen_token_history.borrow_mut() = Some(token_history.to_vec());
@@ -1136,8 +1140,14 @@ fn apply_burst_thinking_budget_passes_through_when_disabled() {
     // non-thinking requests).
     let mut thinking = ThinkingState::disabled();
     let (final_token, override_fired) = apply_burst_thinking_budget(&mut thinking, 4242);
-    assert_eq!(final_token, 4242, "disabled state must pass the token through");
-    assert!(!override_fired, "disabled state must never report an override");
+    assert_eq!(
+        final_token, 4242,
+        "disabled state must pass the token through"
+    );
+    assert!(
+        !override_fired,
+        "disabled state must never report an override"
+    );
 }
 
 #[test]
@@ -1168,7 +1178,10 @@ fn apply_burst_thinking_budget_injects_close_at_budget_boundary() {
     // still passes through.
     let (t2, o2) = apply_burst_thinking_budget(&mut thinking, 201);
     assert_eq!(t2, 201, "second in-block token still under the cap check");
-    assert!(!o2, "no override yet — cap is checked before this token is observed");
+    assert!(
+        !o2,
+        "no override yet — cap is checked before this token is observed"
+    );
 
     // Token 3: `in_block_count` is now 2 == cap, so `decide_override`
     // returns `ForceClose(101)`. The burst-produced token (202) is
@@ -1325,6 +1338,11 @@ fn batched_burst_module_exports_required_for_scheduler_integration_compile() {
     // depends on both. A re-org that renames either breaks this at
     // compile time before runtime tests fire.
     let _ = std::mem::size_of::<super::speculative_burst::BatchedBurstFinalized>();
+    // Issue #688: the per-row payload type `BatchedBurstRow` is also
+    // load-bearing — the scheduler's batched arm destructures it to feed
+    // `donate_finished_sequence_cache`. A rename breaks this test at the
+    // same time as the scheduler.
+    let _ = std::mem::size_of::<super::speculative_burst::BatchedBurstRow>();
     // `try_run_burst_batched` is the load-bearing entry; reference it as
     // a function item so a rename is a compile error.
     let _f: fn(
@@ -1333,6 +1351,124 @@ fn batched_burst_module_exports_required_for_scheduler_integration_compile() {
     ) -> Result<super::speculative_burst::BatchedBurstFinalized, Vec<SequenceInfo>> =
         super::speculative_burst::try_run_burst_batched;
     let _ = _f;
+}
+
+// =============================================================================
+// Issue #688: `BatchedBurstRow` prompt-cache donate plumbing.
+//
+// `try_run_burst_batched` returns a `BatchedBurstFinalized` whose `rows`
+// each carry the same donate-payload shape as the B = 1 `BurstFinalized`
+// — `prompt_tokens`, `generated_tokens`, and `healthy_finish` — so the
+// scheduler's batched arm can call `donate_finished_sequence_cache` per
+// row, symmetric with the B = 1 burst arm and the classic
+// `finalize_completed` path. Driving `try_run_burst_batched` end-to-end
+// needs a real `LoadedModel` (infeasible in a fast unit test — see the
+// comment block above `burst_finalized_carries_prompt_cache_donate_fields`),
+// so these tests pin the per-row struct's shape and the field contract
+// directly: the scheduler's `BatchedBurstRow { .. }` destructuring would
+// break at compile time if a field were renamed or dropped, and the
+// semantic tests assert the healthy / non-healthy field conventions the
+// batched burst's success and error rows must follow. This mirrors the
+// `burst_finalized_*` tests above for the B = 1 path.
+// =============================================================================
+
+#[test]
+fn batched_burst_row_carries_prompt_cache_donate_fields() {
+    use super::speculative_burst::BatchedBurstRow;
+
+    // Construct a `BatchedBurstRow` exactly as the batched burst's
+    // healthy success path does. This is a compile-time pin: if
+    // `prompt_tokens`, `generated_tokens`, or `healthy_finish` are
+    // renamed/removed, the scheduler's `BatchedBurstRow { .. }`
+    // destructuring in `try_speculative_burst` breaks at the same time
+    // as this test.
+    let row = BatchedBurstRow {
+        seq_id: SequenceId::from_raw(11),
+        tokens_generated: 3,
+        prompt_tokens: vec![5, 6, 7, 8],
+        generated_tokens: vec![20, 21, 22],
+        healthy_finish: true,
+    };
+
+    assert_eq!(row.seq_id, SequenceId::from_raw(11));
+    assert_eq!(row.tokens_generated, 3);
+    assert_eq!(row.prompt_tokens, vec![5, 6, 7, 8]);
+    assert_eq!(row.generated_tokens, vec![20, 21, 22]);
+    assert!(row.healthy_finish);
+    // `tokens_generated` must equal the committed `generated_tokens`
+    // length — both are derived from `seq.generated_tokens` after the
+    // early-EOS truncation in `finalize_burst_success`, identical to the
+    // B = 1 `BurstFinalized` invariant.
+    assert_eq!(row.tokens_generated, row.generated_tokens.len());
+}
+
+#[test]
+fn batched_burst_row_error_outcome_has_empty_donate_payload() {
+    use super::speculative_burst::BatchedBurstRow;
+
+    // The error and transition-failure rows of `try_run_burst_batched`
+    // build a `BatchedBurstRow` with empty token vectors and
+    // `healthy_finish == false` — the KV cache is assumed tainted on
+    // those rows, so the scheduler's `donate_finished_sequence_cache`
+    // call must be a guaranteed no-op. This is the same convention the
+    // B = 1 `BurstFinalized` error arms follow:
+    // `donate_finished_sequence_cache` hard-guards on `healthy_finish`
+    // before touching the store, so an empty/false payload is the
+    // correct "do not donate" signal on a tainted-cache row.
+    let errored = BatchedBurstRow {
+        seq_id: SequenceId::from_raw(13),
+        tokens_generated: 0,
+        prompt_tokens: Vec::new(),
+        generated_tokens: Vec::new(),
+        healthy_finish: false,
+    };
+
+    assert!(!errored.healthy_finish, "error row must not be healthy");
+    assert!(
+        errored.prompt_tokens.is_empty() && errored.generated_tokens.is_empty(),
+        "error row carries no tokens to donate"
+    );
+    assert_eq!(errored.tokens_generated, 0);
+}
+
+#[test]
+fn batched_burst_finalized_rows_preserve_per_row_donate_payloads() {
+    use super::speculative_burst::{BatchedBurstFinalized, BatchedBurstRow};
+
+    // A batched window mixes healthy and tainted rows: per-row early-EOS
+    // means one row can finish healthy while a sibling row's state
+    // transition fails. `BatchedBurstFinalized.rows` must preserve each
+    // row's individual donate payload — the scheduler iterates `rows`
+    // and feeds each into `donate_finished_sequence_cache` independently,
+    // so a healthy row donates while a tainted sibling stays a no-op.
+    let finalized = BatchedBurstFinalized {
+        rows: vec![
+            BatchedBurstRow {
+                seq_id: SequenceId::from_raw(1),
+                tokens_generated: 2,
+                prompt_tokens: vec![1, 2, 3],
+                generated_tokens: vec![40, 41],
+                healthy_finish: true,
+            },
+            BatchedBurstRow {
+                seq_id: SequenceId::from_raw(2),
+                tokens_generated: 0,
+                prompt_tokens: Vec::new(),
+                generated_tokens: Vec::new(),
+                healthy_finish: false,
+            },
+        ],
+    };
+
+    assert_eq!(finalized.rows.len(), 2);
+    // Healthy row: full donate payload survives.
+    assert!(finalized.rows[0].healthy_finish);
+    assert_eq!(finalized.rows[0].prompt_tokens, vec![1, 2, 3]);
+    assert_eq!(finalized.rows[0].generated_tokens, vec![40, 41]);
+    // Tainted sibling: empty/false payload survives, donate is a no-op.
+    assert!(!finalized.rows[1].healthy_finish);
+    assert!(finalized.rows[1].prompt_tokens.is_empty());
+    assert!(finalized.rows[1].generated_tokens.is_empty());
 }
 
 // =============================================================================
@@ -1370,19 +1506,28 @@ fn sampling_config_eq_distinguishes_top_k_top_p_min_p() {
         top_k: base.top_k + 7,
         ..SamplingConfig::default()
     };
-    assert!(!super::speculative_burst::sampling_config_eq(&base, &top_k_diff));
+    assert!(!super::speculative_burst::sampling_config_eq(
+        &base,
+        &top_k_diff
+    ));
 
     let top_p_diff = SamplingConfig {
         top_p: (base.top_p - 0.1).max(0.0),
         ..SamplingConfig::default()
     };
-    assert!(!super::speculative_burst::sampling_config_eq(&base, &top_p_diff));
+    assert!(!super::speculative_burst::sampling_config_eq(
+        &base,
+        &top_p_diff
+    ));
 
     let min_p_diff = SamplingConfig {
         min_p: base.min_p + 0.2,
         ..SamplingConfig::default()
     };
-    assert!(!super::speculative_burst::sampling_config_eq(&base, &min_p_diff));
+    assert!(!super::speculative_burst::sampling_config_eq(
+        &base,
+        &min_p_diff
+    ));
 }
 
 #[test]
