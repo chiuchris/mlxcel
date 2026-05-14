@@ -598,8 +598,9 @@ impl BatchScheduler {
     /// speculative *path* is configured — the actual per-request
     /// decision happens inside [`Self::execute_prefill`] via
     /// [`super::speculative_burst::should_burst_for_sequence`], which
-    /// adds per-sequence preconditions (no VLM embeddings, no
-    /// structured-output constraint, no adopted prompt-cache prefix).
+    /// adds per-sequence preconditions (no multimodal payload / VLM
+    /// embeddings, no structured-output constraint, no adopted
+    /// prompt-cache prefix).
     /// The active-batch size is NOT consulted by this gate any more:
     /// the burst takes the full request lifecycle (prefill + decode)
     /// in one tick, so it never enters [`Self::active_batch`] and the
@@ -1710,8 +1711,9 @@ impl BatchScheduler {
         // time, bypassing the standard prefill → finish_prefill →
         // active_batch → decode pipeline. The classic non-speculative
         // path is bit-exact preserved (the gate's per-sequence
-        // preconditions also include: no VLM embeddings, no structured
-        // output, no adopted prompt-cache prefix — see
+        // preconditions also include: no multimodal payload / VLM
+        // embeddings, no structured output, no adopted prompt-cache
+        // prefix — see
         // `speculative_burst::should_burst_for_sequence`).
         //
         // Issue #674 adds the B>1 batched burst: when `max_batch_size >
@@ -1781,9 +1783,10 @@ impl BatchScheduler {
     /// that collapses to size 1 falls back to the B=1 burst.
     fn try_speculative_burst(&mut self, seq: SequenceInfo) -> Option<SequenceInfo> {
         // Fast path: speculative dispatch off, or the head fails the
-        // per-sequence gate (VLM embeddings / structured output /
-        // adopted cache prefix). History-dependent penalties, logprobs,
-        // and thinking budgets are supported by the B = 1 burst path.
+        // per-sequence gate (multimodal payload / VLM embeddings /
+        // structured output / adopted cache prefix). History-dependent
+        // penalties, logprobs, and thinking budgets are supported by
+        // the B = 1 burst path.
         // Route straight to classic only for the hard per-request gates.
         if !super::speculative_burst::should_burst_for_sequence(&self.speculative_dispatch, &seq) {
             return Some(seq);

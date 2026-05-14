@@ -18,14 +18,14 @@
 //! ## What these tests pin
 //!
 //! - **Gate**: [`should_burst_for_sequence`] returns `false` for every
-//!   condition that would silently break the burst path (VLM
-//!   embeddings, structured-output constraint, adopted prompt-cache
-//!   prefix). History-dependent sampling penalties, logprobs requests,
-//!   and active thinking-budget state stay eligible for the B = 1 burst
-//!   path; B > 1 has its own stricter window guard for payloads the
-//!   batched round loops cannot yet return. Each gate has a dedicated
-//!   test so an accidental regression is caught at `cargo test` time
-//!   rather than in production.
+//!   condition that would silently break the burst path (multimodal
+//!   payloads / VLM embeddings, structured-output constraint, adopted
+//!   prompt-cache prefix). History-dependent sampling penalties,
+//!   logprobs requests, and active thinking-budget state stay eligible
+//!   for the B = 1 burst path; B > 1 has its own stricter window guard
+//!   for payloads the batched round loops cannot yet return. Each gate
+//!   has a dedicated test so an accidental regression is caught at
+//!   `cargo test` time rather than in production.
 //!
 //! - **Bind contract (CRITICAL)**: [`drive_mtp_generator`] must run on
 //!   a drafter that has already been [`Drafter::bind`]-ed against its
@@ -146,6 +146,17 @@ fn make_mtp_dispatch() -> crate::server::SpeculativeDispatch {
     }
 }
 
+/// DFlash dispatch with a placeholder drafter path. Like
+/// [`make_mtp_dispatch`], this is only consumed by
+/// [`should_burst_for_sequence`], so no filesystem access occurs.
+fn make_dflash_dispatch() -> crate::server::SpeculativeDispatch {
+    crate::server::SpeculativeDispatch::DFlash {
+        draft_model_path: std::path::PathBuf::from("/tmp/test-dflash-drafter"),
+        block_size: 16,
+        user_requested_explicit_kind: true,
+    }
+}
+
 // =============================================================================
 // `should_burst_for_sequence` gate tests
 //
@@ -191,6 +202,44 @@ fn burst_declined_for_vlm_embeddings() {
     assert!(
         !should_burst_for_sequence(&dispatch, &seq),
         "VLM-embedding requests must fall back to classic decode"
+    );
+}
+
+#[test]
+fn dflash_burst_allowed_for_vlm_wrapped_text_only_sequence_shape() {
+    let dispatch = make_dflash_dispatch();
+    let (seq, _rx) = make_test_sequence();
+    assert!(
+        should_burst_for_sequence(&dispatch, &seq),
+        "a text-only request remains burst-eligible under DFlash dispatch; \
+         the model-variant gate separately accepts Qwen35VLM/Qwen35MoeVLM"
+    );
+}
+
+#[test]
+fn dflash_burst_declined_for_raw_multimodal_payload_without_embeddings() {
+    let dispatch = make_dflash_dispatch();
+    let (mut seq, _rx) = make_test_sequence();
+    seq.images.push(b"not-a-real-image-for-gate".to_vec());
+
+    assert!(
+        !should_burst_for_sequence(&dispatch, &seq),
+        "DFlash must not enter the burst path for image-bearing requests even \
+         before/without a prepared embeddings tensor; text-only VLM-wrapped \
+         Qwen 3.5 is supported, true multimodal speculative tail is gated off"
+    );
+}
+
+#[test]
+fn dflash_burst_declined_for_audio_payload_without_embeddings() {
+    let dispatch = make_dflash_dispatch();
+    let (mut seq, _rx) = make_test_sequence();
+    seq.audio.push(b"not-real-audio-for-gate".to_vec());
+
+    assert!(
+        !should_burst_for_sequence(&dispatch, &seq),
+        "DFlash must not enter the burst path for audio-bearing multimodal \
+         requests unless the multimodal speculative tail is explicitly enabled"
     );
 }
 

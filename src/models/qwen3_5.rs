@@ -1188,7 +1188,8 @@ impl Qwen35Model {
     ///
     /// Used by:
     /// [`crate::server::batch::speculative_burst::run_dflash_on_qwen35`]
-    /// (issue #670 DFlash burst path).
+    /// for both `Qwen35Model` and `Qwen35VLModel` text-only DFlash bursts
+    /// (issues #670 and #691).
     pub(crate) fn make_speculative_caches(&self) -> Vec<Qwen3NextCache> {
         self.make_internal_caches()
     }

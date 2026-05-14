@@ -52,10 +52,11 @@
 //!   [`mlxcel_core::speculative::mtp::MtpGenerator`] through
 //!   [`crate::models::gemma4_mtp_target::Gemma4MtpTargetAdapter`] /
 //!   [`crate::models::gemma4_mtp_target::Gemma4VLMtpTargetAdapter`].
-//! - **DFlash / Qwen 3.5** — [`crate::LoadedModel::Qwen35`]. VLM and MoE
-//!   variants are rejected with a clear error (the existing
-//!   [`mlxcel_core::drafter::dflash::SpeculativeTarget`] impls only cover
-//!   the text-only `Qwen35Model` today).
+//! - **DFlash / Qwen 3.5** — [`crate::LoadedModel::Qwen35`],
+//!   [`crate::LoadedModel::Qwen35Moe`], and their Qwen 3.5 VLM-wrapped
+//!   variants for text-only requests. True multimodal requests still
+//!   fall back to classic decode until the burst path can consume the
+//!   vision/audio prefill embeddings safely.
 //!
 //! B > 1 batched bursts are deferred to a peer follow-up — they require
 //! the batched `MtpTarget` / `SpeculativeTarget` methods on the adapter
@@ -90,8 +91,11 @@
 //! hold:
 //!
 //! - Dispatch is `Disabled` or `Classic` (not a kind-specific variant).
-//! - The request carries VLM embeddings (image inputs): the burst path
-//!   does not yet support vision prefill.
+//! - The request carries multimodal payloads / VLM embeddings (image,
+//!   audio, or video-derived inputs): the burst path does not yet
+//!   support speculative tail decode after multimodal prefill. A
+//!   VLM-wrapped Qwen 3.5 checkpoint with a text-only request remains
+//!   eligible.
 //! - The request carries a structured-output constraint: the speculative
 //!   round loops do not yet plumb `llguidance` per-step.
 //! - The request adopted a prompt-cache prefix (`prefill_start_offset > 0`):
@@ -114,7 +118,10 @@
 //! classic path's `apply_thinking_budget`, injecting a forced `</think>`
 //! at the budget boundary (issue #679).
 //!
-//! Each declined request is logged at `debug` level with the gate reason.
+//! Each declined request is logged with the gate reason (at `debug` for
+//! ordinary gates, and at `warn` for DFlash multimodal requests so operators
+//! can distinguish "VLM-wrapped text-only supported" from "multimodal
+//! speculative tail not enabled").
 //!
 //! B > 1 batched bursts apply one additional window-admission guard:
 //! [`can_join_batched_burst_window`] keeps requests that need per-row
@@ -137,7 +144,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
-use mlxcel_core::drafter::dflash::{DFlashBatchedGenerator, DFlashGenerator};
+use mlxcel_core::drafter::dflash::{DFlashBatchedGenerator, DFlashGenerator, SpeculativeTarget};
 use mlxcel_core::drafter::{Drafter, DrafterKind, load_drafter};
 use mlxcel_core::generate::{LanguageModel, SamplingConfig};
 use mlxcel_core::generation_policy::{initial_token_history, merged_eos_token_ids};
@@ -151,6 +158,37 @@ use crate::models::gemma4_mtp_target::{
 use crate::server::model_provider::GenerateEvent;
 
 use super::sequence::{FinishReason, SequenceInfo, SequenceState};
+
+/// Narrow target contract used by the server-side Qwen 3.5 DFlash burst.
+///
+/// `DFlashGenerator` already accepts any [`SpeculativeTarget`], but the
+/// server prefill side also needs a fresh heterogeneous Qwen 3.5 cache vector.
+/// Both the text-only model and the Qwen 3.5 VLM wrapper satisfy that contract:
+/// the VLM wrapper delegates speculative hooks to its inner text backbone and
+/// allocates the same cache shape. This lets text-only requests against
+/// VLM-wrapped checkpoints run DFlash without opening the true multimodal tail
+/// path yet (issue #691).
+trait Qwen35DFlashTarget:
+    LanguageModel
+    + SpeculativeTarget<
+        Cache = crate::models::qwen3_next::Qwen3NextCache,
+        VerifyOut = crate::models::qwen3_5::VerifyOutput,
+    >
+{
+    fn make_dflash_caches(&self) -> Vec<crate::models::qwen3_next::Qwen3NextCache>;
+}
+
+impl Qwen35DFlashTarget for crate::models::Qwen35Model {
+    fn make_dflash_caches(&self) -> Vec<crate::models::qwen3_next::Qwen3NextCache> {
+        self.make_speculative_caches()
+    }
+}
+
+impl Qwen35DFlashTarget for crate::vision::Qwen35VLModel {
+    fn make_dflash_caches(&self) -> Vec<crate::models::qwen3_next::Qwen3NextCache> {
+        self.text_model.make_speculative_caches()
+    }
+}
 
 /// Lazy-loaded drafter slot held on the scheduler.
 ///
@@ -264,9 +302,9 @@ impl WorkerDrafterSlot {
 ///
 /// 1. `dispatch` is one of the kind-specific variants
 ///    (`Mtp` or `DFlash`).
-/// 2. `seq` has no VLM embeddings attached (image-bearing requests are
-///    rejected from the speculative path today — see the module
-///    docstring's scope note).
+/// 2. `seq` has no multimodal payload / VLM embeddings attached
+///    (image/audio/video-derived requests are rejected from the
+///    speculative path today — see the module docstring's scope note).
 /// 3. `seq` has no structured-output constraint attached. The
 ///    speculative round loops do not yet plumb the `llguidance` matcher
 ///    through per-step; falling back to classic decode preserves the
@@ -293,9 +331,11 @@ impl WorkerDrafterSlot {
 /// `apply_thinking_budget`, injecting a forced `</think>` at the budget
 /// boundary.
 ///
-/// Each gate-out logs at debug level so an operator can correlate a
-/// "spec request fell back to classic" with the reason. The gates run
-/// in cheapest-first order so the hot path stays branch-predictable.
+/// Each gate-out logs a reason so an operator can correlate a "spec request
+/// fell back to classic" with the reason. Most gates use `debug`; DFlash
+/// multimodal requests use `warn` because the Qwen 3.5 VLM-wrapped text-only
+/// path is supported while the true multimodal speculative tail is not. The
+/// gates run in cheapest-first order so the hot path stays branch-predictable.
 pub(crate) fn should_burst_for_sequence(
     dispatch: &crate::server::SpeculativeDispatch,
     seq: &SequenceInfo,
@@ -303,11 +343,20 @@ pub(crate) fn should_burst_for_sequence(
     if !dispatch.is_kind_specific() {
         return false;
     }
-    if seq.vlm_embeddings.is_some() {
-        tracing::debug!(
-            "speculative burst declined for seq {}: VLM embeddings attached",
-            seq.seq_id,
-        );
+    if seq.vlm_embeddings.is_some() || !seq.images.is_empty() || !seq.audio.is_empty() {
+        if matches!(dispatch, crate::server::SpeculativeDispatch::DFlash { .. }) {
+            tracing::warn!(
+                "DFlash speculative dispatch declined for seq {}: multimodal VLM request \
+                 detected; VLM-wrapped text-only Qwen 3.5 targets are supported, but \
+                 multimodal speculative tail is not yet enabled; falling back to classic decode",
+                seq.seq_id,
+            );
+        } else {
+            tracing::debug!(
+                "speculative burst declined for seq {}: multimodal payload or VLM embeddings attached",
+                seq.seq_id,
+            );
+        }
         return false;
     }
     if seq.structured.is_some() {
@@ -892,7 +941,8 @@ where
     )
 }
 
-/// DFlash B=1 burst — Qwen 3.5 target.
+/// DFlash B=1 burst — Qwen 3.5 text target or Qwen 3.5 VLM wrapper serving a
+/// text-only request.
 ///
 /// **Variant gate runs before drafter load.** Same rationale as
 /// [`run_mtp_burst`]: surfacing "unsupported target" decline-to-classic
@@ -913,14 +963,27 @@ fn run_dflash_burst(
     seq: &mut SequenceInfo,
     block_size: u32,
 ) -> Result<BurstSuccess, BurstOutcome> {
+    if seq.vlm_embeddings.is_some() || !seq.images.is_empty() || !seq.audio.is_empty() {
+        tracing::warn!(
+            "DFlash speculative dispatch declined for seq {}: multimodal VLM request \
+             detected; VLM-wrapped text-only Qwen 3.5 targets are supported, but \
+             multimodal speculative tail is not yet enabled; falling back to classic decode",
+            seq.seq_id,
+        );
+        return Err(BurstOutcome::DeclineToClassic);
+    }
+
     // HOIST: validate the model variant BEFORE loading the drafter.
     // See the function-level docstring above.
     match ctx.model {
-        LoadedModel::Qwen35(_) | LoadedModel::Qwen35Moe(_) => {}
+        LoadedModel::Qwen35(_)
+        | LoadedModel::Qwen35Moe(_)
+        | LoadedModel::Qwen35VLM(_)
+        | LoadedModel::Qwen35MoeVLM(_) => {}
         _ => {
             tracing::warn!(
                 "DFlash speculative dispatch declined: target is {:?}, expected \
-                 Qwen 3.5 text-only; falling back to classic decode",
+                 Qwen 3.5 text or VLM-wrapped text-only; falling back to classic decode",
                 model_variant_label(ctx.model),
             );
             return Err(BurstOutcome::DeclineToClassic);
@@ -962,11 +1025,25 @@ fn run_dflash_burst(
     // same payload as the classic decode path (issue #678).
     let logprobs_config = seq.logprobs_config.clone();
 
-    // DFlash supports Qwen35 (text) today. The variant gate above
-    // already rejected anything else, so the inner match is total.
+    // DFlash supports Qwen35 text models and Qwen35 VLM wrappers for
+    // text-only requests. The multimodal gate above rejects image/audio
+    // payloads before this point.
     let prefill_start = Instant::now();
     let (tokens, logprobs, decode_time_ms) = match ctx.model {
         LoadedModel::Qwen35(qwen) | LoadedModel::Qwen35Moe(qwen) => run_dflash_on_qwen35(
+            qwen,
+            &prompt,
+            &sampling,
+            &token_history,
+            &eos_token_ids,
+            owned_drafter,
+            block_size,
+            max_tokens,
+            ctx.drafter_slot,
+            cancel,
+            &logprobs_config,
+        )?,
+        LoadedModel::Qwen35VLM(qwen) | LoadedModel::Qwen35MoeVLM(qwen) => run_dflash_on_qwen35(
             qwen,
             &prompt,
             &sampling,
@@ -1003,7 +1080,8 @@ fn run_dflash_burst(
     })
 }
 
-/// DFlash burst on `Qwen35Model` — handles prefill, first-bonus + first-hidden
+/// DFlash burst on a Qwen 3.5 text target (including a Qwen 3.5 VLM wrapper
+/// serving a text-only request) — handles prefill, first-bonus + first-hidden
 /// extraction, and `DFlashGenerator::run` driving.
 ///
 /// `token_history` is the history-dependent-penalty context for the
@@ -1027,8 +1105,8 @@ fn run_dflash_burst(
 /// round-loop tokens' logprobs come back in `DFlashRunOutput::logprobs`
 /// (issue #678).
 #[allow(clippy::too_many_arguments)]
-fn run_dflash_on_qwen35(
-    qwen: &crate::models::Qwen35Model,
+fn run_dflash_on_qwen35<T>(
+    qwen: &T,
     prompt_tokens: &[i32],
     sampling: &SamplingConfig,
     token_history: &[i32],
@@ -1039,32 +1117,33 @@ fn run_dflash_on_qwen35(
     drafter_slot: &mut WorkerDrafterSlot,
     cancel: &AtomicBool,
     logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
-) -> Result<(Vec<i32>, Vec<Option<TokenLogprobData>>, f64), BurstOutcome> {
+) -> Result<(Vec<i32>, Vec<Option<TokenLogprobData>>, f64), BurstOutcome>
+where
+    T: Qwen35DFlashTarget,
+{
     // Build a fresh per-layer cache vector for this request. We do NOT
     // touch the scheduler-owned `sequence_state` map — the speculative
     // burst's caches are independent of the prompt-cache adoption
     // pipeline (`should_burst_for_sequence` enforces
     // `prefill_start_offset == 0`).
     //
-    // The inherent
-    // `Qwen35Model::make_caches(&self) -> Vec<Qwen3NextCache>` returns
-    // the heterogeneous attention+linear cache vec the round loop
-    // needs, while the `LanguageModel::make_caches(&self) -> Vec<KVCache>`
-    // trait method returns an empty vec for Qwen 3.5 (the model owns
-    // its caches internally). Use [`make_speculative_caches`] which
-    // disambiguates against the trait method by name.
-    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_speculative_caches();
+    // The target-specific cache factory returns the heterogeneous
+    // attention+linear cache vec the round loop needs, while the
+    // `LanguageModel::make_caches(&self) -> Vec<KVCache>` trait method
+    // returns an empty vec for Qwen 3.5 (the model owns its caches
+    // internally). Use the narrow `Qwen35DFlashTarget` helper to
+    // disambiguate against the trait method by name.
+    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_dflash_caches();
 
-    // Prefill the prompt through the target's speculative forward,
-    // capturing per-layer hidden states at the drafter's requested
-    // layer indices. The drafter's `target_layer_ids` are passed via
-    // the target adapter's `verify_forward`; for prefill we use the
-    // same hard-coded list that `SpeculativeTarget::verify_forward`
-    // uses (`[1, 8, 15, 22, 29]`) — this matches the only currently
-    // published DFlash drafter checkpoint (`z-lab/Qwen3.5-4B-DFlash`).
-    const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
+    // Prefill the prompt through the target's speculative verify hook,
+    // capturing the same per-layer hidden states the DFlash round loop
+    // captures for candidate blocks. For Qwen 3.5 text and VLM-wrapped
+    // targets this uses the upstream-standard `[1, 8, 15, 22, 29]`
+    // fallback inside their `SpeculativeTarget::verify_forward` impls,
+    // matching the published DFlash drafter checkpoint
+    // (`z-lab/Qwen3.5-4B-DFlash`).
     let prompt_arr = mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-    let verify_out = qwen.forward_speculative(&prompt_arr, &mut caches, QWEN35_4B_DFLASH_LAYERS);
+    let verify_out = qwen.verify_forward(&prompt_arr, &mut caches);
 
     // Sample the first bonus token from the last-position logits.
     let last_pos = prompt_tokens.len() as i32 - 1;
@@ -1772,7 +1851,8 @@ where
     Ok((run.tokens, recovered))
 }
 
-/// DFlash batched burst — Qwen 3.5 target (B > 1).
+/// DFlash batched burst — Qwen 3.5 text target or Qwen 3.5 VLM wrapper serving
+/// text-only requests (B > 1).
 ///
 /// Mirrors [`run_dflash_burst`] / [`run_dflash_on_qwen35`] but drives
 /// [`DFlashBatchedGenerator`]. The variant gate runs before drafter IO;
@@ -1783,13 +1863,29 @@ fn run_dflash_burst_batched(
     seqs: &mut [SequenceInfo],
     block_size: u32,
 ) -> Result<BatchedBurstTokens, BurstOutcome> {
+    if let Some(seq) = seqs
+        .iter()
+        .find(|seq| seq.vlm_embeddings.is_some() || !seq.images.is_empty() || !seq.audio.is_empty())
+    {
+        tracing::warn!(
+            "DFlash batched speculative dispatch declined for seq {}: multimodal VLM request \
+             detected; VLM-wrapped text-only Qwen 3.5 targets are supported, but \
+             multimodal speculative tail is not yet enabled; falling back to classic decode",
+            seq.seq_id,
+        );
+        return Err(BurstOutcome::DeclineToClassic);
+    }
+
     // HOIST: variant gate before drafter IO.
     match ctx.model {
-        LoadedModel::Qwen35(_) | LoadedModel::Qwen35Moe(_) => {}
+        LoadedModel::Qwen35(_)
+        | LoadedModel::Qwen35Moe(_)
+        | LoadedModel::Qwen35VLM(_)
+        | LoadedModel::Qwen35MoeVLM(_) => {}
         _ => {
             tracing::warn!(
                 "DFlash batched speculative dispatch declined: target is {:?}, expected \
-                 Qwen 3.5 text-only; falling back to classic decode",
+                 Qwen 3.5 text or VLM-wrapped text-only; falling back to classic decode",
                 model_variant_label(ctx.model),
             );
             return Err(BurstOutcome::DeclineToClassic);
@@ -1820,6 +1916,18 @@ fn run_dflash_burst_batched(
             max_tokens,
             ctx.drafter_slot,
         ),
+        LoadedModel::Qwen35VLM(qwen) | LoadedModel::Qwen35MoeVLM(qwen) => {
+            run_dflash_batched_on_qwen35(
+                qwen,
+                &prompts,
+                &sampling,
+                &eos_token_ids,
+                owned_drafter,
+                block_size,
+                max_tokens,
+                ctx.drafter_slot,
+            )
+        }
         _ => {
             // Defensive: unreachable per the variant gate above. Restore
             // the drafter to the slot since we took it without using it.
@@ -1832,15 +1940,16 @@ fn run_dflash_burst_batched(
     }
 }
 
-/// DFlash batched burst on `Qwen35Model` — `[B, L]` prefill, per-row
-/// first-bonus + first-hidden extraction, and `DFlashBatchedGenerator::run_batched`.
+/// DFlash batched burst on a Qwen 3.5 text target (including a Qwen 3.5 VLM
+/// wrapper serving text-only requests) — `[B, L]` prefill, per-row first-bonus
+/// + first-hidden extraction, and `DFlashBatchedGenerator::run_batched`.
 ///
 /// Mirrors [`run_dflash_on_qwen35`] for the B > 1 path. The prompts are
 /// equal length (window-collector contract) so the `[B, L]` prefill is
 /// byte-identical to B separate `[1, L]` prefills.
 #[allow(clippy::too_many_arguments)]
-fn run_dflash_batched_on_qwen35(
-    qwen: &crate::models::Qwen35Model,
+fn run_dflash_batched_on_qwen35<T>(
+    qwen: &T,
     prompts: &[Vec<i32>],
     sampling: &SamplingConfig,
     eos_token_ids: &[i32],
@@ -1848,23 +1957,25 @@ fn run_dflash_batched_on_qwen35(
     block_size: u32,
     max_tokens: usize,
     drafter_slot: &mut WorkerDrafterSlot,
-) -> Result<BatchedBurstTokens, BurstOutcome> {
+) -> Result<BatchedBurstTokens, BurstOutcome>
+where
+    T: Qwen35DFlashTarget,
+{
     let batch_size = prompts.len();
     let prompt_len = prompts[0].len();
 
     // Build the `[B, ...]` per-layer cache vector. As with the B = 1
     // path, we do NOT touch the scheduler-owned `sequence_state` map.
-    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_speculative_caches();
+    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_dflash_caches();
 
     // `[B, L]` prefill through the target's speculative forward.
-    const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
     let mut flat_prompt: Vec<i32> = Vec::with_capacity(batch_size * prompt_len);
     for row in prompts {
         flat_prompt.extend_from_slice(row);
     }
     let prompt_arr =
         mlxcel_core::from_slice_i32(&flat_prompt, &[batch_size as i32, prompt_len as i32]);
-    let verify_out = qwen.forward_speculative(&prompt_arr, &mut caches, QWEN35_4B_DFLASH_LAYERS);
+    let verify_out = qwen.verify_forward(&prompt_arr, &mut caches);
 
     // Per-row first bonus from the `[B, prompt_len, vocab]` last-position
     // logits.

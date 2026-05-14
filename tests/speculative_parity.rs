@@ -29,15 +29,18 @@
 //! - **Qwen 3.5 4B + DFlash** (`models/qwen3.5-4b-4bit` target, drafter
 //!   `models/Qwen3.5-4B-DFlash`, `block_size = 16`). The DFlash drafter
 //!   is loadable via `mlxcel_core::drafter::dflash::DFlashDrafter::load`
-//!   and `Qwen35Model` implements
+//!   and the Qwen 3.5 text / VLM wrappers implement
 //!   `mlxcel_core::drafter::dflash::SpeculativeTarget` (PR #663 wired the
-//!   B>1 path too). The published upstream `z-lab/Qwen3.5-4B-DFlash`
+//!   B>1 path too; issue #691 enables the VLM-wrapped text-only server
+//!   dispatch). The published upstream `z-lab/Qwen3.5-4B-DFlash`
 //!   checkpoint omits `embed_tokens.weight`; issue #675 ported upstream's
 //!   lazy-bind shape so the drafter loads with a tombstone and resolves
 //!   its embedding from the target during `Drafter::bind`. The
 //!   `greedy_parity_dflash_qwen35_4b` test runs the structural load +
 //!   bind pin *and* the issue #676 end-to-end byte-equality phase
-//!   (`mlxcel-server` with vs without `--draft-kind dflash` at temp=0).
+//!   (`mlxcel-server` with vs without `--draft-kind dflash` at temp=0),
+//!   plus an issue #691 log assertion that the speculative server emitted
+//!   `Speculative burst completed` instead of silently falling back.
 //!
 //! - **Gemma 4 31B + MTP assistant** (`models/gemma-4-31b-it-4bit` target,
 //!   drafter `models/gemma-4-31B-it-assistant-bf16`, `block_size = 4`). The
@@ -76,8 +79,11 @@
 //!    baseline) — submit the same fixed prompt to `/v1/chat/completions`
 //!    at `temperature = 0`, and assert the two responses are
 //!    byte-identical (same `message.content` *and* same
-//!    `usage.completion_tokens`). The two servers run sequentially so
-//!    only one target's worth of GPU memory is resident at a time.
+//!    `usage.completion_tokens`). The speculative server log must also
+//!    contain `Speculative burst completed`, preventing a classic fallback
+//!    from silently passing the parity assertion. The two servers run
+//!    sequentially so only one target's worth of GPU memory is resident at a
+//!    time.
 //!
 //! This is the load-bearing correctness gate: at `temperature = 0` the
 //! speculative round loop MUST emit a token sequence byte-identical to
@@ -101,6 +107,7 @@
 
 mod common;
 
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -129,22 +136,32 @@ fn reserve_port() -> u16 {
     port
 }
 
-/// Spawn `mlxcel-server` with the given CLI args. stdout/stderr are
-/// silenced — the test asserts on the HTTP response, not server logs.
+/// Spawn `mlxcel-server` with the given CLI args. stdout/stderr are captured
+/// for diagnostics, while the structured server logs are written via
+/// `--log-file` (added by [`server_round`]).
 fn spawn_server(args: &[&str]) -> Child {
     Command::new(repo_binary_path("mlxcel-server"))
         .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .env("RUST_LOG", "info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("spawn mlxcel-server binary")
 }
 
 /// Kill the server child and reap it so the next phase's server can bind
 /// a fresh port without a lingering process holding GPU memory.
-fn stop_server(child: &mut Child) {
+fn stop_server(child: &mut Child) -> String {
     let _ = child.kill();
+    let mut captured = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut captured);
+    }
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut captured);
+    }
     let _ = child.wait();
+    captured
 }
 
 /// Poll `/health` until the server is ready. Real-model loads (especially
@@ -195,10 +212,16 @@ async fn chat_content_and_token_count(client: &reqwest::Client, base_url: &str) 
     (content, completion_tokens)
 }
 
+struct ServerRoundOutput {
+    content: String,
+    completion_tokens: u64,
+    logs: String,
+}
+
 /// Run one server-spawn round: bring `mlxcel-server` up with `extra_args`
 /// appended to the shared base flags, wait for health, submit the fixed
 /// prompt, tear the server down, and return the
-/// `(content, completion_tokens)` pair.
+/// [`ServerRoundOutput`] bundle.
 ///
 /// The server is always stopped before this function returns (including
 /// on the panic paths inside the helpers it calls — the `Child` is owned
@@ -209,11 +232,18 @@ async fn server_round(
     label: &str,
     target_path: &std::path::Path,
     extra_args: &[&str],
-) -> (String, u64) {
+) -> ServerRoundOutput {
     let port = reserve_port();
     let base_url = format!("http://127.0.0.1:{port}");
     let port_str = port.to_string();
     let target_str = target_path.to_string_lossy().to_string();
+    let log_file = tempfile::Builder::new()
+        .prefix("mlxcel-speculative-parity-")
+        .suffix(".log")
+        .tempfile()
+        .expect("create temporary server log file");
+    let log_path = log_file.path().to_path_buf();
+    let log_path_str = log_path.to_string_lossy().to_string();
 
     let mut args: Vec<&str> = vec![
         "--model",
@@ -223,6 +253,8 @@ async fn server_round(
         "--port",
         &port_str,
         "--no-warmup",
+        "--log-file",
+        &log_path_str,
     ];
     args.extend_from_slice(extra_args);
 
@@ -235,13 +267,23 @@ async fn server_round(
 
     let result = chat_content_and_token_count(&client, &base_url).await;
 
-    stop_server(&mut child);
+    let process_logs = stop_server(&mut child);
+    let file_logs = std::fs::read_to_string(&log_path).unwrap_or_default();
+    let logs = if process_logs.is_empty() {
+        file_logs
+    } else {
+        format!("{file_logs}\n--- process stdout/stderr ---\n{process_logs}")
+    };
     eprintln!(
         "[{pairing_name}] {label}: completion_tokens={}, content.len()={}",
         result.1,
         result.0.len(),
     );
-    result
+    ServerRoundOutput {
+        content: result.0,
+        completion_tokens: result.1,
+        logs,
+    }
 }
 
 /// Issue #676 byte-equality phase: spawn `mlxcel-server` twice against the
@@ -261,7 +303,7 @@ async fn assert_server_byte_equality(
     let block_size_str = pairing.block_size.to_string();
 
     // Round 1: speculative — drafter attached.
-    let (spec_content, spec_tokens) = server_round(
+    let spec = server_round(
         pairing.name,
         "speculative",
         target_path,
@@ -276,31 +318,48 @@ async fn assert_server_byte_equality(
     )
     .await;
 
+    assert!(
+        spec.logs.contains("Speculative burst completed"),
+        "[{}] speculative server logs did not contain the burst completion marker; \
+         this usually means the request fell back to classic decode and the parity \
+         assertion would be a false pass. Captured logs:\n{}",
+        pairing.name,
+        spec.logs,
+    );
+    if pairing.kind == "dflash" {
+        assert!(
+            !spec.logs.contains("DFlash speculative dispatch declined"),
+            "[{}] DFlash server declined speculative dispatch during the parity run. \
+             Captured logs:\n{}",
+            pairing.name,
+            spec.logs,
+        );
+    }
+
     // Round 2: drafter-less baseline — no `--draft-*` / `--model-draft`.
-    let (baseline_content, baseline_tokens) =
-        server_round(pairing.name, "baseline", target_path, &[]).await;
+    let baseline = server_round(pairing.name, "baseline", target_path, &[]).await;
 
     // Byte-equality: at temperature = 0 the speculative round loop must
     // emit a token sequence byte-identical to the drafter-less greedy
     // pass. Compare both the decoded text and the completion-token count.
     assert_eq!(
-        spec_tokens, baseline_tokens,
-        "[{}] speculative completion_tokens ({spec_tokens}) != baseline ({baseline_tokens}); \
+        spec.completion_tokens, baseline.completion_tokens,
+        "[{}] speculative completion_tokens ({}) != baseline ({}); \
          the speculative round loop diverged from the drafter-less greedy pass at temp=0",
-        pairing.name,
+        pairing.name, spec.completion_tokens, baseline.completion_tokens,
     );
     assert_eq!(
-        spec_content, baseline_content,
+        spec.content, baseline.content,
         "[{}] speculative /v1/chat/completions content is NOT byte-identical to the \
          drafter-less baseline at temp=0 — this is a speculative-decoding parity bug.\n\
-         speculative: {spec_content:?}\n\
-         baseline:    {baseline_content:?}",
-        pairing.name,
+         speculative: {:?}\n\
+         baseline:    {:?}",
+        pairing.name, spec.content, baseline.content,
     );
     eprintln!(
         "[{}] byte-equality phase passed: speculative output is byte-identical to the \
-         drafter-less baseline ({spec_tokens} completion tokens)",
-        pairing.name,
+         drafter-less baseline ({} completion tokens)",
+        pairing.name, spec.completion_tokens,
     );
 }
 
@@ -416,8 +475,9 @@ fn pairing_kind_resolution_matches_declaration() {
 /// 2. **Byte-equality phase** (subprocess): spawns `mlxcel-server` with
 ///    `--model-draft --draft-kind dflash --draft-block-size 16` and again
 ///    without any `--draft-*` flag, submits the same fixed prompt to
-///    `/v1/chat/completions` at `temperature = 0`, and asserts the two
-///    responses are byte-identical.
+///    `/v1/chat/completions` at `temperature = 0`, asserts the speculative
+///    server logged `Speculative burst completed` (issue #691: no silent
+///    fallback), and asserts the two responses are byte-identical.
 ///
 /// `#[ignore]`-gated as real-model heavy: it loads the Qwen 3.5 4B target
 /// + DFlash drafter and spawns `mlxcel-server` subprocesses. The CI
