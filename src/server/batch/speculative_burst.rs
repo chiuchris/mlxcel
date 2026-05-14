@@ -346,13 +346,42 @@ pub(crate) fn should_burst_for_sequence(
 /// Prometheus histograms (mirrors the classic decode path's
 /// `batch_metrics.record_sequence_completed(tokens_generated)` call
 /// inside `finalize_completed`).
-#[derive(Debug, Clone, Copy)]
+///
+/// Issue #673: the prompt + generated token vectors and the
+/// `healthy_finish` flag are surfaced so the scheduler can call
+/// [`crate::server::batch::scheduler::BatchScheduler::donate_finished_sequence_cache`]
+/// for the burst path exactly as `finalize_completed` does for the
+/// classic path. The burst consumes `SequenceInfo` by value (it
+/// finalizes the request inline), so without re-surfacing these the
+/// scheduler has no handle to the tokens after the burst returns. The
+/// donate helper is hard-gated on a dense KV-cache backend, so for
+/// today's burst-eligible models — Qwen 3.5 (DFlash) and Gemma 4 (MTP),
+/// both `SequenceStateBackend::ModelOwned` — the donate is a guarded
+/// no-op, **identical** to the classic path's no-op for those same
+/// model families. Wiring it in keeps the two paths symmetric and
+/// future-proofs the burst for any dense-KV-cache model that later
+/// becomes burst-eligible.
+#[derive(Debug, Clone)]
 pub(crate) struct BurstFinalized {
     pub seq_id: mlxcel_core::cache::SequenceId,
     /// Total tokens streamed to the client (including the seed bonus
     /// and any tokens accepted by the round loop). Matches what the
     /// client actually received.
     pub tokens_generated: usize,
+    /// The request's full prompt token stream, forwarded so the
+    /// scheduler can compose the prompt-cache donate key. Empty on the
+    /// error / transition-failure paths (no healthy cache to donate).
+    pub prompt_tokens: Vec<i32>,
+    /// The tokens the burst actually committed to the sequence (post
+    /// early-EOS truncation). Joined with `prompt_tokens` by the
+    /// scheduler to form the donate entry's token key. Empty on the
+    /// error paths.
+    pub generated_tokens: Vec<i32>,
+    /// Whether the burst reached a healthy finish (`Stop` / `Length`).
+    /// Mirrors the classic path's `healthy` gate in `finalize_completed`
+    /// — only healthy finishes donate their cache back. `false` on the
+    /// error / transition-failure paths.
+    pub healthy_finish: bool,
 }
 
 /// Run a speculative burst for `seq`, producing every token the request
@@ -434,14 +463,29 @@ pub(crate) fn try_run_burst_b1(
                 return Ok(BurstFinalized {
                     seq_id,
                     tokens_generated: 0,
+                    // Transition failure is an error outcome — no
+                    // healthy cache to donate (issue #673).
+                    prompt_tokens: Vec::new(),
+                    generated_tokens: Vec::new(),
+                    healthy_finish: false,
                 });
             }
             let seq_id = seq.seq_id;
-            let tokens_generated =
+            // `finalize_burst_success` streams the tokens, classifies
+            // the finish reason, and hands back the prompt + committed
+            // token vectors so the scheduler can mirror the classic
+            // path's prompt-cache donate (issue #673). `logprobs` is
+            // forwarded so a speculative response carries the same
+            // `TokenWithLogprobs` payload as the classic decode path
+            // (issue #678).
+            let finalized =
                 finalize_burst_success(ctx, seq, tokens, logprobs, prefill_time_ms, decode_time_ms);
             Ok(BurstFinalized {
                 seq_id,
-                tokens_generated,
+                tokens_generated: finalized.tokens_generated,
+                prompt_tokens: finalized.prompt_tokens,
+                generated_tokens: finalized.generated_tokens,
+                healthy_finish: finalized.healthy_finish,
             })
         }
         Err(BurstOutcome::DeclineToClassic) => {
@@ -467,6 +511,12 @@ pub(crate) fn try_run_burst_b1(
             Ok(BurstFinalized {
                 seq_id,
                 tokens_generated: 0,
+                // Error outcome: the KV cache is assumed tainted, so
+                // no donate (issue #673, mirrors the classic path's
+                // `Finished(Error)` bypass in `finalize_completed`).
+                prompt_tokens: Vec::new(),
+                generated_tokens: Vec::new(),
+                healthy_finish: false,
             })
         }
     }
@@ -485,6 +535,28 @@ struct BurstSuccess {
     logprobs: Vec<Option<TokenLogprobData>>,
     prefill_time_ms: f64,
     decode_time_ms: f64,
+}
+
+/// Outcome of [`finalize_burst_success`].
+///
+/// Issue #673: in addition to the streamed token count (used for the
+/// Prometheus per-sequence histogram), this carries the data the
+/// scheduler needs to mirror the classic path's prompt-cache donate —
+/// the full prompt token stream, the tokens actually committed to the
+/// sequence (post early-EOS truncation), and whether the finish was
+/// healthy (`Stop` / `Length`). The burst owns the `SequenceInfo` by
+/// value, so re-surfacing these is the only way the scheduler can call
+/// `donate_finished_sequence_cache` after the burst returns.
+struct FinalizeOutcome {
+    /// Tokens actually streamed to the client (== committed
+    /// `generated_tokens.len()`).
+    tokens_generated: usize,
+    /// The request's full prompt token stream (for the donate key).
+    prompt_tokens: Vec<i32>,
+    /// The tokens committed to the sequence after early-EOS truncation.
+    generated_tokens: Vec<i32>,
+    /// `true` for `FinishReason::Stop` / `FinishReason::Length`.
+    healthy_finish: bool,
 }
 
 /// Burst error / decline.
@@ -1142,10 +1214,14 @@ pub(crate) fn apply_burst_thinking_budget(
 /// `scheduler.rs` so the request looks identical to the client whether
 /// it ran through the classic or speculative path.
 ///
-/// Returns the number of tokens actually streamed to the client (i.e.
-/// `seq.generated_tokens.len()` after the loop). The scheduler feeds
-/// this into `batch_metrics.record_sequence_completed(...)` so the
-/// Prometheus counters cover the burst path as well as the classic
+/// Returns a [`FinalizeOutcome`] carrying the number of tokens actually
+/// streamed to the client (`seq.generated_tokens.len()` after the
+/// loop), plus the prompt + committed token vectors and the
+/// healthy-finish flag. The scheduler feeds `tokens_generated` into
+/// `batch_metrics.record_sequence_completed(...)` so the Prometheus
+/// counters cover the burst path as well as the classic path, and uses
+/// the token vectors + flag to call `donate_finished_sequence_cache`
+/// (issue #673) exactly as `finalize_completed` does for the classic
 /// path.
 fn finalize_burst_success(
     ctx: BurstContext<'_>,
@@ -1154,7 +1230,7 @@ fn finalize_burst_success(
     logprobs: Vec<Option<TokenLogprobData>>,
     _prefill_time_ms: f64,
     _decode_time_ms: f64,
-) -> usize {
+) -> FinalizeOutcome {
     // Resolve the eos set once for the EOS-vs-Length classification.
     // `seq.merged_eos` is empty here (the classic path populates it in
     // `finish_prefill`); we recompute from the sampling/model state.
@@ -1231,6 +1307,19 @@ fn finalize_burst_success(
         // still accurate.
         FinishReason::Stop
     };
+    // Issue #673: classify the finish for the prompt-cache donate gate
+    // BEFORE `finish_reason` is moved into `transition_to`. Mirrors the
+    // `healthy` gate in `scheduler.rs::finalize_completed` — only
+    // `Stop` / `Length` / `Cancelled` finishes donate their cache back.
+    // `finalize_burst_success` only ever classifies `Stop` or `Length`
+    // (the `Error` / `Cancelled` outcomes never reach this function),
+    // so this is always `true` here; computing it explicitly keeps the
+    // burst path's gate bit-identical to the classic path's and robust
+    // if the classification above ever gains a new arm.
+    let healthy_finish = matches!(
+        finish_reason,
+        FinishReason::Stop | FinishReason::Length | FinishReason::Cancelled
+    );
     if let Err(err) = seq
         .state
         .transition_to(SequenceState::Finished(finish_reason))
@@ -1254,7 +1343,15 @@ fn finalize_burst_success(
         "Speculative burst completed"
     );
     let _ = seq.response_tx.send(GenerateEvent::Done(result));
-    tokens_generated
+    // Move the prompt + committed token vectors out of `seq` for the
+    // scheduler's prompt-cache donate (issue #673). `seq` is dropped
+    // immediately after this — these are its last readers.
+    FinalizeOutcome {
+        tokens_generated,
+        prompt_tokens: std::mem::take(&mut seq.prompt_tokens),
+        generated_tokens: std::mem::take(&mut seq.generated_tokens),
+        healthy_finish,
+    }
 }
 
 /// Emit an error event for `seq` over the response channel, then drop

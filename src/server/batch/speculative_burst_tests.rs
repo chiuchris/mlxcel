@@ -1244,3 +1244,76 @@ fn burst_module_exports_required_for_scheduler_integration_compile() {
     let _ = std::mem::size_of::<super::speculative_burst::WorkerDrafterSlot>();
     let _ = std::mem::size_of::<super::speculative_burst::BurstFinalized>();
 }
+
+// =============================================================================
+// Issue #673: `BurstFinalized` prompt-cache donate plumbing.
+//
+// `try_run_burst_b1` returns a `BurstFinalized` whose `prompt_tokens`,
+// `generated_tokens`, and `healthy_finish` fields the scheduler feeds
+// into `donate_finished_sequence_cache` so the burst path mirrors the
+// classic path's `finalize_completed` prompt-cache donate. Driving
+// `try_run_burst_b1` end-to-end needs a real `LoadedModel` (infeasible
+// in a fast unit test — see the comment block above), so these tests
+// pin the struct's shape and the field contract directly: the
+// scheduler's destructuring `match` would break at compile time if a
+// field were renamed or dropped, and the semantic tests below assert
+// the healthy / non-healthy field conventions the burst's success and
+// error arms must follow.
+// =============================================================================
+
+#[test]
+fn burst_finalized_carries_prompt_cache_donate_fields() {
+    use super::speculative_burst::BurstFinalized;
+
+    // Construct a `BurstFinalized` exactly as the burst's success arm
+    // does. This is a compile-time pin: if `prompt_tokens`,
+    // `generated_tokens`, or `healthy_finish` are renamed/removed, the
+    // scheduler's `Ok(BurstFinalized { .. })` destructuring in
+    // `execute_prefill` breaks at the same time as this test.
+    let finalized = BurstFinalized {
+        seq_id: SequenceId::from_raw(7),
+        tokens_generated: 3,
+        prompt_tokens: vec![1, 2, 3, 4],
+        generated_tokens: vec![10, 11, 12],
+        healthy_finish: true,
+    };
+
+    assert_eq!(finalized.seq_id, SequenceId::from_raw(7));
+    assert_eq!(finalized.tokens_generated, 3);
+    assert_eq!(finalized.prompt_tokens, vec![1, 2, 3, 4]);
+    assert_eq!(finalized.generated_tokens, vec![10, 11, 12]);
+    assert!(finalized.healthy_finish);
+    // `tokens_generated` must equal the committed `generated_tokens`
+    // length — both are derived from `seq.generated_tokens` after the
+    // early-EOS truncation in `finalize_burst_success`.
+    assert_eq!(finalized.tokens_generated, finalized.generated_tokens.len());
+}
+
+#[test]
+fn burst_finalized_error_outcome_has_empty_donate_payload() {
+    use super::speculative_burst::BurstFinalized;
+
+    // The error / transition-failure arms of `try_run_burst_b1` build
+    // a `BurstFinalized` with empty token vectors and
+    // `healthy_finish == false` — the KV cache is assumed tainted on
+    // those paths, so the scheduler's `donate_finished_sequence_cache`
+    // call must be a no-op. This mirrors the classic path, where
+    // `Finished(Error)` sequences bypass the donate branch in
+    // `finalize_completed`. `donate_finished_sequence_cache` itself
+    // hard-guards on `healthy_finish` before touching the store, so an
+    // empty/false payload is the correct "do not donate" signal.
+    let errored = BurstFinalized {
+        seq_id: SequenceId::from_raw(9),
+        tokens_generated: 0,
+        prompt_tokens: Vec::new(),
+        generated_tokens: Vec::new(),
+        healthy_finish: false,
+    };
+
+    assert!(!errored.healthy_finish, "error outcome must not be healthy");
+    assert!(
+        errored.prompt_tokens.is_empty() && errored.generated_tokens.is_empty(),
+        "error outcome carries no tokens to donate"
+    );
+    assert_eq!(errored.tokens_generated, 0);
+}

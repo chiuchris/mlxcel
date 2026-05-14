@@ -1728,8 +1728,41 @@ impl BatchScheduler {
                 Ok(super::speculative_burst::BurstFinalized {
                     seq_id,
                     tokens_generated,
+                    prompt_tokens,
+                    generated_tokens,
+                    healthy_finish,
                 }) => {
                     // Burst handled the full request lifecycle inline.
+                    //
+                    // Issue #673: donate the finished sequence's KV
+                    // cache back to the prompt-cache store BEFORE the
+                    // `remove`/`release` below — `donate_finished_sequence_cache`
+                    // both consumes the `prompt_cache_seq_ctx` entry
+                    // and needs the cache slot still attached. This
+                    // mirrors the classic path's `finalize_completed`
+                    // (~line 3266), keeping the burst and classic
+                    // donate paths symmetric. The donate helper is
+                    // hard-gated on a dense KV-cache backend; the two
+                    // burst-eligible model families today — Qwen 3.5
+                    // (DFlash) and Gemma 4 (MTP) — are both
+                    // `SequenceStateBackend::ModelOwned` with
+                    // heterogeneous attention+recurrent caches that the
+                    // `DetachedCacheSet` (`Vec<KVCache>`) handoff
+                    // cannot represent, so the donate is a guarded
+                    // no-op for them — *identical* to the classic
+                    // path's no-op for those same model families
+                    // (`donate_finished_sequence_cache` returns early
+                    // at the `backend != DenseKvCache` check for both
+                    // paths). Wiring it in removes the structural
+                    // asymmetry between the two paths and future-proofs
+                    // the burst for any dense-KV-cache model that later
+                    // becomes burst-eligible.
+                    self.donate_finished_sequence_cache(
+                        seq_id,
+                        &prompt_tokens,
+                        &generated_tokens,
+                        healthy_finish,
+                    );
                     // Release the pre-allocated cache slot so the next
                     // request can reuse it. The burst's own per-layer
                     // cache vec (DFlash on Qwen 3.5) was allocated and
@@ -1737,6 +1770,11 @@ impl BatchScheduler {
                     // cache pool entry (and any model-owned per-seq
                     // state for Gemma 4 / Qwen 3.5) is released here
                     // for symmetry with `finalize_completed`.
+                    // `donate_finished_sequence_cache` already removed
+                    // the `prompt_cache_seq_ctx` entry on the donate
+                    // path; the `remove` here is the defensive
+                    // non-donate cleanup (matches `finalize_completed`
+                    // ~line 3276).
                     self.prompt_cache_seq_ctx.remove(&seq_id);
                     self.release_sequence_caches(seq_id);
                     // Mirror the classic path's per-sequence metric
