@@ -97,8 +97,6 @@
 //! - The request adopted a prompt-cache prefix (`prefill_start_offset > 0`):
 //!   a burst owns the cache for its full lifetime; mixing an adopted prefix
 //!   would double-prefill the leading tokens.
-//! - Thinking-budget enforcement is active: the burst path does not yet
-//!   implement forced `</think>` injection on budget exceeded.
 //!
 //! History-dependent sampling penalties (repetition / frequency /
 //! presence / DRY) are **not** a gate: the burst threads
@@ -110,6 +108,11 @@
 //! through `MtpGenerator::generate` / `DFlashGenerator::run` and emits
 //! `TokenWithLogprobs` events from `finalize_burst_success` — the same
 //! payload the classic decode path produces (issue #678).
+//!
+//! Thinking-budget enforcement is **not** a gate: `finalize_burst_success`
+//! runs the same per-token `decide_override` + `observe` cycle as the
+//! classic path's `apply_thinking_budget`, injecting a forced `</think>`
+//! at the budget boundary (issue #679).
 //!
 //! Each declined request is logged at `debug` level with the gate reason.
 //!
@@ -264,9 +267,6 @@ impl WorkerDrafterSlot {
 ///    A speculative burst owns the cache for its full lifetime; mixing
 ///    an adopted prefix with the burst's own prefill would double-prefill
 ///    the leading tokens.
-/// 5. `seq.thinking` is disabled — the burst path does not implement
-///    forced `</think>` injection on budget exceeded. Routing to classic
-///    preserves the budget enforcement.
 ///
 /// History-dependent sampling penalties (repetition / frequency /
 /// presence / DRY) are **no longer** a gate (issue #677): the burst
@@ -278,6 +278,12 @@ impl WorkerDrafterSlot {
 /// #678): the burst threads `logprobs_config` through the round-loop
 /// drivers and emits `TokenWithLogprobs` events from
 /// `finalize_burst_success`, the same payload the classic path produces.
+///
+/// Thinking-budget enforcement is likewise **no longer** a gate (issue
+/// #679): `finalize_burst_success` runs the same per-token
+/// `decide_override` + `observe` cycle as the classic path's
+/// `apply_thinking_budget`, injecting a forced `</think>` at the budget
+/// boundary.
 ///
 /// Each gate-out logs at debug level so an operator can correlate a
 /// "spec request fell back to classic" with the reason. The gates run
@@ -325,14 +331,12 @@ pub(crate) fn should_burst_for_sequence(
     // `MtpGenerator::generate` / `DFlashGenerator::run` and emits
     // `TokenWithLogprobs` events from `finalize_burst_success` — the
     // same payload the classic decode path produces.
-    if !seq.thinking.is_disabled() {
-        tracing::debug!(
-            "speculative burst declined for seq {}: thinking-budget enforcement active \
-             (burst path does not yet implement forced </think> injection)",
-            seq.seq_id,
-        );
-        return false;
-    }
+    //
+    // Thinking-budget enforcement is likewise NO LONGER a gate (issue
+    // #679). `finalize_burst_success` runs the same per-token
+    // `decide_override` + `observe` cycle the classic path's
+    // `apply_thinking_budget` uses, injecting a forced `</think>` at the
+    // budget boundary.
     true
 }
 
@@ -1084,6 +1088,54 @@ fn run_dflash_on_qwen35(
     }
 }
 
+/// Apply issue #409 thinking-budget enforcement to one burst-produced
+/// token, mirroring the classic decode path's
+/// `BatchScheduler::apply_thinking_budget` (`scheduler.rs`).
+///
+/// Inspects `token` via [`mlxcel_core`-adjacent]
+/// [`crate::server::thinking_budget::ThinkingState::decide_override`];
+/// when the `<think>` budget is exceeded the forced `</think>` close id
+/// is substituted, then
+/// [`crate::server::thinking_budget::ThinkingState::observe`] advances
+/// the state machine with the final token. `is_disabled()`
+/// short-circuits to a single branch for non-thinking requests (zero
+/// overhead on the hot path).
+///
+/// Returns `(final_token, override_fired)`:
+/// - `final_token` — the id to commit / stream (either `token` or the
+///   forced `</think>` close id).
+/// - `override_fired` — `true` when the budget substituted a different
+///   token. The caller uses this to drop the per-token logprob (the
+///   generator's logprob describes the *original* token, so emitting it
+///   against the forced `</think>` would make text and metadata
+///   inconsistent — the classic path drops it identically).
+///
+/// ## Burst vs classic semantics
+///
+/// Unlike the classic path — which re-samples fresh logits on the
+/// *next* step after a forced close — the burst's remaining tokens were
+/// pre-computed by the round loop while the model still believed it was
+/// inside the `<think>` block. The budget enforcement still injects
+/// `</think>` at the correct boundary; the post-close tokens are the
+/// burst's own output. This is an inherent property of Option-B burst
+/// dispatch (one scheduler tick produces every token) and is documented
+/// on [`should_burst_for_sequence`].
+pub(crate) fn apply_burst_thinking_budget(
+    thinking: &mut crate::server::thinking_budget::ThinkingState,
+    token: i32,
+) -> (i32, bool) {
+    use crate::server::thinking_budget::ThinkingDecision;
+    if thinking.is_disabled() {
+        return (token, false);
+    }
+    let final_token = match thinking.decide_override(token) {
+        ThinkingDecision::NoOverride => token,
+        ThinkingDecision::ForceClose(close_id) => close_id,
+    };
+    thinking.observe(final_token);
+    (final_token, final_token != token)
+}
+
 /// Stream tokens from a successful burst to `seq.response_tx`, then
 /// emit the `Done` event and clean up. Mirrors the relevant bits of
 /// `finish_prefill` + `decode_single_step` + `finalize_completed` from
@@ -1125,21 +1177,37 @@ fn finalize_burst_success(
         if seq.generated_tokens.len() >= max_tokens {
             break;
         }
+
+        // Issue #409 / #679: thinking-budget enforcement, applied
+        // per-emitted-token. See [`apply_burst_thinking_budget`].
+        // `override_fired` gates logprob emission below: when the
+        // thinking-budget substituted a different token, the
+        // generator's `logprobs[idx]` entry describes the *original*
+        // token, so emitting it against the forced `</think>` would
+        // make the token text and logprob metadata inconsistent. The
+        // classic path drops the logprob in exactly this case
+        // (`scheduler.rs::decode_single_step`).
+        let (final_token, override_fired) =
+            apply_burst_thinking_budget(&mut seq.thinking, token);
+
         // EOS check before recording the token so EOS is reported as
         // FinishReason::Stop, not Length, matching the classic
-        // `decode_single_step` semantics.
-        if eos_set.contains(&token) {
+        // `decode_single_step` semantics. The check uses the
+        // post-override `final_token` so a forced `</think>` that
+        // happens to be an EOS id is classified correctly.
+        if eos_set.contains(&final_token) {
             hit_eos = true;
             break;
         }
-        seq.generated_tokens.push(token);
-        if let Some(new_text) = seq.decode_state.on_token(token, ctx.tokenizer) {
+        seq.generated_tokens.push(final_token);
+        if let Some(new_text) = seq.decode_state.on_token(final_token, ctx.tokenizer) {
             // `logprobs[idx]` mirrors the classic path's per-token
             // `compute_logprobs(...)` result: `Some(lp)` → emit
             // `TokenWithLogprobs`, `None` → emit plain `Token` (the
             // classic path does the same when `compute_logprobs`
-            // returns `None`, e.g. on a sampler override).
-            let event = if logprobs_enabled {
+            // returns `None`, e.g. on a sampler override). A fired
+            // thinking-budget override also forces plain `Token`.
+            let event = if logprobs_enabled && !override_fired {
                 match logprobs.get(idx).and_then(|lp| lp.clone()) {
                     Some(lp) => GenerateEvent::TokenWithLogprobs(new_text, lp),
                     None => GenerateEvent::Token(new_text),

@@ -284,8 +284,16 @@ fn burst_allowed_when_logprobs_enabled() {
     );
 }
 
+// Thinking-budget enforcement is NO LONGER a decline-to-classic gate
+// (issue #679): `finalize_burst_success` runs the same per-token
+// `decide_override` + `observe` cycle as the classic path's
+// `apply_thinking_budget`, injecting a forced `</think>` at the budget
+// boundary. The test below (formerly
+// `burst_declined_when_thinking_state_active`) now asserts the gate
+// stays OPEN. The forced-injection logic itself is pinned by
+// `apply_burst_thinking_budget_*` tests further down.
 #[test]
-fn burst_declined_when_thinking_state_active() {
+fn burst_allowed_when_thinking_state_active() {
     use crate::server::thinking_budget::{ThinkingBudget, ThinkingTokenIds};
     let dispatch = make_mtp_dispatch();
     let (mut seq, _rx) = make_test_sequence();
@@ -301,9 +309,9 @@ fn burst_declined_when_thinking_state_active() {
         .expect("256 > 0 yields Some");
     seq.thinking = ThinkingState::new(Some(token_ids), Some(budget), false);
     assert!(
-        !should_burst_for_sequence(&dispatch, &seq),
-        "thinking-budget enforcement must fall back to classic decode \
-         (burst path does not implement forced </think> injection yet)"
+        should_burst_for_sequence(&dispatch, &seq),
+        "thinking-budget enforcement must NOT decline to classic — the burst \
+         now injects forced </think> at the budget boundary (issue #679)"
     );
 }
 
@@ -1097,6 +1105,130 @@ fn drive_mtp_generator_round_loop_returns_empty_logprobs_when_disabled() {
 // What we can unit-test without weights: the `try_run_burst_b1` interface
 // itself (names / signatures stable) is pinned by the compile test below.
 // =============================================================================
+
+// =============================================================================
+// Thinking-budget enforcement through the burst — issue #679
+//
+// PR #671 (issue #670) gated requests with active thinking-budget
+// enforcement to the classic decode path because the burst path never
+// implemented the forced `</think>` injection. Issue #679 has
+// `finalize_burst_success` run the same per-token `decide_override` +
+// `observe` cycle the classic path's `apply_thinking_budget` uses,
+// factored into the `apply_burst_thinking_budget` helper.
+//
+// The gate change is pinned by `burst_allowed_when_thinking_state_active`
+// above. The forced-injection logic itself is pinned below at the
+// `apply_burst_thinking_budget` helper level — `finalize_burst_success`
+// needs a `BurstContext` (a real `&LoadedModel`) which is infeasible in
+// a fast unit test, but the helper is a pure function over
+// `&mut ThinkingState` (the same shape as the classic path's
+// `apply_thinking_budget`), so it is directly testable. The end-to-end
+// burst behaviour is exercised in the real-model `tests/` lane.
+// =============================================================================
+
+#[test]
+fn apply_burst_thinking_budget_passes_through_when_disabled() {
+    use super::speculative_burst::apply_burst_thinking_budget;
+    use crate::server::thinking_budget::ThinkingState;
+
+    // A disabled state must short-circuit: the token passes through
+    // unchanged and `override_fired` is false (zero-overhead path for
+    // non-thinking requests).
+    let mut thinking = ThinkingState::disabled();
+    let (final_token, override_fired) = apply_burst_thinking_budget(&mut thinking, 4242);
+    assert_eq!(final_token, 4242, "disabled state must pass the token through");
+    assert!(!override_fired, "disabled state must never report an override");
+}
+
+#[test]
+fn apply_burst_thinking_budget_injects_close_at_budget_boundary() {
+    use super::speculative_burst::apply_burst_thinking_budget;
+    use crate::server::thinking_budget::{ThinkingBudget, ThinkingState, ThinkingTokenIds};
+
+    // Budget = 2 in-block tokens. `enter_block_on_start = true` so the
+    // first emitted token is already inside the `<think>` block (the
+    // Qwen3 default where the chat template primes `<think>\n`).
+    let token_ids = ThinkingTokenIds {
+        open: 100,
+        close: 101,
+    };
+    let budget = ThinkingBudget::from_raw_i32(2)
+        .expect("valid budget")
+        .expect("2 > 0 yields Some");
+    let mut thinking = ThinkingState::new(Some(token_ids), Some(budget), true);
+
+    // Token 1: in-block #1 — under budget, passes through.
+    let (t1, o1) = apply_burst_thinking_budget(&mut thinking, 200);
+    assert_eq!(t1, 200, "first in-block token is under budget");
+    assert!(!o1, "no override under budget");
+
+    // Token 2: in-block #2 — reaches budget cap (in_block_count == 2),
+    // but `decide_override` fires on the NEXT token (it checks
+    // `in_block_count >= cap` before observing this one). So token 2
+    // still passes through.
+    let (t2, o2) = apply_burst_thinking_budget(&mut thinking, 201);
+    assert_eq!(t2, 201, "second in-block token still under the cap check");
+    assert!(!o2, "no override yet — cap is checked before this token is observed");
+
+    // Token 3: `in_block_count` is now 2 == cap, so `decide_override`
+    // returns `ForceClose(101)`. The burst-produced token (202) is
+    // SUBSTITUTED with the forced `</think>` close id, and
+    // `override_fired` is true.
+    let (t3, o3) = apply_burst_thinking_budget(&mut thinking, 202);
+    assert_eq!(
+        t3, 101,
+        "at the budget boundary the burst token must be replaced with the \
+         forced </think> close id (issue #679)"
+    );
+    assert!(
+        o3,
+        "override_fired must be true when the forced </think> is injected — \
+         the caller uses this to drop the (now-stale) per-token logprob"
+    );
+
+    // Token 4: the block is now Closed — budget logic is inactive, the
+    // token passes through unchanged.
+    let (t4, o4) = apply_burst_thinking_budget(&mut thinking, 203);
+    assert_eq!(t4, 203, "after the block closes, tokens pass through");
+    assert!(!o4, "no override once the block is Closed");
+}
+
+#[test]
+fn apply_burst_thinking_budget_respects_natural_close_before_budget() {
+    use super::speculative_burst::apply_burst_thinking_budget;
+    use crate::server::thinking_budget::{ThinkingBudget, ThinkingState, ThinkingTokenIds};
+
+    // Generous budget; the model closes the block on its own (emits the
+    // `</think>` token) well before the cap. The burst must NOT inject
+    // a second `</think>` — the natural close passes through and the
+    // block transitions to Closed.
+    let token_ids = ThinkingTokenIds {
+        open: 100,
+        close: 101,
+    };
+    let budget = ThinkingBudget::from_raw_i32(1000)
+        .expect("valid budget")
+        .expect("1000 > 0 yields Some");
+    let mut thinking = ThinkingState::new(Some(token_ids), Some(budget), true);
+
+    // A couple of in-block tokens, then the model's own `</think>`.
+    let (_t, o1) = apply_burst_thinking_budget(&mut thinking, 200);
+    assert!(!o1);
+    let (t_close, o_close) = apply_burst_thinking_budget(&mut thinking, 101);
+    assert_eq!(
+        t_close, 101,
+        "the model's own </think> token passes through unchanged"
+    );
+    assert!(
+        !o_close,
+        "a natural close is NOT an override — no forced injection"
+    );
+
+    // Post-close tokens pass through.
+    let (t_after, o_after) = apply_burst_thinking_budget(&mut thinking, 202);
+    assert_eq!(t_after, 202);
+    assert!(!o_after);
+}
 
 // =============================================================================
 // Compile-time pin: the burst module must export the items the
