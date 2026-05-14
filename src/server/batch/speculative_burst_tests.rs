@@ -591,7 +591,10 @@ fn drive_mtp_generator_round_loop_produces_more_than_one_token_when_drafter_is_b
 
     let prompt = vec![1, 2, 3];
     let sampling = SamplingConfig::greedy();
-    let (emitted, _stats) = generator.generate(&prompt, /* max_tokens= */ 16, &sampling);
+    // Not cancelled — exercise the full round loop.
+    let cancel = AtomicBool::new(false);
+    let (emitted, _stats) =
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
 
     // We expect 8 tokens before EOS (4 per round, 2 rounds):
     // [100, 10, 11, 12, 13, 20, 21, 22]. Then the 9999 EOS in round 2's
@@ -646,7 +649,11 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_drafter_is_unbound() {
 
     let prompt = vec![1, 2, 3];
     let sampling = SamplingConfig::greedy();
-    let (emitted, _stats) = generator.generate(&prompt, /* max_tokens= */ 16, &sampling);
+    // Not cancelled — the early-out we are pinning here is the unbound
+    // drafter, not cancellation.
+    let cancel = AtomicBool::new(false);
+    let (emitted, _stats) =
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
 
     // CRITICAL invariant — without bind, the round loop breaks on the
     // first draft_block call and we get exactly the seed bonus.
@@ -673,6 +680,87 @@ fn drive_mtp_generator_round_loop_returns_only_seed_when_drafter_is_unbound() {
     assert!(
         events_snapshot.contains(&"draft_block"),
         "draft_block must still have been called once (and returned BindNotCalled): {events_snapshot:?}"
+    );
+}
+
+// =============================================================================
+// Cancellation propagation regression — issue #672
+//
+// PR #671 (issue #670) landed Option-B speculative-burst dispatch but
+// `MtpGenerator::generate` / `DFlashGenerator::run` never inspected
+// `seq.cancelled`. A client that disconnected mid-burst would keep the
+// worker thread busy for the full `max_tokens` budget, wasting compute
+// AND head-of-line-blocking the next request. Issue #672 threads an
+// `&AtomicBool` through both generator APIs, checked once per round.
+//
+// The test below pins the MTP side at the `MtpGenerator::generate`
+// layer (the same layer `drive_mtp_generator` drives): a *pre-flagged*
+// cancellation flag must cause the round loop to break before the first
+// `draft_block` call, so the generator returns exactly the seed bonus.
+// If a future refactor drops the per-round `cancel.load(..)` check, this
+// test flips from "1 token" to ">1 token" and the regression surfaces
+// at `cargo test` time rather than as a stuck worker in production.
+//
+// The DFlash side shares the identical per-round-check shape in
+// `DFlashGenerator::run`; it is exercised by the DFlash round-loop unit
+// tests in `mlxcel-core` plus the integration tests in
+// `tests/speculative_dispatch.rs`.
+// =============================================================================
+
+#[test]
+fn drive_mtp_generator_round_loop_returns_only_seed_when_cancelled_before_first_round() {
+    use mlxcel_core::speculative::mtp::MtpGenerator;
+
+    // Same scripted two-round target + a properly bound drafter — the
+    // ONLY difference from
+    // `drive_mtp_generator_round_loop_produces_more_than_one_token_when_drafter_is_bound`
+    // is the pre-flagged cancellation flag.
+    let (target, drafter_scripts) = make_two_round_target_and_drafter();
+
+    let events = Rc::new(RefCell::new(Vec::new()));
+    let mut drafter = TrackingMockDrafter::new(drafter_scripts, events.clone());
+    let lm = MinimalLm;
+    drafter
+        .bind(&lm)
+        .expect("bind must succeed on tracking mock");
+
+    let boxed: Box<dyn Drafter> = Box::new(drafter);
+    let mut generator = MtpGenerator::new(target, boxed, /* block_size= */ 4);
+
+    let prompt = vec![1, 2, 3];
+    let sampling = SamplingConfig::greedy();
+    // Pre-flag cancellation BEFORE the generator runs — mirrors a client
+    // that disconnected while the request was still queued / prefilling.
+    let cancel = AtomicBool::new(true);
+    let (emitted, _stats) =
+        generator.generate(&prompt, /* max_tokens= */ 16, &sampling, &cancel);
+
+    // The prefill + seed-bonus emission happen unconditionally; the
+    // per-round cancellation check fires at the TOP of the round loop,
+    // before the first `draft_block`. So we get exactly the seed bonus.
+    assert_eq!(
+        emitted.len(),
+        1,
+        "a pre-flagged cancellation flag must break the round loop before \
+         the first draft_block call, leaving only the seed bonus. Got \
+         {emitted:?} — the per-round cancel.load(..) check in \
+         MtpGenerator::generate may have regressed (issue #672)."
+    );
+    assert_eq!(
+        emitted[0], 100,
+        "the single emitted token must be the seed bonus"
+    );
+    // `bind` ran (we called it explicitly) but `draft_block` must NOT
+    // have — the cancellation check short-circuits the round loop first.
+    let events_snapshot = events.borrow();
+    assert!(
+        events_snapshot.contains(&"bind"),
+        "bind was called explicitly before generate: {events_snapshot:?}"
+    );
+    assert!(
+        !events_snapshot.contains(&"draft_block"),
+        "draft_block must NOT run when cancellation is pre-flagged — the \
+         round loop breaks before reaching it: {events_snapshot:?}"
     );
 }
 

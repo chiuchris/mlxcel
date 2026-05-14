@@ -119,6 +119,7 @@
 //! operator can correct a typo'd path without restarting the server.
 
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use mlxcel_core::drafter::dflash::DFlashGenerator;
@@ -629,6 +630,12 @@ fn run_mtp_burst(
     let max_tokens = seq.max_tokens.max(1);
     let prompt = seq.prompt_tokens.clone();
 
+    // Cooperative-cancellation flag plumbed into the round-loop driver.
+    // The burst owns the worker thread for its full lifetime; on a
+    // client disconnect mid-burst the scheduler flips `seq.cancelled`
+    // and the generator bails out after the current round instead of
+    // running the whole `max_tokens` budget (issue #672).
+    let cancel: &AtomicBool = &seq.cancelled;
     let (output, stats) = match ctx.model {
         LoadedModel::Gemma4(wrapper) => {
             let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq.seq_id));
@@ -639,6 +646,7 @@ fn run_mtp_burst(
                 max_tokens,
                 &sampling,
                 block_size,
+                cancel,
             )
         }
         LoadedModel::Gemma4VLM(vlm) => {
@@ -653,6 +661,7 @@ fn run_mtp_burst(
                 max_tokens,
                 &sampling,
                 block_size,
+                cancel,
             )
         }
         // Unreachable: the hoisted variant check above already
@@ -707,6 +716,11 @@ struct DriveMtpOutput {
 /// `run_mtp_burst`) so this helper is generic over `T: MtpTarget`
 /// without needing a `&dyn LanguageModel` parameter — keeping the
 /// signature mockable.
+///
+/// `cancel` is the cooperative-cancellation flag forwarded to
+/// [`MtpGenerator::generate`]; it is checked once per round so a
+/// disconnected client's burst stops occupying the worker thread
+/// (issue #672).
 fn drive_mtp_generator<T>(
     target: T,
     drafter: Box<dyn Drafter>,
@@ -714,12 +728,13 @@ fn drive_mtp_generator<T>(
     max_tokens: usize,
     sampling: &SamplingConfig,
     block_size: usize,
+    cancel: &AtomicBool,
 ) -> (DriveMtpOutput, mlxcel_core::generate::GenerationStats)
 where
     T: mlxcel_core::speculative::mtp::target::MtpTarget,
 {
     let mut generator = MtpGenerator::new(target, drafter, block_size);
-    let (emitted, stats) = generator.generate(prompt, max_tokens, sampling);
+    let (emitted, stats) = generator.generate(prompt, max_tokens, sampling, cancel);
     // `MtpGenerator` owns the drafter by value; recover it via
     // `into_drafter` for slot-restoration.
     let recovered_drafter = generator.into_drafter();
@@ -780,6 +795,13 @@ fn run_dflash_burst(
     let prompt = seq.prompt_tokens.clone();
     let eos_token_ids = merged_eos_token_ids(ctx.model.eos_token_ids(), &sampling.stop_token_ids);
 
+    // Cooperative-cancellation flag plumbed into the round-loop driver.
+    // The burst owns the worker thread for its full lifetime; on a
+    // client disconnect mid-burst the scheduler flips `seq.cancelled`
+    // and the generator bails out after the current round instead of
+    // running the whole `max_tokens` budget (issue #672).
+    let cancel: &AtomicBool = &seq.cancelled;
+
     // DFlash supports Qwen35 (text) today. The variant gate above
     // already rejected anything else, so the inner match is total.
     let prefill_start = Instant::now();
@@ -793,6 +815,7 @@ fn run_dflash_burst(
             block_size,
             max_tokens,
             ctx.drafter_slot,
+            cancel,
         )?,
         _ => {
             // Unreachable per the variant gate above. Defensive arm
@@ -819,6 +842,12 @@ fn run_dflash_burst(
 
 /// DFlash burst on `Qwen35Model` — handles prefill, first-bonus + first-hidden
 /// extraction, and `DFlashGenerator::run` driving.
+///
+/// `cancel` is the cooperative-cancellation flag forwarded to
+/// [`DFlashGenerator::run`]; it is checked once per round so a
+/// disconnected client's burst stops occupying the worker thread
+/// (issue #672).
+#[allow(clippy::too_many_arguments)]
 fn run_dflash_on_qwen35(
     qwen: &crate::models::Qwen35Model,
     prompt_tokens: &[i32],
@@ -828,6 +857,7 @@ fn run_dflash_on_qwen35(
     block_size: u32,
     max_tokens: usize,
     drafter_slot: &mut WorkerDrafterSlot,
+    cancel: &AtomicBool,
 ) -> Result<(Vec<i32>, f64), BurstOutcome> {
     // Build a fresh per-layer cache vector for this request. We do NOT
     // touch the scheduler-owned `sequence_state` map — the speculative
@@ -921,6 +951,7 @@ fn run_dflash_on_qwen35(
         first_hidden,
         eos_token_ids,
         max_tokens,
+        cancel,
     );
 
     // Whatever the round-loop's outcome, recover the drafter so the

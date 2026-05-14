@@ -41,6 +41,7 @@
 use crate::drafter::{Drafter, SharedKv};
 use crate::generate::{GenerationStats, SamplingConfig};
 use crate::generation_policy::merged_eos_token_ids;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use super::target::{MtpTarget, MtpVerifyOutput};
@@ -143,6 +144,13 @@ impl<T: MtpTarget> MtpGenerator<T> {
     /// - `sampling`: sampling config. **Greedy parity requires
     ///   `temperature == 0`** — this is the load-bearing correctness
     ///   gate of the MTP path (see issue #629).
+    /// - `cancel`: cooperative-cancellation flag. Checked **once per
+    ///   round** (not per token) at the top of the round loop; when set,
+    ///   the generator returns early with whatever tokens it has already
+    ///   emitted (at minimum the first bonus). The server-side burst
+    ///   path passes `&seq.cancelled` so a client disconnect mid-burst
+    ///   stops occupying the worker thread (issue #672). The offline CLI
+    ///   path passes `&AtomicBool::new(false)`.
     ///
     /// # Returns
     ///
@@ -154,6 +162,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
         prompt_tokens: &[i32],
         max_tokens: usize,
         sampling: &SamplingConfig,
+        cancel: &AtomicBool,
     ) -> (Vec<i32>, GenerationStats) {
         assert!(
             !prompt_tokens.is_empty(),
@@ -204,6 +213,15 @@ impl<T: MtpTarget> MtpGenerator<T> {
         // ROUND LOOP.
         loop {
             if emitted.len() >= max_tokens {
+                break;
+            }
+            // Cooperative cancellation: checked once per round (cheap —
+            // a single relaxed atomic load), not per token. On a client
+            // disconnect mid-burst the server flips `seq.cancelled` and
+            // this loop bails out with the tokens emitted so far rather
+            // than running the full `max_tokens` budget and
+            // head-of-line-blocking the next request (issue #672).
+            if cancel.load(Ordering::Relaxed) {
                 break;
             }
             // Bound the block size by the remaining budget: per upstream

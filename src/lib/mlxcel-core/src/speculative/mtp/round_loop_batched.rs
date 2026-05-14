@@ -524,6 +524,7 @@ mod tests {
     use crate::weights::WeightMap;
     use cxx::UniquePtr;
     use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
 
     // ============================================================
     // Synthetic batched target
@@ -1199,8 +1200,12 @@ mod tests {
                 script: RefCell::new(drafter_script),
             };
             let mut gen_ = MtpGenerator::new(target, Box::new(drafter), block_size);
-            let (tokens, _) =
-                gen_.generate(&[1, 2, 3], max_new_tokens, &SamplingConfig::greedy());
+            let (tokens, _) = gen_.generate(
+                &[1, 2, 3],
+                max_new_tokens,
+                &SamplingConfig::greedy(),
+                &AtomicBool::new(false),
+            );
             reference_tokens.push(tokens);
         }
 

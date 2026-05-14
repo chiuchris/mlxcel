@@ -74,6 +74,7 @@ use crate::drafter::{Drafter, DrafterError};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{GenerationStats, SamplingConfig};
 use cxx::UniquePtr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// Default DFlash draft-block length. Matches the upstream
@@ -468,6 +469,13 @@ impl DFlashGenerator {
     ///   `max_tokens`).
     /// - `max_tokens` — generation budget INCLUDING the first bonus
     ///   token. The loop emits at most `max_tokens - 1` further tokens.
+    /// - `cancel` — cooperative-cancellation flag. Checked **once per
+    ///   round** (not per token) at the top of the round loop; when set,
+    ///   the loop returns early with whatever tokens it has already
+    ///   emitted. The server-side burst path passes `&seq.cancelled` so
+    ///   a client disconnect mid-burst stops occupying the worker thread
+    ///   (issue #672). The offline CLI path passes
+    ///   `&AtomicBool::new(false)`.
     ///
     /// # Returns
     ///
@@ -483,12 +491,12 @@ impl DFlashGenerator {
     /// rest of mlxcel-core's FFI-backed model paths).
     // Each argument here represents a distinct piece of generation
     // state (target, target-LM, caches, first bonus, first hidden,
-    // EOS, budget) that cannot be folded together without losing
-    // clarity at the only call site (the binary's `generate` command).
-    // The classic `SpeculativeGenerator::generate` similarly carries
-    // 6 args; an 8-arg DFlash-side `run` is the same shape with the
-    // added `target_lm` + `first_hidden` that DFlash specifically
-    // needs.
+    // EOS, budget, cancel) that cannot be folded together without
+    // losing clarity at the only call site (the binary's `generate`
+    // command). The classic `SpeculativeGenerator::generate` similarly
+    // carries 6 args; the DFlash-side `run` is the same shape with the
+    // added `target_lm` + `first_hidden` + `cancel` that DFlash
+    // specifically needs.
     #[allow(clippy::too_many_arguments)]
     pub fn run<T: SpeculativeTarget>(
         &mut self,
@@ -499,6 +507,7 @@ impl DFlashGenerator {
         first_hidden: UniquePtr<MlxArray>,
         eos_token_ids: &[i32],
         max_tokens: usize,
+        cancel: &AtomicBool,
     ) -> Result<DFlashRunOutput, DrafterError> {
         self.reset_run_state();
 
@@ -530,6 +539,15 @@ impl DFlashGenerator {
 
         loop {
             if emitted >= max_tokens {
+                break;
+            }
+            // Cooperative cancellation: checked once per round (cheap —
+            // a single relaxed atomic load), not per token. On a client
+            // disconnect mid-burst the server flips `seq.cancelled` and
+            // this loop bails out with the tokens emitted so far rather
+            // than running the full `max_tokens` budget and
+            // head-of-line-blocking the next request (issue #672).
+            if cancel.load(Ordering::Relaxed) {
                 break;
             }
             // Upstream: bs = min(block_total, max_tokens - emitted + 1)
@@ -1157,7 +1175,16 @@ mod tests {
         let first_hidden = ffi::zeros(&[1, 1, 5 * 8], crate::dtype::FLOAT32);
 
         let out = gen
-            .run(&target, &lm, &mut caches, first_bonus, first_hidden, &[], max_tokens)
+            .run(
+                &target,
+                &lm,
+                &mut caches,
+                first_bonus,
+                first_hidden,
+                &[],
+                max_tokens,
+                &AtomicBool::new(false),
+            )
             .expect("synthetic round loop must not fail");
         let rollback_events = target.rollback_events();
         let verify_lens = target.verify_call_lens();
@@ -1518,6 +1545,7 @@ mod tests {
                 first_hidden,
                 /*eos_token_ids=*/ &[104],
                 /*max_tokens=*/ 100,
+                /*cancel=*/ &AtomicBool::new(false),
             )
             .expect("synthetic round loop");
 

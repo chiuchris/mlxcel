@@ -33,6 +33,7 @@ use crate::generate::SamplingConfig;
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
 use std::cell::RefCell;
+use std::sync::atomic::AtomicBool;
 
 /// A fake `MtpTarget` that returns scripted target tokens from a queue.
 ///
@@ -314,7 +315,7 @@ fn round_loop_full_accept_emits_all_proposals_plus_bonus_per_round() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1, 2, 3], 13, &SamplingConfig::greedy());
+    let (tokens, stats) = gen_.generate(&[1, 2, 3], 13, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(
         tokens,
         vec![100, 10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33],
@@ -367,7 +368,7 @@ fn round_loop_partial_accept_rolls_back_by_block_size_minus_accepted_minus_one()
     // (seed + round-1's 2 accepted + round-2's 1 bonus). Larger
     // max_tokens would force more rounds against the reused scripted
     // entries, which is not what this test is measuring.
-    let (tokens, _stats) = gen_.generate(&[1, 2, 3], 4, &SamplingConfig::greedy());
+    let (tokens, _stats) = gen_.generate(&[1, 2, 3], 4, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(tokens, vec![100, 10, 11, 20]);
 
     // Pin the rollback bookkeeping: `verify_finalize` must receive
@@ -410,7 +411,7 @@ fn round_loop_respects_max_tokens_cap_on_full_accept() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1, 2, 3], 6, &SamplingConfig::greedy());
+    let (tokens, stats) = gen_.generate(&[1, 2, 3], 6, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(tokens.len(), 6, "must cap at max_tokens=6");
     assert_eq!(tokens[0], 100, "seed bonus is first");
     assert_eq!(stats.generated_tokens, 6);
@@ -425,7 +426,7 @@ fn round_loop_stops_on_eos_token() {
     let drafter = MockMtpDrafter::new(vec![vec![10, 11, 12]]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, _stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy());
+    let (tokens, _stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(tokens, vec![100, 10, 11, 12]);
 }
 
@@ -437,7 +438,7 @@ fn round_loop_first_bonus_eos_short_circuits_seed() {
     let drafter = MockMtpDrafter::new(vec![]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy());
+    let (tokens, stats) = gen_.generate(&[1], 20, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(tokens, vec![100]);
     assert_eq!(stats.generated_tokens, 1);
 }
@@ -448,7 +449,7 @@ fn round_loop_max_tokens_one_emits_only_seed_bonus() {
     let drafter = MockMtpDrafter::new(vec![]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (tokens, _) = gen_.generate(&[1], 1, &SamplingConfig::greedy());
+    let (tokens, _) = gen_.generate(&[1], 1, &SamplingConfig::greedy(), &AtomicBool::new(false));
     assert_eq!(tokens, vec![100]);
 }
 
@@ -478,7 +479,7 @@ fn round_loop_rebinds_drafter_after_each_round() {
     ]);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (_tokens, _stats) = gen_.generate(&[1], 9, &SamplingConfig::greedy());
+    let (_tokens, _stats) = gen_.generate(&[1], 9, &SamplingConfig::greedy(), &AtomicBool::new(false));
 
     // The drafter is owned by the generator behind `Box<dyn Drafter>`,
     // so we cannot downcast to read the log. Instead we exercise the
@@ -545,7 +546,7 @@ fn greedy_parity_perfect_drafter_matches_no_drafter_baseline_32_tokens() {
     let drafter = MockMtpDrafter::new(scripted_draft);
     let mut gen_ = MtpGenerator::new(target, Box::new(drafter), 4);
 
-    let (mtp_tokens, _) = gen_.generate(&[1], max_tokens, &SamplingConfig::greedy());
+    let (mtp_tokens, _) = gen_.generate(&[1], max_tokens, &SamplingConfig::greedy(), &AtomicBool::new(false));
     let baseline_tokens = greedy_baseline(&scripted_target, first_bonus, max_tokens);
 
     assert_eq!(
