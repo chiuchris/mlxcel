@@ -116,6 +116,12 @@
 //!
 //! Each declined request is logged at `debug` level with the gate reason.
 //!
+//! B > 1 batched bursts apply one additional window-admission guard:
+//! [`can_join_batched_burst_window`] keeps requests that need per-row
+//! payloads unsupported by the batched round loops (currently logprobs)
+//! on the B = 1 path. This preserves correctness without regressing the
+//! richer single-request burst features.
+//!
 //! ## Lazy-load model
 //!
 //! The drafter checkpoint is NOT read from disk at worker startup (issue #670,
@@ -339,6 +345,25 @@ pub(crate) fn should_burst_for_sequence(
     // `decide_override` + `observe` cycle the classic path's
     // `apply_thinking_budget` uses, injecting a forced `</think>` at the
     // budget boundary.
+    true
+}
+
+/// Return whether `seq` may join a B > 1 speculative-burst window.
+///
+/// This is intentionally **stricter** than [`should_burst_for_sequence`]:
+/// the B = 1 burst path can emit per-token logprob payloads, but the
+/// batched MTP/DFlash round loops return token IDs only. Keeping
+/// logprobs-enabled requests out of B > 1 windows makes them fall back
+/// to the B = 1 burst, where issue #678's `TokenWithLogprobs` contract
+/// is preserved.
+pub(crate) fn can_join_batched_burst_window(seq: &SequenceInfo) -> bool {
+    if seq.logprobs_config.enabled {
+        tracing::debug!(
+            "speculative batched burst declined for seq {}: logprobs requested",
+            seq.seq_id,
+        );
+        return false;
+    }
     true
 }
 
@@ -1553,10 +1578,10 @@ pub(crate) fn try_run_burst_batched(
                 // batched burst threads an empty `logprobs` vec into the
                 // shared finalize path — `finalize_burst_success` then
                 // emits plain `Token` events for every row. The batched
-                // window-admission gate (`sampling_config_eq`, added in a
-                // follow-up commit on this branch) rejects any
-                // logprobs-enabled request so it falls back to the B = 1
-                // burst, which captures logprobs correctly (issue #678).
+                // window-admission gate (`can_join_batched_burst_window`)
+                // rejects any logprobs-enabled request so it falls back
+                // to the B = 1 burst, which captures logprobs correctly
+                // (issue #678).
                 let finalized = finalize_burst_success(
                     ctx.reborrow(),
                     seq,

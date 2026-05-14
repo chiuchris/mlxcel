@@ -206,7 +206,8 @@ pub trait LanguageModel {
     /// and the Rust DFlash drafter resolves it here during
     /// [`crate::drafter::Drafter::bind`].
     ///
-    /// Used by: DFlash drafter lazy-bind path; Qwen 3.5 target family
+    /// Used by: DFlash drafter lazy-bind path; Gemma 4 MTP assistant
+    /// binding; Qwen 3.5 target family; Gemma 4 target family
     fn embed_tokens_module(&self) -> Option<crate::layers::UnifiedEmbedding> {
         None // default: not supported
     }

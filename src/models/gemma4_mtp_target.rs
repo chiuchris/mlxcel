@@ -36,17 +36,12 @@
 //! `forward_with_speculative_sinks` /
 //! `rollback_speculative_cache` hook with the captured `seq_id`.
 //!
-//! ## Scope (B = 1 today)
+//! ## Scope
 //!
 //! This adapter implements the B = 1 trait methods (`prefill_and_seed`,
 //! `verify_forward`, `verify_finalize`, `embed_token`, `num_layers`,
-//! `eos_token_ids`). The B > 1 batched methods (`prefill_and_seed_batched`,
-//! `verify_forward_batched`, `verify_finalize_batched`) fall back to the
-//! trait's default `DrafterError::DraftFailed` implementation, which the
-//! batched round-loop driver surfaces as a clear "not yet wired" error.
-//! Batched MTP integration with the continuous-batching scheduler lands
-//! in a peer follow-up — see the worker-startup warning in
-//! `src/server/model_worker.rs`.
+//! `eos_token_ids`). [`Gemma4MtpBatchedTargetAdapter`] implements the
+//! B > 1 batched surface for continuous batching.
 
 use std::cell::RefCell;
 
@@ -91,6 +86,33 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
     /// [`mlxcel_core::speculative::mtp::MtpGenerator::new`].
     pub fn new(wrapper: &'a Gemma4Wrapper, seq_id: Option<SequenceId>) -> Self {
         Self { wrapper, seq_id }
+    }
+
+    /// Slice a `[B, T, H]` hidden tensor down to one position,
+    /// preserving the singleton sequence axis (`[B, 1, H]`).
+    ///
+    /// MTP drafters consume the target hidden state aligned to the last
+    /// emitted token, not the full prompt / verify block. During prefill
+    /// this is the final prompt position; during verify it is the
+    /// `accepted` position selected by the speculative walk.
+    pub(crate) fn hidden_at_position(
+        hidden_full: &MlxArray,
+        position: usize,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(hidden_full);
+        debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, H]");
+        let seq_len = shape[1].max(1);
+        let pos = (position as i32).min(seq_len - 1);
+        mlxcel_core::slice(hidden_full, &[0, pos, 0], &[shape[0], pos + 1, shape[2]])
+    }
+
+    /// Slice the final position of a `[B, T, H]` hidden tensor to
+    /// `[B, 1, H]`.
+    pub(crate) fn last_position_hidden(hidden_full: &MlxArray) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(hidden_full);
+        debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, H]");
+        let last = shape[1].saturating_sub(1) as usize;
+        Self::hidden_at_position(hidden_full, last)
     }
 
     /// Slice the captured shared K/V tensors along the seq-len axis by
@@ -279,16 +301,19 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             mlxcel_core::sampling::compute_logprobs(&adjusted_logits, first_bonus, logprobs_config);
 
         // Build the seed MtpVerifyOutput from the captured sinks.
-        // `next_hidden` is the last entry in the hidden-sink (since we
+        // `hidden_full` is the last entry in the hidden-sink (since we
         // didn't pass `capture_layer_ids`, the sink has exactly one
-        // entry: the last decoder layer's pre-norm hidden state).
+        // entry: the last decoder layer's pre-norm hidden state for the
+        // full prompt). The drafter consumes only the final prompt
+        // position, so slice `[1, prompt_len, H]` to `[1, 1, H]`.
         let hidden_sink = sinks
             .hidden_sink
             .expect("with_hidden_and_shared_kv installs the hidden sink");
-        let next_hidden = hidden_sink
+        let hidden_full = hidden_sink
             .into_iter()
             .next_back()
             .expect("hidden sink must carry at least one entry after a forward pass");
+        let next_hidden = Self::last_position_hidden(hidden_full.as_ref().unwrap());
 
         // Materialize the shared K/V vector in the canonical
         // `[k_full, v_full, k_swa, v_swa]` order. The wrapper's
@@ -424,7 +449,8 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             !tensors.is_empty(),
             "VerifyCaptured must carry at least the hidden tensor at index 0"
         );
-        let next_hidden = tensors.remove(0);
+        let hidden_full = tensors.remove(0);
+        let next_hidden = Self::hidden_at_position(hidden_full.as_ref().unwrap(), accepted);
 
         // Per-row tail-zero rollback. For B = 1 the accept slice is a
         // single-element view; the rotating-cache zeroing inside
@@ -806,6 +832,51 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         let last = shape[1] - 1;
         mlxcel_core::slice(hidden_full, &[0, last, 0], &[shape[0], last + 1, shape[2]])
     }
+
+    /// Slice a `[B, T, H]` hidden tensor at a per-row accepted position,
+    /// yielding `[B, 1, H]`.
+    ///
+    /// Each row's next drafter state must align with that row's last
+    /// emitted token (`accepted_per_row[r]` in the verify block). A
+    /// simple last-position slice is only correct when every row fully
+    /// accepts the whole block.
+    fn hidden_at_positions_batched(
+        hidden_full: &MlxArray,
+        positions: &[usize],
+    ) -> Result<UniquePtr<MlxArray>, DrafterError> {
+        let shape = mlxcel_core::array_shape(hidden_full);
+        debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, hidden]");
+        let batch = shape[0] as usize;
+        let seq_len = shape[1].max(1);
+        if positions.len() != batch {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "Gemma4 batched MTP target: hidden position count {} does not match \
+                     batch size {batch}",
+                    positions.len()
+                ),
+            });
+        }
+
+        let mut rows: Vec<UniquePtr<MlxArray>> = Vec::with_capacity(batch);
+        for (r, &position) in positions.iter().enumerate() {
+            let pos = (position as i32).min(seq_len - 1);
+            rows.push(mlxcel_core::slice(
+                hidden_full,
+                &[r as i32, pos, 0],
+                &[(r as i32) + 1, pos + 1, shape[2]],
+            ));
+        }
+
+        let mut iter = rows.into_iter();
+        let mut out = iter
+            .next()
+            .expect("batch size is non-zero for hidden_at_positions_batched");
+        for row in iter {
+            out = mlxcel_core::concatenate(out.as_ref().unwrap(), row.as_ref().unwrap(), 0);
+        }
+        Ok(out)
+    }
 }
 
 impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
@@ -993,7 +1064,8 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
             });
         }
         let hidden_full = tensors.remove(0);
-        let next_hidden = Self::last_position_hidden(&hidden_full);
+        let next_hidden =
+            Self::hidden_at_positions_batched(hidden_full.as_ref().unwrap(), accepted_per_row)?;
 
         // Per-row tail-zero rollback on the adapter's own [B, ...] cache.
         // `rollback_speculative_cache_explicit` trims by `block_size -

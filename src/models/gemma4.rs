@@ -3151,6 +3151,17 @@ impl LanguageModel for Gemma4Wrapper {
         Some(self.input_embeddings(input_ids))
     }
 
+    /// Hand out the target embedding table for Gemma 4 MTP assistants.
+    ///
+    /// The assistant drafter's own embedding width can differ from the
+    /// target backbone width (for example 31B target 5376 vs assistant
+    /// 1024). Binding the target table lets `draft_block` concatenate
+    /// `[token_embed, target_hidden]` at `2 * backbone_hidden_size`,
+    /// matching upstream Gemma 4 MTP.
+    fn embed_tokens_module(&self) -> Option<mlxcel_core::layers::UnifiedEmbedding> {
+        Some(self.model.text_model.embed_tokens.clone_shared())
+    }
+
     /// Empty external caches: the wrapper owns all cache state internally
     /// and resolves it per `SequenceId` via [`ModelOwnedSequenceState`].
     /// The matching layout descriptor is

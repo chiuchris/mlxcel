@@ -1774,13 +1774,17 @@ impl BatchScheduler {
     /// byte-identical to B separate B=1 prefills (acceptance item 1 of
     /// issue #674). The window also requires matching `max_tokens` and
     /// sampling config so the single per-window sampler / budget the
-    /// batched round loop takes is correct for every row. A window that
-    /// collapses to size 1 falls back to the B=1 burst.
+    /// batched round loop takes is correct for every row. B > 1 also
+    /// applies [`super::speculative_burst::can_join_batched_burst_window`]
+    /// so requests that need payloads unsupported by the batched round
+    /// loops (currently logprobs) stay on the B = 1 burst path. A window
+    /// that collapses to size 1 falls back to the B=1 burst.
     fn try_speculative_burst(&mut self, seq: SequenceInfo) -> Option<SequenceInfo> {
         // Fast path: speculative dispatch off, or the head fails the
         // per-sequence gate (VLM embeddings / structured output /
-        // adopted cache prefix / penalty sampling / logprobs / thinking
-        // budget). Route straight to classic.
+        // adopted cache prefix). History-dependent penalties, logprobs,
+        // and thinking budgets are supported by the B = 1 burst path.
+        // Route straight to classic only for the hard per-request gates.
         if !super::speculative_burst::should_burst_for_sequence(&self.speculative_dispatch, &seq) {
             return Some(seq);
         }
@@ -1789,12 +1793,16 @@ impl BatchScheduler {
         // `seq`; siblings must (1) be speculative-eligible, (2) have the
         // same prompt length, (3) have the same `max_tokens`, and (4)
         // share the same sampling config — the batched round loop takes
-        // one sampler and one per-row budget for the whole window. The
-        // window cap is the configured `max_batch_size`, surfaced via
-        // the active batch's capacity (the scheduler constructs
+        // one sampler and one per-row budget for the whole window. B>1
+        // also excludes requests whose response payloads need per-row
+        // data that batched round loops do not return yet (for example
+        // logprobs), leaving them on the B=1 burst arm. The window cap
+        // is the configured `max_batch_size`, surfaced via the active
+        // batch's capacity (the scheduler constructs
         // `ActiveBatch::new(max_batch_size)`).
         let max_batch_size = self.active_batch.max_size();
-        let window: Vec<SequenceInfo> = if max_batch_size > 1 {
+        let head_can_join_batched = super::speculative_burst::can_join_batched_burst_window(&seq);
+        let window: Vec<SequenceInfo> = if max_batch_size > 1 && head_can_join_batched {
             let head_prompt_len = seq.prompt_tokens.len();
             let head_max_tokens = seq.max_tokens;
             let head_sampling = seq.sampling.clone();
@@ -1814,6 +1822,7 @@ impl BatchScheduler {
                             && super::speculative_burst::should_burst_for_sequence(
                                 dispatch, candidate,
                             )
+                            && super::speculative_burst::can_join_batched_burst_window(candidate)
                     });
             let mut window = Vec::with_capacity(extra.len() + 1);
             window.push(seq);

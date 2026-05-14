@@ -528,6 +528,13 @@ impl LanguageModel for Gemma4VLModel {
         Some(self.text_model.input_embeddings(input_ids))
     }
 
+    /// Delegate the text backbone's embedding module for Gemma 4 MTP
+    /// assistant binding. The vision wrapper owns no separate token
+    /// embedding table.
+    fn embed_tokens_module(&self) -> Option<mlxcel_core::layers::UnifiedEmbedding> {
+        mlxcel_core::generate::LanguageModel::embed_tokens_module(&self.text_model)
+    }
+
     /// Empty external caches: the text wrapper owns all cache state
     /// internally and resolves it per `SequenceId`. The matching layout
     /// descriptor is [`SequenceStateLayout::model_owned`] returned by

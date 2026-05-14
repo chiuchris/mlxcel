@@ -243,6 +243,41 @@ fn batched_last_position_hidden_slices_to_b_by_one() {
 }
 
 #[test]
+fn mtp_hidden_at_position_slices_single_position() {
+    let _runtime = crate::initialize_runtime();
+    // `[1, 4, 3]` hidden -> position 2 slice `[1, 1, 3]`.
+    let data: Vec<f32> = (0..(4 * 3)).map(|i| i as f32).collect();
+    let hidden = mlxcel_core::from_slice_f32(&data, &[1, 4, 3]);
+    let selected = Gemma4MtpTargetAdapter::hidden_at_position(hidden.as_ref().unwrap(), 2);
+    let shape = mlxcel_core::array_shape(selected.as_ref().unwrap());
+    assert_eq!(
+        shape,
+        vec![1, 1, 3],
+        "B=1 MTP target must pass a singleton-position hidden state to the drafter"
+    );
+}
+
+#[test]
+fn batched_hidden_at_positions_slices_per_row() {
+    let _runtime = crate::initialize_runtime();
+    // `[2, 4, 3]` hidden with different accepted positions per row
+    // must still produce `[2, 1, 3]`.
+    let data: Vec<f32> = (0..(2 * 4 * 3)).map(|i| i as f32).collect();
+    let hidden = mlxcel_core::from_slice_f32(&data, &[2, 4, 3]);
+    let selected = Gemma4MtpBatchedTargetAdapter::hidden_at_positions_batched(
+        hidden.as_ref().unwrap(),
+        &[1, 3],
+    )
+    .expect("per-row hidden slice");
+    let shape = mlxcel_core::array_shape(selected.as_ref().unwrap());
+    assert_eq!(
+        shape,
+        vec![2, 1, 3],
+        "Batched MTP target must select each row's accepted hidden position"
+    );
+}
+
+#[test]
 fn batched_scalar_tokens_per_row_extracts_one_per_row() {
     let _runtime = crate::initialize_runtime();
     // A `[3, 1]` token tensor (the shape `sample_token_optimized`

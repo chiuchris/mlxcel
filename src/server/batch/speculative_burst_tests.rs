@@ -20,10 +20,12 @@
 //! - **Gate**: [`should_burst_for_sequence`] returns `false` for every
 //!   condition that would silently break the burst path (VLM
 //!   embeddings, structured-output constraint, adopted prompt-cache
-//!   prefix, history-dependent sampling penalties, logprobs request,
-//!   and active thinking-budget state). Each gate has a dedicated test
-//!   so an accidental regression that drops one of them is caught at
-//!   `cargo test` time rather than in production.
+//!   prefix). History-dependent sampling penalties, logprobs requests,
+//!   and active thinking-budget state stay eligible for the B = 1 burst
+//!   path; B > 1 has its own stricter window guard for payloads the
+//!   batched round loops cannot yet return. Each gate has a dedicated
+//!   test so an accidental regression is caught at `cargo test` time
+//!   rather than in production.
 //!
 //! - **Bind contract (CRITICAL)**: [`drive_mtp_generator`] must run on
 //!   a drafter that has already been [`Drafter::bind`]-ed against its
@@ -84,7 +86,9 @@ use crate::server::model_provider::GenerateEvent;
 use crate::server::model_provider::model_worker::StreamingDecodeState;
 use crate::server::thinking_budget::ThinkingState;
 
-use super::speculative_burst::{WorkerDrafterSlot, should_burst_for_sequence};
+use super::speculative_burst::{
+    WorkerDrafterSlot, can_join_batched_burst_window, should_burst_for_sequence,
+};
 
 // =============================================================================
 // Test helpers
@@ -281,6 +285,32 @@ fn burst_allowed_when_logprobs_enabled() {
         should_burst_for_sequence(&dispatch, &seq),
         "logprobs_config.enabled=true must NOT decline to classic — the burst \
          now threads logprobs through and emits TokenWithLogprobs (issue #678)"
+    );
+}
+
+#[test]
+fn batched_window_rejects_logprobs_enabled_sequences() {
+    let dispatch = make_mtp_dispatch();
+    let (default_seq, _rx) = make_test_sequence();
+    assert!(
+        can_join_batched_burst_window(&default_seq),
+        "default requests without logprobs may join B>1 speculative windows"
+    );
+
+    let (mut seq, _rx) = make_test_sequence();
+    seq.logprobs_config = LogprobsConfig {
+        enabled: true,
+        top_k: 5,
+    };
+
+    assert!(
+        should_burst_for_sequence(&dispatch, &seq),
+        "logprobs-enabled requests must still be eligible for the B=1 burst"
+    );
+    assert!(
+        !can_join_batched_burst_window(&seq),
+        "B>1 speculative windows return token IDs only; logprobs-enabled \
+         requests must stay on the B=1 path so TokenWithLogprobs is emitted"
     );
 }
 

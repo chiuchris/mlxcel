@@ -27,7 +27,12 @@ pub fn repo_binary_path(name: &str) -> PathBuf {
     }
 
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    manifest_dir.join("target").join("debug").join(name)
+    let profile = if cfg!(debug_assertions) {
+        "debug"
+    } else {
+        "release"
+    };
+    manifest_dir.join("target").join(profile).join(name)
 }
 
 #[allow(dead_code)]

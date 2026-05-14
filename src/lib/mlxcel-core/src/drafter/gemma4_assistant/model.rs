@@ -388,32 +388,14 @@ impl std::fmt::Debug for Gemma4AssistantDraftModel {
 /// Holding a `&dyn LanguageModel` for the lifetime of the drafter would force
 /// the drafter to outlive the target wrapper, which would in turn force the
 /// caller to wrap the target in `Arc<dyn LanguageModel>`. Instead, `bind()`
-/// extracts the target's embed weight once and stashes it here so subsequent
-/// `embed(token_id)` lookups inside `draft_block()` go through MLX's
-/// quantized/regular embedding kernel without re-entering the target trait
-/// object.
-///
-/// The captured weight is whatever `LanguageModel::embed_tokens(input_ids)`
-/// returned at `bind()` time, multiplied by `embed_scale` inside
-/// [`Gemma4AssistantDraftModel::embed_with_scale`].
+/// asks the target for a shared-buffer [`UnifiedEmbedding`] handle and stashes
+/// it here so subsequent `embed(token_id)` lookups inside `draft_block()` use
+/// the target backbone's embedding width (for example Gemma 4 31B's 5376-wide
+/// table) instead of the assistant's smaller internal embedding table.
 struct TargetEmbedAdapter {
-    /// Last-known embedding tensor for the single sentinel token used during
-    /// `bind()`. NOT used for live lookups — see `embed_via_target`.
-    #[allow(dead_code)]
-    sentinel: UniquePtr<MlxArray>,
-    /// Cached `embed_tokens(input_ids)` callable as a raw function pointer
-    /// would require a stable ABI on `LanguageModel`. Instead we capture
-    /// `bind()`'s decision and re-enter the target through a stored
-    /// closure-like indirection — see `Gemma4AssistantDraftModel::bind`.
-    ///
-    /// The current minimal binding records only the embed-scale; the
-    /// `embed_tokens(...)` call is re-dispatched at use time through the
-    /// target reference threaded into `draft_block` by the round-loop.
-    /// Once the MTP round-loop (#629) lands, the round-loop will pass a
-    /// `&dyn LanguageModel` to `draft_block` and this adapter becomes
-    /// redundant; for now it holds only the sentinel weight so unit tests
-    /// can introspect the binding.
-    _phantom_target_ref: (),
+    /// Shared-buffer target embedding module. Cloning this handle does not
+    /// copy device memory; MLX arrays are reference-counted.
+    embed_tokens: UnifiedEmbedding,
 }
 
 impl Gemma4AssistantDraftModel {
@@ -603,19 +585,24 @@ impl Gemma4AssistantDraftModel {
                     feature: "embed_tokens",
                 })?;
 
-        // The embed scale (Gemma multiplies by sqrt(hidden_size)) is not
-        // surfaced through `LanguageModel`, but the drafter's
-        // `target_embed_scale` must match it for parity. The round-loop
-        // (#629) will set this explicitly per-target via a follow-up hook
-        // (TODO: track in #629). Until then we default to 1.0 — bit-exact
-        // for targets that do not scale, and the per-token magnitude
-        // mismatch on Gemma will surface as a measurable acceptance-rate
-        // drop, which the integration test in #629 catches.
-        self.target_embed_scale = 1.0;
-        self.target_embed = Some(TargetEmbedAdapter {
-            sentinel: embedded,
-            _phantom_target_ref: (),
-        });
+        let embed_shape = ffi::array_shape(&embedded);
+        let target_hidden = embed_shape.last().copied().unwrap_or(1).max(1);
+
+        // Gemma 4 target forward scales token embeddings by
+        // `sqrt(hidden_size)` before the transformer. The MTP assistant
+        // receives the same embedding stream concatenated with the target
+        // hidden state, so compute the scale from the target embedding
+        // width observed above. This keeps the drafter input identical to
+        // upstream without adding a new target-specific trait method.
+        self.target_embed_scale = (target_hidden as f32).sqrt();
+
+        // Store the target embedding module when the target can hand out a
+        // shared-buffer handle. Older unit-test mocks only implement
+        // `embed_tokens`; those still bind successfully and fall back to
+        // the assistant's own embedding table in `draft_block()`.
+        self.target_embed = target
+            .embed_tokens_module()
+            .map(|embed_tokens| TargetEmbedAdapter { embed_tokens });
 
         // Capture target's layer_types via a best-effort interface query.
         // The current `LanguageModel` trait does not expose `layer_types`
@@ -635,10 +622,9 @@ impl Gemma4AssistantDraftModel {
     /// The result feeds into `pre_projection` after concatenation with the
     /// drafter's recurrent hidden state.
     ///
-    /// Will be invoked from the MTP round-loop (#629) once the round-loop
-    /// threads `&dyn LanguageModel` through `draft_block`. Until then, the
-    /// drafter falls back to its own `embed_tokens` inside `draft_block` so
-    /// the per-step embedding lookup still works in unit tests.
+    /// Kept as a direct target-trait helper for tests / future call sites.
+    /// The hot `draft_block` path uses the shared module captured at
+    /// `bind()` time instead of re-entering the target trait object.
     #[allow(dead_code)]
     fn embed_with_scale(
         &self,
@@ -653,6 +639,23 @@ impl Gemma4AssistantDraftModel {
         // multiply_scalar accepts f32; embed_scale = 1.0 is a no-op fast
         // path inside MLX so this is free in the default case.
         Ok(crate::multiply_scalar(&embedded, self.target_embed_scale))
+    }
+
+    /// Embed token ids for the drafter input stream.
+    ///
+    /// Real Gemma 4 targets expose [`LanguageModel::embed_tokens_module`]
+    /// and this method uses that target table (scaled by
+    /// `sqrt(target_hidden_size)`) so concatenation with the target's
+    /// hidden state has width `2 * backbone_hidden_size`. Synthetic unit
+    /// tests may bind against mocks that only expose `embed_tokens`; those
+    /// fall back to the assistant's own embedding table.
+    fn draft_input_embed(&self, token_ids: &MlxArray) -> UniquePtr<MlxArray> {
+        if let Some(target_embed) = &self.target_embed {
+            let embedded = target_embed.embed_tokens.forward(token_ids);
+            crate::multiply_scalar(&embedded, self.target_embed_scale)
+        } else {
+            self.inner.embed_tokens.forward(token_ids)
+        }
     }
 
     /// Forward through the drafter's transformer stack with the current
@@ -851,12 +854,7 @@ impl Drafter for Gemma4AssistantDraftModel {
         for _ in 0..proposals {
             // Per-row embed: build a [B, 1] token-id tensor, embed, scale.
             let tok_ids = ffi::from_slice_i32(&last_tokens, &[batch_size as i32, 1]);
-            let tok_embed = self.inner.embed_tokens.forward(&tok_ids);
-            let tok_embed = if self.target_embed.is_some() {
-                crate::multiply_scalar(&tok_embed, self.target_embed_scale)
-            } else {
-                tok_embed
-            };
+            let tok_embed = self.draft_input_embed(&tok_ids);
 
             // [B, 1, hidden] + [B, 1, backbone] → [B, 1, 2 * backbone]
             let inputs_embeds = crate::concatenate(&tok_embed, &h_prev, -1);
@@ -899,21 +897,11 @@ impl Drafter for Gemma4AssistantDraftModel {
         block_size: usize,
         sampler: &SamplingConfig,
     ) -> Result<Vec<i32>, DrafterError> {
-        // The trait signature does NOT thread a `&dyn LanguageModel`
-        // through. The MTP round-loop (#629) needs to do that so the
-        // drafter can embed `last_bonus` via the target every step. Until
-        // #629 wires it, the drafter falls back to its own `embed_tokens`
-        // (which the upstream Python NEVER does — but is observable in the
-        // unit tests of #626 that exercise the forward-pass path without
-        // a target). This branch is documented in the issue acceptance
-        // criteria and will be replaced when #629's round-loop is wired
-        // through the trait.
-        //
-        // For now we hard-require `bind()` to have been called and pull the
-        // target embed from the bound state. If the drafter is in
-        // bind()-after-but-with-no-target state (only possible in unit
-        // tests), fall back to the drafter's own embed_tokens with
-        // embed_scale = 1.0.
+        // `bind()` captures the target embedding module when the target
+        // exposes one, so real Gemma 4 pairings embed `last_bonus` with
+        // the backbone-width target table every step. Unit-test mocks
+        // that only implement `embed_tokens` still bind successfully and
+        // fall back to the assistant's own embedding table.
 
         if self.shared_kv.is_none() {
             return Err(DrafterError::SetSharedKvNotCalled);
@@ -942,26 +930,11 @@ impl Drafter for Gemma4AssistantDraftModel {
 
         for _ in 0..block_size.saturating_sub(1) {
             // Embed last_token using the drafter's own embed_tokens as a
-            // fallback for the no-target tests. The real round-loop (#629)
-            // will pass the target through and the embedding will go via
-            // `embed_with_scale`. The fallback is mathematically valid
-            // because tied-dense drafters share the embed table with the
-            // target by construction.
+            // fallback for mocks that do not expose an embedding module.
+            // Real Gemma 4 targets bind a shared target embedding table so
+            // this tensor has backbone width and matches the target hidden.
             let tok_ids = ffi::from_slice_i32(&[last_token], &[1, 1]);
-            let tok_embed = self.inner.embed_tokens.forward(&tok_ids);
-            // For Gemma 4, the target uses sqrt(hidden_size) as embed_scale.
-            // The drafter's tied embedding does NOT need that scaling — the
-            // upstream Python explicitly avoids it on the drafter side by
-            // routing through `self._input_embed = inner.embed_tokens` and
-            // only multiplying when that captured callable is in use.
-            // Without a captured target embed, skip the scale to stay
-            // bit-identical to the test fixture path. The round-loop will
-            // call `embed_with_scale` via a target reference in #629.
-            let tok_embed = if self.target_embed.is_some() {
-                crate::multiply_scalar(&tok_embed, self.target_embed_scale)
-            } else {
-                tok_embed
-            };
+            let tok_embed = self.draft_input_embed(&tok_ids);
 
             // Concatenate along the last axis: [1, 1, hidden_size] + [1, 1,
             // backbone_hidden_size] → [1, 1, 2 * backbone_hidden_size]. The
