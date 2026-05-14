@@ -1137,15 +1137,22 @@ where
 
     // Prefill the prompt through the target's speculative verify hook,
     // capturing the same per-layer hidden states the DFlash round loop
-    // captures for candidate blocks. For Qwen 3.5 text and VLM-wrapped
-    // targets this uses the upstream-standard `[1, 8, 15, 22, 29]`
-    // fallback inside their `SpeculativeTarget::verify_forward` impls,
-    // matching the published DFlash drafter checkpoint
-    // (`z-lab/Qwen3.5-4B-DFlash`).
+    // captures for candidate blocks. The capture list comes from the
+    // drafter checkpoint's `target_layer_ids` (4B uses [1,8,15,22,29];
+    // larger drafts such as 27B use their own list).
+    let capture_layer_ids = owned_drafter
+        .dflash_target_layer_ids()
+        .filter(|ids| !ids.is_empty())
+        .map(<[usize]>::to_vec)
+        .unwrap_or_else(|| qwen.capture_layer_ids().to_vec());
     let prompt_arr = mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
-    let verify_out = qwen.verify_forward(&prompt_arr, &mut caches);
+    let prefill_verify_start = Instant::now();
+    let verify_out =
+        qwen.verify_forward_with_capture_layers(&prompt_arr, &mut caches, &capture_layer_ids);
+    let prefill_verify_ms = prefill_verify_start.elapsed().as_secs_f64() * 1000.0;
 
     // Sample the first bonus token from the last-position logits.
+    let first_bonus_start = Instant::now();
     let last_pos = prompt_tokens.len() as i32 - 1;
     let logits_shape = mlxcel_core::array_shape(&verify_out.logits);
     let vocab = logits_shape[2];
@@ -1173,9 +1180,11 @@ where
         first_bonus,
         logprobs_config,
     );
+    let first_bonus_ms = first_bonus_start.elapsed().as_secs_f64() * 1000.0;
 
     // Build first_hidden = concat(hidden_states, axis=-1)[:, last_pos:last_pos+1, :].
     // The DFlash round loop expects shape [1, 1, num_layers * hidden_size].
+    let first_hidden_start = Instant::now();
     if verify_out.hidden_states.is_empty() {
         // Drafter slot ownership: we took the drafter at the top; we
         // must not silently drop it on error.
@@ -1208,6 +1217,7 @@ where
         &[0, last_pos, 0],
         &[concatenated_shape[0], last_pos + 1, feature_dim],
     );
+    let first_hidden_ms = first_hidden_start.elapsed().as_secs_f64() * 1000.0;
 
     // Drive the round loop. `run` returns the tokens EXCLUDING the
     // first bonus; we prepend it on success so the caller sees a
@@ -1237,6 +1247,31 @@ where
 
     match result {
         Ok(output) => {
+            let diagnostics = output.diagnostics.clone();
+            tracing::info!(
+                block_size = diagnostics.block_size,
+                rounds = diagnostics.rounds,
+                proposed_tokens = diagnostics.proposed_tokens,
+                accepted_tokens = diagnostics.accepted_tokens,
+                acceptance_rate = diagnostics.acceptance_rate(),
+                emitted_per_verify = diagnostics.emitted_per_verify(),
+                zero_accept_rounds = diagnostics.zero_accept_rounds,
+                partial_accept_rounds = diagnostics.partial_accept_rounds,
+                full_accept_rounds = diagnostics.full_accept_rounds,
+                prefill_verify_ms,
+                first_bonus_ms,
+                first_hidden_ms,
+                bind_reset_ms = diagnostics.bind_reset_time_ms,
+                draft_ms = diagnostics.draft_time_ms,
+                verify_ms = diagnostics.verify_time_ms,
+                target_argmax_sync_ms = diagnostics.target_argmax_time_ms,
+                logprobs_ms = diagnostics.logprobs_time_ms,
+                walk_ms = diagnostics.walk_time_ms,
+                hidden_concat_ms = diagnostics.hidden_concat_time_ms,
+                rollback_ms = diagnostics.rollback_time_ms,
+                decode_ms = diagnostics.total_decode_time_ms,
+                "DFlash diagnostics"
+            );
             let mut tokens = Vec::with_capacity(output.tokens.len() + 1);
             tokens.push(first_bonus);
             tokens.extend(output.tokens);
@@ -1968,14 +2003,21 @@ where
     // path, we do NOT touch the scheduler-owned `sequence_state` map.
     let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = qwen.make_dflash_caches();
 
-    // `[B, L]` prefill through the target's speculative forward.
+    // `[B, L]` prefill through the target's speculative forward. Capture the
+    // hidden layers requested by this specific DFlash checkpoint.
+    let capture_layer_ids = owned_drafter
+        .dflash_target_layer_ids()
+        .filter(|ids| !ids.is_empty())
+        .map(<[usize]>::to_vec)
+        .unwrap_or_else(|| qwen.capture_layer_ids().to_vec());
     let mut flat_prompt: Vec<i32> = Vec::with_capacity(batch_size * prompt_len);
     for row in prompts {
         flat_prompt.extend_from_slice(row);
     }
     let prompt_arr =
         mlxcel_core::from_slice_i32(&flat_prompt, &[batch_size as i32, prompt_len as i32]);
-    let verify_out = qwen.verify_forward(&prompt_arr, &mut caches);
+    let verify_out =
+        qwen.verify_forward_with_capture_layers(&prompt_arr, &mut caches, &capture_layer_ids);
 
     // Per-row first bonus from the `[B, prompt_len, vocab]` last-position
     // logits.

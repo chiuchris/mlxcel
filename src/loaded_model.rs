@@ -292,6 +292,10 @@ impl LanguageModel for LoadedModel {
         delegate_language_model!(self, embed_tokens_module())
     }
 
+    fn lm_head_module(&self) -> Option<mlxcel_core::layers::UnifiedLinear> {
+        delegate_language_model!(self, lm_head_module())
+    }
+
     fn after_prefill(&self) {
         delegate_language_model!(self, after_prefill())
     }

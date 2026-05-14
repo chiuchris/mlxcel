@@ -28,23 +28,29 @@
 
 use crate::cache::KVCache;
 use crate::ffi::{self, MlxArray};
-use crate::layers::{Linear, RMSNorm, UnifiedEmbedding};
+use crate::layers::{Linear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
 
 use super::config::DFlashConfig;
 use super::layer::DFlashDecoderLayer;
 
-/// LM head selector: own checkpoint weights or target-shared (tied).
+/// LM head selector: own checkpoint weights, embedding-tied projection, or
+/// target-bound untied projection.
 ///
 /// - [`LmHead::Own`] — drafter checkpoint shipped a dedicated
 ///   `lm_head.weight`. Used as a regular Linear.
 /// - [`LmHead::Tied`] — drafter uses `embed_tokens.as_linear` for the
 ///   final projection. This is the published `z-lab/Qwen3.5-4B-DFlash`
 ///   default (`tie_word_embeddings = true`).
+/// - [`LmHead::TargetBound`] — drafter config says the head is untied but
+///   the checkpoint omits `lm_head.weight`; upstream Python binds the
+///   target model's `lm_head` at runtime for this shape (for example
+///   `z-lab/Qwen3.5-27B-DFlash`).
 enum LmHead {
     Own(Linear),
     Tied,
+    TargetBound(Option<UnifiedLinear>),
 }
 
 /// Qwen 3.5 DFlash drafter (`DFlashDraftModel`).
@@ -97,7 +103,7 @@ pub struct DFlashDraftModel {
     /// Final RMSNorm before the LM head.
     pub norm: RMSNorm,
 
-    /// LM head dispatch: own vs tied.
+    /// LM head dispatch: own, tied, or target-bound untied.
     lm_head: LmHead,
 }
 
@@ -162,22 +168,19 @@ impl DFlashDraftModel {
         }
 
         // LM head: present iff the checkpoint ships `lm_head.weight`.
-        // `tie_word_embeddings = true` (the default) means no `lm_head.weight`
-        // and we route through `embed_tokens.as_linear` instead. For the
-        // published lazy-bind checkpoint (`tie_word_embeddings = true`, no
-        // `lm_head.weight`, no `embed_tokens.weight`) the `Tied` arm is
-        // still correct — the tied head resolves through the *bound*
-        // target embedding once [`Self::bind_target_embedding`] runs.
+        // `tie_word_embeddings = true` (the 4B default) means no
+        // `lm_head.weight` and we route through `embed_tokens.as_linear`
+        // instead. Some official DFlash checkpoints (notably 27B) set
+        // `tie_word_embeddings = false` while still omitting `lm_head.weight`;
+        // upstream Python resolves that by binding the target model's
+        // explicit `lm_head` during `bind()`, with an embedding-tied fallback
+        // if the target has no separate head.
         let lm_head = if weights.contains_key("lm_head.weight") {
             LmHead::Own(Linear::from_weights(weights, "lm_head")?)
         } else if config.tie_word_embeddings {
             LmHead::Tied
         } else {
-            return Err(
-                "tie_word_embeddings=false but lm_head.weight is missing from drafter \
-                 checkpoint; either set tie_word_embeddings=true or ship lm_head.weight"
-                    .to_string(),
-            );
+            LmHead::TargetBound(None)
         };
 
         Ok(Self {
@@ -214,6 +217,24 @@ impl DFlashDraftModel {
         self.embed_tokens = Some(embed);
     }
 
+    /// Install the target's untied LM head into an `lm_head.weight` tombstone.
+    ///
+    /// This mirrors the same upstream `bind()` contract as the embedding
+    /// table, but applies only to DFlash checkpoints whose config says
+    /// `tie_word_embeddings = false` while the checkpoint itself omits
+    /// `lm_head.weight` (for example `z-lab/Qwen3.5-27B-DFlash`). Passing
+    /// `None` intentionally resolves to the upstream fallback path: use the
+    /// bound embedding table as a tied projection if the target does not
+    /// expose an explicit output head.
+    pub fn bind_target_lm_head(&mut self, lm_head: Option<UnifiedLinear>) {
+        if matches!(self.lm_head, LmHead::TargetBound(_)) {
+            self.lm_head = match lm_head {
+                Some(linear) => LmHead::TargetBound(Some(linear)),
+                None => LmHead::Tied,
+            };
+        }
+    }
+
     /// Whether this drafter still needs its `embed_tokens` table resolved
     /// from the target.
     ///
@@ -222,6 +243,15 @@ impl DFlashDraftModel {
     /// drafter checkpoint that shipped its own `embed_tokens.weight`.
     pub fn needs_embed_binding(&self) -> bool {
         self.embed_tokens.is_none()
+    }
+
+    /// Whether this drafter still needs an untied target `lm_head` binding.
+    ///
+    /// `true` for checkpoints such as `z-lab/Qwen3.5-27B-DFlash` until
+    /// [`Self::bind_target_lm_head`] runs; `false` for checkpoints that ship
+    /// their own head or intentionally tie the head to the embedding table.
+    pub fn needs_lm_head_binding(&self) -> bool {
+        matches!(self.lm_head, LmHead::TargetBound(None))
     }
 
     /// Borrow the resolved embedding table.
@@ -300,6 +330,8 @@ impl DFlashDraftModel {
         match &self.lm_head {
             LmHead::Own(linear) => linear.forward(&h),
             LmHead::Tied => embed.as_linear(&h),
+            LmHead::TargetBound(Some(linear)) => linear.forward(&h),
+            LmHead::TargetBound(None) => embed.as_linear(&h),
         }
     }
 
@@ -350,18 +382,7 @@ impl DFlashDraftModel {
 
         // Argmax over the vocab axis (axis=2 → keepdims=false → [1, L-1]).
         let argmax = ffi::argmax(&slice, 2, false);
-        ffi::eval(&argmax);
-
-        // Materialize the [1, L-1] argmax into Rust ints. Each slot is a
-        // [1, 1] sub-slice → i32 scalar via ffi::item_i32.
-        let n = block_size - 1;
-        let mut out = Vec::with_capacity(n);
-        for i in 0..n {
-            let element = ffi::slice(&argmax, &[0_i32, i as i32], &[1_i32, (i + 1) as i32]);
-            ffi::eval(&element);
-            out.push(ffi::item_i32(&element));
-        }
-        out
+        super::materialize_argmax_i32_vec(&argmax, block_size - 1)
     }
 
     /// Strip the `model.` prefix from any weight key carrying it, matching
@@ -413,6 +434,7 @@ mod tests {
             match h {
                 LmHead::Own(_) => "own",
                 LmHead::Tied => "tied",
+                LmHead::TargetBound(_) => "target-bound",
             }
         }
     }
@@ -513,6 +535,29 @@ mod tests {
         );
     }
 
+    /// The published `z-lab/Qwen3.5-27B-DFlash` shape: no
+    /// `embed_tokens.weight`, no `lm_head.weight`, and
+    /// `tie_word_embeddings = false`. Construction must succeed and leave
+    /// both target-owned modules as lazy-bind tombstones.
+    #[test]
+    fn from_weights_allows_target_bound_lm_head_when_untied_head_missing() {
+        let weights = tiny_weights_without_embed();
+        let mut config = tiny_config();
+        config.tie_word_embeddings = false;
+
+        let model = DFlashDraftModel::from_weights(&weights, config)
+            .expect("untied lazy-bind checkpoint without lm_head.weight must construct");
+
+        assert!(
+            model.needs_embed_binding(),
+            "embed_tokens must still be resolved from the target",
+        );
+        assert!(
+            model.needs_lm_head_binding(),
+            "untied missing lm_head.weight must request target lm_head binding",
+        );
+    }
+
     /// A self-contained DFlash checkpoint that *does* ship its own
     /// `embed_tokens.weight` must eager-load it — no tombstone, no
     /// regression to the pre-#675 behavior.
@@ -560,6 +605,29 @@ mod tests {
         assert!(
             !model.needs_embed_binding(),
             "needs_embed_binding() must report false after bind_target_embedding",
+        );
+    }
+
+    /// `bind_target_lm_head` installs the target's untied output projection
+    /// into a 27B-style lazy-bind tombstone.
+    #[test]
+    fn bind_target_lm_head_resolves_the_tombstone() {
+        let weights = tiny_weights_without_embed();
+        let mut config = tiny_config();
+        config.tie_word_embeddings = false;
+        let mut model = DFlashDraftModel::from_weights(&weights, config)
+            .expect("untied lazy-bind checkpoint must construct");
+        assert!(model.needs_lm_head_binding());
+
+        let target_head = crate::layers::UnifiedLinear::Regular(crate::layers::Linear::new(
+            ffi::zeros(&[8, 4], dtype::FLOAT32),
+            None,
+        ));
+        model.bind_target_lm_head(Some(target_head));
+
+        assert!(
+            !model.needs_lm_head_binding(),
+            "needs_lm_head_binding() must report false after bind_target_lm_head",
         );
     }
 

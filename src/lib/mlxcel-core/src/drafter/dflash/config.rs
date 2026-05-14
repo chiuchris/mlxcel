@@ -38,6 +38,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Upstream DFlash default target-layer capture list.
+///
+/// This is the default in
+/// `references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/config.py`
+/// for the original `z-lab/Qwen3.5-4B-DFlash` drafter. Runtime code should
+/// prefer the loaded checkpoint's [`DFlashConfig::target_layer_ids`]; this
+/// constant exists only as the config default / backwards-compatible fallback.
+pub const DEFAULT_TARGET_LAYER_IDS: &[usize] = &[1, 8, 15, 22, 29];
+
 /// Configuration for [`super::model::DFlashDraftModel`].
 ///
 /// Fields are defaulted to match the upstream `DFlashConfig` Python
@@ -159,7 +168,7 @@ fn default_mask_token_id() -> i32 {
     248070
 }
 fn default_target_layer_ids() -> Vec<usize> {
-    vec![1, 8, 15, 22, 29]
+    DEFAULT_TARGET_LAYER_IDS.to_vec()
 }
 fn default_num_target_layers() -> usize {
     32

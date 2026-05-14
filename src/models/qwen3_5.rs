@@ -1922,27 +1922,27 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35Model {
         verify_input: &MlxArray,
         caches: &mut [Self::Cache],
     ) -> Self::VerifyOut {
-        // For Qwen 3.5, the drafter's `target_layer_ids` are part of
-        // the drafter's config and the round-loop driver does NOT
-        // surface them through the target adapter — the upstream
-        // semantics are that the target's verify forward is called
-        // with the drafter's chosen indices.
-        //
-        // Because the trait signature does not let us thread the
-        // drafter-supplied indices through here, the round-loop driver
-        // is expected to set `capture_layer_ids` via a separate hook
-        // (or to pass them in via a wrapper future-issue). For the B=1
-        // path landed in #636, we use the upstream-standard
-        // `[1, 8, 15, 22, 29]` (Qwen 3.5 4B DFlash drafter); this
-        // matches the only currently-published DFlash checkpoint
-        // (`z-lab/Qwen3.5-4B-DFlash`).
-        //
-        // When sub-7 / #630 wires the CLI dispatch, the actual capture
-        // list comes from the drafter's loaded config; until then this
-        // hard-coded default is correct for every currently-supported
-        // DFlash deployment.
-        const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
-        self.forward_speculative(verify_input, caches, QWEN35_4B_DFLASH_LAYERS)
+        self.forward_speculative(
+            verify_input,
+            caches,
+            mlxcel_core::drafter::dflash::config::DEFAULT_TARGET_LAYER_IDS,
+        )
+    }
+
+    fn verify_forward_with_capture_layers(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+        capture_layer_ids: &[usize],
+    ) -> Self::VerifyOut {
+        let capture_layer_ids = if capture_layer_ids.is_empty() {
+            // Backwards-compatible default for older tests/callers that still
+            // invoke `verify_forward` semantics directly.
+            mlxcel_core::drafter::dflash::config::DEFAULT_TARGET_LAYER_IDS
+        } else {
+            capture_layer_ids
+        };
+        self.forward_speculative(verify_input, caches, capture_layer_ids)
     }
 
     fn rollback_partial(
@@ -2565,6 +2565,13 @@ impl LanguageModel for Qwen35Model {
     /// `mlxcel_core::drafter::Drafter::bind` (issue #675).
     fn embed_tokens_module(&self) -> Option<UnifiedEmbedding> {
         Some(self.embed_tokens.clone_shared())
+    }
+
+    /// Hand out the untied output projection for DFlash draft checkpoints
+    /// that bind their `lm_head` from the target at runtime (for example the
+    /// 27B drafter).
+    fn lm_head_module(&self) -> Option<UnifiedLinear> {
+        self.lm_head.as_ref().map(UnifiedLinear::clone_shared)
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

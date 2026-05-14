@@ -212,6 +212,21 @@ pub trait LanguageModel {
         None // default: not supported
     }
 
+    /// Hand out a shared-buffer handle to this model's output projection
+    /// when the projection is untied from the input embedding table.
+    ///
+    /// Some DFlash checkpoints (for example `z-lab/Qwen3.5-27B-DFlash`)
+    /// omit both `embed_tokens.weight` and `lm_head.weight`; upstream Python
+    /// binds both modules from the target at runtime, falling back to
+    /// `embed_tokens.as_linear` only when the target has no explicit head.
+    /// The default returns `None` so tied-embedding models keep using the
+    /// embedding table path.
+    ///
+    /// Used by: DFlash drafter lazy-bind path for untied Qwen 3.5 targets.
+    fn lm_head_module(&self) -> Option<crate::layers::UnifiedLinear> {
+        None // default: tied or unsupported
+    }
+
     /// Called once after prefill completes and before decode starts.
     /// Used by models that need to adjust internal state between phases,
     /// e.g. Phi4MM unfuses vision LoRA so decode uses base weights.

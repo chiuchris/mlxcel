@@ -82,3 +82,42 @@ pub use round_loop::{
     DFlashGenerator, DFlashRunOutput, SpeculativeTarget, DEFAULT_BLOCK_SIZE, DEFAULT_MASK_TOKEN_ID,
 };
 pub use round_loop_batched::{DFlashBatchedGenerator, DFlashBatchedRunOutput};
+
+use crate::ffi::{self, MlxArray};
+
+/// Materialize an integer argmax tensor into host token ids with one
+/// contiguous copy.
+///
+/// Used by: `DFlashDrafter::draft_block`, `DFlashDrafter::draft_block_batched`,
+/// `DFlashDraftModel::draft_block`, `DFlashGenerator::run`.
+pub(crate) fn materialize_argmax_i32_vec(argmax: &MlxArray, expected_len: usize) -> Vec<i32> {
+    let itemsize = ffi::array_itemsize(argmax);
+    let bytes = ffi::array_to_raw_bytes(argmax);
+    match itemsize {
+        4 => bytes
+            .chunks_exact(4)
+            .take(expected_len)
+            .map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+        8 => bytes
+            .chunks_exact(8)
+            .take(expected_len)
+            .map(|chunk| {
+                i64::from_ne_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                    chunk[7],
+                ]) as i32
+            })
+            .collect(),
+        _ => {
+            let flat = ffi::reshape(argmax, &[expected_len as i32]);
+            let mut out = Vec::with_capacity(expected_len);
+            for i in 0..expected_len {
+                let cell = ffi::slice(&flat, &[i as i32], &[(i + 1) as i32]);
+                let scalar = ffi::reshape(&cell, &[]);
+                out.push(ffi::item_i32(&scalar));
+            }
+            out
+        }
+    }
+}

@@ -81,6 +81,7 @@ use crate::ffi::MlxArray;
 use crate::generate::LanguageModel;
 use crate::layers::KVCache;
 use crate::weights::WeightMap;
+use cxx::UniquePtr;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
@@ -570,6 +571,17 @@ pub trait Drafter {
         Ok(())
     }
 
+    /// Target-layer hidden states this drafter expects for DFlash.
+    ///
+    /// DFlash checkpoints carry their own `target_layer_ids` in
+    /// `config.json`; larger Qwen 3.5 drafts use a different capture list
+    /// than the 4B default. The round-loop and server prefill paths consult
+    /// this optional slice to pass the checkpoint-specific list through the
+    /// target verify hooks. Non-DFlash drafters return `None`.
+    fn dflash_target_layer_ids(&self) -> Option<&[usize]> {
+        None
+    }
+
     /// Produce a draft block of proposal tokens.
     ///
     /// Semantics are kind-specific:
@@ -607,6 +619,29 @@ pub trait Drafter {
         block_size: usize,
         sampler: &crate::generate::SamplingConfig,
     ) -> Result<Vec<i32>, DrafterError>;
+
+    /// Produce a draft block as a device-side token array.
+    ///
+    /// DFlash can feed proposal tokens directly into the target verify graph,
+    /// matching the upstream `mx.concatenate([bonus, draft_tokens])` path and
+    /// avoiding an early device→host synchronization before verify. The
+    /// default preserves compatibility for other drafters by falling back to
+    /// [`Self::draft_block`] and rebuilding a `[1, K]` int32 array.
+    ///
+    /// Used by: DFlash round loop; non-DFlash drafters use the default bridge.
+    fn draft_block_array(
+        &mut self,
+        last_bonus: i32,
+        hidden: Option<&MlxArray>,
+        block_size: usize,
+        sampler: &crate::generate::SamplingConfig,
+    ) -> Result<UniquePtr<MlxArray>, DrafterError> {
+        let tokens = self.draft_block(last_bonus, hidden, block_size, sampler)?;
+        Ok(crate::ffi::from_slice_i32(
+            &tokens,
+            &[1, tokens.len() as i32],
+        ))
+    }
 
     /// Produce a batched draft block of proposal tokens (B > 1).
     ///

@@ -166,6 +166,25 @@ pub trait SpeculativeTarget {
         caches: &mut [Self::Cache],
     ) -> Self::VerifyOut;
 
+    /// Run one verify forward while explicitly specifying which target
+    /// layers to capture for the drafter.
+    ///
+    /// The legacy [`Self::verify_forward`] hook predated support for
+    /// checkpoint-specific `target_layer_ids` and lets the target choose its
+    /// own default. New DFlash callers should use this method so larger
+    /// drafts (for example 27B) can pass the capture list loaded from the
+    /// drafter's `config.json`. The default preserves backwards compatibility
+    /// for tests/targets that still ignore the explicit list.
+    fn verify_forward_with_capture_layers(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+        capture_layer_ids: &[usize],
+    ) -> Self::VerifyOut {
+        let _ = capture_layer_ids;
+        self.verify_forward(verify_input, caches)
+    }
+
     /// Rewind the target's caches to the accepted-prefix position.
     ///
     /// Called only when `accepted < block_size - 1`. The implementation
@@ -450,6 +469,81 @@ pub struct DFlashRunOutput {
     /// Wall-clock decode statistics. Prefill stats are the caller's
     /// responsibility (the loop runs after prefill).
     pub stats: GenerationStats,
+    /// Acceptance counters and per-phase timings for real-model
+    /// performance diagnosis (issue #692).
+    pub diagnostics: DFlashDiagnostics,
+}
+
+/// Acceptance counters and per-phase timings for one B=1 DFlash run.
+///
+/// These counters intentionally live in the core round loop rather than
+/// the server wrapper so both offline and server call sites can explain
+/// why a DFlash pairing is fast or slow: low acceptance, draft overhead,
+/// target verify cost, hidden concatenation/slicing, rollback, or host-side
+/// argmax/logprob extraction.
+#[derive(Debug, Clone, Default)]
+pub struct DFlashDiagnostics {
+    /// Configured draft block length (`K`).
+    pub block_size: u32,
+    /// Number of draft/verify/walk rounds executed.
+    pub rounds: usize,
+    /// Number of proposal tokens asked from the drafter.
+    pub proposed_tokens: usize,
+    /// Number of proposal tokens accepted by the target.
+    pub accepted_tokens: usize,
+    /// Number of tokens emitted by the round loop, excluding the caller's
+    /// first bonus token.
+    pub emitted_tokens: usize,
+    /// Rounds with `accepted == 0`.
+    pub zero_accept_rounds: usize,
+    /// Rounds with `0 < accepted < proposals`.
+    pub partial_accept_rounds: usize,
+    /// Rounds with every proposal accepted.
+    pub full_accept_rounds: usize,
+    /// Time spent binding/resetting the drafter at the start of the run.
+    pub bind_reset_time_ms: f64,
+    /// Time spent inside drafter `draft_block`.
+    pub draft_time_ms: f64,
+    /// Time spent constructing target verify-forward graphs. MLX evaluates
+    /// lazily, so the device work for this graph is usually synchronized by
+    /// [`Self::target_argmax_time_ms`] below.
+    pub verify_time_ms: f64,
+    /// Time spent converting target verify logits to greedy token ids. This
+    /// includes the lazy target verify + LM-head graph synchronization when
+    /// MLX has not materialized the verify logits yet.
+    pub target_argmax_time_ms: f64,
+    /// Time spent computing optional per-token logprob payloads.
+    pub logprobs_time_ms: f64,
+    /// Time spent in the host-side speculative walk.
+    pub walk_time_ms: f64,
+    /// Time spent concatenating/slicing captured target hiddens for the next
+    /// drafter round.
+    pub hidden_concat_time_ms: f64,
+    /// Time spent rolling target caches back after partial accepts.
+    pub rollback_time_ms: f64,
+    /// End-to-end round-loop decode time, excluding bind/reset and target
+    /// prefill handled by the caller.
+    pub total_decode_time_ms: f64,
+}
+
+impl DFlashDiagnostics {
+    /// Fraction of proposed tokens accepted by the target.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.proposed_tokens > 0 {
+            self.accepted_tokens as f64 / self.proposed_tokens as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Average number of emitted tokens produced per target verify forward.
+    pub fn emitted_per_verify(&self) -> f64 {
+        if self.rounds > 0 {
+            self.emitted_tokens as f64 / self.rounds as f64
+        } else {
+            0.0
+        }
+    }
 }
 
 impl DFlashGenerator {
@@ -535,8 +629,22 @@ impl DFlashGenerator {
         // Bind + reset the drafter against the target. `bind` is a
         // capability smoke-test (target must expose embed_tokens);
         // `reset` clears the drafter's own KV cache between runs.
+        let bind_reset_start = Instant::now();
         self.drafter.bind(target_lm)?;
         self.drafter.reset(target_lm)?;
+        let bind_reset_time = bind_reset_start.elapsed();
+
+        let mut diagnostics = DFlashDiagnostics {
+            block_size: self.block_size,
+            bind_reset_time_ms: bind_reset_time.as_secs_f64() * 1000.0,
+            ..DFlashDiagnostics::default()
+        };
+        let capture_layer_ids = self
+            .drafter
+            .dflash_target_layer_ids()
+            .filter(|ids| !ids.is_empty())
+            .map(<[usize]>::to_vec)
+            .unwrap_or_else(|| target.capture_layer_ids().to_vec());
 
         if max_tokens <= 1 {
             // First bonus is the caller's own; we have no further work.
@@ -545,6 +653,7 @@ impl DFlashGenerator {
                 logprobs: Vec::new(),
                 accept_lens: Vec::new(),
                 stats: build_zero_stats(),
+                diagnostics,
             });
         }
 
@@ -585,32 +694,70 @@ impl DFlashGenerator {
             }
 
             // ---- Draft ----
-            let draft_tokens = self.drafter.draft_block(
+            let phase_start = Instant::now();
+            let draft_tokens_arr = self.drafter.draft_block_array(
                 bonus,
                 Some(hidden.as_ref().expect("hidden must be Some")),
                 bs,
                 &self.sampler,
             )?;
-            // `draft_tokens.len()` is `bs - 1` for the DFlash drafter.
+            // Keep proposals on-device for the target verify input. This is
+            // the main upstream parity point: Python does not copy
+            // `draft_tokens` to host until `_speculative_walk`; it feeds the
+            // array directly into `mx.concatenate([bonus, draft_tokens])`.
+            let draft_tokens_arr = ffi::astype(&draft_tokens_arr, crate::dtype::INT32);
+            ffi::async_eval(&draft_tokens_arr);
+            diagnostics.draft_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
+            let draft_shape = ffi::array_shape(&draft_tokens_arr);
             debug_assert_eq!(
-                draft_tokens.len(),
-                bs - 1,
-                "DFlash drafter must produce bs - 1 proposals"
+                draft_shape,
+                vec![1, (bs - 1) as i32],
+                "DFlash drafter must produce [1, bs - 1] proposal ids"
             );
 
             // ---- Verify ----
             // Build the verify input `[bonus, d_0, ..., d_{bs - 2}]`.
-            let mut verify_tokens: Vec<i32> = Vec::with_capacity(bs);
-            verify_tokens.push(bonus);
-            verify_tokens.extend_from_slice(&draft_tokens);
-            let verify_input = ffi::from_slice_i32(&verify_tokens, &[1, bs as i32]);
-            let verify_out = target.verify_forward(&verify_input, caches);
+            let bonus_arr = ffi::from_slice_i32(&[bonus], &[1, 1]);
+            let verify_input = crate::concatenate(&bonus_arr, &draft_tokens_arr, 1);
+            let phase_start = Instant::now();
+            let verify_out = target.verify_forward_with_capture_layers(
+                &verify_input,
+                caches,
+                &capture_layer_ids,
+            );
+            diagnostics.verify_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
 
             // ---- Argmax sample of target's per-position logits ----
             // Greedy at temp=0.0 / top_k=1 — the only mode this sub-issue
             // gates parity on. Stochastic sampling for DFlash is sub-9 / #632.
             let verify_logits = target.verify_logits(&verify_out);
-            let target_tokens = argmax_logits_to_vec(verify_logits, bs as i32);
+            let phase_start = Instant::now();
+            let target_tokens_arr = argmax_logits_to_array(verify_logits, bs as i32);
+
+            // Build the next round's hidden graph before host materialization,
+            // then async-evaluate it together with target tokens. This mirrors
+            // upstream `mx.async_eval(target_tokens, hidden)` and lets hidden
+            // preparation overlap the host-side speculative walk.
+            let hidden_phase_start = Instant::now();
+            let full_hidden = target.concat_hidden_for_drafter(&verify_out);
+            diagnostics.hidden_concat_time_ms += hidden_phase_start.elapsed().as_secs_f64() * 1000.0;
+            // SAFETY: both arrays are live for the duration of this call, and
+            // the FFI bridge consumes the stack pointer slice synchronously to
+            // schedule MLX evaluation.
+            unsafe {
+                let evals: [*const MlxArray; 2] = [
+                    target_tokens_arr.as_ref().expect("target tokens") as *const MlxArray,
+                    full_hidden.as_ref().expect("full hidden") as *const MlxArray,
+                ];
+                ffi::async_eval_all(&evals);
+            }
+            let (draft_tokens, target_tokens) = materialize_draft_and_target_tokens(
+                &draft_tokens_arr,
+                &target_tokens_arr,
+                bs - 1,
+                bs,
+            );
+            diagnostics.target_argmax_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
 
             // Per-position log-probability data, aligned 1:1 with
             // `target_tokens`. `None` (zero-overhead — no slicing, no
@@ -619,14 +766,28 @@ impl DFlashGenerator {
             // penalty-adjusted logits the classic decode path feeds
             // `compute_logprobs`, so these logprobs are byte-identical
             // to the classic path for greedy sampling (issue #678).
+            let phase_start = Instant::now();
             let target_logprobs =
                 per_position_logprobs(verify_logits, &target_tokens, logprobs_config);
+            diagnostics.logprobs_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
 
             // ---- Walk ----
             let budget = max_tokens.saturating_sub(emitted);
+            let phase_start = Instant::now();
             let (accepted, new_tokens) =
                 speculative_walk(&draft_tokens, &target_tokens, budget);
+            diagnostics.walk_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
             self.accept_lens.push(accepted as u32);
+            diagnostics.rounds += 1;
+            diagnostics.proposed_tokens += draft_tokens.len();
+            diagnostics.accepted_tokens += accepted;
+            if accepted == 0 {
+                diagnostics.zero_accept_rounds += 1;
+            } else if accepted == draft_tokens.len() {
+                diagnostics.full_accept_rounds += 1;
+            } else {
+                diagnostics.partial_accept_rounds += 1;
+            }
 
             // ---- Emit ----
             // Track EOS in the same loop body so we can stop early
@@ -683,15 +844,9 @@ impl DFlashGenerator {
                 break;
             }
 
-            // Build the next round's hidden input. Upstream:
-            //   hidden = mx.concatenate(verify_out.hidden_states, axis=-1)
-            //   if accepted < bs - 1:
-            //       hidden = hidden[:, : accepted + 1, :]
-            //
-            // Full-accept keeps the [1, bs, dim] tensor; partial-accept
-            // slices to [1, accepted+1, dim] so the drafter's cross-
-            // attention only sees the validated context.
-            let full_hidden = target.concat_hidden_for_drafter(&verify_out);
+            // Full-accept keeps the already-built [1, bs, dim] tensor;
+            // partial-accept slices to [1, accepted+1, dim] so the drafter's
+            // cross-attention only sees the validated context.
             hidden = if (accepted as i32) < (bs as i32) - 1 {
                 let full_shape = ffi::array_shape(&full_hidden);
                 debug_assert_eq!(
@@ -720,7 +875,9 @@ impl DFlashGenerator {
             // linear-attention layers. The target trait method handles
             // both.
             if accepted < bs - 1 {
+                let phase_start = Instant::now();
                 target.rollback_partial(caches, &verify_out, accepted as i32, bs as i32);
+                diagnostics.rollback_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
             }
 
             // Periodic memory cache clear, mirroring
@@ -731,13 +888,17 @@ impl DFlashGenerator {
             }
         }
 
+        let decode_elapsed = decode_start.elapsed();
+        diagnostics.emitted_tokens = self.generated_tokens.len();
+        diagnostics.total_decode_time_ms = decode_elapsed.as_secs_f64() * 1000.0;
+
         let stats = GenerationStats {
             prompt_tokens: 0,
             generated_tokens: self.generated_tokens.len(),
             prefill_time_ms: 0.0,
-            decode_time_ms: decode_start.elapsed().as_secs_f64() * 1000.0,
+            decode_time_ms: diagnostics.total_decode_time_ms,
             prefill_tok_per_sec: 0.0,
-            decode_tok_per_sec: tokens_per_second(self.generated_tokens.len(), decode_start.elapsed()),
+            decode_tok_per_sec: tokens_per_second(self.generated_tokens.len(), decode_elapsed),
         };
 
         Ok(DFlashRunOutput {
@@ -745,37 +906,44 @@ impl DFlashGenerator {
             logprobs,
             accept_lens: std::mem::take(&mut self.accept_lens),
             stats,
+            diagnostics,
         })
     }
 }
 
-/// Per-position argmax over `logits` of shape `[1, seq_len, vocab]`,
-/// materialized to a `Vec<i32>` of length `seq_len`.
+/// Per-position argmax over `logits` of shape `[1, seq_len, vocab]`.
 ///
 /// Equivalent to upstream `sampler(verify_out.logits)` with the greedy
 /// `sampler = argmax(axis=-1)`. Stochastic samplers are out of scope
 /// for this sub-issue (sub-9 / #632 covers stochastic DFlash parity).
-fn argmax_logits_to_vec(logits: &MlxArray, seq_len: i32) -> Vec<i32> {
+fn argmax_logits_to_array(logits: &MlxArray, seq_len: i32) -> UniquePtr<MlxArray> {
     let shape = ffi::array_shape(logits);
     debug_assert!(shape.len() == 3, "expected [1, seq_len, vocab] logits");
     debug_assert_eq!(shape[1], seq_len, "logits seq dim must match block_size");
+    ffi::argmax_last_axis(logits)
+}
 
-    let argmax = ffi::argmax_last_axis(logits);
-    ffi::eval(&argmax);
-
-    // `argmax_last_axis` reduces over the trailing axis, producing
-    // `[1, seq_len]`. Materialize each entry via per-position scalar
-    // extraction (a single eval was already done above so the data is
-    // resident).
-    let mut out: Vec<i32> = Vec::with_capacity(seq_len as usize);
-    for s in 0..seq_len {
-        let cell = ffi::slice(&argmax, &[0, s], &[1, s + 1]);
-        // `item_i32` requires a scalar — `cell` has shape `[1, 1]` so
-        // reshape it to `[]` (i.e. `&[]`-shaped scalar).
-        let scalar = ffi::reshape(&cell, &[]);
-        out.push(ffi::item_i32(&scalar));
-    }
-    out
+/// Materialize draft and target tokens with one combined device→host copy.
+///
+/// Mirrors upstream `_speculative_walk`, which concatenates flattened
+/// `draft_tokens` and `target_tokens` before calling `.tolist()`. Keeping the
+/// draft proposals device-side until this point avoids an early sync between
+/// draft and verify, and concatenating both token arrays here avoids two
+/// separate host copies.
+fn materialize_draft_and_target_tokens(
+    draft_tokens: &MlxArray,
+    target_tokens: &MlxArray,
+    n_draft: usize,
+    n_target: usize,
+) -> (Vec<i32>, Vec<i32>) {
+    let draft_i32 = ffi::astype(draft_tokens, crate::dtype::INT32);
+    let target_i32 = ffi::astype(target_tokens, crate::dtype::INT32);
+    let draft_flat = ffi::reshape(&draft_i32, &[n_draft as i32]);
+    let target_flat = ffi::reshape(&target_i32, &[n_target as i32]);
+    let combined = crate::concatenate(&draft_flat, &target_flat, 0);
+    let mut combined_vec = super::materialize_argmax_i32_vec(&combined, n_draft + n_target);
+    let target_vec = combined_vec.split_off(n_draft);
+    (combined_vec, target_vec)
 }
 
 /// Compute per-position [`crate::sampling::TokenLogprobData`] for a
@@ -783,7 +951,7 @@ fn argmax_logits_to_vec(logits: &MlxArray, seq_len: i32) -> Vec<i32> {
 /// aligned 1:1 with `target_tokens` (issue #678).
 ///
 /// The DFlash round loop is greedy-only today (`temperature == 0`, pure
-/// argmax — see [`argmax_logits_to_vec`]), so the per-position verify
+/// argmax — see [`argmax_logits_to_array`]), so the per-position verify
 /// logits ARE the penalty-adjusted logits the classic decode path feeds
 /// `compute_logprobs`: no temperature scaling, no history-dependent
 /// penalty applied during verify. That makes the resulting logprobs
@@ -983,6 +1151,9 @@ mod tests {
         /// Recorded verify-input lengths. Tests inspect this to confirm
         /// the round loop calls `verify_forward` with the expected `K`.
         verify_call_lens: Rc<Cell<Vec<i32>>>,
+        /// Recorded capture-layer id slices received by
+        /// `verify_forward_with_capture_layers`.
+        verify_capture_layer_ids: Rc<Cell<Vec<Vec<usize>>>>,
         /// Current bonus that was sent into the last verify call. Used
         /// to derive per-position target tokens deterministically.
         last_bonus: Rc<Cell<i32>>,
@@ -1000,6 +1171,7 @@ mod tests {
                 argmax_fn: Box::new(argmax_fn),
                 rollback_events: Rc::new(Cell::new(Vec::new())),
                 verify_call_lens: Rc::new(Cell::new(Vec::new())),
+                verify_capture_layer_ids: Rc::new(Cell::new(Vec::new())),
                 last_bonus: Rc::new(Cell::new(0)),
             }
         }
@@ -1013,6 +1185,12 @@ mod tests {
         fn verify_call_lens(&self) -> Vec<i32> {
             let v = self.verify_call_lens.take();
             self.verify_call_lens.set(v.clone());
+            v
+        }
+
+        fn verify_capture_layer_ids(&self) -> Vec<Vec<usize>> {
+            let v = self.verify_capture_layer_ids.take();
+            self.verify_capture_layer_ids.set(v.clone());
             v
         }
     }
@@ -1089,6 +1267,18 @@ mod tests {
                 captured_hidden: hidden,
                 verify_len: k,
             }
+        }
+
+        fn verify_forward_with_capture_layers(
+            &self,
+            verify_input: &MlxArray,
+            caches: &mut [Self::Cache],
+            capture_layer_ids: &[usize],
+        ) -> Self::VerifyOut {
+            let mut ids = self.verify_capture_layer_ids.take();
+            ids.push(capture_layer_ids.to_vec());
+            self.verify_capture_layer_ids.set(ids);
+            self.verify_forward(verify_input, caches)
         }
 
         fn rollback_partial(
@@ -1173,6 +1363,7 @@ mod tests {
         propose: Box<SyntheticProposeFn>,
         bind_calls: u32,
         reset_calls: u32,
+        target_layer_ids: Option<Vec<usize>>,
     }
 
     impl SyntheticDrafter {
@@ -1181,7 +1372,13 @@ mod tests {
                 propose: Box::new(propose),
                 bind_calls: 0,
                 reset_calls: 0,
+                target_layer_ids: None,
             }
+        }
+
+        fn with_target_layer_ids(mut self, target_layer_ids: Vec<usize>) -> Self {
+            self.target_layer_ids = Some(target_layer_ids);
+            self
         }
     }
 
@@ -1204,6 +1401,10 @@ mod tests {
             self.bind(target)?;
             self.reset_calls += 1;
             Ok(())
+        }
+
+        fn dflash_target_layer_ids(&self) -> Option<&[usize]> {
+            self.target_layer_ids.as_deref()
         }
 
         fn set_shared_kv(
@@ -1296,6 +1497,55 @@ mod tests {
     // --------------------------------------------------------------
     // Round-loop control-flow tests
     // --------------------------------------------------------------
+
+    /// The round loop must prefer the drafter checkpoint's
+    /// `target_layer_ids` over the target-side fallback. This is
+    /// load-bearing for larger DFlash drafts whose capture list differs
+    /// from the original 4B `[1, 8, 15, 22, 29]` default.
+    #[test]
+    fn round_loop_passes_drafter_target_layer_ids_to_verify() {
+        let drafter_ids = vec![1, 16, 31, 46, 61];
+        let target = SyntheticTarget::new(
+            vec![1, 8, 15, 22, 29],
+            5 * 8,
+            |_s: i32, prev_token: i32| prev_token + 1,
+        );
+        let mut caches: Vec<SyntheticCache> = (0..3).map(|_| SyntheticCache::default()).collect();
+
+        let drafter = SyntheticDrafter::new(|bonus, bs| {
+            (1..bs as i32).map(|s| bonus + s).collect()
+        })
+        .with_target_layer_ids(drafter_ids.clone());
+        let lm = EmbedOnlyLm;
+        let mut gen = DFlashGenerator::new(
+            Box::new(drafter),
+            SamplingConfig::greedy(),
+            4,
+            DEFAULT_MASK_TOKEN_ID,
+        );
+        let first_hidden = ffi::zeros(&[1, 1, 5 * 8], crate::dtype::FLOAT32);
+
+        let _ = gen
+            .run(
+                &target,
+                &lm,
+                &mut caches,
+                100,
+                first_hidden,
+                &[],
+                8,
+                &AtomicBool::new(false),
+                &crate::sampling::LogprobsConfig::default(),
+            )
+            .expect("synthetic round loop must not fail");
+
+        let seen = target.verify_capture_layer_ids();
+        assert!(!seen.is_empty(), "verify should run at least one round");
+        assert!(
+            seen.iter().all(|ids| ids == &drafter_ids),
+            "verify must receive drafter target_layer_ids; got {seen:?}",
+        );
+    }
 
     /// All proposals match: every round accepts `block_size - 1` and
     /// rollback is NEVER invoked. Pins the "full-accept" hot path.

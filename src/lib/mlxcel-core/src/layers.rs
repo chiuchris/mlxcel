@@ -86,6 +86,22 @@ impl QuantizedWeight {
             None => std::ptr::null(),
         }
     }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// quantized-weight buffers.
+    ///
+    /// Used by speculative drafters that lazy-bind an untied target
+    /// `lm_head` without copying the actual tensor payloads.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+            scales: ffi::copy(&self.scales),
+            biases: self.biases.as_ref().map(|b| ffi::copy(b)),
+            group_size: self.group_size,
+            bits: self.bits,
+            mode: self.mode.clone(),
+        }
+    }
 }
 
 // Embedding Layers.
@@ -517,6 +533,20 @@ impl Linear {
             None => result,
         }
     }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// weight/bias buffers.
+    ///
+    /// Runtime LoRA state is intentionally not carried over: this helper is
+    /// for binding target projection heads into speculative drafters after
+    /// load-time adapter fusion/sanitization has already happened.
+    pub fn clone_shared(&self) -> Self {
+        Self {
+            weight: ffi::copy(&self.weight),
+            bias: self.bias.as_ref().map(|b| ffi::copy(b)),
+            lora: None,
+        }
+    }
 }
 
 /// Infer actual per-tensor quantization bits from weight and scales shapes.
@@ -754,6 +784,20 @@ impl UnifiedLinear {
         match self {
             Self::Regular(linear) => Some(linear),
             Self::Quantized { .. } => None,
+        }
+    }
+
+    /// Produce an independent handle that shares the same underlying MLX
+    /// buffers.
+    ///
+    /// Used by: DFlash lazy binding for untied target `lm_head` projections.
+    pub fn clone_shared(&self) -> Self {
+        match self {
+            Self::Quantized { weight, bias } => Self::Quantized {
+                weight: weight.clone_shared(),
+                bias: bias.as_ref().map(|b| ffi::copy(b)),
+            },
+            Self::Regular(linear) => Self::Regular(linear.clone_shared()),
         }
     }
 }

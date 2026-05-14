@@ -220,10 +220,9 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35VLModel {
     type VerifyOut = crate::models::qwen3_5::VerifyOutput;
 
     fn capture_layer_ids(&self) -> &[usize] {
-        // Placeholder until sub-7 / #630 wires the CLI dispatch; see
-        // the peer impl on `Qwen35Model` for the rationale and the
-        // hard-coded `QWEN35_4B_DFLASH_LAYERS` fallback used at
-        // verify time.
+        // The VLM wrapper follows the text model: the drafter checkpoint owns
+        // the actual capture list, so callers pass it through
+        // `verify_forward_with_capture_layers`.
         &[]
     }
 
@@ -232,9 +231,26 @@ impl mlxcel_core::drafter::dflash::SpeculativeTarget for Qwen35VLModel {
         verify_input: &MlxArray,
         caches: &mut [Self::Cache],
     ) -> Self::VerifyOut {
-        const QWEN35_4B_DFLASH_LAYERS: &[usize] = &[1, 8, 15, 22, 29];
+        self.text_model.forward_speculative(
+            verify_input,
+            caches,
+            mlxcel_core::drafter::dflash::config::DEFAULT_TARGET_LAYER_IDS,
+        )
+    }
+
+    fn verify_forward_with_capture_layers(
+        &self,
+        verify_input: &MlxArray,
+        caches: &mut [Self::Cache],
+        capture_layer_ids: &[usize],
+    ) -> Self::VerifyOut {
+        let capture_layer_ids = if capture_layer_ids.is_empty() {
+            mlxcel_core::drafter::dflash::config::DEFAULT_TARGET_LAYER_IDS
+        } else {
+            capture_layer_ids
+        };
         self.text_model
-            .forward_speculative(verify_input, caches, QWEN35_4B_DFLASH_LAYERS)
+            .forward_speculative(verify_input, caches, capture_layer_ids)
     }
 
     fn rollback_partial(
@@ -415,6 +431,10 @@ impl LanguageModel for Qwen35VLModel {
     /// model.
     fn embed_tokens_module(&self) -> Option<mlxcel_core::layers::UnifiedEmbedding> {
         mlxcel_core::generate::LanguageModel::embed_tokens_module(&self.text_model)
+    }
+
+    fn lm_head_module(&self) -> Option<mlxcel_core::layers::UnifiedLinear> {
+        mlxcel_core::generate::LanguageModel::lm_head_module(&self.text_model)
     }
 
     fn make_caches(&self) -> Vec<KVCache> {

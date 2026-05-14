@@ -361,6 +361,12 @@ impl DFlashBatchedGenerator {
         let decode_start = Instant::now();
 
         let block_size_cfg = self.block_size as usize;
+        let capture_layer_ids = self
+            .drafter
+            .dflash_target_layer_ids()
+            .filter(|ids| !ids.is_empty())
+            .map(<[usize]>::to_vec)
+            .unwrap_or_else(|| target.capture_layer_ids().to_vec());
 
         // Per-row state. `b[r]` is the active bonus for row r. `emitted[r]`
         // counts every token the caller has seen for row r including the
@@ -444,7 +450,8 @@ impl DFlashBatchedGenerator {
             }
             let verify_input =
                 ffi::from_slice_i32(&verify_buf, &[batch_size as i32, bs as i32]);
-            let verify_out = target.verify_forward(&verify_input, caches);
+            let verify_out =
+                target.verify_forward_with_capture_layers(&verify_input, caches, &capture_layer_ids);
 
             // ---- Argmax sample (greedy at temp=0) of the per-row logits ----
             let target_tokens_per_row = argmax_logits_per_row(

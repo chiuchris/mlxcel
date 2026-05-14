@@ -30,6 +30,7 @@ use crate::drafter::{Drafter, DrafterError, DrafterKind};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
 use crate::weights::WeightMap;
+use cxx::UniquePtr;
 use std::path::Path;
 
 use super::config::DFlashConfig;
@@ -188,7 +189,7 @@ fn convert_bf16_to_f16_non_quantized(weights: &mut WeightMap) {
 
 impl Drafter for DFlashDrafter {
     fn bind(&mut self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
-        // Two cases, mirroring upstream Python's lazy-bind shape
+        // Two embedding cases, mirroring upstream Python's lazy-bind shape
         // (`references/mlx-vlm/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py`
         // lines 88, 92-108):
         //
@@ -237,6 +238,16 @@ impl Drafter for DFlashDrafter {
                 });
             }
         }
+        if self.model.needs_lm_head_binding() {
+            // Some official larger DFlash checkpoints (for example
+            // `z-lab/Qwen3.5-27B-DFlash`) also omit `lm_head.weight` while
+            // setting `tie_word_embeddings = false`. Upstream Python binds
+            // the target's untied output head in the same `bind()` step as
+            // `embed_tokens`, falling back to the tied embedding projection
+            // if the target exposes no explicit LM head. The `Option` keeps
+            // that fallback behavior in the model forward path.
+            self.model.bind_target_lm_head(target.lm_head_module());
+        }
         self.bound = true;
         Ok(())
     }
@@ -256,6 +267,10 @@ impl Drafter for DFlashDrafter {
         self.bind(target)?;
         self.caches = self.model.make_cache();
         Ok(())
+    }
+
+    fn dflash_target_layer_ids(&self) -> Option<&[usize]> {
+        Some(&self.model.config.target_layer_ids)
     }
 
     fn draft_block(
@@ -294,6 +309,40 @@ impl Drafter for DFlashDrafter {
         // [last_bonus, mask, mask, ..., mask], so positions [1, ..., L-1]
         // are the proposal slots; we sample those.
         sample_block_per_position(&logits, block_size, sampler)
+    }
+
+    fn draft_block_array(
+        &mut self,
+        last_bonus: i32,
+        hidden: Option<&MlxArray>,
+        block_size: usize,
+        sampler: &SamplingConfig,
+    ) -> Result<UniquePtr<MlxArray>, DrafterError> {
+        let target_hidden = hidden.ok_or_else(|| DrafterError::DraftFailed {
+            reason: "DFlash drafter requires a target hidden state \
+                     (target_layer_ids concatenation); got hidden = None"
+                .to_string(),
+        })?;
+
+        if block_size < 2 {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "DFlash drafter requires block_size >= 2 (got {block_size}); \
+                     block_size 1 has no masked positions to sample"
+                ),
+            });
+        }
+
+        let mask_id = self.model.config.mask_token_id;
+        let mut block: Vec<i32> = Vec::with_capacity(block_size);
+        block.push(last_bonus);
+        for _ in 1..block_size {
+            block.push(mask_id);
+        }
+        let inputs = ffi::from_slice_i32(&block, &[1, block_size as i32]);
+
+        let logits = self.model.forward(&inputs, target_hidden, &mut self.caches);
+        sample_block_per_position_array(&logits, block_size, sampler)
     }
 
     fn draft_block_batched(
@@ -394,6 +443,26 @@ fn sample_block_per_position_batched(
     let mut out: Vec<Vec<i32>> = (0..batch_size).map(|_| Vec::with_capacity(n)).collect();
 
     let greedy = sampler.temperature == 0.0 || sampler.top_k == 1;
+    if greedy {
+        // Greedy DFlash is the hot server path. Argmax the whole
+        // `[B, block_size - 1, vocab]` proposal slab in one MLX op and
+        // materialize all token ids with one contiguous host copy. The old
+        // row-by-row implementation performed `(B * (K - 1))` slice/eval/item
+        // synchronizations per round, which showed up as a dominant short-run
+        // Qwen3.5-4B overhead in issue #692.
+        let masked_logits = ffi::slice(
+            logits,
+            &[0_i32, 1_i32, 0_i32],
+            &[batch_size as i32, block_size as i32, vocab],
+        );
+        let argmax = ffi::argmax_last_axis(&masked_logits);
+        let flat = super::materialize_argmax_i32_vec(&argmax, batch_size * n);
+        for (b, row) in out.iter_mut().enumerate() {
+            let start = b * n;
+            row.extend_from_slice(&flat[start..start + n]);
+        }
+        return Ok(out);
+    }
 
     for b in 0..batch_size as i32 {
         for i in 0..n {
@@ -407,17 +476,13 @@ fn sample_block_per_position_batched(
             // Drop the seq axis so we get a `[1, vocab]` 2D slice (fused_sample
             // / argmax expect `[batch, vocab]`).
             let row = ffi::reshape(&row, &[1_i32, vocab]);
-            let token = if greedy {
-                ffi::argmax_last_axis(&row)
-            } else {
-                ffi::fused_sample(
-                    &row,
-                    sampler.temperature,
-                    sampler.top_k,
-                    sampler.top_p,
-                    sampler.min_p,
-                )
-            };
+            let token = ffi::fused_sample(
+                &row,
+                sampler.temperature,
+                sampler.top_k,
+                sampler.top_p,
+                sampler.min_p,
+            );
             ffi::eval(&token);
             out[b as usize].push(ffi::item_i32(&token));
         }
@@ -449,9 +514,24 @@ fn sample_block_per_position(
     }
     let vocab = shape[2];
     let n = block_size - 1;
-    let mut out = Vec::with_capacity(n);
 
     let greedy = sampler.temperature == 0.0 || sampler.top_k == 1;
+    if greedy {
+        // Greedy DFlash is the hot server path. Argmax all masked proposal
+        // positions in one op and copy all token ids at once. This removes
+        // the per-position slice/eval/item synchronization loop that made the
+        // Qwen3.5-4B DFlash path slower than baseline for short generations
+        // (issue #692).
+        let masked_logits = ffi::slice(
+            logits,
+            &[0_i32, 1_i32, 0_i32],
+            &[1_i32, block_size as i32, vocab],
+        );
+        let argmax = ffi::argmax_last_axis(&masked_logits);
+        return Ok(super::materialize_argmax_i32_vec(&argmax, n));
+    }
+
+    let mut out = Vec::with_capacity(n);
 
     for i in 0..n {
         // Row `i + 1` of the [1, L, V] logits.
@@ -460,21 +540,58 @@ fn sample_block_per_position(
         // Drop the seq axis so we get a `[1, vocab]` 2D slice (fused_sample
         // / argmax expect `[batch, vocab]`).
         let row = ffi::reshape(&row, &[1_i32, vocab]);
-        let token = if greedy {
-            ffi::argmax_last_axis(&row)
-        } else {
-            ffi::fused_sample(
-                &row,
-                sampler.temperature,
-                sampler.top_k,
-                sampler.top_p,
-                sampler.min_p,
-            )
-        };
+        let token = ffi::fused_sample(
+            &row,
+            sampler.temperature,
+            sampler.top_k,
+            sampler.top_p,
+            sampler.min_p,
+        );
         ffi::eval(&token);
         out.push(ffi::item_i32(&token));
     }
     Ok(out)
+}
+
+/// Device-side variant of [`sample_block_per_position`].
+///
+/// Greedy DFlash keeps the whole proposal vector as an MLX array so the
+/// round loop can concatenate it into the target verify input without first
+/// copying token ids back to the host. This mirrors upstream mlx-vlm's
+/// `draft_tokens = draft_model.draft_block(...); verify_input =
+/// mx.concatenate([bonus, draft_tokens], axis=1)` pipeline. Stochastic
+/// sampling falls back to the scalar helper because stochastic DFlash parity
+/// is outside the hot path optimized by issue #692.
+fn sample_block_per_position_array(
+    logits: &MlxArray,
+    block_size: usize,
+    sampler: &SamplingConfig,
+) -> Result<UniquePtr<MlxArray>, DrafterError> {
+    let shape = ffi::array_shape(logits);
+    if shape.len() != 3 || shape[0] != 1 || shape[1] != block_size as i32 {
+        return Err(DrafterError::DraftFailed {
+            reason: format!(
+                "DFlash drafter expected logits shape [1, {block_size}, vocab]; got {shape:?}"
+            ),
+        });
+    }
+    let vocab = shape[2];
+
+    let greedy = sampler.temperature == 0.0 || sampler.top_k == 1;
+    if greedy {
+        let masked_logits = ffi::slice(
+            logits,
+            &[0_i32, 1_i32, 0_i32],
+            &[1_i32, block_size as i32, vocab],
+        );
+        return Ok(ffi::argmax_last_axis(&masked_logits));
+    }
+
+    let tokens = sample_block_per_position(logits, block_size, sampler)?;
+    Ok(ffi::from_slice_i32(
+        &tokens,
+        &[1, (block_size - 1) as i32],
+    ))
 }
 
 #[cfg(test)]
