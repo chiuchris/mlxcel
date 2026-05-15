@@ -1810,6 +1810,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "mlxcel-core",
+ "mlxcel-surgery",
  "path-clean",
  "percent-encoding",
  "reqwest",
@@ -1852,6 +1853,17 @@ dependencies = [
  "tokenizers 0.22.2",
  "tracing",
  "unicode-script",
+]
+
+[[package]]
+name = "mlxcel-surgery"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mlxcel-core",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

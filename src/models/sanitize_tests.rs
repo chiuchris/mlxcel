@@ -528,3 +528,162 @@ fn load_text_weights_propagates_transform_error() {
 
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// --- Integration tests for the Axis A `mlxcel-surgery` crate (#367).
+// Gated on the `surgery` feature so the default build still passes
+// without pulling the new crate into the dependency graph. ---
+
+#[cfg(feature = "surgery")]
+mod surgery_integration {
+    use super::*;
+    use mlxcel_surgery::{SharedSurgeryOp, SurgeryError, SurgeryOp, SurgeryPipeline};
+    use std::sync::Arc;
+
+    /// `SurgeryOp` that simply notes that it ran. Used to prove the
+    /// `SurgeryPipeline` is actually invoked by A1's hook, without
+    /// touching the weight values (so the bit-exactness assertion
+    /// still holds).
+    struct RecordingOp {
+        counter: Arc<AtomicUsize>,
+    }
+
+    impl SurgeryOp for RecordingOp {
+        fn apply(
+            &self,
+            _weights: &mut WeightMap,
+            _cfg: &serde_json::Value,
+        ) -> Result<(), SurgeryError> {
+            self.counter.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        fn name(&self) -> &'static str {
+            "recording-noop"
+        }
+    }
+
+    #[test]
+    fn empty_surgery_pipeline_is_bit_exact_with_none() {
+        // Acceptance criterion (b) / (e) — wiring a `SurgeryPipeline`
+        // through the consolidated loader with no registered ops must
+        // produce the same `WeightMap` as `transform = None`. This
+        // doubles as proof that the new crate's `SurgeryPipeline`
+        // really does implement A1's `WeightTransform` trait at the
+        // type level (the call would not type-check otherwise).
+        let dir_a = temp_model_dir("surgery_empty_a");
+        let dir_b = temp_model_dir("surgery_empty_b");
+        write_text_model_fixture(&dir_a);
+        write_text_model_fixture(&dir_b);
+
+        let baseline = load_text_weights(&dir_a, None).unwrap();
+        let pipeline = SurgeryPipeline::new();
+        let with_empty = load_text_weights(&dir_b, Some(&pipeline)).unwrap();
+
+        assert_eq!(baseline.len(), with_empty.len());
+        for (k, base) in &baseline {
+            let other = with_empty
+                .get(k)
+                .unwrap_or_else(|| panic!("missing key {k} in surgery path"));
+            mlxcel_core::eval(base);
+            mlxcel_core::eval(other);
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(base),
+                mlxcel_core::array_to_raw_bytes(other),
+                "empty surgery pipeline must preserve key {k} bit-for-bit",
+            );
+        }
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    #[test]
+    fn surgery_pipeline_runs_registered_ops_during_load() {
+        // Acceptance criterion (b) — a non-empty pipeline routed
+        // through A1's hook must actually invoke each registered op.
+        // We use a recording no-op so the resulting `WeightMap` is
+        // still bit-identical to the baseline (because the op does
+        // not mutate weights), which proves that "no-op" semantics
+        // hold end-to-end.
+        let dir_a = temp_model_dir("surgery_recording_a");
+        let dir_b = temp_model_dir("surgery_recording_b");
+        write_text_model_fixture(&dir_a);
+        write_text_model_fixture(&dir_b);
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = SurgeryPipeline::new();
+        let op: SharedSurgeryOp = Arc::new(RecordingOp {
+            counter: counter.clone(),
+        });
+        pipeline.push(op);
+
+        let baseline = load_text_weights(&dir_a, None).unwrap();
+        let with_pipeline = load_text_weights(&dir_b, Some(&pipeline)).unwrap();
+
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "recording op must have run exactly once during load",
+        );
+
+        for (k, base) in &baseline {
+            let other = with_pipeline
+                .get(k)
+                .unwrap_or_else(|| panic!("missing key {k} in surgery path"));
+            mlxcel_core::eval(base);
+            mlxcel_core::eval(other);
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(base),
+                mlxcel_core::array_to_raw_bytes(other),
+                "recording no-op surgery must preserve key {k} bit-for-bit",
+            );
+        }
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    #[test]
+    fn surgery_error_propagates_through_load_path() {
+        // Acceptance criterion (b) — when a surgery op fails, the
+        // error must surface out of `load_text_weights` rather than
+        // being silently swallowed. Use the existing
+        // `SurgeryError::TensorNotFound` variant since it exercises
+        // the `Display` impl that the pipeline funnels through
+        // `WeightTransform::apply`'s `Result<_, String>` return.
+        struct FailingOp;
+        impl SurgeryOp for FailingOp {
+            fn apply(
+                &self,
+                _weights: &mut WeightMap,
+                _cfg: &serde_json::Value,
+            ) -> Result<(), SurgeryError> {
+                Err(SurgeryError::TensorNotFound(
+                    "expected.key.for.test".to_string(),
+                ))
+            }
+            fn name(&self) -> &'static str {
+                "failing"
+            }
+        }
+
+        let dir = temp_model_dir("surgery_failing");
+        write_text_model_fixture(&dir);
+
+        let mut pipeline = SurgeryPipeline::new();
+        pipeline.push(Arc::new(FailingOp));
+
+        let result = load_text_weights(&dir, Some(&pipeline));
+        match result {
+            Ok(_) => panic!("expected failing surgery op to abort the load"),
+            Err(err) => {
+                assert!(
+                    err.contains("failing") && err.contains("expected.key.for.test"),
+                    "expected error to identify failing op + key, got: {err}",
+                );
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

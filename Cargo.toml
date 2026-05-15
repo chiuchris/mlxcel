@@ -31,10 +31,19 @@ metal = ["mlxcel-core/metal"]
 accelerate = ["mlxcel-core/accelerate"]
 cuda = ["mlxcel-core/cuda"]
 test-utils = []
+# Axis A "weight-load surgery" framework (Epic #363, issues #367 / #369).
+# Off by default — when this feature is not active the `mlxcel-surgery`
+# crate is not linked at all, so the default serving path keeps its
+# pre-surgery footprint and the bit-exactness guarantee from #365 holds
+# trivially.
+surgery = ["dep:mlxcel-surgery"]
 
 [dependencies]
 # MLX - mlxcel-core (direct C++ bindings via cxx)
 mlxcel-core = { path = "src/lib/mlxcel-core", default-features = false }
+
+# Axis A weight-load surgery — opt-in via the `surgery` feature above.
+mlxcel-surgery = { path = "src/lib/mlxcel-surgery", optional = true }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
