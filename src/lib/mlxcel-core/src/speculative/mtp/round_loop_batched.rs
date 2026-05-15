@@ -73,6 +73,7 @@ use crate::generate::{GenerationStats, SamplingConfig};
 use crate::generation_policy::merged_eos_token_ids;
 use std::time::{Duration, Instant};
 
+use super::adaptive::effective_mtp_block_size;
 use super::target::{MtpBatchedVerifyOutput, MtpTarget};
 use super::walk::speculative_walk_batched;
 
@@ -125,7 +126,12 @@ impl std::fmt::Debug for MtpBatchedRunOutput {
 pub struct MtpBatchedGenerator<T: MtpTarget> {
     target: T,
     drafter: Box<dyn Drafter>,
+    /// User-requested ceiling for the verify block length.
     block_size: usize,
+    /// Drafter checkpoint's configured block length. User-requested values
+    /// above this start here and expand adaptively after high acceptance.
+    configured_block_size: usize,
+    prefer_requested_block_size: bool,
 }
 
 impl<T: MtpTarget> MtpBatchedGenerator<T> {
@@ -140,10 +146,14 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
             "MtpBatchedGenerator: block_size must be >= 2 \
              (block_size=1 produces no draft proposals)",
         );
+        let configured_block_size = drafter.configured_block_size().unwrap_or(block_size).max(2);
+        let prefer_requested_block_size = drafter.prefer_requested_block_size();
         Self {
             target,
             drafter,
             block_size,
+            configured_block_size,
+            prefer_requested_block_size,
         }
     }
 
@@ -267,20 +277,16 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
             });
         }
 
-        // Bind the drafter against the seed shared K/V. The drafter's
-        // `set_shared_kv` consumes per-row metadata via the batched signal
-        // we plumb through `bonus_position`/`kv_offset` (B=1 default
-        // signature); for the batched path we route per-row left-padding
-        // through the (future) batched `set_shared_kv` API. Until that
-        // arrives this method falls back to a per-row sequential bind via
-        // the existing scalar entrypoint — the round-loop's per-row
-        // `kv_offset_per_row` / `left_padding_per_row` slices are passed
-        // through and the drafter sees their max in the scalar arm.
+        // Bind the drafter against the seed shared K/V. The B>1 entrypoint
+        // preserves per-row offsets, valid lengths, RoPE anchors, and
+        // left-padding so mixed-accept rows do not inherit the longest
+        // row's scalar metadata.
         self.rebind_drafter_from_seed(&verify_out)?;
 
         let decode_start = Instant::now();
         // Per-row bonus tokens drive the next round's verify input.
         let mut bonus_per_row: Vec<i32> = first_bonus_per_row.clone();
+        let mut accept_lens_for_adaptive: Vec<f64> = Vec::new();
 
         loop {
             if finished.iter().all(|&f| f) {
@@ -305,7 +311,16 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
                 })
                 .min()
                 .unwrap_or(1);
-            let bs = self.block_size.min(remaining_min);
+            let bs = if self.prefer_requested_block_size {
+                self.block_size.min(remaining_min)
+            } else {
+                effective_mtp_block_size(
+                    self.block_size,
+                    self.configured_block_size,
+                    &accept_lens_for_adaptive,
+                    remaining_min,
+                )
+            };
             if bs <= 1 {
                 break;
             }
@@ -390,6 +405,14 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
             for r in 0..batch_size {
                 accept_lens_per_row[r].push(accepted_per_row[r] as u32);
             }
+            let active_accept_sum: usize = (0..batch_size)
+                .filter(|&r| !finished[r])
+                .map(|r| accepted_per_row[r])
+                .sum();
+            let active_count = (0..batch_size).filter(|&r| !finished[r]).count();
+            if active_count > 0 {
+                accept_lens_for_adaptive.push(active_accept_sum as f64 / active_count as f64);
+            }
 
             // ---- Emit (per-row, frozen rows dropped) ----
             for r in 0..batch_size {
@@ -452,46 +475,27 @@ impl<T: MtpTarget> MtpBatchedGenerator<T> {
     }
 
     /// Wire the verify output's `next_shared_kv` into the drafter's
-    /// `set_shared_kv`, threading per-row metadata through the scalar
-    /// entrypoint.
+    /// batched `set_shared_kv` entrypoint with per-row metadata intact.
     ///
-    /// The current [`Drafter::set_shared_kv`] signature carries scalar
-    /// `kv_offset`, `position`, and `left_padding`. For the batched path
-    /// we collapse per-row values to their max (the longest valid
-    /// prefix's offset and the largest left-padding extent) so the
-    /// drafter still constructs masks correctly against the full shared
-    /// K/V allocation. The per-row normalization happens inside the
-    /// drafter's `set_shared_kv` override via the masks helper. A future
-    /// follow-up will extend the trait to accept per-row vectors directly
-    /// (tracked alongside #631's wiring); the round-loop's per-row state
-    /// is already plumbed through the rebind call so swapping the trait
-    /// signature is local.
+    /// This is load-bearing for real Gemma 4 MTP B>1 bursts: after mixed
+    /// speculative accepts, rows have different logical `kv_valid_len`
+    /// and frozen RoPE anchors even though the physical K/V slab uses the
+    /// global max length. Collapsing those values to a scalar max makes
+    /// the shorter rows attend into zeroed tails and rotate at the wrong
+    /// position.
     fn rebind_drafter_from_seed(
         &mut self,
         verify_out: &MtpBatchedVerifyOutput,
     ) -> Result<(), DrafterError> {
         let refs = verify_out.shared_kv_refs();
         let shared_kv = SharedKv::new(&refs);
-        // Collapse per-row vectors to the maxima the drafter's scalar
-        // signature can accept. The drafter's `set_shared_kv` is
-        // responsible for the per-row normalization (via
-        // `normalize_batched_shared_kv_states`) when it sees a
-        // batched-shape K/V — i.e., leading dim > 1.
-        let kv_offset = verify_out.kv_offset_per_row.iter().copied().max().unwrap_or(0);
-        let position = verify_out
-            .bonus_position_per_row
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        let left_padding = verify_out
-            .left_padding_per_row
-            .iter()
-            .copied()
-            .max()
-            .unwrap_or(0);
-        self.drafter
-            .set_shared_kv(shared_kv, kv_offset, position, left_padding)
+        self.drafter.set_shared_kv_batched(
+            shared_kv,
+            &verify_out.kv_offset_per_row,
+            &verify_out.bonus_position_per_row,
+            &verify_out.kv_valid_len_per_row,
+            &verify_out.left_padding_per_row,
+        )
     }
 }
 

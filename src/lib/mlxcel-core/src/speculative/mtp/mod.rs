@@ -46,6 +46,7 @@
 //!   `rollback_speculative_cache`) to the round-loop driver without
 //!   forcing this crate to depend on the outer `mlxcel` crate.
 
+pub(crate) mod adaptive;
 pub mod generator;
 pub mod round_loop_batched;
 pub mod target;

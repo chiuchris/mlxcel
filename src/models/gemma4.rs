@@ -682,6 +682,19 @@ impl Cache {
         }
     }
 
+    /// Add upstream-style rollback slack to sliding-window target caches used
+    /// by Gemma 4 MTP. The logical attention window is unchanged; only the
+    /// rotating cache's temporary storage grows so verify-block append +
+    /// rollback cannot overwrite still-visible window entries.
+    ///
+    /// Used by: Gemma 4 MTP B=1/B>1 target adapters.
+    pub(crate) fn enable_mtp_rotating_buffer(&mut self, buffer_size: i32) -> Result<(), String> {
+        match self {
+            Self::Standard(_) => Ok(()),
+            Self::Rotating(cache) => cache.enable_speculative_buffer(buffer_size),
+        }
+    }
+
     /// Per-row tail-zero of the rotating cache for partial-accept rows in a
     /// batched verify pass. Mirrors the Python `hasattr(c, "_idx")` branch in
     /// `rollback_speculative_cache` (references/mlx-vlm/mlx_vlm/models/gemma4
@@ -1660,6 +1673,7 @@ impl Gemma4TextModel {
             per_layer_inputs,
             None,
             None,
+            false,
         )
     }
 
@@ -1697,6 +1711,7 @@ impl Gemma4TextModel {
         per_layer_inputs: Option<&MlxArray>,
         capture_layer_ids: Option<&[usize]>,
         mut sinks: Option<&mut Gemma4SpeculativeSinks>,
+        skip_final_norm: bool,
     ) -> UniquePtr<MlxArray> {
         // When `input_embeddings` is supplied (e.g. from the VLM path where
         // vision/audio features have already been merged into the embedding
@@ -1893,7 +1908,11 @@ impl Gemma4TextModel {
             }
         }
 
-        self.norm.forward(&h)
+        if skip_final_norm {
+            h
+        } else {
+            self.norm.forward(&h)
+        }
     }
 
     pub(crate) fn get_per_layer_inputs(&self, input_ids: &MlxArray) -> UniquePtr<MlxArray> {
@@ -2180,7 +2199,57 @@ impl Gemma4Model {
             per_layer_inputs,
             capture_layer_ids,
             sinks,
+            false,
         );
+        let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
+        if let Some(cap) = self.config.final_logit_softcapping {
+            logits = mlxcel_core::compiled_softcap(&logits, cap);
+        }
+        logits
+    }
+
+    /// Run the transformer with speculative sinks but skip the tied LM head.
+    ///
+    /// Used by: Gemma 4 MTP deferred greedy verification, which needs the
+    /// pre-norm hidden states and shared K/V slabs but can project only the
+    /// positions required by the speculative walk.
+    fn forward_hidden_with_caches_and_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        caches: &mut [Cache],
+        mask: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+        skip_final_norm: bool,
+    ) -> UniquePtr<MlxArray> {
+        self.text_model.forward_with_speculative_sinks(
+            input_ids,
+            input_embeddings,
+            caches,
+            mask,
+            per_layer_inputs,
+            capture_layer_ids,
+            sinks,
+            skip_final_norm,
+        )
+    }
+
+    /// Apply the Gemma 4 final norm to a pre-norm decoder hidden state.
+    ///
+    /// Used by: Gemma 4 MTP drafter hidden preparation and deferred
+    /// hidden-to-logits verification.
+    fn speculative_draft_hidden(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        self.text_model.norm.forward(hidden)
+    }
+
+    /// Project a pre-norm decoder hidden state to logits using the tied LM
+    /// head and optional final-logit softcap.
+    ///
+    /// Used by: Gemma 4 MTP deferred greedy verification.
+    fn speculative_logits_from_hidden(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        let hidden = self.speculative_draft_hidden(hidden);
         let mut logits = self.text_model.embed_tokens.as_linear(&hidden);
         if let Some(cap) = self.config.final_logit_softcapping {
             logits = mlxcel_core::compiled_softcap(&logits, cap);
@@ -2811,6 +2880,54 @@ impl Gemma4Wrapper {
         self.model.eos_token_ids.clone()
     }
 
+    /// Read the current absolute KV-cache offset for the requested
+    /// attention-layer family in a model-owned speculative cache slot.
+    ///
+    /// Used by: `Gemma4MtpTargetAdapter` to rebind the assistant drafter
+    /// with the same post-rollback absolute offset that upstream exposes
+    /// as `prompt_cache[0].offset`.
+    pub(crate) fn speculative_cache_offset(
+        &self,
+        seq_id: Option<SequenceId>,
+        layer_type: &str,
+    ) -> i32 {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| first_cache_offset(sequence_caches, layer_type),
+        )
+    }
+
+    /// Enable buffered rotating caches for a Gemma 4 MTP B=1 target slot.
+    ///
+    /// Mirrors upstream mlx-vlm's `BufferedRotatingKVCache` conversion after
+    /// prompt prefill: full-attention caches are left unchanged, while
+    /// sliding-attention caches keep a small temporary prefix buffer so MTP
+    /// verify bursts can be rolled back without destructive ring wrap.
+    ///
+    /// Used by: `Gemma4MtpTargetAdapter::prefill_and_seed`.
+    pub(crate) fn enable_mtp_rotating_cache_buffer(
+        &self,
+        seq_id: Option<SequenceId>,
+        buffer_size: i32,
+    ) {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                for cache in sequence_caches.iter_mut() {
+                    if let Err(error) = cache.enable_mtp_rotating_buffer(buffer_size) {
+                        tracing::warn!(
+                            error,
+                            buffer_size,
+                            "Gemma4 MTP could not enable rotating-cache rollback buffer"
+                        );
+                    }
+                }
+            },
+        );
+    }
+
     /// Returns the text model's hidden size (embedding dimension).
     ///
     /// Used by: `Gemma4VLModel::get_input_embeddings_with_audio` to apply the
@@ -2906,6 +3023,55 @@ impl Gemma4Wrapper {
             capture_layer_ids,
             sinks,
         )
+    }
+
+    /// Sink-aware hidden forward used by Gemma 4 MTP deferred greedy
+    /// verification.
+    ///
+    /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpTargetAdapter`].
+    pub(crate) fn forward_hidden_with_speculative_sinks(
+        &self,
+        input_ids: &MlxArray,
+        input_embeddings: Option<&MlxArray>,
+        per_layer_inputs: Option<&MlxArray>,
+        mask: Option<&MlxArray>,
+        seq_id: Option<SequenceId>,
+        capture_layer_ids: Option<&[usize]>,
+        sinks: Option<&mut Gemma4SpeculativeSinks>,
+        skip_final_norm: bool,
+    ) -> UniquePtr<MlxArray> {
+        self.sequence_state.with_or_create_sequence_state(
+            seq_id,
+            || self.model.make_caches(),
+            |sequence_caches| {
+                self.model.forward_hidden_with_caches_and_speculative_sinks(
+                    input_ids,
+                    input_embeddings,
+                    sequence_caches,
+                    mask,
+                    per_layer_inputs,
+                    capture_layer_ids,
+                    sinks,
+                    skip_final_norm,
+                )
+            },
+        )
+    }
+
+    /// Normalize a pre-norm hidden state before handing it to the MTP
+    /// assistant drafter.
+    ///
+    /// Used by: [`crate::models::gemma4_mtp_target::Gemma4MtpTargetAdapter`].
+    pub(crate) fn speculative_draft_hidden(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        self.model.speculative_draft_hidden(hidden)
+    }
+
+    /// Project a pre-norm hidden state to logits without rerunning the
+    /// transformer.
+    ///
+    /// Used by: Gemma 4 MTP deferred greedy verification.
+    pub(crate) fn speculative_logits_from_hidden(&self, hidden: &MlxArray) -> UniquePtr<MlxArray> {
+        self.model.speculative_logits_from_hidden(hidden)
     }
 
     /// Allocate a fresh per-layer cache vector for a batched MTP burst

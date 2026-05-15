@@ -499,6 +499,7 @@ impl<'a> std::fmt::Debug for SharedKv<'a> {
 /// |-----------------------|----------------------------------|---------------------------------|---------------------------------|
 /// | [`bind`]              | required                         | required                        | required                        |
 /// | [`set_shared_kv`]     | required                         | no-op (default)                 | no-op (default)                 |
+/// | [`set_shared_kv_batched`] | required for B>1 MTP         | no-op (default)                 | no-op (default)                 |
 /// | [`make_cache`]        | empty vec (default)              | required (own KV cache)         | required (own KV cache)         |
 /// | [`reset`]             | no-op (default)                  | required                        | required                        |
 /// | [`draft_block`]       | K autoregressive forwards        | single masked forward           | K autoregressive forwards       |
@@ -554,6 +555,36 @@ pub trait Drafter {
         Ok(())
     }
 
+    /// Batched variant of [`Self::set_shared_kv`] that preserves per-row
+    /// cache positions and padding metadata.
+    ///
+    /// **MTP-only.** The default collapses per-row metadata to scalar
+    /// maxima and calls [`Self::set_shared_kv`], preserving compatibility
+    /// for non-batched drafters and tests. Concrete B>1 MTP drafters should
+    /// override this so masks and RoPE anchors use each row's logical
+    /// position instead of the longest row's value.
+    ///
+    /// - `kv_offset_per_row`: logical per-row post-rollback cache offsets.
+    /// - `position_per_row`: per-row frozen bonus-token RoPE anchors.
+    /// - `kv_valid_len_per_row`: per-row valid prefix lengths in the shared
+    ///   K/V slabs.
+    /// - `left_padding_per_row`: per-row left-padding extents in the shared
+    ///   K/V slabs.
+    #[allow(unused_variables)]
+    fn set_shared_kv_batched(
+        &mut self,
+        shared_kv: SharedKv<'_>,
+        kv_offset_per_row: &[usize],
+        position_per_row: &[usize],
+        kv_valid_len_per_row: &[usize],
+        left_padding_per_row: &[usize],
+    ) -> Result<(), DrafterError> {
+        let kv_offset = kv_offset_per_row.iter().copied().max().unwrap_or(0);
+        let position = position_per_row.iter().copied().max().unwrap_or(0);
+        let left_padding = left_padding_per_row.iter().copied().max().unwrap_or(0);
+        self.set_shared_kv(shared_kv, kv_offset, position, left_padding)
+    }
+
     /// Create the drafter's own KV cache (one slot per drafter layer).
     ///
     /// **DFlash- and InternalMtp-only.** Default returns an empty `Vec`
@@ -580,6 +611,25 @@ pub trait Drafter {
     /// target verify hooks. Non-DFlash drafters return `None`.
     fn dflash_target_layer_ids(&self) -> Option<&[usize]> {
         None
+    }
+
+    /// Drafter checkpoint's configured speculative block size, when known.
+    ///
+    /// MTP uses this to mirror upstream adaptive block sizing: a user may
+    /// request a larger `--draft-block-size`, but Gemma-style assistants
+    /// start at their configured depth and only expand after recent
+    /// acceptance proves the configured prefix is usually fully accepted.
+    fn configured_block_size(&self) -> Option<usize> {
+        None
+    }
+
+    /// Whether the drafter should always honor a user-requested block size
+    /// instead of using the adaptive configured-depth warm-up.
+    ///
+    /// Upstream Qwen 3.5 MTP sets `prefer_requested_block_size = True`.
+    /// Gemma 4 assistant leaves this false.
+    fn prefer_requested_block_size(&self) -> bool {
+        false
     }
 
     /// Produce a draft block of proposal tokens.

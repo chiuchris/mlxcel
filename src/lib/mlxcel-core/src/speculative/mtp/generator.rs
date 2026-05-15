@@ -43,10 +43,102 @@ use crate::generate::{GenerationStats, SamplingConfig};
 use crate::generation_policy::merged_eos_token_ids;
 use crate::sampling::{LogprobsConfig, TokenLogprobData};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
+use super::adaptive::effective_mtp_block_size;
 use super::target::{MtpTarget, MtpVerifyOutput};
 use super::walk::speculative_walk;
+
+#[derive(Debug, Default)]
+struct MtpRoundDiagnostics {
+    rounds: usize,
+    proposed_tokens: usize,
+    accepted_draft_tokens: usize,
+    emitted_from_verify_tokens: usize,
+    zero_accept_rounds: usize,
+    partial_accept_rounds: usize,
+    full_accept_rounds: usize,
+    prefill_seed_ms: f64,
+    set_shared_kv_ms: f64,
+    draft_ms: f64,
+    verify_forward_ms: f64,
+    speculative_walk_ms: f64,
+    verify_finalize_ms: f64,
+}
+
+impl MtpRoundDiagnostics {
+    fn new(prefill_seed_time: Duration) -> Self {
+        Self {
+            prefill_seed_ms: duration_ms(prefill_seed_time),
+            ..Self::default()
+        }
+    }
+
+    fn record_round(&mut self, proposed_tokens: usize, accepted: usize, emitted_tokens: usize) {
+        self.rounds += 1;
+        self.proposed_tokens += proposed_tokens;
+        self.accepted_draft_tokens += accepted.min(proposed_tokens);
+        self.emitted_from_verify_tokens += emitted_tokens;
+        if accepted == 0 {
+            self.zero_accept_rounds += 1;
+        } else if accepted >= proposed_tokens {
+            self.full_accept_rounds += 1;
+        } else {
+            self.partial_accept_rounds += 1;
+        }
+    }
+
+    fn acceptance_rate(&self) -> f64 {
+        if self.proposed_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f64 / self.proposed_tokens as f64
+        }
+    }
+
+    fn emitted_per_verify(&self) -> f64 {
+        if self.rounds == 0 {
+            0.0
+        } else {
+            self.emitted_from_verify_tokens as f64 / self.rounds as f64
+        }
+    }
+
+    fn log(
+        &self,
+        block_size: usize,
+        prompt_tokens: usize,
+        generated_tokens: usize,
+        decode_time: Duration,
+    ) {
+        tracing::info!(
+            block_size,
+            prompt_tokens,
+            generated_tokens,
+            rounds = self.rounds,
+            proposed_tokens = self.proposed_tokens,
+            accepted_draft_tokens = self.accepted_draft_tokens,
+            acceptance_rate = self.acceptance_rate(),
+            emitted_from_verify_tokens = self.emitted_from_verify_tokens,
+            emitted_per_verify = self.emitted_per_verify(),
+            zero_accept_rounds = self.zero_accept_rounds,
+            partial_accept_rounds = self.partial_accept_rounds,
+            full_accept_rounds = self.full_accept_rounds,
+            prefill_seed_ms = self.prefill_seed_ms,
+            set_shared_kv_ms = self.set_shared_kv_ms,
+            draft_ms = self.draft_ms,
+            verify_forward_ms = self.verify_forward_ms,
+            speculative_walk_ms = self.speculative_walk_ms,
+            verify_finalize_ms = self.verify_finalize_ms,
+            decode_ms = duration_ms(decode_time),
+            "MTP round-loop diagnostics",
+        );
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1000.0
+}
 
 /// Round-loop driver for Gemma 4 MTP speculative decoding (B=1).
 ///
@@ -83,7 +175,12 @@ use super::walk::speculative_walk;
 pub struct MtpGenerator<T: MtpTarget> {
     target: T,
     drafter: Box<dyn Drafter>,
+    /// User-requested ceiling for the verify block length.
     block_size: usize,
+    /// Drafter checkpoint's configured block length. User-requested values
+    /// above this start here and expand adaptively after high acceptance.
+    configured_block_size: usize,
+    prefer_requested_block_size: bool,
 }
 
 impl<T: MtpTarget> MtpGenerator<T> {
@@ -98,10 +195,14 @@ impl<T: MtpTarget> MtpGenerator<T> {
             block_size >= 2,
             "MtpGenerator: block_size must be >= 2 (block_size=1 produces no draft proposals)",
         );
+        let configured_block_size = drafter.configured_block_size().unwrap_or(block_size).max(2);
+        let prefer_requested_block_size = drafter.prefer_requested_block_size();
         Self {
             target,
             drafter,
             block_size,
+            configured_block_size,
+            prefer_requested_block_size,
         }
     }
 
@@ -216,6 +317,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
             self.target
                 .prefill_and_seed(prompt_tokens, sampling, token_history, logprobs_config);
         let prefill_time = prefill_start.elapsed();
+        let mut diagnostics = MtpRoundDiagnostics::new(prefill_time);
 
         // Emit the first bonus and short-circuit if it's EOS or
         // max_tokens=1.
@@ -225,6 +327,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
         }
         if eos_tokens.contains(&first_bonus) || max_tokens == 1 {
             let gen_count = emitted.len();
+            diagnostics.log(self.block_size, prompt_len, gen_count, Duration::ZERO);
             return (
                 emitted,
                 logprobs,
@@ -234,10 +337,13 @@ impl<T: MtpTarget> MtpGenerator<T> {
 
         let decode_start = Instant::now();
         let mut bonus = first_bonus;
+        let mut accept_lens: Vec<f64> = Vec::new();
 
         // Arm the drafter's shared K/V from the seed capture.
         // The drafter MUST already have been bound (see struct docs).
+        let set_shared_start = Instant::now();
         self.set_shared_kv_from_verify(&verify_out);
+        diagnostics.set_shared_kv_ms += duration_ms(set_shared_start.elapsed());
 
         // ROUND LOOP.
         loop {
@@ -253,12 +359,25 @@ impl<T: MtpTarget> MtpGenerator<T> {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
-            // Bound the block size by the remaining budget: per upstream
-            // `bs = min(block_total, max_tokens - emitted + 1)`. The `+1`
-            // is because the verify input is `[bonus, draft_0, …,
-            // draft_{K-2}]` — one prefix bonus position that the
-            // round-loop already counts as emitted.
-            let bs = self.block_size.min(max_tokens - emitted.len() + 1);
+            // Bound the block size by the remaining budget. When the
+            // operator requested a block larger than the drafter's
+            // configured depth, mirror upstream's adaptive controller:
+            // stay at configured depth until recent acceptance proves the
+            // configured prefix is usually fully accepted, then expand to
+            // the requested ceiling. The `+1` is because the verify input
+            // is `[bonus, draft_0, …, draft_{K-2}]` — one prefix bonus
+            // position that the round-loop already counts as emitted.
+            let remaining = max_tokens - emitted.len() + 1;
+            let bs = if self.prefer_requested_block_size {
+                self.block_size.min(remaining)
+            } else {
+                effective_mtp_block_size(
+                    self.block_size,
+                    self.configured_block_size,
+                    &accept_lens,
+                    remaining,
+                )
+            };
             if bs <= 1 {
                 break;
             }
@@ -267,9 +386,14 @@ impl<T: MtpTarget> MtpGenerator<T> {
             // hidden captured from the previous verify pass (or the
             // seed verify on the first iteration).
             let hidden = verify_out.next_hidden.as_ref();
+            let draft_start = Instant::now();
             let draft_tokens = match self.drafter.draft_block(bonus, hidden, bs, sampling) {
-                Ok(t) => t,
+                Ok(t) => {
+                    diagnostics.draft_ms += duration_ms(draft_start.elapsed());
+                    t
+                }
                 Err(e) => {
+                    diagnostics.draft_ms += duration_ms(draft_start.elapsed());
                     // Drafter failed — bail out cleanly. We've already
                     // emitted at least the seed bonus, so return what
                     // we have rather than panicking. Future hardening
@@ -292,24 +416,32 @@ impl<T: MtpTarget> MtpGenerator<T> {
             // `bs` longer than before the call. We have target_tokens
             // for the walk; the captured state holds hidden + shared
             // K/V slabs for the finalize step.
+            let verify_forward_start = Instant::now();
             let forward_out =
                 self.target
                     .verify_forward(&verify_input, sampling, logprobs_config);
+            diagnostics.verify_forward_ms += duration_ms(verify_forward_start.elapsed());
 
             // Walk the draft against the target's argmax tokens.
             let budget = max_tokens - emitted.len();
+            let walk_start = Instant::now();
             let walk = speculative_walk(&draft_tokens, &forward_out.target_tokens, budget);
+            diagnostics.speculative_walk_ms += duration_ms(walk_start.elapsed());
+            diagnostics.record_round(draft_tokens.len(), walk.accepted, walk.new_tokens.len());
+            accept_lens.push(walk.accepted as f64);
 
             // Phase 2: rollback the cache + slice shared K/V based on
             // the walk's accepted count. This consumes the captured
             // state from phase 1. `target_logprobs` is pulled out
             // *before* `forward_out` is moved into `verify_finalize`.
             let target_logprobs = forward_out.target_logprobs;
+            let verify_finalize_start = Instant::now();
             verify_out = self.target.verify_finalize(
                 walk.accepted,
                 actual_bs,
                 forward_out.captured,
             );
+            diagnostics.verify_finalize_ms += duration_ms(verify_finalize_start.elapsed());
 
             // Emit accepted tokens. `walk.new_tokens[i] == target_tokens[i]`
             // for every `i` (accepted draft tokens matched the target by
@@ -332,6 +464,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
                 if eos_tokens.contains(&tok) {
                     let decode_time = decode_start.elapsed();
                     let gen_count = emitted.len();
+                    diagnostics.log(self.block_size, prompt_len, gen_count, decode_time);
                     return (
                         emitted,
                         logprobs,
@@ -341,6 +474,7 @@ impl<T: MtpTarget> MtpGenerator<T> {
                 if emitted.len() >= max_tokens {
                     let decode_time = decode_start.elapsed();
                     let gen_count = emitted.len();
+                    diagnostics.log(self.block_size, prompt_len, gen_count, decode_time);
                     return (
                         emitted,
                         logprobs,
@@ -359,11 +493,14 @@ impl<T: MtpTarget> MtpGenerator<T> {
             // K/V the verify call produced. The drafter's
             // `set_shared_kv` will read these slabs at the start of the
             // next `draft_block`.
+            let set_shared_start = Instant::now();
             self.set_shared_kv_from_verify(&verify_out);
+            diagnostics.set_shared_kv_ms += duration_ms(set_shared_start.elapsed());
         }
 
         let decode_time = decode_start.elapsed();
         let gen_count = emitted.len();
+        diagnostics.log(self.block_size, prompt_len, gen_count, decode_time);
         (
             emitted,
             logprobs,
@@ -393,11 +530,11 @@ impl<T: MtpTarget> MtpGenerator<T> {
     fn build_stats(
         prompt_count: usize,
         gen_count: usize,
-        prefill_time: std::time::Duration,
-        decode_time: std::time::Duration,
+        prefill_time: Duration,
+        decode_time: Duration,
     ) -> GenerationStats {
-        let prefill_ms = prefill_time.as_secs_f64() * 1000.0;
-        let decode_ms = decode_time.as_secs_f64() * 1000.0;
+        let prefill_ms = duration_ms(prefill_time);
+        let decode_ms = duration_ms(decode_time);
         GenerationStats {
             prompt_tokens: prompt_count,
             generated_tokens: gen_count,

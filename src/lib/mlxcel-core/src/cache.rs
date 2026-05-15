@@ -3311,8 +3311,16 @@ impl Default for KVCache {
 pub struct RotatingKVCache {
     pub keys: Option<UniquePtr<MlxArray>>,
     pub values: Option<UniquePtr<MlxArray>>,
+    /// Logical sliding-window length used by attention.
     pub max_size: i32,
+    /// Extra speculative rollback slack. When non-zero, the cache keeps a
+    /// temporal prefix of up to `max_size + buffer_size` tokens and compacts
+    /// from the front instead of destructively wrapping as soon as the logical
+    /// sliding window is full.
+    pub buffer_size: i32,
     pub offset: i32,
+    /// Absolute logical position of `keys[..., 0, :]` when `buffer_size > 0`.
+    start_position: i32,
     /// Current write position in the buffer (separate from offset to handle trim correctly)
     idx: i32,
     step: i32,
@@ -3381,7 +3389,9 @@ impl RotatingKVCache {
             keys: None,
             values: None,
             max_size,
+            buffer_size: 0,
             offset: 0,
+            start_position: 0,
             idx: 0,
             step: 256,
             mode,
@@ -3402,6 +3412,9 @@ impl RotatingKVCache {
 
     /// Get current sequence length in cache
     pub fn seq_len(&self) -> i32 {
+        if self.buffer_size > 0 {
+            return self.idx.max(0);
+        }
         if let Some(ref keys) = self.keys {
             let shape = ffi::array_shape(keys);
             if shape.len() >= 3 {
@@ -3466,6 +3479,10 @@ impl RotatingKVCache {
         new_keys: UniquePtr<MlxArray>,
         new_values: UniquePtr<MlxArray>,
     ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        if self.buffer_size > 0 {
+            return self.update_and_fetch_buffered_fp16(new_keys, new_values);
+        }
+
         let new_seq_len = {
             let shape = ffi::array_shape(&new_keys);
             shape[2]
@@ -3476,6 +3493,282 @@ impl RotatingKVCache {
         }
 
         self.update_in_place(new_keys, new_values)
+    }
+
+    /// Enable upstream-style buffered rotating semantics for speculative
+    /// verification bursts.
+    ///
+    /// This mirrors mlx-vlm's `BufferedRotatingKVCache`: the logical attention
+    /// window remains `max_size`, but the backing buffer receives extra
+    /// temporary slack (`buffer_size`) so an MTP verify block can append and
+    /// then roll back without overwriting the oldest still-visible window
+    /// entries. Existing ring contents are converted into temporal order.
+    ///
+    /// Used by: Gemma 4 MTP target caches near sliding-window rollover.
+    pub fn enable_speculative_buffer(&mut self, buffer_size: i32) -> Result<(), String> {
+        let buffer_size = buffer_size.max(0);
+        if buffer_size <= self.buffer_size && self.buffer_size > 0 {
+            return Ok(());
+        }
+        if self.mode != KVCacheMode::Fp16 {
+            return Err(format!(
+                "RotatingKVCache::enable_speculative_buffer only supports FP16 storage; \
+                 got {:?}",
+                self.mode
+            ));
+        }
+
+        if self.keys.is_none() {
+            self.buffer_size = self.buffer_size.max(buffer_size);
+            self.idx = 0;
+            self.start_position = self.offset;
+            return Ok(());
+        }
+        if self.values.is_none() {
+            return Err(
+                "RotatingKVCache::enable_speculative_buffer requires a value buffer".into(),
+            );
+        }
+
+        let (keys, values, visible_len) = self.visible_fp16_prefix_for_concat();
+        self.buffer_size = self.buffer_size.max(buffer_size);
+        let keep = visible_len.min(self.max_size).max(0);
+        let start = visible_len - keep;
+        let k_shape = ffi::array_shape(&keys);
+        let v_shape = ffi::array_shape(&values);
+        let kept_keys = ffi::slice(
+            &keys,
+            &[0, 0, start, 0],
+            &[k_shape[0], k_shape[1], visible_len, k_shape[3]],
+        );
+        let kept_values = ffi::slice(
+            &values,
+            &[0, 0, start, 0],
+            &[v_shape[0], v_shape[1], visible_len, v_shape[3]],
+        );
+
+        let capacity = self.buffered_capacity_for(keep, 0);
+        let k_zeros = ffi::zeros(
+            &[k_shape[0], k_shape[1], capacity, k_shape[3]],
+            ffi::array_dtype(&kept_keys),
+        );
+        let v_zeros = ffi::zeros(
+            &[v_shape[0], v_shape[1], capacity, v_shape[3]],
+            ffi::array_dtype(&kept_values),
+        );
+
+        self.keys = Some(if keep > 0 {
+            ffi::slice_update(
+                &k_zeros,
+                &kept_keys,
+                &[0, 0, 0, 0],
+                &[k_shape[0], k_shape[1], keep, k_shape[3]],
+            )
+        } else {
+            k_zeros
+        });
+        self.values = Some(if keep > 0 {
+            ffi::slice_update(
+                &v_zeros,
+                &kept_values,
+                &[0, 0, 0, 0],
+                &[v_shape[0], v_shape[1], keep, v_shape[3]],
+            )
+        } else {
+            v_zeros
+        });
+        self.idx = keep;
+        self.start_position = self.offset - keep;
+        Ok(())
+    }
+
+    fn buffered_target_size(&self, incoming: i32) -> i32 {
+        self.max_size + self.buffer_size.max(incoming).max(0)
+    }
+
+    fn buffered_capacity_for(&self, needed: i32, incoming: i32) -> i32 {
+        let target = needed.max(self.buffered_target_size(incoming));
+        ((target + self.step - 1) / self.step) * self.step
+    }
+
+    fn buffered_planned_drop(&self, incoming: i32) -> i32 {
+        let needed = self.idx + incoming;
+        let target_size = self.buffered_target_size(incoming);
+        if needed <= target_size {
+            return 0;
+        }
+        let target_start = (self.offset - self.max_size + 1).max(0);
+        (target_start - self.start_position).max(0).min(self.idx)
+    }
+
+    fn compact_buffered_prefix(&mut self, drop: i32) {
+        if drop <= 0 || self.keys.is_none() {
+            return;
+        }
+        let keep = self.idx - drop;
+        let keys = self.keys.as_ref().unwrap();
+        let values = self
+            .values
+            .as_ref()
+            .expect("buffered rotating cache keeps values with keys");
+        let k_shape = ffi::array_shape(keys);
+        let v_shape = ffi::array_shape(values);
+        let capacity = k_shape[2];
+        let kept_keys = ffi::slice(
+            keys,
+            &[0, 0, drop, 0],
+            &[k_shape[0], k_shape[1], self.idx, k_shape[3]],
+        );
+        let kept_values = ffi::slice(
+            values,
+            &[0, 0, drop, 0],
+            &[v_shape[0], v_shape[1], self.idx, v_shape[3]],
+        );
+        let k_zeros = ffi::zeros(
+            &[k_shape[0], k_shape[1], capacity, k_shape[3]],
+            ffi::array_dtype(keys),
+        );
+        let v_zeros = ffi::zeros(
+            &[v_shape[0], v_shape[1], capacity, v_shape[3]],
+            ffi::array_dtype(values),
+        );
+        self.keys = Some(if keep > 0 {
+            ffi::slice_update(
+                &k_zeros,
+                &kept_keys,
+                &[0, 0, 0, 0],
+                &[k_shape[0], k_shape[1], keep, k_shape[3]],
+            )
+        } else {
+            k_zeros
+        });
+        self.values = Some(if keep > 0 {
+            ffi::slice_update(
+                &v_zeros,
+                &kept_values,
+                &[0, 0, 0, 0],
+                &[v_shape[0], v_shape[1], keep, v_shape[3]],
+            )
+        } else {
+            v_zeros
+        });
+        self.start_position += drop;
+        self.idx = keep;
+    }
+
+    fn ensure_buffered_capacity(
+        &mut self,
+        new_keys: &MlxArray,
+        new_values: &MlxArray,
+        needed: i32,
+        incoming: i32,
+    ) {
+        if let Some(keys) = self.keys.as_ref() {
+            if needed <= ffi::array_shape(keys)[2] {
+                return;
+            }
+        }
+
+        let new_k_shape = ffi::array_shape(new_keys);
+        let new_v_shape = ffi::array_shape(new_values);
+        let capacity = self.buffered_capacity_for(needed, incoming);
+        let k_zeros = ffi::zeros(
+            &[new_k_shape[0], new_k_shape[1], capacity, new_k_shape[3]],
+            ffi::array_dtype(new_keys),
+        );
+        let v_zeros = ffi::zeros(
+            &[new_v_shape[0], new_v_shape[1], capacity, new_v_shape[3]],
+            ffi::array_dtype(new_values),
+        );
+
+        if self.keys.is_none() || self.idx <= 0 {
+            self.keys = Some(k_zeros);
+            self.values = Some(v_zeros);
+            return;
+        }
+
+        let keys = self.keys.as_ref().unwrap();
+        let values = self
+            .values
+            .as_ref()
+            .expect("buffered rotating cache keeps values with keys");
+        let k_shape = ffi::array_shape(keys);
+        let v_shape = ffi::array_shape(values);
+        let live_keys = ffi::slice(
+            keys,
+            &[0, 0, 0, 0],
+            &[k_shape[0], k_shape[1], self.idx, k_shape[3]],
+        );
+        let live_values = ffi::slice(
+            values,
+            &[0, 0, 0, 0],
+            &[v_shape[0], v_shape[1], self.idx, v_shape[3]],
+        );
+        self.keys = Some(ffi::slice_update(
+            &k_zeros,
+            &live_keys,
+            &[0, 0, 0, 0],
+            &[k_shape[0], k_shape[1], self.idx, k_shape[3]],
+        ));
+        self.values = Some(ffi::slice_update(
+            &v_zeros,
+            &live_values,
+            &[0, 0, 0, 0],
+            &[v_shape[0], v_shape[1], self.idx, v_shape[3]],
+        ));
+    }
+
+    fn update_and_fetch_buffered_fp16(
+        &mut self,
+        new_keys: UniquePtr<MlxArray>,
+        new_values: UniquePtr<MlxArray>,
+    ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+        let incoming = ffi::array_shape(&new_keys)[2];
+        let drop = self.buffered_planned_drop(incoming);
+        self.compact_buffered_prefix(drop);
+
+        let needed = self.idx + incoming;
+        self.ensure_buffered_capacity(
+            new_keys.as_ref().unwrap(),
+            new_values.as_ref().unwrap(),
+            needed,
+            incoming,
+        );
+
+        let mut k_buffer = self.keys.take().unwrap();
+        let mut v_buffer = self.values.take().unwrap();
+        let k_shape = ffi::array_shape(&k_buffer);
+        let v_shape = ffi::array_shape(&v_buffer);
+        let pos = self.idx;
+        k_buffer = ffi::slice_update(
+            &k_buffer,
+            &new_keys,
+            &[0, 0, pos, 0],
+            &[k_shape[0], k_shape[1], needed, k_shape[3]],
+        );
+        v_buffer = ffi::slice_update(
+            &v_buffer,
+            &new_values,
+            &[0, 0, pos, 0],
+            &[v_shape[0], v_shape[1], needed, v_shape[3]],
+        );
+
+        self.idx = needed;
+        self.offset += incoming;
+
+        let k_out = ffi::slice(
+            &k_buffer,
+            &[0, 0, 0, 0],
+            &[k_shape[0], k_shape[1], self.idx, k_shape[3]],
+        );
+        let v_out = ffi::slice(
+            &v_buffer,
+            &[0, 0, 0, 0],
+            &[v_shape[0], v_shape[1], self.idx, v_shape[3]],
+        );
+        self.keys = Some(k_buffer);
+        self.values = Some(v_buffer);
+        (k_out, v_out)
     }
 
     fn update_concat(
@@ -3492,13 +3785,11 @@ impl RotatingKVCache {
             return (new_keys, new_values);
         }
 
-        let current_seq_len = {
-            let shape = ffi::array_shape(self.keys.as_ref().unwrap());
-            shape[2]
-        };
+        let (base_k, base_v, current_seq_len) =
+            self.visible_fp16_prefix_for_concat();
 
-        let concat_k = concatenate(self.keys.as_ref().unwrap(), &new_keys, 2);
-        let concat_v = concatenate(self.values.as_ref().unwrap(), &new_values, 2);
+        let concat_k = concatenate(&base_k, &new_keys, 2);
+        let concat_v = concatenate(&base_v, &new_values, 2);
 
         let total_len = current_seq_len + new_seq_len;
         self.offset += new_seq_len;
@@ -3525,6 +3816,63 @@ impl RotatingKVCache {
             self.values = Some(ffi::contiguous(&concat_v, false));
             (concat_k, concat_v)
         }
+    }
+
+    /// Return the visible FP16 K/V prefix in chronological order for a
+    /// multi-token append.
+    ///
+    /// Used by: [`Self::update_concat`] after speculative decode rewinds.
+    /// `RotatingKVCache::trim` mirrors upstream and only rewinds
+    /// `offset`/`idx`; it intentionally leaves the backing buffer at its
+    /// previous capacity. A later multi-token verify append must therefore
+    /// concatenate onto the visible prefix (`visible_len()`), not onto stale
+    /// tail slots still present in the physical allocation.
+    fn visible_fp16_prefix_for_concat(&self) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>, i32) {
+        let keys = self
+            .keys
+            .as_ref()
+            .expect("visible_fp16_prefix_for_concat requires initialized keys");
+        let values = self
+            .values
+            .as_ref()
+            .expect("visible_fp16_prefix_for_concat requires initialized values");
+        let k_shape = ffi::array_shape(keys);
+        let v_shape = ffi::array_shape(values);
+        let physical_len = k_shape[2];
+        let visible_len = self.visible_len().min(physical_len).max(0);
+        let logical_start = self.logical_start().min(physical_len).max(0);
+
+        let slice_range = |arr: &MlxArray, shape: &[i32], start: i32, stop: i32| {
+            ffi::slice(
+                arr,
+                &[0, 0, start, 0],
+                &[shape[0], shape[1], stop, shape[3]],
+            )
+        };
+
+        if visible_len == 0 || logical_start == 0 {
+            return (
+                slice_range(keys, &k_shape, 0, visible_len),
+                slice_range(values, &v_shape, 0, visible_len),
+                visible_len,
+            );
+        }
+
+        let tail_len = (physical_len - logical_start).min(visible_len);
+        let k_tail = slice_range(keys, &k_shape, logical_start, logical_start + tail_len);
+        let v_tail = slice_range(values, &v_shape, logical_start, logical_start + tail_len);
+        if tail_len == visible_len {
+            return (k_tail, v_tail, visible_len);
+        }
+
+        let head_len = visible_len - tail_len;
+        let k_head = slice_range(keys, &k_shape, 0, head_len);
+        let v_head = slice_range(values, &v_shape, 0, head_len);
+        (
+            concatenate(&k_tail, &k_head, 2),
+            concatenate(&v_tail, &v_head, 2),
+            visible_len,
+        )
     }
 
     fn update_in_place(
@@ -4003,6 +4351,9 @@ impl RotatingKVCache {
 
     /// Visible length exposed to decode attention.
     pub fn visible_len(&self) -> i32 {
+        if self.buffer_size > 0 {
+            return self.idx.max(0);
+        }
         self.seq_len().min(self.offset).max(0)
     }
 
@@ -4012,6 +4363,9 @@ impl RotatingKVCache {
     /// wrapping, `idx` tracks the next write position, which is also the
     /// oldest logical token in the ring.
     pub fn logical_start(&self) -> i32 {
+        if self.buffer_size > 0 {
+            return 0;
+        }
         let visible_len = self.visible_len();
         if visible_len == 0 || self.offset <= visible_len {
             0
@@ -4049,7 +4403,11 @@ impl RotatingKVCache {
     ///
     /// Used by: Gemma 4 MTP `rollback_speculative_cache` (issue #625).
     pub fn trim(&mut self, n: i32) -> i32 {
-        let n = n.min(self.offset);
+        let n = if self.buffer_size > 0 {
+            n.min(self.idx).min(self.offset)
+        } else {
+            n.min(self.offset)
+        };
         if n <= 0 {
             return 0;
         }
@@ -5285,6 +5643,148 @@ mod tests {
         assert_eq!(cache.trim(5), 2);
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn rotating_cache_multi_token_append_after_trim_uses_visible_prefix() {
+        let mut cache = RotatingKVCache::new(16);
+        let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 1, 4, 1]);
+        let values = ffi::from_slice_f32(&[10.0, 20.0, 30.0, 40.0], &[1, 1, 4, 1]);
+        let _ = cache.update_and_fetch(keys, values);
+
+        assert_eq!(cache.offset, 4);
+        assert_eq!(cache.idx, 4);
+        assert_eq!(cache.seq_len(), 4);
+
+        // Speculative rollback rewinds the logical write point but leaves
+        // the backing allocation intact, matching upstream rotating-cache
+        // semantics.
+        assert_eq!(cache.trim(3), 3);
+        assert_eq!(cache.offset, 1);
+        assert_eq!(cache.idx, 1);
+        assert_eq!(cache.seq_len(), 4);
+
+        let new_keys = ffi::from_slice_f32(&[5.0, 6.0, 7.0, 8.0], &[1, 1, 4, 1]);
+        let new_values = ffi::from_slice_f32(&[50.0, 60.0, 70.0, 80.0], &[1, 1, 4, 1]);
+        let (visible_keys, visible_values) = cache.update_and_fetch(new_keys, new_values);
+
+        assert_eq!(cache.offset, 5);
+        assert_eq!(cache.idx, 5);
+        assert_eq!(ffi::array_shape(&visible_keys), vec![1, 1, 5, 1]);
+        assert_eq!(ffi::array_shape(&visible_values), vec![1, 1, 5, 1]);
+
+        let to_f32 = |arr: &MlxArray| {
+            ffi::eval(arr);
+            ffi::array_to_raw_bytes(arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(to_f32(&visible_keys), vec![1.0, 5.0, 6.0, 7.0, 8.0]);
+        assert_eq!(
+            to_f32(&visible_values),
+            vec![10.0, 50.0, 60.0, 70.0, 80.0]
+        );
+    }
+
+    #[test]
+    fn rotating_cache_speculative_buffer_preserves_temporal_prefix() {
+        let mut cache = RotatingKVCache::new(4);
+        cache
+            .enable_speculative_buffer(2)
+            .expect("fp16 rotating cache supports speculative buffering");
+
+        let token = |x: f32| ffi::from_slice_f32(&[x], &[1, 1, 1, 1]);
+        let mut visible = None;
+        for i in 1..=6 {
+            let (keys, _) = cache.update_and_fetch(token(i as f32), token((i * 10) as f32));
+            visible = Some(keys);
+        }
+
+        let to_f32 = |arr: &MlxArray| {
+            ffi::eval(arr);
+            ffi::array_to_raw_bytes(arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+
+        let visible = visible.expect("updates produced a visible prefix");
+        assert_eq!(cache.get_offset(), 6);
+        assert_eq!(cache.buffer_write_idx(), 6);
+        assert_eq!(ffi::array_shape(&visible), vec![1, 1, 6, 1]);
+        assert_eq!(to_f32(&visible), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // The first overflow past `max_size + buffer_size` compacts the
+        // prefix instead of ring-wrapping, so the returned state stays in
+        // chronological order and rollback can safely rewind from the tail.
+        let (visible, _) = cache.update_and_fetch(token(7.0), token(70.0));
+        assert_eq!(cache.get_offset(), 7);
+        assert_eq!(cache.buffer_write_idx(), 4);
+        assert_eq!(ffi::array_shape(&visible), vec![1, 1, 4, 1]);
+        assert_eq!(to_f32(&visible), vec![4.0, 5.0, 6.0, 7.0]);
+
+        assert_eq!(cache.trim(2), 2);
+        let new_keys = ffi::from_slice_f32(&[8.0, 9.0], &[1, 1, 2, 1]);
+        let new_values = ffi::from_slice_f32(&[80.0, 90.0], &[1, 1, 2, 1]);
+        let (visible, _) = cache.update_and_fetch(new_keys, new_values);
+        assert_eq!(cache.get_offset(), 7);
+        assert_eq!(cache.buffer_write_idx(), 4);
+        assert_eq!(to_f32(&visible), vec![4.0, 5.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn rotating_cache_speculative_buffer_conversion_keeps_last_window() {
+        let mut cache = RotatingKVCache::new(4);
+        let keys = ffi::from_slice_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 1, 6, 1]);
+        let values = ffi::from_slice_f32(&[10.0, 20.0, 30.0, 40.0, 50.0, 60.0], &[1, 1, 6, 1]);
+        let _ = cache.update_and_fetch(keys, values);
+
+        cache
+            .enable_speculative_buffer(2)
+            .expect("fp16 rotating cache supports speculative buffering");
+
+        let token = |x: f32| ffi::from_slice_f32(&[x], &[1, 1, 1, 1]);
+        let (visible, _) = cache.update_and_fetch(token(7.0), token(70.0));
+        let to_f32 = |arr: &MlxArray| {
+            ffi::eval(arr);
+            ffi::array_to_raw_bytes(arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(cache.get_offset(), 7);
+        assert_eq!(cache.buffer_write_idx(), 5);
+        assert_eq!(ffi::array_shape(&visible), vec![1, 1, 5, 1]);
+        assert_eq!(to_f32(&visible), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn rotating_cache_speculative_buffer_conversion_reorders_wrapped_ring() {
+        let mut cache = RotatingKVCache::new(4);
+        let token = |x: f32| ffi::from_slice_f32(&[x], &[1, 1, 1, 1]);
+        for i in 1..=6 {
+            cache.update_and_fetch(token(i as f32), token((i * 10) as f32));
+        }
+        assert_eq!(cache.get_offset(), 6);
+        assert_eq!(cache.buffer_write_idx(), 2);
+
+        cache
+            .enable_speculative_buffer(2)
+            .expect("fp16 rotating cache supports speculative buffering");
+        let (visible, _) = cache.update_and_fetch(token(7.0), token(70.0));
+        let to_f32 = |arr: &MlxArray| {
+            ffi::eval(arr);
+            ffi::array_to_raw_bytes(arr)
+                .chunks_exact(4)
+                .map(|c| f32::from_ne_bytes([c[0], c[1], c[2], c[3]]))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(cache.get_offset(), 7);
+        assert_eq!(cache.buffer_write_idx(), 5);
+        assert_eq!(to_f32(&visible), vec![3.0, 4.0, 5.0, 6.0, 7.0]);
     }
 
     // Issue #603: `trim_front` drops the oldest `n` tokens from a KVCache's

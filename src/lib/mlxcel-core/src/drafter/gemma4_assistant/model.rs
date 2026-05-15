@@ -36,9 +36,9 @@
 //!    autoregressive steps, returning `block_size - 1` proposal tokens.
 
 use crate::drafter::gemma4_assistant::config::{DrafterTextConfig, Gemma4AssistantConfig};
-use crate::drafter::gemma4_assistant::layer::DraftDecoderLayer;
+use crate::drafter::gemma4_assistant::layer::{DraftDecoderLayer, RopeOffset};
 use crate::drafter::masked_embedder::MaskedEmbedder;
-use crate::drafter::masks::{make_drafter_masks, BatchScalar, LayerType};
+use crate::drafter::masks::{make_drafter_masks_with_valid_len, BatchScalar, LayerType};
 use crate::drafter::{Drafter, DrafterError, DrafterKind, SharedKv};
 use crate::ffi::{self, MlxArray};
 use crate::generate::{LanguageModel, SamplingConfig};
@@ -191,10 +191,28 @@ impl OwnedSharedKv {
         shared: &SharedKv<'_>,
         left_padding: usize,
     ) -> Result<Self, DrafterError> {
-        use crate::drafter::masks::{
-            normalize_batched_shared_kv_states, BatchScalar, LayerType,
-        };
-        use std::collections::HashMap;
+        let kv_len = shared_kv_len(shared)?;
+        let kv_valid_len = kv_len.saturating_sub(left_padding as i32);
+        let valid_scalar = BatchScalar::Scalar(kv_valid_len);
+        let left_scalar = BatchScalar::Scalar(left_padding as i32);
+        Self::from_shared_kv_normalized_with_metadata(
+            shared,
+            &valid_scalar,
+            Some(&left_scalar),
+        )
+    }
+
+    /// Batched-MTP constructor that accepts explicit per-row valid lengths
+    /// and left-padding extents. This is the reference-parity path used
+    /// after rows diverge: each row's prefix is normalized independently
+    /// before the drafter builds masks and cross-attends into the shared
+    /// K/V slabs.
+    fn from_shared_kv_normalized_with_metadata(
+        shared: &SharedKv<'_>,
+        kv_valid_len: &BatchScalar<'_>,
+        left_padding: Option<&BatchScalar<'_>>,
+    ) -> Result<Self, DrafterError> {
+        use crate::drafter::masks::normalize_batched_shared_kv_states;
 
         // Build the `LayerType -> (K, V)` map the masks helper expects.
         let (k_full, v_full, k_swa, v_swa) = match shared.tensors.len() {
@@ -213,30 +231,13 @@ impl OwnedSharedKv {
             }
         };
 
-        // Each K/V tensor is shape [B, n_kv_heads, kv_len, head_dim]. The
-        // valid prefix length per row is `kv_len - left_padding` (defensive
-        // clip to non-negative). Pass scalar broadcasts; the masks helper
-        // re-broadcasts to per-row internally.
-        let kv_len = {
-            let shape = ffi::array_shape(k_full);
-            if shape.len() == 4 {
-                shape[2]
-            } else {
-                0
-            }
-        };
-        let kv_valid_len = kv_len.saturating_sub(left_padding as i32);
-
         let mut map: HashMap<LayerType, (&MlxArray, &MlxArray)> = HashMap::new();
         map.insert(LayerType::FullAttention, (k_full, v_full));
         if let (Some(ks), Some(vs)) = (k_swa, v_swa) {
             map.insert(LayerType::SlidingWindowAttention, (ks, vs));
         }
 
-        let valid_scalar = BatchScalar::Scalar(kv_valid_len);
-        let left_scalar = BatchScalar::Scalar(left_padding as i32);
-        let normalized =
-            normalize_batched_shared_kv_states(&map, &valid_scalar, Some(&left_scalar));
+        let normalized = normalize_batched_shared_kv_states(&map, kv_valid_len, left_padding);
 
         let take_pair = |layer: LayerType| -> Option<(UniquePtr<MlxArray>, UniquePtr<MlxArray>)> {
             normalized.get(&layer).map(|(k, v)| (ffi::copy(k), ffi::copy(v)))
@@ -293,6 +294,20 @@ impl OwnedSharedKv {
         }
         map
     }
+}
+
+fn shared_kv_len(shared: &SharedKv<'_>) -> Result<i32, DrafterError> {
+    let first = match shared.tensors.len() {
+        2 | 4 => shared.tensors[0],
+        n => {
+            return Err(DrafterError::SharedKvShape {
+                got: n,
+                expected: &[2, 4],
+            });
+        }
+    };
+    let shape = ffi::array_shape(first);
+    Ok(if shape.len() == 4 { shape[2] } else { 0 })
 }
 
 // ---------------------------------------------------------------------------
@@ -356,9 +371,26 @@ pub struct Gemma4AssistantDraftModel {
     shared_kv: Option<OwnedSharedKv>,
     /// `kv_offset` from `set_shared_kv()` — kept for diagnostics.
     kv_offset: i32,
+    /// Valid target-cache length associated with the current shared K/V.
+    ///
+    /// Latest upstream Gemma 4 MTP distinguishes this from `position`:
+    /// `position` is the frozen query/RoPE anchor (`kv_valid_len - 1`),
+    /// while masks must still treat all keys before `kv_valid_len` as
+    /// valid. Keeping both values prevents the drafter from accidentally
+    /// masking the final verified key after each rebind.
+    kv_valid_len: i32,
     /// Bonus-token absolute position. Used as the RoPE offset for every
     /// step inside a draft block (the "frozen anchor" semantics).
     position: i32,
+    /// Batched MTP per-row bonus-token positions. When present, this is
+    /// used for RoPE anchors; [`position`] remains the max for diagnostics
+    /// and scalar fallback paths.
+    position_per_row: Option<Vec<i32>>,
+    /// Device-side copy of [`position_per_row`] used by the mask helpers.
+    position_per_row_array: Option<UniquePtr<MlxArray>>,
+    /// Device-side per-row valid target-cache lengths used by the mask
+    /// helpers. When absent, [`kv_valid_len`] is broadcast to every row.
+    kv_valid_len_per_row_array: Option<UniquePtr<MlxArray>>,
 }
 
 // Manual `Debug` impl: `Linear`, `Embedding`, and `MlxArray` are FFI-opaque
@@ -378,7 +410,12 @@ impl std::fmt::Debug for Gemma4AssistantDraftModel {
             .field("bound", &self.lm_head.is_some())
             .field("shared_kv_set", &self.shared_kv.is_some())
             .field("kv_offset", &self.kv_offset)
+            .field("kv_valid_len", &self.kv_valid_len)
             .field("position", &self.position)
+            .field(
+                "position_per_row_len",
+                &self.position_per_row.as_ref().map(Vec::len),
+            )
             .finish()
     }
 }
@@ -470,7 +507,11 @@ impl Gemma4AssistantDraftModel {
             target_embed_scale: 1.0,
             shared_kv: None,
             kv_offset: 0,
+            kv_valid_len: 0,
             position: 0,
+            position_per_row: None,
+            position_per_row_array: None,
+            kv_valid_len_per_row_array: None,
         })
     }
 
@@ -685,21 +726,41 @@ impl Gemma4AssistantDraftModel {
         // fast path (returns `None` masks when query_offset >= kv_len and
         // kv_len <= sliding_window) and the batched path.
         //
-        // `query_offset == self.position` mirrors the upstream Python's
-        // `kv_valid_len = query_offset` convention used inside
-        // `make_drafter_masks`: the drafter queries from position `self.position`
-        // (the bonus-token absolute position), and every key before that
-        // position is valid.
+        // Upstream Gemma 4 MTP now separates the drafter's query/RoPE
+        // anchor from the K/V valid length:
+        //
+        //   position     = max(kv_valid_len - 1, 0)
+        //   kv_valid_len = target cache length
+        //
+        // The drafter queries from `position` (the last verified token) but
+        // masks must still expose every key before `kv_valid_len`.
         let shared_kv_map = shared.as_layer_type_map();
-        let query_offset = BatchScalar::Scalar(self.position);
+        let query_offset = self
+            .position_per_row_array
+            .as_ref()
+            .and_then(|arr| arr.as_ref())
+            .map(BatchScalar::PerRow)
+            .unwrap_or(BatchScalar::Scalar(self.position));
+        let kv_valid_len = self
+            .kv_valid_len_per_row_array
+            .as_ref()
+            .and_then(|arr| arr.as_ref())
+            .map(BatchScalar::PerRow)
+            .unwrap_or(BatchScalar::Scalar(self.kv_valid_len));
+        let rope_offset = self
+            .position_per_row
+            .as_deref()
+            .map(RopeOffset::PerRow)
+            .unwrap_or(RopeOffset::Scalar(self.position));
         let sliding_window = self.config.text_config().sliding_window as i32;
         let dtype = ffi::array_dtype(inputs_embeds);
-        let masks = make_drafter_masks(
+        let masks = make_drafter_masks_with_valid_len(
             &shared_kv_map,
             /*query_len=*/ 1,
             &query_offset,
             sliding_window,
             dtype,
+            Some(&kv_valid_len),
         );
 
         // Run each drafter layer with shared K/V and the frozen RoPE offset.
@@ -711,7 +772,7 @@ impl Gemma4AssistantDraftModel {
             let mask_opt = masks
                 .get(&layer_type_enum)
                 .and_then(|m| m.as_deref());
-            h = layer.forward(&h, mask_opt, k, v, self.position);
+            h = layer.forward(&h, mask_opt, k, v, rope_offset);
         }
 
         // Final RMSNorm + post_projection.
@@ -795,7 +856,81 @@ impl Drafter for Gemma4AssistantDraftModel {
             self.shared_kv = Some(OwnedSharedKv::from_shared_kv(&shared_kv)?);
         }
         self.kv_offset = kv_offset as i32;
+        self.kv_valid_len = kv_offset as i32;
         self.position = position as i32;
+        self.position_per_row = None;
+        self.position_per_row_array = None;
+        self.kv_valid_len_per_row_array = None;
+        Ok(())
+    }
+
+    fn set_shared_kv_batched(
+        &mut self,
+        shared_kv: SharedKv<'_>,
+        kv_offset_per_row: &[usize],
+        position_per_row: &[usize],
+        kv_valid_len_per_row: &[usize],
+        left_padding_per_row: &[usize],
+    ) -> Result<(), DrafterError> {
+        let batch = kv_offset_per_row.len();
+        if position_per_row.len() != batch
+            || kv_valid_len_per_row.len() != batch
+            || left_padding_per_row.len() != batch
+        {
+            return Err(DrafterError::DraftFailed {
+                reason: format!(
+                    "Gemma 4 assistant batched set_shared_kv metadata length mismatch: \
+                     kv_offset={}, position={}, kv_valid_len={}, left_padding={}",
+                    kv_offset_per_row.len(),
+                    position_per_row.len(),
+                    kv_valid_len_per_row.len(),
+                    left_padding_per_row.len()
+                ),
+            });
+        }
+        if batch == 0 {
+            return Err(DrafterError::DraftFailed {
+                reason: "Gemma 4 assistant batched set_shared_kv requires B >= 1".to_string(),
+            });
+        }
+
+        let to_i32 = |values: &[usize], label: &str| -> Result<Vec<i32>, DrafterError> {
+            values
+                .iter()
+                .copied()
+                .map(|v| {
+                    i32::try_from(v).map_err(|_| DrafterError::DraftFailed {
+                        reason: format!(
+                            "Gemma 4 assistant batched set_shared_kv {label} value {v} \
+                             exceeds i32::MAX"
+                        ),
+                    })
+                })
+                .collect()
+        };
+
+        let kv_offsets_i32 = to_i32(kv_offset_per_row, "kv_offset")?;
+        let positions_i32 = to_i32(position_per_row, "position")?;
+        let valid_i32 = to_i32(kv_valid_len_per_row, "kv_valid_len")?;
+        let left_i32 = to_i32(left_padding_per_row, "left_padding")?;
+
+        let position_arr = ffi::from_slice_i32(&positions_i32, &[batch as i32]);
+        let valid_arr = ffi::from_slice_i32(&valid_i32, &[batch as i32]);
+        let left_arr = ffi::from_slice_i32(&left_i32, &[batch as i32]);
+        let valid = BatchScalar::PerRow(valid_arr.as_ref().expect("non-null valid metadata"));
+        let left = BatchScalar::PerRow(left_arr.as_ref().expect("non-null left metadata"));
+        self.shared_kv = Some(OwnedSharedKv::from_shared_kv_normalized_with_metadata(
+            &shared_kv,
+            &valid,
+            Some(&left),
+        )?);
+
+        self.kv_offset = kv_offsets_i32.iter().copied().max().unwrap_or(0);
+        self.kv_valid_len = valid_i32.iter().copied().max().unwrap_or(0);
+        self.position = positions_i32.iter().copied().max().unwrap_or(0);
+        self.position_per_row = Some(positions_i32);
+        self.position_per_row_array = Some(position_arr);
+        self.kv_valid_len_per_row_array = Some(valid_arr);
         Ok(())
     }
 
@@ -805,6 +940,10 @@ impl Drafter for Gemma4AssistantDraftModel {
         // default trait impl already returns an empty Vec, so the override
         // here is only to be explicit about intent.
         Vec::new()
+    }
+
+    fn configured_block_size(&self) -> Option<usize> {
+        Some(self.config.block_size)
     }
 
     fn draft_block_batched(

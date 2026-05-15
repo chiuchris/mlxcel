@@ -416,6 +416,37 @@ pub(crate) fn can_join_batched_burst_window(seq: &SequenceInfo) -> bool {
     true
 }
 
+/// Whether to force the Gemma 4 MTP B=1 burst path.
+///
+/// Issue #693 real-model measurements showed the assistant drafter is not
+/// profitable for single-request Gemma 4 31B serving: the upstream reference
+/// speedups are reported for B>1 windows, while the B=1 path spends an extra
+/// drafter forward per token at very low acceptance. Production therefore
+/// routes singleton MTP requests through classic decode by default and keeps
+/// this override for parity/debug investigations.
+pub(crate) fn mtp_b1_burst_enabled() -> bool {
+    std::env::var("MLXCEL_ENABLE_MTP_B1")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Whether to force the Gemma 4 MTP B>1 batched burst path.
+///
+/// Reference Gemma 4 MTP gets its advertised speedups from batched verify
+/// windows. The Rust path now preserves per-row cache positions / RoPE
+/// anchors after mixed accepts, but real 31B validation still shows the
+/// forced B>1 MTP burst is not consistently faster than classic batched
+/// decode. Keep the path available behind an explicit operator/debug flag
+/// while production falls back to the known-profitable classic scheduler
+/// path.
+pub(crate) fn mtp_batched_burst_enabled() -> bool {
+    std::env::var("MLXCEL_ENABLE_MTP_BATCH")
+        .ok()
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 /// Successful burst outcome returned to the scheduler.
 ///
 /// The scheduler uses `tokens_generated` to update the per-request
@@ -801,7 +832,8 @@ fn run_mtp_burst(
     let logprobs_config = seq.logprobs_config.clone();
     let (output, stats) = match ctx.model {
         LoadedModel::Gemma4(wrapper) => {
-            let adapter = Gemma4MtpTargetAdapter::new(wrapper, Some(seq.seq_id));
+            let adapter =
+                Gemma4MtpTargetAdapter::new_with_block_size(wrapper, Some(seq.seq_id), block_size);
             drive_mtp_generator(
                 adapter,
                 owned_drafter,
@@ -815,10 +847,12 @@ fn run_mtp_burst(
             )
         }
         LoadedModel::Gemma4VLM(vlm) => {
-            let adapter = crate::models::gemma4_mtp_target::Gemma4VLMtpTargetAdapter::new(
-                vlm,
-                Some(seq.seq_id),
-            );
+            let adapter =
+                crate::models::gemma4_mtp_target::Gemma4VLMtpTargetAdapter::new_with_block_size(
+                    vlm,
+                    Some(seq.seq_id),
+                    block_size,
+                );
             drive_mtp_generator(
                 adapter,
                 owned_drafter,
@@ -1823,7 +1857,8 @@ fn run_mtp_burst_batched(
 
     let (tokens_per_row, recovered_drafter) = match ctx.model {
         LoadedModel::Gemma4(wrapper) => {
-            let adapter = Gemma4MtpBatchedTargetAdapter::new(wrapper, batch_size);
+            let adapter =
+                Gemma4MtpBatchedTargetAdapter::new_with_block_size(wrapper, batch_size, block_size);
             drive_mtp_batched_generator(
                 adapter,
                 owned_drafter,
@@ -1834,7 +1869,8 @@ fn run_mtp_burst_batched(
             )?
         }
         LoadedModel::Gemma4VLM(vlm) => {
-            let adapter = Gemma4VLMtpBatchedTargetAdapter::new(vlm, batch_size);
+            let adapter =
+                Gemma4VLMtpBatchedTargetAdapter::new_with_block_size(vlm, batch_size, block_size);
             drive_mtp_batched_generator(
                 adapter,
                 owned_drafter,

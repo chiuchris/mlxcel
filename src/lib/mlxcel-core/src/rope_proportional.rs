@@ -201,6 +201,83 @@ pub fn apply_proportional_rope(
     concatenate(&head_new, &tail, last_axis)
 }
 
+/// Apply proportional RoPE with one independent offset per batch row.
+///
+/// This mirrors [`crate::fast_rope_batched`] for Gemma 4 full-attention
+/// layers that use the proportional-frequency variant. A uniform-offset
+/// batch collapses back to the scalar fast path; mixed offsets slice the
+/// leading batch dimension, apply scalar proportional RoPE per row, and
+/// concatenate the rows again.
+///
+/// Used by: Gemma 4 MTP assistant batched drafter when rows accept
+/// different numbers of speculative tokens and therefore need per-row
+/// frozen RoPE anchors.
+pub fn apply_proportional_rope_batched(
+    x: &MlxArray,
+    head_dim: i32,
+    partial_rotary_factor: f32,
+    offsets: &[i32],
+    freqs: Option<&MlxArray>,
+) -> UniquePtr<MlxArray> {
+    let shape = array_shape(x);
+    let batch = shape.first().copied().unwrap_or(0).max(0) as usize;
+    assert_eq!(
+        batch,
+        offsets.len(),
+        "apply_proportional_rope_batched expected {batch} offsets, got {}",
+        offsets.len()
+    );
+
+    if batch == 0 {
+        return copy(x);
+    }
+    if batch == 1 {
+        return apply_proportional_rope(
+            x,
+            head_dim,
+            partial_rotary_factor,
+            offsets[0],
+            freqs,
+        );
+    }
+
+    let first_offset = offsets[0];
+    if offsets[1..].iter().all(|&offset| offset == first_offset) {
+        return apply_proportional_rope(
+            x,
+            head_dim,
+            partial_rotary_factor,
+            first_offset,
+            freqs,
+        );
+    }
+
+    let rank = shape.len();
+    let mut begin = vec![0; rank];
+    let mut end = vec![i32::MAX; rank];
+    end[0] = 1;
+
+    let first = slice(x, &begin, &end);
+    let mut result =
+        apply_proportional_rope(&first, head_dim, partial_rotary_factor, offsets[0], freqs);
+
+    for (batch_idx, &offset) in offsets.iter().enumerate().skip(1) {
+        begin[0] = batch_idx as i32;
+        end[0] = batch_idx as i32 + 1;
+        let chunk = slice(x, &begin, &end);
+        let chunk = apply_proportional_rope(
+            &chunk,
+            head_dim,
+            partial_rotary_factor,
+            offset,
+            freqs,
+        );
+        result = concatenate(&result, &chunk, 0);
+    }
+
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

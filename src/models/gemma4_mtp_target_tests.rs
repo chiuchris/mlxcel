@@ -37,6 +37,15 @@
 use super::*;
 
 #[test]
+fn mtp_rotating_buffer_size_matches_upstream_clamp() {
+    assert_eq!(mtp_rotating_buffer_size(1), 32);
+    assert_eq!(mtp_rotating_buffer_size(4), 32);
+    assert_eq!(mtp_rotating_buffer_size(8), 64);
+    assert_eq!(mtp_rotating_buffer_size(16), 128);
+    assert_eq!(mtp_rotating_buffer_size(64), 128);
+}
+
+#[test]
 fn slice_shared_kv_with_zero_rejected_is_identity() {
     // Build a synthetic 4-tensor shared K/V vector to verify the
     // fast-path. We use the FFI `from_slice_f32` to build small tensors;

@@ -42,9 +42,22 @@
 use crate::drafter::gemma4_assistant::config::DrafterTextConfig;
 use crate::ffi::{self, MlxArray};
 use crate::layers::{RMSNorm, UnifiedLinear};
-use crate::rope_proportional::{apply_proportional_rope, compute_proportional_rope_freqs};
+use crate::rope_proportional::{
+    apply_proportional_rope, apply_proportional_rope_batched, compute_proportional_rope_freqs,
+};
 use crate::weights::WeightMap;
 use cxx::UniquePtr;
+
+/// Frozen RoPE anchor for a drafter block.
+///
+/// B=1 uses a scalar anchor. Batched MTP uses per-row anchors after rows
+/// accept different numbers of speculative tokens; the attention layer
+/// applies the same anchor to every autoregressive step within the block.
+#[derive(Clone, Copy)]
+pub(crate) enum RopeOffset<'a> {
+    Scalar(i32),
+    PerRow(&'a [i32]),
+}
 
 /// MLP block (gate_proj + up_proj + down_proj) for the drafter.
 ///
@@ -199,7 +212,7 @@ impl DrafterAttention {
         mask: Option<&MlxArray>,
         shared_keys: &MlxArray,
         shared_values: &MlxArray,
-        offset: i32,
+        offset: RopeOffset<'_>,
     ) -> UniquePtr<MlxArray> {
         let shape = ffi::array_shape(x);
         let b = shape[0];
@@ -209,23 +222,32 @@ impl DrafterAttention {
         let queries = ffi::reshape(&q_proj_out, &[b, l, self.n_heads, self.head_dim]);
         let queries = self.q_norm.forward(&queries);
         let queries = ffi::transpose_axes(&queries, &[0, 2, 1, 3]);
-        let queries = if self.proportional_rope_freqs.is_some() {
-            apply_proportional_rope(
+        let queries = match (self.proportional_rope_freqs.as_deref(), offset) {
+            (Some(freqs), RopeOffset::Scalar(offset)) => apply_proportional_rope(
                 &queries,
                 self.head_dim,
                 self.proportional_partial_rotary_factor,
                 offset,
-                self.proportional_rope_freqs.as_deref(),
-            )
-        } else {
-            ffi::fast_rope(
+                Some(freqs),
+            ),
+            (Some(freqs), RopeOffset::PerRow(offsets)) => apply_proportional_rope_batched(
+                &queries,
+                self.head_dim,
+                self.proportional_partial_rotary_factor,
+                offsets,
+                Some(freqs),
+            ),
+            (None, RopeOffset::Scalar(offset)) => {
+                ffi::fast_rope(&queries, self.rope_dims, false, self.rope_theta, 1.0, offset)
+            }
+            (None, RopeOffset::PerRow(offsets)) => crate::fast_rope_batched(
                 &queries,
                 self.rope_dims,
                 false,
                 self.rope_theta,
                 1.0,
-                offset,
-            )
+                offsets,
+            ),
         };
 
         let attn_out = crate::layers::attention(
@@ -265,6 +287,14 @@ pub(crate) struct DraftDecoderLayer {
     post_attention_layernorm: RMSNorm,
     pre_feedforward_layernorm: RMSNorm,
     post_feedforward_layernorm: RMSNorm,
+    /// Learned per-layer output scalar from Gemma 4 assistant checkpoints.
+    ///
+    /// Used by: Gemma 4 MTP assistant drafter. Upstream reuses the target
+    /// `DecoderLayer` implementation, whose final step multiplies every layer
+    /// output by `layer_scalar`. The 31B assistant checkpoint ships non-trivial
+    /// values (well below 1.0), so omitting this multiply makes the drafter
+    /// distribution diverge and collapses MTP acceptance.
+    layer_scalar: Option<UniquePtr<MlxArray>>,
     layer_type: String,
 }
 
@@ -308,6 +338,9 @@ impl DraftDecoderLayer {
                 )?,
                 config.rms_norm_eps,
             ),
+            layer_scalar: weights
+                .get(&format!("{prefix}.layer_scalar"))
+                .map(|w| ffi::copy(w)),
             layer_type: config.layer_type(layer_idx).to_string(),
         })
     }
@@ -324,7 +357,7 @@ impl DraftDecoderLayer {
         mask: Option<&MlxArray>,
         shared_keys: &MlxArray,
         shared_values: &MlxArray,
-        offset: i32,
+        offset: RopeOffset<'_>,
     ) -> UniquePtr<MlxArray> {
         let h_attn = self.input_layernorm.forward(x);
         let h_attn = self
@@ -336,7 +369,12 @@ impl DraftDecoderLayer {
         let ffn_in = self.pre_feedforward_layernorm.forward(&after_attn);
         let ffn_out = self.mlp.forward(&ffn_in);
         let ffn_out = self.post_feedforward_layernorm.forward(&ffn_out);
-        ffi::add(&after_attn, &ffn_out)
+        let h = ffi::add(&after_attn, &ffn_out);
+        if let Some(layer_scalar) = &self.layer_scalar {
+            ffi::multiply(&h, layer_scalar)
+        } else {
+            h
+        }
     }
 
     pub(crate) fn layer_type(&self) -> &str {

@@ -55,7 +55,60 @@ use mlxcel_core::speculative::mtp::target::{
 };
 use mlxcel_core::{MlxArray, UniquePtr};
 
-use crate::models::gemma4::{Cache, Gemma4SpeculativeSinks, Gemma4Wrapper};
+use crate::models::gemma4::{Cache, Gemma4SpeculativeSinks, Gemma4Wrapper, first_cache_offset};
+
+/// Materialize an integer argmax tensor into host token ids with one
+/// contiguous copy.
+///
+/// Used by: Gemma 4 MTP B=1/B>1 verify argmax extraction. Mirrors the
+/// DFlash bulk materializer but stays local to the Gemma 4 adapter to
+/// avoid exporting a speculative-internal helper as public API.
+fn materialize_argmax_i32_vec(argmax: &MlxArray, expected_len: usize) -> Vec<i32> {
+    let itemsize = mlxcel_core::array_itemsize(argmax);
+    let bytes = mlxcel_core::array_to_raw_bytes(argmax);
+    match itemsize {
+        4 => bytes
+            .chunks_exact(4)
+            .take(expected_len)
+            .map(|chunk| i32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
+            .collect(),
+        8 => bytes
+            .chunks_exact(8)
+            .take(expected_len)
+            .map(|chunk| {
+                i64::from_ne_bytes([
+                    chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+                ]) as i32
+            })
+            .collect(),
+        _ => {
+            let flat = mlxcel_core::reshape(argmax, &[expected_len as i32]);
+            let mut out = Vec::with_capacity(expected_len);
+            for i in 0..expected_len {
+                let cell = mlxcel_core::slice(&flat, &[i as i32], &[(i + 1) as i32]);
+                let scalar = mlxcel_core::reshape(&cell, &[]);
+                out.push(mlxcel_core::item_i32(&scalar));
+            }
+            out
+        }
+    }
+}
+
+/// Latest upstream Gemma 4 MTP anchors the drafter's frozen query/RoPE
+/// position to the last valid target-cache token, while passing the full
+/// valid cache length separately for masks.
+fn mtp_draft_position(kv_valid_len: usize) -> usize {
+    kv_valid_len.saturating_sub(1)
+}
+
+/// Upstream mlx-vlm buffers Gemma 4 MTP rotating target caches by
+/// `max(32, min(128, max(configured, requested) * 8))` tokens. The Rust
+/// adapter receives the effective requested block size from the server-side
+/// dispatch; the 32-token floor covers the current configured K=4 assistants.
+pub(crate) fn mtp_rotating_buffer_size(requested_block_size: usize) -> i32 {
+    let requested = requested_block_size.max(1);
+    (requested * 8).clamp(32, 128) as i32
+}
 
 /// MTP target adapter binding a [`Gemma4Wrapper`] to a specific
 /// per-sequence cache slot.
@@ -75,6 +128,8 @@ pub struct Gemma4MtpTargetAdapter<'a> {
     /// internal fallback slot (used by the CLI / single-row tests). The
     /// server scheduler always passes `Some(seq_id)`.
     seq_id: Option<SequenceId>,
+    /// Buffered rotating-cache slack for MTP verify append + rollback.
+    rotating_buffer_size: i32,
 }
 
 impl<'a> Gemma4MtpTargetAdapter<'a> {
@@ -85,7 +140,22 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
     /// the adapter to
     /// [`mlxcel_core::speculative::mtp::MtpGenerator::new`].
     pub fn new(wrapper: &'a Gemma4Wrapper, seq_id: Option<SequenceId>) -> Self {
-        Self { wrapper, seq_id }
+        Self::new_with_block_size(wrapper, seq_id, 4)
+    }
+
+    /// Construct an adapter with the effective MTP block size requested by
+    /// the dispatch path. Used to size the upstream-style rotating-cache
+    /// rollback buffer.
+    pub fn new_with_block_size(
+        wrapper: &'a Gemma4Wrapper,
+        seq_id: Option<SequenceId>,
+        block_size: usize,
+    ) -> Self {
+        Self {
+            wrapper,
+            seq_id,
+            rotating_buffer_size: mtp_rotating_buffer_size(block_size),
+        }
     }
 
     /// Slice a `[B, T, H]` hidden tensor down to one position,
@@ -113,6 +183,49 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
         debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, H]");
         let last = shape[1].saturating_sub(1) as usize;
         Self::hidden_at_position(hidden_full, last)
+    }
+
+    /// Slice one hidden position and apply the Gemma 4 final norm before
+    /// handing it to the assistant drafter.
+    ///
+    /// Mirrors upstream `speculative_draft_hidden()`; the hidden captured by
+    /// `Gemma4SpeculativeSinks` is pre-final-norm, while the MTP assistant
+    /// consumes the normalized target hidden stream.
+    fn draft_hidden_at_position(
+        &self,
+        hidden_full: &MlxArray,
+        position: usize,
+    ) -> UniquePtr<MlxArray> {
+        let hidden = Self::hidden_at_position(hidden_full, position);
+        self.wrapper
+            .speculative_draft_hidden(hidden.as_ref().unwrap())
+    }
+
+    /// Final-position variant of [`Self::draft_hidden_at_position`].
+    fn last_position_draft_hidden(&self, hidden_full: &MlxArray) -> UniquePtr<MlxArray> {
+        let hidden = Self::last_position_hidden(hidden_full);
+        self.wrapper
+            .speculative_draft_hidden(hidden.as_ref().unwrap())
+    }
+
+    /// Greedy target-token extraction from pre-norm hidden states without a
+    /// Rust-side per-position FFI loop.
+    ///
+    /// This keeps the upstream-style `skip_final_norm=True` verify path but
+    /// projects the whole `[B=1, K, H]` hidden block through
+    /// `speculative_logits_from_hidden()` in one MLX graph, then materializes
+    /// the `[K]` argmax tensor with one host copy. It deliberately does not
+    /// early-stop on the first mismatch: for the small Gemma 4 MTP block sizes
+    /// we use today, avoiding `K` separate cxx/MLX calls is more important
+    /// than skipping the tail projection on low-accept rounds.
+    fn argmax_from_hidden_positions(&self, hidden_full: &MlxArray) -> Vec<i32> {
+        let shape = mlxcel_core::array_shape(hidden_full);
+        debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, H]");
+        let expected_len = shape[1].max(0) as usize;
+        let logits = self.wrapper.speculative_logits_from_hidden(hidden_full);
+        let argmax = mlxcel_core::argmax_last_axis(logits.as_ref().unwrap());
+        mlxcel_core::eval(&argmax);
+        materialize_argmax_i32_vec(&argmax, expected_len)
     }
 
     /// Slice the captured shared K/V tensors along the seq-len axis by
@@ -193,15 +306,10 @@ impl<'a> Gemma4MtpTargetAdapter<'a> {
         let argmax = mlxcel_core::argmax_last_axis(logits);
         mlxcel_core::eval(&argmax);
 
-        // Materialize per-position scalars. The buffer is now tiny
-        // (block_size i32 cells), so the per-cell extraction is cheap.
-        let mut out: Vec<i32> = Vec::with_capacity(block_size as usize);
-        for s in 0..block_size {
-            let cell = mlxcel_core::slice(&argmax, &[0, s], &[1, s + 1]);
-            let scalar = mlxcel_core::reshape(&cell, &[]);
-            out.push(mlxcel_core::item_i32(&scalar));
-        }
-        out
+        // Materialize all positions with one host copy. Re-entering MLX
+        // once per scalar made the real-model MTP path sync on every
+        // verify position, which dominated the small K=4 verify loop.
+        materialize_argmax_i32_vec(&argmax, block_size as usize)
     }
 
     /// Compute per-position [`mlxcel_core::sampling::TokenLogprobData`]
@@ -283,6 +391,8 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             None,
             Some(&mut sinks),
         );
+        self.wrapper
+            .enable_mtp_rotating_cache_buffer(self.seq_id, self.rotating_buffer_size);
 
         // Sample the first bonus from the last-position logits.
         // `token_history` carries the history-dependent-penalty context
@@ -313,7 +423,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             .into_iter()
             .next_back()
             .expect("hidden sink must carry at least one entry after a forward pass");
-        let next_hidden = Self::last_position_hidden(hidden_full.as_ref().unwrap());
+        let next_hidden = self.last_position_draft_hidden(hidden_full.as_ref().unwrap());
 
         // Materialize the shared K/V vector in the canonical
         // `[k_full, v_full, k_swa, v_swa]` order. The wrapper's
@@ -334,9 +444,11 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // After prefill the cache holds `prompt_tokens.len()` entries;
         // the bonus token is NOT yet in the cache (it will be the first
         // slot of the first round's verify input). `kv_offset` therefore
-        // equals `prompt_tokens.len()`.
+        // equals `prompt_tokens.len()`, while the drafter's RoPE/query
+        // anchor is the last valid cache token (`kv_offset - 1`) per the
+        // latest upstream reference.
         let kv_offset = prompt_tokens.len();
-        let bonus_position = kv_offset;
+        let bonus_position = mtp_draft_position(kv_offset);
 
         let seed = MtpVerifyOutput {
             next_hidden,
@@ -367,21 +479,51 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
     fn verify_forward(
         &self,
         verify_input: &[i32],
-        _sampler: &SamplingConfig,
+        sampler: &SamplingConfig,
         logprobs_config: &mlxcel_core::sampling::LogprobsConfig,
     ) -> VerifyForwardOutput {
         // Sink-aware forward over `[bonus, draft_0, …, draft_{K-2}]`.
         let verify_arr = mlxcel_core::from_slice_i32(verify_input, &[1, verify_input.len() as i32]);
         let mut sinks = Gemma4SpeculativeSinks::with_hidden_and_shared_kv();
-        let logits = self.wrapper.forward_with_speculative_sinks(
-            &verify_arr,
-            None,
-            None,
-            None,
-            self.seq_id,
-            None,
-            Some(&mut sinks),
-        );
+        // Greedy/no-logprobs can use the latest upstream deferred path: run
+        // the transformer once with `skip_final_norm=True`, capture pre-norm
+        // hidden/shared K/V, then project hidden positions to logits only as
+        // needed. Keep the full-logits path for non-greedy or logprob
+        // requests so existing sampler/logprob semantics stay unchanged.
+        // The upstream Python reference uses deferred greedy hidden→logits
+        // projection by default. In Rust/MLX today that path projects one
+        // position at a time across the cxx bridge and is slower than the
+        // batched `[K, vocab]` LM-head projection for Gemma 4 31B on local
+        // Apple Silicon runs. Keep it available for parity experiments, but
+        // leave the faster full-logits verifier as the default until we have
+        // a fused/graph-side deferred walk.
+        let use_deferred_greedy = std::env::var("MLXCEL_ENABLE_MTP_DEFERRED").ok().as_deref()
+            == Some("1")
+            && sampler.temperature == 0.0
+            && !logprobs_config.enabled;
+        let logits = if use_deferred_greedy {
+            let _ = self.wrapper.forward_hidden_with_speculative_sinks(
+                &verify_arr,
+                None,
+                None,
+                None,
+                self.seq_id,
+                None,
+                Some(&mut sinks),
+                true,
+            );
+            None
+        } else {
+            Some(self.wrapper.forward_with_speculative_sinks(
+                &verify_arr,
+                None,
+                None,
+                None,
+                self.seq_id,
+                None,
+                Some(&mut sinks),
+            ))
+        };
 
         // Greedy-parity gate: pull the per-position argmax tokens from
         // the verify logits. At temperature == 0 this is byte-identical
@@ -390,13 +532,22 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         // At temperature > 0 a future enhancement plumbs the sampler
         // through per-position; the round-loop driver's perf-sensitive
         // path is greedy, so we keep argmax-only for now.
-        let target_tokens = Self::argmax_per_position(&logits);
+        let target_tokens = if let Some(logits) = logits.as_ref() {
+            Self::argmax_per_position(logits)
+        } else {
+            // The hidden sink is still owned by `sinks`; pull it below but
+            // compute after extraction so the hidden handle is available for
+            // both token projection and `VerifyCaptured`.
+            Vec::new()
+        };
 
         // Per-position log-probability data, aligned 1:1 with
         // `target_tokens`. `None` (zero-overhead) when logprobs are
         // disabled; the round loop forwards the entries for accepted
         // positions on to `finalize_burst_success` (issue #678).
-        let target_logprobs = Self::per_position_logprobs(&logits, &target_tokens, logprobs_config);
+        let target_logprobs = logits.as_ref().and_then(|logits| {
+            Self::per_position_logprobs(logits, &target_tokens, logprobs_config)
+        });
 
         // Capture the hidden + pre-slice shared K/V for the finalize step.
         let hidden_sink = sinks
@@ -406,6 +557,11 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             .into_iter()
             .next_back()
             .expect("hidden sink must carry at least one entry");
+        let target_tokens = if target_tokens.is_empty() && use_deferred_greedy {
+            self.argmax_from_hidden_positions(hidden_full.as_ref().unwrap())
+        } else {
+            target_tokens
+        };
 
         let shared_kv_map = sinks
             .shared_kv_sink
@@ -450,7 +606,7 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
             "VerifyCaptured must carry at least the hidden tensor at index 0"
         );
         let hidden_full = tensors.remove(0);
-        let next_hidden = Self::hidden_at_position(hidden_full.as_ref().unwrap(), accepted);
+        let next_hidden = self.draft_hidden_at_position(hidden_full.as_ref().unwrap(), accepted);
 
         // Per-row tail-zero rollback. For B = 1 the accept slice is a
         // single-element view; the rotating-cache zeroing inside
@@ -465,26 +621,22 @@ impl<'a> MtpTarget for Gemma4MtpTargetAdapter<'a> {
         let rejected = block_size - accepted - 1;
         let next_shared_kv = Self::slice_shared_kv(tensors, rejected);
 
-        // After rollback, the cache offset advanced from the pre-verify
-        // offset by `accepted + 1` (one per accepted token + the bonus
-        // position). The round-loop driver tracks the absolute offset
-        // separately via the sequence of returned `MtpVerifyOutput`s; the
-        // value we return here is only used to RoPE-rotate the drafter's
-        // cross-attention queries, so we report the new offset directly.
-        //
-        // We cannot read the cache's offset back out without exposing a
-        // new accessor; the upstream Python carries the value via
-        // `prompt_cache[0].offset`. As a load-bearing fix, the round-loop
-        // driver itself advances `kv_offset` between calls — this
-        // implementation reports `accepted + 1` as the **delta** which
-        // the driver adds to the pre-call offset.
-        //
-        // Issue #666 follow-up: surface a `cache_offset(seq_id) -> usize`
-        // accessor on `Gemma4Wrapper` so the kv_offset is read directly
-        // rather than reconstructed. Until then the driver layer
-        // accounts for the delta — see `MtpGenerator::set_shared_kv_from_verify`.
-        let kv_offset = accepted + 1;
-        let bonus_position = kv_offset;
+        // Upstream rebinds the drafter with `prompt_cache[0].offset`
+        // *after* rollback, i.e. the absolute post-rollback target cache
+        // offset. Returning `accepted + 1` here was only a per-round
+        // delta; the generator forwards this value verbatim to
+        // `set_shared_kv`, so the drafter's RoPE position and
+        // bidirectional masks drifted back to tiny offsets after the
+        // first verify round. Read the wrapper-owned cache directly so
+        // the Rust path mirrors the Python reference and keeps
+        // `kv_valid_len == kv_len` in the no-padding fast path. The drafter
+        // query/RoPE anchor itself is `kv_offset - 1`, matching upstream
+        // `_mtp_draft_position(kv_offset)`.
+        let kv_offset = self
+            .wrapper
+            .speculative_cache_offset(self.seq_id, "full_attention")
+            .max(0) as usize;
+        let bonus_position = mtp_draft_position(kv_offset);
 
         MtpVerifyOutput {
             next_hidden,
@@ -519,8 +671,18 @@ impl<'a> Gemma4VLMtpTargetAdapter<'a> {
     /// Construct an adapter that routes every trait call through the
     /// inner text model's per-sequence cache slot at `seq_id`.
     pub fn new(vlm: &'a crate::vision::Gemma4VLModel, seq_id: Option<SequenceId>) -> Self {
+        Self::new_with_block_size(vlm, seq_id, 4)
+    }
+
+    /// Construct an adapter with the effective MTP block size requested by
+    /// the dispatch path.
+    pub fn new_with_block_size(
+        vlm: &'a crate::vision::Gemma4VLModel,
+        seq_id: Option<SequenceId>,
+        block_size: usize,
+    ) -> Self {
         Self {
-            inner: Gemma4MtpTargetAdapter::new(&vlm.text_model, seq_id),
+            inner: Gemma4MtpTargetAdapter::new_with_block_size(&vlm.text_model, seq_id, block_size),
         }
     }
 }
@@ -639,6 +801,13 @@ pub struct Gemma4MtpBatchedTargetAdapter<'a> {
     /// Batch size. Set at construction; every trait call's per-row
     /// vectors must match this length.
     batch_size: usize,
+    /// Buffered rotating-cache slack for MTP verify append + rollback.
+    rotating_buffer_size: i32,
+    /// Per-row logical target cache lengths. The physical cache offset is
+    /// the global max after rollback, but shorter rows have their tails
+    /// zeroed and must pass their own valid length to the drafter masks and
+    /// RoPE anchor.
+    positions: RefCell<Vec<usize>>,
 }
 
 impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
@@ -648,14 +817,28 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
     /// [`Gemma4Wrapper::make_speculative_caches`]; the cache is empty
     /// until the first `prefill_and_seed_batched` call.
     pub fn new(wrapper: &'a Gemma4Wrapper, batch_size: usize) -> Self {
+        Self::new_with_block_size(wrapper, batch_size, 4)
+    }
+
+    /// Construct a batched adapter with the effective MTP block size requested
+    /// by the dispatch path. Sliding layers get a small upstream-style
+    /// rollback buffer from the first prefill onward.
+    pub fn new_with_block_size(
+        wrapper: &'a Gemma4Wrapper,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Self {
         assert!(
             batch_size >= 1,
             "Gemma4MtpBatchedTargetAdapter: batch_size must be >= 1",
         );
+        let rotating_buffer_size = mtp_rotating_buffer_size(block_size);
         Self {
             wrapper,
             caches: RefCell::new(wrapper.make_speculative_caches()),
             batch_size,
+            rotating_buffer_size,
+            positions: RefCell::new(vec![0; batch_size]),
         }
     }
 
@@ -722,15 +905,12 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         debug_assert_eq!(shape.len(), 3, "expected [B, width, vocab] logits");
         let argmax = mlxcel_core::argmax_last_axis(logits);
         mlxcel_core::eval(&argmax);
+        let flat = materialize_argmax_i32_vec(&argmax, (batch_size * width) as usize);
         let mut out: Vec<Vec<i32>> = Vec::with_capacity(batch_size as usize);
         for r in 0..batch_size {
-            let mut row: Vec<i32> = Vec::with_capacity(width as usize);
-            for s in 0..width {
-                let cell = mlxcel_core::slice(&argmax, &[r, s], &[r + 1, s + 1]);
-                let scalar = mlxcel_core::reshape(&cell, &[]);
-                row.push(mlxcel_core::item_i32(&scalar));
-            }
-            out.push(row);
+            let start = (r * width) as usize;
+            let end = start + width as usize;
+            out.push(flat[start..end].to_vec());
         }
         out
     }
@@ -824,6 +1004,19 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         (logits, hidden_full, shared_kv)
     }
 
+    fn enable_rotating_cache_buffer(&self) {
+        let mut caches = self.caches.borrow_mut();
+        for cache in caches.iter_mut() {
+            if let Err(error) = cache.enable_mtp_rotating_buffer(self.rotating_buffer_size) {
+                tracing::warn!(
+                    error,
+                    buffer_size = self.rotating_buffer_size,
+                    "Gemma4 batched MTP could not enable rotating-cache rollback buffer"
+                );
+            }
+        }
+    }
+
     /// Slice the `[B, T, *]` hidden tensor down to its last position,
     /// yielding `[B, 1, *]`.
     fn last_position_hidden(hidden_full: &MlxArray) -> UniquePtr<MlxArray> {
@@ -831,6 +1024,12 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
         debug_assert_eq!(shape.len(), 3, "hidden must be 3-D [B, T, hidden]");
         let last = shape[1] - 1;
         mlxcel_core::slice(hidden_full, &[0, last, 0], &[shape[0], last + 1, shape[2]])
+    }
+
+    fn last_position_draft_hidden(&self, hidden_full: &MlxArray) -> UniquePtr<MlxArray> {
+        let hidden = Self::last_position_hidden(hidden_full);
+        self.wrapper
+            .speculative_draft_hidden(hidden.as_ref().unwrap())
     }
 
     /// Slice a `[B, T, H]` hidden tensor at a per-row accepted position,
@@ -876,6 +1075,17 @@ impl<'a> Gemma4MtpBatchedTargetAdapter<'a> {
             out = mlxcel_core::concatenate(out.as_ref().unwrap(), row.as_ref().unwrap(), 0);
         }
         Ok(out)
+    }
+
+    fn draft_hidden_at_positions_batched(
+        &self,
+        hidden_full: &MlxArray,
+        positions: &[usize],
+    ) -> Result<UniquePtr<MlxArray>, DrafterError> {
+        let hidden = Self::hidden_at_positions_batched(hidden_full, positions)?;
+        Ok(self
+            .wrapper
+            .speculative_draft_hidden(hidden.as_ref().unwrap()))
     }
 }
 
@@ -966,6 +1176,7 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         // Sink-aware prefill. The adapter's [B, ...] cache now holds
         // `prompt_len` entries per row.
         let (logits, hidden_full, shared_kv) = self.batched_sink_forward(&prompt_arr);
+        self.enable_rotating_cache_buffer();
 
         // Sample the per-row first bonus. `sample_token_optimized`
         // internally slices the last position of the [B, prompt_len,
@@ -980,14 +1191,22 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
 
         // Build the seed MtpBatchedVerifyOutput. After prefill every row
         // has `prompt_len` cache entries; the bonus token is NOT yet in
-        // the cache, so each row's `kv_offset` / `bonus_position` is
-        // `prompt_len`. With equal-length prompts there is no
-        // left-padding, and the K/V valid length equals `prompt_len`.
-        let next_hidden = Self::last_position_hidden(&hidden_full);
+        // the cache, so each row's `kv_offset` / `kv_valid_len` is
+        // `prompt_len`, while the drafter position is `prompt_len - 1`.
+        // With equal-length prompts there is no left-padding.
+        let next_hidden = self.last_position_draft_hidden(&hidden_full);
         let prompt_len_usize = prompt_len as usize;
-        let kv_offset_per_row = vec![prompt_len_usize; self.batch_size];
-        let bonus_position_per_row = vec![prompt_len_usize; self.batch_size];
-        let kv_valid_len_per_row = vec![prompt_len_usize; self.batch_size];
+        {
+            let mut positions = self.positions.borrow_mut();
+            *positions = vec![prompt_len_usize; self.batch_size];
+        }
+        let logical_positions = self.positions.borrow().clone();
+        let kv_offset_per_row = logical_positions.clone();
+        let bonus_position_per_row: Vec<usize> = logical_positions
+            .iter()
+            .map(|&pos| mtp_draft_position(pos))
+            .collect();
+        let kv_valid_len_per_row = logical_positions;
         let left_padding_per_row = vec![0_usize; self.batch_size];
 
         let seed = MtpBatchedVerifyOutput {
@@ -1064,22 +1283,23 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
             });
         }
         let hidden_full = tensors.remove(0);
-        let next_hidden =
-            Self::hidden_at_positions_batched(hidden_full.as_ref().unwrap(), accepted_per_row)?;
+        let next_hidden = self
+            .draft_hidden_at_positions_batched(hidden_full.as_ref().unwrap(), accepted_per_row)?;
 
         // Per-row tail-zero rollback on the adapter's own [B, ...] cache.
         // `rollback_speculative_cache_explicit` trims by `block_size -
         // max(accepted) - 1` and per-row zeros the tails for rows below
         // max — the per-row early-EOS / partial-accept contract.
         let accepted_i32: Vec<i32> = accepted_per_row.iter().map(|&a| a as i32).collect();
-        {
+        let post_rollback_kv_offset = {
             let mut caches = self.caches.borrow_mut();
             self.wrapper
                 .rollback_speculative_cache_explicit(&mut caches, &accepted_i32, block_size as i32)
                 .map_err(|e| DrafterError::DraftFailed {
                     reason: format!("Gemma4 batched MTP rollback failed: {e}"),
                 })?;
-        }
+            first_cache_offset(caches.as_mut_slice(), "full_attention").max(0) as usize
+        };
 
         // Slice the captured shared K/V to the post-rollback length. The
         // global trim amount is `block_size - max(accepted) - 1`; this
@@ -1088,16 +1308,31 @@ impl<'a> MtpTarget for Gemma4MtpBatchedTargetAdapter<'a> {
         let rejected = block_size.saturating_sub(max_accepted).saturating_sub(1);
         let next_shared_kv = Self::slice_shared_kv_batched(tensors, rejected);
 
-        // Post-rollback per-row metadata. The round-loop driver tracks
-        // the absolute KV offset itself (it adds the returned delta to
-        // the running offset — see `MtpBatchedGenerator`'s rebind).
-        // We report the per-row delta `accepted[r] + 1`.
-        let kv_offset_per_row: Vec<usize> = accepted_per_row.iter().map(|&a| a + 1).collect();
-        let bonus_position_per_row = kv_offset_per_row.clone();
+        // Post-rollback per-row logical metadata. The physical cache offset
+        // remains the global post-rollback max (used above for slicing the
+        // captured K/V slabs), but each row advanced by its own
+        // accepted+bonus count. Thread those logical positions through so
+        // the drafter masks zeroed tails and rotates queries at the row's
+        // own bonus-token anchor.
+        {
+            let mut positions = self.positions.borrow_mut();
+            if positions.len() != self.batch_size {
+                *positions = vec![post_rollback_kv_offset; self.batch_size];
+            }
+            for (row_pos, &accepted) in positions.iter_mut().zip(accepted_per_row) {
+                *row_pos += accepted + 1;
+            }
+        }
+        let logical_positions = self.positions.borrow().clone();
+        let kv_offset_per_row = logical_positions.clone();
+        let bonus_position_per_row: Vec<usize> = logical_positions
+            .iter()
+            .map(|&pos| mtp_draft_position(pos))
+            .collect();
         // With equal-length prompts and uniform verify width there is no
-        // left-padding; the K/V valid length per row equals the
-        // post-rollback length `max_accepted + 1`.
-        let kv_valid_len_per_row = vec![max_accepted + 1; self.batch_size];
+        // left-padding; the K/V valid length per row equals that row's
+        // logical post-rollback position in the prefix-valid layout.
+        let kv_valid_len_per_row = logical_positions;
         let left_padding_per_row = vec![0_usize; self.batch_size];
 
         Ok(MtpBatchedVerifyOutput {
@@ -1126,8 +1361,22 @@ impl<'a> Gemma4VLMtpBatchedTargetAdapter<'a> {
     /// Construct a batched adapter routing every trait call through the
     /// inner text model's own `[B, ...]` cache.
     pub fn new(vlm: &'a crate::vision::Gemma4VLModel, batch_size: usize) -> Self {
+        Self::new_with_block_size(vlm, batch_size, 4)
+    }
+
+    /// Construct a batched VLM MTP adapter with the effective requested block
+    /// size.
+    pub fn new_with_block_size(
+        vlm: &'a crate::vision::Gemma4VLModel,
+        batch_size: usize,
+        block_size: usize,
+    ) -> Self {
         Self {
-            inner: Gemma4MtpBatchedTargetAdapter::new(&vlm.text_model, batch_size),
+            inner: Gemma4MtpBatchedTargetAdapter::new_with_block_size(
+                &vlm.text_model,
+                batch_size,
+                block_size,
+            ),
         }
     }
 

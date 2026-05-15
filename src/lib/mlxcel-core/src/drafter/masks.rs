@@ -170,31 +170,66 @@ pub fn bidirectional_full_mask(
     kv_valid_len: Option<&BatchScalar<'_>>,
     dtype: i32,
 ) -> Option<UniquePtr<MlxArray>> {
+    let key_offset = BatchScalar::Scalar(0);
+    bidirectional_full_mask_with_key_offset(
+        _query_len,
+        kv_len,
+        kv_valid_len,
+        &key_offset,
+        dtype,
+    )
+}
+
+/// Build the bidirectional full-attention bias with an absolute K/V
+/// `key_offset`.
+///
+/// Latest upstream Gemma 4 MTP passes `key_offset = max(kv_valid_len -
+/// kv_len, 0)` for full-attention caches so a sliced post-rollback K/V slab
+/// whose local axis is `[0, kv_len)` still masks against the correct absolute
+/// key positions. [`bidirectional_full_mask`] is kept as the legacy
+/// `key_offset = 0` wrapper for existing tests and callers.
+pub fn bidirectional_full_mask_with_key_offset(
+    _query_len: i32,
+    kv_len: i32,
+    kv_valid_len: Option<&BatchScalar<'_>>,
+    key_offset: &BatchScalar<'_>,
+    dtype: i32,
+) -> Option<UniquePtr<MlxArray>> {
     let valid = kv_valid_len?;
 
-    match valid {
-        BatchScalar::Scalar(v) => {
+    match (valid, key_offset) {
+        (BatchScalar::Scalar(v), BatchScalar::Scalar(ko)) => {
             // B=1 fast path. Skip when the scalar valid length already
             // covers the buffer.
-            if *v >= kv_len {
+            if *ko + kv_len <= *v {
                 return None;
             }
 
             // Build bias of shape [kv_len], 0 at valid positions and -inf
             // elsewhere, then broadcast to [1, 1, 1, kv_len].
-            let k_idx = ffi::arange_i32(0, kv_len, 1);
+            let k_idx = ffi::arange_i32(*ko, *ko + kv_len, 1);
             let valid_arr = ffi::from_slice_i32(&[*v], &[1]);
             let inside = ffi::less(&k_idx, &valid_arr); // bool [kv_len]
             let bias = build_bias_from_bool(&inside, dtype);
             // Reshape from [kv_len] to [1, 1, 1, kv_len].
             Some(ffi::reshape(&bias, &[1, 1, 1, kv_len]))
         }
-        BatchScalar::PerRow(valid_per_row) => {
+        (BatchScalar::Scalar(v), BatchScalar::PerRow(key_offset_per_row)) => {
+            let batch = ffi::array_shape(key_offset_per_row)[0];
+            let ko_2d = ffi::reshape(key_offset_per_row, &[batch, 1]);
+            let k_range = ffi::reshape(&ffi::arange_i32(0, kv_len, 1), &[1, kv_len]);
+            let k_idx = ffi::add(&ko_2d, &k_range);
+            let valid_arr = ffi::from_slice_i32(&[*v], &[1]);
+            let inside = ffi::less(&k_idx, &valid_arr); // bool [B, kv_len]
+            let bias_2d = build_bias_from_bool(&inside, dtype);
+            Some(ffi::reshape(&bias_2d, &[batch, 1, 1, kv_len]))
+        }
+        (BatchScalar::PerRow(valid_per_row), BatchScalar::Scalar(ko)) => {
             // Per-row valid lengths: build bias of shape [B, 1, 1, kv_len].
             let batch = ffi::array_shape(valid_per_row)[0];
 
             // k_idx: shape [1, kv_len] (broadcasts over batch).
-            let k_idx_1d = ffi::arange_i32(0, kv_len, 1);
+            let k_idx_1d = ffi::arange_i32(*ko, *ko + kv_len, 1);
             let k_idx = ffi::reshape(&k_idx_1d, &[1, kv_len]);
 
             // valid_per_row reshaped to [B, 1] for broadcast.
@@ -203,6 +238,16 @@ pub fn bidirectional_full_mask(
             let inside = ffi::less(&k_idx, &valid_2d); // bool [B, kv_len]
             let bias_2d = build_bias_from_bool(&inside, dtype);
             // Reshape from [B, kv_len] to [B, 1, 1, kv_len].
+            Some(ffi::reshape(&bias_2d, &[batch, 1, 1, kv_len]))
+        }
+        (BatchScalar::PerRow(valid_per_row), BatchScalar::PerRow(key_offset_per_row)) => {
+            let batch = ffi::array_shape(valid_per_row)[0];
+            let ko_2d = ffi::reshape(key_offset_per_row, &[batch, 1]);
+            let k_range = ffi::reshape(&ffi::arange_i32(0, kv_len, 1), &[1, kv_len]);
+            let k_idx = ffi::add(&ko_2d, &k_range); // [B, kv_len]
+            let valid_2d = ffi::reshape(valid_per_row, &[batch, 1]);
+            let inside = ffi::less(&k_idx, &valid_2d);
+            let bias_2d = build_bias_from_bool(&inside, dtype);
             Some(ffi::reshape(&bias_2d, &[batch, 1, 1, kv_len]))
         }
     }
@@ -242,16 +287,51 @@ pub fn bidirectional_swa_mask(
     kv_valid_len: Option<&BatchScalar<'_>>,
     dtype: i32,
 ) -> Option<UniquePtr<MlxArray>> {
+    let key_offset = BatchScalar::Scalar(0);
+    bidirectional_swa_mask_with_key_offset(
+        query_len,
+        query_offset,
+        kv_len,
+        window,
+        kv_valid_len,
+        &key_offset,
+        dtype,
+    )
+}
+
+/// Build the bidirectional sliding-window bias with an absolute K/V
+/// `key_offset`.
+///
+/// The latest upstream MTP mask logic maps rotating-cache query/valid
+/// positions onto the local K/V window before calling this helper, but keeps
+/// this explicit `key_offset` parameter for full absolute-distance parity.
+/// [`bidirectional_swa_mask`] is the legacy `key_offset = 0` wrapper.
+pub fn bidirectional_swa_mask_with_key_offset(
+    query_len: i32,
+    query_offset: &BatchScalar<'_>,
+    kv_len: i32,
+    window: i32,
+    kv_valid_len: Option<&BatchScalar<'_>>,
+    key_offset: &BatchScalar<'_>,
+    dtype: i32,
+) -> Option<UniquePtr<MlxArray>> {
     // ----- "no mask needed" fast path -------------------------------------
     //
     // The window already covers every query in both directions when:
     //   - query_offset is scalar,
     //   - kv_valid_len is None or scalar,
+    //   - key_offset is scalar,
     //   - kv_len <= window,
-    //   - query_offset + query_len <= kv_len + window.
+    //   - the first key is less than `window` behind the first query,
+    //   - the last key is less than `window` ahead of the last query.
     let kv_valid_is_scalar = kv_valid_len.map(BatchScalar::is_scalar).unwrap_or(true);
-    if let (BatchScalar::Scalar(qo), true) = (query_offset, kv_valid_is_scalar) {
-        if kv_len <= window && *qo + query_len <= kv_len + window {
+    if let (BatchScalar::Scalar(qo), true, BatchScalar::Scalar(ko)) =
+        (query_offset, kv_valid_is_scalar, key_offset)
+    {
+        if kv_len <= window
+            && *qo - *ko < window
+            && *ko + kv_len - (*qo + query_len) < window
+        {
             return None;
         }
     }
@@ -261,14 +341,14 @@ pub fn bidirectional_swa_mask(
     // Build q_idx and k_idx so dist = q_idx - k_idx broadcasts to the
     // appropriate mask shape (either [query_len, kv_len] for scalar
     // offsets or [B, query_len, kv_len] for per-row offsets).
-    match query_offset {
-        BatchScalar::Scalar(qo) => {
+    match (query_offset, key_offset) {
+        (BatchScalar::Scalar(qo), BatchScalar::Scalar(ko)) => {
             // q_idx: shape [query_len, 1].
             let q_idx_1d = ffi::arange_i32(*qo, *qo + query_len, 1);
             let q_idx = ffi::reshape(&q_idx_1d, &[query_len, 1]);
 
             // k_idx: shape [1, kv_len].
-            let k_idx_1d = ffi::arange_i32(0, kv_len, 1);
+            let k_idx_1d = ffi::arange_i32(*ko, *ko + kv_len, 1);
             let k_idx = ffi::reshape(&k_idx_1d, &[1, kv_len]);
 
             // dist = q_idx - k_idx, broadcast to [query_len, kv_len].
@@ -281,7 +361,20 @@ pub fn bidirectional_swa_mask(
             // Reshape from [query_len, kv_len] to [1, 1, query_len, kv_len].
             Some(ffi::reshape(&bias_2d, &[1, 1, query_len, kv_len]))
         }
-        BatchScalar::PerRow(qo_vec) => {
+        (BatchScalar::Scalar(qo), BatchScalar::PerRow(ko_vec)) => {
+            let batch = ffi::array_shape(ko_vec)[0];
+            let qo_vec = scalar_batch_vector(*qo, batch);
+            bidirectional_swa_mask_with_key_offset(
+                query_len,
+                &BatchScalar::PerRow(&qo_vec),
+                kv_len,
+                window,
+                kv_valid_len,
+                key_offset,
+                dtype,
+            )
+        }
+        (BatchScalar::PerRow(qo_vec), key_offset) => {
             let batch = ffi::array_shape(qo_vec)[0];
 
             // q_idx[b, q] = qo_vec[b] + q. Shape [B, query_len].
@@ -293,8 +386,17 @@ pub fn bidirectional_swa_mask(
             //   q_idx -> [B, query_len, 1], k_idx -> [1, 1, kv_len].
             let q_idx = ffi::reshape(&q_idx_2d, &[batch, query_len, 1]);
 
-            let k_idx_1d = ffi::arange_i32(0, kv_len, 1);
-            let k_idx = ffi::reshape(&k_idx_1d, &[1, 1, kv_len]);
+            let k_idx = match key_offset {
+                BatchScalar::Scalar(ko) => {
+                    let k_idx_1d = ffi::arange_i32(*ko, *ko + kv_len, 1);
+                    ffi::reshape(&k_idx_1d, &[1, 1, kv_len])
+                }
+                BatchScalar::PerRow(ko_vec) => {
+                    let ko_3d = ffi::reshape(ko_vec, &[batch, 1, 1]);
+                    let k_range = ffi::reshape(&ffi::arange_i32(0, kv_len, 1), &[1, 1, kv_len]);
+                    ffi::add(&ko_3d, &k_range)
+                }
+            };
 
             let dist = ffi::subtract(&q_idx, &k_idx); // [B, query_len, kv_len]
             let inside = swa_inside_from_dist(&dist, window);
@@ -306,6 +408,11 @@ pub fn bidirectional_swa_mask(
             Some(ffi::reshape(&bias_3d, &[batch, 1, query_len, kv_len]))
         }
     }
+}
+
+fn scalar_batch_vector(value: i32, batch: i32) -> UniquePtr<MlxArray> {
+    let values = vec![value; batch as usize];
+    ffi::from_slice_i32(&values, &[batch])
 }
 
 /// `inside = (dist > -window) & (dist < window)` — the bidirectional
@@ -416,33 +523,177 @@ pub fn make_drafter_masks(
     sliding_window: i32,
     dtype: i32,
 ) -> HashMap<LayerType, Option<UniquePtr<MlxArray>>> {
+    make_drafter_masks_with_valid_len(
+        shared_kv_states,
+        query_len,
+        query_offset,
+        sliding_window,
+        dtype,
+        None,
+    )
+}
+
+/// Build the per-layer-type drafter mask map with an explicit
+/// `kv_valid_len`.
+///
+/// Upstream Gemma 4 MTP now distinguishes the drafter query/RoPE anchor
+/// (`position = kv_valid_len - 1`) from the valid target-cache length used
+/// to mask shared K/V (`kv_valid_len`). This helper ports that split while
+/// keeping [`make_drafter_masks`] as the backwards-compatible
+/// `kv_valid_len = query_offset` wrapper.
+pub fn make_drafter_masks_with_valid_len(
+    shared_kv_states: &HashMap<LayerType, (&MlxArray, &MlxArray)>,
+    query_len: i32,
+    query_offset: &BatchScalar<'_>,
+    sliding_window: i32,
+    dtype: i32,
+    kv_valid_len: Option<&BatchScalar<'_>>,
+) -> HashMap<LayerType, Option<UniquePtr<MlxArray>>> {
     let mut masks: HashMap<LayerType, Option<UniquePtr<MlxArray>>> =
         HashMap::with_capacity(shared_kv_states.len());
 
     for (&layer_type, (keys, _values)) in shared_kv_states {
         let kv_len = kv_len_of(keys);
-        // Upstream: `kv_valid_len = query_offset` for both mask flavours.
-        let kv_valid_len = match query_offset {
-            BatchScalar::Scalar(v) => BatchScalar::Scalar(*v),
-            BatchScalar::PerRow(arr) => BatchScalar::PerRow(arr),
+        let effective_valid = match kv_valid_len {
+            Some(v) => match v {
+                BatchScalar::Scalar(s) => BatchScalar::Scalar(*s),
+                BatchScalar::PerRow(arr) => BatchScalar::PerRow(arr),
+            },
+            None => match query_offset {
+                BatchScalar::Scalar(v) => BatchScalar::Scalar(*v),
+                BatchScalar::PerRow(arr) => BatchScalar::PerRow(arr),
+            },
         };
         let mask = match layer_type {
-            LayerType::SlidingWindowAttention => bidirectional_swa_mask(
+            LayerType::SlidingWindowAttention => make_swa_mask_with_local_offsets(
                 query_len,
                 query_offset,
                 kv_len,
                 sliding_window,
-                Some(&kv_valid_len),
+                &effective_valid,
                 dtype,
             ),
-            LayerType::FullAttention => {
-                bidirectional_full_mask(query_len, kv_len, Some(&kv_valid_len), dtype)
-            }
+            LayerType::FullAttention => make_full_mask_with_absolute_key_offset(
+                query_len,
+                kv_len,
+                &effective_valid,
+                dtype,
+            ),
         };
         masks.insert(layer_type, mask);
     }
 
     masks
+}
+
+fn make_full_mask_with_absolute_key_offset(
+    query_len: i32,
+    kv_len: i32,
+    kv_valid_len: &BatchScalar<'_>,
+    dtype: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    match kv_valid_len {
+        BatchScalar::Scalar(v) => {
+            let key_offset = BatchScalar::Scalar((*v - kv_len).max(0));
+            bidirectional_full_mask_with_key_offset(
+                query_len,
+                kv_len,
+                Some(kv_valid_len),
+                &key_offset,
+                dtype,
+            )
+        }
+        BatchScalar::PerRow(valid_per_row) => {
+            let kv_len_arr = ffi::from_slice_i32(&[kv_len], &[1]);
+            let diff = ffi::subtract(valid_per_row, &kv_len_arr);
+            let zero = ffi::from_slice_i32(&[0], &[1]);
+            let key_offset_arr = ffi::maximum(&diff, &zero);
+            let key_offset = BatchScalar::PerRow(&key_offset_arr);
+            bidirectional_full_mask_with_key_offset(
+                query_len,
+                kv_len,
+                Some(kv_valid_len),
+                &key_offset,
+                dtype,
+            )
+        }
+    }
+}
+
+fn make_swa_mask_with_local_offsets(
+    query_len: i32,
+    query_offset: &BatchScalar<'_>,
+    kv_len: i32,
+    sliding_window: i32,
+    kv_valid_len: &BatchScalar<'_>,
+    dtype: i32,
+) -> Option<UniquePtr<MlxArray>> {
+    let key_offset = BatchScalar::Scalar(0);
+    match (query_offset, kv_valid_len) {
+        (BatchScalar::Scalar(q), BatchScalar::Scalar(v)) => {
+            let local_query = BatchScalar::Scalar((*q).min(kv_len));
+            let local_valid = BatchScalar::Scalar((*v).min(kv_len));
+            bidirectional_swa_mask_with_key_offset(
+                query_len,
+                &local_query,
+                kv_len,
+                sliding_window,
+                Some(&local_valid),
+                &key_offset,
+                dtype,
+            )
+        }
+        (BatchScalar::PerRow(q_arr), BatchScalar::Scalar(v)) => {
+            let local_query_arr = local_window_offset_array(q_arr, kv_len);
+            let local_query = BatchScalar::PerRow(&local_query_arr);
+            let local_valid = BatchScalar::Scalar((*v).min(kv_len));
+            bidirectional_swa_mask_with_key_offset(
+                query_len,
+                &local_query,
+                kv_len,
+                sliding_window,
+                Some(&local_valid),
+                &key_offset,
+                dtype,
+            )
+        }
+        (BatchScalar::Scalar(q), BatchScalar::PerRow(v_arr)) => {
+            let batch = ffi::array_shape(v_arr)[0];
+            let local_query_arr = scalar_batch_vector((*q).min(kv_len), batch);
+            let local_valid_arr = local_window_offset_array(v_arr, kv_len);
+            let local_query = BatchScalar::PerRow(&local_query_arr);
+            let local_valid = BatchScalar::PerRow(&local_valid_arr);
+            bidirectional_swa_mask_with_key_offset(
+                query_len,
+                &local_query,
+                kv_len,
+                sliding_window,
+                Some(&local_valid),
+                &key_offset,
+                dtype,
+            )
+        }
+        (BatchScalar::PerRow(q_arr), BatchScalar::PerRow(v_arr)) => {
+            let local_query_arr = local_window_offset_array(q_arr, kv_len);
+            let local_valid_arr = local_window_offset_array(v_arr, kv_len);
+            let local_query = BatchScalar::PerRow(&local_query_arr);
+            let local_valid = BatchScalar::PerRow(&local_valid_arr);
+            bidirectional_swa_mask_with_key_offset(
+                query_len,
+                &local_query,
+                kv_len,
+                sliding_window,
+                Some(&local_valid),
+                &key_offset,
+                dtype,
+            )
+        }
+    }
+}
+
+fn local_window_offset_array(value: &MlxArray, kv_len: i32) -> UniquePtr<MlxArray> {
+    let kv_len_arr = ffi::from_slice_i32(&[kv_len], &[1]);
+    ffi::minimum(value, &kv_len_arr)
 }
 
 /// Read `K.shape[-2]` — the K/V sequence-length axis. K is always 4-D in
@@ -784,6 +1035,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn full_mask_key_offset_uses_absolute_key_positions() {
+        // Latest upstream uses key_offset=max(kv_valid_len-kv_len, 0) for
+        // sliced full-attention K/V. With kv_valid_len=10 and a local slab
+        // carrying absolute keys [7, 8, 9, 10], only the last column is past
+        // the valid prefix.
+        let valid = BatchScalar::Scalar(10);
+        let key_offset = BatchScalar::Scalar(7);
+        let mask =
+            bidirectional_full_mask_with_key_offset(1, 4, Some(&valid), &key_offset, dtype::FLOAT32)
+                .expect("absolute key 10 must be masked");
+        assert_eq!(ffi::array_shape(&mask), vec![1, 1, 1, 4]);
+
+        for k in 0..3 {
+            let v = mask_at_qk(&mask, &[0, 0, 0, k]);
+            assert_eq!(v, 0.0, "absolute key {} must be valid", 7 + k);
+        }
+        let v = mask_at_qk(&mask, &[0, 0, 0, 3]);
+        assert!(
+            v.is_infinite() && v < 0.0,
+            "absolute key 10 must be masked, got {v}",
+        );
+    }
+
     // ----- bidirectional_swa_mask ------------------------------------------
 
     #[test]
@@ -891,6 +1166,42 @@ mod tests {
         assert!(
             masks.get(&LayerType::SlidingWindowAttention).unwrap().is_none(),
             "SWA mask must be None in the fast path",
+        );
+    }
+
+    #[test]
+    fn make_drafter_masks_with_valid_len_maps_swa_to_local_window() {
+        // Regression pin for the upstream #1166 mask change: after a
+        // rotating-cache slice the absolute drafter position can be much
+        // larger than the local K/V axis. SWA masks must compare against
+        // min(position, kv_len), while still using kv_valid_len for tail
+        // validity.
+        let kv_len = 4_i32;
+        let query_len = 1_i32;
+        let sliding_window = 5_i32;
+        let query_offset = BatchScalar::Scalar(9);
+        let kv_valid_len = BatchScalar::Scalar(10);
+
+        let k_swa = ffi::zeros(&[1, 1, kv_len, 1], dtype::FLOAT32);
+        let v_swa = ffi::zeros(&[1, 1, kv_len, 1], dtype::FLOAT32);
+
+        let mut shared: HashMap<LayerType, (&MlxArray, &MlxArray)> = HashMap::new();
+        shared.insert(LayerType::SlidingWindowAttention, (&k_swa, &v_swa));
+
+        let masks = make_drafter_masks_with_valid_len(
+            &shared,
+            query_len,
+            &query_offset,
+            sliding_window,
+            dtype::FLOAT32,
+            Some(&kv_valid_len),
+        );
+        assert!(
+            masks
+                .get(&LayerType::SlidingWindowAttention)
+                .unwrap()
+                .is_none(),
+            "SWA should be mask-free after mapping absolute position 9 to local offset 4",
         );
     }
 

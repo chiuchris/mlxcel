@@ -1835,6 +1835,56 @@ impl BatchScheduler {
             vec![seq]
         };
 
+        if window.len() == 1
+            && matches!(
+                self.speculative_dispatch,
+                crate::server::SpeculativeDispatch::Mtp { .. }
+            )
+            && !super::speculative_burst::mtp_b1_burst_enabled()
+        {
+            let seq = window.into_iter().next().expect("singleton window");
+            tracing::info!(
+                "MTP speculative burst declined for seq {}: singleton B=1 window is \
+                 slower than classic Gemma 4 decode on real 31B measurements; set \
+                 MLXCEL_ENABLE_MTP_B1=1 to force the experimental singleton MTP path",
+                seq.seq_id,
+            );
+            return Some(seq);
+        }
+
+        if window.len() >= 2
+            && matches!(
+                self.speculative_dispatch,
+                crate::server::SpeculativeDispatch::Mtp { .. }
+            )
+            && !super::speculative_burst::mtp_batched_burst_enabled()
+        {
+            let mut rejected_window = window;
+            let head = rejected_window.remove(0);
+            tracing::info!(
+                "MTP batched speculative burst declined for seq {}: current Gemma 4 \
+                 B>1 MTP validation does not preserve greedy parity on real 31B; \
+                 falling back to classic decode. Set MLXCEL_ENABLE_MTP_BATCH=1 to force \
+                 the experimental batched MTP path",
+                head.seq_id,
+            );
+            for sibling in rejected_window {
+                let sibling_id = sibling.seq_id;
+                if let Err(boxed) = self.prefill_queue.enqueue(sibling) {
+                    tracing::warn!(
+                        "MTP batched speculative burst declined and prefill queue \
+                         full; aborting sibling seq {sibling_id}"
+                    );
+                    self.prompt_cache_seq_ctx.remove(&sibling_id);
+                    self.abort_sequence(
+                        *boxed,
+                        "MTP batched speculative burst declined and prefill queue full",
+                    );
+                }
+            }
+            return Some(head);
+        }
+
         if window.len() >= 2 {
             // ---- Batched B>1 burst ----
             let ctx = super::speculative_burst::BurstContext {
