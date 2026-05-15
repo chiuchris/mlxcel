@@ -53,11 +53,11 @@ pub mod ops;
 mod pipeline;
 
 pub use config::{
-    InterpolateMethod, OpSpec, PruneGranularity, SUPPORTED_SCHEMA_VERSION, SurgeryConfig,
-    parse_config_file, parse_config_str,
+    parse_config_file, parse_config_str, InterpolateMethod, OpSpec, PruneGranularity,
+    SurgeryConfig, SUPPORTED_SCHEMA_VERSION,
 };
 pub use error::SurgeryError;
-pub use ops::{AddOp, PruneOp, PruneSelector, ReplaceOp, ScaleOp};
+pub use ops::{AddOp, InterpolateOp, PruneOp, PruneSelector, ReplaceOp, ScaleOp};
 pub use pipeline::SurgeryPipeline;
 
 /// A single weight-load surgical operation.

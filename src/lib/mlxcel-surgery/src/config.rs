@@ -48,14 +48,12 @@
 //!
 //! The parser validates schema syntax, glob pattern syntax, schema
 //! version, and the presence of external source files at parse time
-//! (so the load fails before any weights are mutated). The `scale`
-//! (A5), `add` (A6), `prune` (A7), and `replace` (A8) variants
-//! materialize to real [`crate::ops::ScaleOp`] /
-//! [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] /
-//! [`crate::ops::ReplaceOp`] instances; the remaining variant
-//! (`interpolate`) still constructs a placeholder
-//! [`crate::SurgeryOp`] that returns a "not yet implemented" error if
-//! `apply` is invoked, pending A9.
+//! (so the load fails before any weights are mutated). All five
+//! op variants — `scale` (A5), `add` (A6), `prune` (A7), `replace`
+//! (A8), and `interpolate` (A9) — materialize to real
+//! [`crate::ops::ScaleOp`] / [`crate::ops::AddOp`] /
+//! [`crate::ops::PruneOp`] / [`crate::ops::ReplaceOp`] /
+//! [`crate::ops::InterpolateOp`] instances.
 //!
 //! ## Path resolution
 //!
@@ -71,8 +69,10 @@ use std::sync::Arc;
 use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 
-use crate::ops::ScaleOp;
-use crate::{SharedSurgeryOp, SurgeryError, SurgeryOp, SurgeryPipeline, WeightMap};
+use crate::ops::{InterpolateOp, ScaleOp};
+use crate::{SharedSurgeryOp, SurgeryError, SurgeryPipeline};
+#[cfg(test)]
+use crate::WeightMap;
 
 /// The only schema version this parser understands. Bump when the
 /// YAML shape changes in a way that is not backwards-compatible; the
@@ -201,19 +201,19 @@ pub enum InterpolateMethod {
 /// YAML. Pass the directory containing the YAML file when calling
 /// from [`parse_config_file`], or `None` to require absolute paths.
 ///
-/// On success, the `scale` (A5), `add` (A6), `prune` (A7), and
-/// `replace` (A8) operations are materialized as real [`ScaleOp`] /
-/// [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] /
-/// [`crate::ops::ReplaceOp`] instances; the remaining variant
-/// (`interpolate`) is still a placeholder [`SurgeryOp`] that records
-/// the parsed spec and returns a "not yet implemented" error on
-/// `apply` until A9 lands.
+/// On success, all five operations (`scale` (A5), `add` (A6),
+/// `prune` (A7), `replace` (A8), `interpolate` (A9)) are
+/// materialized as real concrete [`SurgeryOp`] instances:
+/// [`ScaleOp`] / [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] /
+/// [`crate::ops::ReplaceOp`] / [`crate::ops::InterpolateOp`].
 ///
-/// Used by: [`parse_config_file`], future CLI wiring (A4)
-pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
-    let config: SurgeryConfig = serde_yaml::from_str(yaml).map_err(|e| {
-        SurgeryError::Other(anyhow::anyhow!("failed to parse surgery YAML: {e}"))
-    })?;
+/// Used by: [`parse_config_file`], CLI wiring from A4 (`--surgery`)
+pub fn parse_config_str(
+    yaml: &str,
+    base_dir: Option<&Path>,
+) -> Result<SurgeryPipeline, SurgeryError> {
+    let config: SurgeryConfig = serde_yaml::from_str(yaml)
+        .map_err(|e| SurgeryError::Other(anyhow::anyhow!("failed to parse surgery YAML: {e}")))?;
 
     if config.version != SUPPORTED_SCHEMA_VERSION {
         return Err(SurgeryError::Other(anyhow::anyhow!(
@@ -249,7 +249,7 @@ pub fn parse_config_file<P: AsRef<Path>>(path: P) -> Result<SurgeryPipeline, Sur
 }
 
 /// Validate one `OpSpec`, resolve its paths, and construct the
-/// matching placeholder [`SurgeryOp`].
+/// matching concrete [`SurgeryOp`].
 fn materialize_op(
     idx: usize,
     spec: OpSpec,
@@ -346,7 +346,13 @@ fn materialize_op(
             ratio,
             method,
         } => {
-            let glob = compile_glob(idx, "interpolate", &pattern)?;
+            // Validate the glob at the config layer so a malformed
+            // pattern surfaces with a "surgery operation #N" error
+            // path that mirrors the other op variants. The compiled
+            // matcher itself is rebuilt inside `InterpolateOp::new`,
+            // which is a cheap operation on the already-validated
+            // string.
+            let _ = compile_glob(idx, "interpolate", &pattern)?;
             if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
                 return Err(spec_error(
                     idx,
@@ -358,15 +364,9 @@ fn materialize_op(
                 resolve_existing_source(idx, "interpolate", "source_a", &source_a, base_dir)?;
             let resolved_b =
                 resolve_existing_source(idx, "interpolate", "source_b", &source_b, base_dir)?;
-            Ok(Arc::new(NotYetImplementedOp {
-                name: "interpolate",
-                summary: format!(
-                    "interpolate(pattern={pattern:?}, source_a={}, source_b={}, ratio={ratio}, method={method:?})",
-                    resolved_a.display(),
-                    resolved_b.display(),
-                ),
-                _glob: glob,
-            }))
+            let op = InterpolateOp::new(&pattern, resolved_a, resolved_b, ratio, method)
+                .map_err(|e| spec_error(idx, "interpolate", &format!("{e}")))?;
+            Ok(Arc::new(op))
         }
     }
 }
@@ -439,10 +439,7 @@ fn resolve_existing_source(
         return Err(spec_error(
             idx,
             op_name,
-            &format!(
-                "{field} path does not exist: {}",
-                resolved.display()
-            ),
+            &format!("{field} path does not exist: {}", resolved.display()),
         ));
     }
     Ok(resolved)
@@ -452,35 +449,6 @@ fn spec_error(idx: usize, op_name: &str, msg: &str) -> SurgeryError {
     SurgeryError::Other(anyhow::anyhow!(
         "surgery operation #{idx} ({op_name}): {msg}"
     ))
-}
-
-/// Placeholder [`SurgeryOp`] that materializes from a parsed
-/// [`OpSpec`] but errors with "not yet implemented" if its `apply`
-/// is invoked. The concrete behavior lands in issues A5–A9; until
-/// then the parser can still validate YAML end-to-end and tests can
-/// thread real `SurgeryPipeline` values through the load path.
-struct NotYetImplementedOp {
-    name: &'static str,
-    summary: String,
-    // Compiled glob is retained so the eventual concrete op can
-    // inherit it without re-parsing. Unused for now (the placeholder
-    // does not apply weights), but its presence keeps the parser
-    // honest about validating glob syntax up-front.
-    _glob: GlobMatcher,
-}
-
-impl SurgeryOp for NotYetImplementedOp {
-    fn apply(&self, _weights: &mut WeightMap, _cfg: &serde_json::Value) -> Result<(), SurgeryError> {
-        Err(SurgeryError::Other(anyhow::anyhow!(
-            "surgery op `{}` is not yet implemented ({})",
-            self.name,
-            self.summary,
-        )))
-    }
-
-    fn name(&self) -> &'static str {
-        self.name
-    }
 }
 
 #[cfg(test)]
@@ -507,10 +475,7 @@ mod tests {
     /// Helper: create a tempdir, write the YAML there, plus a list
     /// of dummy "donor" safetensors files. Returns the tempdir so
     /// the caller can keep it alive.
-    fn write_yaml_with_donors(
-        yaml: &str,
-        donor_names: &[&str],
-    ) -> (tempfile::TempDir, PathBuf) {
+    fn write_yaml_with_donors(yaml: &str, donor_names: &[&str]) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
         for name in donor_names {
             let donor_path = dir.path().join(name);
@@ -583,8 +548,7 @@ operations:
     source: "./task_vec.safetensors"
     alpha: 0.5
 "#;
-        let (_dir, yaml_path) =
-            write_yaml_with_donors(yaml, &["task_vec.safetensors"]);
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["task_vec.safetensors"]);
         let pipeline = parse_config_file(&yaml_path).expect("parse with relative source");
         assert_eq!(pipeline.len(), 1);
     }
@@ -660,7 +624,10 @@ operations:
 "#;
         let err = parse_config_str(yaml, None).expect_err("missing layer_ids must fail");
         let msg = format!("{err}");
-        assert!(msg.contains("layer_ids"), "error must mention layer_ids: {msg}");
+        assert!(
+            msg.contains("layer_ids"),
+            "error must mention layer_ids: {msg}"
+        );
     }
 
     #[test]
@@ -690,7 +657,10 @@ operations:
 "#;
         let err = parse_config_str(yaml, None).expect_err("empty list must fail");
         let msg = format!("{err}");
-        assert!(msg.contains("at least one id"), "error must reject empty: {msg}");
+        assert!(
+            msg.contains("at least one id"),
+            "error must reject empty: {msg}"
+        );
     }
 
     #[test]
@@ -736,8 +706,7 @@ operations:
     ratio: 0.3
     method: slerp
 "#;
-        let (_dir, yaml_path) =
-            write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
         let pipeline = parse_config_file(&yaml_path).expect("interpolate parses");
         assert_eq!(pipeline.len(), 1);
     }
@@ -753,8 +722,7 @@ operations:
     ratio: 1.5
     method: lerp
 "#;
-        let (_dir, yaml_path) =
-            write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
         let err = parse_config_file(&yaml_path).expect_err("ratio>1 must fail");
         let msg = format!("{err}");
         assert!(msg.contains("ratio"), "error must mention ratio: {msg}");
@@ -781,7 +749,10 @@ operations:
 "#; // factor missing
         let err = parse_config_str(yaml, None).expect_err("missing field must fail");
         let msg = format!("{err}");
-        assert!(msg.contains("factor"), "error must mention missing field: {msg}");
+        assert!(
+            msg.contains("factor"),
+            "error must mention missing field: {msg}"
+        );
     }
 
     #[test]
@@ -825,43 +796,6 @@ operations:
             msg.contains("glob") || msg.contains("pattern") || msg.contains("malformed"),
             "error must mention glob issue: {msg}"
         );
-    }
-
-    #[test]
-    fn placeholder_op_returns_not_yet_implemented_on_apply() {
-        // Acceptance criterion: the parser builds a pipeline, but
-        // the op that has not yet landed (A9: interpolate) remains
-        // an explicit "not yet implemented" stub. Calling `apply`
-        // must error visibly so a user who runs surgery against an
-        // unimplemented variant does not get a silent no-op. `scale`
-        // (A5), `add` (A6), `prune` (A7), and `replace` (A8) now
-        // materialize to real ops and are exercised by their own
-        // integration tests instead.
-        let (_dir, yaml_path) = write_yaml_with_donors(
-            r#"version: 1
-operations:
-  - op: interpolate
-    pattern: "*"
-    source_a: "./a.safetensors"
-    source_b: "./b.safetensors"
-    ratio: 0.5
-    method: lerp
-"#,
-            &["a.safetensors", "b.safetensors"],
-        );
-        let pipeline = parse_config_file(&yaml_path).expect("parse");
-        let mut weights = WeightMap::new();
-        let result =
-            WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null);
-        match result {
-            Ok(_) => panic!("placeholder op must surface an error"),
-            Err(msg) => {
-                assert!(
-                    msg.contains("not yet implemented"),
-                    "placeholder error must say so: {msg}"
-                );
-            }
-        }
     }
 
     #[test]

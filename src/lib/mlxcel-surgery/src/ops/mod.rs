@@ -20,7 +20,7 @@
 //!
 //! - Public struct is the bare op name in PascalCase
 //!   ([`scale::ScaleOp`], [`add::AddOp`], [`prune::PruneOp`],
-//!   [`replace::ReplaceOp`], future `InterpolateOp`). Each is
+//!   [`replace::ReplaceOp`], [`interpolate::InterpolateOp`]). Each is
 //!   `Send + Sync` and stateless across `apply` calls.
 //! - Construction goes through a `from_spec` constructor that consumes
 //!   the already-validated `OpSpec::*` variant from the YAML parser
@@ -31,6 +31,7 @@
 //! §3.2 for the operation matrix.
 
 pub mod add;
+pub mod interpolate;
 pub mod prune;
 pub mod replace;
 pub mod scale;
@@ -43,6 +44,7 @@ mod add_test_helpers;
 mod add_tests;
 
 pub use add::AddOp;
+pub use interpolate::InterpolateOp;
 pub use prune::{PruneOp, PruneSelector};
 pub use replace::ReplaceOp;
 pub use scale::ScaleOp;

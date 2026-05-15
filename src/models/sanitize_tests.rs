@@ -759,47 +759,42 @@ mod surgery_integration {
     }
 
     #[test]
-    fn non_empty_yaml_config_surfaces_not_yet_implemented_through_loader() {
+    fn nonmatching_pattern_surfaces_zero_match_error_through_loader() {
         // Acceptance criterion (b) — the parser returns a real
-        // `SurgeryPipeline` that consumes through A1's hook. For the
-        // remaining op that has not yet landed (A9: interpolate),
-        // the placeholder errors with "not yet implemented"; this
-        // test pins that error reaching the caller via
+        // `SurgeryPipeline` that consumes through A1's hook, and
+        // op-level errors propagate end-to-end. With all five Axis A
+        // ops now landed (#365 / A1 → #378 / A9), the canonical
+        // op-level error to assert on is the "zero matches" condition
+        // every real op emits when its glob does not select any
+        // tensor. This test pins that error reaching the caller via
         // `load_text_weights`, which proves the wiring is complete
-        // and there is no silent no-op. `scale` (A5), `add` (A6),
-        // `prune` (A7), and `replace` (A8) are now real and are
-        // exercised by separate tests.
-        let dir = temp_model_dir("yaml_not_yet_implemented");
+        // and there is no silent no-op.
+        let dir = temp_model_dir("yaml_zero_match_through_loader");
         write_text_model_fixture(&dir);
-        let config_dir = temp_model_dir("yaml_not_yet_implemented_config");
+        let config_dir = temp_model_dir("yaml_zero_match_through_loader_config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        // Stub donor files for interpolate's source_a / source_b
-        // validation (parser checks path existence at parse time).
-        std::fs::write(config_dir.join("a.safetensors"), b"\x00\x00\x00\x00").unwrap();
-        std::fs::write(config_dir.join("b.safetensors"), b"\x00\x00\x00\x00").unwrap();
         let yaml_path = config_dir.join("surgery.yaml");
         std::fs::write(
             &yaml_path,
             r#"version: 1
 operations:
-  - op: interpolate
-    pattern: "*"
-    source_a: "./a.safetensors"
-    source_b: "./b.safetensors"
-    ratio: 0.5
-    method: lerp
+  - op: scale
+    pattern: "no.such.key.anywhere"
+    factor: 2.0
 "#,
         )
         .unwrap();
         let pipeline =
-            mlxcel_surgery::parse_config_file(&yaml_path).expect("interpolate op parses");
+            mlxcel_surgery::parse_config_file(&yaml_path).expect("scale yaml must parse");
 
         let result = load_text_weights(&dir, Some(&pipeline));
         match result {
-            Ok(_) => panic!("placeholder op must surface an error end-to-end"),
+            Ok(_) => panic!("zero-match op must surface an error end-to-end"),
             Err(err) => assert!(
-                err.contains("not yet implemented"),
-                "expected not-yet-implemented error, got: {err}",
+                err.to_lowercase().contains("zero")
+                    || err.to_lowercase().contains("no match")
+                    || err.to_lowercase().contains("matched no"),
+                "expected zero-match style error, got: {err}",
             ),
         }
 
@@ -954,28 +949,22 @@ operations:
     fn active_pipeline_slot_is_consulted_when_transform_arg_is_none() {
         let _env_guard = crate::test_support::env_lock::env_lock();
 
-        // Install a placeholder pipeline that errors on apply, then
-        // call `load_text_weights(_, None)`. The active-pipeline slot
-        // must be consulted because the explicit `transform` is None,
-        // and the placeholder error must propagate out. Uses
-        // `interpolate` because `scale` (A5), `add` (A6), `prune`
-        // (A7), and `replace` (A8) now materialize to real ops;
-        // `interpolate` remains a placeholder until A9.
-        let donor_dir = temp_model_dir("active_slot_donors");
-        std::fs::create_dir_all(&donor_dir).unwrap();
-        std::fs::write(donor_dir.join("a.safetensors"), b"\x00\x00\x00\x00").unwrap();
-        std::fs::write(donor_dir.join("b.safetensors"), b"\x00\x00\x00\x00").unwrap();
+        // Install a real op pipeline whose glob deliberately matches
+        // nothing in the fixture, then call `load_text_weights(_,
+        // None)`. The active-pipeline slot must be consulted because
+        // the explicit `transform` is None, and the zero-match error
+        // emitted by `ScaleOp::apply` must propagate out. All five
+        // Axis A ops (#365 / A1 → #378 / A9) are now real, so we use
+        // the zero-match diagnostic — every real op emits one — as
+        // the load-path-visible signal.
         let yaml = r#"version: 1
 operations:
-  - op: interpolate
-    pattern: "*"
-    source_a: "./a.safetensors"
-    source_b: "./b.safetensors"
-    ratio: 0.5
-    method: lerp
+  - op: scale
+    pattern: "no.such.key.anywhere"
+    factor: 2.0
 "#;
-        let pipeline = mlxcel_surgery::parse_config_str(yaml, Some(&donor_dir))
-            .expect("interpolate parses");
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, None)
+            .expect("scale yaml must parse");
         let _slot_guard = ScopedActivePipeline::install(Arc::new(pipeline));
 
         let dir_with_slot = temp_model_dir("active_slot_installed");
@@ -985,17 +974,18 @@ operations:
         match result {
             Ok(_) => panic!(
                 "active-pipeline slot must be consulted when transform=None, \
-                 expected placeholder 'not yet implemented' error"
+                 expected zero-match error from ScaleOp"
             ),
             Err(err) => assert!(
-                err.contains("not yet implemented"),
+                err.to_lowercase().contains("zero")
+                    || err.to_lowercase().contains("no match")
+                    || err.to_lowercase().contains("matched no"),
                 "active-pipeline slot integration must propagate errors, got: {err}",
             ),
         }
 
         // `_slot_guard` drops here and clears the slot back to None.
         std::fs::remove_dir_all(&dir_with_slot).unwrap();
-        std::fs::remove_dir_all(&donor_dir).unwrap();
     }
 
     /// Issue #371 (A4): explicit `transform` argument takes precedence
@@ -1260,6 +1250,12 @@ operations:
         // bit-identical to the baseline (proves the op only mutates
         // matching keys; A4's `--surgery` flag will route this
         // exact pipeline through the same loader path).
+        //
+        // Issue #371: the baseline `load_text_weights(_, None)` call
+        // below consults the process-global active-pipeline slot, so
+        // we must hold `env_lock` to keep parallel tests that touch
+        // that slot from polluting our baseline read.
+        let _env_guard = crate::test_support::env_lock::env_lock();
         let dir = temp_model_dir("yaml_replace_e2e");
         write_text_model_fixture(&dir);
 
