@@ -19,8 +19,9 @@
 //! conventions:
 //!
 //! - Public struct is the bare op name in PascalCase
-//!   ([`scale::ScaleOp`], [`add::AddOp`], future `PruneOp`, ...). Each is
-//!   `Send + Sync` and stateless across `apply` calls.
+//!   ([`scale::ScaleOp`], [`add::AddOp`], [`prune::PruneOp`], future
+//!   `ReplaceOp`, `InterpolateOp`). Each is `Send + Sync` and stateless
+//!   across `apply` calls.
 //! - Construction goes through a `from_spec` constructor that consumes
 //!   the already-validated `OpSpec::*` variant from the YAML parser
 //!   ([`crate::config`]). The factory in `crate::config` is the only
@@ -30,6 +31,7 @@
 //! §3.2 for the operation matrix.
 
 pub mod add;
+pub mod prune;
 pub mod scale;
 
 #[cfg(test)]
@@ -40,4 +42,5 @@ mod add_test_helpers;
 mod add_tests;
 
 pub use add::AddOp;
+pub use prune::{PruneOp, PruneSelector};
 pub use scale::ScaleOp;

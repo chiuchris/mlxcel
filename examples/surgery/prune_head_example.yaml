@@ -1,0 +1,24 @@
+# Attention-head pruning example (Axis A, issue #376, A7).
+#
+# Zeroes Q-head 3 and Q-head 7 of layer 12 in a Llama-family model.
+# The op interprets `head_ids` as **Q head ids** under the GQA-safe
+# policy: q_proj and o_proj are zeroed on the corresponding slice;
+# k_proj and v_proj are NOT touched (a single KV head is typically
+# shared across multiple Q heads in GQA models, so zeroing it would
+# silently kill more Q heads than the user asked for). See
+# `src/lib/mlxcel-surgery/src/ops/prune.rs` for the full policy.
+#
+# Use this YAML with the (in-progress) `--surgery` CLI flag (A4,
+# issue #371) or programmatically by passing the parsed pipeline as
+# the `WeightTransform` argument to `load_text_weights`.
+#
+# Equivalent variants:
+#   granularity: layer        with `layer_ids:   [12]`
+#   granularity: mlp_channel  with `channel_ids: [1024, 2048]`
+
+version: 1
+operations:
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.12.self_attn.*"
+    head_ids: [3, 7]

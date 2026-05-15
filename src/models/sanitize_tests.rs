@@ -762,31 +762,37 @@ mod surgery_integration {
     fn non_empty_yaml_config_surfaces_not_yet_implemented_through_loader() {
         // Acceptance criterion (b) — the parser returns a real
         // `SurgeryPipeline` that consumes through A1's hook. For ops
-        // that have not yet landed (A7–A9: prune / replace /
-        // interpolate), the placeholder errors with "not yet
-        // implemented"; this test pins that error reaching the
-        // caller via `load_text_weights`, which proves the wiring
-        // is complete and there is no silent no-op. `scale` (A5)
-        // and `add` (A6) are now real and are exercised by separate
-        // tests.
+        // that have not yet landed (A8–A9: replace / interpolate),
+        // the placeholder errors with "not yet implemented"; this
+        // test pins that error reaching the caller via
+        // `load_text_weights`, which proves the wiring is complete
+        // and there is no silent no-op. `scale` (A5), `add` (A6),
+        // and `prune` (A7) are now real and are exercised by
+        // separate tests.
         let dir = temp_model_dir("yaml_not_yet_implemented");
         write_text_model_fixture(&dir);
         let config_dir = temp_model_dir("yaml_not_yet_implemented_config");
         std::fs::create_dir_all(&config_dir).unwrap();
+        // Stub donor files for interpolate's source_a / source_b
+        // validation (parser checks path existence at parse time).
+        std::fs::write(config_dir.join("a.safetensors"), b"\x00\x00\x00\x00").unwrap();
+        std::fs::write(config_dir.join("b.safetensors"), b"\x00\x00\x00\x00").unwrap();
         let yaml_path = config_dir.join("surgery.yaml");
         std::fs::write(
             &yaml_path,
             r#"version: 1
 operations:
-  - op: prune
-    granularity: attention_head
-    pattern: "model.layers.0.self_attn.*"
-    head_ids: [0]
+  - op: interpolate
+    pattern: "*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 0.5
+    method: lerp
 "#,
         )
         .unwrap();
         let pipeline =
-            mlxcel_surgery::parse_config_file(&yaml_path).expect("prune op parses");
+            mlxcel_surgery::parse_config_file(&yaml_path).expect("interpolate op parses");
 
         let result = load_text_weights(&dir, Some(&pipeline));
         match result {
@@ -817,6 +823,12 @@ operations:
         // and shape, and the pipeline did not error out. A
         // non-zero numerical check lives in the synthetic
         // WeightMap unit tests inside `mlxcel-surgery`.
+        //
+        // Issue #371: the second `load_text_weights(_, None)` call
+        // below consults the process-global active-pipeline slot, so
+        // we must hold `env_lock` to keep parallel tests that touch
+        // that slot from polluting our baseline read.
+        let _env_guard = crate::test_support::env_lock::env_lock();
         let dir = temp_model_dir("yaml_scale_real");
         write_text_model_fixture(&dir);
         let yaml_path = dir.join("surgery.yaml");
@@ -945,18 +957,25 @@ operations:
         // Install a placeholder pipeline that errors on apply, then
         // call `load_text_weights(_, None)`. The active-pipeline slot
         // must be consulted because the explicit `transform` is None,
-        // and the placeholder error must propagate out. Uses `prune`
-        // because `scale` (A5) and `add` (A6) now materialize to real
-        // ops; `prune` / `replace` / `interpolate` remain placeholders
-        // until A7–A9.
+        // and the placeholder error must propagate out. Uses
+        // `interpolate` because `scale` (A5), `add` (A6), and `prune`
+        // (A7) now materialize to real ops; `replace` / `interpolate`
+        // remain placeholders until A8–A9.
+        let donor_dir = temp_model_dir("active_slot_donors");
+        std::fs::create_dir_all(&donor_dir).unwrap();
+        std::fs::write(donor_dir.join("a.safetensors"), b"\x00\x00\x00\x00").unwrap();
+        std::fs::write(donor_dir.join("b.safetensors"), b"\x00\x00\x00\x00").unwrap();
         let yaml = r#"version: 1
 operations:
-  - op: prune
-    granularity: attention_head
-    pattern: "model.layers.0.self_attn.*"
-    head_ids: [0]
+  - op: interpolate
+    pattern: "*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 0.5
+    method: lerp
 "#;
-        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("prune parses");
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, Some(&donor_dir))
+            .expect("interpolate parses");
         let _slot_guard = ScopedActivePipeline::install(Arc::new(pipeline));
 
         let dir_with_slot = temp_model_dir("active_slot_installed");
@@ -976,6 +995,7 @@ operations:
 
         // `_slot_guard` drops here and clears the slot back to None.
         std::fs::remove_dir_all(&dir_with_slot).unwrap();
+        std::fs::remove_dir_all(&donor_dir).unwrap();
     }
 
     /// Issue #371 (A4): explicit `transform` argument takes precedence
@@ -1017,6 +1037,216 @@ operations:
             1,
             "explicit transform must be the one invoked"
         );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Write a Llama-shaped synthetic fixture suitable for a prune
+    /// end-to-end test (#376). The fixture sets `num_attention_heads=4`,
+    /// `num_key_value_heads=4` (MHA so the test does not have to assert
+    /// on GQA-skip semantics here), `hidden_size=32`, `head_dim=8`,
+    /// `intermediate_size=64`, and one transformer block.
+    ///
+    /// Used by: end-to-end PruneOp tests below.
+    fn write_prune_fixture(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("config.json"),
+            serde_json::to_vec(&json!({
+                "model_type": "llama",
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "hidden_size": 32,
+                "head_dim": 8,
+                "intermediate_size": 64,
+                "num_hidden_layers": 1,
+                "tie_word_embeddings": false,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // q_proj [num_heads*head_dim=32, hidden=32] = 1024 f32 ones.
+        let qkvo_shape = vec![32usize, 32usize];
+        let qkvo_data = vec![0u8; 4 * 32 * 32];
+        // Fill with f32 = 1.0 little-endian: 0x0000803F.
+        let mut q_bytes = qkvo_data.clone();
+        for chunk in q_bytes.chunks_exact_mut(4) {
+            chunk[0] = 0x00;
+            chunk[1] = 0x00;
+            chunk[2] = 0x80;
+            chunk[3] = 0x3F;
+        }
+        let o_bytes = q_bytes.clone();
+        let kv_bytes = q_bytes.clone();
+        write_safetensors(
+            &dir.join("model.safetensors"),
+            &[
+                (
+                    "model.embed_tokens.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: vec![16, 32],
+                        data: vec![0u8; 16 * 32 * 4],
+                    },
+                ),
+                (
+                    "lm_head.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: vec![16, 32],
+                        data: vec![0u8; 16 * 32 * 4],
+                    },
+                ),
+                (
+                    "model.layers.0.self_attn.q_proj.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: qkvo_shape.clone(),
+                        data: q_bytes,
+                    },
+                ),
+                (
+                    "model.layers.0.self_attn.o_proj.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: qkvo_shape.clone(),
+                        data: o_bytes,
+                    },
+                ),
+                (
+                    "model.layers.0.self_attn.k_proj.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: qkvo_shape.clone(),
+                        data: kv_bytes.clone(),
+                    },
+                ),
+                (
+                    "model.layers.0.self_attn.v_proj.weight",
+                    OwnedTensor {
+                        dtype: SafeTensorDtype::F32,
+                        shape: qkvo_shape,
+                        data: kv_bytes,
+                    },
+                ),
+            ],
+        );
+    }
+
+    /// Read the f32 contents of a weight key as a flat `Vec<f32>`.
+    fn read_f32_weight(weights: &WeightMap, key: &str) -> Vec<f32> {
+        let arr = weights
+            .get(key)
+            .unwrap_or_else(|| panic!("key {key} not in weight map"));
+        mlxcel_core::eval(arr);
+        let bytes = mlxcel_core::array_to_raw_bytes(arr);
+        let mut out = Vec::with_capacity(bytes.len() / 4);
+        for chunk in bytes.chunks_exact(4) {
+            out.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        out
+    }
+
+    #[test]
+    fn prune_op_runs_through_load_text_weights() {
+        // Acceptance criterion (b) for #376 — a concrete PruneOp
+        // routed through the consolidated text-weight load path must
+        // actually zero the right slice of the right tensor without
+        // crashing or returning NaN/Inf. This is the end-to-end
+        // integration test that A4 (`--surgery` CLI flag) will
+        // eventually run on a real model; here we exercise the same
+        // code path with a Llama-shaped synthetic fixture.
+        use mlxcel_surgery::{PruneOp, PruneSelector};
+
+        let dir = temp_model_dir("prune_e2e_basic");
+        write_prune_fixture(&dir);
+
+        let op = PruneOp::new(
+            "model.layers.0.self_attn.*",
+            PruneSelector::AttentionHead { head_ids: vec![1] },
+        )
+        .expect("compile prune op");
+        let mut pipeline = SurgeryPipeline::new();
+        pipeline.push(op.into_shared());
+
+        let loaded = load_text_weights(&dir, Some(&pipeline)).expect("load with surgery");
+
+        // q_proj head 1 = rows [8..16) of shape [32, 32] must be zero;
+        // every other row must remain 1.0.
+        let q = read_f32_weight(&loaded, "model.layers.0.self_attn.q_proj.weight");
+        for r in 0..32usize {
+            let row_sum: f32 = q[r * 32..(r + 1) * 32].iter().sum();
+            if (8..16).contains(&r) {
+                assert_eq!(row_sum, 0.0, "q_proj row {r} (head 1) must be zero");
+            } else {
+                assert_eq!(row_sum, 32.0, "q_proj row {r} must remain ones");
+            }
+        }
+
+        // o_proj head 1 = columns [8..16) of shape [32, 32] must be
+        // zero; every other column 1.0.
+        let o = read_f32_weight(&loaded, "model.layers.0.self_attn.o_proj.weight");
+        for r in 0..32 {
+            for c in 0..32 {
+                let v = o[r * 32 + c];
+                let expected = if (8..16).contains(&c) { 0.0 } else { 1.0 };
+                assert_eq!(v, expected, "o_proj[{r}, {c}] mismatch");
+            }
+        }
+
+        // KV are untouched per the GQA-safe policy. (Even though this
+        // fixture is MHA — num_kv_heads == num_heads — the policy
+        // still applies because the implementation does not
+        // special-case MHA. Documenting and enforcing the policy
+        // uniformly avoids surprise across model families.)
+        let k = read_f32_weight(&loaded, "model.layers.0.self_attn.k_proj.weight");
+        assert!(k.iter().all(|&v| v == 1.0), "k_proj must remain untouched");
+        let v = read_f32_weight(&loaded, "model.layers.0.self_attn.v_proj.weight");
+        assert!(v.iter().all(|&v| v == 1.0), "v_proj must remain untouched");
+
+        // No NaN/Inf anywhere — paranoia check for slice_update path.
+        for k in loaded.keys() {
+            let floats = read_f32_weight(&loaded, k);
+            for (i, &f) in floats.iter().enumerate() {
+                assert!(f.is_finite(), "{k}[{i}] = {f} is NaN/Inf");
+            }
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn prune_op_via_yaml_runs_through_load_text_weights() {
+        // Same as above, but routed through the YAML factory. This
+        // proves the YAML -> SurgeryPipeline -> SurgeryOp::apply path
+        // works end-to-end (the path A4's CLI will use).
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.0.self_attn.*"
+    head_ids: [2]
+"#;
+        let pipeline =
+            mlxcel_surgery::parse_config_str(yaml, None).expect("YAML must parse");
+        assert_eq!(pipeline.len(), 1);
+
+        let dir = temp_model_dir("prune_e2e_yaml");
+        write_prune_fixture(&dir);
+
+        let loaded = load_text_weights(&dir, Some(&pipeline)).expect("load with surgery");
+
+        let q = read_f32_weight(&loaded, "model.layers.0.self_attn.q_proj.weight");
+        // Head 2 = rows [16..24).
+        for r in 0..32 {
+            let row_sum: f32 = q[r * 32..(r + 1) * 32].iter().sum();
+            if (16..24).contains(&r) {
+                assert_eq!(row_sum, 0.0);
+            } else {
+                assert_eq!(row_sum, 32.0);
+            }
+        }
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -49,11 +49,12 @@
 //! The parser validates schema syntax, glob pattern syntax, schema
 //! version, and the presence of external source files at parse time
 //! (so the load fails before any weights are mutated). The `scale`
-//! (A5) and `add` (A6) variants materialize to real
-//! [`crate::ops::ScaleOp`] / [`crate::ops::AddOp`] instances; the
-//! remaining variants (`prune` / `replace` / `interpolate`) still
-//! construct placeholder [`crate::SurgeryOp`]s that return a "not yet
-//! implemented" error if `apply` is invoked, pending A7–A9.
+//! (A5), `add` (A6), and `prune` (A7) variants materialize to real
+//! [`crate::ops::ScaleOp`] / [`crate::ops::AddOp`] /
+//! [`crate::ops::PruneOp`] instances; the remaining variants
+//! (`replace` / `interpolate`) still construct placeholder
+//! [`crate::SurgeryOp`]s that return a "not yet implemented" error if
+//! `apply` is invoked, pending A8–A9.
 //!
 //! ## Path resolution
 //!
@@ -199,11 +200,12 @@ pub enum InterpolateMethod {
 /// YAML. Pass the directory containing the YAML file when calling
 /// from [`parse_config_file`], or `None` to require absolute paths.
 ///
-/// On success, the `scale` (A5) and `add` (A6) operations are
-/// materialized as real [`ScaleOp`] / [`crate::ops::AddOp`] instances;
-/// the remaining variants (`prune` / `replace` / `interpolate`) are
-/// still placeholder [`SurgeryOp`]s that record the parsed spec and
-/// return a "not yet implemented" error on `apply` until A7–A9 land.
+/// On success, the `scale` (A5), `add` (A6), and `prune` (A7)
+/// operations are materialized as real [`ScaleOp`] /
+/// [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] instances; the
+/// remaining variants (`replace` / `interpolate`) are still
+/// placeholder [`SurgeryOp`]s that record the parsed spec and return
+/// a "not yet implemented" error on `apply` until A8–A9 land.
 ///
 /// Used by: [`parse_config_file`], future CLI wiring (A4)
 pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
@@ -293,15 +295,25 @@ fn materialize_op(
             channel_ids,
             layer_ids,
         } => {
-            let glob = compile_glob(idx, "prune", &pattern)?;
+            // Validate glob syntax up-front so the YAML parser fails
+            // cleanly before A7 builds a real PruneOp. Discard the
+            // compiled glob — `PruneOp::new` re-compiles internally —
+            // because matching is constructor-private.
+            let _glob = compile_glob(idx, "prune", &pattern)?;
             validate_prune_ids(idx, granularity, &head_ids, &channel_ids, &layer_ids)?;
-            Ok(Arc::new(NotYetImplementedOp {
-                name: "prune",
-                summary: format!(
-                    "prune(granularity={granularity:?}, pattern={pattern:?}, head_ids={head_ids:?}, channel_ids={channel_ids:?}, layer_ids={layer_ids:?})"
-                ),
-                _glob: glob,
-            }))
+            // A7 dispatches granularity to the concrete `PruneOp`.
+            // Errors here are user-facing (e.g. invalid id list), so
+            // we route them through `spec_error` to keep the message
+            // shape consistent with the rest of the parser.
+            let op = crate::ops::prune::build_from_yaml(
+                &pattern,
+                granularity,
+                head_ids,
+                channel_ids,
+                layer_ids,
+            )
+            .map_err(|e| spec_error(idx, "prune", &format!("{e}")))?;
+            Ok(Arc::new(op))
         }
         OpSpec::Replace {
             pattern,
@@ -814,21 +826,26 @@ operations:
     #[test]
     fn placeholder_op_returns_not_yet_implemented_on_apply() {
         // Acceptance criterion: the parser builds a pipeline, but
-        // ops that have not yet landed (A7–A9: prune / replace /
+        // ops that have not yet landed (A8–A9: replace /
         // interpolate) remain explicit "not yet implemented" stubs.
         // Calling `apply` must error visibly so a user who runs
         // surgery against an unimplemented variant does not get a
-        // silent no-op. `scale` (A5) and `add` (A6) now materialize
-        // to real ops and are exercised by their own integration
-        // tests instead.
-        let yaml = r#"version: 1
+        // silent no-op. `scale` (A5), `add` (A6), and `prune` (A7)
+        // now materialize to real ops and are exercised by their
+        // own integration tests instead.
+        let (_dir, yaml_path) = write_yaml_with_donors(
+            r#"version: 1
 operations:
-  - op: prune
-    granularity: attention_head
-    pattern: "model.layers.0.self_attn.*"
-    head_ids: [0]
-"#;
-        let pipeline = parse_config_str(yaml, None).expect("parse");
+  - op: interpolate
+    pattern: "*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 0.5
+    method: lerp
+"#,
+            &["a.safetensors", "b.safetensors"],
+        );
+        let pipeline = parse_config_file(&yaml_path).expect("parse");
         let mut weights = WeightMap::new();
         let result =
             WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null);
