@@ -72,16 +72,19 @@ pub const DEFAULT_DFLASH_BLOCK_SIZE: u32 = 16;
 pub struct SpeculativeArgs {
     /// Speculative drafter kind. Optional.
     ///
-    /// Accepted values: `dflash`, `mtp`. When unset AND `--draft-model` is
-    /// supplied, the kind is auto-detected from the drafter's
+    /// Accepted values: `dflash`, `mtp`. When unset AND a drafter path is
+    /// supplied (`--draft-model` on `mlxcel`, `--model-draft` on
+    /// `mlxcel-server`), the kind is auto-detected from the drafter's
     /// `config.json::model_type` via
     /// `mlxcel_core::drafter::resolve_drafter_kind`. Auto-detect maps
     /// `gemma4_assistant -> mtp`; everything else falls back to
     /// `dflash` (matching the upstream
     /// `DEFAULT_DRAFTER_KIND = "dflash"` convention).
     ///
-    /// When unset AND `--draft-model` is also unset, mlxcel runs the
-    /// classic non-MTP / non-DFlash `SpeculativeGenerator` path.
+    /// When unset AND no drafter path is supplied, mlxcel runs without a
+    /// speculative drafter. The offline `mlxcel generate` command keeps the
+    /// classic non-MTP / non-DFlash `SpeculativeGenerator` path when a
+    /// drafter is supplied without an explicit kind.
     ///
     /// Also read from `LLAMA_ARG_DRAFT_KIND` (and the mlxcel-native
     /// alias `MLXCEL_DRAFT_KIND`).

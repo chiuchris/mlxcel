@@ -114,7 +114,7 @@ pub(crate) struct ModelOptions {
     #[arg(long, value_name = "PATH")]
     pub(crate) adapter: Option<PathBuf>,
 
-    /// Path to draft model for speculative decoding (optional)
+    /// Path to draft model for classic offline speculative decoding (optional)
     #[arg(long, value_name = "PATH")]
     pub(crate) draft_model: Option<PathBuf>,
 
@@ -365,7 +365,7 @@ pub(crate) struct ServeArgs {
     #[arg(long = "n-predict", env = "LLAMA_ARG_N_PREDICT", default_value_t = -1)]
     n_predict: i32,
 
-    /// Path to draft model for speculative decoding
+    /// Path to drafter checkpoint for server speculative decoding
     #[arg(long, value_name = "PATH")]
     draft_model: Option<PathBuf>,
 

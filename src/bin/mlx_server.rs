@@ -198,7 +198,7 @@ struct ServerArgs {
     #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
     timeout: u64,
 
-    /// Path to draft model for speculative decoding
+    /// Path to drafter checkpoint for server speculative decoding
     #[arg(
         long = "model-draft",
         env = "LLAMA_ARG_MODEL_DRAFT",
