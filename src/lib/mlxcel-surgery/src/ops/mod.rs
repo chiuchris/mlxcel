@@ -19,7 +19,7 @@
 //! conventions:
 //!
 //! - Public struct is the bare op name in PascalCase
-//!   ([`scale::ScaleOp`], future `AddOp`, `PruneOp`, ...). Each is
+//!   ([`scale::ScaleOp`], [`add::AddOp`], future `PruneOp`, ...). Each is
 //!   `Send + Sync` and stateless across `apply` calls.
 //! - Construction goes through a `from_spec` constructor that consumes
 //!   the already-validated `OpSpec::*` variant from the YAML parser
@@ -29,6 +29,15 @@
 //! See `docs_internal/architecture/structural-finetuning-overview-20260419.md`
 //! §3.2 for the operation matrix.
 
+pub mod add;
 pub mod scale;
 
+#[cfg(test)]
+mod add_apply_tests;
+#[cfg(test)]
+mod add_test_helpers;
+#[cfg(test)]
+mod add_tests;
+
+pub use add::AddOp;
 pub use scale::ScaleOp;

@@ -1,0 +1,28 @@
+# Example surgery config: task-vector addition.
+#
+# Adds a precomputed task vector — typically the diff between two
+# fine-tuned variants of the same base architecture — to every
+# matching tensor at load time.  Mathematically:
+#
+#     base[key] += alpha * source[key]
+#
+# for every base tensor whose key matches `pattern` and is present
+# in the donor `source` safetensors file.
+#
+# Notes:
+# - Paths in this file are resolved relative to this YAML's parent
+#   directory.  Absolute paths are taken verbatim.
+# - `alpha` is optional and defaults to 1.0 when omitted.
+# - The first cut of `add` (#375 / axis A6) supports floating-point
+#   task vectors on floating-point base tensors only.  Quantized
+#   models can still apply addition to the matching `.scales` /
+#   `.biases` keys, or first dequantize via a future surgery op.
+# - The donor file referenced below is illustrative — it does not
+#   exist in-tree.
+
+version: 1
+operations:
+  - op: add
+    pattern: "model.layers.*.mlp.down_proj.weight"
+    source: "./task_vectors/personality_friendly.safetensors"
+    alpha: 0.5

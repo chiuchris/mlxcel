@@ -49,11 +49,11 @@
 //! The parser validates schema syntax, glob pattern syntax, schema
 //! version, and the presence of external source files at parse time
 //! (so the load fails before any weights are mutated). The `scale`
-//! variant materializes to a real [`crate::ops::ScaleOp`] from A5;
-//! the remaining variants (`add` / `prune` / `replace` /
-//! `interpolate`) still construct placeholder [`crate::SurgeryOp`]s
-//! that return a "not yet implemented" error if `apply` is invoked,
-//! pending A6–A9.
+//! (A5) and `add` (A6) variants materialize to real
+//! [`crate::ops::ScaleOp`] / [`crate::ops::AddOp`] instances; the
+//! remaining variants (`prune` / `replace` / `interpolate`) still
+//! construct placeholder [`crate::SurgeryOp`]s that return a "not yet
+//! implemented" error if `apply` is invoked, pending A7–A9.
 //!
 //! ## Path resolution
 //!
@@ -199,11 +199,11 @@ pub enum InterpolateMethod {
 /// YAML. Pass the directory containing the YAML file when calling
 /// from [`parse_config_file`], or `None` to require absolute paths.
 ///
-/// On success, the `scale` operation is materialized as a real
-/// [`ScaleOp`] (A5); the remaining variants (`add` / `prune` /
-/// `replace` / `interpolate`) are still placeholder
-/// [`SurgeryOp`]s that record the parsed spec and return a "not
-/// yet implemented" error on `apply` until A6–A9 land.
+/// On success, the `scale` (A5) and `add` (A6) operations are
+/// materialized as real [`ScaleOp`] / [`crate::ops::AddOp`] instances;
+/// the remaining variants (`prune` / `replace` / `interpolate`) are
+/// still placeholder [`SurgeryOp`]s that record the parsed spec and
+/// return a "not yet implemented" error on `apply` until A7–A9 land.
 ///
 /// Used by: [`parse_config_file`], future CLI wiring (A4)
 pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
@@ -273,19 +273,18 @@ fn materialize_op(
             source,
             alpha,
         } => {
+            // A6 (#375) — concrete factory hook for `op: add`.
+            // The compiled glob is built once here for validation and
+            // then handed off to `AddOp::from_compiled` so the
+            // operation does not re-parse it.
             let glob = compile_glob(idx, "add", &pattern)?;
             if !alpha.is_finite() {
                 return Err(spec_error(idx, "add", "alpha must be finite"));
             }
             let resolved = resolve_existing_source(idx, "add", "source", &source, base_dir)?;
-            Ok(Arc::new(NotYetImplementedOp {
-                name: "add",
-                summary: format!(
-                    "add(pattern={pattern:?}, source={}, alpha={alpha})",
-                    resolved.display()
-                ),
-                _glob: glob,
-            }))
+            Ok(Arc::new(crate::ops::AddOp::from_compiled(
+                glob, pattern, resolved, alpha,
+            )))
         }
         OpSpec::Prune {
             granularity,
@@ -815,24 +814,21 @@ operations:
     #[test]
     fn placeholder_op_returns_not_yet_implemented_on_apply() {
         // Acceptance criterion: the parser builds a pipeline, but
-        // ops that have not yet landed (A6–A9: add / prune /
-        // replace / interpolate) remain explicit "not yet
-        // implemented" stubs. Calling `apply` must error visibly so
-        // a user who runs surgery against an unimplemented variant
-        // does not get a silent no-op. `scale` (A5) now materializes
-        // to a real `ScaleOp` and is exercised by the integration
+        // ops that have not yet landed (A7–A9: prune / replace /
+        // interpolate) remain explicit "not yet implemented" stubs.
+        // Calling `apply` must error visibly so a user who runs
+        // surgery against an unimplemented variant does not get a
+        // silent no-op. `scale` (A5) and `add` (A6) now materialize
+        // to real ops and are exercised by their own integration
         // tests instead.
-        let (_dir, yaml_path) = write_yaml_with_donors(
-            r#"version: 1
+        let yaml = r#"version: 1
 operations:
-  - op: add
-    pattern: "*"
-    source: "./task_vec.safetensors"
-    alpha: 0.5
-"#,
-            &["task_vec.safetensors"],
-        );
-        let pipeline = parse_config_file(&yaml_path).expect("parse");
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.0.self_attn.*"
+    head_ids: [0]
+"#;
+        let pipeline = parse_config_str(yaml, None).expect("parse");
         let mut weights = WeightMap::new();
         let result =
             WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null);

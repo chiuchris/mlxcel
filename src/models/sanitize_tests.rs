@@ -762,38 +762,31 @@ mod surgery_integration {
     fn non_empty_yaml_config_surfaces_not_yet_implemented_through_loader() {
         // Acceptance criterion (b) — the parser returns a real
         // `SurgeryPipeline` that consumes through A1's hook. For ops
-        // that have not yet landed (A6–A9: add / prune / replace /
+        // that have not yet landed (A7–A9: prune / replace /
         // interpolate), the placeholder errors with "not yet
         // implemented"; this test pins that error reaching the
         // caller via `load_text_weights`, which proves the wiring
         // is complete and there is no silent no-op. `scale` (A5)
-        // is now real and is exercised by a separate test below.
-        //
-        // The YAML config + donor live in a *sibling* directory of
-        // the model fixture, not inside it — the consolidated
-        // loader globs `*.safetensors` in the model dir and would
-        // otherwise try to mmap the stub donor and fail before the
-        // surgery hook runs.
+        // and `add` (A6) are now real and are exercised by separate
+        // tests.
         let dir = temp_model_dir("yaml_not_yet_implemented");
         write_text_model_fixture(&dir);
         let config_dir = temp_model_dir("yaml_not_yet_implemented_config");
         std::fs::create_dir_all(&config_dir).unwrap();
-        let donor_path = config_dir.join("donor.safetensors");
-        std::fs::write(&donor_path, b"\x00\x00\x00\x00").unwrap();
         let yaml_path = config_dir.join("surgery.yaml");
         std::fs::write(
             &yaml_path,
             r#"version: 1
 operations:
-  - op: add
-    pattern: "*"
-    source: "./donor.safetensors"
-    alpha: 1.0
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.0.self_attn.*"
+    head_ids: [0]
 "#,
         )
         .unwrap();
         let pipeline =
-            mlxcel_surgery::parse_config_file(&yaml_path).expect("add op parses");
+            mlxcel_surgery::parse_config_file(&yaml_path).expect("prune op parses");
 
         let result = load_text_weights(&dir, Some(&pipeline));
         match result {
@@ -952,14 +945,18 @@ operations:
         // Install a placeholder pipeline that errors on apply, then
         // call `load_text_weights(_, None)`. The active-pipeline slot
         // must be consulted because the explicit `transform` is None,
-        // and the placeholder error must propagate out.
+        // and the placeholder error must propagate out. Uses `prune`
+        // because `scale` (A5) and `add` (A6) now materialize to real
+        // ops; `prune` / `replace` / `interpolate` remain placeholders
+        // until A7–A9.
         let yaml = r#"version: 1
 operations:
-  - op: scale
-    pattern: "*"
-    factor: 2.0
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.0.self_attn.*"
+    head_ids: [0]
 "#;
-        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("scale parses");
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("prune parses");
         let _slot_guard = ScopedActivePipeline::install(Arc::new(pipeline));
 
         let dir_with_slot = temp_model_dir("active_slot_installed");

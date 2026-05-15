@@ -44,3 +44,9 @@ anyhow = "1.0"
 # adjacent donor `.safetensors` so the parser's relative-path
 # resolution can be exercised without polluting the workspace.
 tempfile = "3"
+
+# `safetensors` writer used by AddOp's unit and integration tests to
+# build synthetic donor task-vector files. Version pinned to the
+# top-level `mlxcel` crate's pin to share a single transitive
+# dependency.
+safetensors = "0.7.0"
