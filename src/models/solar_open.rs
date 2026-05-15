@@ -844,7 +844,7 @@ impl SolarOpenModel {
             args.bits()
         );
 
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         let weights = sanitize_weights(weights, &args);
 
         let model = Self::from_weights(&weights, &args)?;

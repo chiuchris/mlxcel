@@ -31,7 +31,8 @@ use crate::models;
 use crate::vision;
 
 use super::{
-    load_vlm_weights, parse_vlm_config, read_sanitized_vlm_config, strip_language_model_prefix,
+    load_vlm_weights_common, parse_vlm_config, read_sanitized_vlm_config,
+    strip_language_model_prefix,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,7 +271,7 @@ pub(crate) fn load_llava_vlm(model_path: &Path) -> Result<LoadedModel> {
     let (config_str, full_config) = read_sanitized_vlm_config(model_path)?;
     let vlm_config: VLMConfig = parse_vlm_config(&config_str, "VLM config")?;
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
 
     let text_model_type = vlm_config
         .text_config
@@ -366,7 +367,7 @@ pub(crate) fn load_llava_bunny_vlm(model_path: &Path) -> Result<LoadedModel> {
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     sanitize_bunny_weight_keys(&mut weights);
 
     models::sanitize_tied_embeddings(&mut weights, &full_config);

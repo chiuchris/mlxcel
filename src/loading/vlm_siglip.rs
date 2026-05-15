@@ -30,7 +30,7 @@ use crate::LoadedModel;
 use crate::models;
 use crate::vision;
 
-use super::{load_vlm_weights, read_sanitized_vlm_config, strip_language_model_prefix};
+use super::{load_vlm_weights_common, read_sanitized_vlm_config, strip_language_model_prefix};
 
 fn quantization_params(full_config: &Value) -> (i32, i32) {
     let group_size = full_config
@@ -180,7 +180,7 @@ pub(crate) fn load_aya_vision_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::processors::siglip::SigLipProcessor;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     sanitize_aya_weights(&mut weights);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
@@ -276,7 +276,7 @@ pub(crate) fn load_paligemma_vlm(model_path: &Path) -> Result<LoadedModel> {
     use vision::processors::siglip::SigLipProcessor;
 
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     sanitize_paligemma_weights(&mut weights);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 

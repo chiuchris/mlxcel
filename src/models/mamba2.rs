@@ -691,7 +691,7 @@ impl Mamba2Model {
 
         // Load weights
         println!("[Mamba2] Loading weights from safetensors...");
-        let weights = crate::models::load_and_sanitize_weights(path)?;
+        let weights = crate::models::load_text_weights(path, None)?;
 
         // Process weights (handle conv1d weight transpose)
         let weights = Self::sanitize_weights(weights, &config);

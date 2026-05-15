@@ -70,8 +70,7 @@ impl Llama4StageExecutor {
         let args: models::llama4::TextArgs = serde_json::from_value(text_config.clone())
             .map_err(|err| anyhow!("failed to parse Llama 4 text config: {}", err))?;
 
-        let mut weights =
-            models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let mut weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         // Llama 4 Scout does not expose `tie_word_embeddings` — the
         // `language_model.lm_head.*` weights are always stored separately
         // from `language_model.model.embed_tokens.*`, so no tied-head

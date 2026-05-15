@@ -44,8 +44,7 @@ impl LlamaStageExecutor {
         let args: models::llama3::ModelArgs = serde_json::from_str(&config_str)
             .map_err(|err| anyhow!("failed to parse {}: {}", config_path.display(), err))?;
 
-        let mut weights =
-            models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let mut weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         let mut effective_filter = filter.clone();
         if args.tie_word_embeddings && filter.has_lm_head {
             effective_filter.has_embedding = true;

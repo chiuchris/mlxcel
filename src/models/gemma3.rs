@@ -861,7 +861,7 @@ impl Gemma3Model {
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
         // Load weights (with tied-embedding sanitization)
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Create model
         let model = Self::from_weights(&weights, &args)?;
@@ -928,7 +928,7 @@ impl Gemma3StageModel {
         let args: ModelArgs = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse {}: {}", config_path.display(), e))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut weights = crate::models::load_text_weights(model_dir, None)?;
         filter_weight_map(&mut weights, filter);
         Self::from_filtered_weights(&weights, &args, filter, stage_index)
     }

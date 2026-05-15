@@ -104,7 +104,34 @@ pub(super) fn require_object_mut<'a>(
         .ok_or_else(|| anyhow::anyhow!("Expected {} to be a JSON object", label))
 }
 
-fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
+/// Consolidated VLM weight load entry point with optional
+/// Axis A "weight-load surgery" hook.
+///
+/// All `src/loading/vlm_*.rs` family loaders funnel through this
+/// function with `transform = None` by default. It reads safetensors,
+/// applies Apple Silicon bf16 → f16 conversion for non-quantized
+/// models, then invokes the optional
+/// [`mlxcel_core::weights::WeightTransform`] hook.
+///
+/// When `transform` is `None`, behavior is bit-exact identical to the
+/// pre-refactor `load_vlm_weights` path: no observable change to any
+/// VLM load flow.
+///
+/// The bf16 → f16 conversion happens **before** the transform so
+/// transforms operate on the final-precision tensors (consistent with
+/// the text path in [`crate::models::load_text_weights`], where
+/// transforms also see post-sanitization, pre-precision weights — for
+/// VLMs the basic sanitization step is the family-specific weight
+/// remap which runs in the caller after we return). Surgery operations
+/// inspecting dtype therefore see the dtype the model graph will see.
+///
+/// Used by: all VLM family loaders in src/loading/vlm_*.rs
+/// (gemma, llava, nemotron_h_nano_omni, pixtral, qwen, siglip,
+/// special, youtu_vl)
+pub(crate) fn load_vlm_weights_common(
+    model_path: &Path,
+    transform: Option<&dyn mlxcel_core::weights::WeightTransform>,
+) -> Result<WeightMap> {
     let mut weights = mlxcel_core::weights::load_weights_from_dir(model_path)
         .map_err(|e| anyhow::anyhow!("{}", e))?;
 
@@ -119,6 +146,21 @@ fn load_vlm_weights(model_path: &Path) -> Result<WeightMap> {
                 crate::models::warn_bf16_precision();
             }
         }
+    }
+
+    // Axis A weight-load surgery hook (Epic #363). Invoked with the
+    // parsed config.json so transforms can inspect quantization or
+    // structural metadata. When `transform` is `None` the call is a
+    // no-op and behavior matches the pre-refactor path bit-exactly.
+    if let Some(transform) = transform {
+        let cfg = std::fs::read_to_string(model_path.join("config.json"))
+            .ok()
+            .map(|s| crate::models::sanitize_config_json(&s))
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .unwrap_or(serde_json::Value::Null);
+        transform
+            .apply(&mut weights, &cfg)
+            .map_err(|e| anyhow::anyhow!("{}", e))?;
     }
 
     Ok(weights)

@@ -236,7 +236,7 @@ impl GlmMoeDsaModel {
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
         let dsv32_args = args.to_dsv32_args();
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         let weights = DeepSeekV32Model::sanitize_weights_with_args(weights, &dsv32_args);
         let inner = DeepSeekV32Model::from_weights(&weights, &dsv32_args)?;
 

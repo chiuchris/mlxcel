@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::sanitize::{sanitize_config_json, sanitize_tied_embeddings};
-use mlxcel_core::weights::WeightMap;
+use super::sanitize::{load_text_weights, sanitize_config_json, sanitize_tied_embeddings};
+use mlxcel_core::weights::{WeightMap, WeightTransform};
 use mlxcel_core::{self, dtype};
 use safetensors::tensor::{Dtype as SafeTensorDtype, View};
 use serde_json::json;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn sample_weight_map(key: &str) -> WeightMap {
     let mut weights = WeightMap::new();
@@ -329,6 +330,200 @@ fn load_and_sanitize_weights_dequantizes_nvfp4_gemma4_checkpoint() {
             (v - 1.0f32).abs() < 1e-3,
             "Expected 1.0, got {v}; nibble=0x2 (1.0) * scale=1.0 * scale2=1.0 should equal 1.0"
         );
+    }
+
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+// --- Tests for the consolidated `load_text_weights` entry point and the
+// optional `WeightTransform` hook introduced for Axis A (issue #365). ---
+
+/// Build a minimal text model fixture: tiny config.json with no
+/// quantization plus a single safetensors shard containing
+/// `model.embed_tokens.weight`. Enough to exercise the consolidated
+/// loader's sanitize → optional transform → precision-cast pipeline.
+fn write_text_model_fixture(dir: &Path) {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("config.json"),
+        serde_json::to_vec(&json!({
+            "model_type": "llama",
+            "tie_word_embeddings": true,
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // Two F32 weights so we can verify both that sanitize copies
+    // `embed_tokens` into `lm_head` (via `tie_word_embeddings: true`)
+    // and that the transform observes the right keys.
+    let weight_data = vec![0u8; 4 * 4]; // 4 x F32 zeros
+    write_safetensors(
+        &dir.join("model.safetensors"),
+        &[
+            (
+                "model.embed_tokens.weight",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![2, 2],
+                    data: weight_data,
+                },
+            ),
+            (
+                "model.layers.0.self_attn.q_proj.weight",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![2, 2],
+                    data: vec![0u8; 4 * 4],
+                },
+            ),
+        ],
+    );
+}
+
+#[test]
+fn load_text_weights_with_none_transform_matches_legacy_path() {
+    // Bit-exactness (a) — when `transform = None` the consolidated
+    // entry point must produce exactly the same `WeightMap` (same
+    // keys, same dtypes, same shapes, byte-identical contents) as the
+    // legacy `load_and_sanitize_weights` alias. The alias itself is
+    // implemented as `load_text_weights(p, None)`, so this test
+    // doubles as a regression guard against accidental divergence
+    // between the alias and the new entry point.
+    let dir_a = temp_model_dir("text_load_none_transform_a");
+    let dir_b = temp_model_dir("text_load_none_transform_b");
+    write_text_model_fixture(&dir_a);
+    write_text_model_fixture(&dir_b);
+
+    let legacy = super::sanitize::load_and_sanitize_weights(&dir_a).unwrap();
+    let consolidated = load_text_weights(&dir_b, None).unwrap();
+
+    assert_eq!(
+        legacy.len(),
+        consolidated.len(),
+        "WeightMap entry count must match"
+    );
+    let mut keys_a: Vec<&String> = legacy.keys().collect();
+    let mut keys_b: Vec<&String> = consolidated.keys().collect();
+    keys_a.sort();
+    keys_b.sort();
+    assert_eq!(keys_a, keys_b, "key sets must match");
+
+    for k in keys_a {
+        let a = legacy.get(k).unwrap();
+        let b = consolidated.get(k).unwrap();
+        assert_eq!(
+            mlxcel_core::array_dtype(a),
+            mlxcel_core::array_dtype(b),
+            "dtype mismatch for key {k}"
+        );
+        assert_eq!(
+            mlxcel_core::array_shape(a),
+            mlxcel_core::array_shape(b),
+            "shape mismatch for key {k}"
+        );
+        mlxcel_core::eval(a);
+        mlxcel_core::eval(b);
+        let a_bytes = mlxcel_core::array_to_raw_bytes(a);
+        let b_bytes = mlxcel_core::array_to_raw_bytes(b);
+        assert_eq!(a_bytes, b_bytes, "byte mismatch for key {k}");
+    }
+
+    std::fs::remove_dir_all(&dir_a).unwrap();
+    std::fs::remove_dir_all(&dir_b).unwrap();
+}
+
+/// Counter-based `WeightTransform` that records how many times
+/// `apply` ran. Used to prove the hook is actually invoked by
+/// `load_text_weights` when a non-`None` transform is supplied.
+struct CountingTransform {
+    calls: AtomicUsize,
+}
+
+impl CountingTransform {
+    fn new() -> Self {
+        Self {
+            calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn call_count(&self) -> usize {
+        self.calls.load(Ordering::SeqCst)
+    }
+}
+
+impl WeightTransform for CountingTransform {
+    fn apply(&self, _weights: &mut WeightMap, _cfg: &serde_json::Value) -> Result<(), String> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[test]
+fn load_text_weights_invokes_transform_when_supplied() {
+    // Integration (b) — the optional hook must be invoked exactly
+    // once per call when a transform is supplied. With a no-op
+    // transform the produced `WeightMap` must match the `None` path
+    // bit-for-bit.
+    let dir_a = temp_model_dir("text_load_transform_invoked_a");
+    let dir_b = temp_model_dir("text_load_transform_invoked_b");
+    write_text_model_fixture(&dir_a);
+    write_text_model_fixture(&dir_b);
+
+    let baseline = load_text_weights(&dir_a, None).unwrap();
+    let transform = CountingTransform::new();
+    let with_hook = load_text_weights(&dir_b, Some(&transform)).unwrap();
+
+    assert_eq!(
+        transform.call_count(),
+        1,
+        "WeightTransform::apply must run exactly once per load"
+    );
+    assert_eq!(baseline.len(), with_hook.len());
+
+    // Verify byte-level equivalence between the no-transform path and
+    // the empty-transform path (this is the bit-exactness guarantee
+    // a no-op pipeline must uphold).
+    for (k, base) in &baseline {
+        let other = with_hook
+            .get(k)
+            .unwrap_or_else(|| panic!("missing key {k}"));
+        mlxcel_core::eval(base);
+        mlxcel_core::eval(other);
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(base),
+            mlxcel_core::array_to_raw_bytes(other),
+            "no-op transform must preserve weights bit-for-bit: key={k}"
+        );
+    }
+
+    std::fs::remove_dir_all(&dir_a).unwrap();
+    std::fs::remove_dir_all(&dir_b).unwrap();
+}
+
+/// `WeightTransform` that returns an error so we can verify error
+/// propagation from the consolidated loader.
+struct FailingTransform;
+
+impl WeightTransform for FailingTransform {
+    fn apply(&self, _weights: &mut WeightMap, _cfg: &serde_json::Value) -> Result<(), String> {
+        Err("intentional failure for test".to_string())
+    }
+}
+
+#[test]
+fn load_text_weights_propagates_transform_error() {
+    let dir = temp_model_dir("text_load_transform_error");
+    write_text_model_fixture(&dir);
+
+    let transform = FailingTransform;
+    let result = load_text_weights(&dir, Some(&transform));
+    match result {
+        Ok(_) => panic!("expected failing transform to surface an error"),
+        Err(err) => assert!(
+            err.contains("intentional failure for test"),
+            "expected transform error to be surfaced, got: {err}"
+        ),
     }
 
     std::fs::remove_dir_all(&dir).unwrap();

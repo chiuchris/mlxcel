@@ -594,7 +594,7 @@ impl OlmoeModel {
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
         // Load weights
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Sanitize weights (join expert weights if separate)
         let weights = sanitize_weights(weights, &args);

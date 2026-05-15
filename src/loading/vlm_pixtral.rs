@@ -31,7 +31,7 @@ use crate::models;
 use crate::vision;
 
 use super::llava::infer_llama_config_from_weights;
-use super::{load_vlm_weights, read_sanitized_vlm_config, strip_language_model_prefix};
+use super::{load_vlm_weights_common, read_sanitized_vlm_config, strip_language_model_prefix};
 
 struct PixtralFamilyContext {
     full_config: Value,
@@ -97,7 +97,7 @@ pub(super) fn build_mistral_text_config(full_config: &Value, weights: &WeightMap
 fn build_pixtral_family_context(model_path: &Path) -> Result<PixtralFamilyContext> {
     let (_config_str, full_config) = read_sanitized_vlm_config(model_path)?;
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     vision::encoders::pixtral::sanitize_pixtral_weights(&mut weights);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 

@@ -1355,7 +1355,7 @@ impl Gemma3nModel {
         let config = args.text_args();
 
         // Load weights
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Create model
         let language_model =

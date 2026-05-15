@@ -1400,7 +1400,7 @@ impl Qwen35Model {
         );
 
         println!("[Qwen3.5] Loading weights...");
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Strip language_model. prefix and sanitize
         let weights = sanitize_moe_weights(weights, &config);
@@ -2118,7 +2118,7 @@ impl Qwen35StageModel {
         let config: Qwen35Config = serde_json::from_value(text_config_val)
             .map_err(|e| format!("Failed to parse config: {}", e))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut weights = crate::models::load_text_weights(model_dir, None)?;
         weights = sanitize_moe_weights(weights, &config);
         let mut effective_filter = filter.clone();
         if config.tie_word_embeddings && filter.has_lm_head {

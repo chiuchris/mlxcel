@@ -44,7 +44,8 @@ use crate::vision::encoders::youtu_vl::{YoutuVLVisionEncoder, YoutuVisionConfig}
 use crate::vision::processors::youtu_vl::YoutuVLProcessor;
 
 use super::{
-    load_vlm_weights, parse_required_vlm_subconfig, parse_vlm_config, read_sanitized_vlm_config,
+    load_vlm_weights_common, parse_required_vlm_subconfig, parse_vlm_config,
+    read_sanitized_vlm_config,
 };
 
 /// Default token IDs from upstream `youtu_vl/config.py::ModelConfig`.
@@ -115,7 +116,7 @@ pub(crate) fn load_youtu_vl_vlm(model_path: &Path) -> Result<LoadedModel> {
     let eos_token_ids = parse_eos_token_ids(&full_config);
 
     // Load raw weights and run the Youtu-VL key remapping.
-    let raw_weights = load_vlm_weights(model_path)?;
+    let raw_weights = load_vlm_weights_common(model_path, None)?;
     let weights = remap_youtu_vl_weights(raw_weights);
     let weights = sanitize_text_weights(weights, &text_config)
         .map_err(|e| anyhow::anyhow!("Failed to sanitize Youtu-VL text weights: {}", e))?;

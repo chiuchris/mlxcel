@@ -442,7 +442,7 @@ impl NemotronNASModel {
         );
 
         println!("[NemotronNAS] Loading weights from safetensors...");
-        let weights = crate::models::load_and_sanitize_weights(path)?;
+        let weights = crate::models::load_text_weights(path, None)?;
 
         println!("[NemotronNAS] Building model...");
         let model = Self::from_weights(config.clone(), weights)?;

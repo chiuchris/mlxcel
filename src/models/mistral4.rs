@@ -703,7 +703,7 @@ impl Mistral4Model {
         let config: Mistral4Config = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config.json: {e}"))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Run weight sanitization for MoE expert weight splitting
         sanitize_weights(&mut weights, &config, "");
@@ -730,7 +730,7 @@ impl Mistral4Model {
         let args: Mistral4Config = serde_json::from_value(text_config.clone())
             .map_err(|e| format!("Failed to parse text_config: {e}"))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Sanitize with language_model. prefix for VLM weights
         sanitize_weights(&mut weights, &args, "language_model.");

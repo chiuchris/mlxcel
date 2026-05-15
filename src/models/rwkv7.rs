@@ -946,7 +946,7 @@ impl Rwkv7 {
         let config_str = std::fs::read_to_string(&config_path)?;
         let config: Rwkv7Config = serde_json::from_str(&config_str)?;
 
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         Ok(Self::from_weights(&weights, config)?)
     }
 

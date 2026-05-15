@@ -1009,7 +1009,7 @@ impl Step3p5Model {
             .map_err(|e| format!("Failed to parse config JSON: {}", e))?;
         let eos_token_ids = parse_eos_token_ids(&config_value);
 
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         let weights = Self::sanitize_weights(weights, &config);
 
         let mut model = Self::from_weights(&weights, &config)?;

@@ -33,7 +33,7 @@ use crate::vision;
 
 use super::{
     Qwen35VlmVariant, QwenVisionTokenIds, inherit_qwen_text_quantization,
-    inherit_qwen_vision_quantization, load_vlm_weights, parse_required_vlm_subconfig,
+    inherit_qwen_vision_quantization, load_vlm_weights_common, parse_required_vlm_subconfig,
     parse_vlm_config, qwen_vl_processor, qwen_vl_processor_with_norm, qwen_vl_token_ids,
     qwen35_vlm_token_defaults, read_sanitized_vlm_config, remap_qwen3_vl_weights,
     strip_language_model_prefix, wrap_qwen35_vlm,
@@ -55,7 +55,7 @@ pub(crate) fn load_qwen2_vl(model_path: &Path) -> Result<LoadedModel> {
 
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
 
     // Sanitize tied embeddings
     models::sanitize_tied_embeddings(&mut weights, &full_config);
@@ -109,7 +109,7 @@ pub(crate) fn load_qwen2_5_vl(model_path: &Path) -> Result<LoadedModel> {
 
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Qwen2VLModel::from_weights(&weights, &text_config)
@@ -156,7 +156,7 @@ pub(crate) fn load_qwen3_vl(model_path: &Path) -> Result<LoadedModel> {
         parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3VL vision config")?;
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    let mut weights = remap_qwen3_vl_weights(load_vlm_weights(model_path)?, false);
+    let mut weights = remap_qwen3_vl_weights(load_vlm_weights_common(model_path, None)?, false);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Qwen3VLModel::from_weights(&weights, &text_config)
@@ -202,7 +202,7 @@ pub(crate) fn load_qwen3_vl_moe(model_path: &Path) -> Result<LoadedModel> {
         parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3VLMoe vision config")?;
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    let mut weights = remap_qwen3_vl_weights(load_vlm_weights(model_path)?, true);
+    let mut weights = remap_qwen3_vl_weights(load_vlm_weights_common(model_path, None)?, true);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Qwen3VLMoeModel::from_weights(&weights, &text_config)
@@ -257,7 +257,7 @@ fn load_qwen3_5_vlm_with_variant(
         parse_required_vlm_subconfig(&full_config, "vision_config", "Qwen3.5 vision config")?;
     inherit_qwen_vision_quantization(&mut vision_config, &full_config);
 
-    let raw_weights = load_vlm_weights(model_path)?;
+    let raw_weights = load_vlm_weights_common(model_path, None)?;
     let mut text_weights = mlxcel_core::weights::WeightMap::new();
     let mut vision_weights = mlxcel_core::weights::WeightMap::new();
 

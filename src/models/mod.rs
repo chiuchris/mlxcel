@@ -174,7 +174,7 @@ pub(crate) use sanitize::{
     load_gemma4_vlm_weights_with_backing, strip_gemma4_kv_shared_weights,
 };
 pub use sanitize::{
-    convert_bf16_weights, load_and_sanitize_weights, sanitize_config_json,
+    convert_bf16_weights, load_and_sanitize_weights, load_text_weights, sanitize_config_json,
     sanitize_tied_embeddings, warn_bf16_precision,
 };
 pub use smollm3::SmolLM3Model;

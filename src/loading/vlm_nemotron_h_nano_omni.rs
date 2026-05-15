@@ -46,7 +46,7 @@ use mlxcel_core::weights::WeightMap;
 use serde_json::Value;
 use std::path::Path;
 
-use super::{load_vlm_weights, read_sanitized_vlm_config};
+use super::{load_vlm_weights_common, read_sanitized_vlm_config};
 use crate::LoadedModel;
 use crate::audio::nemotron_h_nano_omni::{
     NemotronOmniAudioConfig, NemotronOmniFeatureExtractor, NemotronOmniSoundEncoder,
@@ -367,7 +367,7 @@ pub(crate) fn load_nemotron_h_nano_omni_vlm(model_path: &Path) -> Result<LoadedM
     // 2. Load weights. When the checkpoint ships a sound_config we
     // keep audio weights and run the upstream `sanitize_audio_weights`
     // transpose pass; when audio is absent we drop them as before.
-    let raw_weights = load_vlm_weights(model_path)?;
+    let raw_weights = load_vlm_weights_common(model_path, None)?;
     let drop_audio = audio_config.is_none();
     let raw_weights = filter_out_audio_weights(raw_weights, drop_audio);
     let raw_weights = if audio_config.is_some() {

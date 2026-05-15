@@ -397,7 +397,7 @@ fn dequantize_nvfp4_weights(weights: &mut mlxcel_core::weights::WeightMap) {
 /// text-only format (fields directly at the top level) and the VLM format
 /// (`text_config` sub-object) are handled.
 ///
-/// Used by: load_and_sanitize_weights, load_gemma4_vlm (vlm_gemma.rs)
+/// Used by: load_text_weights, load_gemma4_vlm (vlm_gemma.rs)
 pub(crate) fn strip_gemma4_kv_shared_weights(
     weights: &mut mlxcel_core::weights::WeightMap,
     config: &Value,
@@ -900,7 +900,7 @@ pub(crate) fn load_gemma4_vlm_weights_with_backing<P: AsRef<Path>>(
 /// Auto-detection: if tie_word_embeddings is explicitly false, do nothing.
 /// Otherwise (true or absent), copy if lm_head.weight is missing.
 ///
-/// Used by: all VLM loaders, load_model_from_weights, load_and_sanitize_weights
+/// Used by: all VLM loaders, load_model_from_weights, load_text_weights
 pub fn sanitize_tied_embeddings(
     weights: &mut mlxcel_core::weights::WeightMap,
     config: &serde_json::Value,
@@ -941,9 +941,28 @@ pub fn sanitize_tied_embeddings(
 
 /// Load weights from a model directory with automatic tied-embedding sanitization.
 ///
-/// This is the common weight loading entry point for text model `load()`
-/// functions. It reads safetensors, parses config.json, and ensures lm_head
-/// weights exist.
+/// Convenience wrapper around [`load_text_weights`] for the common case
+/// where no [`mlxcel_core::weights::WeightTransform`] hook is needed.
+/// Equivalent to `load_text_weights(model_dir, None)`.
+///
+/// Kept for source compatibility with older call sites and tests that
+/// expected the original entry point. New call sites should call
+/// [`load_text_weights`] directly so the optional transform hook stays
+/// visible at the call site.
+///
+/// Used by: legacy text-model load() shims, fixture-based sanitize tests
+pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
+    model_dir: P,
+) -> Result<mlxcel_core::weights::WeightMap, String> {
+    load_text_weights(model_dir, None)
+}
+
+/// Consolidated text model weight load entry point.
+///
+/// This is the single funnel through which every text model load path
+/// (and the distributed pipeline / tensor-parallel runtimes) reads
+/// safetensors, parses `config.json`, ensures `lm_head` weights exist,
+/// and applies Apple Silicon precision policy.
 ///
 /// On Apple Silicon, bf16 tensors are automatically converted to f16 for
 /// performance.  No Apple GPU (M1–M5) has native bf16 ALU hardware — bf16
@@ -951,8 +970,21 @@ pub fn sanitize_tied_embeddings(
 /// f16 is strictly better: on M3/M4 it unlocks ~2x compute throughput via
 /// fp16 co-issue, and on M1/M2 there is no penalty.  Non-Apple backends
 /// keep bf16 as-is since they may support it natively.
-pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
+///
+/// The optional `transform` parameter is the Axis A "weight-load
+/// surgery" hook (Epic #363, issue #365). It is invoked *after* basic
+/// sanitization (tied embeddings, NVFP4 dequant, KV-shared stripping)
+/// and *before* the Apple Silicon bf16 → f16 conversion, so any
+/// transform observes weights in the same layout the model graph would
+/// see them. When `transform` is `None` the call is bit-exact identical
+/// to the pre-refactor `load_and_sanitize_weights` path.
+///
+/// Used by: text model `load()` (all 60+ entry points in src/models/),
+/// stage_executor pipeline (deepseek_v3, glm4, glm_moe_dsa, llama,
+/// llama4, mistral, mixtral, qwen3), tensor_parallel llama_runtime
+pub fn load_text_weights<P: AsRef<std::path::Path>>(
     model_dir: P,
+    transform: Option<&dyn mlxcel_core::weights::WeightTransform>,
 ) -> Result<mlxcel_core::weights::WeightMap, String> {
     let model_dir = model_dir.as_ref();
     let config_path = model_dir.join("config.json");
@@ -995,6 +1027,14 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
                 .is_some();
     }
 
+    // Axis A weight-load surgery hook (Epic #363). Runs after sanitization
+    // and before precision conversion so transforms observe weights in
+    // their final tied/dequantized layout.
+    if let Some(transform) = transform {
+        let cfg = parsed_config.clone().unwrap_or(Value::Null);
+        transform.apply(&mut weights, &cfg)?;
+    }
+
     // Convert bf16 → f16 on all Apple Silicon for performance.  No Apple GPU
     // has native bf16 ALU, so f16 is strictly better.  Only for non-quantized
     // models — quantized models use bf16 scales/biases in quantized_matmul
@@ -1027,7 +1067,7 @@ fn should_convert_bf16_to_f16() -> bool {
 /// Emit a one-line stderr note when a full-precision bf16 model is loaded,
 /// unless suppressed by `MLXCEL_NO_PRECISION_WARNING` env var.
 ///
-/// Used by: load_and_sanitize_weights, load_vlm_weights
+/// Used by: load_text_weights, load_vlm_weights_common
 pub fn warn_bf16_precision() {
     if std::env::var("MLXCEL_NO_PRECISION_WARNING").is_err() {
         eprintln!(
@@ -1040,7 +1080,7 @@ pub fn warn_bf16_precision() {
 ///
 /// Returns `true` if any bf16 tensors were found and converted, `false` otherwise.
 ///
-/// Used by: load_and_sanitize_weights, load_vlm_weights
+/// Used by: load_text_weights, load_vlm_weights_common
 #[must_use]
 pub fn convert_bf16_weights(weights: &mut mlxcel_core::weights::WeightMap) -> bool {
     let bf16_keys: Vec<String> = weights

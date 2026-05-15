@@ -208,7 +208,7 @@ where
     Wrap: Fn(B) -> L,
 {
     let args: A = parse_model_args(model_dir)?;
-    let mut weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+    let mut weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
 
     let mut effective_filter = filter.clone();
     if tie_embeddings(&args) && filter.has_lm_head {

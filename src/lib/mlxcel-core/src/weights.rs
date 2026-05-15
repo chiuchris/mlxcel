@@ -28,6 +28,35 @@ use std::path::Path;
 /// Loaded model weights as a map of tensor names to mlx-cxx arrays
 pub type WeightMap = HashMap<String, UniquePtr<MlxArray>>;
 
+/// Hook for mutating an in-memory [`WeightMap`] after load and basic
+/// sanitization, before the model graph consumes it.
+///
+/// This trait is the single insertion point for Axis A "weight-load
+/// surgery" (see Epic #363, issue #365). The consolidated text and VLM
+/// weight loaders accept an `Option<&dyn WeightTransform>`; when `None`,
+/// the load path is bit-exact identical to the pre-refactor behavior.
+///
+/// Implementations must:
+/// - be a no-op when there is nothing to apply (e.g. an empty pipeline),
+/// - not retain references into `weights` after `apply` returns, and
+/// - leave `weights` in a consistent state on success.
+///
+/// `cfg` carries the model `config.json` parsed as a free-form
+/// [`serde_json::Value`] so transforms can inspect quantization flags,
+/// layer counts, etc. without depending on every model-specific
+/// `ModelArgs` struct.
+///
+/// Used by: load_text_weights (mlxcel::models::sanitize), load_vlm_weights_common (mlxcel::loading::vlm)
+pub trait WeightTransform {
+    /// Apply the transform to `weights`. Returns `Ok(())` on success or
+    /// an error string describing why the transform could not be applied.
+    fn apply(
+        &self,
+        weights: &mut WeightMap,
+        cfg: &serde_json::Value,
+    ) -> Result<(), String>;
+}
+
 /// Parse a `model.safetensors.index.json` file and return the set of unique shard filenames.
 ///
 /// The index JSON format is:

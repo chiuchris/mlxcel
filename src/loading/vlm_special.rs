@@ -37,8 +37,8 @@ use crate::models;
 use crate::vision;
 
 use super::{
-    load_vlm_weights, parse_required_vlm_subconfig, parse_vlm_config, read_optional_model_json,
-    read_sanitized_vlm_config,
+    load_vlm_weights_common, parse_required_vlm_subconfig, parse_vlm_config,
+    read_optional_model_json, read_sanitized_vlm_config,
 };
 
 fn phi3_vision_config() -> vision::config::VisionConfig {
@@ -362,7 +362,7 @@ pub(crate) fn load_minicpmo_vlm(model_path: &Path) -> Result<LoadedModel> {
     let processor_config = minicpmo_processor_config_value(model_path, &full_config)
         .unwrap_or_else(|| full_config.clone());
 
-    let raw_weights = load_vlm_weights(model_path)?;
+    let raw_weights = load_vlm_weights_common(model_path, None)?;
     let text_weights = remap_minicpmo_text_weights(&raw_weights);
     let (group_size, bits) = parse_quantization_params(&full_config);
 
@@ -436,7 +436,7 @@ pub(crate) fn load_moondream3_vlm(model_path: &Path) -> Result<LoadedModel> {
         serde_json::from_value(moondream3_vision_config_value(&full_config))
             .map_err(|err| anyhow::anyhow!("Failed to parse Moondream3 vision config: {}", err))?;
 
-    let raw_weights = load_vlm_weights(model_path)?;
+    let raw_weights = load_vlm_weights_common(model_path, None)?;
     let weights = remap_moondream3_weights(&raw_weights, &text_config)?;
 
     let text_model = models::Moondream3Model::from_weights(&weights, &text_config)
@@ -736,8 +736,10 @@ pub(crate) fn load_phi4mm_vlm(model_path: &Path) -> Result<LoadedModel> {
         }
     };
 
-    let (mut weights, lora_pairs, effective_scale) =
-        remap_phi4mm_weights(load_vlm_weights(model_path)?, vision_lora_scale)?;
+    let (mut weights, lora_pairs, effective_scale) = remap_phi4mm_weights(
+        load_vlm_weights_common(model_path, None)?,
+        vision_lora_scale,
+    )?;
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     // Load glb_GN and sub_GN learnable separator weights
@@ -887,7 +889,7 @@ pub(crate) fn load_phi4_siglip_vlm(model_path: &Path) -> Result<LoadedModel> {
         .unwrap_or((vision_config.image_size / vision_config.patch_size).pow(2) as u64)
         as usize;
 
-    let mut weights = remap_phi4_siglip_weights(load_vlm_weights(model_path)?);
+    let mut weights = remap_phi4_siglip_weights(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Phi3Model::from_weights(&weights, &text_config)
@@ -1016,7 +1018,7 @@ pub(crate) fn load_phi3_vlm(model_path: &Path) -> Result<LoadedModel> {
     let text_args: models::phi3::ModelArgs = parse_vlm_config(&config_str, "text config")?;
 
     let image_dim_out = phi3_vision_config().hidden_size;
-    let mut weights = remap_phi3_weights(load_vlm_weights(model_path)?);
+    let mut weights = remap_phi3_weights(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Phi3Model::from_weights(&weights, &text_args)
@@ -1218,7 +1220,7 @@ pub(crate) fn load_molmo2_vlm(model_path: &Path) -> Result<LoadedModel> {
         .and_then(|v| v.as_i64())
         .unwrap_or(151937) as i32;
 
-    let mut weights = remap_molmo2_weights(load_vlm_weights(model_path)?);
+    let mut weights = remap_molmo2_weights(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model =
@@ -1426,7 +1428,7 @@ pub(crate) fn load_molmo_point_vlm(model_path: &Path) -> Result<LoadedModel> {
         .unwrap_or(50000.0) as f32;
 
     // Load and remap weights
-    let weights = remap_molmo_point_weights(load_vlm_weights(model_path)?);
+    let weights = remap_molmo_point_weights(load_vlm_weights_common(model_path, None)?);
 
     // Load language model (uses Molmo2 text config)
     let language_model =
@@ -1654,7 +1656,7 @@ pub(crate) fn load_llama4_vlm(model_path: &Path) -> Result<LoadedModel> {
     )
     .map_err(|e| anyhow::anyhow!("Failed to parse vision_config: {}", e))?;
 
-    let weights = load_vlm_weights(model_path)?;
+    let weights = load_vlm_weights_common(model_path, None)?;
     let mut text_weights = language_model_only_weights(&weights);
     models::sanitize_tied_embeddings(&mut text_weights, &full_config);
 

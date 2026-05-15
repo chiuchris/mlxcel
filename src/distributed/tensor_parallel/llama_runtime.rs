@@ -69,7 +69,7 @@ impl TensorParallelLlamaModel {
         let config_str = crate::models::sanitize_config_json(&config_str);
         let args: crate::models::llama3::ModelArgs =
             serde_json::from_str(&config_str).context("failed to parse llama config")?;
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }
 
@@ -246,7 +246,7 @@ impl TensorParallelQwen3Model {
         let config_str = crate::models::sanitize_config_json(&config_str);
         let args: crate::models::qwen3::ModelArgs =
             serde_json::from_str(&config_str).context("failed to parse qwen3 config")?;
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }
 
@@ -499,7 +499,7 @@ impl TensorParallelGemma3Model {
         let config_str = crate::models::sanitize_config_json(&config_str);
         let args: crate::models::gemma3::ModelArgs =
             serde_json::from_str(&config_str).context("failed to parse gemma3 config")?;
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }
 
@@ -789,7 +789,7 @@ impl TensorParallelGemma4Model {
                 .map_err(anyhow::Error::msg)?;
             weights
         } else {
-            models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?
+            models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?
         };
         // Strip k_proj/v_proj/k_norm entries for KV-shared layers.  The
         // quantized branch uses load_gemma4_text_weights_with_backing which
@@ -1563,7 +1563,7 @@ impl TensorParallelErnie45Model {
         let config_str = crate::models::sanitize_config_json(&config_str);
         let args: crate::models::ernie4_5::ModelArgs =
             serde_json::from_str(&config_str).context("failed to parse ernie4_5 config")?;
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }
 
@@ -1684,7 +1684,7 @@ impl TensorParallelHunyuanV1DenseModel {
         let config_str = crate::models::sanitize_config_json(&config_str);
         let args: crate::models::hunyuan_v1_dense::ModelArgs =
             serde_json::from_str(&config_str).context("failed to parse hunyuan_v1_dense config")?;
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         Self::from_full_weights(&args, &weights, &support.summary.plan)
     }
 
@@ -1909,7 +1909,7 @@ fn local_llama_args(
     local.num_key_value_heads = Some(num_kv_heads / plan.tp_size);
     local.intermediate_size /= plan.tp_size;
     // TP ranks load a replicated lm_head copy even for tied-embedding checkpoints.
-    // `load_and_sanitize_weights()` guarantees `lm_head.*` exists by copying from
+    // `load_text_weights()` guarantees `lm_head.*` exists by copying from
     // `model.embed_tokens.*` when the original checkpoint ties embeddings.
     local.tie_word_embeddings = false;
     Ok(local)
@@ -2863,7 +2863,7 @@ fn load_qwen35_tp_text_weights(
     args: &crate::models::qwen3_5::Qwen35Config,
 ) -> Result<WeightMap> {
     if full_config.get("vision_config").is_none() {
-        let weights = models::load_and_sanitize_weights(model_dir).map_err(anyhow::Error::msg)?;
+        let weights = models::load_text_weights(model_dir, None).map_err(anyhow::Error::msg)?;
         return Ok(crate::models::qwen3_5::sanitize_moe_weights(weights, args));
     }
 

@@ -979,7 +979,7 @@ impl JambaModel {
 
         // Load weights
         println!("[Jamba] Loading weights from safetensors...");
-        let weights = crate::models::load_and_sanitize_weights(path)?;
+        let weights = crate::models::load_text_weights(path, None)?;
 
         // Process weights
         let weights = Self::sanitize_weights(weights, &config);

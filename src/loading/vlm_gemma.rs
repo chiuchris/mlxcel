@@ -31,8 +31,8 @@ use crate::models;
 use crate::vision;
 
 use super::{
-    load_vlm_weights, parse_required_vlm_subconfig, parse_vlm_config, read_optional_model_json,
-    read_sanitized_vlm_config, strip_language_model_prefix,
+    load_vlm_weights_common, parse_required_vlm_subconfig, parse_vlm_config,
+    read_optional_model_json, read_sanitized_vlm_config, strip_language_model_prefix,
 };
 
 struct Gemma3nMetadata {
@@ -97,7 +97,7 @@ fn gemma3n_language_model_prefix(weights: &WeightMap) -> &'static str {
 
 fn sanitize_gemma3n_weights(raw_weights: WeightMap) -> WeightMap {
     let needs_transpose = gemma3n_needs_conv_transpose(&raw_weights);
-    // bf16→f16 conversion for M5 is handled by load_vlm_weights() in vlm.rs.
+    // bf16→f16 conversion for M5 is handled by load_vlm_weights_common in vlm.rs.
     let mut weights = WeightMap::new();
 
     for (key, value) in raw_weights {
@@ -138,7 +138,7 @@ pub(crate) fn load_gemma3_vlm(model_path: &Path) -> Result<LoadedModel> {
         serde_json::from_value(vlm_config.text_config.clone())
             .map_err(|e| anyhow::anyhow!("Failed to parse text_config: {}", e))?;
 
-    let mut weights = strip_language_model_prefix(load_vlm_weights(model_path)?);
+    let mut weights = strip_language_model_prefix(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let text_model = models::Gemma3Model::from_weights(&weights, &text_config)
@@ -210,7 +210,7 @@ pub(crate) fn load_gemma3n_vlm(model_path: &Path) -> Result<LoadedModel> {
     let text_config = top_args.text_args();
     let metadata = gemma3n_metadata(&full_config);
 
-    let mut weights = sanitize_gemma3n_weights(load_vlm_weights(model_path)?);
+    let mut weights = sanitize_gemma3n_weights(load_vlm_weights_common(model_path, None)?);
     models::sanitize_tied_embeddings(&mut weights, &full_config);
 
     let language_model = models::gemma3n::Gemma3nLanguageModel::from_weights(

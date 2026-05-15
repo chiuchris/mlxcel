@@ -1344,7 +1344,7 @@ impl Llama4CxxModel {
             .map_err(|e| format!("Failed to parse text config: {}", e))?;
 
         // Load weights
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Create model
         let model = Self::from_weights(&weights, &args)?;

@@ -674,7 +674,7 @@ impl DeepSeekV2Model {
         let args: ModelArgs = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         let model = Self::from_weights(&weights, &args)?;
 
         Ok((model, args))

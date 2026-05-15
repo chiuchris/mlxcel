@@ -2117,14 +2117,14 @@ impl Gemma4Model {
             super::sanitize::load_gemma4_text_weights_with_backing(model_dir)?
         } else {
             (
-                crate::models::load_and_sanitize_weights(model_dir)?,
+                crate::models::load_text_weights(model_dir, None)?,
                 super::sanitize::Gemma4WeightBacking::default(),
             )
         };
         // Strip k_proj/v_proj/k_norm entries for KV-shared layers so the
         // model constructor does not attempt to allocate them.  This applies
         // on all loader paths including the quantized text-only path above,
-        // which bypasses load_and_sanitize_weights and therefore does not
+        // which bypasses load_text_weights and therefore does not
         // benefit from the strip already embedded in that function.
         crate::models::strip_gemma4_kv_shared_weights(&mut weights, &config_value);
         crate::models::sanitize_tied_embeddings(&mut weights, &config_value);
@@ -2300,7 +2300,7 @@ impl Gemma4StageModel {
             super::sanitize::load_gemma4_text_weights_with_backing(model_dir)?
         } else {
             (
-                crate::models::load_and_sanitize_weights(model_dir)?,
+                crate::models::load_text_weights(model_dir, None)?,
                 super::sanitize::Gemma4WeightBacking::default(),
             )
         };

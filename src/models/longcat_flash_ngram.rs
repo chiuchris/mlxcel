@@ -911,7 +911,7 @@ impl LongcatFlashNgramModel {
         let args: LongcatFlashNgramConfig = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config: {e}"))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(path)?;
+        let mut weights = crate::models::load_text_weights(path, None)?;
         weights = sanitize_weights(weights, &args);
 
         let model = Self::from_weights(&weights, &args)?;

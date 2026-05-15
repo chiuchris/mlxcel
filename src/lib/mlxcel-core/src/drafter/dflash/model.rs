@@ -22,7 +22,7 @@
 //! - Hidden, K, V, and projected proposal/context tensors stay in bf16/f16.
 //! - No `f32` promotion in the forward path.
 //! - Weights remain bf16 or quantized as-loaded; the non-quantized bf16 →
-//!   f16 conversion happens in the binary's `load_and_sanitize_weights`
+//!   f16 conversion happens in the binary's `load_text_weights`
 //!   path that ultimately hands the [`WeightMap`] to
 //!   [`DFlashDraftModel::from_weights`].
 

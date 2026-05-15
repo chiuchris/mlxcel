@@ -2058,7 +2058,7 @@ impl NemotronHModel {
         );
 
         println!("[NemotronH] Loading weights from safetensors...");
-        let weights = crate::models::load_and_sanitize_weights(path)?;
+        let weights = crate::models::load_text_weights(path, None)?;
         let weights = Self::sanitize_weights(weights, &config);
 
         println!("[NemotronH] Building model...");

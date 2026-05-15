@@ -949,7 +949,7 @@ impl GptOssModel {
         let args: ModelArgs = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse config.json: {}", e))?;
 
-        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let weights = crate::models::load_text_weights(model_dir, None)?;
         let model = Self::from_weights(&weights, &args)?;
 
         Ok((model, args))
@@ -1084,7 +1084,7 @@ impl GptOssStageModel {
         let args: ModelArgs = serde_json::from_str(&config_str)
             .map_err(|e| format!("Failed to parse {}: {}", config_path.display(), e))?;
 
-        let mut weights = crate::models::load_and_sanitize_weights(model_dir)?;
+        let mut weights = crate::models::load_text_weights(model_dir, None)?;
         let mut effective_filter = filter.clone();
         if args.tie_word_embeddings && filter.has_lm_head {
             effective_filter.has_embedding = true;
