@@ -100,6 +100,28 @@ pub(crate) struct GenerateArgs {
     /// [`SpeculativeArgs`] for the rationale.
     #[command(flatten)]
     pub(crate) speculative: SpeculativeArgs,
+
+    // Axis A weight-load surgery configuration (Epic #363, issue #371).
+    // The closed-repo references stay in this non-doc comment so the
+    // user-facing `--help` block does not advertise tracker URLs (see
+    // `tests/cli_help_consistency.rs::FORBIDDEN_SUBSTRINGS`).
+    /// Apply weight-load surgery configuration from a YAML file.
+    ///
+    /// Path to a YAML configuration file describing structural
+    /// fine-tuning operations (scale / add / prune / replace /
+    /// interpolate). When omitted, model loading is bit-exact identical
+    /// to the pre-surgery baseline — no extra work, no observable
+    /// difference in generated tokens for any seed.
+    ///
+    /// Example:
+    ///
+    ///     mlxcel generate -m models/foo --surgery surgery.yaml -p "Hello"
+    ///
+    /// The YAML schema is documented in
+    /// `docs_internal/architecture/structural-finetuning-overview-20260419.md`.
+    #[cfg(feature = "surgery")]
+    #[arg(long = "surgery", value_name = "FILE", env = "MLXCEL_SURGERY")]
+    pub(crate) surgery: Option<PathBuf>,
 }
 
 /// Model loading options
@@ -968,6 +990,29 @@ pub(crate) struct ServeArgs {
     /// Also reads `APC_HASH`.
     #[arg(long = "apc-hash", value_name = "ALGO")]
     apc_hash: Option<String>,
+
+    // Axis A weight-load surgery configuration (Epic #363, issue #371).
+    // Closed-repo references kept in a non-doc comment to avoid leaking
+    // tracker URLs into `--help` text.
+    /// Apply weight-load surgery configuration from a YAML file.
+    ///
+    /// Path to a YAML configuration file describing structural
+    /// fine-tuning operations (scale / add / prune / replace /
+    /// interpolate). When omitted, weight loading is bit-exact identical
+    /// to the pre-surgery baseline — every served request runs against
+    /// unmodified weights, so the server's response stream is unchanged.
+    ///
+    /// Also reads `MLXCEL_SURGERY`; CLI flag wins on conflict.
+    ///
+    /// Example:
+    ///
+    ///     mlxcel serve -m models/foo --surgery surgery.yaml
+    ///
+    /// The YAML schema is documented in
+    /// `docs_internal/architecture/structural-finetuning-overview-20260419.md`.
+    #[cfg(feature = "surgery")]
+    #[arg(long = "surgery", value_name = "FILE", env = "MLXCEL_SURGERY")]
+    pub(crate) surgery: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {

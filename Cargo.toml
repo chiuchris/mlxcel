@@ -26,16 +26,24 @@ name = "speculative_bench"
 path = "src/bin/speculative_bench.rs"
 
 [features]
-default = []
+default = ["surgery"]
 metal = ["mlxcel-core/metal"]
 accelerate = ["mlxcel-core/accelerate"]
 cuda = ["mlxcel-core/cuda"]
 test-utils = []
-# Axis A "weight-load surgery" framework (Epic #363, issues #367 / #369).
-# Off by default — when this feature is not active the `mlxcel-surgery`
-# crate is not linked at all, so the default serving path keeps its
-# pre-surgery footprint and the bit-exactness guarantee from #365 holds
-# trivially.
+# Axis A "weight-load surgery" framework (Epic #363, issues #367 / #369 / #371).
+#
+# On by default so production `mlxcel` and `mlxcel-server` binaries expose
+# the `--surgery <config.yaml>` flag without rebuilds. Bit-exactness with
+# the pre-surgery baseline is preserved without conditional features: when
+# the flag is not supplied, the active-pipeline slot in `crate::surgery`
+# stays `None`, the consolidated loaders call `transform.apply` zero times,
+# and the load path matches `transform = None` byte-for-byte (verified by
+# `crate::models::sanitize_tests::load_text_weights_with_none_transform_matches_legacy_path`).
+#
+# Build with `--no-default-features` to compile without the surgery crate
+# entirely (e.g. CI parity tests against pre-A1 behaviour or constrained
+# embedded targets).
 surgery = ["dep:mlxcel-surgery"]
 
 [dependencies]

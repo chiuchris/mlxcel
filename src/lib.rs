@@ -27,6 +27,8 @@ pub mod lora;
 pub mod models;
 pub mod multimodal;
 pub mod server;
+#[cfg(feature = "surgery")]
+pub mod surgery;
 pub mod tokenizer;
 pub mod vision;
 

@@ -355,6 +355,25 @@ pub struct ServerStartupInput {
     pub conversation_store_max_entries: usize,
     /// Issue #622: `--conversation-store-ttl-secs` value (`0` disables TTL).
     pub conversation_store_ttl_secs: u64,
+
+    /// Issue #371 (A4): path to a YAML weight-load surgery configuration.
+    ///
+    /// `None` (the default) keeps the server on the bit-exact baseline
+    /// weight-load path — no surgery crate work, no observable
+    /// difference in generated tokens. `Some(path)` installs the
+    /// parsed [`mlxcel_surgery::SurgeryPipeline`] as the process-wide
+    /// active pipeline via [`crate::surgery::set_active_pipeline`]
+    /// before the model worker thread is spawned, so every subsequent
+    /// load picks it up through the consolidated loaders'
+    /// active-pipeline fallback (see `crate::models::load_text_weights`
+    /// and `crate::loading::vlm::load_vlm_weights_common`).
+    ///
+    /// Path existence and YAML validity are checked at startup time
+    /// inside [`crate::server::startup::start_server`]; malformed
+    /// configurations cause the server to refuse to start with a clear
+    /// error before any model load begins.
+    #[cfg(feature = "surgery")]
+    pub surgery_config_path: Option<PathBuf>,
 }
 
 impl ServerStartupInput {
@@ -537,6 +556,11 @@ impl ServerStartupInput {
             responses_store_ttl_secs: self.responses_store_ttl_secs,
             conversation_store_max_entries: self.conversation_store_max_entries,
             conversation_store_ttl_secs: self.conversation_store_ttl_secs,
+            // Issue #371 (A4): forward the surgery YAML path verbatim.
+            // start_server() parses the YAML and installs the pipeline
+            // exactly once before spawning the model worker.
+            #[cfg(feature = "surgery")]
+            surgery_config_path: self.surgery_config_path,
         })
     }
 }

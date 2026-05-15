@@ -219,6 +219,11 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         responses_store_ttl_secs: args.responses_store_ttl_secs,
         conversation_store_max_entries: args.conversation_store_max_entries,
         conversation_store_ttl_secs: args.conversation_store_ttl_secs,
+        // Issue #371 (A4): forward the surgery YAML path. clap reads
+        // `MLXCEL_SURGERY` directly via the `env = ...` attribute on
+        // the flag, so no separate env-fallback helper is needed.
+        #[cfg(feature = "surgery")]
+        surgery_config_path: args.surgery,
     })
 }
 

@@ -795,9 +795,56 @@ fn run_generation_mode<M: LanguageModel>(
     Ok(output)
 }
 
+/// Parse the `--surgery <FILE>` YAML configuration when supplied and
+/// install the resulting [`crate::surgery::SurgeryPipeline`] as the
+/// process-wide active pipeline.
+///
+/// Returns early with a friendly `anyhow::Error` if the YAML cannot be
+/// parsed, the file is missing, or any referenced donor checkpoint
+/// (`source*` field) cannot be located. Surfacing these errors *before*
+/// any model weights are touched mirrors the contract called out in
+/// issue #371 acceptance criterion (a).
+///
+/// When the flag is absent, this is a no-op: the active-pipeline slot
+/// stays at `None` and the load path follows the bit-exact baseline.
+///
+/// Used by: `run_generate`
+#[cfg(feature = "surgery")]
+fn install_surgery_pipeline_from_cli(args: &GenerateArgs) -> Result<()> {
+    let Some(ref path) = args.surgery else {
+        return Ok(());
+    };
+    if !path.exists() {
+        return Err(anyhow::anyhow!(
+            "--surgery: config file does not exist: {}",
+            path.display()
+        ));
+    }
+    let pipeline = mlxcel::surgery::load_pipeline_from_file(path)
+        .map_err(|e| anyhow::anyhow!("--surgery: {e}"))?;
+    println!(
+        "Surgery: loaded {} operation(s) from {}",
+        pipeline.len(),
+        path.display()
+    );
+    mlxcel::surgery::set_active_pipeline(Some(std::sync::Arc::new(pipeline)));
+    Ok(())
+}
+
 pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
     let runtime = initialize_runtime();
     print_runtime_setup(&runtime);
+
+    // Axis A weight-load surgery (Epic #363, issue #371). Parse the
+    // YAML and install the pipeline *before* any heavier validation
+    // so a malformed / missing surgery config fails fast with a clear
+    // error rather than being masked by an unrelated tensor-parallel
+    // or pipeline-parallel diagnostic. When `--surgery` is absent this
+    // is a no-op and the load path remains bit-exact identical to the
+    // pre-#371 baseline.
+    #[cfg(feature = "surgery")]
+    install_surgery_pipeline_from_cli(&args)?;
+
     validate_tensor_parallel_args(&args)?;
     validate_pipeline_parallel_args(&args)?;
 

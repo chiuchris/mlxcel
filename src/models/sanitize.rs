@@ -979,6 +979,23 @@ pub fn load_and_sanitize_weights<P: AsRef<std::path::Path>>(
 /// see them. When `transform` is `None` the call is bit-exact identical
 /// to the pre-refactor `load_and_sanitize_weights` path.
 ///
+/// ## Active-pipeline fallback (issue #371 — A4)
+///
+/// When the explicit `transform` parameter is `None` *and* the
+/// `surgery` feature is enabled *and* the CLI has installed an active
+/// pipeline via `crate::surgery::set_active_pipeline(...)`, this
+/// function transparently uses that pipeline as the transform. This is
+/// the integration glue that lets `mlxcel generate --surgery foo.yaml`
+/// thread surgery through the 60+ model-family loaders without
+/// modifying each loader's `load_text_weights(_, None)` call site.
+///
+/// When no `--surgery` flag is provided the active-pipeline slot is
+/// `None`, the snapshot fast-path returns `None` (a single relaxed
+/// `OnceLock::get` load), and the load path is byte-for-byte identical
+/// to the pre-#371 baseline. The same is true at compile time on
+/// builds with `--no-default-features` (no `surgery` feature → the
+/// active-pipeline lookup is compiled out entirely).
+///
 /// Used by: text model `load()` (all 60+ entry points in src/models/),
 /// stage_executor pipeline (deepseek_v3, glm4, glm_moe_dsa, llama,
 /// llama4, mistral, mixtral, qwen3), tensor_parallel llama_runtime
@@ -1030,7 +1047,37 @@ pub fn load_text_weights<P: AsRef<std::path::Path>>(
     // Axis A weight-load surgery hook (Epic #363). Runs after sanitization
     // and before precision conversion so transforms observe weights in
     // their final tied/dequantized layout.
-    if let Some(transform) = transform {
+    //
+    // Resolution order (issue #371, A4):
+    //   1. Explicit `transform` argument — used as-is (test fixtures and
+    //      future programmatic callers that want to bypass the global slot).
+    //   2. `surgery` feature active + CLI-installed active pipeline —
+    //      consulted only when `transform.is_none()`.
+    //   3. Baseline — no transform applied; loader produces the same
+    //      weight map it did before A1.
+    #[cfg(feature = "surgery")]
+    let active_pipeline = transform
+        .is_none()
+        .then(crate::surgery::snapshot_active_pipeline)
+        .flatten();
+    let resolved_transform: Option<&dyn mlxcel_core::weights::WeightTransform> = match transform {
+        Some(t) => Some(t),
+        None => {
+            #[cfg(feature = "surgery")]
+            {
+                active_pipeline.as_deref().map(
+                    |p: &crate::surgery::SurgeryPipeline| {
+                        p as &dyn mlxcel_core::weights::WeightTransform
+                    },
+                )
+            }
+            #[cfg(not(feature = "surgery"))]
+            {
+                None
+            }
+        }
+    };
+    if let Some(transform) = resolved_transform {
         let cfg = parsed_config.clone().unwrap_or(Value::Null);
         transform.apply(&mut weights, &cfg)?;
     }

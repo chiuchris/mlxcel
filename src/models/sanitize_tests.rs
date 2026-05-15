@@ -390,6 +390,15 @@ fn load_text_weights_with_none_transform_matches_legacy_path() {
     // implemented as `load_text_weights(p, None)`, so this test
     // doubles as a regression guard against accidental divergence
     // between the alias and the new entry point.
+    //
+    // Issue #371 (A4): the `load_text_weights(_, None)` call below
+    // reads the process-global active-pipeline slot. Acquire
+    // `env_lock` so a parallel test in `surgery_integration` can't
+    // install a pipeline mid-test and leak it into the consolidated
+    // baseline.
+    #[cfg(feature = "surgery")]
+    let _env_guard = crate::test_support::env_lock::env_lock();
+
     let dir_a = temp_model_dir("text_load_none_transform_a");
     let dir_b = temp_model_dir("text_load_none_transform_b");
     write_text_model_fixture(&dir_a);
@@ -465,6 +474,13 @@ fn load_text_weights_invokes_transform_when_supplied() {
     // once per call when a transform is supplied. With a no-op
     // transform the produced `WeightMap` must match the `None` path
     // bit-for-bit.
+    //
+    // Issue #371 (A4): baseline call reads the active-pipeline slot,
+    // so we need the same `env_lock` discipline as the other tests
+    // touching `load_text_weights(_, None)`.
+    #[cfg(feature = "surgery")]
+    let _env_guard = crate::test_support::env_lock::env_lock();
+
     let dir_a = temp_model_dir("text_load_transform_invoked_a");
     let dir_b = temp_model_dir("text_load_transform_invoked_b");
     write_text_model_fixture(&dir_a);
@@ -570,6 +586,14 @@ mod surgery_integration {
         // doubles as proof that the new crate's `SurgeryPipeline`
         // really does implement A1's `WeightTransform` trait at the
         // type level (the call would not type-check otherwise).
+        //
+        // Issue #371 (A4): `load_text_weights(_, None)` reads the
+        // process-global active-pipeline slot, so any test that calls
+        // it must serialise on the same `env_lock` as the tests that
+        // mutate the slot — otherwise a parallel mutator can leak a
+        // pipeline into this test's baseline call.
+        let _env_guard = crate::test_support::env_lock::env_lock();
+
         let dir_a = temp_model_dir("surgery_empty_a");
         let dir_b = temp_model_dir("surgery_empty_b");
         write_text_model_fixture(&dir_a);
@@ -605,6 +629,11 @@ mod surgery_integration {
         // still bit-identical to the baseline (because the op does
         // not mutate weights), which proves that "no-op" semantics
         // hold end-to-end.
+        //
+        // Issue #371: env_lock as in `empty_surgery_pipeline_*` — the
+        // baseline `load_text_weights(_, None)` reads the active slot.
+        let _env_guard = crate::test_support::env_lock::env_lock();
+
         let dir_a = temp_model_dir("surgery_recording_a");
         let dir_b = temp_model_dir("surgery_recording_b");
         write_text_model_fixture(&dir_a);
@@ -694,6 +723,11 @@ mod surgery_integration {
         // acceptance criterion (e): when `operations: []`, the
         // produced pipeline behaves bit-exact identically to the
         // `transform = None` path.
+        //
+        // Issue #371: baseline call needs env_lock — same rationale
+        // as `empty_surgery_pipeline_is_bit_exact_with_none`.
+        let _env_guard = crate::test_support::env_lock::env_lock();
+
         let yaml = "version: 1\noperations: []\n";
         let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("empty config parses");
         assert!(pipeline.is_empty());
@@ -751,6 +785,123 @@ operations:
                 "expected not-yet-implemented error, got: {err}",
             ),
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// RAII guard that installs `pipeline` into the process-wide
+    /// active-pipeline slot on construction and always clears it on
+    /// drop, even when the test body panics mid-way through.
+    ///
+    /// Together with `crate::test_support::env_lock::env_lock` this
+    /// keeps the slot mutation invisible to any test running in
+    /// parallel inside the same cargo-test binary. Other tests that
+    /// call `load_text_weights(_, None)` from outside this module —
+    /// and therefore do not acquire `env_lock` — are still safe
+    /// because the guard restores the slot to `None` before the test
+    /// thread releases `env_lock`.
+    struct ScopedActivePipeline;
+
+    impl ScopedActivePipeline {
+        fn install(pipeline: Arc<SurgeryPipeline>) -> Self {
+            crate::surgery::set_active_pipeline(Some(pipeline));
+            Self
+        }
+    }
+
+    impl Drop for ScopedActivePipeline {
+        fn drop(&mut self) {
+            crate::surgery::set_active_pipeline(None);
+        }
+    }
+
+    /// Issue #371 (A4): when the CLI installs an active pipeline via
+    /// `crate::surgery::set_active_pipeline`, the consolidated loader
+    /// must pick it up for `load_text_weights(_, None)` callers. This
+    /// is the integration glue that lets `mlxcel generate --surgery
+    /// foo.yaml` flow through the 60+ model-family loaders without
+    /// per-loader plumbing changes.
+    ///
+    /// Holds `crate::test_support::env_lock::env_lock` because the
+    /// active-pipeline slot is process-global, just like an env var:
+    /// no other test in this binary can observe the slot in the
+    /// non-None state because they all serialise on the same lock
+    /// when they touch a process-global resource.
+    #[test]
+    fn active_pipeline_slot_is_consulted_when_transform_arg_is_none() {
+        let _env_guard = crate::test_support::env_lock::env_lock();
+
+        // Install a placeholder pipeline that errors on apply, then
+        // call `load_text_weights(_, None)`. The active-pipeline slot
+        // must be consulted because the explicit `transform` is None,
+        // and the placeholder error must propagate out.
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: 2.0
+"#;
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("scale parses");
+        let _slot_guard = ScopedActivePipeline::install(Arc::new(pipeline));
+
+        let dir_with_slot = temp_model_dir("active_slot_installed");
+        write_text_model_fixture(&dir_with_slot);
+        let result = load_text_weights(&dir_with_slot, None);
+
+        match result {
+            Ok(_) => panic!(
+                "active-pipeline slot must be consulted when transform=None, \
+                 expected placeholder 'not yet implemented' error"
+            ),
+            Err(err) => assert!(
+                err.contains("not yet implemented"),
+                "active-pipeline slot integration must propagate errors, got: {err}",
+            ),
+        }
+
+        // `_slot_guard` drops here and clears the slot back to None.
+        std::fs::remove_dir_all(&dir_with_slot).unwrap();
+    }
+
+    /// Issue #371 (A4): explicit `transform` argument takes precedence
+    /// over the active-pipeline slot. This is the contract callers
+    /// (e.g. future programmatic users and the existing #365/#367
+    /// integration tests) rely on to bypass the global slot.
+    #[test]
+    fn explicit_transform_arg_wins_over_active_pipeline_slot() {
+        let _env_guard = crate::test_support::env_lock::env_lock();
+
+        // Install a "failing" pipeline in the slot, then pass an
+        // explicit no-op `WeightTransform`. Because the explicit
+        // argument wins, the load must succeed (the slot's failing
+        // pipeline is never consulted).
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: 2.0
+"#;
+        let bad_pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("scale parses");
+        let _slot_guard = ScopedActivePipeline::install(Arc::new(bad_pipeline));
+
+        let dir = temp_model_dir("explicit_wins_slot");
+        write_text_model_fixture(&dir);
+
+        // CountingTransform is a no-op (from the outer test module);
+        // its apply returns Ok(()).
+        let transform = CountingTransform::new();
+        let result = load_text_weights(&dir, Some(&transform));
+
+        assert!(
+            result.is_ok(),
+            "explicit transform must win over slot (load failed; \
+             slot pipeline was incorrectly consulted)"
+        );
+        assert_eq!(
+            transform.call_count(),
+            1,
+            "explicit transform must be the one invoked"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

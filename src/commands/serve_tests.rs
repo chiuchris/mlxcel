@@ -120,6 +120,9 @@ fn sample_args() -> crate::ServeArgs {
         responses_store_ttl_secs: 3600,
         conversation_store_max_entries: 256,
         conversation_store_ttl_secs: 3600,
+        // Issue #371 (A4): keep tests on the baseline path by default.
+        #[cfg(feature = "surgery")]
+        surgery: None,
     }
 }
 

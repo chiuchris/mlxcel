@@ -125,6 +125,19 @@ pub(super) fn require_object_mut<'a>(
 /// remap which runs in the caller after we return). Surgery operations
 /// inspecting dtype therefore see the dtype the model graph will see.
 ///
+/// ## Active-pipeline fallback (issue #371 — A4)
+///
+/// When the explicit `transform` argument is `None` *and* the
+/// `surgery` feature is enabled *and* the CLI has installed an active
+/// pipeline via `crate::surgery::set_active_pipeline(...)`, the
+/// installed pipeline is used as the transform. This is the integration
+/// glue for `mlxcel generate --surgery foo.yaml` and
+/// `mlxcel serve --surgery foo.yaml` on the VLM load path.
+///
+/// When no surgery is active (the default), the snapshot lookup
+/// returns `None` and the call site falls through the existing
+/// `if let Some(transform) = transform` arm exactly as before.
+///
 /// Used by: all VLM family loaders in src/loading/vlm_*.rs
 /// (gemma, llava, nemotron_h_nano_omni, pixtral, qwen, siglip,
 /// special, youtu_vl)
@@ -150,9 +163,37 @@ pub(crate) fn load_vlm_weights_common(
 
     // Axis A weight-load surgery hook (Epic #363). Invoked with the
     // parsed config.json so transforms can inspect quantization or
-    // structural metadata. When `transform` is `None` the call is a
-    // no-op and behavior matches the pre-refactor path bit-exactly.
-    if let Some(transform) = transform {
+    // structural metadata. When both `transform` and the active
+    // surgery slot are absent, the hook is bypassed entirely and the
+    // load path matches the pre-#371 baseline bit-for-bit.
+    //
+    // Resolution order (issue #371, A4) mirrors `load_text_weights`:
+    //   1. Explicit `transform` argument (test fixtures, programmatic).
+    //   2. CLI-installed active pipeline (--surgery flag).
+    //   3. Baseline — no transform applied.
+    #[cfg(feature = "surgery")]
+    let active_pipeline = transform
+        .is_none()
+        .then(crate::surgery::snapshot_active_pipeline)
+        .flatten();
+    let resolved_transform: Option<&dyn mlxcel_core::weights::WeightTransform> = match transform {
+        Some(t) => Some(t),
+        None => {
+            #[cfg(feature = "surgery")]
+            {
+                active_pipeline.as_deref().map(
+                    |p: &crate::surgery::SurgeryPipeline| {
+                        p as &dyn mlxcel_core::weights::WeightTransform
+                    },
+                )
+            }
+            #[cfg(not(feature = "surgery"))]
+            {
+                None
+            }
+        }
+    };
+    if let Some(transform) = resolved_transform {
         let cfg = std::fs::read_to_string(model_path.join("config.json"))
             .ok()
             .map(|s| crate::models::sanitize_config_json(&s))

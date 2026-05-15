@@ -863,6 +863,28 @@ struct ServerArgs {
     /// Also reads `APC_HASH`.
     #[arg(long = "apc-hash", value_name = "ALGO")]
     apc_hash: Option<String>,
+
+    // Axis A weight-load surgery configuration (Epic #363, issue #371).
+    // Closed-repo references kept in a non-doc comment to avoid leaking
+    // tracker URLs into `--help` text.
+    /// Apply weight-load surgery configuration from a YAML file.
+    ///
+    /// Path to a YAML configuration file describing structural
+    /// fine-tuning operations (scale / add / prune / replace /
+    /// interpolate). When omitted, weight loading is bit-exact identical
+    /// to the pre-surgery baseline.
+    ///
+    /// Also reads `MLXCEL_SURGERY`; CLI flag wins on conflict.
+    ///
+    /// Example:
+    ///
+    ///     mlxcel-server -m models/foo --surgery surgery.yaml --port 8080
+    ///
+    /// The YAML schema is documented in
+    /// `docs_internal/architecture/structural-finetuning-overview-20260419.md`.
+    #[cfg(feature = "surgery")]
+    #[arg(long = "surgery", value_name = "FILE", env = "MLXCEL_SURGERY")]
+    surgery: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -1100,5 +1122,10 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         responses_store_ttl_secs: args.responses_store_ttl_secs,
         conversation_store_max_entries: args.conversation_store_max_entries,
         conversation_store_ttl_secs: args.conversation_store_ttl_secs,
+        // Issue #371 (A4): forward the surgery YAML path. clap reads
+        // `MLXCEL_SURGERY` directly via the `env = ...` attribute on
+        // the flag, so no separate env-fallback helper is needed.
+        #[cfg(feature = "surgery")]
+        surgery_config_path: args.surgery,
     })
 }

@@ -300,6 +300,22 @@ pub struct ServerStartupConfig {
     /// Issue #622: TTL (seconds) for conversation transcripts. `0`
     /// disables TTL.
     pub conversation_store_ttl_secs: u64,
+
+    /// Issue #371 (A4): resolved path to a YAML weight-load surgery
+    /// configuration. `None` keeps the bit-exact baseline load path.
+    ///
+    /// The path is parsed into a [`mlxcel_surgery::SurgeryPipeline`]
+    /// inside [`start_server`] and installed via
+    /// [`crate::surgery::set_active_pipeline`] before the model worker
+    /// thread is spawned. The string is propagated through the startup
+    /// config (rather than constructing the pipeline at
+    /// [`super::cli_input::ServerStartupInput::into_startup_config`]
+    /// time) so the `serde::Debug`-friendly shape of this struct is
+    /// preserved and so tests that drive `start_server` without
+    /// passing a real YAML file (the common case in `tests/`) remain
+    /// trivial to construct.
+    #[cfg(feature = "surgery")]
+    pub surgery_config_path: Option<PathBuf>,
 }
 
 impl Default for ServerStartupConfig {
@@ -395,6 +411,8 @@ impl Default for ServerStartupConfig {
             responses_store_ttl_secs: 3600,
             conversation_store_max_entries: 256,
             conversation_store_ttl_secs: 3600,
+            #[cfg(feature = "surgery")]
+            surgery_config_path: None,
         }
     }
 }
@@ -1194,11 +1212,48 @@ async fn serve_remote_pipeline_stage(service_config: RemoteStageServiceConfig) -
     handle.shutdown()
 }
 
+/// Install the configured `--surgery <FILE>` YAML pipeline into the
+/// process-wide active-pipeline slot, returning early with a friendly
+/// `anyhow::Error` on malformed input.
+///
+/// Called once during [`start_server`] before any model worker thread
+/// is spawned. When `surgery_config_path` is `None`, this is a no-op
+/// and the server runs on the bit-exact baseline load path.
+#[cfg(feature = "surgery")]
+fn install_surgery_pipeline_for_server(startup: &ServerStartupConfig) -> Result<()> {
+    let Some(ref path) = startup.surgery_config_path else {
+        return Ok(());
+    };
+    if !path.exists() {
+        anyhow::bail!(
+            "--surgery: config file does not exist: {}",
+            path.display()
+        );
+    }
+    let pipeline = crate::surgery::load_pipeline_from_file(path)
+        .map_err(|e| anyhow::anyhow!("--surgery: {e}"))?;
+    tracing::info!(
+        path = %path.display(),
+        ops = pipeline.len(),
+        "Surgery: installed weight-load pipeline"
+    );
+    crate::surgery::set_active_pipeline(Some(std::sync::Arc::new(pipeline)));
+    Ok(())
+}
+
 /// Start the server with the given startup configuration.
 ///
 /// Shared entry point used by both `mlxcel serve` and `mlxcel-server`.
 pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
+
+    // Axis A weight-load surgery (Epic #363, issue #371). Install the
+    // pipeline *before* worker startup so the spawned model loader
+    // thread observes it through the active-pipeline snapshot. When
+    // `--surgery` is absent this is a no-op and the load path stays
+    // bit-exact with the pre-#371 baseline.
+    #[cfg(feature = "surgery")]
+    install_surgery_pipeline_for_server(&startup)?;
 
     // Zero-config multi-machine pipeline bring-up (issue #342). Runs before
     // the tensor-parallel / pipeline-parallel validators so the emitted TOML

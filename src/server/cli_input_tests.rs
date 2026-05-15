@@ -138,6 +138,9 @@ fn sample_input() -> ServerStartupInput {
         responses_store_ttl_secs: 3600,
         conversation_store_max_entries: 256,
         conversation_store_ttl_secs: 3600,
+        // Issue #371 (A4): default to None for baseline-path tests.
+        #[cfg(feature = "surgery")]
+        surgery_config_path: None,
     }
 }
 
