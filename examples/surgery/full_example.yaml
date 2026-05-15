@@ -1,0 +1,45 @@
+# Full surgery config sample exercising every supported operation.
+# Use this as a copy-paste starting point.  Schema is documented in
+# `src/lib/mlxcel-surgery/src/config.rs`.
+#
+# NOTE: this file references donor safetensors that do not exist in
+# the workspace — it is for documentation only.  Real configs must
+# point at real files.
+
+version: 1
+operations:
+  # Multiply matching weights by a scalar.
+  - op: scale
+    pattern: "model.layers.*.self_attn.o_proj.weight"
+    factor: 1.2
+
+  # Task-vector arithmetic finetuning: add an external task vector
+  # scaled by `alpha` (defaults to 1.0 when omitted).
+  - op: add
+    pattern: "model.layers.*.mlp.down_proj.weight"
+    source: "./task_vectors/personality_friendly.safetensors"
+    alpha: 0.5
+
+  # Structural pruning by attention head.  Use `granularity: layer`
+  # with `layer_ids: [...]` to drop whole transformer blocks, or
+  # `granularity: mlp_channel` with `channel_ids: [...]` for MLP
+  # channel-level pruning.
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.12.self_attn.*"
+    head_ids: [3, 7]
+
+  # Replace matching weights with the corresponding tensor from a
+  # donor checkpoint.
+  - op: replace
+    pattern: "model.embed_tokens.weight"
+    source: "./donors/other_model.safetensors"
+    source_key: "model.embed_tokens.weight"
+
+  # Interpolate (slerp or lerp) between two donor checkpoints.
+  - op: interpolate
+    pattern: "model.layers.*.*"
+    source_a: "./donors/model_a.safetensors"
+    source_b: "./donors/model_b.safetensors"
+    ratio: 0.3
+    method: slerp

@@ -686,4 +686,72 @@ mod surgery_integration {
 
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn empty_yaml_config_pipeline_is_bit_exact_with_none() {
+        // End-to-end YAML → SurgeryPipeline → load_text_weights(Some(&p))
+        // for the empty-config case. Demonstrates the issue #369
+        // acceptance criterion (e): when `operations: []`, the
+        // produced pipeline behaves bit-exact identically to the
+        // `transform = None` path.
+        let yaml = "version: 1\noperations: []\n";
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("empty config parses");
+        assert!(pipeline.is_empty());
+
+        let dir_a = temp_model_dir("yaml_empty_a");
+        let dir_b = temp_model_dir("yaml_empty_b");
+        write_text_model_fixture(&dir_a);
+        write_text_model_fixture(&dir_b);
+
+        let baseline = load_text_weights(&dir_a, None).unwrap();
+        let with_yaml = load_text_weights(&dir_b, Some(&pipeline)).unwrap();
+
+        assert_eq!(baseline.len(), with_yaml.len());
+        for (k, base) in &baseline {
+            let other = with_yaml
+                .get(k)
+                .unwrap_or_else(|| panic!("missing key {k}"));
+            mlxcel_core::eval(base);
+            mlxcel_core::eval(other);
+            assert_eq!(
+                mlxcel_core::array_to_raw_bytes(base),
+                mlxcel_core::array_to_raw_bytes(other),
+                "empty YAML pipeline must preserve key {k} bit-for-bit",
+            );
+        }
+
+        std::fs::remove_dir_all(&dir_a).unwrap();
+        std::fs::remove_dir_all(&dir_b).unwrap();
+    }
+
+    #[test]
+    fn non_empty_yaml_config_surfaces_not_yet_implemented_through_loader() {
+        // Acceptance criterion (b) — the parser returns a real
+        // `SurgeryPipeline` that consumes through A1's hook. Until
+        // A5–A9 land the placeholder ops error with "not yet
+        // implemented"; this test pins that error reaching the
+        // caller via `load_text_weights`, which proves the wiring
+        // is complete and there is no silent no-op.
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: 1.0
+"#;
+        let pipeline = mlxcel_surgery::parse_config_str(yaml, None).expect("scale parses");
+
+        let dir = temp_model_dir("yaml_not_yet_implemented");
+        write_text_model_fixture(&dir);
+
+        let result = load_text_weights(&dir, Some(&pipeline));
+        match result {
+            Ok(_) => panic!("placeholder op must surface an error end-to-end"),
+            Err(err) => assert!(
+                err.contains("not yet implemented"),
+                "expected not-yet-implemented error, got: {err}",
+            ),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

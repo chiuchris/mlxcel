@@ -1,0 +1,12 @@
+# Example surgery config: scale every attention output projection
+# weight by 1.2.  See `mlxcel-surgery` (issue #369) for the schema.
+#
+# All paths in this file (none here, but see add/replace/interpolate
+# examples below) are resolved relative to this YAML file's parent
+# directory.
+
+version: 1
+operations:
+  - op: scale
+    pattern: "model.layers.*.self_attn.o_proj.weight"
+    factor: 1.2

@@ -47,9 +47,14 @@ use std::sync::Arc;
 
 pub use mlxcel_core::weights::{WeightMap, WeightTransform};
 
+pub mod config;
 mod error;
 mod pipeline;
 
+pub use config::{
+    InterpolateMethod, OpSpec, PruneGranularity, SUPPORTED_SCHEMA_VERSION, SurgeryConfig,
+    parse_config_file, parse_config_str,
+};
 pub use error::SurgeryError;
 pub use pipeline::SurgeryPipeline;
 

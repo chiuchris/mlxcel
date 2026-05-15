@@ -1,0 +1,890 @@
+// Copyright 2025-2026 Lablup Inc. and Jeongkyu Shin
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! YAML configuration schema for Axis A weight-load surgery (#369).
+//!
+//! Schema overview (see `examples/surgery/*.yaml` for full samples):
+//!
+//! ```yaml
+//! version: 1
+//! operations:
+//!   - op: scale
+//!     pattern: "model.layers.*.self_attn.o_proj.weight"
+//!     factor: 1.2
+//!
+//!   - op: add
+//!     pattern: "model.layers.*.mlp.down_proj.weight"
+//!     source: "./task_vectors/personality_friendly.safetensors"
+//!     alpha: 0.5
+//!
+//!   - op: prune
+//!     granularity: attention_head   # or: layer | mlp_channel
+//!     pattern: "model.layers.12.self_attn.*"
+//!     head_ids: [3, 7]
+//!
+//!   - op: replace
+//!     pattern: "model.embed_tokens.weight"
+//!     source: "./donors/other_model.safetensors"
+//!     source_key: "model.embed_tokens.weight"
+//!
+//!   - op: interpolate
+//!     pattern: "model.layers.*.*"
+//!     source_a: "./model_a.safetensors"
+//!     source_b: "./model_b.safetensors"
+//!     ratio: 0.3
+//!     method: slerp                 # or: lerp
+//! ```
+//!
+//! The parser validates schema syntax, glob pattern syntax, schema
+//! version, and the presence of external source files at parse time
+//! (so the load fails before any weights are mutated). Concrete
+//! operation implementations land in A5–A9; for now every variant
+//! constructs a placeholder [`crate::SurgeryOp`] that returns a
+//! "not yet implemented" error if `apply` is invoked.
+//!
+//! ## Path resolution
+//!
+//! Relative `source*` paths in the YAML are resolved against the
+//! parent directory of the YAML file. Absolute paths are taken
+//! verbatim. The parser canonicalizes paths once at parse time, so
+//! downstream ops can use the stored [`std::path::PathBuf`] without
+//! re-resolving.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use globset::{Glob, GlobMatcher};
+use serde::Deserialize;
+
+use crate::{SharedSurgeryOp, SurgeryError, SurgeryOp, SurgeryPipeline, WeightMap};
+
+/// The only schema version this parser understands. Bump when the
+/// YAML shape changes in a way that is not backwards-compatible; the
+/// parser rejects YAML with an unknown version up front so users get
+/// a clear error rather than a silent misinterpretation.
+pub const SUPPORTED_SCHEMA_VERSION: u32 = 1;
+
+/// Top-level YAML document.
+///
+/// Used by: [`parse_config_str`], [`parse_config_file`]
+#[derive(Debug, Clone, Deserialize)]
+pub struct SurgeryConfig {
+    /// Schema version. Must equal [`SUPPORTED_SCHEMA_VERSION`].
+    pub version: u32,
+    /// Ordered list of surgery operations. An empty list is allowed
+    /// — it produces an empty [`SurgeryPipeline`] whose `apply` is a
+    /// no-op.
+    #[serde(default)]
+    pub operations: Vec<OpSpec>,
+}
+
+/// Tagged-union spec for the five supported operation types.
+///
+/// The `op` field selects the variant; remaining fields are
+/// variant-specific. Unknown `op` values are rejected at parse time
+/// with a descriptive error.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum OpSpec {
+    /// `scale(W) = factor * W` over every tensor whose key matches
+    /// `pattern`.
+    Scale {
+        /// Glob pattern matched against tensor keys.
+        pattern: String,
+        /// Scalar multiplier (any finite f32).
+        factor: f32,
+    },
+
+    /// `add(W) = W + alpha * source[key]` (task-vector / arithmetic
+    /// finetuning).
+    Add {
+        /// Glob pattern matched against tensor keys.
+        pattern: String,
+        /// Path to a safetensors file containing the task vector.
+        source: PathBuf,
+        /// Coefficient on the source term. Defaults to `1.0`.
+        #[serde(default = "default_alpha_one")]
+        alpha: f32,
+    },
+
+    /// Structural pruning at the granularity indicated by
+    /// `granularity`.
+    Prune {
+        /// Which structural axis is being pruned.
+        granularity: PruneGranularity,
+        /// Glob pattern matched against tensor keys.
+        pattern: String,
+        /// Head indices (required when `granularity = attention_head`).
+        #[serde(default)]
+        head_ids: Option<Vec<usize>>,
+        /// MLP channel indices (required when
+        /// `granularity = mlp_channel`).
+        #[serde(default)]
+        channel_ids: Option<Vec<usize>>,
+        /// Layer indices (required when `granularity = layer`).
+        #[serde(default)]
+        layer_ids: Option<Vec<usize>>,
+    },
+
+    /// Replace matching weights with the corresponding tensor from a
+    /// donor safetensors file.
+    Replace {
+        /// Glob pattern matched against tensor keys.
+        pattern: String,
+        /// Donor file path.
+        source: PathBuf,
+        /// Donor tensor key to read.
+        source_key: String,
+    },
+
+    /// Interpolate (lerp / slerp) between two donor checkpoints.
+    Interpolate {
+        /// Glob pattern matched against tensor keys.
+        pattern: String,
+        /// Donor checkpoint A.
+        source_a: PathBuf,
+        /// Donor checkpoint B.
+        source_b: PathBuf,
+        /// Mixing ratio in `[0.0, 1.0]`.
+        ratio: f32,
+        /// Interpolation method.
+        method: InterpolateMethod,
+    },
+}
+
+fn default_alpha_one() -> f32 {
+    1.0
+}
+
+/// Structural-pruning granularity.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneGranularity {
+    /// Drop entire attention heads.
+    AttentionHead,
+    /// Drop entire transformer blocks.
+    Layer,
+    /// Drop individual MLP channels.
+    MlpChannel,
+}
+
+/// Tensor-space interpolation method.
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InterpolateMethod {
+    /// Spherical linear interpolation.
+    Slerp,
+    /// Linear interpolation.
+    Lerp,
+}
+
+/// Parse a YAML config string and build a populated
+/// [`SurgeryPipeline`].
+///
+/// `base_dir` is used to resolve any relative `source*` paths in the
+/// YAML. Pass the directory containing the YAML file when calling
+/// from [`parse_config_file`], or `None` to require absolute paths.
+///
+/// On success, every operation in the YAML is materialized as a
+/// placeholder [`SurgeryOp`] that records the parsed spec and
+/// returns a "not yet implemented" error on `apply`. The concrete
+/// implementations land in A5–A9.
+///
+/// Used by: [`parse_config_file`], future CLI wiring (A4)
+pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
+    let config: SurgeryConfig = serde_yaml::from_str(yaml).map_err(|e| {
+        SurgeryError::Other(anyhow::anyhow!("failed to parse surgery YAML: {e}"))
+    })?;
+
+    if config.version != SUPPORTED_SCHEMA_VERSION {
+        return Err(SurgeryError::Other(anyhow::anyhow!(
+            "unsupported surgery schema version {}; this build understands version {}",
+            config.version,
+            SUPPORTED_SCHEMA_VERSION,
+        )));
+    }
+
+    let mut ops: Vec<SharedSurgeryOp> = Vec::with_capacity(config.operations.len());
+    for (idx, spec) in config.operations.into_iter().enumerate() {
+        ops.push(materialize_op(idx, spec, base_dir)?);
+    }
+    Ok(SurgeryPipeline::from(ops))
+}
+
+/// Parse a YAML config from a file path and build a populated
+/// [`SurgeryPipeline`]. Relative `source*` paths in the YAML are
+/// resolved against the file's parent directory.
+///
+/// Used by: future CLI wiring (A4), `mlxcel surgery validate` (A4),
+/// integration tests in this crate
+pub fn parse_config_file<P: AsRef<Path>>(path: P) -> Result<SurgeryPipeline, SurgeryError> {
+    let path = path.as_ref();
+    let yaml = std::fs::read_to_string(path).map_err(|e| {
+        SurgeryError::Io(std::io::Error::new(
+            e.kind(),
+            format!("failed to read surgery config '{}': {e}", path.display()),
+        ))
+    })?;
+    let base_dir = path.parent();
+    parse_config_str(&yaml, base_dir)
+}
+
+/// Validate one `OpSpec`, resolve its paths, and construct the
+/// matching placeholder [`SurgeryOp`].
+fn materialize_op(
+    idx: usize,
+    spec: OpSpec,
+    base_dir: Option<&Path>,
+) -> Result<SharedSurgeryOp, SurgeryError> {
+    match spec {
+        OpSpec::Scale { pattern, factor } => {
+            let glob = compile_glob(idx, "scale", &pattern)?;
+            if !factor.is_finite() {
+                return Err(spec_error(idx, "scale", "factor must be finite"));
+            }
+            Ok(Arc::new(NotYetImplementedOp {
+                name: "scale",
+                summary: format!("scale(factor={factor}, pattern={pattern:?})"),
+                _glob: glob,
+            }))
+        }
+        OpSpec::Add {
+            pattern,
+            source,
+            alpha,
+        } => {
+            let glob = compile_glob(idx, "add", &pattern)?;
+            if !alpha.is_finite() {
+                return Err(spec_error(idx, "add", "alpha must be finite"));
+            }
+            let resolved = resolve_existing_source(idx, "add", "source", &source, base_dir)?;
+            Ok(Arc::new(NotYetImplementedOp {
+                name: "add",
+                summary: format!(
+                    "add(pattern={pattern:?}, source={}, alpha={alpha})",
+                    resolved.display()
+                ),
+                _glob: glob,
+            }))
+        }
+        OpSpec::Prune {
+            granularity,
+            pattern,
+            head_ids,
+            channel_ids,
+            layer_ids,
+        } => {
+            let glob = compile_glob(idx, "prune", &pattern)?;
+            validate_prune_ids(idx, granularity, &head_ids, &channel_ids, &layer_ids)?;
+            Ok(Arc::new(NotYetImplementedOp {
+                name: "prune",
+                summary: format!(
+                    "prune(granularity={granularity:?}, pattern={pattern:?}, head_ids={head_ids:?}, channel_ids={channel_ids:?}, layer_ids={layer_ids:?})"
+                ),
+                _glob: glob,
+            }))
+        }
+        OpSpec::Replace {
+            pattern,
+            source,
+            source_key,
+        } => {
+            let glob = compile_glob(idx, "replace", &pattern)?;
+            if source_key.is_empty() {
+                return Err(spec_error(idx, "replace", "source_key must not be empty"));
+            }
+            let resolved =
+                resolve_existing_source(idx, "replace", "source", &source, base_dir)?;
+            Ok(Arc::new(NotYetImplementedOp {
+                name: "replace",
+                summary: format!(
+                    "replace(pattern={pattern:?}, source={}, source_key={source_key:?})",
+                    resolved.display()
+                ),
+                _glob: glob,
+            }))
+        }
+        OpSpec::Interpolate {
+            pattern,
+            source_a,
+            source_b,
+            ratio,
+            method,
+        } => {
+            let glob = compile_glob(idx, "interpolate", &pattern)?;
+            if !ratio.is_finite() || !(0.0..=1.0).contains(&ratio) {
+                return Err(spec_error(
+                    idx,
+                    "interpolate",
+                    "ratio must be a finite number in [0.0, 1.0]",
+                ));
+            }
+            let resolved_a =
+                resolve_existing_source(idx, "interpolate", "source_a", &source_a, base_dir)?;
+            let resolved_b =
+                resolve_existing_source(idx, "interpolate", "source_b", &source_b, base_dir)?;
+            Ok(Arc::new(NotYetImplementedOp {
+                name: "interpolate",
+                summary: format!(
+                    "interpolate(pattern={pattern:?}, source_a={}, source_b={}, ratio={ratio}, method={method:?})",
+                    resolved_a.display(),
+                    resolved_b.display(),
+                ),
+                _glob: glob,
+            }))
+        }
+    }
+}
+
+fn compile_glob(idx: usize, op_name: &str, pattern: &str) -> Result<GlobMatcher, SurgeryError> {
+    Glob::new(pattern)
+        .map(|g| g.compile_matcher())
+        .map_err(|e| {
+            spec_error(
+                idx,
+                op_name,
+                &format!("malformed glob pattern {pattern:?}: {e}"),
+            )
+        })
+}
+
+fn validate_prune_ids(
+    idx: usize,
+    granularity: PruneGranularity,
+    head_ids: &Option<Vec<usize>>,
+    channel_ids: &Option<Vec<usize>>,
+    layer_ids: &Option<Vec<usize>>,
+) -> Result<(), SurgeryError> {
+    let chosen = match granularity {
+        PruneGranularity::AttentionHead => ("head_ids", head_ids.as_deref()),
+        PruneGranularity::MlpChannel => ("channel_ids", channel_ids.as_deref()),
+        PruneGranularity::Layer => ("layer_ids", layer_ids.as_deref()),
+    };
+    let field = chosen.0;
+    let ids = chosen.1.ok_or_else(|| {
+        spec_error(
+            idx,
+            "prune",
+            &format!("granularity={granularity:?} requires field `{field}`"),
+        )
+    })?;
+    if ids.is_empty() {
+        return Err(spec_error(
+            idx,
+            "prune",
+            &format!("`{field}` must contain at least one id"),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_existing_source(
+    idx: usize,
+    op_name: &str,
+    field: &str,
+    source: &Path,
+    base_dir: Option<&Path>,
+) -> Result<PathBuf, SurgeryError> {
+    let resolved = if source.is_absolute() {
+        source.to_path_buf()
+    } else if let Some(base) = base_dir {
+        base.join(source)
+    } else {
+        return Err(spec_error(
+            idx,
+            op_name,
+            &format!(
+                "{field} must be an absolute path when no config file directory is available; got {}",
+                source.display()
+            ),
+        ));
+    };
+
+    if !resolved.exists() {
+        return Err(spec_error(
+            idx,
+            op_name,
+            &format!(
+                "{field} path does not exist: {}",
+                resolved.display()
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
+fn spec_error(idx: usize, op_name: &str, msg: &str) -> SurgeryError {
+    SurgeryError::Other(anyhow::anyhow!(
+        "surgery operation #{idx} ({op_name}): {msg}"
+    ))
+}
+
+/// Placeholder [`SurgeryOp`] that materializes from a parsed
+/// [`OpSpec`] but errors with "not yet implemented" if its `apply`
+/// is invoked. The concrete behavior lands in issues A5–A9; until
+/// then the parser can still validate YAML end-to-end and tests can
+/// thread real `SurgeryPipeline` values through the load path.
+struct NotYetImplementedOp {
+    name: &'static str,
+    summary: String,
+    // Compiled glob is retained so the eventual concrete op can
+    // inherit it without re-parsing. Unused for now (the placeholder
+    // does not apply weights), but its presence keeps the parser
+    // honest about validating glob syntax up-front.
+    _glob: GlobMatcher,
+}
+
+impl SurgeryOp for NotYetImplementedOp {
+    fn apply(&self, _weights: &mut WeightMap, _cfg: &serde_json::Value) -> Result<(), SurgeryError> {
+        Err(SurgeryError::Other(anyhow::anyhow!(
+            "surgery op `{}` is not yet implemented ({})",
+            self.name,
+            self.summary,
+        )))
+    }
+
+    fn name(&self) -> &'static str {
+        self.name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlxcel_core::weights::WeightTransform;
+    use std::io::Write;
+
+    /// Helper: write a YAML string into a tempfile and parse it via
+    /// the file-based entry point so the test exercises relative
+    /// path resolution too.
+    fn parse_tempfile(yaml: &str) -> Result<SurgeryPipeline, SurgeryError> {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("surgery.yaml");
+        let mut f = std::fs::File::create(&path).expect("write yaml");
+        f.write_all(yaml.as_bytes()).expect("write yaml bytes");
+        // Keep the tempdir alive by leaking it through std::mem::forget
+        // so callers can re-stat the directory. The OS cleans up on
+        // process exit; tests are short-lived.
+        std::mem::forget(dir);
+        parse_config_file(&path)
+    }
+
+    /// Helper: create a tempdir, write the YAML there, plus a list
+    /// of dummy "donor" safetensors files. Returns the tempdir so
+    /// the caller can keep it alive.
+    fn write_yaml_with_donors(
+        yaml: &str,
+        donor_names: &[&str],
+    ) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for name in donor_names {
+            let donor_path = dir.path().join(name);
+            // Donors are validated by existence only at parse time;
+            // any non-empty bytes are fine.
+            std::fs::write(&donor_path, b"\x00\x00\x00\x00").expect("write donor");
+        }
+        let yaml_path = dir.path().join("surgery.yaml");
+        std::fs::write(&yaml_path, yaml).expect("write yaml");
+        (dir, yaml_path)
+    }
+
+    #[test]
+    fn empty_operations_yields_empty_pipeline() {
+        let yaml = "version: 1\noperations: []\n";
+        let pipeline = parse_config_str(yaml, None).expect("parse should succeed");
+        assert!(pipeline.is_empty());
+        // Empty pipeline must be a no-op when applied via A1's hook.
+        let mut weights = WeightMap::new();
+        WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null)
+            .expect("empty pipeline apply must succeed");
+        assert!(weights.is_empty());
+    }
+
+    #[test]
+    fn omitted_operations_field_defaults_to_empty() {
+        let yaml = "version: 1\n";
+        let pipeline = parse_config_str(yaml, None).expect("parse should succeed");
+        assert!(pipeline.is_empty());
+    }
+
+    #[test]
+    fn scale_op_parses_and_validates_factor() {
+        let yaml = r#"
+version: 1
+operations:
+  - op: scale
+    pattern: "model.layers.*.self_attn.o_proj.weight"
+    factor: 1.5
+"#;
+        let pipeline = parse_config_str(yaml, None).expect("parse");
+        assert_eq!(pipeline.len(), 1);
+        let names: Vec<_> = pipeline.ops().map(|op| op.name()).collect();
+        assert_eq!(names, vec!["scale"]);
+    }
+
+    #[test]
+    fn scale_rejects_non_finite_factor() {
+        let yaml = r#"
+version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: .nan
+"#;
+        let err = parse_config_str(yaml, None).expect_err("nan factor must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("scale") && msg.contains("finite"),
+            "error must mention op and reason: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_op_resolves_relative_source() {
+        let yaml = r#"version: 1
+operations:
+  - op: add
+    pattern: "model.layers.*.mlp.down_proj.weight"
+    source: "./task_vec.safetensors"
+    alpha: 0.5
+"#;
+        let (_dir, yaml_path) =
+            write_yaml_with_donors(yaml, &["task_vec.safetensors"]);
+        let pipeline = parse_config_file(&yaml_path).expect("parse with relative source");
+        assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn add_op_alpha_defaults_to_one_when_omitted() {
+        let yaml = r#"version: 1
+operations:
+  - op: add
+    pattern: "*"
+    source: "./donor.safetensors"
+"#;
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["donor.safetensors"]);
+        // The pipeline parses successfully — alpha is implicit 1.0.
+        let pipeline = parse_config_file(&yaml_path).expect("alpha is optional");
+        assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn add_rejects_missing_source_file() {
+        let yaml = r#"version: 1
+operations:
+  - op: add
+    pattern: "*"
+    source: "./does-not-exist.safetensors"
+    alpha: 1.0
+"#;
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &[]);
+        let err = parse_config_file(&yaml_path).expect_err("missing donor must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does-not-exist.safetensors") && msg.contains("does not exist"),
+            "error must mention the missing path: {msg}"
+        );
+    }
+
+    #[test]
+    fn prune_attention_head_requires_head_ids() {
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.12.self_attn.*"
+"#;
+        let err = parse_config_str(yaml, None).expect_err("missing head_ids must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("head_ids") && msg.contains("requires"),
+            "error must demand head_ids: {msg}"
+        );
+    }
+
+    #[test]
+    fn prune_attention_head_accepts_head_ids() {
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.12.self_attn.*"
+    head_ids: [3, 7]
+"#;
+        let pipeline = parse_config_str(yaml, None).expect("parse");
+        assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn prune_layer_requires_layer_ids() {
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: layer
+    pattern: "model.layers.12.*"
+"#;
+        let err = parse_config_str(yaml, None).expect_err("missing layer_ids must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("layer_ids"), "error must mention layer_ids: {msg}");
+    }
+
+    #[test]
+    fn prune_mlp_channel_requires_channel_ids() {
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: mlp_channel
+    pattern: "model.layers.*.mlp.gate_proj.weight"
+"#;
+        let err = parse_config_str(yaml, None).expect_err("missing channel_ids must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("channel_ids"),
+            "error must mention channel_ids: {msg}"
+        );
+    }
+
+    #[test]
+    fn prune_rejects_empty_id_list() {
+        let yaml = r#"version: 1
+operations:
+  - op: prune
+    granularity: attention_head
+    pattern: "*"
+    head_ids: []
+"#;
+        let err = parse_config_str(yaml, None).expect_err("empty list must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("at least one id"), "error must reject empty: {msg}");
+    }
+
+    #[test]
+    fn replace_op_resolves_source() {
+        let yaml = r#"version: 1
+operations:
+  - op: replace
+    pattern: "model.embed_tokens.weight"
+    source: "./donor.safetensors"
+    source_key: "model.embed_tokens.weight"
+"#;
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["donor.safetensors"]);
+        let pipeline = parse_config_file(&yaml_path).expect("replace parses");
+        assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn replace_rejects_empty_source_key() {
+        let yaml = r#"version: 1
+operations:
+  - op: replace
+    pattern: "*"
+    source: "./donor.safetensors"
+    source_key: ""
+"#;
+        let (_dir, yaml_path) = write_yaml_with_donors(yaml, &["donor.safetensors"]);
+        let err = parse_config_file(&yaml_path).expect_err("empty source_key must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("source_key") && msg.contains("not be empty"),
+            "error must mention empty source_key: {msg}"
+        );
+    }
+
+    #[test]
+    fn interpolate_op_parses_with_slerp() {
+        let yaml = r#"version: 1
+operations:
+  - op: interpolate
+    pattern: "model.layers.*.*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 0.3
+    method: slerp
+"#;
+        let (_dir, yaml_path) =
+            write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
+        let pipeline = parse_config_file(&yaml_path).expect("interpolate parses");
+        assert_eq!(pipeline.len(), 1);
+    }
+
+    #[test]
+    fn interpolate_rejects_out_of_range_ratio() {
+        let yaml = r#"version: 1
+operations:
+  - op: interpolate
+    pattern: "*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 1.5
+    method: lerp
+"#;
+        let (_dir, yaml_path) =
+            write_yaml_with_donors(yaml, &["a.safetensors", "b.safetensors"]);
+        let err = parse_config_file(&yaml_path).expect_err("ratio>1 must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("ratio"), "error must mention ratio: {msg}");
+    }
+
+    #[test]
+    fn unknown_op_is_rejected() {
+        let yaml = r#"version: 1
+operations:
+  - op: teleport
+    pattern: "*"
+"#;
+        let err = parse_config_str(yaml, None).expect_err("unknown op must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("teleport") || msg.contains("unknown"), "{msg}");
+    }
+
+    #[test]
+    fn missing_required_field_is_rejected() {
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+"#; // factor missing
+        let err = parse_config_str(yaml, None).expect_err("missing field must fail");
+        let msg = format!("{err}");
+        assert!(msg.contains("factor"), "error must mention missing field: {msg}");
+    }
+
+    #[test]
+    fn wrong_field_type_is_rejected() {
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: "not a number"
+"#;
+        let err = parse_config_str(yaml, None).expect_err("type mismatch must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("factor") || msg.contains("number"),
+            "error must surface the type mismatch: {msg}",
+        );
+    }
+
+    #[test]
+    fn unsupported_version_is_rejected() {
+        let yaml = "version: 99\noperations: []\n";
+        let err = parse_config_str(yaml, None).expect_err("future version must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("version") && msg.contains("99"),
+            "error must mention the unknown version: {msg}",
+        );
+    }
+
+    #[test]
+    fn malformed_glob_pattern_is_rejected() {
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "model.layers.{0"
+    factor: 1.0
+"#;
+        let err = parse_config_str(yaml, None).expect_err("malformed glob must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("glob") || msg.contains("pattern") || msg.contains("malformed"),
+            "error must mention glob issue: {msg}"
+        );
+    }
+
+    #[test]
+    fn placeholder_op_returns_not_yet_implemented_on_apply() {
+        // Acceptance criterion: the parser builds a pipeline, but
+        // the produced ops are explicit "not yet implemented" stubs
+        // (A5–A9 will replace them). Calling `apply` must error
+        // visibly so a user who runs surgery before A5–A9 land does
+        // not get a silent no-op.
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "*"
+    factor: 1.5
+"#;
+        let pipeline = parse_config_str(yaml, None).expect("parse");
+        let mut weights = WeightMap::new();
+        let result =
+            WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null);
+        match result {
+            Ok(_) => panic!("placeholder op must surface an error"),
+            Err(msg) => {
+                assert!(
+                    msg.contains("not yet implemented"),
+                    "placeholder error must say so: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn full_schema_parses_with_all_op_types() {
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "model.layers.*.self_attn.o_proj.weight"
+    factor: 1.2
+
+  - op: add
+    pattern: "model.layers.*.mlp.down_proj.weight"
+    source: "./task_vec.safetensors"
+    alpha: 0.5
+
+  - op: prune
+    granularity: attention_head
+    pattern: "model.layers.12.self_attn.*"
+    head_ids: [3, 7]
+
+  - op: replace
+    pattern: "model.embed_tokens.weight"
+    source: "./donor.safetensors"
+    source_key: "model.embed_tokens.weight"
+
+  - op: interpolate
+    pattern: "model.layers.*.*"
+    source_a: "./a.safetensors"
+    source_b: "./b.safetensors"
+    ratio: 0.3
+    method: slerp
+"#;
+        let (_dir, yaml_path) = write_yaml_with_donors(
+            yaml,
+            &[
+                "task_vec.safetensors",
+                "donor.safetensors",
+                "a.safetensors",
+                "b.safetensors",
+            ],
+        );
+        let pipeline = parse_config_file(&yaml_path).expect("full schema parses");
+        assert_eq!(pipeline.len(), 5);
+        let names: Vec<&'static str> = pipeline.ops().map(|op| op.name()).collect();
+        assert_eq!(
+            names,
+            vec!["scale", "add", "prune", "replace", "interpolate"]
+        );
+    }
+
+    // Suppress the dead_code warning that fires because
+    // `parse_tempfile` is wired up for potential future use, but
+    // every existing test reaches the file-based entry point via
+    // `write_yaml_with_donors` for clarity.
+    #[allow(dead_code)]
+    fn _keep_parse_tempfile_alive(yaml: &str) -> Result<SurgeryPipeline, SurgeryError> {
+        parse_tempfile(yaml)
+    }
+}
