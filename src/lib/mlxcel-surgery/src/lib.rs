@@ -49,6 +49,7 @@ pub use mlxcel_core::weights::{WeightMap, WeightTransform};
 
 pub mod config;
 mod error;
+pub mod ops;
 mod pipeline;
 
 pub use config::{
@@ -56,6 +57,7 @@ pub use config::{
     parse_config_file, parse_config_str,
 };
 pub use error::SurgeryError;
+pub use ops::ScaleOp;
 pub use pipeline::SurgeryPipeline;
 
 /// A single weight-load surgical operation.

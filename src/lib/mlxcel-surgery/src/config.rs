@@ -48,10 +48,12 @@
 //!
 //! The parser validates schema syntax, glob pattern syntax, schema
 //! version, and the presence of external source files at parse time
-//! (so the load fails before any weights are mutated). Concrete
-//! operation implementations land in A5–A9; for now every variant
-//! constructs a placeholder [`crate::SurgeryOp`] that returns a
-//! "not yet implemented" error if `apply` is invoked.
+//! (so the load fails before any weights are mutated). The `scale`
+//! variant materializes to a real [`crate::ops::ScaleOp`] from A5;
+//! the remaining variants (`add` / `prune` / `replace` /
+//! `interpolate`) still construct placeholder [`crate::SurgeryOp`]s
+//! that return a "not yet implemented" error if `apply` is invoked,
+//! pending A6–A9.
 //!
 //! ## Path resolution
 //!
@@ -67,6 +69,7 @@ use std::sync::Arc;
 use globset::{Glob, GlobMatcher};
 use serde::Deserialize;
 
+use crate::ops::ScaleOp;
 use crate::{SharedSurgeryOp, SurgeryError, SurgeryOp, SurgeryPipeline, WeightMap};
 
 /// The only schema version this parser understands. Bump when the
@@ -196,10 +199,11 @@ pub enum InterpolateMethod {
 /// YAML. Pass the directory containing the YAML file when calling
 /// from [`parse_config_file`], or `None` to require absolute paths.
 ///
-/// On success, every operation in the YAML is materialized as a
-/// placeholder [`SurgeryOp`] that records the parsed spec and
-/// returns a "not yet implemented" error on `apply`. The concrete
-/// implementations land in A5–A9.
+/// On success, the `scale` operation is materialized as a real
+/// [`ScaleOp`] (A5); the remaining variants (`add` / `prune` /
+/// `replace` / `interpolate`) are still placeholder
+/// [`SurgeryOp`]s that record the parsed spec and return a "not
+/// yet implemented" error on `apply` until A6–A9 land.
 ///
 /// Used by: [`parse_config_file`], future CLI wiring (A4)
 pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
@@ -249,15 +253,20 @@ fn materialize_op(
 ) -> Result<SharedSurgeryOp, SurgeryError> {
     match spec {
         OpSpec::Scale { pattern, factor } => {
-            let glob = compile_glob(idx, "scale", &pattern)?;
+            // Compile the glob up-front so a malformed pattern still
+            // fails at parse time with the standard
+            // `surgery operation #N (scale): ...` prefix, even though
+            // `ScaleOp::new` would compile the glob a second time on
+            // its own. The cost is one transient `GlobMatcher`; the
+            // benefit is identical error wording for every op kind.
+            let _glob = compile_glob(idx, "scale", &pattern)?;
             if !factor.is_finite() {
                 return Err(spec_error(idx, "scale", "factor must be finite"));
             }
-            Ok(Arc::new(NotYetImplementedOp {
-                name: "scale",
-                summary: format!("scale(factor={factor}, pattern={pattern:?})"),
-                _glob: glob,
-            }))
+            let op = ScaleOp::new(&pattern, factor).map_err(|e| {
+                spec_error(idx, "scale", &format!("failed to construct ScaleOp: {e}"))
+            })?;
+            Ok(Arc::new(op))
         }
         OpSpec::Add {
             pattern,
@@ -806,17 +815,24 @@ operations:
     #[test]
     fn placeholder_op_returns_not_yet_implemented_on_apply() {
         // Acceptance criterion: the parser builds a pipeline, but
-        // the produced ops are explicit "not yet implemented" stubs
-        // (A5–A9 will replace them). Calling `apply` must error
-        // visibly so a user who runs surgery before A5–A9 land does
-        // not get a silent no-op.
-        let yaml = r#"version: 1
+        // ops that have not yet landed (A6–A9: add / prune /
+        // replace / interpolate) remain explicit "not yet
+        // implemented" stubs. Calling `apply` must error visibly so
+        // a user who runs surgery against an unimplemented variant
+        // does not get a silent no-op. `scale` (A5) now materializes
+        // to a real `ScaleOp` and is exercised by the integration
+        // tests instead.
+        let (_dir, yaml_path) = write_yaml_with_donors(
+            r#"version: 1
 operations:
-  - op: scale
+  - op: add
     pattern: "*"
-    factor: 1.5
-"#;
-        let pipeline = parse_config_str(yaml, None).expect("parse");
+    source: "./task_vec.safetensors"
+    alpha: 0.5
+"#,
+            &["task_vec.safetensors"],
+        );
+        let pipeline = parse_config_file(&yaml_path).expect("parse");
         let mut weights = WeightMap::new();
         let result =
             WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null);
@@ -829,6 +845,39 @@ operations:
                 );
             }
         }
+    }
+
+    #[test]
+    fn scale_op_materializes_to_real_implementation() {
+        // A5 landing pin: `scale` is no longer a "not yet implemented"
+        // stub. Parse a `scale` op, populate a synthetic WeightMap,
+        // and confirm the pipeline mutates the matched tensor — i.e.
+        // the placeholder is gone and `ScaleOp` is wired through the
+        // factory.
+        let yaml = r#"version: 1
+operations:
+  - op: scale
+    pattern: "model.layer.weight"
+    factor: 2.0
+"#;
+        let pipeline = parse_config_str(yaml, None).expect("parse");
+        let mut weights = WeightMap::new();
+        weights.insert(
+            "model.layer.weight".to_string(),
+            mlxcel_core::from_slice_f32(&[3.0, -4.0], &[2]),
+        );
+
+        WeightTransform::apply(&pipeline, &mut weights, &serde_json::Value::Null)
+            .expect("real ScaleOp must apply without error");
+
+        let after = weights.get("model.layer.weight").unwrap();
+        mlxcel_core::eval(after);
+        let bytes = mlxcel_core::array_to_raw_bytes(after);
+        let values: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_ne_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(values, vec![6.0, -8.0]);
     }
 
     #[test]
