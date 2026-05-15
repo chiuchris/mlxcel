@@ -761,14 +761,14 @@ mod surgery_integration {
     #[test]
     fn non_empty_yaml_config_surfaces_not_yet_implemented_through_loader() {
         // Acceptance criterion (b) — the parser returns a real
-        // `SurgeryPipeline` that consumes through A1's hook. For ops
-        // that have not yet landed (A8–A9: replace / interpolate),
+        // `SurgeryPipeline` that consumes through A1's hook. For the
+        // remaining op that has not yet landed (A9: interpolate),
         // the placeholder errors with "not yet implemented"; this
         // test pins that error reaching the caller via
         // `load_text_weights`, which proves the wiring is complete
         // and there is no silent no-op. `scale` (A5), `add` (A6),
-        // and `prune` (A7) are now real and are exercised by
-        // separate tests.
+        // `prune` (A7), and `replace` (A8) are now real and are
+        // exercised by separate tests.
         let dir = temp_model_dir("yaml_not_yet_implemented");
         write_text_model_fixture(&dir);
         let config_dir = temp_model_dir("yaml_not_yet_implemented_config");
@@ -958,9 +958,9 @@ operations:
         // call `load_text_weights(_, None)`. The active-pipeline slot
         // must be consulted because the explicit `transform` is None,
         // and the placeholder error must propagate out. Uses
-        // `interpolate` because `scale` (A5), `add` (A6), and `prune`
-        // (A7) now materialize to real ops; `replace` / `interpolate`
-        // remain placeholders until A8–A9.
+        // `interpolate` because `scale` (A5), `add` (A6), `prune`
+        // (A7), and `replace` (A8) now materialize to real ops;
+        // `interpolate` remains a placeholder until A9.
         let donor_dir = temp_model_dir("active_slot_donors");
         std::fs::create_dir_all(&donor_dir).unwrap();
         std::fs::write(donor_dir.join("a.safetensors"), b"\x00\x00\x00\x00").unwrap();
@@ -1247,6 +1247,94 @@ operations:
                 assert_eq!(row_sum, 32.0);
             }
         }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn replace_yaml_swaps_targeted_tensor_through_load_text_weights() {
+        // Issue #377 acceptance criterion (b) — the real ReplaceOp,
+        // built from YAML, replaces the targeted base tensor with
+        // the donor's content when invoked through A1's
+        // `load_text_weights` hook. Untouched tensors stay
+        // bit-identical to the baseline (proves the op only mutates
+        // matching keys; A4's `--surgery` flag will route this
+        // exact pipeline through the same loader path).
+        let dir = temp_model_dir("yaml_replace_e2e");
+        write_text_model_fixture(&dir);
+
+        // Build the donor `.safetensors` directly inside the model
+        // dir so the YAML can refer to it with a relative path. The
+        // donor uses a non-zero, identifiable byte pattern so we can
+        // assert the swap really happened (the baseline fixture
+        // stores all-zero tensors).
+        let donor_path = dir.join("donor.safetensors");
+        let donor_floats: [f32; 4] = [10.0, 20.0, 30.0, 40.0];
+        let mut donor_bytes = Vec::with_capacity(donor_floats.len() * 4);
+        for v in donor_floats {
+            donor_bytes.extend_from_slice(&v.to_le_bytes());
+        }
+        write_safetensors(
+            &donor_path,
+            &[(
+                "model.embed_tokens.weight",
+                OwnedTensor {
+                    dtype: SafeTensorDtype::F32,
+                    shape: vec![2, 2],
+                    data: donor_bytes,
+                },
+            )],
+        );
+
+        // Write the YAML alongside the donor so the parser's
+        // relative-path resolution picks up the donor automatically.
+        let yaml_path = dir.join("replace.yaml");
+        let yaml = r#"version: 1
+operations:
+  - op: replace
+    pattern: "model.embed_tokens.weight"
+    source: "./donor.safetensors"
+    source_key: "model.embed_tokens.weight"
+"#;
+        std::fs::write(&yaml_path, yaml).unwrap();
+        let pipeline =
+            mlxcel_surgery::parse_config_file(&yaml_path).expect("replace yaml parses");
+
+        let baseline = load_text_weights(&dir, None).unwrap();
+        let with_replace = load_text_weights(&dir, Some(&pipeline)).unwrap();
+
+        // The targeted tensor differs from the baseline.
+        let post = with_replace.get("model.embed_tokens.weight").unwrap();
+        mlxcel_core::eval(post);
+        let bytes = mlxcel_core::array_to_raw_bytes(post);
+        let mut floats: Vec<f32> = Vec::with_capacity(4);
+        for chunk in bytes.chunks_exact(4) {
+            floats.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        assert_eq!(
+            floats,
+            vec![10.0, 20.0, 30.0, 40.0],
+            "replace op must substitute the donor payload"
+        );
+        let base_e = baseline.get("model.embed_tokens.weight").unwrap();
+        mlxcel_core::eval(base_e);
+        assert_ne!(
+            mlxcel_core::array_to_raw_bytes(base_e),
+            mlxcel_core::array_to_raw_bytes(post),
+            "result must differ from the baseline (acceptance b)"
+        );
+
+        // Untouched tensors stay bit-identical to the baseline.
+        let untouched_key = "model.layers.0.self_attn.q_proj.weight";
+        let baseline_t = baseline.get(untouched_key).unwrap();
+        let post_t = with_replace.get(untouched_key).unwrap();
+        mlxcel_core::eval(baseline_t);
+        mlxcel_core::eval(post_t);
+        assert_eq!(
+            mlxcel_core::array_to_raw_bytes(baseline_t),
+            mlxcel_core::array_to_raw_bytes(post_t),
+            "untouched tensor must stay bit-exact across the replace op"
+        );
 
         std::fs::remove_dir_all(&dir).unwrap();
     }

@@ -49,12 +49,13 @@
 //! The parser validates schema syntax, glob pattern syntax, schema
 //! version, and the presence of external source files at parse time
 //! (so the load fails before any weights are mutated). The `scale`
-//! (A5), `add` (A6), and `prune` (A7) variants materialize to real
-//! [`crate::ops::ScaleOp`] / [`crate::ops::AddOp`] /
-//! [`crate::ops::PruneOp`] instances; the remaining variants
-//! (`replace` / `interpolate`) still construct placeholder
-//! [`crate::SurgeryOp`]s that return a "not yet implemented" error if
-//! `apply` is invoked, pending A8–A9.
+//! (A5), `add` (A6), `prune` (A7), and `replace` (A8) variants
+//! materialize to real [`crate::ops::ScaleOp`] /
+//! [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] /
+//! [`crate::ops::ReplaceOp`] instances; the remaining variant
+//! (`interpolate`) still constructs a placeholder
+//! [`crate::SurgeryOp`] that returns a "not yet implemented" error if
+//! `apply` is invoked, pending A9.
 //!
 //! ## Path resolution
 //!
@@ -200,12 +201,13 @@ pub enum InterpolateMethod {
 /// YAML. Pass the directory containing the YAML file when calling
 /// from [`parse_config_file`], or `None` to require absolute paths.
 ///
-/// On success, the `scale` (A5), `add` (A6), and `prune` (A7)
-/// operations are materialized as real [`ScaleOp`] /
-/// [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] instances; the
-/// remaining variants (`replace` / `interpolate`) are still
-/// placeholder [`SurgeryOp`]s that record the parsed spec and return
-/// a "not yet implemented" error on `apply` until A8–A9 land.
+/// On success, the `scale` (A5), `add` (A6), `prune` (A7), and
+/// `replace` (A8) operations are materialized as real [`ScaleOp`] /
+/// [`crate::ops::AddOp`] / [`crate::ops::PruneOp`] /
+/// [`crate::ops::ReplaceOp`] instances; the remaining variant
+/// (`interpolate`) is still a placeholder [`SurgeryOp`] that records
+/// the parsed spec and returns a "not yet implemented" error on
+/// `apply` until A9 lands.
 ///
 /// Used by: [`parse_config_file`], future CLI wiring (A4)
 pub fn parse_config_str(yaml: &str, base_dir: Option<&Path>) -> Result<SurgeryPipeline, SurgeryError> {
@@ -320,20 +322,22 @@ fn materialize_op(
             source,
             source_key,
         } => {
-            let glob = compile_glob(idx, "replace", &pattern)?;
+            // Validate the glob syntax up front so users get the
+            // same "malformed glob" diagnostic the other ops
+            // produce. The `ReplaceOp` uses its own capture-aware
+            // matcher (see `ops::replace::wildcard`) but pinning
+            // syntax compatibility with `globset::Glob` here keeps
+            // the YAML schema consistent across op kinds.
+            let _glob_syntax_check = compile_glob(idx, "replace", &pattern)?;
             if source_key.is_empty() {
                 return Err(spec_error(idx, "replace", "source_key must not be empty"));
             }
             let resolved =
                 resolve_existing_source(idx, "replace", "source", &source, base_dir)?;
-            Ok(Arc::new(NotYetImplementedOp {
-                name: "replace",
-                summary: format!(
-                    "replace(pattern={pattern:?}, source={}, source_key={source_key:?})",
-                    resolved.display()
-                ),
-                _glob: glob,
-            }))
+            let op = crate::ops::ReplaceOp::new(&pattern, &source_key, resolved).map_err(
+                |e| spec_error(idx, "replace", &format!("{e}")),
+            )?;
+            Ok(Arc::new(op))
         }
         OpSpec::Interpolate {
             pattern,
@@ -826,13 +830,13 @@ operations:
     #[test]
     fn placeholder_op_returns_not_yet_implemented_on_apply() {
         // Acceptance criterion: the parser builds a pipeline, but
-        // ops that have not yet landed (A8–A9: replace /
-        // interpolate) remain explicit "not yet implemented" stubs.
-        // Calling `apply` must error visibly so a user who runs
-        // surgery against an unimplemented variant does not get a
-        // silent no-op. `scale` (A5), `add` (A6), and `prune` (A7)
-        // now materialize to real ops and are exercised by their
-        // own integration tests instead.
+        // the op that has not yet landed (A9: interpolate) remains
+        // an explicit "not yet implemented" stub. Calling `apply`
+        // must error visibly so a user who runs surgery against an
+        // unimplemented variant does not get a silent no-op. `scale`
+        // (A5), `add` (A6), `prune` (A7), and `replace` (A8) now
+        // materialize to real ops and are exercised by their own
+        // integration tests instead.
         let (_dir, yaml_path) = write_yaml_with_donors(
             r#"version: 1
 operations:

@@ -1,0 +1,41 @@
+# Replace-op-only surgery config sample (issue #377).
+#
+# Demonstrates substituting a base-model tensor with the equivalent
+# tensor from a donor safetensors file. The most common use case is
+# swapping a `model.embed_tokens.weight` matrix or an `lm_head.weight`
+# matrix between compatible sibling models.
+#
+# Wildcard substitution semantics:
+#
+#   - The N-th `*` in `pattern` captures a substring of the matched
+#     base-model tensor key. That substring is substituted for the
+#     N-th `*` in `source_key`, so the wildcard count in `pattern`
+#     and `source_key` must match. This is checked at parse time.
+#   - For a single tensor (no wildcards) `pattern` and `source_key`
+#     are used verbatim — they may differ, allowing renames such as
+#     base `model.embed_tokens.weight` <- donor `embedding.weight`.
+#
+# Quantized base tensors are replaced atomically together with their
+# `.scales` and `.biases` siblings: all three must exist in the
+# donor and share the same shapes and dtypes as the base, otherwise
+# the operation errors before any mutation.
+#
+# NOTE: this file references a donor that does not exist in the
+# workspace — it is for documentation only. Real configs must point
+# at real safetensors files.
+
+version: 1
+operations:
+  # Single-tensor replace: swap the embedding matrix.
+  - op: replace
+    pattern: "model.embed_tokens.weight"
+    source: "./donors/sibling_model.safetensors"
+    source_key: "model.embed_tokens.weight"
+
+  # Multi-tensor replace via a glob: substitute every layer's
+  # `o_proj.weight` (and its `.scales` / `.biases` siblings if the
+  # base model is quantized) with the donor's equivalent.
+  - op: replace
+    pattern: "model.layers.*.self_attn.o_proj.weight"
+    source: "./donors/sibling_model.safetensors"
+    source_key: "model.layers.*.self_attn.o_proj.weight"
