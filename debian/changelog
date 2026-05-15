@@ -1,3 +1,89 @@
+mlxcel (0.0.27-1~jammy1) jammy; urgency=medium
+
+  * Feat: Speculative decoding Phase 2 — end-to-end Gemma 4 MTP and
+    Qwen 3.5 DFlash drafter pipelines. Drafter trait + DrafterKind
+    enum + model_type auto-detection (#624); MaskedEmbedder for E2B/E4B
+    drafters (#627); drafter masks (bidirectional full + SWA) +
+    normalize_batched_shared_kv_states (#628); Gemma4AssistantDraftModel
+    4-layer drafter + pre/post projections (#626); DFlashDraftModel
+    5-layer drafter + DFlashAttention + DFlashKVCache (#635);
+    Gemma 4 return_hidden / return_shared_kv / rollback_speculative_cache
+    target hooks (#625); Qwen 3.5 return_hidden + capture_layer_ids +
+    GDN-aware rollback_speculative_cache (#634)
+  * Feat: Speculative round loops — DFlash single-batch round loop
+    (#636), MtpGenerator single-batch round loop (#629), batched
+    DFlash round loop with continuous batching + GDN-aware rollback
+    (#637), batched MTP round loop with continuous batching +
+    left-padding normalization (#631)
+  * Feat: CLI — --draft-kind {dflash,mtp} and --draft-block-size
+    flags (#630); test(speculative) greedy-parity + perf benchmarks
+    for drafter pairings (#632)
+  * Feat: Server speculative dispatch — wire speculative dispatch
+    resolution and MtpTarget adapters (#666); wire real MaskedEmbedder
+    and make_drafter_masks for Gemma 4 assistant; wire speculative
+    dispatch into scheduler via B=1 bursts (#670); B>1 batched
+    speculative dispatch via MtpBatchedGenerator / DFlashBatchedGenerator
+    (#684); cancellation propagation through MtpGenerator and
+    DFlashGenerator (#681); thread token_history through speculative-burst
+    first sample (#682); logprobs support in speculative-burst (#686);
+    thinking-budget enforcement in speculative-burst (#687); wire
+    donate_finished_sequence_cache symmetric with classic path (#680)
+    and into the B>1 batched arm (#689); real-model byte-equality
+    end-to-end tests (#685); harden speculative drafter epic follow-ups
+  * Fix: DFlash drafter lazy-bind for upstream z-lab/Qwen3.5-4B-DFlash
+    checkpoint (#683); enable DFlash for Qwen 3.5 VLM text requests
+    (#694); avoid slow Gemma 4 MTP singleton bursts (#698); validate
+    trimmable cache and reserve last token in prefill for speculative
+    rollback safety (#612)
+  * Perf: Qwen 3.5 DFlash decode-path greedy argmax optimization
+  * Feat: OpenAI Responses API (Phase 1) — /v1/responses endpoint
+    with conversation store, streaming events, reasoning-trace
+    forwarding, response cancellation, and four new CLI flags on both
+    binaries (#622, #623)
+  * Feat: APC block-level partial cache adoption in the scheduler —
+    when APC is on, a prompt sharing the first N blocks with a cached
+    entry but diverging at block N+1 now reuses blocks 0..N and
+    re-prefills only from the divergence boundary via
+    DetachedKVCache::trim_to / DetachedCacheSet::truncate_to (FP16,
+    INT8, Turbo4, Turbo4Delegated sidecars). APC-off retains bit-exact
+    prior behaviour (#580, #607)
+  * Feat: Nemotron H Nano Omni audio modality — Parakeet/Conformer
+    sound encoder, mel-spectrogram feature extractor, audio projector,
+    interleaved audio+vision token merging at sound_context_token_id
+    in generate_vlm (#582, #609)
+  * Feat: mlxcel download / mlxcel-server download per-file +
+    aggregate progress bars with terminal-aware suppression, reqwest
+    streaming, and atomic tempfile rename (#648, #649); follow-up
+    security hardening — plaintext HF_ENDPOINT + token warning
+    (M1), client connect/read timeouts (M2), URL path percent-encoding
+    for ?/#/% in filenames (L1), O_NOFOLLOW tempfile creation (L2),
+    Result-based token ASCII handling (L3), stale .mlxcel-partial.*
+    cleanup at start (L5), parallel HEAD with buffer_unordered(8)
+    (L6) (#650, #652)
+  * Feat: Server --max-kv-size flag (matching llama-server) and
+    tighter chat-completion response shape (#618)
+  * Feat: Tokenizer multi-token think and tool-call sequence support
+    (#590, #613)
+  * Fix: MiniMax M2 parallel tool calling parser (#616); preserve
+    token positions when buffering parallel tool calls (#615); skip
+    tool→normal transition when tool_call_end is empty (#614);
+    pop_prefixes in RadixTrie with correct immediate-prefix semantics
+    for the prompt cache (#617)
+  * Fix: Close TOCTOU race in video allowlist by passing fd to
+    ffmpeg (#601, #611); Gemma 4 skip k_proj/v_proj/k_norm load for
+    KV-shared layers (#608); Nemotron H default time_step_limit to
+    (0.0, inf) regardless of time_step_min/max (#619); gated_delta
+    zero-init y[dv_idx] when mask is false in masked Metal kernel
+    variants (#610); upstream-sync review follow-ups
+  * Chore: clippy 1.93 — replace .map_or(false, ...) with
+    .is_some_and(...) in tokenizer (#651); test fixture adds
+    max_kv_size field to ServeArgs (#620)
+  * CI: bump GitHub Actions to Node 24 runtime
+  * Docs: refresh README to match current code and benchmarks (#700);
+    update speculative decoding guidance
+
+ -- Jeongkyu Shin <inureyes@gmail.com>  Sat, 16 May 2026 18:00:00 +0900
+
 mlxcel (0.0.26-1~jammy1) jammy; urgency=medium
 
   * Feat: TurboQuant KV cache — Walsh-Hadamard transform op + PolarQuant
