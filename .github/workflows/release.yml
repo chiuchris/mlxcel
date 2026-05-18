@@ -9,8 +9,8 @@ on:
         description: 'Release tag to upload artifacts to (e.g. v0.1.0)'
         required: false
 
-permissions:
-  contents: write
+# Default-deny top-level permissions; each job grants only what it needs.
+permissions: {}
 
 jobs:
   # ============================================================================
@@ -21,6 +21,14 @@ jobs:
     runs-on: self-hosted-macos-26-arm64 # Self-hosted Apple Silicon runner with macOS 26 SDK + Metal 4
     environment: packaging
     timeout-minutes: 90
+    # Block forks from invoking this workflow against the canonical self-hosted
+    # runner pool. `workflow_dispatch` can be triggered from any branch the
+    # actor has push access to, so this guard is the last line of defense
+    # against a forked copy of the repo dispatching a build with the
+    # canonical-org runner labels.
+    if: github.repository == 'lablup/mlxcel'
+    permissions:
+      contents: write
 
     env:
       MACOSX_DEPLOYMENT_TARGET: "14.0"
@@ -28,6 +36,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Don't leave GITHUB_TOKEN in .git/config; release jobs only fetch.
+          persist-credentials: false
 
       # Use persistent cache paths for self-hosted runner (outside workspace)
       - name: Setup persistent cache paths (self-hosted)
@@ -184,6 +195,9 @@ jobs:
     name: Build Linux ARM64 CUDA (${{ matrix.variant }})
     runs-on: GB10
     environment: packaging
+    if: github.repository == 'lablup/mlxcel'
+    permissions:
+      contents: write
 
     strategy:
       fail-fast: false
@@ -204,6 +218,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Don't leave GITHUB_TOKEN in .git/config; release jobs only fetch.
+          persist-credentials: false
 
       # Use persistent cache paths for self-hosted runner (outside workspace)
       - name: Setup persistent cache paths (self-hosted)
@@ -295,7 +312,7 @@ jobs:
   notify-teams:
     name: Notify Teams on release
     needs: [build-macos, build-linux-cuda]
-    if: github.event_name == 'release'
+    if: github.repository == 'lablup/mlxcel' && github.event_name == 'release'
     runs-on: ubuntu-latest
     permissions: {}
 
@@ -349,7 +366,7 @@ jobs:
   promote-release:
     name: Promote to full release
     needs: [build-macos, build-linux-cuda]
-    if: always() && github.event_name == 'release' && github.event.release.prerelease && needs.build-macos.result == 'success' && needs.build-linux-cuda.result == 'success'
+    if: always() && github.repository == 'lablup/mlxcel' && github.event_name == 'release' && github.event.release.prerelease && needs.build-macos.result == 'success' && needs.build-linux-cuda.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: write

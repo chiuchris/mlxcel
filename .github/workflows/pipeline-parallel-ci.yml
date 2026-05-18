@@ -78,6 +78,15 @@ jobs:
   two-host-logical:
     name: 2-host logical (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    # Public-mirror guard: skip on forks. PRs opened from a fork would
+    # otherwise execute fork-author code against this canonical repository's
+    # GITHUB_TOKEN and CI fixture release, which we intentionally disallow on
+    # the public release mirror. Internal PRs (head repo == this repo) and
+    # `workflow_dispatch` still run normally.
+    if: >-
+      github.repository == 'lablup/mlxcel' &&
+      (github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository)
     strategy:
       fail-fast: false
       matrix:
@@ -88,6 +97,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Don't leave GITHUB_TOKEN in .git/config; CI jobs only fetch.
+          persist-credentials: false
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -194,10 +206,13 @@ jobs:
     # stays queued until the runner becomes available or the PR is
     # updated — it does not auto-fail.
     if: |
-      (github.event_name == 'pull_request' &&
-        contains(github.event.pull_request.labels.*.name, 'ci:pp-three-host')) ||
-      (github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.run_three_host == 'true')
+      github.repository == 'lablup/mlxcel' && (
+        (github.event_name == 'pull_request' &&
+          github.event.pull_request.head.repo.full_name == github.repository &&
+          contains(github.event.pull_request.labels.*.name, 'ci:pp-three-host')) ||
+        (github.event_name == 'workflow_dispatch' &&
+          github.event.inputs.run_three_host == 'true')
+      )
     runs-on:
       - self-hosted
       - pp-three-host
@@ -213,6 +228,9 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v6
+        with:
+          # Don't leave GITHUB_TOKEN in .git/config; CI jobs only fetch.
+          persist-credentials: false
 
       - name: Resolve model root
         id: model

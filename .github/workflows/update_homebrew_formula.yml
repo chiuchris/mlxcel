@@ -1,0 +1,112 @@
+name: Update Homebrew Formula
+
+# Adapted from lablup/all-smi's update_homebrew_formula.yml. mlxcel ships a
+# single brew-supported artifact (macOS Apple Silicon); the Linux CUDA
+# variants are hardware-specific and continue to be distributed only as raw
+# GitHub Release assets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. v0.0.27)"
+        required: false
+
+  workflow_run:
+    workflows: ["Release"]
+    types:
+      - completed
+
+# Default-deny top-level permissions; each job grants only what it needs.
+permissions: {}
+
+jobs:
+  update-homebrew:
+    name: Update Homebrew Formula
+    runs-on: macos-latest
+    environment: packaging
+    # Pin this job to the canonical public repository. `workflow_run` cannot
+    # be triggered from a fork's Release workflow (workflow_run only observes
+    # workflows defined on the default branch of the same repo), but
+    # `workflow_dispatch` can be invoked from any branch the actor has push
+    # access to. The repository guard removes that residual attack surface.
+    if: >-
+      github.repository == 'lablup/mlxcel' &&
+      (github.event_name == 'workflow_dispatch' ||
+        github.event.workflow_run.conclusion == 'success')
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Install gnu-sed
+        run: brew install gnu-sed
+
+      - name: Determine version tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ -n "${{ github.event.inputs.release_tag }}" ]; then
+            echo "VERSION=${{ github.event.inputs.release_tag }}" >> $GITHUB_ENV
+          else
+            TAG=$(gh api repos/${{ github.repository }}/releases/latest --jq .tag_name)
+            echo "VERSION=$TAG" >> $GITHUB_ENV
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Clone Homebrew tap repository
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          git clone "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/lablup/homebrew-tap.git"
+          cd homebrew-tap
+          git config user.name "GitHub Action"
+          git config user.email "actions@github.com"
+
+      - name: Download release artifact and calculate SHA256
+        run: |
+          cd homebrew-tap
+          RAW_VERSION="${{ env.VERSION }}"
+          VERSION="${RAW_VERSION#v}"  # Strip leading 'v' if present
+          echo "VERSION_NO_V=$VERSION" >> $GITHUB_ENV
+
+          MAC_URL="https://github.com/${{ github.repository }}/releases/download/v${VERSION}/mlxcel-macos-aarch64.zip"
+
+          mkdir -p tmp
+          # -f: fail on HTTP errors (so a missing release surfaces here, not as
+          # a silent zero-byte artifact whose SHA256 ends up committed to the
+          # tap).
+          curl -fLs --retry 3 "$MAC_URL" -o tmp/mac.zip
+
+          # Sanity check: a non-zero file with a valid zip magic. mlxcel's
+          # macOS asset is around 60 MB at v0.0.27, so anything tiny is a
+          # release-pipeline regression and we abort before mutating the
+          # formula.
+          ACTUAL_SIZE=$(stat -f%z tmp/mac.zip)
+          if [ "$ACTUAL_SIZE" -lt 1048576 ]; then
+            echo "::error::Downloaded artifact is suspiciously small ($ACTUAL_SIZE B); aborting bump."
+            exit 1
+          fi
+
+          echo "mac_url=$MAC_URL" >> $GITHUB_ENV
+          echo "mac_sha=$(shasum -a 256 tmp/mac.zip | awk '{print $1}')" >> $GITHUB_ENV
+
+      - name: Update formula
+        run: |
+          cd homebrew-tap
+          VERSION="${{ env.VERSION_NO_V }}"
+
+          gsed -i "s/^  version .*/  version \"${VERSION}\"/" Formula/mlxcel.rb
+
+          gsed -i "s|https://github.com/.*/mlxcel-macos-aarch64.zip|${mac_url}|" Formula/mlxcel.rb
+          gsed -i "/mlxcel-macos-aarch64.zip\"/!b;n;c\      sha256 \"${mac_sha}\"" Formula/mlxcel.rb
+
+      - name: Commit and push changes to tap
+        run: |
+          cd homebrew-tap
+          if git diff --quiet Formula/mlxcel.rb; then
+            echo "Formula already up to date for v${{ env.VERSION_NO_V }} — nothing to push."
+            exit 0
+          fi
+          git add Formula/mlxcel.rb
+          git commit -m "bump: mlxcel to v${{ env.VERSION_NO_V }}"
+          git push origin main
