@@ -69,11 +69,50 @@ Linux/CUDA builds use the `cuda` feature and require the CUDA toolkit plus the s
 
 ## Performance
 
-Benchmark results depend on model family, quantization, prompt length, decode length, batch shape, and hardware. Benchmark methodology and raw tables should be kept in [Benchmarks](docs/benchmarks.md).
+Benchmark results depend on model family, quantization, prompt length, decode
+length, batch shape, and hardware. See [Benchmarks](docs/benchmarks.md) for
+methodology notes and caveats.
 
-As a historical reference, a 2026-05-08 run on Mac Studio M1 Ultra compared 37 4-bit text checkpoints against `mlx-lm` using mlxcel 0.0.25, MLX 0.31.2, and mlx-lm 0.31.3. Decode throughput averaged about 119% of the mlx-lm baseline, with all tested text models staying within 90% of parity. VLM numbers should be read separately because comparable coverage and preprocessing paths differ by model family.
+As a reference-runtime comparison, a 2026-05-08 run on Mac Studio M1 Ultra
+compared 37 4-bit text checkpoints against `mlx-lm` using mlxcel 0.0.25, MLX
+0.31.2, and mlx-lm 0.31.3. Decode throughput averaged about **1.19x** of the
+mlx-lm baseline; **35 / 37** text models were faster than `mlx-lm`, and all 37
+stayed within 90% of parity. In the same M1 Ultra benchmark set, 5 / 6
+comparable VLMs were at or above `mlx-vlm` decode parity.
 
-Re-run the benchmark suite on your target hardware before using these numbers for capacity planning.
+Current Apple Silicon capacity snapshots are shown below as absolute decode
+throughput, not as cross-runtime comparisons. Numbers are selected rows from
+full-suite `mlxcel generate --profile` runs.
+
+| Text model | M1 Ultra 128GB<br>2026-05-08 | M5 Max 128GB<br>2026-05-18 |
+|------------|-----------------------------:|---------------------------:|
+| SmolLM-135M 4bit | 365 tok/s | 919 tok/s |
+| Llama 3.1 8B 4bit | 109 tok/s | 113 tok/s |
+| Qwen2.5 7B 4bit | 113 tok/s | 126 tok/s |
+| Gemma 3 4B 4bit | 104 tok/s | 145 tok/s |
+| Gemma 4 E2B 4bit | 124 tok/s | 222 tok/s |
+| Gemma 4 26B-A4B 4bit | 72 tok/s | 136 tok/s |
+| Qwen3 MoE 30B 4bit | 72 tok/s | 152 tok/s |
+| Nemotron-H 30B 4bit | 90 tok/s | 156 tok/s |
+| Mixtral 8x7B 4bit | 54 tok/s | 63 tok/s |
+| Llama 4 Scout 17B 4bit | 37 tok/s | 48 tok/s |
+| Solar Open 100B 4bit | 14 tok/s | 16 tok/s |
+
+| VLM model | M1 Ultra 128GB<br>2026-05-08 | M5 Max 128GB<br>2026-05-18 |
+|-----------|-----------------------------:|---------------------------:|
+| LLaVA Interleave Qwen 0.5B bf16 | 262 tok/s | 342 tok/s |
+| Qwen3-VL 2B 4bit | 158 tok/s | 276 tok/s |
+| Gemma 4 E2B 4bit | 106 tok/s | 216 tok/s |
+| Gemma 4 26B-A4B 4bit | 66 tok/s | 129 tok/s |
+| Phi 3.5 Vision 4bit | 88 tok/s | 121 tok/s |
+| Llama 4 Scout 17B 4bit | 35 tok/s | 48 tok/s |
+
+The 2026-05-18 M5 Max sweep tested 98 text model directories with 89 pass, 4
+partial, and 5 fail results; 62 of 93 numeric text runs reached at least 100
+decode tok/s. VLM runs used a 224x224 benchmark fixture image and should be
+read separately because vision preprocessing, image size, and prompt
+construction differ by family. Re-run the benchmark suite on your target
+hardware before using these numbers for capacity planning.
 
 ## Supported models
 
