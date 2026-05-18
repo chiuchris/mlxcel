@@ -1,0 +1,220 @@
+//! Native completion endpoint (llama-server /completion format)
+//!
+//! Different from /v1/completions — uses `n_predict` instead of `max_tokens`,
+//! returns `{"content": "...", "stop": true, "timings": {...}}`.
+
+use std::convert::Infallible;
+
+use axum::{
+    Json,
+    extract::State,
+    response::{
+        IntoResponse, Response,
+        sse::{Event, Sse},
+    },
+};
+use futures::stream::Stream;
+use tokio::sync::mpsc;
+use tokio_stream::wrappers::ReceiverStream;
+
+use crate::SamplingConfig;
+use crate::server::types::{
+    ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
+};
+use crate::server::{AppState, ServerGenerateOptions};
+
+/// POST /completion
+pub async fn native_completion(
+    State(state): State<AppState>,
+    Json(request): Json<NativeCompletionRequest>,
+) -> Response {
+    if request.stream.unwrap_or(false) {
+        stream_native_completion(state, request)
+            .await
+            .into_response()
+    } else {
+        non_stream_native_completion(state, request)
+            .await
+            .into_response()
+    }
+}
+
+async fn non_stream_native_completion(
+    state: AppState,
+    request: NativeCompletionRequest,
+) -> Result<Json<NativeCompletionResponse>, ErrorResponse> {
+    let _permit = state.slot_semaphore.try_acquire().map_err(|_| {
+        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+    })?;
+
+    let options = build_native_options(&request, &state);
+
+    let result = state
+        .model_provider
+        .generate(request.prompt.clone(), options)
+        .map_err(|e| ErrorResponse::new(format!("Generation error: {}", e), "server_error"))?;
+
+    let prompt_ms = result.prompt_eval_ms as f64;
+    let gen_ms = result.generation_only_ms as f64;
+
+    state.metrics.record_request(
+        result.prompt_tokens,
+        result.completion_tokens,
+        result.generation_time_ms,
+    );
+
+    Ok(Json(NativeCompletionResponse {
+        content: result.text,
+        stop: result.finish_reason == "stop",
+        generation_settings: serde_json::json!({}),
+        model: state.display_model_id().to_string(),
+        tokens_predicted: result.completion_tokens,
+        tokens_evaluated: result.prompt_tokens,
+        timings: TimingInfo {
+            prompt_n: result.prompt_tokens,
+            prompt_ms,
+            prompt_per_token_ms: if result.prompt_tokens > 0 {
+                prompt_ms / result.prompt_tokens as f64
+            } else {
+                0.0
+            },
+            prompt_per_second: if prompt_ms > 0.0 {
+                result.prompt_tokens as f64 / (prompt_ms / 1000.0)
+            } else {
+                0.0
+            },
+            predicted_n: result.completion_tokens,
+            predicted_ms: gen_ms,
+            predicted_per_token_ms: if result.completion_tokens > 0 {
+                gen_ms / result.completion_tokens as f64
+            } else {
+                0.0
+            },
+            predicted_per_second: if gen_ms > 0.0 {
+                result.completion_tokens as f64 / (gen_ms / 1000.0)
+            } else {
+                0.0
+            },
+        },
+    }))
+}
+
+async fn stream_native_completion(
+    state: AppState,
+    request: NativeCompletionRequest,
+) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    let permit = state.slot_semaphore.clone().try_acquire_owned().ok();
+
+    let options = build_native_options(&request, &state);
+    let prompt = request.prompt.clone();
+
+    let (tx, rx) = mpsc::channel::<Result<Event, Infallible>>(100);
+
+    tokio::task::spawn_blocking(move || {
+        let _permit = match permit {
+            Some(p) => p,
+            None => {
+                let err = serde_json::json!({"content": "", "stop": true});
+                let _ = tx.blocking_send(Ok(Event::default().data(err.to_string())));
+                return;
+            }
+        };
+
+        let tx_clone = tx.clone();
+
+        let result = state
+            .model_provider
+            .generate_streaming(prompt, options, |token| {
+                let chunk = serde_json::json!({
+                    "content": token,
+                    "stop": false,
+                });
+                let _ = tx_clone.blocking_send(Ok(Event::default().data(chunk.to_string())));
+            });
+
+        // Send final chunk
+        let stop = match &result {
+            Ok(r) => r.finish_reason == "stop",
+            Err(_) => true,
+        };
+        let final_chunk = serde_json::json!({
+            "content": "",
+            "stop": true,
+            "stop_type": if stop { "stop" } else { "limit" },
+        });
+        let _ = tx.blocking_send(Ok(Event::default().data(final_chunk.to_string())));
+    });
+
+    Sse::new(ReceiverStream::new(rx))
+}
+
+fn build_native_options(
+    request: &NativeCompletionRequest,
+    state: &AppState,
+) -> ServerGenerateOptions {
+    let config = &state.config;
+    let temperature = request.temperature.unwrap_or(config.default_temperature);
+    let top_k = request.top_k.unwrap_or(config.default_top_k);
+    let top_p = request.top_p.unwrap_or(config.default_top_p);
+    let repeat_penalty = request
+        .repeat_penalty
+        .unwrap_or(config.default_repetition_penalty);
+    let min_p = request.min_p.unwrap_or(config.default_min_p);
+    let seed = request.seed.or(config.default_seed);
+    let frequency_penalty = request
+        .frequency_penalty
+        .unwrap_or(config.default_frequency_penalty);
+    let presence_penalty = request
+        .presence_penalty
+        .unwrap_or(config.default_presence_penalty);
+
+    let sampling = if temperature <= 0.0 {
+        SamplingConfig {
+            min_p,
+            seed,
+            repetition_penalty: repeat_penalty,
+            frequency_penalty,
+            presence_penalty,
+            dry_multiplier: request
+                .dry_multiplier
+                .unwrap_or(config.default_dry_multiplier),
+            dry_base: request.dry_base.unwrap_or(config.default_dry_base),
+            dry_allowed_length: request
+                .dry_allowed_length
+                .unwrap_or(config.default_dry_allowed_length),
+            dry_penalty_last_n: request
+                .dry_penalty_last_n
+                .unwrap_or(config.default_dry_penalty_last_n),
+            ..SamplingConfig::greedy()
+        }
+    } else {
+        SamplingConfig {
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            seed,
+            repetition_penalty: repeat_penalty,
+            frequency_penalty,
+            presence_penalty,
+            dry_multiplier: request
+                .dry_multiplier
+                .unwrap_or(config.default_dry_multiplier),
+            dry_base: request.dry_base.unwrap_or(config.default_dry_base),
+            dry_allowed_length: request
+                .dry_allowed_length
+                .unwrap_or(config.default_dry_allowed_length),
+            dry_penalty_last_n: request
+                .dry_penalty_last_n
+                .unwrap_or(config.default_dry_penalty_last_n),
+            dry_sequence_breakers: request.dry_sequence_breakers.clone().unwrap_or_default(),
+            stop_token_ids: Vec::new(),
+        }
+    };
+
+    ServerGenerateOptions {
+        max_tokens: request.n_predict.unwrap_or(config.default_max_tokens),
+        sampling,
+        stop_sequences: request.stop.clone(),
+    }
+}

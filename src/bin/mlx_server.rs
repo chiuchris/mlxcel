@@ -1,0 +1,291 @@
+use clap::Parser;
+use std::path::PathBuf;
+
+use mlxcel::server::{ServerStartupConfig, start_server};
+
+/// mlxcel-server: llama-server compatible HTTP server for MLX inference
+///
+/// Drop-in replacement for llama-server (llama.cpp) using Apple Silicon MLX backend.
+/// Supports OpenAI-compatible API endpoints and llama-server native endpoints.
+#[derive(Parser, Debug)]
+#[command(
+    name = "mlxcel-server",
+    author = "Lablup Inc.",
+    version,
+    about = "llama-server compatible HTTP server for MLX inference on Apple Silicon"
+)]
+struct Args {
+    /// Path to the model directory
+    #[arg(
+        short = 'm',
+        long = "model",
+        env = "LLAMA_ARG_MODEL",
+        value_name = "PATH"
+    )]
+    model: PathBuf,
+
+    /// Model alias (shown in API responses instead of directory name)
+    #[arg(
+        short = 'a',
+        long = "alias",
+        env = "LLAMA_ARG_ALIAS",
+        value_name = "NAME"
+    )]
+    alias: Option<String>,
+
+    /// Path to LoRA adapter directory
+    #[arg(long = "lora", value_name = "PATH")]
+    lora: Option<PathBuf>,
+
+    /// Host address to bind to (or Unix socket path when --port 0)
+    #[arg(long, env = "LLAMA_ARG_HOST", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port number to listen on (0 = Unix socket mode using --host as socket path)
+    #[arg(long, env = "LLAMA_ARG_PORT", default_value_t = 8080)]
+    port: u16,
+
+    /// Context size limit (0 = use model default)
+    #[arg(
+        short = 'c',
+        long = "ctx-size",
+        env = "LLAMA_ARG_CTX_SIZE",
+        default_value_t = 0
+    )]
+    ctx_size: usize,
+
+    /// Maximum tokens to predict (-1 = unlimited)
+    #[arg(
+        short = 'n',
+        long = "predict",
+        visible_alias = "n-predict",
+        env = "LLAMA_ARG_N_PREDICT",
+        default_value_t = -1
+    )]
+    predict: i32,
+
+    /// Number of parallel request slots
+    #[arg(long = "parallel", env = "LLAMA_ARG_N_PARALLEL", default_value_t = 1)]
+    parallel: usize,
+
+    /// API key for authentication
+    #[arg(long = "api-key", env = "LLAMA_API_KEY", value_name = "KEY")]
+    api_key: Option<String>,
+
+    /// Path to file containing API key
+    #[arg(long = "api-key-file", value_name = "PATH")]
+    api_key_file: Option<PathBuf>,
+
+    /// Request timeout in seconds
+    #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
+    timeout: u64,
+
+    /// Path to draft model for speculative decoding
+    #[arg(
+        long = "model-draft",
+        env = "LLAMA_ARG_MODEL_DRAFT",
+        value_name = "PATH"
+    )]
+    model_draft: Option<PathBuf>,
+
+    /// Maximum number of draft tokens per speculation step
+    #[arg(
+        long = "draft",
+        visible_alias = "draft-max",
+        env = "LLAMA_ARG_DRAFT_MAX",
+        default_value_t = 16
+    )]
+    draft: usize,
+
+    /// Override chat template (Jinja2 template string)
+    #[arg(long = "chat-template", value_name = "TEMPLATE")]
+    chat_template: Option<String>,
+
+    /// Path to chat template file
+    #[arg(long = "chat-template-file", value_name = "PATH")]
+    chat_template_file: Option<PathBuf>,
+
+    /// Enable /slots endpoint
+    #[arg(long = "slots", overrides_with = "_no_slots", default_value_t = true)]
+    slots: bool,
+
+    /// Disable /slots endpoint
+    #[arg(long = "no-slots", overrides_with = "slots", hide = true)]
+    _no_slots: bool,
+
+    /// Enable /props endpoint
+    #[arg(long = "props")]
+    props: bool,
+
+    /// Enable /metrics endpoint
+    #[arg(long = "metrics")]
+    metrics: bool,
+
+    /// Enable model warmup on startup
+    #[arg(long = "warmup", overrides_with = "_no_warmup", default_value_t = true)]
+    warmup: bool,
+
+    /// Disable model warmup on startup
+    #[arg(long = "no-warmup", overrides_with = "warmup", hide = true)]
+    _no_warmup: bool,
+
+    // --- Default sampling parameters ---
+    /// Default sampling temperature
+    #[arg(long = "temp", default_value_t = 0.8)]
+    temp: f32,
+
+    /// Default top-K sampling
+    #[arg(long = "top-k", env = "LLAMA_ARG_TOP_K", default_value_t = 40)]
+    top_k: i32,
+
+    /// Default top-P (nucleus) sampling
+    #[arg(long = "top-p", default_value_t = 0.9)]
+    top_p: f32,
+
+    /// Default min-P sampling
+    #[arg(long = "min-p", default_value_t = 0.1)]
+    min_p: f32,
+
+    /// Random seed (-1 = random)
+    #[arg(short = 's', long = "seed", default_value_t = -1)]
+    seed: i64,
+
+    /// Default repetition penalty lookback window
+    #[arg(long = "repeat-last-n", default_value_t = 64)]
+    repeat_last_n: usize,
+
+    /// Default repetition penalty multiplier
+    #[arg(long = "repeat-penalty", default_value_t = 1.0)]
+    repeat_penalty: f32,
+
+    /// Default presence penalty
+    #[arg(long = "presence-penalty", default_value_t = 0.0)]
+    presence_penalty: f32,
+
+    /// Default frequency penalty
+    #[arg(long = "frequency-penalty", default_value_t = 0.0)]
+    frequency_penalty: f32,
+
+    // --- DRY sampling parameters ---
+    /// DRY penalty multiplier (0.0 = disabled)
+    #[arg(long = "dry-multiplier", default_value_t = 0.0)]
+    dry_multiplier: f32,
+
+    /// DRY exponential base
+    #[arg(long = "dry-base", default_value_t = 1.75)]
+    dry_base: f32,
+
+    /// DRY minimum match length before penalty
+    #[arg(long = "dry-allowed-length", default_value_t = 2)]
+    dry_allowed_length: usize,
+
+    /// DRY lookback window (-1 = full context)
+    #[arg(long = "dry-penalty-last-n", default_value_t = -1)]
+    dry_penalty_last_n: i32,
+
+    /// DRY sequence breaker token strings (e.g. "\n", "\t")
+    #[arg(long = "dry-sequence-breaker", value_delimiter = ',')]
+    dry_sequence_breakers: Vec<String>,
+
+    // --- Logging ---
+    /// Enable verbose (debug) logging
+    #[arg(short = 'v', long = "verbose")]
+    verbose: bool,
+
+    /// Disable all logging
+    #[arg(long = "log-disable")]
+    log_disable: bool,
+
+    /// Log output file
+    #[arg(long = "log-file", env = "LLAMA_LOG_FILE", value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    // --- llama-server compatibility arguments (accepted but ignored) ---
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
+    #[arg(long, hide = true)]
+    _no_webui: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always processes templates)
+    #[arg(long, hide = true)]
+    _jinja: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always uses Metal)
+    #[arg(long = "n-gpu-layers", hide = true)]
+    _n_gpu_layers: Option<i32>,
+
+    /// Accepted for llama-server CLI compatibility (ignored — vision projector loaded automatically)
+    #[arg(long, hide = true)]
+    _mmproj: Option<String>,
+
+    /// Accepted for llama-server CLI compatibility (ignored)
+    #[arg(long, hide = true)]
+    _flash_attn: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    #[arg(long, hide = true)]
+    _mlock: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    #[arg(long = "no-mmap", hide = true)]
+    _no_mmap: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel handles batching internally)
+    #[arg(long, hide = true)]
+    _cont_batching: bool,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+
+    // Handle --no-slots / --no-warmup overrides
+    let enable_slots = args.slots && !args._no_slots;
+    let enable_warmup = args.warmup && !args._no_warmup;
+
+    let seed = if args.seed < 0 {
+        None
+    } else {
+        Some(args.seed as u64)
+    };
+
+    let startup = ServerStartupConfig {
+        model_path: args.model,
+        adapter_path: args.lora,
+        model_alias: args.alias,
+        host: args.host,
+        port: args.port,
+        api_key: args.api_key,
+        api_key_file: args.api_key_file,
+        n_parallel: args.parallel,
+        ctx_size: args.ctx_size,
+        n_predict: args.predict,
+        timeout: args.timeout,
+        draft_model_path: args.model_draft,
+        draft_max: args.draft,
+        chat_template: args.chat_template,
+        chat_template_file: args.chat_template_file,
+        enable_slots,
+        enable_props: args.props,
+        enable_metrics: args.metrics,
+        warmup: enable_warmup,
+        temperature: args.temp,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        min_p: args.min_p,
+        seed,
+        repeat_last_n: args.repeat_last_n,
+        repeat_penalty: args.repeat_penalty,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        dry_multiplier: args.dry_multiplier,
+        dry_base: args.dry_base,
+        dry_allowed_length: args.dry_allowed_length,
+        dry_penalty_last_n: args.dry_penalty_last_n,
+        dry_sequence_breakers: args.dry_sequence_breakers,
+        verbose: args.verbose,
+        log_disable: args.log_disable,
+        log_file: args.log_file,
+    };
+
+    start_server(startup).await
+}

@@ -1,0 +1,961 @@
+// Copyright 2025 mlx-lm-rs authors
+// Direct C++ bridge for MLX via cxx
+
+#pragma once
+
+#include <memory>
+#include <cstdint>
+#include "rust/cxx.h"
+#include "mlx/mlx.h"
+
+namespace mlx_cxx {
+
+// Opaque wrapper struct to hold mlx::core::array
+// This allows cxx to manage the lifetime without exposing the complex internals
+struct MlxArray {
+    mlx::core::array inner;
+
+    explicit MlxArray(mlx::core::array&& arr) : inner(std::move(arr)) {}
+    explicit MlxArray(const mlx::core::array& arr) : inner(arr) {}
+};
+
+// Opaque wrapper for mlx::core::Stream
+struct MlxStream {
+    mlx::core::Stream inner;
+
+    explicit MlxStream(mlx::core::Stream s) : inner(s) {}
+};
+
+
+// ============================================================================
+// Stream functions
+// ============================================================================
+
+std::unique_ptr<MlxStream> default_stream();
+std::unique_ptr<MlxStream> new_stream_on_device(bool gpu);
+void synchronize_stream(const MlxStream& stream);
+
+// ============================================================================
+// Array factory functions
+// ============================================================================
+
+// Create array filled with zeros
+std::unique_ptr<MlxArray> zeros(rust::Slice<const int32_t> shape, int32_t dtype);
+std::unique_ptr<MlxArray> zeros_stream(rust::Slice<const int32_t> shape, int32_t dtype, const MlxStream& stream);
+
+// Create array filled with ones
+std::unique_ptr<MlxArray> ones(rust::Slice<const int32_t> shape, int32_t dtype);
+std::unique_ptr<MlxArray> ones_stream(rust::Slice<const int32_t> shape, int32_t dtype, const MlxStream& stream);
+
+// Create array with specific value
+std::unique_ptr<MlxArray> full_f32(rust::Slice<const int32_t> shape, float value, int32_t dtype);
+
+// Create identity/eye matrix
+std::unique_ptr<MlxArray> eye(int32_t n, int32_t m, int32_t k, int32_t dtype);
+
+// Create linearly spaced values
+std::unique_ptr<MlxArray> linspace(float start, float stop, int32_t num, int32_t dtype);
+
+// Create arrays with same shape as input
+std::unique_ptr<MlxArray> zeros_like(const MlxArray& a);
+std::unique_ptr<MlxArray> ones_like(const MlxArray& a);
+std::unique_ptr<MlxArray> full_like(const MlxArray& a, float value);
+
+// Create array from data
+std::unique_ptr<MlxArray> from_slice_f32(rust::Slice<const float> data, rust::Slice<const int32_t> shape);
+std::unique_ptr<MlxArray> from_slice_i32(rust::Slice<const int32_t> data, rust::Slice<const int32_t> shape);
+std::unique_ptr<MlxArray> from_slice_u32(rust::Slice<const uint32_t> data, rust::Slice<const int32_t> shape);
+std::unique_ptr<MlxArray> from_slice_i64(rust::Slice<const int64_t> data, rust::Slice<const int32_t> shape);
+
+// Create array from raw bytes with specified dtype
+std::unique_ptr<MlxArray> from_bytes(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, int32_t dtype);
+
+// Create half-precision array from raw bytes
+std::unique_ptr<MlxArray> from_bytes_f16(rust::Slice<const uint8_t> data, rust::Slice<const int32_t> shape, bool bfloat16);
+
+// ============================================================================
+// Array property accessors
+// ============================================================================
+
+rust::Vec<int32_t> array_shape(const MlxArray& arr);
+int32_t array_dtype(const MlxArray& arr);
+size_t array_size(const MlxArray& arr);
+size_t array_ndim(const MlxArray& arr);
+size_t array_itemsize(const MlxArray& arr);
+size_t array_nbytes(const MlxArray& arr);
+
+// ============================================================================
+// Array data access (scalar extraction)
+// ============================================================================
+
+float item_f32(const MlxArray& arr);
+int32_t item_i32(const MlxArray& arr);
+int64_t item_i64(const MlxArray& arr);
+bool item_bool(const MlxArray& arr);
+
+// ============================================================================
+// Evaluation
+// ============================================================================
+
+void eval(const MlxArray& arr);
+void eval_all(rust::Slice<const MlxArray* const> arrays);
+
+// ============================================================================
+// Element-wise binary operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> add(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> subtract(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> remainder(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> multiply(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> divide(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> maximum(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> minimum(const MlxArray& a, const MlxArray& b);
+
+// ============================================================================
+// Element-wise unary operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> negative(const MlxArray& a);
+std::unique_ptr<MlxArray> abs(const MlxArray& a);
+std::unique_ptr<MlxArray> exp(const MlxArray& a);
+std::unique_ptr<MlxArray> log(const MlxArray& a);
+std::unique_ptr<MlxArray> sqrt(const MlxArray& a);
+std::unique_ptr<MlxArray> rsqrt(const MlxArray& a);
+std::unique_ptr<MlxArray> square(const MlxArray& a);
+std::unique_ptr<MlxArray> sin(const MlxArray& a);
+std::unique_ptr<MlxArray> cos(const MlxArray& a);
+std::unique_ptr<MlxArray> tanh(const MlxArray& a);
+std::unique_ptr<MlxArray> sigmoid(const MlxArray& a);
+std::unique_ptr<MlxArray> floor(const MlxArray& a);
+std::unique_ptr<MlxArray> ceil(const MlxArray& a);
+std::unique_ptr<MlxArray> round(const MlxArray& a);
+std::unique_ptr<MlxArray> sign(const MlxArray& a);
+std::unique_ptr<MlxArray> reciprocal(const MlxArray& a);
+
+// Trigonometric functions
+std::unique_ptr<MlxArray> tan(const MlxArray& a);
+std::unique_ptr<MlxArray> sinh(const MlxArray& a);
+std::unique_ptr<MlxArray> cosh(const MlxArray& a);
+std::unique_ptr<MlxArray> arcsin(const MlxArray& a);
+std::unique_ptr<MlxArray> arccos(const MlxArray& a);
+std::unique_ptr<MlxArray> arctan(const MlxArray& a);
+std::unique_ptr<MlxArray> arctan2(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> arcsinh(const MlxArray& a);
+std::unique_ptr<MlxArray> arccosh(const MlxArray& a);
+std::unique_ptr<MlxArray> arctanh(const MlxArray& a);
+std::unique_ptr<MlxArray> degrees(const MlxArray& a);
+std::unique_ptr<MlxArray> radians(const MlxArray& a);
+
+// Mathematical/Special functions
+std::unique_ptr<MlxArray> erf(const MlxArray& a);
+std::unique_ptr<MlxArray> erfinv(const MlxArray& a);
+std::unique_ptr<MlxArray> expm1(const MlxArray& a);
+std::unique_ptr<MlxArray> log2(const MlxArray& a);
+std::unique_ptr<MlxArray> log10(const MlxArray& a);
+std::unique_ptr<MlxArray> logaddexp(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> power(const MlxArray& a, const MlxArray& b);
+
+// Checks
+std::unique_ptr<MlxArray> isnan(const MlxArray& a);
+std::unique_ptr<MlxArray> isinf(const MlxArray& a);
+std::unique_ptr<MlxArray> isfinite(const MlxArray& a);
+std::unique_ptr<MlxArray> isneginf(const MlxArray& a);
+std::unique_ptr<MlxArray> isposinf(const MlxArray& a);
+
+// ============================================================================
+// Reduction operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> sum_all(const MlxArray& a);
+std::unique_ptr<MlxArray> sum_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> mean_all(const MlxArray& a);
+std::unique_ptr<MlxArray> mean_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> max_all(const MlxArray& a);
+std::unique_ptr<MlxArray> max_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> min_all(const MlxArray& a);
+std::unique_ptr<MlxArray> min_axis(const MlxArray& a, int32_t axis, bool keepdims);
+
+// Product reduction
+std::unique_ptr<MlxArray> prod_all(const MlxArray& a);
+std::unique_ptr<MlxArray> prod_axis(const MlxArray& a, int32_t axis, bool keepdims);
+
+// Variance and standard deviation
+std::unique_ptr<MlxArray> var_all(const MlxArray& a);
+std::unique_ptr<MlxArray> var_axis(const MlxArray& a, int32_t axis, bool keepdims, int32_t ddof);
+std::unique_ptr<MlxArray> std_all(const MlxArray& a);
+std::unique_ptr<MlxArray> std_axis(const MlxArray& a, int32_t axis, bool keepdims, int32_t ddof);
+
+// Logsumexp
+std::unique_ptr<MlxArray> logsumexp_all(const MlxArray& a);
+std::unique_ptr<MlxArray> logsumexp_axis(const MlxArray& a, int32_t axis, bool keepdims);
+
+// All/any reductions
+std::unique_ptr<MlxArray> all_all(const MlxArray& a);
+std::unique_ptr<MlxArray> any_all(const MlxArray& a);
+
+// ============================================================================
+// Matrix operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> matmul(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> transpose(const MlxArray& a);
+std::unique_ptr<MlxArray> transpose_axes(const MlxArray& a, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> reshape(const MlxArray& a, rust::Slice<const int32_t> shape);
+
+// ============================================================================
+// Shape operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> expand_dims(const MlxArray& a, int32_t axis);
+std::unique_ptr<MlxArray> squeeze(const MlxArray& a);
+std::unique_ptr<MlxArray> squeeze_axis(const MlxArray& a, int32_t axis);
+std::unique_ptr<MlxArray> broadcast_to(const MlxArray& a, rust::Slice<const int32_t> shape);
+
+// Flatten array
+std::unique_ptr<MlxArray> flatten(const MlxArray& a);
+std::unique_ptr<MlxArray> flatten_range(const MlxArray& a, int32_t start_axis, int32_t end_axis);
+
+// Move axis
+std::unique_ptr<MlxArray> moveaxis(const MlxArray& a, int32_t source, int32_t destination);
+
+// Pad array
+std::unique_ptr<MlxArray> pad(const MlxArray& a, rust::Slice<const int32_t> pad_width, float pad_value);
+
+// Split array at indices
+std::unique_ptr<MlxArray> split_at_indices(const MlxArray& a, rust::Slice<const int32_t> indices, int32_t axis);
+
+// Diagonal operations
+std::unique_ptr<MlxArray> diag(const MlxArray& a, int32_t k);
+std::unique_ptr<MlxArray> diagonal(const MlxArray& a, int32_t offset, int32_t axis1, int32_t axis2);
+
+// ============================================================================
+// Type conversion
+// ============================================================================
+
+std::unique_ptr<MlxArray> astype(const MlxArray& a, int32_t dtype);
+
+// ============================================================================
+// Copy
+// ============================================================================
+
+std::unique_ptr<MlxArray> copy(const MlxArray& a);
+
+// ============================================================================
+// High-level operations for LLM inference
+// ============================================================================
+
+// Softmax along axis
+std::unique_ptr<MlxArray> softmax(const MlxArray& a, int32_t axis);
+
+// Log-softmax along axis (numerically stable)
+std::unique_ptr<MlxArray> log_softmax(const MlxArray& a, int32_t axis);
+
+// RMS normalization
+std::unique_ptr<MlxArray> rms_norm(const MlxArray& x, const MlxArray& weight, float eps);
+
+// Layer normalization
+std::unique_ptr<MlxArray> layer_norm(const MlxArray& x, const MlxArray& weight,
+                                     const MlxArray& bias, float eps);
+
+// Concatenate arrays along axis
+std::unique_ptr<MlxArray> concatenate(rust::Slice<const MlxArray* const> arrays, int32_t axis);
+
+// Split array into multiple parts
+rust::Vec<std::unique_ptr<MlxArray>> split(const MlxArray& a, int32_t num_splits, int32_t axis);
+
+// Slice array with start, stop, step
+std::unique_ptr<MlxArray> slice(const MlxArray& a,
+                                rust::Slice<const int32_t> starts,
+                                rust::Slice<const int32_t> stops);
+
+// Slice update: src[starts:stops] = update (for in-place KV cache updates)
+// Returns a new array with the update applied
+std::unique_ptr<MlxArray> slice_update(const MlxArray& src,
+                                        const MlxArray& update,
+                                        rust::Slice<const int32_t> starts,
+                                        rust::Slice<const int32_t> stops);
+
+// Argmax along axis
+std::unique_ptr<MlxArray> argmax(const MlxArray& a, int32_t axis, bool keepdims);
+
+// Where (conditional select)
+std::unique_ptr<MlxArray> where_cond(const MlxArray& condition, const MlxArray& x, const MlxArray& y);
+
+// Comparison operations
+std::unique_ptr<MlxArray> greater(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> less(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> equal(const MlxArray& a, const MlxArray& b);
+
+// Seed the global MLX random number generator
+void random_seed(uint64_t seed);
+
+// Random categorical sampling
+std::unique_ptr<MlxArray> random_categorical(const MlxArray& logits, int32_t axis);
+
+// ============================================================================
+// Transformer-specific high-level operations (reduces FFI calls)
+// ============================================================================
+
+// Rotary position embedding (RoPE)
+// Returns (cos, sin) for position embedding
+std::unique_ptr<MlxArray> rope_forward(
+    const MlxArray& x,
+    int32_t head_dim,
+    float theta,
+    int32_t offset,
+    bool traditional
+);
+
+// Apply rotary embedding to query/key
+std::unique_ptr<MlxArray> apply_rope(
+    const MlxArray& x,
+    const MlxArray& cos,
+    const MlxArray& sin
+);
+
+// Scaled dot-product attention (entire attention computation in one call)
+// q: [batch, n_heads, seq_len, head_dim]
+// k: [batch, n_kv_heads, seq_len, head_dim]
+// v: [batch, n_kv_heads, seq_len, head_dim]
+// mask: optional attention mask
+// scale: attention scale factor
+std::unique_ptr<MlxArray> scaled_dot_product_attention(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    const MlxArray* mask  // nullable
+);
+
+// Linear layer forward (with optional bias)
+std::unique_ptr<MlxArray> linear_forward(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray* bias  // nullable
+);
+
+// Quantized linear layer forward
+std::unique_ptr<MlxArray> quantized_linear_forward(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    const MlxArray* linear_bias,  // nullable
+    int32_t group_size,
+    int32_t bits
+);
+
+// SwiGLU MLP forward (common in LLMs like Llama)
+// output = down_proj(silu(gate_proj(x)) * up_proj(x))
+std::unique_ptr<MlxArray> swiglu_mlp_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& up_proj,
+    const MlxArray& down_proj
+);
+
+// SwiGLU activation only - compiled with kernel fusion (shapeless=true)
+// output = silu(gate) * x
+// Uses mlx::core::compile for kernel fusion (like Python's @mx.compile)
+std::unique_ptr<MlxArray> compiled_swiglu_activation(
+    const MlxArray& gate,
+    const MlxArray& x
+);
+
+// Full transformer layer forward (maximum FFI reduction)
+// Combines: attention + MLP + residuals + norms
+std::unique_ptr<MlxArray> transformer_layer_forward(
+    const MlxArray& x,
+    const MlxArray& attn_norm_weight,
+    const MlxArray& q_proj,
+    const MlxArray& k_proj,
+    const MlxArray& v_proj,
+    const MlxArray& o_proj,
+    const MlxArray& ffn_norm_weight,
+    const MlxArray& gate_proj,
+    const MlxArray& up_proj,
+    const MlxArray& down_proj,
+    const MlxArray* kv_cache_k,  // nullable for first token
+    const MlxArray* kv_cache_v,  // nullable for first token
+    int32_t n_heads,
+    int32_t n_kv_heads,
+    int32_t head_dim,
+    float rope_theta,
+    int32_t rope_offset,
+    float norm_eps
+);
+
+// ============================================================================
+// Advanced indexing operations
+// ============================================================================
+
+// Take elements along an axis using indices
+std::unique_ptr<MlxArray> take(const MlxArray& a, const MlxArray& indices, int32_t axis);
+
+// Gather elements using indices (multi-dimensional indexing)
+// indices can be a vector of index arrays for each dimension
+std::unique_ptr<MlxArray> gather(
+    const MlxArray& a,
+    rust::Slice<const MlxArray* const> indices,
+    rust::Slice<const int32_t> axes,
+    rust::Slice<const int32_t> slice_sizes
+);
+
+// Take along axis (like numpy.take_along_axis)
+std::unique_ptr<MlxArray> take_along_axis(const MlxArray& a, const MlxArray& indices, int32_t axis);
+
+// Put along axis (scatter update)
+std::unique_ptr<MlxArray> put_along_axis(const MlxArray& a, const MlxArray& indices,
+                                          const MlxArray& values, int32_t axis);
+
+// Stack arrays along new axis
+std::unique_ptr<MlxArray> stack(rust::Slice<const MlxArray* const> arrays, int32_t axis);
+
+// Tile/repeat array
+std::unique_ptr<MlxArray> tile(const MlxArray& a, rust::Slice<const int32_t> reps);
+std::unique_ptr<MlxArray> repeat(const MlxArray& a, int32_t repeats, int32_t axis);
+
+// Arange
+std::unique_ptr<MlxArray> arange_f32(float start, float stop, float step);
+std::unique_ptr<MlxArray> arange_i32(int32_t start, int32_t stop, int32_t step);
+
+// ============================================================================
+// Logical operations
+// ============================================================================
+
+std::unique_ptr<MlxArray> logical_not(const MlxArray& a);
+std::unique_ptr<MlxArray> logical_and(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> logical_or(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> all_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> any_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> greater_equal(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> less_equal(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> not_equal(const MlxArray& a, const MlxArray& b);
+
+// ============================================================================
+// Activation functions
+// ============================================================================
+
+std::unique_ptr<MlxArray> silu(const MlxArray& a);
+std::unique_ptr<MlxArray> gelu(const MlxArray& a);
+std::unique_ptr<MlxArray> gelu_approx(const MlxArray& a);
+std::unique_ptr<MlxArray> relu(const MlxArray& a);
+std::unique_ptr<MlxArray> leaky_relu(const MlxArray& a, float negative_slope);
+
+// ============================================================================
+// Sorting and searching
+// ============================================================================
+
+std::unique_ptr<MlxArray> argsort(const MlxArray& a, int32_t axis);
+std::unique_ptr<MlxArray> argpartition(const MlxArray& a, int32_t kth, int32_t axis);
+std::unique_ptr<MlxArray> argmin(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> topk(const MlxArray& a, int32_t k, int32_t axis);
+
+// Sort and partition
+std::unique_ptr<MlxArray> sort(const MlxArray& a, int32_t axis);
+std::unique_ptr<MlxArray> partition(const MlxArray& a, int32_t kth, int32_t axis);
+
+// Cumulative operations
+std::unique_ptr<MlxArray> cummax(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
+std::unique_ptr<MlxArray> cummin(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
+std::unique_ptr<MlxArray> cumprod(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
+
+// Scatter operations
+std::unique_ptr<MlxArray> scatter(const MlxArray& a, const MlxArray& indices, const MlxArray& updates, int32_t axis);
+std::unique_ptr<MlxArray> scatter_add(const MlxArray& a, const MlxArray& indices, const MlxArray& updates, int32_t axis);
+std::unique_ptr<MlxArray> scatter_max(const MlxArray& a, const MlxArray& indices, const MlxArray& updates, int32_t axis);
+std::unique_ptr<MlxArray> scatter_min(const MlxArray& a, const MlxArray& indices, const MlxArray& updates, int32_t axis);
+std::unique_ptr<MlxArray> scatter_prod(const MlxArray& a, const MlxArray& indices, const MlxArray& updates, int32_t axis);
+
+// Bitwise operations
+std::unique_ptr<MlxArray> bitwise_and(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> bitwise_or(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> bitwise_xor(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> left_shift(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> right_shift(const MlxArray& a, const MlxArray& b);
+
+// Linear algebra
+std::unique_ptr<MlxArray> tensordot(const MlxArray& a, const MlxArray& b, int32_t axes);
+std::unique_ptr<MlxArray> inner(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> outer(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> trace(const MlxArray& a, int32_t offset, int32_t axis1, int32_t axis2);
+
+// Roll (circular shift)
+std::unique_ptr<MlxArray> roll(const MlxArray& a, int32_t shift, int32_t axis);
+
+// Nan handling
+std::unique_ptr<MlxArray> nan_to_num(const MlxArray& a, float nan_val, float posinf_val, float neginf_val);
+
+// Stop gradient
+std::unique_ptr<MlxArray> stop_gradient(const MlxArray& a);
+
+// 2D convolution
+std::unique_ptr<MlxArray> conv2d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride_h, int32_t stride_w,
+    int32_t padding_h, int32_t padding_w,
+    int32_t dilation_h, int32_t dilation_w,
+    int32_t groups
+);
+
+// 2D average pooling
+// Used by: VisionModule (Gemma3 AvgPool projector)
+std::unique_ptr<MlxArray> avg_pool2d(
+    const MlxArray& input,
+    int32_t kernel_h, int32_t kernel_w,
+    int32_t stride_h, int32_t stride_w,
+    int32_t padding_h, int32_t padding_w
+);
+
+// ============================================================================
+// MoE (Mixture of Experts) operations
+// ============================================================================
+
+// Gather matrix multiply for MoE
+// sorted_indices: if true, lhs_indices are pre-sorted for better memory access
+std::unique_ptr<MlxArray> gather_mm(
+    const MlxArray& a,
+    const MlxArray& b,
+    const MlxArray* lhs_indices,    // nullable
+    const MlxArray* rhs_indices,    // nullable
+    bool sorted_indices
+);
+
+// Gather quantized matrix multiply for MoE
+// sorted_indices: if true, lhs_indices are pre-sorted for better memory access
+std::unique_ptr<MlxArray> gather_qmm(
+    const MlxArray& x,
+    const MlxArray& w,
+    const MlxArray& scales,
+    const MlxArray* biases,         // nullable for no-bias quantization
+    const MlxArray* lhs_indices,    // nullable
+    const MlxArray* rhs_indices,    // nullable
+    bool transpose,
+    int32_t group_size,
+    int32_t bits,
+    bool sorted_indices
+);
+
+// Direct quantized matrix multiplication
+// y = x @ dequantize(w, scales, biases).T if transpose else x @ dequantize(w, scales, biases)
+std::unique_ptr<MlxArray> quantized_matmul(
+    const MlxArray& x,
+    const MlxArray& w,
+    const MlxArray& scales,
+    const MlxArray* biases,         // nullable for no-bias quantization
+    bool transpose,
+    int32_t group_size,
+    int32_t bits
+);
+
+// Dequantize quantized weights
+// Returns full-precision weights from quantized representation
+std::unique_ptr<MlxArray> dequantize(
+    const MlxArray& w,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t group_size,
+    int32_t bits
+);
+
+// ============================================================================
+// Embedding
+// ============================================================================
+
+std::unique_ptr<MlxArray> embedding(const MlxArray& weight, const MlxArray& indices);
+
+// Quantized embedding lookup with dequantization
+std::unique_ptr<MlxArray> quantized_embedding(
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    const MlxArray& indices,
+    int32_t group_size,
+    int32_t bits
+);
+
+// ============================================================================
+// Fast operations (using MLX fast kernels)
+// ============================================================================
+
+// Fast RoPE using MLX fast kernel
+std::unique_ptr<MlxArray> fast_rope(
+    const MlxArray& x,
+    int32_t dims,
+    bool traditional,
+    float base,
+    float scale,
+    int32_t offset
+);
+
+// Fast RoPE with custom frequencies (for Yarn RoPE)
+std::unique_ptr<MlxArray> fast_rope_with_freqs(
+    const MlxArray& x,
+    int32_t dims,
+    bool traditional,
+    float scale,
+    int32_t offset,
+    const MlxArray& freqs
+);
+
+// Fast RMS norm using MLX fast kernel
+std::unique_ptr<MlxArray> fast_rms_norm(
+    const MlxArray& x,
+    const MlxArray& weight,
+    float eps
+);
+
+// Fast layer norm using MLX fast kernel
+std::unique_ptr<MlxArray> fast_layer_norm(
+    const MlxArray& x,
+    const MlxArray* weight,  // nullable
+    const MlxArray* bias,    // nullable
+    float eps
+);
+
+// Fast scaled dot product attention using MLX fast kernel
+std::unique_ptr<MlxArray> fast_scaled_dot_product_attention(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale,
+    const MlxArray* mask  // nullable
+);
+
+// SDPA with explicit causal masking for prefill (no mask array needed)
+std::unique_ptr<MlxArray> fast_scaled_dot_product_attention_causal(
+    const MlxArray& q,
+    const MlxArray& k,
+    const MlxArray& v,
+    float scale
+);
+
+// Fused QKV projection + reshape + transpose + RoPE
+// Reduces FFI overhead for the projection chain
+std::unique_ptr<MlxArray> fused_qkv_project_and_rope(
+    const MlxArray& x,
+    const MlxArray& weight,
+    const MlxArray& scales,
+    const MlxArray& biases,
+    int32_t num_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    int32_t cache_offset,
+    int32_t group_size,
+    int32_t bits,
+    bool apply_rope
+);
+
+// ============================================================================
+// Compiled operations (with kernel fusion)
+// ============================================================================
+
+// Compiled full MoE expert forward
+// Compiles: silu(gate_proj(x)) * up_proj(x), then down_proj
+std::unique_ptr<MlxArray> compiled_moe_expert_forward(
+    const MlxArray& x,
+    const MlxArray& gate_proj,
+    const MlxArray& gate_scales,
+    const MlxArray& gate_biases,
+    const MlxArray& up_proj,
+    const MlxArray& up_scales,
+    const MlxArray& up_biases,
+    const MlxArray& down_proj,
+    const MlxArray& down_scales,
+    const MlxArray& down_biases,
+    int32_t group_size,
+    int32_t bits
+);
+
+// ============================================================================
+// Memory and stream management
+// ============================================================================
+
+void clear_memory_cache();
+
+// Async evaluation
+void async_eval(const MlxArray& arr);
+void async_eval_all(rust::Slice<const MlxArray* const> arrays);
+
+// Synchronize stream
+void synchronize_default();
+
+// Memory limits
+size_t set_wired_limit(size_t limit);
+size_t get_wired_limit();
+
+// GPU memory info (works across Metal and CUDA backends)
+size_t gpu_max_memory_size();
+
+// Create new stream on GPU
+std::unique_ptr<MlxStream> new_gpu_stream();
+
+// ============================================================================
+// Optimized generation functions
+// ============================================================================
+
+// Extract last token logits: logits[:, -1, :] -> [batch, vocab]
+// Optimized for sampling during generation
+std::unique_ptr<MlxArray> slice_last_logits(const MlxArray& logits);
+
+// Slice on the last dimension only: a[..., start:end]
+// Useful for fused QKV/gate_up projections
+std::unique_ptr<MlxArray> slice_last_dim(const MlxArray& a, int32_t start, int32_t end);
+
+// Argmax on last axis for greedy sampling
+std::unique_ptr<MlxArray> argmax_last_axis(const MlxArray& a);
+
+// Reshape token for next forward pass: [] or [batch] -> [batch, 1]
+std::unique_ptr<MlxArray> reshape_token_for_forward(const MlxArray& token);
+
+// Async eval two arrays at once (for lookahead pipelining)
+void async_eval_pair(const MlxArray& a, const MlxArray& b);
+
+// Set default stream for subsequent operations
+void set_default_stream(const MlxStream& stream);
+
+// Check if GPU is available
+bool is_gpu_available();
+
+// Fused sampling: temperature scaling + top-k + top-p + min-p + categorical
+// in a single function call to minimize FFI round-trips.
+// Input: 2D logits [batch, vocab] (already sliced, penalties already applied)
+// Returns sampled token
+std::unique_ptr<MlxArray> fused_sample(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p
+);
+
+// ============================================================================
+// SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H
+// ============================================================================
+
+// Cumulative sum along axis
+std::unique_ptr<MlxArray> cumsum(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
+
+// Lower triangular matrix (keeps elements on and below k-th diagonal)
+std::unique_ptr<MlxArray> tril(const MlxArray& a, int32_t k);
+
+// Upper triangular matrix (keeps elements on and above k-th diagonal)
+std::unique_ptr<MlxArray> triu(const MlxArray& a, int32_t k);
+
+// Clip values to range [a_min, a_max]
+std::unique_ptr<MlxArray> clip(const MlxArray& a, const MlxArray& a_min, const MlxArray& a_max);
+
+// log(1 + x) - numerically stable for small x, used for softplus
+std::unique_ptr<MlxArray> log1p(const MlxArray& a);
+
+// Softplus activation: log(1 + exp(x))
+std::unique_ptr<MlxArray> softplus(const MlxArray& a);
+
+// 1D convolution with groups support (for depthwise conv when groups=channels)
+std::unique_ptr<MlxArray> conv1d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride,
+    int32_t padding,
+    int32_t dilation,
+    int32_t groups
+);
+
+// Swap axes (convenient for SSM attention)
+std::unique_ptr<MlxArray> swap_axes(const MlxArray& a, int32_t axis1, int32_t axis2);
+
+// ============================================================================
+// Core ops additions
+// ============================================================================
+
+// Array creation
+std::unique_ptr<MlxArray> identity(int32_t n, int32_t dtype);
+std::unique_ptr<MlxArray> tri(int32_t n, int32_t m, int32_t k, int32_t dtype);
+
+// Shape manipulation
+std::unique_ptr<MlxArray> unflatten(const MlxArray& a, int32_t axis, rust::Slice<const int32_t> shape);
+std::unique_ptr<MlxArray> as_strided(const MlxArray& a, rust::Slice<const int32_t> shape, rust::Slice<const int64_t> strides, size_t offset);
+std::unique_ptr<MlxArray> contiguous(const MlxArray& a, bool allow_col_major);
+std::unique_ptr<MlxArray> broadcast_arrays_get(rust::Slice<const MlxArray* const> arrays, size_t index);
+size_t broadcast_arrays_count(rust::Slice<const MlxArray* const> arrays);
+
+// Arithmetic
+std::unique_ptr<MlxArray> floor_divide(const MlxArray& a, const MlxArray& b);
+
+// Comparison & Boolean
+std::unique_ptr<MlxArray> array_equal(const MlxArray& a, const MlxArray& b, bool equal_nan);
+std::unique_ptr<MlxArray> allclose(const MlxArray& a, const MlxArray& b, double rtol, double atol);
+std::unique_ptr<MlxArray> isclose(const MlxArray& a, const MlxArray& b, double rtol, double atol);
+
+// Reductions
+std::unique_ptr<MlxArray> median_all(const MlxArray& a);
+std::unique_ptr<MlxArray> median_axis(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> logcumsumexp(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
+
+// Bitwise
+std::unique_ptr<MlxArray> bitwise_invert(const MlxArray& a);
+
+// Complex number ops
+std::unique_ptr<MlxArray> real_part(const MlxArray& a);
+std::unique_ptr<MlxArray> imag_part(const MlxArray& a);
+std::unique_ptr<MlxArray> conjugate(const MlxArray& a);
+
+// View/reinterpret
+std::unique_ptr<MlxArray> view(const MlxArray& a, int32_t dtype);
+
+// Kronecker product
+std::unique_ptr<MlxArray> kron(const MlxArray& a, const MlxArray& b);
+
+// Matrix operations
+std::unique_ptr<MlxArray> addmm(const MlxArray& c, const MlxArray& a, const MlxArray& b, float alpha, float beta);
+std::unique_ptr<MlxArray> block_masked_mm(
+    const MlxArray& a,
+    const MlxArray& b,
+    int32_t block_size,
+    const MlxArray* mask_out,   // nullable
+    const MlxArray* mask_lhs,   // nullable
+    const MlxArray* mask_rhs    // nullable
+);
+std::unique_ptr<MlxArray> segmented_mm(const MlxArray& a, const MlxArray& b, const MlxArray& segments);
+
+// Hadamard
+std::unique_ptr<MlxArray> hadamard_transform(const MlxArray& a);
+
+// Number of elements
+std::unique_ptr<MlxArray> number_of_elements(const MlxArray& a, rust::Slice<const int32_t> axes, bool inverted, int32_t dtype);
+
+// ============================================================================
+// Convolution additions
+// ============================================================================
+
+std::unique_ptr<MlxArray> conv3d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride_d, int32_t stride_h, int32_t stride_w,
+    int32_t padding_d, int32_t padding_h, int32_t padding_w,
+    int32_t dilation_d, int32_t dilation_h, int32_t dilation_w,
+    int32_t groups
+);
+
+std::unique_ptr<MlxArray> conv_transpose1d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride,
+    int32_t padding,
+    int32_t dilation,
+    int32_t output_padding,
+    int32_t groups
+);
+
+std::unique_ptr<MlxArray> conv_transpose2d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride_h, int32_t stride_w,
+    int32_t padding_h, int32_t padding_w,
+    int32_t dilation_h, int32_t dilation_w,
+    int32_t output_padding_h, int32_t output_padding_w,
+    int32_t groups
+);
+
+std::unique_ptr<MlxArray> conv_transpose3d(
+    const MlxArray& input,
+    const MlxArray& weight,
+    int32_t stride_d, int32_t stride_h, int32_t stride_w,
+    int32_t padding_d, int32_t padding_h, int32_t padding_w,
+    int32_t dilation_d, int32_t dilation_h, int32_t dilation_w,
+    int32_t output_padding_d, int32_t output_padding_h, int32_t output_padding_w,
+    int32_t groups
+);
+
+// ============================================================================
+// Einsum
+// ============================================================================
+
+std::unique_ptr<MlxArray> einsum(rust::Str subscripts, rust::Slice<const MlxArray* const> operands);
+
+// ============================================================================
+// Linear algebra (mlx/linalg.h)
+// ============================================================================
+
+std::unique_ptr<MlxArray> linalg_norm(const MlxArray& a, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> linalg_norm_ord(const MlxArray& a, double ord, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> linalg_norm_str(const MlxArray& a, rust::Str ord, int32_t axis, bool keepdims);
+std::unique_ptr<MlxArray> linalg_qr_q(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_qr_r(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_svd_u(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_svd_s(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_svd_vt(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_inv(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_pinv(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_cholesky(const MlxArray& a, bool upper);
+std::unique_ptr<MlxArray> linalg_solve(const MlxArray& a, const MlxArray& b);
+std::unique_ptr<MlxArray> linalg_solve_triangular(const MlxArray& a, const MlxArray& b, bool upper);
+std::unique_ptr<MlxArray> linalg_lu_p(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_lu_l(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_lu_u(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_lu_factor_lu(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_lu_factor_pivots(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eig_values(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eig_vectors(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eigvals(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eigh_values(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eigh_vectors(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_eigvalsh(const MlxArray& a);
+std::unique_ptr<MlxArray> linalg_cross(const MlxArray& a, const MlxArray& b, int32_t axis);
+std::unique_ptr<MlxArray> linalg_tri_inv(const MlxArray& a, bool upper);
+std::unique_ptr<MlxArray> linalg_cholesky_inv(const MlxArray& a, bool upper);
+
+// ============================================================================
+// FFT (mlx/fft.h)
+// ============================================================================
+
+std::unique_ptr<MlxArray> fft(const MlxArray& a, int32_t n, int32_t axis);
+std::unique_ptr<MlxArray> ifft(const MlxArray& a, int32_t n, int32_t axis);
+std::unique_ptr<MlxArray> rfft(const MlxArray& a, int32_t n, int32_t axis);
+std::unique_ptr<MlxArray> irfft(const MlxArray& a, int32_t n, int32_t axis);
+std::unique_ptr<MlxArray> fft2(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> ifft2(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> rfft2(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> irfft2(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> fftn_axes(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> ifftn_axes(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> rfftn_axes(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> irfftn_axes(const MlxArray& a, rust::Slice<const int32_t> n, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> fftshift(const MlxArray& a, rust::Slice<const int32_t> axes);
+std::unique_ptr<MlxArray> ifftshift(const MlxArray& a, rust::Slice<const int32_t> axes);
+
+// ============================================================================
+// Random (mlx/random.h)
+// ============================================================================
+
+std::unique_ptr<MlxArray> random_key(uint64_t seed);
+std::unique_ptr<MlxArray> random_split_key(const MlxArray& key, int32_t num);
+std::unique_ptr<MlxArray> random_uniform(float low, float high, rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_normal(rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_bernoulli_p(float p, rust::Slice<const int32_t> shape, const MlxArray* key);
+std::unique_ptr<MlxArray> random_randint(int32_t low, int32_t high, rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_truncated_normal(float lower, float upper, rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_gumbel(rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_laplace(rust::Slice<const int32_t> shape, int32_t dtype, const MlxArray* key);
+std::unique_ptr<MlxArray> random_permutation(int32_t x, const MlxArray* key);
+std::unique_ptr<MlxArray> random_permutation_array(const MlxArray& a, int32_t axis, const MlxArray* key);
+std::unique_ptr<MlxArray> random_multivariate_normal(
+    const MlxArray& mean,
+    const MlxArray& cov,
+    rust::Slice<const int32_t> shape,
+    int32_t dtype,
+    const MlxArray* key
+);
+
+// ============================================================================
+// Quantization additions
+// ============================================================================
+
+std::unique_ptr<MlxArray> quantize_weights_w(const MlxArray& w, int32_t group_size, int32_t bits);
+std::unique_ptr<MlxArray> quantize_weights_scales(const MlxArray& w, int32_t group_size, int32_t bits);
+std::unique_ptr<MlxArray> quantize_weights_biases(const MlxArray& w, int32_t group_size, int32_t bits);
+
+} // namespace mlx_cxx

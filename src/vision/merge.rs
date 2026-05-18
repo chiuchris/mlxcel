@@ -1,0 +1,219 @@
+//! Token merging for vision-language models
+//!
+//! Merges vision encoder output features with text token embeddings
+//! at image token positions.
+//!
+//! Strategies:
+//! - Gemma3: masked_scatter with 4D attention mask (prepare_inputs_for_multimodal)
+//! - LLaVA: simple replacement at image token positions, standard causal masking
+//!
+//! Reference: references/mlx-vlm/mlx_vlm/models/gemma3/gemma3.py:121-168
+//! Reference: references/mlx-vlm/mlx_vlm/models/llava/llava.py:85-111
+
+use mlxcel_core::{MlxArray, UniquePtr};
+
+/// Merged embeddings ready for text model
+pub struct InputEmbeddings {
+    pub inputs_embeds: UniquePtr<MlxArray>,
+    pub attention_mask_4d: Option<UniquePtr<MlxArray>>,
+}
+
+/// Prepare multimodal inputs by merging text and vision embeddings
+///
+/// Port of Gemma3 Model.prepare_inputs_for_multimodal()
+///
+/// # Arguments
+/// * `hidden_size` - Text model hidden size (for scaling vision features)
+/// * `pad_token_id` - Padding token ID
+/// * `image_token_index` - Token ID for image placeholder tokens
+/// * `image_features` - Vision encoder output [batch, num_vision_tokens, embed_dim]
+/// * `inputs_embeds` - Text token embeddings [batch, seq_len, embed_dim]
+/// * `input_ids` - Token IDs [batch, seq_len]
+/// * `attention_mask` - Attention mask [batch, seq_len]
+pub fn prepare_inputs_for_multimodal(
+    hidden_size: usize,
+    pad_token_id: i32,
+    image_token_index: i32,
+    image_features: &MlxArray,
+    inputs_embeds: &MlxArray,
+    input_ids: &MlxArray,
+    attention_mask: &MlxArray,
+) -> InputEmbeddings {
+    let feat_shape = mlxcel_core::array_shape(image_features);
+    let embed_dim = feat_shape[2];
+
+    let ids_shape = mlxcel_core::array_shape(input_ids);
+    let batch_size = ids_shape[0];
+    let sequence_length = ids_shape[1];
+
+    // NOTE: In Python mlx-vlm, vision features are scaled by 1/sqrt(hidden_size) here,
+    // but then the language model forward() scales ALL embeddings by sqrt(hidden_size),
+    // which cancels out. Since our embed_tokens() already applies sqrt(hidden_size)
+    // scaling to text embeddings, and our forward_with_caches_and_embeddings() does NOT
+    // apply additional scaling, we skip the 1/sqrt(hidden_size) scaling here.
+    let _ = hidden_size;
+    let scaled_image_features = mlxcel_core::copy(image_features);
+
+    // Create zero embedding buffer
+    let mut final_embedding = mlxcel_core::zeros(
+        &[batch_size, sequence_length, embed_dim],
+        mlxcel_core::dtype::FLOAT32,
+    );
+
+    // Create masks from input_ids
+    let image_token_arr =
+        mlxcel_core::full_f32(&[1], image_token_index as f32, mlxcel_core::dtype::INT32);
+    let image_token_arr = mlxcel_core::astype(&image_token_arr, mlxcel_core::dtype::INT32);
+    let pad_token_arr = mlxcel_core::full_f32(&[1], pad_token_id as f32, mlxcel_core::dtype::INT32);
+    let pad_token_arr = mlxcel_core::astype(&pad_token_arr, mlxcel_core::dtype::INT32);
+
+    let is_image = mlxcel_core::equal(input_ids, &image_token_arr);
+    let is_pad = mlxcel_core::equal(input_ids, &pad_token_arr);
+    let not_image = mlxcel_core::logical_not(&is_image);
+    let not_pad = mlxcel_core::logical_not(&is_pad);
+    let text_mask = mlxcel_core::logical_and(&not_image, &not_pad);
+
+    // Expand masks to embedding dimension: [batch, seq_len] -> [batch, seq_len, embed_dim]
+    let text_mask_expanded = mlxcel_core::expand_dims(&text_mask, -1);
+    let text_mask_expanded = mlxcel_core::repeat(&text_mask_expanded, embed_dim, -1);
+    let pad_mask_expanded = mlxcel_core::expand_dims(&is_pad, -1);
+    let pad_mask_expanded = mlxcel_core::repeat(&pad_mask_expanded, embed_dim, -1);
+    let image_mask_expanded = mlxcel_core::expand_dims(&is_image, -1);
+    let image_mask_expanded = mlxcel_core::repeat(&image_mask_expanded, embed_dim, -1);
+
+    // Place text embeddings at text positions
+    final_embedding = mlxcel_core::where_cond(&text_mask_expanded, inputs_embeds, &final_embedding);
+
+    // Zero out pad positions
+    let zeros = mlxcel_core::zeros_like(&final_embedding);
+    final_embedding = mlxcel_core::where_cond(&pad_mask_expanded, &zeros, &final_embedding);
+
+    // Place scaled vision features at image positions via masked_scatter
+    final_embedding = masked_scatter(
+        &final_embedding,
+        &image_mask_expanded,
+        &scaled_image_features,
+    );
+
+    // Build 4D attention mask
+    let attn_mask_1 = mlxcel_core::expand_dims(attention_mask, 1); // [B, 1, S]
+    let attn_mask_2 = mlxcel_core::expand_dims(attention_mask, 2); // [B, S, 1]
+    let attn_mask_4d = mlxcel_core::multiply(&attn_mask_1, &attn_mask_2); // [B, S, S]
+    let attn_mask_4d = mlxcel_core::expand_dims(&attn_mask_4d, 1); // [B, 1, S, S]
+
+    // Cast final embedding to same dtype as inputs_embeds
+    let dtype = mlxcel_core::array_dtype(inputs_embeds);
+    let final_embedding = mlxcel_core::astype(&final_embedding, dtype);
+
+    InputEmbeddings {
+        inputs_embeds: final_embedding,
+        attention_mask_4d: Some(attn_mask_4d),
+    }
+}
+
+/// Merge image features with text embeddings for LLaVA
+///
+/// Port of LLaVA _merge_input_ids_with_image_features (llava.py:85-111)
+///
+/// Simpler than Gemma3: directly replaces image token positions with projected features.
+/// Uses standard causal masking (no special 4D attention mask needed).
+///
+/// # Arguments
+/// * `image_token_index` - Token ID for image placeholder tokens
+/// * `image_features` - Projected vision features [num_images, num_patches, hidden]
+/// * `inputs_embeds` - Text token embeddings [batch, seq_len, embed_dim]
+/// * `input_ids` - Token IDs [batch, seq_len]
+pub fn merge_llava(
+    image_token_index: i32,
+    image_features: &MlxArray,
+    inputs_embeds: &MlxArray,
+    input_ids: &MlxArray,
+) -> InputEmbeddings {
+    let feat_shape = mlxcel_core::array_shape(image_features);
+    let embed_dim = feat_shape[feat_shape.len() - 1];
+
+    // Flatten image features: [N_images, num_patches, hidden] -> [total_patches, hidden]
+    let total_patches = feat_shape
+        .iter()
+        .take(feat_shape.len() - 1)
+        .product::<i32>();
+    let flat_features = mlxcel_core::reshape(image_features, &[total_patches, embed_dim]);
+
+    // Cast image features to same dtype as text embeddings
+    let embed_dtype = mlxcel_core::array_dtype(inputs_embeds);
+    let flat_features = mlxcel_core::astype(&flat_features, embed_dtype);
+
+    // Find image token positions and scatter features
+
+    // Create image token comparison value
+    let image_token_arr =
+        mlxcel_core::full_f32(&[1], image_token_index as f32, mlxcel_core::dtype::INT32);
+    let image_token_arr = mlxcel_core::astype(&image_token_arr, mlxcel_core::dtype::INT32);
+    let is_image = mlxcel_core::equal(input_ids, &image_token_arr);
+
+    // Expand mask to embedding dimension: [batch, seq_len] -> [batch, seq_len, embed_dim]
+    let image_mask_expanded = mlxcel_core::expand_dims(&is_image, -1);
+    let image_mask_expanded = mlxcel_core::repeat(&image_mask_expanded, embed_dim, -1);
+
+    // Use masked_scatter to place features at image token positions
+    let final_embedding = masked_scatter(inputs_embeds, &image_mask_expanded, &flat_features);
+
+    // Cast to input dtype
+    let final_embedding = mlxcel_core::astype(&final_embedding, embed_dtype);
+
+    InputEmbeddings {
+        inputs_embeds: final_embedding,
+        attention_mask_4d: None, // LLaVA uses standard causal masking
+    }
+}
+
+/// Scatter scaled image features into image token positions
+///
+/// Port of masked_scatter from gemma3.py:54-72
+///
+/// Used by: Gemma3 VLM, LLaVA
+fn masked_scatter(
+    final_embedding: &MlxArray,
+    image_mask_expanded: &MlxArray,
+    scaled_image_features: &MlxArray,
+) -> UniquePtr<MlxArray> {
+    let final_shape = mlxcel_core::array_shape(final_embedding);
+
+    // Flatten everything to 1D
+    let features_flat = mlxcel_core::flatten(scaled_image_features);
+    let embedding_flat = mlxcel_core::flatten(final_embedding);
+    let mask_flat = mlxcel_core::flatten(image_mask_expanded);
+
+    // Use where_cond to place features where mask is true
+    // This works because the flattened image features align with the true positions
+    // in the flattened mask, but only if num_true_positions == num_feature_elements.
+    //
+    // However, where_cond requires same shape. The image features may have fewer
+    // elements than the full embedding. We need to expand features to full size
+    // and use the mask to select.
+    //
+    // Alternative approach: build a full-size array where mask positions get feature values.
+    // We use cumsum on the mask to create indices into the features array.
+    let mask_i32 = mlxcel_core::astype(&mask_flat, mlxcel_core::dtype::INT32);
+    let cumsum = mlxcel_core::cumsum(&mask_i32, 0, false, true); // inclusive cumsum
+    // cumsum[i] = number of true values at or before position i
+    // For mask positions: cumsum[i] - 1 = index into features_flat
+
+    // Subtract 1 to get 0-based indices, clamp to valid range
+    let one = mlxcel_core::full_f32(&[1], 1.0, mlxcel_core::dtype::INT32);
+    let one = mlxcel_core::astype(&one, mlxcel_core::dtype::INT32);
+    let indices = mlxcel_core::subtract(&cumsum, &one);
+    // Clamp negative values to 0
+    let zero = mlxcel_core::full_f32(&[1], 0.0, mlxcel_core::dtype::INT32);
+    let zero = mlxcel_core::astype(&zero, mlxcel_core::dtype::INT32);
+    let indices = mlxcel_core::maximum(&indices, &zero);
+
+    // Gather from features using indices
+    let gathered = mlxcel_core::take(&features_flat, &indices, 0);
+
+    // Use mask to select: where mask is true, use gathered features; else use original
+    let result = mlxcel_core::where_cond(&mask_flat, &gathered, &embedding_flat);
+
+    // Reshape back
+    mlxcel_core::reshape(&result, &final_shape)
+}

@@ -1,0 +1,30 @@
+[package]
+name = "mlxcel-core"
+version = "0.1.0"
+edition = "2021"
+description = "Low-level MLX building blocks for mlxcel"
+license = "MIT"
+
+[lib]
+crate-type = ["lib"]
+
+[features]
+default = []
+metal = []
+accelerate = []
+cuda = []
+
+[dependencies]
+cxx = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+safetensors = "0.4"
+memmap2 = "0.9"
+
+[build-dependencies]
+cxx-build = "1.0"
+cmake = "0.1"
+
+[[example]]
+name = "benchmark"
+path = "examples/benchmark.rs"

@@ -1,0 +1,498 @@
+//! MiniCPM model implementation using mlxcel-core
+//!
+//! MiniCPM architecture with key features:
+//! - Embedding scaling: h = embed(x) * scale_emb
+//! - Residual scaling: scale_depth / sqrt(num_hidden_layers)
+//! - Output scaling: logits / (hidden_size / dim_model_base)
+//! - Standard Llama attention/MLP otherwise
+
+use mlxcel_core::generate::LanguageModel;
+use mlxcel_core::layers::{KVCache, UnifiedLinear, RMSNorm, UnifiedEmbedding};
+use mlxcel_core::weights::WeightMap;
+use mlxcel_core::{MlxArray, UniquePtr};
+use serde::Deserialize;
+use std::path::Path;
+
+// ============================================================================
+// Configuration
+// ============================================================================
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelArgs {
+    pub model_type: String,
+    pub hidden_size: usize,
+    pub dim_model_base: usize,
+    pub num_hidden_layers: usize,
+    pub intermediate_size: usize,
+    pub num_attention_heads: usize,
+    pub rms_norm_eps: f32,
+    pub vocab_size: usize,
+    pub num_key_value_heads: usize,
+    pub scale_depth: f32,
+    pub scale_emb: f32,
+
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
+
+    #[serde(default = "default_rope_theta")]
+    pub rope_theta: f32,
+
+    #[serde(default)]
+    pub rope_traditional: bool,
+
+    #[serde(default)]
+    pub tie_word_embeddings: bool,
+
+    #[serde(default)]
+    pub quantization: Option<Quantization>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Quantization {
+    pub group_size: i32,
+    pub bits: i32,
+}
+
+fn default_rope_theta() -> f32 {
+    1_000_000.0
+}
+
+impl ModelArgs {
+    pub fn head_dim(&self) -> usize {
+        self.hidden_size / self.num_attention_heads
+    }
+
+    /// Get the residual scale factor: scale_depth / sqrt(num_hidden_layers)
+    pub fn residual_scale(&self) -> f32 {
+        self.scale_depth / (self.num_hidden_layers as f32).sqrt()
+    }
+
+    /// Get the output scale factor: hidden_size / dim_model_base
+    pub fn output_scale(&self) -> f32 {
+        self.hidden_size as f32 / self.dim_model_base as f32
+    }
+
+    pub fn group_size(&self) -> i32 {
+        self.quantization
+            .as_ref()
+            .map(|q| q.group_size)
+            .unwrap_or(64)
+    }
+
+    pub fn bits(&self) -> i32 {
+        self.quantization.as_ref().map(|q| q.bits).unwrap_or(4)
+    }
+}
+
+// ============================================================================
+// Attention
+// ============================================================================
+
+pub struct Attention {
+    pub q_proj: UnifiedLinear,
+    pub k_proj: UnifiedLinear,
+    pub v_proj: UnifiedLinear,
+    pub o_proj: UnifiedLinear,
+    pub num_heads: i32,
+    pub num_kv_heads: i32,
+    pub head_dim: i32,
+    pub scale: f32,
+    pub rope_dims: i32,
+    pub rope_base: f32,
+    pub rope_traditional: bool,
+}
+
+impl Attention {
+    pub fn forward(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        let shape = mlxcel_core::array_shape(x);
+        let b = shape[0];
+        let l = shape[1];
+
+        // Project Q, K, V
+        let q = self.q_proj.forward(x);
+        let k = self.k_proj.forward(x);
+        let v = self.v_proj.forward(x);
+
+        // Reshape to [batch, seq_len, n_heads, head_dim]
+        let q = mlxcel_core::reshape(&q, &[b, l, self.num_heads, self.head_dim]);
+        let k = mlxcel_core::reshape(&k, &[b, l, self.num_kv_heads, self.head_dim]);
+        let v = mlxcel_core::reshape(&v, &[b, l, self.num_kv_heads, self.head_dim]);
+
+        // Transpose to [batch, n_heads, seq_len, head_dim]
+        let q = mlxcel_core::transpose_axes(&q, &[0, 2, 1, 3]);
+        let k = mlxcel_core::transpose_axes(&k, &[0, 2, 1, 3]);
+        let v = mlxcel_core::transpose_axes(&v, &[0, 2, 1, 3]);
+
+        let offset = cache.offset;
+
+        // Apply RoPE
+        let q = mlxcel_core::fast_rope(
+            &q,
+            self.rope_dims,
+            self.rope_traditional,
+            self.rope_base,
+            1.0, // scale
+            offset,
+        );
+        let k = mlxcel_core::fast_rope(
+            &k,
+            self.rope_dims,
+            self.rope_traditional,
+            self.rope_base,
+            1.0, // scale
+            offset,
+        );
+
+        // Update KV cache and get sliced views
+        let (cache_k, cache_v) = cache.update_and_fetch(k, v);
+
+        // Scaled dot-product attention
+        let attn_out = if l > 1 && mask.is_none() {
+            // Prefill: use causal masking
+            mlxcel_core::fast_scaled_dot_product_attention_causal(
+                &q, &cache_k, &cache_v, self.scale,
+            )
+        } else {
+            // Single token or explicit mask
+            let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
+            unsafe {
+                mlxcel_core::fast_scaled_dot_product_attention(
+                    &q, &cache_k, &cache_v, self.scale, mask_ptr,
+                )
+            }
+        };
+
+        // Transpose back and reshape
+        let attn_out = mlxcel_core::transpose_axes(&attn_out, &[0, 2, 1, 3]);
+        let attn_out = mlxcel_core::reshape(&attn_out, &[b, l, self.num_heads * self.head_dim]);
+
+        // Output projection
+        self.o_proj.forward(&attn_out)
+    }
+
+    pub fn from_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        let group_size = args.group_size();
+        let bits = args.bits();
+
+        let q_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.q_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        let k_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.k_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        let v_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.v_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        let o_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.o_proj", prefix),
+            group_size,
+            bits,
+        )?;
+
+        let head_dim = args.head_dim() as i32;
+
+        Ok(Self {
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            num_heads: args.num_attention_heads as i32,
+            num_kv_heads: args.num_key_value_heads as i32,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            rope_dims: head_dim,
+            rope_base: args.rope_theta,
+            rope_traditional: args.rope_traditional,
+        })
+    }
+}
+
+// ============================================================================
+// MLP (SwiGLU)
+// ============================================================================
+
+pub struct MLP {
+    pub gate_proj: UnifiedLinear,
+    pub up_proj: UnifiedLinear,
+    pub down_proj: UnifiedLinear,
+}
+
+impl MLP {
+    pub fn forward(&self, x: &MlxArray) -> UniquePtr<MlxArray> {
+        // SwiGLU: down_proj(silu(gate_proj(x)) * up_proj(x))
+        let gate = self.gate_proj.forward(x);
+        let up = self.up_proj.forward(x);
+
+        // Use compiled SwiGLU for kernel fusion
+        let activated = mlxcel_core::compiled_swiglu_activation(&gate, &up);
+
+        self.down_proj.forward(&activated)
+    }
+
+    pub fn from_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        let group_size = args.group_size();
+        let bits = args.bits();
+
+        let gate_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.gate_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        let up_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.up_proj", prefix),
+            group_size,
+            bits,
+        )?;
+        let down_proj = UnifiedLinear::from_weights(
+            weights,
+            &format!("{}.down_proj", prefix),
+            group_size,
+            bits,
+        )?;
+
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
+    }
+}
+
+// ============================================================================
+// Transformer Block with Residual Scaling
+// ============================================================================
+
+pub struct TransformerBlock {
+    pub self_attn: Attention,
+    pub mlp: MLP,
+    pub input_layernorm: RMSNorm,
+    pub post_attention_layernorm: RMSNorm,
+    pub residual_scale: f32,
+}
+
+impl TransformerBlock {
+    pub fn forward(
+        &self,
+        x: &MlxArray,
+        cache: &mut KVCache,
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        // Pre-norm attention
+        let normed = self.input_layernorm.forward(x);
+        let attn_out = self.self_attn.forward(&normed, cache, mask);
+
+        // Apply residual scaling
+        let attn_out = mlxcel_core::multiply_scalar(&attn_out, self.residual_scale);
+        let h = mlxcel_core::add(x, &attn_out);
+
+        // Pre-norm FFN
+        let normed = self.post_attention_layernorm.forward(&h);
+        let ff_out = self.mlp.forward(&normed);
+
+        // Apply residual scaling
+        let ff_out = mlxcel_core::multiply_scalar(&ff_out, self.residual_scale);
+        mlxcel_core::add(&h, &ff_out)
+    }
+
+    pub fn from_weights(
+        weights: &WeightMap,
+        args: &ModelArgs,
+        layer_idx: usize,
+    ) -> Result<Self, String> {
+        let prefix = format!("model.layers.{}", layer_idx);
+
+        let self_attn = Attention::from_weights(weights, args, &format!("{}.self_attn", prefix))?;
+        let mlp = MLP::from_weights(weights, args, &format!("{}.mlp", prefix))?;
+
+        let input_norm_weight =
+            get_weight_copy(weights, &format!("{}.input_layernorm.weight", prefix))?;
+        let post_norm_weight = get_weight_copy(
+            weights,
+            &format!("{}.post_attention_layernorm.weight", prefix),
+        )?;
+
+        let input_layernorm = RMSNorm::new(input_norm_weight, args.rms_norm_eps);
+        let post_attention_layernorm = RMSNorm::new(post_norm_weight, args.rms_norm_eps);
+
+        Ok(Self {
+            self_attn,
+            mlp,
+            input_layernorm,
+            post_attention_layernorm,
+            residual_scale: args.residual_scale(),
+        })
+    }
+}
+
+// ============================================================================
+// MiniCPM Model
+// ============================================================================
+
+pub struct MiniCPMModel {
+    pub embed_tokens: UnifiedEmbedding,
+    pub layers: Vec<TransformerBlock>,
+    pub norm: RMSNorm,
+    pub lm_head: Option<UnifiedLinear>,
+    pub scale_emb: f32,
+    pub output_scale: f32,
+}
+
+impl MiniCPMModel {
+    /// Forward pass through the entire model
+    pub fn forward(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        // Embed tokens with scaling
+        let h = self.embed_tokens.forward(input_ids);
+        let mut h = mlxcel_core::multiply_scalar(&h, self.scale_emb);
+
+        // Pass through transformer layers
+        for (i, layer) in self.layers.iter().enumerate() {
+            h = layer.forward(&h, &mut caches[i], mask);
+        }
+
+        // Final norm
+        let h = self.norm.forward(&h);
+
+        // LM head (with output scaling only for separate lm_head)
+        if let Some(ref lm_head) = self.lm_head {
+            // Apply output scaling: h / (hidden_size / dim_model_base)
+            let h = mlxcel_core::divide_scalar(&h, self.output_scale);
+            lm_head.forward(&h)
+        } else {
+            // For tied embeddings, no scaling
+            self.embed_tokens.as_linear(&h)
+        }
+    }
+
+    /// Create KV caches for all layers
+    pub fn make_caches(&self) -> Vec<KVCache> {
+        (0..self.layers.len()).map(|_| KVCache::new()).collect()
+    }
+
+    /// Load model from directory
+    pub fn load<P: AsRef<Path>>(model_dir: P) -> Result<(Self, ModelArgs), String> {
+        let model_dir = model_dir.as_ref();
+
+        // Load config
+        let config_path = model_dir.join("config.json");
+        let config_str = std::fs::read_to_string(&config_path)
+            .map_err(|e| format!("Failed to read config.json: {}", e))?;
+        let args: ModelArgs = serde_json::from_str(&config_str)
+            .map_err(|e| format!("Failed to parse config.json: {}", e))?;
+
+        // Load weights
+        let weights = crate::models::load_and_sanitize_weights(model_dir)?;
+
+        // Create model
+        let model = Self::from_weights(&weights, &args)?;
+
+        Ok((model, args))
+    }
+
+    /// Create model from loaded weights
+    pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
+        let group_size = args.group_size();
+        let bits = args.bits();
+
+        // Load quantized embedding
+        let embed_tokens =
+            UnifiedEmbedding::from_weights(weights, "model.embed_tokens", group_size, bits)?;
+
+        // Load layers
+        let mut layers = Vec::with_capacity(args.num_hidden_layers);
+        for i in 0..args.num_hidden_layers {
+            let layer = TransformerBlock::from_weights(weights, args, i)?;
+            layers.push(layer);
+        }
+
+        // Load final norm
+        let norm_weight = get_weight_copy(weights, "model.norm.weight")?;
+        let norm = RMSNorm::new(norm_weight, args.rms_norm_eps);
+
+        // Load LM head
+        let lm_head = if !args.tie_word_embeddings {
+            Some(UnifiedLinear::from_weights(
+                weights, "lm_head", group_size, bits,
+            )?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+            scale_emb: args.scale_emb,
+            output_scale: args.output_scale(),
+        })
+    }
+}
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
+
+fn get_weight_copy(weights: &WeightMap, name: &str) -> Result<UniquePtr<MlxArray>, String> {
+    weights
+        .get(name)
+        .map(|w| mlxcel_core::copy(w))
+        .ok_or_else(|| format!("Weight not found: {}", name))
+}
+
+// ============================================================================
+// LanguageModel trait implementation
+// ============================================================================
+
+impl LanguageModel for MiniCPMModel {
+    fn forward(
+        &self,
+        input_ids: &MlxArray,
+        caches: &mut [KVCache],
+        mask: Option<&MlxArray>,
+    ) -> UniquePtr<MlxArray> {
+        MiniCPMModel::forward(self, input_ids, caches, mask)
+    }
+
+    fn make_caches(&self) -> Vec<KVCache> {
+        MiniCPMModel::make_caches(self)
+    }
+
+    fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    fn eos_token_ids(&self) -> Vec<i32> {
+        // MiniCPM EOS token
+        vec![2] // </s>
+    }
+}

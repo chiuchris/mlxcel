@@ -1,0 +1,440 @@
+use clap::{Args, Parser, Subcommand};
+use mlxcel::tokenizer::MlxcelTokenizer;
+use std::path::PathBuf;
+
+mod generate;
+mod generate_vlm;
+
+/// mlxcel: High-performance LLM/VLM/VLA inference on Apple Silicon
+///
+/// A Rust implementation for running Large Language Models, Vision-Language
+/// Models, and Vision-Language-Action Models efficiently on Apple Silicon
+/// using the MLX framework.
+#[derive(Parser, Debug)]
+#[command(
+    name = "mlxcel",
+    author = "Lablup Inc.",
+    version,
+    about = "High-performance LLM/VLM/VLA inference on Apple Silicon",
+    long_about = None,
+    after_help = "For more information, visit: https://github.com/lablup/mlxcel"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Generate text from a prompt
+    #[command(visible_alias = "gen")]
+    Generate(GenerateArgs),
+
+    /// Start an OpenAI/llama-server compatible HTTP server
+    Serve(ServeArgs),
+
+    /// List supported model architectures
+    #[command(visible_alias = "ls")]
+    List,
+}
+
+#[derive(Args, Debug)]
+pub(crate) struct GenerateArgs {
+    #[command(flatten)]
+    pub(crate) model: ModelOptions,
+
+    #[command(flatten)]
+    pub(crate) generation: GenerationOptions,
+
+    #[command(flatten)]
+    pub(crate) sampling: SamplingOptions,
+}
+
+/// Model loading options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Model Options")]
+pub(crate) struct ModelOptions {
+    /// Path to the model directory
+    #[arg(short, long, value_name = "PATH")]
+    pub(crate) model: PathBuf,
+
+    /// Path to LoRA adapter directory (optional)
+    #[arg(long, value_name = "PATH")]
+    pub(crate) adapter: Option<PathBuf>,
+
+    /// Path to draft model for speculative decoding (optional)
+    #[arg(long, value_name = "PATH")]
+    pub(crate) draft_model: Option<PathBuf>,
+
+    /// Number of draft tokens per speculation step (default: 3)
+    #[arg(long, default_value_t = 3, value_name = "N")]
+    pub(crate) num_draft_tokens: usize,
+}
+
+/// Text generation options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Generation Options")]
+pub(crate) struct GenerationOptions {
+    /// The prompt to generate text from
+    #[arg(short, long, value_name = "TEXT")]
+    pub(crate) prompt: String,
+
+    /// Image file paths for vision-language models (VLM)
+    #[arg(long, value_name = "PATH", num_args = 1..)]
+    pub(crate) image: Vec<PathBuf>,
+
+    /// Maximum number of tokens to generate
+    #[arg(short = 'n', long, default_value_t = 100, value_name = "N")]
+    pub(crate) max_tokens: usize,
+
+    /// Enable profiling mode with detailed timing breakdown
+    #[arg(long, default_value_t = false)]
+    pub(crate) profile: bool,
+
+    /// Disable automatic chat template application
+    #[arg(long, default_value_t = false)]
+    pub(crate) no_chat_template: bool,
+}
+
+/// Sampling strategy options
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Sampling Options")]
+pub(crate) struct SamplingOptions {
+    /// Sampling temperature (0.0 = greedy, higher = more random)
+    #[arg(short, long, default_value_t = 0.0, value_name = "FLOAT")]
+    pub(crate) temp: f32,
+
+    /// Top-P (nucleus) sampling threshold
+    #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
+    pub(crate) top_p: f32,
+
+    /// Top-K sampling limit
+    #[arg(long, default_value_t = 0, value_name = "K")]
+    pub(crate) top_k: i32,
+
+    /// Min-P sampling threshold (0.0 = disabled)
+    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
+    pub(crate) min_p: f32,
+
+    /// Repetition penalty multiplier
+    #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
+    pub(crate) repetition_penalty: f32,
+
+    /// DRY (Don't Repeat Yourself) penalty multiplier (0.0 = disabled)
+    #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
+    pub(crate) dry_multiplier: f32,
+
+    /// DRY exponential base for penalty scaling
+    #[arg(long, default_value_t = 1.75, value_name = "FLOAT")]
+    pub(crate) dry_base: f32,
+
+    /// DRY minimum match length before penalty applies
+    #[arg(long, default_value_t = 2, value_name = "N")]
+    pub(crate) dry_allowed_length: usize,
+
+    /// DRY lookback window size (0 = use full history)
+    #[arg(long, default_value_t = 0, value_name = "N")]
+    pub(crate) dry_penalty_last_n: usize,
+}
+
+/// Server options
+#[derive(Args, Debug)]
+struct ServeArgs {
+    /// Path to the model directory
+    #[arg(short, long, env = "LLAMA_ARG_MODEL", value_name = "PATH")]
+    model: PathBuf,
+
+    /// Path to LoRA adapter directory
+    #[arg(long, visible_alias = "lora", value_name = "PATH")]
+    adapter: Option<PathBuf>,
+
+    /// Model alias (shown in API responses instead of directory name)
+    #[arg(short = 'a', long, env = "LLAMA_ARG_ALIAS", value_name = "NAME")]
+    alias: Option<String>,
+
+    /// Host address to bind to (or Unix socket path when --port 0)
+    #[arg(long, env = "LLAMA_ARG_HOST", default_value = "127.0.0.1")]
+    host: String,
+
+    /// Port number to listen on (0 = Unix socket mode using --host as socket path)
+    #[arg(long, env = "LLAMA_ARG_PORT", default_value_t = 8080)]
+    port: u16,
+
+    /// API key for authentication
+    #[arg(long, env = "LLAMA_API_KEY", value_name = "KEY")]
+    api_key: Option<String>,
+
+    /// Path to file containing API key
+    #[arg(long, value_name = "PATH")]
+    api_key_file: Option<PathBuf>,
+
+    /// Number of parallel request slots
+    #[arg(long, env = "LLAMA_ARG_N_PARALLEL", default_value_t = 1)]
+    n_parallel: usize,
+
+    /// Context size limit (0 = use model default)
+    #[arg(long, env = "LLAMA_ARG_CTX_SIZE", default_value_t = 0)]
+    ctx_size: usize,
+
+    /// Maximum tokens to predict (-1 = unlimited)
+    #[arg(long = "n-predict", env = "LLAMA_ARG_N_PREDICT", default_value_t = -1)]
+    n_predict: i32,
+
+    /// Path to draft model for speculative decoding
+    #[arg(long, value_name = "PATH")]
+    draft_model: Option<PathBuf>,
+
+    /// Maximum number of draft tokens per speculation step
+    #[arg(long, env = "LLAMA_ARG_DRAFT_MAX", default_value_t = 16)]
+    draft_max: usize,
+
+    /// Request timeout in seconds
+    #[arg(long, env = "LLAMA_ARG_TIMEOUT", default_value_t = 600)]
+    timeout: u64,
+
+    /// Override chat template (Jinja2 template string)
+    #[arg(long, value_name = "TEMPLATE")]
+    chat_template: Option<String>,
+
+    /// Path to chat template file
+    #[arg(long, value_name = "PATH")]
+    chat_template_file: Option<PathBuf>,
+
+    /// Enable /slots endpoint
+    #[arg(long = "slots", overrides_with = "_no_slots", default_value_t = true)]
+    slots: bool,
+
+    /// Disable /slots endpoint
+    #[arg(long = "no-slots", overrides_with = "slots", hide = true)]
+    _no_slots: bool,
+
+    /// Enable /props endpoint
+    #[arg(long)]
+    props: bool,
+
+    /// Enable /metrics endpoint
+    #[arg(long)]
+    metrics: bool,
+
+    /// Enable model warmup on startup
+    #[arg(long = "warmup", overrides_with = "_no_warmup", default_value_t = true)]
+    warmup: bool,
+
+    /// Disable model warmup on startup
+    #[arg(long = "no-warmup", overrides_with = "warmup", hide = true)]
+    _no_warmup: bool,
+
+    // --- Default sampling parameters ---
+    /// Default sampling temperature
+    #[arg(long = "temp", default_value_t = 0.8)]
+    temp: f32,
+
+    /// Default top-K sampling
+    #[arg(long, env = "LLAMA_ARG_TOP_K", default_value_t = 40)]
+    top_k: i32,
+
+    /// Default top-P (nucleus) sampling
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f32,
+
+    /// Default min-P sampling
+    #[arg(long, default_value_t = 0.1)]
+    min_p: f32,
+
+    /// Random seed (-1 = random)
+    #[arg(short = 's', long, default_value_t = -1)]
+    seed: i64,
+
+    /// Default repetition penalty lookback window
+    #[arg(long, default_value_t = 64)]
+    repeat_last_n: usize,
+
+    /// Default repetition penalty multiplier
+    #[arg(long, default_value_t = 1.0)]
+    repeat_penalty: f32,
+
+    /// Default presence penalty
+    #[arg(long, default_value_t = 0.0)]
+    presence_penalty: f32,
+
+    /// Default frequency penalty
+    #[arg(long, default_value_t = 0.0)]
+    frequency_penalty: f32,
+
+    // --- DRY sampling parameters ---
+    /// DRY penalty multiplier (0.0 = disabled)
+    #[arg(long, default_value_t = 0.0)]
+    dry_multiplier: f32,
+
+    /// DRY exponential base
+    #[arg(long, default_value_t = 1.75)]
+    dry_base: f32,
+
+    /// DRY minimum match length before penalty
+    #[arg(long, default_value_t = 2)]
+    dry_allowed_length: usize,
+
+    /// DRY lookback window (-1 = full context)
+    #[arg(long, default_value_t = -1)]
+    dry_penalty_last_n: i32,
+
+    /// DRY sequence breaker token strings (e.g. "\n", "\t")
+    #[arg(long, value_delimiter = ',')]
+    dry_sequence_breakers: Vec<String>,
+
+    // --- Logging ---
+    /// Enable verbose (debug) logging
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Disable all logging
+    #[arg(long)]
+    log_disable: bool,
+
+    /// Log output file
+    #[arg(long, env = "LLAMA_LOG_FILE", value_name = "PATH")]
+    log_file: Option<PathBuf>,
+
+    // --- llama-server compatibility arguments (accepted but ignored) ---
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel has no web UI)
+    #[arg(long, hide = true)]
+    _no_webui: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always processes templates)
+    #[arg(long, hide = true)]
+    _jinja: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel always uses Metal)
+    #[arg(long = "n-gpu-layers", hide = true)]
+    _n_gpu_layers: Option<i32>,
+
+    /// Accepted for llama-server CLI compatibility (ignored — vision projector loaded automatically)
+    #[arg(long, hide = true)]
+    _mmproj: Option<String>,
+
+    /// Accepted for llama-server CLI compatibility (ignored)
+    #[arg(long, hide = true)]
+    _flash_attn: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    #[arg(long, hide = true)]
+    _mlock: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — not applicable to MLX)
+    #[arg(long = "no-mmap", hide = true)]
+    _no_mmap: bool,
+
+    /// Accepted for llama-server CLI compatibility (ignored — mlxcel handles batching internally)
+    #[arg(long, hide = true)]
+    _cont_batching: bool,
+}
+
+fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Generate(args) => generate::run_generate(args),
+        Commands::Serve(args) => run_serve(args),
+        Commands::List => {
+            print_supported_models();
+            Ok(())
+        }
+    }
+}
+
+#[tokio::main]
+async fn run_serve(args: ServeArgs) -> anyhow::Result<()> {
+    use mlxcel::server::{ServerStartupConfig, start_server};
+
+    // Handle --no-slots / --no-warmup overrides
+    let enable_slots = args.slots && !args._no_slots;
+    let enable_warmup = args.warmup && !args._no_warmup;
+
+    let seed = if args.seed < 0 {
+        None
+    } else {
+        Some(args.seed as u64)
+    };
+
+    let startup = ServerStartupConfig {
+        model_path: args.model,
+        adapter_path: args.adapter,
+        model_alias: args.alias,
+        host: args.host,
+        port: args.port,
+        api_key: args.api_key,
+        api_key_file: args.api_key_file,
+        n_parallel: args.n_parallel,
+        ctx_size: args.ctx_size,
+        n_predict: args.n_predict,
+        timeout: args.timeout,
+        draft_model_path: args.draft_model,
+        draft_max: args.draft_max,
+        chat_template: args.chat_template,
+        chat_template_file: args.chat_template_file,
+        enable_slots,
+        enable_props: args.props,
+        enable_metrics: args.metrics,
+        warmup: enable_warmup,
+        temperature: args.temp,
+        top_k: args.top_k,
+        top_p: args.top_p,
+        min_p: args.min_p,
+        seed,
+        repeat_last_n: args.repeat_last_n,
+        repeat_penalty: args.repeat_penalty,
+        presence_penalty: args.presence_penalty,
+        frequency_penalty: args.frequency_penalty,
+        dry_multiplier: args.dry_multiplier,
+        dry_base: args.dry_base,
+        dry_allowed_length: args.dry_allowed_length,
+        dry_penalty_last_n: args.dry_penalty_last_n,
+        dry_sequence_breakers: args.dry_sequence_breakers,
+        verbose: args.verbose,
+        log_disable: args.log_disable,
+        log_file: args.log_file,
+    };
+
+    start_server(startup).await
+}
+
+fn print_supported_models() {
+    println!("Supported Model Architectures (57+):\n");
+
+    println!("TRANSFORMER MODELS:");
+    println!("  Llama family:     Llama 1/2/3/4, Yi, TinyLlama, Vicuna");
+    println!("  Qwen family:      Qwen 2/2.5/3, Qwen MoE variants");
+    println!("  Gemma family:     Gemma 1/2/3/3n, RecurrentGemma");
+    println!("  Phi family:       Phi 1/2/3/3-small, PhiMoE");
+    println!("  Mistral family:   Mistral, Mixtral, Ministral3, Mistral3");
+    println!("  DeepSeek:         DeepSeek v1/v2/v3/v3.2, DeepSeek R1");
+    println!("  Cohere:           Command R/R+ (Cohere, Cohere2)");
+    println!("  InternLM:         InternLM 2/3");
+    println!("  GLM:              GLM4, GLM4 MoE");
+    println!("  ExaOne:           ExaOne 3/4, ExaOne MoE");
+    println!("  OLMo:             OLMo 1/2/3, OLMoE");
+    println!("  Others:           StarCoder2, StableLM, Baichuan, MiniCPM 1/3");
+    println!();
+
+    println!("STATE SPACE / RNN MODELS:");
+    println!("  Mamba:            Mamba 1/2, Falcon Mamba");
+    println!("  RWKV:             RWKV v7");
+    println!("  RecurrentGemma:   Griffin hybrid (RGLRU + attention)");
+    println!();
+
+    println!("HYBRID MODELS (Attention + SSM/Linear):");
+    println!("  Jamba:            Mamba + Transformer + MoE");
+    println!("  Qwen3 Next:       Full Attention + GatedDeltaNet + MoE");
+    println!("  Nemotron-H:       Mamba2 + Attention + MLP/MoE hybrid");
+    println!();
+
+    println!("SPECIALIZED MODELS:");
+    println!("  Nemotron:         Nemotron-4, Nemotron-H, Nemotron-NAS");
+    println!("  ERNIE:            ERNIE 4.5, ERNIE 4.5 MoE");
+    println!("  SmolLM3:          Efficient small model");
+    println!("  Hunyuan:          Hunyuan v1 Dense");
+    println!("  MiMo:             Multi-token prediction");
+    println!();
+
+    println!("For the full list, see: docs/model_implementations.md");
+}
