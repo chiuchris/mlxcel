@@ -1,0 +1,15 @@
+# gitleaks ignore list.
+#
+# Each line is a finding fingerprint produced by `gitleaks detect`. The
+# entries below correspond to false positives where gitleaks' generic-api-key
+# entropy rule flagged the safetensors shard filename in test fixtures as a
+# high-entropy secret. The matched text is just a model weight file name (no
+# credential).
+#
+# File: src/distributed/pipeline/partial_loading_tests.rs
+# Pattern: the test fixture maps a model weight key to a sharded safetensors
+# filename; gitleaks' entropy rule flags the filename token, not a credential.
+
+50fcddf241e01b70d2c7cf516ab266ef74f07d77:src/distributed/pipeline/partial_loading_tests.rs:generic-api-key:293
+50fcddf241e01b70d2c7cf516ab266ef74f07d77:src/distributed/pipeline/partial_loading_tests.rs:generic-api-key:318
+50fcddf241e01b70d2c7cf516ab266ef74f07d77:src/distributed/pipeline/partial_loading_tests.rs:generic-api-key:343

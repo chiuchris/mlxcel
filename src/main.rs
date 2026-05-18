@@ -38,9 +38,9 @@ use mlxcel::lang_bias::LangBiasCliArgs;
     after_help = "\
 Environment Variables:
   MLXCEL_DEVICE          Runtime device: \"gpu\" (default), \"cpu\"
-  MLXCEL_WIRED_LIMIT     GPU wired memory limit (default: none, like Python mlx-lm)
-                           \"max\"  — pin all GPU memory (may OOM on large models)
-                           \"0\"    — no limit (default)
+  MLXCEL_WIRED_LIMIT     Apple Silicon wired memory limit
+                           unset/\"max\" — use MLX gpu_max_memory_size (default)
+                           \"0\"/\"none\" — disable the wired limit
                            \"96GB\" — explicit limit (supports GB, MB, or bytes)
 
 Tensor Parallel Runtime:

@@ -3,7 +3,7 @@ name = "mlxcel-core"
 version = "0.1.0"
 edition = "2021"
 description = "Low-level MLX building blocks for mlxcel"
-license = "MIT"
+license = "Apache-2.0"
 
 [lib]
 crate-type = ["lib"]
