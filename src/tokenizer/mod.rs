@@ -993,6 +993,79 @@ fn is_diffusion_gemma_model(model_path: &Path) -> bool {
     )
 }
 
+/// Return whether tokenizer metadata asks Transformers to construct Llama
+/// tokenizer semantics instead of trusting the serialized pipeline verbatim.
+fn declares_llama_tokenizer(model_path: &Path) -> bool {
+    let Ok(raw) = std::fs::read_to_string(model_path.join("tokenizer_config.json")) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return false;
+    };
+    matches!(
+        config
+            .get("tokenizer_class")
+            .and_then(|value| value.as_str()),
+        Some("LlamaTokenizer" | "LlamaTokenizerFast")
+    )
+}
+
+/// Apply the BPE input pipeline that `mlx_lm` uses for
+/// `LlamaTokenizerFast` checkpoints.
+///
+/// Some converted checkpoints declare `LlamaTokenizerFast` while shipping a
+/// ByteLevel `tokenizer.json`. Transformers treats the declared class as
+/// authoritative and replaces that serialized pipeline with Llama Metaspace
+/// pre-tokenization, byte fallback, and fused unknowns. `mlx_lm` separately
+/// detects the serialized ByteLevel decoder and uses its BPE streaming
+/// detokenizer for generated tokens, so that decoder must remain unchanged.
+/// Loading the input pipeline verbatim produces different prompt token ids;
+/// replacing the decoder exposes raw `Ġ` and `Ċ` vocabulary glyphs.
+fn apply_llama_fast_compat(tokenizer_json: &mut serde_json::Value) -> bool {
+    let Some(model) = tokenizer_json
+        .get_mut("model")
+        .and_then(serde_json::Value::as_object_mut)
+    else {
+        return false;
+    };
+    if model.get("type").and_then(serde_json::Value::as_str) != Some("BPE") {
+        return false;
+    }
+
+    model.insert("byte_fallback".to_string(), serde_json::Value::Bool(true));
+    model.insert("fuse_unk".to_string(), serde_json::Value::Bool(true));
+    model.insert(
+        "continuing_subword_prefix".to_string(),
+        serde_json::Value::Null,
+    );
+    model.insert("end_of_word_suffix".to_string(), serde_json::Value::Null);
+
+    tokenizer_json["normalizer"] = serde_json::Value::Null;
+    tokenizer_json["pre_tokenizer"] = serde_json::json!({
+        "type": "Metaspace",
+        "replacement": "▁",
+        "prepend_scheme": "always",
+        "split": false
+    });
+    true
+}
+
+fn build_llama_compatible_tokenizer(tokenizer_json_path: &Path) -> Result<tokenizers::Tokenizer> {
+    let raw = std::fs::read_to_string(tokenizer_json_path)
+        .map_err(|e| anyhow::anyhow!("Failed to read {:?}: {}", tokenizer_json_path, e))?;
+    let mut json: serde_json::Value = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("Failed to parse {:?}: {}", tokenizer_json_path, e))?;
+    if apply_llama_fast_compat(&mut json) {
+        tracing::info!(
+            tokenizer_json = %tokenizer_json_path.display(),
+            "applied mlx_lm-compatible LlamaTokenizerFast input pipeline"
+        );
+    }
+    let bytes = serde_json::to_vec(&json)
+        .map_err(|e| anyhow::anyhow!("Failed to re-serialize {:?}: {}", tokenizer_json_path, e))?;
+    tokenizers::Tokenizer::from_bytes(bytes).map_err(|e| anyhow::anyhow!(e))
+}
+
 pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
     // Model-specific override: some official checkpoints ship a stale
     // tokenizer.json that does not match their weights (starmie-era
@@ -1016,6 +1089,8 @@ pub fn load_tokenizer(model_path: &Path) -> Result<MlxcelTokenizer> {
     if tokenizer_json_path.exists() {
         let mut tokenizer = if is_diffusion_gemma_model(model_path) {
             build_diffusion_gemma_tokenizer(&tokenizer_json_path)?
+        } else if declares_llama_tokenizer(model_path) {
+            build_llama_compatible_tokenizer(&tokenizer_json_path)?
         } else {
             tokenizers::Tokenizer::from_file(&tokenizer_json_path)
                 .map_err(|e| anyhow::anyhow!(e))?
@@ -1800,6 +1875,59 @@ mod tests {
             "non-diffusion_gemma model unexpectedly retained a marker: {other_decoded:?}"
         );
         let _ = std::fs::remove_dir_all(other_dir);
+    }
+
+    #[test]
+    fn llama_fast_compat_matches_mlx_lm_pipeline_shape() {
+        let mut json = serde_json::json!({
+            "normalizer": {"type": "NFC"},
+            "pre_tokenizer": {"type": "ByteLevel"},
+            "decoder": {"type": "ByteLevel"},
+            "model": {
+                "type": "BPE",
+                "byte_fallback": false,
+                "fuse_unk": false,
+                "continuing_subword_prefix": "",
+                "end_of_word_suffix": ""
+            }
+        });
+
+        assert!(super::apply_llama_fast_compat(&mut json));
+        assert!(json["normalizer"].is_null());
+        assert_eq!(json["pre_tokenizer"]["type"], "Metaspace");
+        assert_eq!(json["pre_tokenizer"]["replacement"], "▁");
+        assert_eq!(json["pre_tokenizer"]["prepend_scheme"], "always");
+        assert_eq!(json["pre_tokenizer"]["split"], false);
+        assert_eq!(json["model"]["byte_fallback"], true);
+        assert_eq!(json["model"]["fuse_unk"], true);
+        assert!(json["model"]["continuing_subword_prefix"].is_null());
+        assert!(json["model"]["end_of_word_suffix"].is_null());
+        assert_eq!(json["decoder"]["type"], "ByteLevel");
+    }
+
+    #[test]
+    #[ignore = "requires MLXCEL_LLAMA_PARITY_MODEL_PATH"]
+    fn llama_fast_real_checkpoint_matches_mlx_lm_reference() {
+        let model_path = std::env::var_os("MLXCEL_LLAMA_PARITY_MODEL_PATH")
+            .map(std::path::PathBuf::from)
+            .expect("set MLXCEL_LLAMA_PARITY_MODEL_PATH to the checkpoint snapshot");
+        let tokenizer = super::load_tokenizer(&model_path).expect("load real checkpoint tokenizer");
+        let text = "<｜begin▁of▁sentence｜>You are a local AI Agent.<｜User｜>\
+                    convert 100 USD to CAD<｜Assistant｜>";
+        let ids = tokenizer
+            .encode(text, false)
+            .expect("encode parity fixture");
+        assert_eq!(
+            ids,
+            vec![
+                151643, 2610, 546, 278, 3683, 32, 5863, 15772, 13, 151669, 14166, 16, 15, 15, 2034,
+                14797, 48570, 151670,
+            ]
+        );
+        let decoded = tokenizer
+            .decode(&[198, 198, 5338, 11, 279, 1196, 1053, 25], false)
+            .expect("decode ByteLevel generation fixture");
+        assert_eq!(decoded, "\n\nFirst, the user said:");
     }
 
     #[test]
