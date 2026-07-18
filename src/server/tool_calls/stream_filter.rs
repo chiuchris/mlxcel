@@ -505,12 +505,21 @@ impl StreamFilter {
                         self.buffer.drain(..pos);
                     }
 
-                    // Consume the delimiter bytes and count how many token
-                    // positions they spanned. Each position that contributed
-                    // bytes to the delimiter range is one suppressed position:
-                    // callers emit empty-text placeholder events for each.
+                    // Emit the delimiter text to reasoning for thinking-block
+                    // markers so they survive in reasoning_content, matching
+                    // the Python mlx_lm backend which does not strip them.
+                    // Tool-call markers remain suppressed so they never leak
+                    // into visible content deltas.
+                    let delim_text = self.buffer[..delim_len].to_string();
                     let delim_positions = self.drain_fragment_lengths(delim_len);
-                    suppressed_positions += delim_positions;
+                    match action {
+                        DelimiterAction::EnterThinking | DelimiterAction::ExitThinking => {
+                            reasoning.push_str(&delim_text);
+                        }
+                        _ => {
+                            suppressed_positions += delim_positions;
+                        }
+                    }
                     consumed_positions += delim_positions;
                     self.buffer.drain(..delim_len);
                     self.apply_action(action);
@@ -863,7 +872,7 @@ mod tests {
         // SSE chunks. Content after the close stays in `content`.
         let mut f = StreamFilter::new();
         let out = f.feed("<|channel>thought\nReasoning text<channel|>Answer text");
-        assert_eq!(out.reasoning.as_deref(), Some("thought\nReasoning text"));
+        assert_eq!(out.reasoning.as_deref(), Some("<|channel>thought\nReasoning text<channel|>"));
         assert_eq!(out.content.as_deref(), Some("Answer text"));
     }
 
@@ -873,9 +882,11 @@ mod tests {
         // end of the generation prompt, the model's first emitted tokens are
         // already inside the thinking channel. Starting the filter in
         // `Thinking` state routes them to `reasoning`.
+        // The close marker is emitted to reasoning so it survives in
+        // reasoning_content.
         let mut f = StreamFilter::new_primed_open_thinking();
         let out = f.feed("I am thinking<channel|>the answer");
-        assert_eq!(out.reasoning.as_deref(), Some("I am thinking"));
+        assert_eq!(out.reasoning.as_deref(), Some("I am thinking<channel|>"));
         assert_eq!(out.content.as_deref(), Some("the answer"));
     }
 
@@ -908,7 +919,7 @@ mod tests {
         assert_eq!(f.feed(" think.").reasoning.as_deref(), Some(" think."));
         // Close marker transitions state; nothing emitted on the marker itself.
         let closing = f.feed("<channel|>");
-        assert!(closing.reasoning.is_none());
+        assert_eq!(closing.reasoning.as_deref(), Some("<channel|>"));
         assert!(closing.content.is_none());
         // After the close, fragments are content.
         assert_eq!(f.feed("Done.").content.as_deref(), Some("Done."));
@@ -930,15 +941,17 @@ mod tests {
 
     #[test]
     fn qwen_think_full_chunk() {
-        // Full chunk: reasoning inside <think>…</think> surfaces as `reasoning`,
-        // content after the close surfaces as `content`, no raw markers leak.
+        // Full chunk: reasoning inside <think>…</think> surfaces as `reasoning`
+        // WITH the markers preserved, so reasoning_content matches the Python
+        // mlx_lm backend output which does not strip thinking delimiters.
+        // Content after the close surfaces as `content`.
         let mut f = StreamFilter::new();
         let out = f.feed("<think>reasoning here</think>content");
-        assert_eq!(out.reasoning.as_deref(), Some("reasoning here"));
+        assert_eq!(out.reasoning.as_deref(), Some("<think>reasoning here</think>"));
         assert_eq!(out.content.as_deref(), Some("content"));
-        // Verify markers themselves don't appear in either field
-        assert!(!out.reasoning.as_deref().unwrap_or("").contains("<think>"));
-        assert!(!out.reasoning.as_deref().unwrap_or("").contains("</think>"));
+        // Markers are preserved in reasoning, absent from content
+        assert!(out.reasoning.as_deref().unwrap_or("").contains("<think>"));
+        assert!(out.reasoning.as_deref().unwrap_or("").contains("</think>"));
         assert!(!out.content.as_deref().unwrap_or("").contains("<think>"));
         assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
     }
@@ -947,10 +960,11 @@ mod tests {
     fn qwen_think_prompt_primed() {
         // Prompt-primed case: generation prompt appended `<think>\n` so the
         // model's first token is already reasoning.  Start the filter in
-        // Thinking state; the first `</think>` closes the block.
+        // Thinking state; the first `</think>` closes the block and is
+        // preserved in reasoning.
         let mut f = StreamFilter::new_primed_open_thinking();
         let out = f.feed("reasoning here</think>content");
-        assert_eq!(out.reasoning.as_deref(), Some("reasoning here"));
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning here</think>"));
         assert_eq!(out.content.as_deref(), Some("content"));
         assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
     }
@@ -982,10 +996,10 @@ mod tests {
         if let Some(c) = flushed.content {
             total_content.push_str(&c);
         }
-        assert_eq!(total_reasoning, "reasoning here");
+        assert_eq!(total_reasoning, "<think>reasoning here</think>");
         assert_eq!(total_content, "content");
-        assert!(!total_reasoning.contains("<think>"));
-        assert!(!total_reasoning.contains("</think>"));
+        assert!(total_reasoning.contains("<think>"));
+        assert!(total_reasoning.contains("</think>"));
         assert!(!total_content.contains("<think>"));
         assert!(!total_content.contains("</think>"));
     }
@@ -993,6 +1007,7 @@ mod tests {
     #[test]
     fn qwen_think_token_by_token_prompt_primed() {
         // Token-by-token streaming of the prompt-primed case.
+        // The close marker is emitted to reasoning.
         let mut f = StreamFilter::new_primed_open_thinking();
         let fragments = [
             "rea", "son", "ing", " he", "re<", "/th", "ink", ">con", "tent",
@@ -1015,7 +1030,7 @@ mod tests {
         if let Some(c) = flushed.content {
             total_content.push_str(&c);
         }
-        assert_eq!(total_reasoning, "reasoning here");
+        assert_eq!(total_reasoning, "reasoning here</think>");
         assert_eq!(total_content, "content");
     }
 
@@ -1029,7 +1044,7 @@ mod tests {
         // Gemma 4 will be caught here.
         let mut f = StreamFilter::new();
         let out = f.feed("<|channel>thought\nReasoning text<channel|>Answer text");
-        assert_eq!(out.reasoning.as_deref(), Some("thought\nReasoning text"));
+        assert_eq!(out.reasoning.as_deref(), Some("<|channel>thought\nReasoning text<channel|>"));
         assert_eq!(out.content.as_deref(), Some("Answer text"));
         assert!(!out.content.as_deref().unwrap_or("").contains("<|channel>"));
         assert!(!out.content.as_deref().unwrap_or("").contains("<channel|>"));
@@ -1471,20 +1486,19 @@ mod tests {
 
     #[test]
     fn thinking_delimiter_also_increments_suppressed_positions() {
-        // Thinking delimiters (`<think>`, `</think>`, `<|channel>`, etc.)
-        // are also matched-and-drained, so they should also increment
-        // suppressed_positions. This ensures position alignment is preserved
-        // even when reasoning blocks appear before or between tool calls.
+        // Thinking delimiters are now emitted to reasoning (not suppressed),
+        // so they no longer increment suppressed_positions. Tool-call
+        // delimiters remain suppressed.
         let mut f = StreamFilter::new();
         let out = f.feed("<think>reasoning</think>");
-        // The fragment contains TWO delimiters: <think> and </think>.
+        // Thinking markers are emitted, not suppressed
         assert_eq!(
-            out.suppressed_positions, 2,
-            "<think>...</think> must produce suppressed_positions == 2 (one per delimiter match)"
+            out.suppressed_positions, 0,
+            "<think> markers are now emitted to reasoning (not suppressed)"
         );
-        // No content emitted from the markers; reasoning text goes to `reasoning`.
+        // Markers preserved in reasoning
         assert_eq!(out.content, None);
-        assert_eq!(out.reasoning.as_deref(), Some("reasoning"));
+        assert_eq!(out.reasoning.as_deref(), Some("<think>reasoning</think>"));
     }
 
     // -- HIGH-1 regression: multi-fragment (multi-token) delimiter counting --
