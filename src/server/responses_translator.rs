@@ -242,6 +242,7 @@ pub fn responses_request_to_chat(
         user,
         extra_body_fields: serde_json::Map::new(),
         response_format,
+        tool_schema: None,
         params: sampling,
     };
 

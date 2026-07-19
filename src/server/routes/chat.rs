@@ -422,6 +422,35 @@ async fn non_stream_chat_completion(
     // sequence.
     options.structured = structured;
 
+    // Piece B: build the tool-trigger config from tool_schema.
+    // Resolve <tool_call> / </tool_call> token ids and store the schema
+    // so the scheduler can engage constrained decoding on trigger.
+    if let Some(ref tool_schema) = request.tool_schema {
+        if let Some(hf_tok) = state.tokenizer.hf_tokenizer() {
+            let trigger_tokens: Vec<u32> = hf_tok
+                .encode("<tool_call>", false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default();
+            let end_tokens: Vec<u32> = hf_tok
+                .encode("</tool_call>", false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default();
+            if trigger_tokens.len() == 1 && end_tokens.len() == 1 {
+                options.tool_trigger =
+                    Some(crate::server::structured::ToolTriggerConfig {
+                        schema: tool_schema.clone(),
+                        trigger_token_id: trigger_tokens[0],
+                        end_token_id: end_tokens[0],
+                    });
+            } else {
+                tracing::warn!(
+                    "tool_schema present but <tool_call>/</tool_call> not \
+                     single tokens for this model; trigger-based masking disabled"
+                );
+            }
+        }
+    }
+
     // Set logprobs configuration when requested
     let top_k = request.top_logprobs.unwrap_or(0) as usize;
     if request.logprobs == Some(true) {
@@ -656,6 +685,28 @@ async fn stream_chat_completion(
     // forward the constraint built at the request boundary so
     // streamed generation is also constrained.
     options.structured = structured;
+
+    // Piece B: tool-trigger config for streamed generation.
+    if let Some(ref tool_schema) = request.tool_schema {
+        if let Some(hf_tok) = state.tokenizer.hf_tokenizer() {
+            let trigger_tokens: Vec<u32> = hf_tok
+                .encode("<tool_call>", false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default();
+            let end_tokens: Vec<u32> = hf_tok
+                .encode("</tool_call>", false)
+                .map(|e| e.get_ids().to_vec())
+                .unwrap_or_default();
+            if trigger_tokens.len() == 1 && end_tokens.len() == 1 {
+                options.tool_trigger =
+                    Some(crate::server::structured::ToolTriggerConfig {
+                        schema: tool_schema.clone(),
+                        trigger_token_id: trigger_tokens[0],
+                        end_token_id: end_tokens[0],
+                    });
+            }
+        }
+    }
 
     // Extract include_usage before request is moved into the closure
     let include_usage = request
@@ -1548,6 +1599,7 @@ mod tests {
             user: None,
             extra_body_fields: serde_json::Map::new(),
             response_format: None,
+            tool_schema: None,
             params: SamplingParams::default(),
         }
     }

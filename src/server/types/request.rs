@@ -661,6 +661,15 @@ pub struct ChatCompletionRequest {
     #[serde(default)]
     pub response_format: Option<serde_json::Value>,
 
+    /// Tool-call schema for trigger-based constrained decoding (Piece B).
+    ///
+    /// When present, the server resolves `<tool_call>`/`</tool_call>` token
+    /// ids and engages constrained decoding only after the model emits the
+    /// trigger token. This is NOT part of the OpenAI spec — it is a gateway
+    /// extension forwarded by the MacOsServer routing layer.
+    #[serde(default)]
+    pub tool_schema: Option<serde_json::Value>,
+
     /// Sampling parameters (flattened)
     #[serde(flatten)]
     pub params: SamplingParams,
