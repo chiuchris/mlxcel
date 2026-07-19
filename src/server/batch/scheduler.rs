@@ -5879,12 +5879,17 @@ impl BatchScheduler {
                 continue;
             }
 
-            // --- Piece B: trigger-based tool-call constraint lifecycle ---
-            // If no structured constraint is active but a tool_trigger is
-            // configured, check whether the just-sampled token is the
-            // trigger token. If so, build the constraint and attach it.
-            // If a constraint IS active and has stopped (grammar complete),
-            // detach it so free-text generation resumes.
+            // --- structured-output / tool-call constraint lifecycle ---
+            // Trigger-based masking (Piece B) is retained but unused: mlxcel
+            // never emits the `<tool_call>` trigger, so the live path is a
+            // whole-output `response_format` constraint attached from the start.
+            // When such a constraint reaches its terminal accept state the
+            // entire object has been emitted; the sequence must FINISH (after
+            // the completing token below) rather than release into
+            // unconstrained free-run — releasing degenerates into filler tokens
+            // up to max_tokens (the `!!!!` bug). A triggered constraint instead
+            // releases so free text can resume after `</tool_call>`.
+            let mut whole_output_structured_done = false;
             if let Some(seq) = self.active_batch.get_mut(seq_id) {
                 if seq.structured.is_none() {
                     if let Some(ref trigger_cfg) = seq.tool_trigger {
@@ -5919,8 +5924,13 @@ impl BatchScheduler {
                         .map(|guard| guard.is_stopped())
                         .unwrap_or(false);
                     if stopped {
-                        tracing::debug!("tool-call constraint completed, releasing");
-                        seq.structured = None;
+                        if seq.tool_trigger.is_some() {
+                            tracing::debug!("tool-call constraint completed, releasing");
+                            seq.structured = None;
+                        } else {
+                            tracing::debug!("response_format constraint completed, finishing");
+                            whole_output_structured_done = true;
+                        }
                     }
                 }
             }
@@ -5953,6 +5963,19 @@ impl BatchScheduler {
                     None => GenerateEvent::Token(new_text),
                 };
                 let _ = seq.response_tx.send(event);
+            }
+
+            // A whole-output response_format constraint that reached its
+            // terminal accept state has now emitted its final token; stop the
+            // sequence instead of continuing into unconstrained filler.
+            if whole_output_structured_done {
+                if let Err(err) = seq
+                    .state
+                    .transition_to(SequenceState::Finished(FinishReason::Stop))
+                {
+                    tracing::error!("State transition error: {err}");
+                }
+                continue;
             }
 
             if seq.generated_tokens.len() >= seq.max_tokens
@@ -6257,6 +6280,22 @@ impl BatchScheduler {
             None => return,
         };
 
+        // A whole-output response_format constraint (no tool_trigger) that
+        // reached its terminal accept state has emitted the entire object;
+        // finish after this token instead of continuing into unconstrained
+        // filler. Without this the next step hits the force-EOS-via-all--inf
+        // fallback in `apply_structured_mask_to_logits`, which masks EVERY
+        // token (incl. the real EOS, since llguidance's EOS id differs from the
+        // model's) and degenerates greedy argmax to token 0 (`!`) up to
+        // max_tokens.
+        let whole_output_structured_done = seq.tool_trigger.is_none()
+            && seq
+                .structured
+                .as_ref()
+                .and_then(|c| c.lock().ok())
+                .map(|guard| guard.is_stopped())
+                .unwrap_or(false);
+
         if seq.merged_eos.contains(&token_val) {
             if let Err(err) = seq
                 .state
@@ -6280,6 +6319,16 @@ impl BatchScheduler {
                 None => GenerateEvent::Token(new_text),
             };
             let _ = seq.response_tx.send(event);
+        }
+
+        if whole_output_structured_done {
+            if let Err(err) = seq
+                .state
+                .transition_to(SequenceState::Finished(FinishReason::Stop))
+            {
+                tracing::error!("State transition error: {err}");
+            }
+            return;
         }
 
         if seq.generated_tokens.len() >= seq.max_tokens
