@@ -377,6 +377,27 @@ impl StructuredOutputConstraint {
                 mask[idx] = true;
             }
         });
+
+        // If llguidance has fast-forward tokens (forced structural tokens that
+        // must be emitted to cross BPE boundaries), make the mask ONLY include
+        // them. This forces the model to pick the structurally-required token
+        // rather than a token the VOB allows but the grammar will reject.
+        let ff_tokens = self.matcher.compute_ff_tokens();
+        if !ff_tokens.is_empty() {
+            tracing::debug!(
+                "structured-output: {} ff token(s) forcing mask: {:?}",
+                ff_tokens.len(),
+                &ff_tokens[..ff_tokens.len().min(8)]
+            );
+            // Clear any VOB-allowed tokens and set ONLY ff token positions.
+            mask.fill(false);
+            for &tok in &ff_tokens {
+                let idx = tok as usize;
+                if idx < vocab_size {
+                    mask[idx] = true;
+                }
+            }
+        }
         Ok(&self.mask_buf)
     }
 
@@ -429,6 +450,11 @@ impl StructuredOutputConstraint {
     /// Once true, subsequent tokens would either be EOS or cause an error.
     pub fn is_stopped(&self) -> bool {
         self.matcher.is_stopped()
+    }
+
+    /// Returns a debug representation of the stop reason (Phase 0 diagnostic).
+    pub fn stop_reason_debug(&self) -> String {
+        format!("{:?}", self.matcher.stop_reason())
     }
 }
 
@@ -561,11 +587,13 @@ pub fn build_json_schema_constraint(
     let mut factory = ParserFactory::new(
         &tok_env,
         InferenceCapabilities {
-            // mlxcel does not currently expose ff-token streams from the
-            // sampler, so we keep the safe defaults: per-step mask only.
-            ff_tokens: false,
+            // Enable fast-forward tokens so llguidance can force structural
+            // tokens (e.g. property separators) past BPE boundary splits.
+            // backtrack=false because the lark parser backend doesn't support
+            // it; we rely on ff-token-only mask for the cases that work.
+            ff_tokens: true,
             backtrack: false,
-            conditional_ff_tokens: false,
+            conditional_ff_tokens: true,
             fork: false,
         },
         &[],
@@ -739,10 +767,29 @@ pub fn apply_structured_mask_to_logits(
         let allowed = constraint.compute_mask()?;
         let usable_allowed_count = allowed.iter().take(vocab_size).filter(|x| **x).count();
         if usable_allowed_count == 0 {
-            // No legal continuation reachable by the sampler — surface
-            // as a clean error so the scheduler can stop the sequence
-            // with a 5xx-equivalent FinishReason::Error rather than
-            // silently emitting an arbitrary token.
+            // If the matcher stopped naturally (grammar complete), return an
+            // all-`-inf` bias so the model emits its EOS token. This is a
+            // successful completion, not an error.
+            if constraint.is_stopped() {
+                tracing::debug!(
+                    "structured-output: matcher stopped ({:?}), forcing EOS via all--inf bias",
+                    constraint.stop_reason_debug()
+                );
+                constraint.bias_buf.clear();
+                constraint.bias_buf.resize(vocab_size, f32::NEG_INFINITY);
+                let bias_arr = mlxcel_core::from_slice_f32(
+                    &constraint.bias_buf,
+                    &[1, vocab_size as i32],
+                );
+                return Ok(mlxcel_core::add(logits, &bias_arr));
+            }
+            // Diagnostic: log matcher state when it dead-ends (not stopped).
+            tracing::warn!(
+                "structured-output empty mask (NOT stopped): vocab_size={vocab_size} \
+                 is_stopped={} stop_reason={:?}",
+                constraint.is_stopped(),
+                constraint.stop_reason_debug(),
+            );
             return Err(StructuredOutputError::Matcher(
                 "structured-output matcher returned an empty mask: \
                  no token can extend the partial output without violating \
