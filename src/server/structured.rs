@@ -459,6 +459,25 @@ impl StructuredOutputConstraint {
 }
 
 // ---------------------------------------------------------------------------
+// Trigger-based tool-call constraint (Piece B)
+// ---------------------------------------------------------------------------
+
+/// Configuration for trigger-based tool-call constrained decoding.
+///
+/// When the model emits `trigger_token_id`, a [`StructuredOutputConstraint`]
+/// is built from `schema` and attached to the sequence. The constraint
+/// stays active until the JSON body is complete (matcher stopped).
+#[derive(Debug, Clone)]
+pub struct ToolTriggerConfig {
+    /// JSON Schema for the tool-call body (`{name: enum, arguments: object}`).
+    pub schema: serde_json::Value,
+    /// Token id for `<tool_call>` — the trigger that engages the constraint.
+    pub trigger_token_id: u32,
+    /// Token id for `</tool_call>` — forced after the JSON body completes.
+    pub end_token_id: u32,
+}
+
+// ---------------------------------------------------------------------------
 // Builders
 // ---------------------------------------------------------------------------
 

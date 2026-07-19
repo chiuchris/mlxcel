@@ -188,6 +188,9 @@ pub(crate) fn build_server_generate_options(
         // that handle `response_format` populate this after the helper
         // returns — see `chat.rs` and `completions.rs`.
         structured: None,
+        // Trigger-based tool-call schema (Piece B). Populated by chat
+        // routes when `tool_schema` is present in the request.
+        tool_trigger: None,
         // Default unset (use the checkpoint's configured Gemma 4 budget). The
         // chat routes populate this from the resolved `image_url` content
         // parts after the helper returns; the raw text-completion endpoints

@@ -154,6 +154,14 @@ pub struct ServerGenerateOptions {
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
     >,
 
+    /// Trigger-based tool-call constraint configuration (Piece B).
+    ///
+    /// When `Some`, the scheduler watches for the trigger token
+    /// (`<tool_call>`) during free-form generation and engages
+    /// constrained decoding on the tool-call body. `None` means
+    /// unconstrained generation (no tool-call schema to enforce).
+    pub tool_trigger: Option<crate::server::structured::ToolTriggerConfig>,
+
     /// per-request Gemma 4 image soft-token budget.
     ///
     /// `None` means "no override": the Gemma 4 preprocessor uses the budget
