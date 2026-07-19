@@ -324,6 +324,13 @@ pub struct StreamFilter {
     /// suppressed until the first `ExitThinking` — matching the non-stream
     /// `strip_thinking` prompt-primed pass.
     primed: bool,
+    /// Whether to suppress output during the primed phase (before the first
+    /// `ExitThinking`). Set `true` for the streaming path (SSE deltas) so
+    /// the primed close marker and leading whitespace don't leak into
+    /// visible content or reasoning deltas. Set `false` for the non-stream
+    /// `extract_reasoning_content` path so unclosed thinking still surfaces
+    /// as `reasoning_content`.
+    suppress_primed: bool,
     /// Whether we've seen at least one `EnterThinking` delimiter.
     /// Used with `primed` to decide whether an `ExitThinking` is a
     /// prompt-primed close (suppress) or a balanced close (emit to
@@ -366,6 +373,7 @@ impl StreamFilter {
             state: FilterState::Content,
             content_started: false,
             primed: false,
+            suppress_primed: false,
             seen_enter_thinking: false,
             buffer: String::new(),
             fragment_lengths: std::collections::VecDeque::new(),
@@ -381,13 +389,32 @@ impl StreamFilter {
     /// token is already reasoning content, not a regular response, so it is
     /// routed to `reasoning` until the model emits the matching close marker
     /// (`<channel|>` or `</think>`) to transition back to `Content`.  If the
-    /// model never closes the block, the entire generation is suppressed —
-    /// matching the non-streaming post-processor behavior in
-    /// `routes::chat::strip_unclosed_primed_thinking`.
+    /// model never closes the block, the entire generation is routed to
+    /// `reasoning` (via `flush`).
+    ///
+    /// For the **streaming** path (SSE deltas), use
+    /// [`new_primed_open_thinking_suppress`] instead — that variant suppresses
+    /// primed-phase output so the primed close marker and leading whitespace
+    /// don't leak into visible deltas (matching the non-stream
+    /// `strip_thinking` prompt-primed pass).
     pub fn new_primed_open_thinking() -> Self {
         let mut s = Self::new();
         s.state = FilterState::Thinking;
         s.primed = true;
+        s
+    }
+
+    /// Create a filter like [`new_primed_open_thinking`] but suppress all
+    /// output during the primed phase (before the first `ExitThinking`).
+    ///
+    /// Use for the **streaming** path (SSE deltas) so the primed close
+    /// marker (`</think>` / `<channel|>`) and any leading whitespace don't
+    /// leak into visible `delta.content` or `delta.reasoning_content` chunks.
+    /// This matches the non-stream `strip_thinking` prompt-primed pass which
+    /// strips everything up to and including the first bare close marker.
+    pub fn new_primed_open_thinking_suppress() -> Self {
+        let mut s = Self::new_primed_open_thinking();
+        s.suppress_primed = true;
         s
     }
 
@@ -518,7 +545,9 @@ impl StreamFilter {
                         match self.state {
                             FilterState::Content => content.push_str(&self.buffer[..pos]),
                             FilterState::Thinking
-                                if self.primed && !self.seen_enter_thinking =>
+                                if self.primed
+                                    && self.suppress_primed
+                                    && !self.seen_enter_thinking =>
                             {
                                 // Primed phase: suppress everything,
                                 // matching strip_thinking's prompt-primed
@@ -545,7 +574,8 @@ impl StreamFilter {
                     let delim_positions = self.drain_fragment_lengths(delim_len);
                     match action {
                         DelimiterAction::EnterThinking => {
-                            let was_primed = self.primed && !self.seen_enter_thinking;
+                            let was_primed =
+                                self.primed && self.suppress_primed && !self.seen_enter_thinking;
                             self.seen_enter_thinking = true;
                             if was_primed {
                                 // Primed phase — suppress (shouldn't happen
@@ -568,7 +598,8 @@ impl StreamFilter {
                             // When we DID enter Thinking via an explicit
                             // <think> marker, route the close marker to
                             // reasoning as usual.
-                            let is_primed_close = self.primed && !self.seen_enter_thinking;
+                            let is_primed_close =
+                                self.primed && self.suppress_primed && !self.seen_enter_thinking;
                             if is_primed_close {
                                 // Also suppress any buffered content that
                                 // was queued for reasoning (the model may
@@ -599,7 +630,9 @@ impl StreamFilter {
                         match self.state {
                             FilterState::Content => content.push_str(&self.buffer[..safe_len]),
                             FilterState::Thinking
-                                if self.primed && !self.seen_enter_thinking =>
+                                if self.primed
+                                    && self.suppress_primed
+                                    && !self.seen_enter_thinking =>
                             {
                                 // Primed phase — suppress.
                             }
@@ -970,42 +1003,46 @@ mod tests {
     fn primed_open_thinking_starts_in_reasoning_state() {
         // When the chat template primed an open `<|channel>thought\n` at the
         // end of the generation prompt, the model's first emitted tokens are
-        // already inside the thinking channel. The primed phase suppresses
-        // everything up to and including the first close marker, matching
-        // strip_thinking's prompt-primed pass. After the close, content
-        // routes to the `content` channel.
+        // already inside the thinking channel. Starting the filter in
+        // `Thinking` state routes them to `reasoning`.
+        // The close marker is emitted to reasoning so it survives in
+        // reasoning_content.
         let mut f = StreamFilter::new_primed_open_thinking();
         let out = f.feed("I am thinking<channel|>the answer");
-        assert_eq!(out.reasoning, None, "primed phase suppresses reasoning");
+        assert_eq!(out.reasoning.as_deref(), Some("I am thinking<channel|>"));
         assert_eq!(out.content.as_deref(), Some("the answer"));
     }
 
     #[test]
     fn primed_open_thinking_unclosed_suppresses_content_entirely() {
         // Model ran out of budget inside the primed channel — never emits
-        // `<channel|>`. The primed phase suppresses everything — no
-        // reasoning or content is emitted, matching strip_thinking.
+        // `<channel|>`. The filter keeps every token in `reasoning` and
+        // leaves `content` empty, including on flush.
         let mut f = StreamFilter::new_primed_open_thinking();
         let out = f.feed("reasoning continues");
         assert_eq!(out.content, None);
-        assert_eq!(out.reasoning, None, "primed phase suppresses reasoning");
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning continues"));
 
         let flushed = f.flush();
         assert_eq!(flushed.content, None);
-        assert_eq!(flushed.reasoning, None);
+        // Buffer was already drained inside feed, so flush has nothing left
+        // to surface. Either None or empty is acceptable.
+        assert!(
+            flushed.reasoning.as_deref().unwrap_or("").is_empty(),
+            "flush must not leak buffered reasoning as content"
+        );
     }
 
     #[test]
     fn primed_open_thinking_token_by_token() {
-        // Fragment-by-fragment streaming: every pre-close token is
-        // suppressed (matching strip_thinking's prompt-primed pass),
+        // Fragment-by-fragment streaming: every pre-close token is reasoning,
         // every post-close token is content.
         let mut f = StreamFilter::new_primed_open_thinking();
-        assert_eq!(f.feed("Let me").reasoning, None, "primed phase suppresses");
-        assert_eq!(f.feed(" think.").reasoning, None, "primed phase suppresses");
-        // Close marker transitions state; suppressed in primed phase.
+        assert_eq!(f.feed("Let me").reasoning.as_deref(), Some("Let me"));
+        assert_eq!(f.feed(" think.").reasoning.as_deref(), Some(" think."));
+        // Close marker transitions state; nothing emitted on the marker itself.
         let closing = f.feed("<channel|>");
-        assert_eq!(closing.reasoning, None);
+        assert_eq!(closing.reasoning.as_deref(), Some("<channel|>"));
         assert!(closing.content.is_none());
         // After the close, fragments are content.
         assert_eq!(f.feed("Done.").content.as_deref(), Some("Done."));
@@ -1045,13 +1082,12 @@ mod tests {
     #[test]
     fn qwen_think_prompt_primed() {
         // Prompt-primed case: generation prompt appended `<think>\n` so the
-        // model's first token is already reasoning. The primed phase
-        // suppresses everything up to and including the first `</think>`,
-        // matching strip_thinking's prompt-primed pass. Only content after
-        // the close is emitted.
+        // model's first token is already reasoning.  Start the filter in
+        // Thinking state; the first `</think>` closes the block and is
+        // preserved in reasoning.
         let mut f = StreamFilter::new_primed_open_thinking();
         let out = f.feed("reasoning here</think>content");
-        assert_eq!(out.reasoning, None, "primed phase suppresses");
+        assert_eq!(out.reasoning.as_deref(), Some("reasoning here</think>"));
         assert_eq!(out.content.as_deref(), Some("content"));
         assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
     }
@@ -1094,8 +1130,7 @@ mod tests {
     #[test]
     fn qwen_think_token_by_token_prompt_primed() {
         // Token-by-token streaming of the prompt-primed case.
-        // The primed phase suppresses everything; only post-close
-        // content is emitted, matching strip_thinking.
+        // The close marker is emitted to reasoning.
         let mut f = StreamFilter::new_primed_open_thinking();
         let fragments = [
             "rea", "son", "ing", " he", "re<", "/th", "ink", ">con", "tent",
@@ -1118,8 +1153,35 @@ mod tests {
         if let Some(c) = flushed.content {
             total_content.push_str(&c);
         }
-        assert_eq!(total_reasoning, "", "primed phase suppresses all reasoning");
+        assert_eq!(total_reasoning, "reasoning here</think>");
         assert_eq!(total_content, "content");
+    }
+
+    #[test]
+    fn qwen_think_suppress_primed_phase() {
+        // Suppress variant: matches strip_thinking's prompt-primed pass.
+        // Everything before and including the first bare </think> is
+        // suppressed (not routed to reasoning). Only post-close content
+        // is emitted.
+        let mut f = StreamFilter::new_primed_open_thinking_suppress();
+        let out = f.feed("reasoning here</think>content");
+        assert_eq!(out.reasoning, None, "suppress variant: no reasoning");
+        assert_eq!(out.content.as_deref(), Some("content"));
+        assert!(!out.content.as_deref().unwrap_or("").contains("</think>"));
+    }
+
+    #[test]
+    fn qwen_think_suppress_primed_unclosed() {
+        // Suppress variant, unclosed: the model never emits </think>.
+        // All content is suppressed — matching strip_unclosed_primed_thinking
+        // which returns empty content.
+        let mut f = StreamFilter::new_primed_open_thinking_suppress();
+        let out = f.feed("reasoning overflow with no close");
+        assert_eq!(out.content, None);
+        assert_eq!(out.reasoning, None);
+        let flushed = f.flush();
+        assert_eq!(flushed.content, None);
+        assert_eq!(flushed.reasoning, None);
     }
 
     // -- Gemma 4 regression guard --
