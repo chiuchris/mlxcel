@@ -293,6 +293,13 @@ pub struct SequenceInfo {
         std::sync::Arc<std::sync::Mutex<crate::server::structured::StructuredOutputConstraint>>,
     >,
 
+    /// Trigger-based tool-call constraint config (Piece B).
+    ///
+    /// When `Some`, the scheduler watches for the trigger token during
+    /// free-form generation and engages constrained decoding on the
+    /// tool-call body. `None` means no tool-call schema to enforce.
+    pub(crate) tool_trigger: Option<crate::server::structured::ToolTriggerConfig>,
+
     // -- Response channel --
     /// Sender for streaming events back to the HTTP handler.
     pub response_tx: mpsc::Sender<GenerateEvent>,

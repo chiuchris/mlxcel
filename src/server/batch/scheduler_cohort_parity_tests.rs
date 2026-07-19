@@ -179,6 +179,7 @@ fn make_seq(
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
+            tool_trigger: None,
     };
     (seq, rx)
 }

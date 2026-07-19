@@ -270,6 +270,7 @@ fn make_slice_sequence(max_tokens: usize) -> (SequenceInfo, mpsc::Receiver<Gener
         merged_eos: Vec::new(),
         thinking: ThinkingState::disabled(),
         structured: None,
+            tool_trigger: None,
     };
     (seq, rx)
 }

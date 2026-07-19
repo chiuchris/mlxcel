@@ -835,6 +835,7 @@ impl BatchScheduler {
             merged_eos: Vec::new(),
             thinking: crate::server::thinking_budget::ThinkingState::disabled(),
             structured: None,
+            tool_trigger: None,
         };
         self.prefill_request_for_handoff(seq)
     }
@@ -930,6 +931,7 @@ impl BatchScheduler {
             merged_eos,
             thinking: crate::server::thinking_budget::ThinkingState::disabled(),
             structured: None,
+            tool_trigger: None,
         };
 
         if self.active_batch.add(seq).is_err() {
@@ -3018,6 +3020,9 @@ impl BatchScheduler {
             // forward the structured-output constraint built by
             // the route layer so the per-step sampling path can consult it.
             structured: options.structured.clone(),
+            // forward the tool-trigger config (Piece B) so the
+            // decode loop can engage constrained decoding on trigger.
+            tool_trigger: options.tool_trigger.clone(),
         };
 
         if let Err(rejected) = self.prefill_queue.enqueue(seq) {
@@ -5872,6 +5877,52 @@ impl BatchScheduler {
                     &msg,
                 );
                 continue;
+            }
+
+            // --- Piece B: trigger-based tool-call constraint lifecycle ---
+            // If no structured constraint is active but a tool_trigger is
+            // configured, check whether the just-sampled token is the
+            // trigger token. If so, build the constraint and attach it.
+            // If a constraint IS active and has stopped (grammar complete),
+            // detach it so free-text generation resumes.
+            if let Some(seq) = self.active_batch.get_mut(seq_id) {
+                if seq.structured.is_none() {
+                    if let Some(ref trigger_cfg) = seq.tool_trigger {
+                        if sampled_token == trigger_cfg.trigger_token_id as i32 {
+                            tracing::debug!(
+                                "tool-call trigger detected (token={sampled_token}), \
+                                 engaging constrained decoding"
+                            );
+                            match crate::server::structured::build_json_schema_constraint(
+                                &self.tokenizer,
+                                trigger_cfg.schema.clone(),
+                            ) {
+                                Ok(constraint) => {
+                                    seq.structured = Some(constraint);
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "tool-call constraint build failed: {e}; \
+                                         generation will be unconstrained"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    // Constraint is active — check if it completed.
+                    // We briefly lock the mutex to probe is_stopped().
+                    let stopped = seq
+                        .structured
+                        .as_ref()
+                        .and_then(|c| c.lock().ok())
+                        .map(|guard| guard.is_stopped())
+                        .unwrap_or(false);
+                    if stopped {
+                        tracing::debug!("tool-call constraint completed, releasing");
+                        seq.structured = None;
+                    }
+                }
             }
 
             let seq = match self.active_batch.get_mut(seq_id) {

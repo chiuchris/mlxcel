@@ -72,6 +72,7 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
+            tool_trigger: None,
     };
 
     (seq, rx)
@@ -262,6 +263,7 @@ fn make_test_sequence_with_priority(
         merged_eos: Vec::new(),
         thinking: crate::server::thinking_budget::ThinkingState::disabled(),
         structured: None,
+            tool_trigger: None,
     };
 
     (seq, rx)
