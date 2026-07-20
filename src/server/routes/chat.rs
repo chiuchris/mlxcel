@@ -787,7 +787,7 @@ async fn stream_chat_completion(
         let cb_state = std::sync::Arc::new(std::sync::Mutex::new(StreamCallbackState {
             accumulated: String::new(),
             stream_filter: if primed_open_thinking {
-                StreamFilter::new_primed_open_thinking_suppress()
+                StreamFilter::new_primed_open_thinking()
             } else {
                 StreamFilter::new()
             },
