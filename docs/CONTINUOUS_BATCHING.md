@@ -115,9 +115,11 @@ padded batched prefill, the path pads every row to the window's longest prompt
 allocate an `O(B*L^2)` mask that ignores `--prefill-chunk-size`: four 8k prompts
 build a `[4, 8192, 8192]` FP32 mask, about 1 GiB, a spike far above the working
 set of the sequential chunked prefill those prompts take when batched prefill is
-off. On the serving path an allocation failure is an uncatchable MLX C++ throw
-that aborts the whole server, so this is an availability edge the KV budget does
-not model.
+off. On the serving path an allocation failure at this eval is now caught at the
+fallible `try_eval` FFI boundary and fails just the cohort's requests instead of
+aborting the whole server (issue #822); a persistent run of consecutive eval
+failures across cohorts still trips a shutdown guard, so the transient itself
+remains an availability edge the KV budget does not model.
 
 `--max-batch-prefill-tokens N` caps the drained batched window by total padded
 tokens (`rows * L`). Draining stops before a row that would push `rows * L` past
@@ -241,12 +243,48 @@ config can instead run as one B>1 batched burst, but that path is experimental
 and stays behind `MLXCEL_ENABLE_MTP_BATCH` (plus
 `MLXCEL_ENABLE_MTP_BATCH_RAGGED` for mixed prompt lengths).
 
+A tick-cooperative slice spans the request's whole generation, so the single
+speculative slot would otherwise be held for that entire time. Since issue
+#746 the slot rotates across concurrent speculative requests instead of
+serving only the first one: while a slice is in flight, up to 2 further
+tick-slice-eligible requests are parked in a grant backlog (any beyond that
+cap fall back to classic decode, the pre-#746 behavior), and once the active
+request has run `MLXCEL_MTP_SLICE_GRANT_ROUNDS` slices (default 8, slice 0
+included) with the backlog non-empty, it is parked at the next round boundary
+and the slot is granted to the next request, priority lane first and FIFO
+within a lane, with an anti-starvation floor: an entry passed over by 2 grant
+decisions becomes overdue and must be granted next regardless of lane, so a
+sustained stream of higher-priority arrivals (priorities are client-assignable
+via the `X-Priority` header) can delay a lower-priority request only by a
+bounded number of grants, never stall its stream outright. The backlog cap
+applies at admission; a park transiently holds cap + 1 backlog entries until
+the next promotion, so total live speculative sessions (the active request
+plus parked and waiting ones, each holding its per-sequence KV) peak at 3.
+A parked request resumes from its saved session state on its
+next grant, with the worker's one drafter handle handed over through the same
+return/take plumbing the end of a request uses (safe because the MTP
+assistant drafter's reset is a no-op and every round re-arms the drafter from
+the session's own stored verify output), so the token streams are
+byte-identical to uncontended runs. The budget binds only under contention:
+a single speculative request never rotates and behaves exactly as under
+#734. `MLXCEL_MTP_SLICE_GRANT_ROUNDS=0` disables rotation and restores the
+whole-generation hold, including the classic fallback for every concurrent
+speculative request.
+
 Operator controls, all env-level (see
 [environment-variables.md](environment-variables.md)): `MLXCEL_ENABLE_MTP_B1`
 pins the B=1 decision in either direction and suppresses profiling,
 `MLXCEL_MTP_ADAPTIVE=0` disables the adaptive policy in favor of the static
-per-hardware gates, and `MLXCEL_QMV_MULTIROW=0` restores the stock per-row
-CUDA quantized-matmul kernel under the verify.
+per-hardware gates, `MLXCEL_MTP_SLICE_GRANT_ROUNDS` sizes (or disables) the
+speculative-slot grant rotation, and `MLXCEL_QMV_MULTIROW=0` restores the
+stock per-row CUDA quantized-matmul kernel under the verify.
+
+On CUDA, the same draft/verify shape diversity (multiplied by batch size and
+sequence-length bucket) is also what drives MLX's own captured-graph-cache
+LRU hardest; mlxcel raises `MLX_CUDA_GRAPH_CACHE_SIZE` to 2000 at startup by
+default so a long-lived server does not hit MLX's fatal `Cache thrashing`
+abort at its own 400 default (issue #818, `MLX_CUDA_GRAPH_CACHE_SIZE` in
+[environment-variables.md](environment-variables.md)).
 
 ## Disaggregated serving
 
