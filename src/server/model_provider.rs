@@ -28,7 +28,7 @@ use mlxcel_core::sampling::TokenLogprobData;
 
 use crate::server::ServerGenerateOptions;
 use crate::server::batch::BatchObservability;
-use crate::server::media::ResolvedVideo;
+use crate::server::media::{MediaRequestMetadata, ResolvedVideo};
 use crate::server::state::BatchMetrics;
 
 /// Request to the model thread
@@ -58,6 +58,13 @@ pub(crate) enum ModelRequest {
         /// path — closing the canonicalise → ffmpeg-open TOCTOU window.
         /// Empty for non-video requests.
         videos: Vec<ResolvedVideo>,
+        /// Declared and resolved media counts retained from the HTTP boundary.
+        ///
+        /// MLX/diffusion workers ignore this metadata and keep their tolerant
+        /// resolver behavior. XLA validates it before deciding whether a
+        /// request is text-only.
+        #[cfg_attr(not(feature = "xla-iree"), allow(dead_code))]
+        media: MediaRequestMetadata,
         response_tx: mpsc::Sender<GenerateEvent>,
         /// Cancellation flag set by the SSE sender when the client disconnects.
         /// The `BatchScheduler` polls this to abort orphaned sequences.
@@ -890,7 +897,23 @@ impl ModelProvider {
         audio: Vec<Vec<u8>>,
         videos: Vec<ResolvedVideo>,
     ) -> Result<GenerationResult> {
-        let response_rx = self.send_generate_request(prompt, options, images, audio, videos)?;
+        let media = MediaRequestMetadata::from_resolved(images.len(), audio.len(), videos.len());
+        self.generate_with_media_and_videos_declared(prompt, options, images, audio, videos, media)
+    }
+
+    /// Generation entry used by prepared HTTP requests that retain declared
+    /// media cardinality across tolerant resolution.
+    pub(crate) fn generate_with_media_and_videos_declared(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<ResolvedVideo>,
+        media: MediaRequestMetadata,
+    ) -> Result<GenerationResult> {
+        let response_rx = self
+            .send_generate_request_with_metadata(prompt, options, images, audio, videos, media)?;
         drain_generation_events(response_rx, self.decode_hang_timeout, |_| {})
     }
 
@@ -1020,8 +1043,31 @@ impl ModelProvider {
     where
         F: FnMut(String, Option<TokenLogprobData>),
     {
-        let response_rx = self.send_generate_request_with_cancellation(
-            prompt, options, images, audio, videos, cancelled,
+        let media = MediaRequestMetadata::from_resolved(images.len(), audio.len(), videos.len());
+        self.generate_streaming_with_logprobs_cancellable_videos_declared(
+            prompt, options, images, audio, videos, media, cancelled, callback,
+        )
+    }
+
+    /// Streaming entry used by prepared HTTP requests that retain declared
+    /// media cardinality across tolerant resolution.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn generate_streaming_with_logprobs_cancellable_videos_declared<F>(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<ResolvedVideo>,
+        media: MediaRequestMetadata,
+        cancelled: Arc<AtomicBool>,
+        callback: F,
+    ) -> Result<GenerationResult>
+    where
+        F: FnMut(String, Option<TokenLogprobData>),
+    {
+        let response_rx = self.send_generate_request_with_cancellation_and_metadata(
+            prompt, options, images, audio, videos, media, cancelled,
         )?;
         drain_generation_events_with_logprobs(response_rx, self.decode_hang_timeout, callback)
     }
@@ -1034,12 +1080,26 @@ impl ModelProvider {
         audio: Vec<Vec<u8>>,
         videos: Vec<ResolvedVideo>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
-        self.send_generate_request_with_cancellation(
+        let media = MediaRequestMetadata::from_resolved(images.len(), audio.len(), videos.len());
+        self.send_generate_request_with_metadata(prompt, options, images, audio, videos, media)
+    }
+
+    fn send_generate_request_with_metadata(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<ResolvedVideo>,
+        media: MediaRequestMetadata,
+    ) -> Result<mpsc::Receiver<GenerateEvent>> {
+        self.send_generate_request_with_cancellation_and_metadata(
             prompt,
             options,
             images,
             audio,
             videos,
+            media,
             Arc::new(AtomicBool::new(false)),
         )
     }
@@ -1058,6 +1118,23 @@ impl ModelProvider {
         videos: Vec<ResolvedVideo>,
         cancelled: Arc<AtomicBool>,
     ) -> Result<mpsc::Receiver<GenerateEvent>> {
+        let media = MediaRequestMetadata::from_resolved(images.len(), audio.len(), videos.len());
+        self.send_generate_request_with_cancellation_and_metadata(
+            prompt, options, images, audio, videos, media, cancelled,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn send_generate_request_with_cancellation_and_metadata(
+        &self,
+        prompt: String,
+        options: ServerGenerateOptions,
+        images: Vec<Vec<u8>>,
+        audio: Vec<Vec<u8>>,
+        videos: Vec<ResolvedVideo>,
+        media: MediaRequestMetadata,
+        cancelled: Arc<AtomicBool>,
+    ) -> Result<mpsc::Receiver<GenerateEvent>> {
         let (response_tx, response_rx) = mpsc::channel();
 
         // Tokenize on this (request-dispatch / HTTP-side) thread when a
@@ -1066,7 +1143,12 @@ impl ModelProvider {
         // falls back to `None` so the scheduler encodes it and surfaces the
         // error through the normal response channel.
         let prompt_token_ids = self.prompt_tokenizer.as_ref().and_then(|tok| {
-            tokenize_prompt_for_generation(tok, &prompt)
+            let tokenized = if audio.is_empty() {
+                tokenize_prompt_for_generation(tok, &prompt)
+            } else {
+                tokenize_prompt_for_generation_with_ordered_media(tok, &prompt, true)
+            };
+            tokenized
                 .map_err(|err| {
                     tracing::debug!(
                         "HTTP-side prompt tokenization failed ({err}); deferring to scheduler"
@@ -1084,6 +1166,7 @@ impl ModelProvider {
                 images,
                 audio,
                 videos,
+                media,
                 response_tx,
                 cancelled,
             })
@@ -1104,8 +1187,24 @@ pub(crate) fn tokenize_prompt_for_generation(
     tokenizer: &crate::tokenizer::MlxcelTokenizer,
     prompt: &str,
 ) -> Result<Vec<i32>> {
-    let add_special = !prompt.starts_with("<bos>") && !prompt.starts_with("<s>");
-    let ids = tokenizer.encode(prompt, add_special)?;
+    tokenize_prompt_for_generation_with_ordered_media(tokenizer, prompt, false)
+}
+
+pub(crate) fn tokenize_prompt_for_generation_with_ordered_media(
+    tokenizer: &crate::tokenizer::MlxcelTokenizer,
+    prompt: &str,
+    has_audio: bool,
+) -> Result<Vec<i32>> {
+    let plain_prompt = if has_audio {
+        std::borrow::Cow::Owned(
+            crate::server::types::request::strip_ordered_media_sentinels(prompt)
+                .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        std::borrow::Cow::Borrowed(prompt)
+    };
+    let add_special = !plain_prompt.starts_with("<bos>") && !plain_prompt.starts_with("<s>");
+    let ids = tokenizer.encode(&plain_prompt, add_special)?;
     Ok(ids.iter().map(|&x| x as i32).collect())
 }
 

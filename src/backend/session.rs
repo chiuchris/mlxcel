@@ -40,9 +40,116 @@ use mlxcel_core::MlxArray;
 use mlxcel_core::generate::{GenerationStats, LanguageModel, SamplingConfig};
 #[cfg(feature = "xla-backend")]
 use mlxcel_core::session::InferenceSession;
+#[cfg(feature = "xla-backend")]
+use mlxcel_core::session::PreparedPrefill;
 use mlxcel_core::session::{MlxInferenceSession, SessionCapabilities};
 #[cfg(feature = "xla-backend")]
 use mlxcel_xla::XlaInferenceSession;
+
+#[cfg(feature = "xla-backend")]
+pub(super) fn qualified_xla_capabilities(
+    mut engine_capabilities: SessionCapabilities,
+    has_image_preprocessor: bool,
+) -> SessionCapabilities {
+    engine_capabilities.multimodal = engine_capabilities.multimodal && has_image_preprocessor;
+    engine_capabilities
+}
+
+#[cfg(feature = "xla-backend")]
+pub(super) fn qualified_xla_supports_images(
+    engine_capabilities: SessionCapabilities,
+    has_image_preprocessor: bool,
+) -> bool {
+    qualified_xla_capabilities(engine_capabilities, has_image_preprocessor).multimodal
+}
+
+#[cfg(feature = "xla-backend")]
+pub(super) fn qualified_xla_vision_backend(
+    image_preprocessor: Option<&dyn crate::HostMultimodalPreprocessor>,
+) -> Option<crate::XlaVisionBackend> {
+    image_preprocessor.map(|preprocessor| preprocessor.backend())
+}
+
+/// Root-crate OpenXLA session with the matching host image preprocessor.
+///
+/// The compiler runtime lives in `mlxcel-xla`, while the host preprocessor
+/// either owns the qualified MLX vision path or a resident IREE projector.
+/// Keeping it in the session makes capability and backend reporting depend on
+/// the same loaded value.
+#[cfg(feature = "xla-backend")]
+pub struct XlaBackendSession {
+    engine: XlaInferenceSession,
+    image_preprocessor: Option<Box<dyn crate::HostMultimodalPreprocessor>>,
+}
+
+#[cfg(feature = "xla-backend")]
+impl XlaBackendSession {
+    #[must_use]
+    pub(crate) fn new(
+        engine: XlaInferenceSession,
+        image_preprocessor: Option<Box<dyn crate::HostMultimodalPreprocessor>>,
+    ) -> Self {
+        Self {
+            engine,
+            image_preprocessor,
+        }
+    }
+
+    /// Report only capabilities whose complete host/runtime path was loaded.
+    #[must_use]
+    pub fn capabilities(&self) -> SessionCapabilities {
+        qualified_xla_capabilities(
+            self.engine.capabilities(),
+            self.image_preprocessor.is_some(),
+        )
+    }
+
+    /// Whether this session can prepare and execute image-prefill requests.
+    #[must_use]
+    pub fn supports_images(&self) -> bool {
+        qualified_xla_supports_images(
+            self.engine.capabilities(),
+            self.image_preprocessor.is_some(),
+        )
+    }
+
+    /// Selected implementation for the loaded XLA vision tower/projector.
+    #[must_use]
+    pub fn vision_backend(&self) -> Option<crate::XlaVisionBackend> {
+        qualified_xla_vision_backend(self.image_preprocessor.as_deref())
+    }
+
+    /// Prepare decoded images through the exact preprocessor used by the
+    /// capability predicate.
+    pub fn prepare_images(
+        &self,
+        token_ids: &[i32],
+        images: &[image::DynamicImage],
+    ) -> Result<PreparedPrefill, String> {
+        let preprocessor = self.image_preprocessor.as_ref().ok_or_else(|| {
+            "the loaded OpenXLA model/runtime bundle does not support image input".to_string()
+        })?;
+        preprocessor
+            .prepare(token_ids, images)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(feature = "xla-backend")]
+impl std::ops::Deref for XlaBackendSession {
+    type Target = XlaInferenceSession;
+
+    fn deref(&self) -> &Self::Target {
+        &self.engine
+    }
+}
+
+#[cfg(feature = "xla-backend")]
+impl std::ops::DerefMut for XlaBackendSession {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.engine
+    }
+}
 
 /// The inference session selected for a load.
 ///
@@ -59,7 +166,7 @@ pub enum Session {
     /// on-device, so it self-drives the engine-neutral prefill / decode_step
     /// contract and ignores the threaded MLX model and sampling config (greedy).
     #[cfg(feature = "xla-backend")]
-    Xla(XlaInferenceSession),
+    Xla(XlaBackendSession),
 }
 
 impl Session {
@@ -74,8 +181,11 @@ impl Session {
     #[cfg(feature = "xla-backend")]
     #[inline]
     #[must_use]
-    pub fn xla(session: XlaInferenceSession) -> Self {
-        Session::Xla(session)
+    pub(crate) fn xla(
+        session: XlaInferenceSession,
+        image_preprocessor: Option<Box<dyn crate::HostMultimodalPreprocessor>>,
+    ) -> Self {
+        Session::Xla(XlaBackendSession::new(session, image_preprocessor))
     }
 
     /// What this session can do, so the control plane can gate features.
@@ -86,6 +196,16 @@ impl Session {
             Session::Mlx(s) => s.capabilities(),
             #[cfg(feature = "xla-backend")]
             Session::Xla(s) => s.capabilities(),
+        }
+    }
+
+    /// Selected XLA vision implementation, when this is an image-capable XLA session.
+    #[must_use]
+    pub fn xla_vision_backend(&self) -> Option<crate::XlaVisionBackend> {
+        match self {
+            Session::Mlx(_) => None,
+            #[cfg(feature = "xla-backend")]
+            Session::Xla(session) => session.vision_backend(),
         }
     }
 
@@ -180,11 +300,14 @@ impl Session {
                 sampling,
                 on_token,
             ),
-            // The XLA session is single-sequence text; it has no multimodal
-            // capability, so it ignores the input embeddings and drives the token
-            // stream from the prompt ids.
             #[cfg(feature = "xla-backend")]
             Session::Xla(s) => {
+                if input_embeddings.is_some() || mask.is_some() {
+                    eprintln!(
+                        "OpenXLA generation rejected native MLX embeddings; provide an owned PreparedPrefill through generate_streaming_with_prepared"
+                    );
+                    return Vec::new();
+                }
                 let eos = s.eos_token_ids().to_vec();
                 s.generate_streaming_greedy(prompt_tokens, max_tokens, &eos, on_token)
                     .unwrap_or_else(|e| {
@@ -220,6 +343,49 @@ impl Session {
         }
     }
 
+    /// Streaming OpenXLA generation from the backend-neutral owned embeddings
+    /// contract. MLX callers must continue using their native array entry.
+    #[cfg(feature = "xla-backend")]
+    #[inline]
+    pub fn generate_streaming_with_prepared<F: FnMut(i32) -> bool>(
+        &mut self,
+        prepared: &PreparedPrefill,
+        max_tokens: usize,
+        on_token: F,
+    ) -> Result<Vec<i32>, String> {
+        match self {
+            Session::Mlx(_) => Err(
+                "the MLX session does not consume PreparedPrefill; use generate_streaming_with_embeddings with native MLX arrays"
+                    .to_string(),
+            ),
+            Session::Xla(s) => {
+                let eos = s.eos_token_ids().to_vec();
+                s.generate_prepared_streaming_greedy(prepared, max_tokens, &eos, on_token)
+            }
+        }
+    }
+
+    /// Non-streaming OpenXLA generation from owned prepared embeddings.
+    #[cfg(feature = "xla-backend")]
+    #[inline]
+    pub fn generate_with_stats_and_prepared(
+        &mut self,
+        prepared: &PreparedPrefill,
+        max_tokens: usize,
+    ) -> Result<(Vec<i32>, GenerationStats), String> {
+        match self {
+            Session::Mlx(_) => Err(
+                "the MLX session does not consume PreparedPrefill; use generate_with_stats_and_embeddings with native MLX arrays"
+                    .to_string(),
+            ),
+            Session::Xla(s) => {
+                let eos = s.eos_token_ids().to_vec();
+                let tokens = s.generate_prepared_greedy(prepared, max_tokens, &eos)?;
+                Ok((tokens, GenerationStats::default()))
+            }
+        }
+    }
+
     /// Embedding-prefill generation with profiling stats.
     #[inline]
     pub fn generate_with_stats_and_embeddings<M: LanguageModel>(
@@ -242,6 +408,12 @@ impl Session {
             ),
             #[cfg(feature = "xla-backend")]
             Session::Xla(s) => {
+                if input_embeddings.is_some() || mask.is_some() {
+                    eprintln!(
+                        "OpenXLA generation rejected native MLX embeddings; provide an owned PreparedPrefill through generate_with_stats_and_prepared"
+                    );
+                    return (Vec::new(), GenerationStats::default());
+                }
                 let eos = s.eos_token_ids().to_vec();
                 let toks = s
                     .generate_greedy(prompt_tokens, max_tokens, &eos)

@@ -34,7 +34,7 @@ use crate::moondream2_prompt::{Moondream2PromptMode, prepare_moondream2_prompt_t
 use crate::moondream3_prompt::{Moondream3PromptMode, prepare_moondream3_prompt_tokens};
 use crate::phi3v_prompt::prepare_phi3v_prompt_tokens;
 use crate::phi4_siglip_prompt::prepare_phi4_siglip_prompt_tokens;
-use crate::phi4mm_prompt::prepare_phi4mm_prompt_tokens;
+use crate::phi4mm_prompt::{expand_phi4mm_placeholders, prepare_phi4mm_prompt_tokens};
 use crate::pixtral_prompt::insert_pixtral_image_tokens;
 use crate::qwen_vl::{insert_qwen_vl_image_tokens, insert_qwen3_omni_image_tokens};
 use crate::smolvlm_prompt::insert_smolvlm_image_tokens;
@@ -74,6 +74,11 @@ pub enum VlmPreparationSummary {
         total_tokens: usize,
     },
     Gemma4Audio {
+        audio_tokens: usize,
+        total_tokens: usize,
+    },
+    Gemma3nAudio {
+        audio_clips: usize,
         audio_tokens: usize,
         total_tokens: usize,
     },
@@ -628,10 +633,11 @@ where
             }))
         }
         VlmRuntimeRef::Gemma3n(gemma3n_vl) => {
-            let preparation = model
-                .image_token_block_info()
-                .and_then(|info| apply_image_token_blocks(prompt_tokens, info, images.len()))
-                .map(VlmPreparationSummary::ImageBlocks);
+            let preparation = match model.image_token_block_info() {
+                Some(info) => apply_image_token_blocks(prompt_tokens, info, images.len())?
+                    .map(VlmPreparationSummary::ImageBlocks),
+                None => None,
+            };
 
             let pixel_values = gemma3n_vl.processor.preprocess(images);
             let input_ids_arr = prompt_ids_array(prompt_tokens);
@@ -736,36 +742,20 @@ where
             }))
         }
         VlmRuntimeRef::Phi4MM(phi4mm) => {
-            // 1. Preprocess images first to get num_img_tokens per image
             let processed_images = phi4mm.processor.preprocess(images);
-
-            // 2. Tokenize prompt (gets 1x -200 per image placeholder)
-            let prepared = prepare_phi4mm_prompt_tokens(prompt, images.len(), &mut encode)
+            let prepared = prepare_phi4mm_prompt_tokens(prompt, images.len(), 0, &mut encode)
                 .map_err(|err| anyhow::anyhow!("{}", err))?;
-            let tokens = prepared.tokens;
-
-            // 3. Expand each -200 sentinel to match num_img_tokens from HD transform
-            let mut img_idx = 0;
-            let mut expanded = Vec::with_capacity(tokens.len());
-            for &tok in &tokens {
-                if tok == crate::phi4_siglip_prompt::PHI4_SIGLIP_IMAGE_TOKEN_INDEX {
-                    if let Some(processed) = processed_images.get(img_idx) {
-                        expanded.extend(std::iter::repeat_n(
-                            crate::phi4_siglip_prompt::PHI4_SIGLIP_IMAGE_TOKEN_INDEX,
-                            processed.num_img_tokens,
-                        ));
-                    } else {
-                        expanded.push(tok);
-                    }
-                    img_idx += 1;
-                } else {
-                    expanded.push(tok);
-                }
-            }
-            *prompt_tokens = expanded;
+            let image_sizes: Vec<usize> = processed_images
+                .iter()
+                .map(|image| image.num_img_tokens)
+                .collect();
+            *prompt_tokens = expand_phi4mm_placeholders(&prepared.tokens, &image_sizes, &[])
+                .map_err(anyhow::Error::msg)?;
 
             let input_ids_arr = prompt_ids_array(prompt_tokens);
-            let embeddings = phi4mm.get_input_embeddings(&input_ids_arr, &processed_images);
+            let embeddings = phi4mm
+                .get_input_embeddings(&input_ids_arr, &processed_images)
+                .map_err(anyhow::Error::msg)?;
 
             Ok(Some(PreparedVlmEmbeddings {
                 embeddings,
@@ -1380,7 +1370,7 @@ where
             };
             let tokens_per_image = vision_module.mm_tokens_per_image;
             let preparation =
-                apply_image_token_blocks(prompt_tokens, info, images.len()).map(|_| {
+                apply_image_token_blocks(prompt_tokens, info, images.len())?.map(|_| {
                     VlmPreparationSummary::FastVLM {
                         image_blocks: images.len(),
                         total_image_tokens: (images.len() * tokens_per_image) as i32,
@@ -1616,10 +1606,11 @@ where
             }))
         }
         VlmRuntimeRef::Standard(vision_module) => {
-            let preparation = model
-                .image_token_block_info()
-                .and_then(|info| apply_image_token_blocks(prompt_tokens, info, images.len()))
-                .map(VlmPreparationSummary::ImageBlocks);
+            let preparation = match model.image_token_block_info() {
+                Some(info) => apply_image_token_blocks(prompt_tokens, info, images.len())?
+                    .map(VlmPreparationSummary::ImageBlocks),
+                None => None,
+            };
 
             let pixel_values = vision_module.processor.preprocess(images);
             let mask =
@@ -2041,6 +2032,67 @@ pub fn expand_gemma4_audio_tokens_for_server(
     if let Some(tok) = last {
         prompt_tokens.push(tok);
     }
+}
+
+/// Expand Gemma 3n audio placeholders using the pinned processor's fixed
+/// `boa + audio*188 + eoa` sequence for every clip. When the rendered template
+/// dropped audio content parts, all clip blocks are inserted before the last
+/// user-turn terminator. Existing placeholders must match the clip count
+/// exactly; a mismatch is rejected instead of silently reordering media.
+pub fn expand_gemma3n_audio_tokens(
+    prompt_tokens: &mut Vec<i32>,
+    audio_token_id: i32,
+    boa_token_id: i32,
+    eoa_token_id: i32,
+    audio_clips: usize,
+    soft_tokens_per_clip: usize,
+    wrapper_tokens: &[i32],
+    end_of_turn_token_id: Option<i32>,
+) -> Result<()> {
+    if audio_clips == 0 {
+        return Ok(());
+    }
+    let block = || {
+        let mut tokens = Vec::with_capacity(wrapper_tokens.len() * 2 + soft_tokens_per_clip + 2);
+        tokens.extend_from_slice(wrapper_tokens);
+        tokens.push(boa_token_id);
+        tokens.extend(std::iter::repeat_n(audio_token_id, soft_tokens_per_clip));
+        tokens.push(eoa_token_id);
+        tokens.extend_from_slice(wrapper_tokens);
+        tokens
+    };
+    let placeholders = prompt_tokens
+        .iter()
+        .filter(|token| **token == audio_token_id)
+        .count();
+    if placeholders > 0 {
+        if placeholders != audio_clips {
+            anyhow::bail!(
+                "Gemma3n audio placeholder mismatch: prompt has {placeholders}, request has {audio_clips} clips"
+            );
+        }
+        let mut expanded =
+            Vec::with_capacity(prompt_tokens.len() + audio_clips * (soft_tokens_per_clip + 2));
+        for token in prompt_tokens.iter().copied() {
+            if token == audio_token_id {
+                expanded.extend(block());
+            } else {
+                expanded.push(token);
+            }
+        }
+        *prompt_tokens = expanded;
+        return Ok(());
+    }
+
+    let insertion = end_of_turn_token_id
+        .and_then(|eot| prompt_tokens.iter().rposition(|token| *token == eot))
+        .unwrap_or(prompt_tokens.len());
+    let mut blocks = Vec::with_capacity(audio_clips * (soft_tokens_per_clip + 2));
+    for _ in 0..audio_clips {
+        blocks.extend(block());
+    }
+    prompt_tokens.splice(insertion..insertion, blocks);
+    Ok(())
 }
 
 /// Place the Nemotron H Nano Omni sound-context block in the server prompt.

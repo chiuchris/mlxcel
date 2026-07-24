@@ -47,11 +47,70 @@
 
 mod builder;
 mod config;
+mod gemma3n;
+mod gemma3n_decode;
+mod gemma3n_emit;
+mod gemma3n_emit_ops;
+mod gemma3n_math;
+mod gemma3n_qmv;
+mod gemma3n_schema;
+mod gemma3n_weights;
 mod model;
 mod moe;
 mod rope;
+mod vision;
+mod vision_config;
 
-pub(crate) use config::{Config, NormStyle, QkNorm, WeightScheme};
+#[cfg(test)]
+mod context_tests;
+
+#[allow(unused_imports)]
+pub(crate) use config::{
+    Config, DeepStackConfig, MropeConfig, MropeLayout, NormStyle, QkNorm, QuantConfig, WeightScheme,
+};
+#[allow(unused_imports)]
+pub(crate) use gemma3n::{
+    Gemma3nConfig, Gemma3nLayerType, Gemma3nPleDType, Gemma3nPleMetadata, validate_gemma3n_ple,
+};
+#[allow(unused_imports)]
+pub(crate) use gemma3n_decode::{
+    emit_gemma3n_decode, emit_gemma3n_decode_ragged, emit_gemma3n_decode_ragged_with,
+    emit_gemma3n_decode_ragged_with_qmv, emit_gemma3n_decode_with, emit_gemma3n_decode_with_qmv,
+};
+#[cfg(feature = "diagnostics")]
+pub use gemma3n_emit::{Gemma3nDiagnosticLayout, Gemma3nDiagnosticSegment};
+#[cfg(feature = "diagnostics")]
+pub(crate) use gemma3n_emit::{
+    emit_gemma3n_all_layer_diagnostics_with_qmv, emit_gemma3n_prefill_diagnostics_with_qmv,
+};
+#[allow(unused_imports)]
+pub(crate) use gemma3n_emit::{
+    emit_gemma3n_prefill, emit_gemma3n_prefill_embeddings_ple,
+    emit_gemma3n_prefill_embeddings_ple_with, emit_gemma3n_prefill_embeddings_ple_with_qmv,
+    emit_gemma3n_prefill_with, emit_gemma3n_prefill_with_qmv,
+};
+#[allow(unused_imports)]
+pub(crate) use gemma3n_qmv::{
+    artifact_identity as gemma3n_qmv_artifact_identity, is_available as gemma3n_qmv_is_available,
+};
+#[cfg(all(feature = "diagnostics", xla_iree_cuda))]
+pub use gemma3n_qmv::{
+    run_altup_correct_diagnostic_probe as run_gemma3n_altup_correct_diagnostic_probe,
+    run_altup_predict_diagnostic_probe as run_gemma3n_altup_predict_diagnostic_probe,
+    run_attention_diagnostic_probe as run_gemma3n_attention_diagnostic_probe,
+    run_decode_attention_diagnostic_probe as run_gemma3n_decode_attention_diagnostic_probe,
+    run_dense_mlp_diagnostic_probe as run_gemma3n_dense_mlp_diagnostic_probe,
+    run_diagnostic_probe as run_gemma3n_qmv_diagnostic_probe,
+    run_initial_altup_diagnostic_probe as run_gemma3n_initial_altup_diagnostic_probe,
+    run_ple_diagnostic_probe as run_gemma3n_ple_diagnostic_probe,
+    run_ple_injection_all_planes_diagnostic_probe as run_gemma3n_ple_injection_all_planes_diagnostic_probe,
+    run_ple_injection_diagnostic_probe as run_gemma3n_ple_injection_diagnostic_probe,
+    run_post_attention_diagnostic_probe as run_gemma3n_post_attention_diagnostic_probe,
+    run_rms_diagnostic_probe as run_gemma3n_rms_diagnostic_probe,
+    run_sdpa_vector_context_diagnostic_probe as run_gemma3n_sdpa_vector_context_diagnostic_probe,
+};
+#[allow(unused_imports)]
+pub(crate) use gemma3n_weights::{Gemma3nWeightSpec, gemma3n_weight_specs};
 // MoE FFN config types (issue #500), read by the weight loader (`iree.rs`) and the
 // validation harness. `SharedExpertConfig` is only named in some build cfgs.
 #[allow(unused_imports)]
@@ -67,9 +126,20 @@ pub(crate) use builder::{
 };
 #[allow(unused_imports)]
 pub(crate) use model::{
-    emit_decode, emit_decode_batched, emit_decode_ragged, emit_decode_ragged_with,
-    emit_decode_with, emit_moe_probe, emit_moe_probe_with, emit_prefill, emit_prefill_with,
+    PREFILL_EMBEDDINGS_MASKED_VALUE, PositionInputMode, PrefillEmbeddingsDType,
+    PrefillEmbeddingsInputMetadata, emit_decode, emit_decode_batched, emit_decode_ragged,
+    emit_decode_ragged_with, emit_decode_with, emit_moe_probe, emit_moe_probe_with, emit_prefill,
+    emit_prefill_embeddings, emit_prefill_embeddings_deepstack_diagnostics_with,
+    emit_prefill_embeddings_deepstack_with, emit_prefill_embeddings_with, emit_prefill_with,
+    mrope_axis_selector, validate_prefill_embeddings_attention_bias,
+    validate_prefill_embeddings_metadata,
 };
+#[allow(unused_imports)]
+pub(crate) use vision::emit_vision;
+#[cfg(any(test, feature = "diagnostics"))]
+pub(crate) use vision::emit_vision_diagnostics;
+#[allow(unused_imports)]
+pub(crate) use vision_config::{LlavaVisionConfig, VisionActivation, VisionWeightSpec};
 
 #[cfg(test)]
 mod tests {
@@ -131,6 +201,20 @@ mod tests {
             // pull them (sliding_pattern, use_rope_layers, weight_scheme, and the
             // dense-arch-pack flags) from the reference Llama config.
             ..Config::llama_3_2_1b()
+        }
+    }
+
+    fn mrope_qwen(layout: MropeLayout) -> Config {
+        Config {
+            context_capacity: 8,
+            hidden: 24,
+            n_q: 2,
+            head_dim: 12,
+            mrope: Some(MropeConfig {
+                sections: [2, 2, 2],
+                layout,
+            }),
+            ..qwen_like(true)
         }
     }
 
@@ -733,6 +817,363 @@ mod tests {
             .expect("write decode_logits.mlir");
     }
 
+    /// Opt-in graph dump for the real IREE token-vs-embeddings parity fixture.
+    /// Both modules are emitted from the exact same config and precision so the
+    /// fixture can feed one weight set to each and compare logits plus every K/V
+    /// element. This stays pure Rust; the Python harness owns IREE compilation and
+    /// execution.
+    #[test]
+    #[ignore = "opt-in: writes token and embeddings prefill graphs for IREE parity"]
+    fn dump_prefill_embeddings_parity_graphs() {
+        let cfg_path = std::env::var("MLXCEL_DUMP_CONFIG")
+            .expect("set MLXCEL_DUMP_CONFIG to a config.json path");
+        let dir = std::env::var("MLXCEL_DUMP_DIR").expect("set MLXCEL_DUMP_DIR");
+        let text = std::fs::read_to_string(&cfg_path).expect("read MLXCEL_DUMP_CONFIG");
+        let cfg = Config::from_json_str(&text).expect("parse config.json");
+        let dir = std::path::Path::new(&dir);
+        std::fs::write(dir.join("prefill_logits.mlir"), emit_prefill(&cfg, false))
+            .expect("write token prefill graph");
+        std::fs::write(
+            dir.join("prefill_embeddings_logits.mlir"),
+            emit_prefill_embeddings(&cfg, false),
+        )
+        .expect("write embeddings prefill graph");
+        if cfg.deepstack.is_some() {
+            std::fs::write(
+                dir.join("prefill_embeddings_deepstack_logits.mlir"),
+                emit_prefill_embeddings_deepstack_with(&cfg, false, super::builder::Precision::F32),
+            )
+            .expect("write DeepStack embeddings prefill graph");
+            std::fs::write(
+                dir.join("prefill_embeddings_deepstack_diagnostics.mlir"),
+                emit_prefill_embeddings_deepstack_diagnostics_with(
+                    &cfg,
+                    super::builder::Precision::F32,
+                ),
+            )
+            .expect("write DeepStack post-hook diagnostics graph");
+        }
+    }
+
+    #[test]
+    fn prefill_embeddings_schema_bypasses_lookup_and_embedding_scale() {
+        let cfg = gemma2_like(None);
+        let lp = cfg.context_capacity;
+        let token = emit_prefill(&cfg, false);
+        let embeddings = emit_prefill_embeddings(&cfg, false);
+        let sampled_embeddings = emit_prefill_embeddings(&cfg, true);
+
+        assert!(token.starts_with("module @prefill {"));
+        assert!(embeddings.starts_with("module @prefill_embeddings {"));
+        assert!(embeddings.contains(&format!("tensor<{lp}x8xf32> loc(\"embeddings\")")));
+        assert!(embeddings.contains(&format!("tensor<{lp}xi32> loc(\"positions\")")));
+        assert!(embeddings.contains("tensor<i32> loc(\"real_len\")"));
+        assert!(embeddings.contains(&format!("tensor<{lp}x{lp}xf32> loc(\"attention_bias\")")));
+        assert!(!embeddings.contains("loc(\"tokens\")"));
+        assert!(
+            sampled_embeddings.contains(&format!(
+                ") -> (tensor<i32>, tensor<4x{lp}x1x6xf32>, tensor<4x{lp}x1x6xf32>)"
+            )),
+            "sampled embeddings prefill keeps the scalar argmax plus K/V return contract"
+        );
+
+        let ordered = [
+            "loc(\"embeddings\")",
+            "loc(\"positions\")",
+            "loc(\"real_len\")",
+            "loc(\"attention_bias\")",
+        ];
+        let offsets: Vec<_> = ordered
+            .iter()
+            .map(|needle| embeddings.find(needle).expect("schema arg present"))
+            .collect();
+        assert!(
+            offsets.windows(2).all(|w| w[0] < w[1]),
+            "runtime inputs keep their documented deterministic order"
+        );
+
+        assert!(
+            token.contains("\"stablehlo.gather\"(%arg0,"),
+            "token prefill gathers the embedding table"
+        );
+        assert!(
+            !embeddings.contains("\"stablehlo.gather\"(%arg0,"),
+            "embeddings prefill must not gather the embedding table"
+        );
+        let scale_hex = format!("0x{:08X}", cfg.embed_normalizer().to_bits());
+        assert!(
+            token.contains(&scale_hex),
+            "token prefill emits Gemma scaling"
+        );
+        assert!(
+            !embeddings.contains(&scale_hex),
+            "post-scale embeddings must not be scaled a second time"
+        );
+    }
+
+    #[test]
+    fn prefill_embeddings_preserves_tied_and_untied_head_weights() {
+        let tied = qwen_like(false);
+        let tied_mlir = emit_prefill_embeddings(&tied, false);
+        assert!(tied_mlir.contains("loc(\"params['embed']\")"));
+        assert!(!tied_mlir.contains("params['lm_head']"));
+        let tied_tail = tied_mlir
+            .lines()
+            .rfind(|line| line.contains("stablehlo.dot_general"))
+            .expect("tied logits dot");
+        assert!(tied_tail.contains("%arg0"), "tied logits reuse embed");
+
+        let mut untied = tied;
+        untied.tie_word_embeddings = false;
+        let untied_mlir = emit_prefill_embeddings(&untied, false);
+        assert!(untied_mlir.contains("loc(\"params['embed']\")"));
+        assert!(untied_mlir.contains("loc(\"params['lm_head']\")"));
+        let untied_tail = untied_mlir
+            .lines()
+            .rfind(|line| line.contains("stablehlo.dot_general"))
+            .expect("untied logits dot");
+        assert!(untied_tail.contains("%arg2"), "untied logits use lm_head");
+    }
+
+    #[test]
+    fn deepstack_prefill_is_distinct_sparse_and_leaves_ordinary_graph_byte_exact() {
+        let mut cfg = qwen_like(false);
+        cfg.n_layers = 4;
+        let ordinary = emit_prefill_embeddings(&cfg, false);
+        let token = emit_prefill(&cfg, false);
+        let decode = emit_decode(&cfg, false);
+        cfg.deepstack = Some(DeepStackConfig {
+            target_layer_indices: vec![0, 2, 3],
+            max_visual_positions: 5,
+        });
+
+        assert_eq!(
+            emit_prefill_embeddings(&cfg, false),
+            ordinary,
+            "declaring DeepStack must not change the ordinary embeddings entry"
+        );
+        assert_eq!(
+            emit_prefill(&cfg, false),
+            token,
+            "declaring DeepStack must not change token prefill"
+        );
+        assert_eq!(
+            emit_decode(&cfg, false),
+            decode,
+            "declaring DeepStack must not change decode"
+        );
+        let deepstack =
+            emit_prefill_embeddings_deepstack_with(&cfg, false, super::builder::Precision::F32);
+        assert!(deepstack.starts_with("module @prefill_embeddings_deepstack {"));
+        assert!(
+            !deepstack.contains("tensor<4x2048x8xf32>"),
+            "the ABI must not expose a dense [num_layers, Lp, hidden] payload"
+        );
+
+        let ordered = [
+            "loc(\"embeddings\")",
+            "loc(\"positions\")",
+            "loc(\"real_len\")",
+            "loc(\"attention_bias\")",
+            "loc(\"deepstack.visual_positions\")",
+            "loc(\"deepstack.layer_features\")",
+            "loc(\"deepstack.layer_indices\")",
+            "loc(\"deepstack.actual_layer_count\")",
+            "loc(\"deepstack.actual_visual_count\")",
+        ];
+        let offsets = ordered
+            .iter()
+            .map(|needle| deepstack.find(needle).expect("DeepStack schema arg"))
+            .collect::<Vec<_>>();
+        assert!(offsets.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(deepstack.contains("tensor<5xi32> loc(\"deepstack.visual_positions\")"));
+        assert!(deepstack.contains("tensor<3x5x8xf32> loc(\"deepstack.layer_features\")"));
+        assert!(deepstack.contains("tensor<3xi32> loc(\"deepstack.layer_indices\")"));
+        assert_eq!(
+            occurs(&deepstack, "stablehlo.select ") - occurs(&ordinary, "stablehlo.select "),
+            3,
+            "first, middle, and last target layers each get one sparse residual injection"
+        );
+        assert_eq!(
+            occurs(&deepstack, "stablehlo.reduce(") - occurs(&ordinary, "stablehlo.reduce("),
+            3,
+            "each target reduces only across the compact visual-position axis"
+        );
+
+        let diagnostics = emit_prefill_embeddings_deepstack_diagnostics_with(
+            &cfg,
+            super::builder::Precision::F32,
+        );
+        assert!(diagnostics.starts_with("module @prefill_embeddings_deepstack_diagnostics {"));
+        assert!(
+            diagnostics.contains("tensor<3x256x8xf32>"),
+            "diagnostics return every first/middle/last post-hook hidden state"
+        );
+    }
+
+    #[test]
+    fn deepstack_c_abi_pins_explicit_position_mode_rank_and_bytes() {
+        let source = include_str!("../../csrc/xla_iree.c");
+        let (_, implementation) = source
+            .split_once("static int xla_llama_prefill_embeddings_deepstack_impl(")
+            .expect("DeepStack C implementation");
+        let (implementation, _) = implementation
+            .split_once("int xla_llama_prefill_embeddings_deepstack(")
+            .expect("DeepStack C public wrappers");
+        assert!(
+            implementation.contains("position_mode != c->position_mode"),
+            "the native boundary must reject a caller mode that disagrees with the bundle"
+        );
+        assert!(
+            implementation.contains("\"positions\", positions, 1, position_mode == 1 ? 2 : 1,")
+        );
+        assert!(
+            implementation
+                .contains("position_mode == 1 ? positions_mrope_dims : positions_1d_dims")
+        );
+        assert!(
+            source
+                .contains("xla_ctx* c, int32_t position_mode, const xla_tensor_desc* embeddings,"),
+            "single DeepStack ABI must carry the explicit position mode"
+        );
+        assert!(
+            source.contains(
+                "xla_ctx* c, int32_t slot, int32_t position_mode,\n    const xla_tensor_desc* embeddings,"
+            ),
+            "ragged DeepStack ABI must carry the explicit position mode"
+        );
+        assert!(
+            source.contains("desc->byte_length != expected_bytes"),
+            "the shared descriptor validator must reject rank-correct truncated buffers"
+        );
+    }
+
+    #[test]
+    fn qwen_deepstack_config_parses_and_rejects_unstable_schema() {
+        let valid = r#"{"model_type":"qwen3","hidden_size":8,"num_attention_heads":2,
+            "num_key_value_heads":1,"head_dim":4,"intermediate_size":16,
+            "num_hidden_layers":4,"rms_norm_eps":1e-6,"rope_theta":1e6,
+            "vocab_size":10,"tie_word_embeddings":true,
+            "deepstack_language_layer_indices":[0,2,3],
+            "deepstack_max_visual_positions":5}"#;
+        let cfg = Config::from_json_str(valid).expect("canonical Qwen DeepStack config");
+        assert_eq!(
+            cfg.deepstack,
+            Some(DeepStackConfig {
+                target_layer_indices: vec![0, 2, 3],
+                max_visual_positions: 5,
+            })
+        );
+        assert!(
+            format!("{cfg:?}").contains("target_layer_indices: [0, 2, 3]"),
+            "target language layers participate in the compiled artifact identity"
+        );
+
+        let larger_bucket = valid.replace(
+            "\"deepstack_max_visual_positions\":5",
+            "\"deepstack_max_visual_positions\":300",
+        );
+        let parsed =
+            Config::from_json_str(&larger_bucket).expect("capacity-independent schema parses");
+        let selected = parsed
+            .clone()
+            .with_context_capacity(512)
+            .expect("selected 512 capacity admits compact maximum 300");
+        assert_eq!(selected.context_capacity, 512);
+        assert_eq!(
+            selected
+                .deepstack
+                .as_ref()
+                .expect("DeepStack schema")
+                .max_visual_positions,
+            300
+        );
+        let error = parsed
+            .with_context_capacity(256)
+            .expect_err("selected capacity below compact maximum must fail");
+        assert!(error.contains("exceeds selected context capacity 256"));
+
+        for invalid in [
+            valid.replace("[0,2,3]", "[0,2,2]"),
+            valid.replace("[0,2,3]", "[0,2,4]"),
+            valid.replace(",\n            \"deepstack_max_visual_positions\":5", ""),
+            valid.replace(
+                "\"deepstack_language_layer_indices\":[0,2,3],\n            ",
+                "",
+            ),
+            valid.replace(
+                "\"deepstack_max_visual_positions\":5",
+                "\"deepstack_max_visual_positions\":0",
+            ),
+        ] {
+            assert!(
+                Config::from_json_str(&invalid).is_err(),
+                "invalid DeepStack schema must fail closed: {invalid}"
+            );
+        }
+    }
+
+    #[test]
+    fn prefill_embeddings_metadata_and_bias_fail_closed() {
+        let cfg = qwen_like(false);
+        let lp = cfg.context_capacity;
+        let valid = PrefillEmbeddingsInputMetadata::canonical(&cfg);
+        validate_prefill_embeddings_metadata(&cfg, &valid).expect("canonical metadata");
+
+        let invalid = [
+            PrefillEmbeddingsInputMetadata {
+                embeddings_shape: [lp - 1, cfg.hidden],
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                embeddings_shape: [lp, cfg.hidden + 1],
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                embeddings_dtype: PrefillEmbeddingsDType::F16,
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                positions_shape: [lp - 1, 0],
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                attention_bias_shape: [lp, lp - 1],
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                attention_bias_dtype: PrefillEmbeddingsDType::Bf16,
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                real_len: 0,
+                ..valid
+            },
+            PrefillEmbeddingsInputMetadata {
+                real_len: lp + 1,
+                ..valid
+            },
+        ];
+        for metadata in invalid {
+            assert!(
+                validate_prefill_embeddings_metadata(&cfg, &metadata).is_err(),
+                "invalid metadata must fail: {metadata:?}"
+            );
+        }
+
+        let mut bias = vec![PREFILL_EMBEDDINGS_MASKED_VALUE; lp * lp];
+        bias[0] = 0.0;
+        validate_prefill_embeddings_attention_bias(&cfg, &bias).expect("canonical finite bias");
+        for invalid_value in [f32::NEG_INFINITY, f32::NAN, -1.0] {
+            bias[17] = invalid_value;
+            assert!(
+                validate_prefill_embeddings_attention_bias(&cfg, &bias).is_err(),
+                "invalid bias value {invalid_value} must fail"
+            );
+        }
+        assert!(validate_prefill_embeddings_attention_bias(&cfg, &bias[..bias.len() - 1]).is_err());
+    }
+
     /// Plain RoPE base frequencies are the textbook `1 / theta^(2i/head_dim)`
     /// (Qwen2), distinct from the llama3-scaled table.
     #[test]
@@ -1037,6 +1478,137 @@ mod tests {
         }
     }
 
+    #[test]
+    fn mrope_axis_selection_matches_qwen2_and_qwen3_layouts() {
+        let chunked = mrope_axis_selector(&mrope_qwen(MropeLayout::Chunked)).unwrap();
+        assert_eq!(chunked, [0, 0, 1, 1, 2, 2]);
+
+        let interleaved = mrope_axis_selector(&mrope_qwen(MropeLayout::Interleaved)).unwrap();
+        assert_eq!(interleaved, [0, 1, 2, 0, 1, 2]);
+    }
+
+    fn eager_mrope_half_split(
+        input: &[f32],
+        rows: usize,
+        rotary_width: usize,
+        positions: &[[i32; 3]],
+        axes: &[usize],
+        theta: f64,
+    ) -> Vec<f32> {
+        let half = rotary_width / 2;
+        let mut output = vec![0.0; input.len()];
+        for row in 0..rows {
+            for column in 0..half {
+                let inv = 1.0 / theta.powf((2 * column) as f64 / rotary_width as f64);
+                let angle = positions[row][axes[column]] as f64 * inv;
+                let (sin, cos) = angle.sin_cos();
+                let left = input[row * rotary_width + column] as f64;
+                let right = input[row * rotary_width + half + column] as f64;
+                output[row * rotary_width + column] = (left * cos - right * sin) as f32;
+                output[row * rotary_width + half + column] = (right * cos + left * sin) as f32;
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn mrope_qk_rotation_matches_independent_eager_oracle() {
+        let positions = [[3, 5, 7], [11, 13, 17]];
+        let q = (0..24)
+            .map(|index| index as f32 * 0.03125 - 0.4)
+            .collect::<Vec<_>>();
+        let k = (0..24)
+            .map(|index| 0.7 - index as f32 * 0.021)
+            .collect::<Vec<_>>();
+
+        for (layout, oracle_axes) in [
+            (MropeLayout::Chunked, [0, 0, 1, 1, 2, 2]),
+            (MropeLayout::Interleaved, [0, 1, 2, 0, 1, 2]),
+        ] {
+            let cfg = mrope_qwen(layout);
+            let emitted_axes = mrope_axis_selector(&cfg).unwrap();
+            for tensor in [&q, &k] {
+                let actual = eager_mrope_half_split(
+                    tensor,
+                    2,
+                    cfg.rotary_width(),
+                    &positions,
+                    &emitted_axes,
+                    cfg.rope_theta,
+                );
+                let expected = eager_mrope_half_split(
+                    tensor,
+                    2,
+                    cfg.rotary_width(),
+                    &positions,
+                    &oracle_axes,
+                    cfg.rope_theta,
+                );
+                assert!(
+                    actual
+                        .iter()
+                        .zip(expected.iter())
+                        .all(|(left, right)| (left - right).abs() < 1.0e-6),
+                    "{layout:?} transformed Q/K must match the independent eager oracle"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mrope_graphs_have_explicit_position_shapes_and_dynamic_trig() {
+        let mut cfg = mrope_qwen(MropeLayout::Chunked);
+        cfg.deepstack = Some(DeepStackConfig {
+            target_layer_indices: vec![0],
+            max_visual_positions: 2,
+        });
+        let prefill = emit_prefill(&cfg, false);
+        let embeddings = emit_prefill_embeddings(&cfg, false);
+        let deepstack =
+            emit_prefill_embeddings_deepstack_with(&cfg, false, super::builder::Precision::F32);
+        let decode = emit_decode(&cfg, false);
+        let ragged = emit_decode_ragged(&cfg, 4, false);
+
+        for graph in [&prefill, &embeddings, &deepstack] {
+            assert!(
+                graph.contains("tensor<3x8xi32>"),
+                "every prefill entry must carry explicit M-RoPE [3,L] positions"
+            );
+            assert!(graph.contains("stablehlo.cosine"));
+            assert!(graph.contains("stablehlo.sine"));
+        }
+        assert!(
+            decode.contains("tensor<3xi32>"),
+            "single decode carries one explicit T/H/W coordinate"
+        );
+        assert!(
+            ragged.contains("tensor<4x3xi32>"),
+            "ragged decode carries one T/H/W coordinate per slot"
+        );
+        for graph in [&decode, &ragged] {
+            assert!(graph.contains("stablehlo.cosine"));
+            assert!(graph.contains("stablehlo.sine"));
+        }
+
+        let metadata = PrefillEmbeddingsInputMetadata::canonical(&cfg);
+        assert_eq!(metadata.position_mode, PositionInputMode::Mrope3D);
+        assert_eq!(metadata.positions_shape, [3, 8]);
+        assert_eq!(metadata.positions_rank, 2);
+        validate_prefill_embeddings_metadata(&cfg, &metadata).unwrap();
+        assert!(
+            validate_prefill_embeddings_metadata(
+                &cfg,
+                &PrefillEmbeddingsInputMetadata {
+                    position_mode: PositionInputMode::OneD,
+                    positions_shape: [8, 0],
+                    positions_rank: 1,
+                    ..metadata
+                }
+            )
+            .is_err()
+        );
+    }
+
     fn qwen3_like() -> Config {
         Config {
             qk_norm: Some(QkNorm {
@@ -1235,7 +1807,7 @@ mod tests {
 
     /// Gemma3 pairs the Gemma2 four-norm layer and a per-head `(1+w)` q/k norm with a
     /// DUAL RoPE base: the sliding layers rotate on a local-base table distinct from
-    /// the global one, so the graph carries two extra `[MAX_SEQ, head_dim]` constant
+    /// the global one, so the graph carries two extra `[context_capacity, head_dim]` constant
     /// tables (cos_local, sin_local) versus a single-RoPE twin.
     #[test]
     fn gemma3_dual_rope_and_qk_norm_reach_the_shared_core() {

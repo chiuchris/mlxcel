@@ -68,15 +68,24 @@ use super::chat_template_kwargs::{
     strip_think_block,
 };
 use super::media::{
-    ResolvedVideo, extract_chat_audio_data, extract_chat_video_paths, try_extract_chat_image_data,
+    MediaRequestMetadata, ResolvedVideo, extract_chat_video_paths, try_extract_chat_audio_data,
+    try_extract_chat_image_data,
 };
 use super::prompt_cache::key::resolve_session_key;
 use super::types::ChatCompletionRequest;
-use super::types::request::{ContentPart, Message, MessageContent, Tool};
+use super::types::request::{
+    ContentPart, Message, MessageContent, Tool, ordered_audio_sentinel, ordered_image_sentinel,
+};
 
 pub(crate) struct PreparedChatRequest {
     pub(crate) prompt: String,
     pub(crate) image_data: Vec<Vec<u8>>,
+    /// Cardinalities before and after the tolerant media resolver.
+    ///
+    /// MLX consumers retain their historical behavior. XLA carries this
+    /// metadata to its worker so invalid or partially resolved media cannot be
+    /// mistaken for a text-only request.
+    pub(crate) media: MediaRequestMetadata,
     /// Request-scoped Gemma 4 image soft-token budget, resolved from the
     /// `detail` / `max_soft_tokens` fields on the `image_url` content parts
     /// (see [`crate::server::types::request::ImageUrl`]).
@@ -154,6 +163,15 @@ pub(crate) async fn prepare_chat_request_with_cache(
     server_default_kwargs: Option<&ChatTemplateKwargs>,
     prompt_cache_enabled: bool,
 ) -> Result<PreparedChatRequest> {
+    let declared_images = request.image_urls().len();
+    let declared_audio = request.audio_inputs().len();
+    let declared_videos = request.video_urls().len();
+    if declared_audio > 0 && declared_videos > 0 {
+        anyhow::bail!("Combined video and audio inputs are not supported");
+    }
+    if declared_audio > 0 {
+        validate_no_reserved_media_sentinels(request)?;
+    }
     // Determine effective tools based on tool_choice
     let effective_tools = effective_tools(request);
     let merged_extra_body = request.merged_extra_body();
@@ -185,12 +203,16 @@ pub(crate) async fn prepare_chat_request_with_cache(
 
     let preserve_thinking = merged_kwargs.preserve_thinking();
 
-    let prompt = if has_tool_fields(request) || has_reasoning_fields(request) {
-        // When messages contain tool_calls / tool_call_id, or a parallel
-        // `reasoning` field (issue #362), use raw JSON rendering so the Jinja2
-        // template can access all fields. The typed `ChatMessage` path only
-        // carries role + content, so reasoning would otherwise be dropped
-        // before reaching templates that render `message.get('reasoning')`.
+    let prompt = if has_tool_fields(request)
+        || has_reasoning_fields(request)
+        || has_template_media_parts(request)
+    {
+        // When messages contain tool_calls / tool_call_id, a parallel
+        // `reasoning` field (issue #362), or typed media content, use raw JSON
+        // rendering so the Jinja2 template can access the complete message
+        // shape. The typed `ChatMessage` path only carries role + flattened
+        // text, which would otherwise drop image/audio/video positions before
+        // processor-aware templates can render their placeholder tokens.
         let raw_messages = build_raw_json_messages_with_thinking(request, preserve_thinking);
         // Build the stripped ChatMessages in parallel so the fallback path can
         // use them without re-running strip_rolling_checkpoint.
@@ -225,19 +247,60 @@ pub(crate) async fn prepare_chat_request_with_cache(
         .image_soft_tokens()
         .map_err(|err| anyhow::anyhow!("{err}"))?;
 
+    // Audio acquisition is owned by this request-preparation future. Before
+    // scheduler admission there is no streaming disconnect token to pass, so
+    // handler cancellation drops this future (and its URL stream) as a unit.
+    // The audio resolver exposes a separate cooperative-token entry point for
+    // the future XLA audio admission path; XLA audio remains capability-false.
     let (image_data, audio_data, videos) = tokio::join!(
         try_extract_chat_image_data(request),
-        extract_chat_audio_data(request),
+        try_extract_chat_audio_data(request),
         extract_chat_video_paths(request),
+    );
+    let image_data = image_data?;
+    let audio_data = audio_data?;
+    let media = MediaRequestMetadata::new(
+        declared_images,
+        declared_audio,
+        declared_videos,
+        image_data.len(),
+        audio_data.len(),
+        videos.len(),
     );
 
     Ok(PreparedChatRequest {
         prompt,
-        image_data: image_data?,
+        image_data,
+        media,
         image_soft_tokens,
         audio_data,
         videos,
     })
+}
+
+fn validate_no_reserved_media_sentinels(request: &ChatCompletionRequest) -> Result<()> {
+    for message in &request.messages {
+        match &message.content {
+            MessageContent::Text(text)
+                if text.contains(super::types::request::ORDERED_MEDIA_PREFIX) =>
+            {
+                anyhow::bail!("message text contains a reserved ordered-media sentinel");
+            }
+            MessageContent::Parts(parts) => {
+                if parts.iter().any(|part| {
+                    matches!(
+                        part,
+                        ContentPart::Text { text }
+                            if text.contains(super::types::request::ORDERED_MEDIA_PREFIX)
+                    )
+                }) {
+                    anyhow::bail!("message text contains a reserved ordered-media sentinel");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 /// Emit an INFO log exactly once per resolved session when the
@@ -401,6 +464,8 @@ fn build_raw_json_messages_with_thinking(
     request: &ChatCompletionRequest,
     preserve_thinking: bool,
 ) -> serde_json::Value {
+    let preserve_media_order = !request.audio_inputs().is_empty();
+    let mut ordered_media = preserve_media_order.then(OrderedMediaOrdinals::default);
     // Decide which assistant messages (by index) need their think blocks
     // stripped. Empty set means "keep everything."
     let strip_indices: std::collections::HashSet<usize> = if preserve_thinking {
@@ -418,11 +483,12 @@ fn build_raw_json_messages_with_thinking(
         .map(|(idx, m)| {
             // Strip think blocks from assistant messages before the checkpoint.
             let stripped = strip_indices.contains(&idx);
-            let raw_content = m.content.text();
+            let normalized_content = template_content(&m.content, ordered_media.as_mut());
+            let raw_content = template_text_content(&normalized_content);
             let content = if stripped {
-                strip_think_block(&raw_content).into_owned()
+                serde_json::Value::String(strip_think_block(&raw_content).into_owned())
             } else {
-                raw_content
+                normalized_content
             };
 
             let mut msg = serde_json::json!({
@@ -460,7 +526,7 @@ fn build_raw_json_messages_with_thinking(
             if !stripped
                 && let Some(reasoning) = m.reasoning.as_ref()
                 && !reasoning.is_empty()
-                && !content.contains("<think>")
+                && !raw_content.contains("<think>")
             {
                 msg["reasoning"] = serde_json::Value::String(reasoning.clone());
             }
@@ -470,6 +536,106 @@ fn build_raw_json_messages_with_thinking(
         .collect();
 
     serde_json::Value::Array(messages)
+}
+
+/// Return whether any message carries a media part whose position must reach
+/// the processor-aware chat template.
+///
+/// OpenAI's wire types (`image_url`, `video_url`, `input_audio`) are transport
+/// objects, while Hugging Face processor templates branch on semantic types
+/// (`image`, `video`, `audio`). Routing only these requests through the raw
+/// renderer keeps the established string-content path unchanged for ordinary
+/// text requests and text-only content arrays.
+fn has_template_media_parts(request: &ChatCompletionRequest) -> bool {
+    request.messages.iter().any(|message| {
+        matches!(
+            &message.content,
+            MessageContent::Parts(parts)
+                if parts.iter().any(|part| !matches!(part, ContentPart::Text { .. }))
+        )
+    })
+}
+
+/// Normalize OpenAI transport content into the typed content shape consumed by
+/// Hugging Face processor templates.
+///
+/// Media bytes/URLs are resolved by the server's media pipeline, not by Jinja.
+/// Exposing them to a template would both leak unnecessarily large payloads
+/// into rendering and fail templates such as LLaVA's, which select
+/// `content.type == "image"`. Keep only an ordered semantic marker at this
+/// boundary.
+#[derive(Default)]
+struct OrderedMediaOrdinals {
+    image: usize,
+    audio: usize,
+}
+
+fn template_content(
+    content: &MessageContent,
+    ordered_media: Option<&mut OrderedMediaOrdinals>,
+) -> serde_json::Value {
+    // Audio-capable families consume private image/audio ordinals after chat
+    // rendering. Combined audio/video requests are rejected before this
+    // helper, so the ordered representation deliberately has no video
+    // sentinel.
+    if let Some(ordinals) = ordered_media {
+        return match content {
+            MessageContent::Text(text) => serde_json::Value::String(text.clone()),
+            MessageContent::Parts(parts) => {
+                let mut flattened = String::new();
+                for part in parts {
+                    match part {
+                        ContentPart::Text { text } => flattened.push_str(text),
+                        ContentPart::ImageUrl { .. } => {
+                            ordinals.image += 1;
+                            flattened.push_str(&ordered_image_sentinel(ordinals.image));
+                        }
+                        ContentPart::InputAudio { .. } => {
+                            ordinals.audio += 1;
+                            flattened.push_str(&ordered_audio_sentinel(ordinals.audio));
+                        }
+                        ContentPart::VideoUrl { .. } => {}
+                    }
+                }
+                serde_json::Value::String(flattened)
+            }
+        };
+    }
+
+    match content {
+        MessageContent::Text(text) => serde_json::Value::String(text.clone()),
+        MessageContent::Parts(parts) => serde_json::Value::Array(
+            parts
+                .iter()
+                .map(|part| match part {
+                    ContentPart::Text { text } => serde_json::json!({
+                        "type": "text",
+                        "text": text,
+                    }),
+                    ContentPart::ImageUrl { .. } => serde_json::json!({
+                        "type": "image",
+                    }),
+                    ContentPart::VideoUrl { .. } => serde_json::json!({
+                        "type": "video",
+                    }),
+                    ContentPart::InputAudio { .. } => serde_json::json!({
+                        "type": "audio",
+                    }),
+                })
+                .collect(),
+        ),
+    }
+}
+
+fn template_text_content(content: &serde_json::Value) -> String {
+    match content {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(serde_json::Value::as_str))
+            .collect(),
+        _ => String::new(),
+    }
 }
 
 /// Normalize each tool call's `function.arguments` from a JSON-encoded string
@@ -555,6 +721,8 @@ fn build_chat_messages_with_thinking(
     request: &ChatCompletionRequest,
     preserve_thinking: bool,
 ) -> Vec<ChatMessage> {
+    let preserve_media_order = !request.audio_inputs().is_empty();
+    let mut ordered_media = preserve_media_order.then(OrderedMediaOrdinals::default);
     let strip_indices: std::collections::HashSet<usize> = if preserve_thinking {
         std::collections::HashSet::new()
     } else {
@@ -568,7 +736,8 @@ fn build_chat_messages_with_thinking(
         .iter()
         .enumerate()
         .map(|(idx, message)| {
-            let raw = message.content.text();
+            let normalized_content = template_content(&message.content, ordered_media.as_mut());
+            let raw = template_text_content(&normalized_content);
             let content = if strip_indices.contains(&idx) {
                 strip_think_block(&raw).into_owned()
             } else {

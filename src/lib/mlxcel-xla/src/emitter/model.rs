@@ -20,19 +20,178 @@
 //! is byte-identical to before.
 
 use super::builder::{Builder, Precision, Ty, Val, precision_from_env, quant_in_graph};
-use super::config::{Config, NormStyle};
+use super::config::{Config, DeepStackConfig, MropeLayout, NormStyle};
 use super::moe::{self, MoeLayerW, MoeSharedW};
 use super::rope;
 
-const MAX_SEQ: usize = 256;
+/// Canonical finite additive-attention value for a disallowed prefill edge.
+///
+/// The embeddings entry accepts only `0.0` (allowed) and this value (masked).
+/// Negative infinity is deliberately rejected so every caller, compiler target,
+/// and softmax lowering observes the same finite input convention as the existing
+/// token prefill graph.
+pub(crate) const PREFILL_EMBEDDINGS_MASKED_VALUE: f32 = -1e30;
 
-/// Bucketed padded prompt length for prefill. Set to MAX_SEQ so the one bucket
-/// covers any prompt the cache holds (e.g. the ~103-token Llama-3.2 chat-template
-/// prompt), not just the 46-token spike prompt. KV for real positions is
-/// identical to a smaller bucket (padding positions are causally masked), so the
-/// generated tokens are unchanged.
-const PREFILL_LP: usize = MAX_SEQ;
+/// Runtime tensor element types understood by the prefill-embeddings schema
+/// validator. The graph currently consumes f32 hidden states and an f32 additive
+/// bias; the other variants exist so callers get an actionable error before IREE
+/// compilation/invocation instead of silently reinterpreting bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrefillEmbeddingsDType {
+    F32,
+    F16,
+    Bf16,
+}
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PositionInputMode {
+    OneD,
+    Mrope3D,
+}
+
+/// Shape/dtype metadata validated before compiling or invoking
+/// `prefill_embeddings.main`.
+///
+/// Argument order after the model weights is stable and deliberately documented
+/// here: `embeddings`, `positions`, `real_len`, `attention_bias`. The explicit
+/// `position_mode` fixes positions as either `[L]` or M-RoPE `[3,L]`; rank is
+/// never inferred from the payload after the runtime boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrefillEmbeddingsInputMetadata {
+    pub embeddings_shape: [usize; 2],
+    pub embeddings_dtype: PrefillEmbeddingsDType,
+    pub position_mode: PositionInputMode,
+    /// The first `positions_rank` dimensions are significant.
+    pub positions_shape: [usize; 2],
+    pub positions_rank: usize,
+    pub attention_bias_shape: [usize; 2],
+    pub attention_bias_dtype: PrefillEmbeddingsDType,
+    pub real_len: usize,
+}
+
+impl PrefillEmbeddingsInputMetadata {
+    /// Metadata for the static context-capacity schema emitted for `c`.
+    pub(crate) fn canonical(c: &Config) -> Self {
+        let lp = c.context_capacity;
+        Self {
+            embeddings_shape: [lp, c.hidden],
+            embeddings_dtype: PrefillEmbeddingsDType::F32,
+            position_mode: if c.uses_mrope() {
+                PositionInputMode::Mrope3D
+            } else {
+                PositionInputMode::OneD
+            },
+            positions_shape: if c.uses_mrope() { [3, lp] } else { [lp, 0] },
+            positions_rank: if c.uses_mrope() { 2 } else { 1 },
+            attention_bias_shape: [lp, lp],
+            attention_bias_dtype: PrefillEmbeddingsDType::F32,
+            real_len: lp,
+        }
+    }
+}
+
+/// Validate the static prefill-from-embeddings input contract before compiling or
+/// invoking the graph.
+///
+/// `real_len` selects the output row but does not alter padded-row computation:
+/// callers provide a complete `[Lp, Lp]` bias for the whole static bucket. For
+/// token-parity padding, padded rows therefore retain the same causal pattern as
+/// ordinary rows, while real rows mask every future/padded key.
+pub(crate) fn validate_prefill_embeddings_metadata(
+    c: &Config,
+    metadata: &PrefillEmbeddingsInputMetadata,
+) -> Result<(), String> {
+    let lp = c.context_capacity;
+    let want_embeddings = [lp, c.hidden];
+    if metadata.embeddings_shape != want_embeddings {
+        return Err(format!(
+            "prefill embeddings shape {:?} does not match required {:?}",
+            metadata.embeddings_shape, want_embeddings
+        ));
+    }
+    if metadata.embeddings_dtype != PrefillEmbeddingsDType::F32 {
+        return Err(format!(
+            "prefill embeddings dtype {:?} is unsupported; expected F32",
+            metadata.embeddings_dtype
+        ));
+    }
+    let expected_position_mode = if c.uses_mrope() {
+        PositionInputMode::Mrope3D
+    } else {
+        PositionInputMode::OneD
+    };
+    let expected_positions_shape = if c.uses_mrope() { [3, lp] } else { [lp, 0] };
+    let expected_positions_rank = if c.uses_mrope() { 2 } else { 1 };
+    if metadata.position_mode != expected_position_mode
+        || metadata.positions_shape != expected_positions_shape
+        || metadata.positions_rank != expected_positions_rank
+    {
+        return Err(format!(
+            "prefill position mode/shape {:?} {:?} rank {} does not match required {:?} {:?} rank {}",
+            metadata.position_mode,
+            metadata.positions_shape,
+            metadata.positions_rank,
+            expected_position_mode,
+            expected_positions_shape,
+            expected_positions_rank,
+        ));
+    }
+    if metadata.attention_bias_shape != [lp, lp] {
+        return Err(format!(
+            "prefill attention-bias shape {:?} does not match required [{}, {}]",
+            metadata.attention_bias_shape, lp, lp
+        ));
+    }
+    if metadata.attention_bias_dtype != PrefillEmbeddingsDType::F32 {
+        return Err(format!(
+            "prefill attention-bias dtype {:?} is unsupported; expected F32",
+            metadata.attention_bias_dtype
+        ));
+    }
+    if !(1..=lp).contains(&metadata.real_len) {
+        return Err(format!(
+            "prefill real_len {} is outside the required range 1..={lp}",
+            metadata.real_len,
+        ));
+    }
+    Ok(())
+}
+
+/// Validate a canonical additive attention-bias payload. Only `0.0` (allowed)
+/// and [`PREFILL_EMBEDDINGS_MASKED_VALUE`] (masked) are accepted; NaN, infinity,
+/// and intermediate additive values are rejected to keep polarity unambiguous.
+pub(crate) fn validate_prefill_embeddings_attention_bias(
+    c: &Config,
+    bias: &[f32],
+) -> Result<(), String> {
+    let expected = c
+        .context_capacity
+        .checked_mul(c.context_capacity)
+        .ok_or_else(|| {
+            format!(
+                "prefill attention-bias size overflows for context capacity {}",
+                c.context_capacity
+            )
+        })?;
+    if bias.len() != expected {
+        return Err(format!(
+            "prefill attention bias has {} elements; expected {expected}",
+            bias.len()
+        ));
+    }
+    if let Some((index, value)) = bias
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|(_, value)| *value != 0.0 && *value != PREFILL_EMBEDDINGS_MASKED_VALUE)
+    {
+        return Err(format!(
+            "prefill attention bias at flat index {index} is {value}; expected only 0 or {}",
+            PREFILL_EMBEDDINGS_MASKED_VALUE
+        ));
+    }
+    Ok(())
+}
 /// Per-layer weight handles (JAX alphabetical order: down, gate, in_ln,
 /// post_ln, up, wk, wo, wq, wv). `bk`/`bq`/`bv` are the q/k/v projection biases,
 /// present only for an architecture with `qkv_bias` (Qwen2); `None` for Llama,
@@ -468,18 +627,23 @@ fn build_arg_schema(b: &mut Builder, c: &Config) -> (Vec<ArgDecl>, Args) {
     }
 
     let token = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "token".into());
-    let pos = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "pos".into());
+    let pos = take_arg(
+        &mut decls,
+        &mut idx,
+        Ty::new(if c.uses_mrope() { vec![3] } else { vec![] }, "i32"),
+        "pos".into(),
+    );
     let cache_len = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "cache_len".into());
     let kcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![c.n_layers, c.context_capacity, c.n_kv, c.head_dim]),
         "kcache".into(),
     );
     let vcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![c.n_layers, c.context_capacity, c.n_kv, c.head_dim]),
         "vcache".into(),
     );
 
@@ -533,20 +697,21 @@ pub(crate) struct Consts {
 }
 
 fn emit_consts(b: &mut Builder, c: &Config) -> Consts {
-    let (cos, sin) = rope::rope_tables(c, MAX_SEQ);
+    let seq = c.context_capacity;
+    let (cos, sin) = rope::rope_tables(c, seq);
     // The rotary width (`head_dim`, or the smaller `rotary_dim` for a partial-RoPE
     // arch like StableLM). The Llama family has `rot == head_dim`, so its tables are
     // byte-identical.
     let rot = c.rotary_width();
-    let cos_table = b.const_tensor_f32(&cos, vec![MAX_SEQ, rot]);
-    let sin_table = b.const_tensor_f32(&sin, vec![MAX_SEQ, rot]);
+    let cos_table = b.const_tensor_f32(&cos, vec![seq, rot]);
+    let sin_table = b.const_tensor_f32(&sin, vec![seq, rot]);
     // Gemma3 / OLMo3 local RoPE tables (distinct base for the sliding layers).
     let (cos_local, sin_local) = match c.rope_local_base {
         Some(base) => {
-            let (cl, sl) = rope::rope_tables_local(c, MAX_SEQ, base);
+            let (cl, sl) = rope::rope_tables_local(c, seq, base);
             (
-                Some(b.const_tensor_f32(&cl, vec![MAX_SEQ, rot])),
-                Some(b.const_tensor_f32(&sl, vec![MAX_SEQ, rot])),
+                Some(b.const_tensor_f32(&cl, vec![seq, rot])),
+                Some(b.const_tensor_f32(&sl, vec![seq, rot])),
             )
         }
         None => (None, None),
@@ -1282,6 +1447,7 @@ impl AttnLayout {
     ) -> (Val, Val) {
         let d = c.head_dim;
         let nkv = c.n_kv;
+        let seq = c.context_capacity;
         match self {
             AttnLayout::Single { cache_len, .. } => {
                 let k_upd = b.reshape(kk, vec![1, 1, nkv, d]);
@@ -1296,10 +1462,10 @@ impl AttnLayout {
                     &v_upd,
                     &[&k.layer_idx[li], cache_len, &k.c0, &k.c0],
                 );
-                let kl = b.slice(&*kcache, &[(li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)]);
-                let kl = b.reshape(&kl, vec![MAX_SEQ, nkv, d]);
-                let vl = b.slice(&*vcache, &[(li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)]);
-                let vl = b.reshape(&vl, vec![MAX_SEQ, nkv, d]);
+                let kl = b.slice(&*kcache, &[(li, li + 1), (0, seq), (0, nkv), (0, d)]);
+                let kl = b.reshape(&kl, vec![seq, nkv, d]);
+                let vl = b.slice(&*vcache, &[(li, li + 1), (0, seq), (0, nkv), (0, d)]);
+                let vl = b.reshape(&vl, vec![seq, nkv, d]);
                 (kl, vl)
             }
             AttnLayout::Ragged {
@@ -1329,14 +1495,14 @@ impl AttnLayout {
                 }
                 let kl = b.slice(
                     &*kcache,
-                    &[(0, *bsz), (li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)],
+                    &[(0, *bsz), (li, li + 1), (0, seq), (0, nkv), (0, d)],
                 );
-                let kl = b.reshape(&kl, vec![*bsz, MAX_SEQ, nkv, d]);
+                let kl = b.reshape(&kl, vec![*bsz, seq, nkv, d]);
                 let vl = b.slice(
                     &*vcache,
-                    &[(0, *bsz), (li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)],
+                    &[(0, *bsz), (li, li + 1), (0, seq), (0, nkv), (0, d)],
                 );
-                let vl = b.reshape(&vl, vec![*bsz, MAX_SEQ, nkv, d]);
+                let vl = b.reshape(&vl, vec![*bsz, seq, nkv, d]);
                 (kl, vl)
             }
             AttnLayout::Prefill { lp, .. } => {
@@ -1362,12 +1528,12 @@ impl AttnLayout {
     fn raw_scores(&self, b: &mut Builder, c: &Config, q: &Val, kslab: &Val) -> Val {
         let d = c.head_dim;
         let (nq, nkv, g) = (c.n_q, c.n_kv, c.group());
+        let seq = c.context_capacity;
         match self {
             AttnLayout::Single { .. } => {
                 let q_r = b.reshape(q, vec![nkv, g, d]);
-                let scores =
-                    b.dot_general(&q_r, kslab, &[0], &[1], &[2], &[2], vec![nkv, g, MAX_SEQ]);
-                b.reshape(&scores, vec![nq, MAX_SEQ])
+                let scores = b.dot_general(&q_r, kslab, &[0], &[1], &[2], &[2], vec![nkv, g, seq]);
+                b.reshape(&scores, vec![nq, seq])
             }
             AttnLayout::Ragged { bsz, .. } => {
                 let q_r = b.reshape(q, vec![*bsz, nkv, g, d]);
@@ -1378,9 +1544,9 @@ impl AttnLayout {
                     &[0, 2],
                     &[3],
                     &[3],
-                    vec![*bsz, nkv, g, MAX_SEQ],
+                    vec![*bsz, nkv, g, seq],
                 );
-                b.reshape(&scores, vec![*bsz, nq, MAX_SEQ])
+                b.reshape(&scores, vec![*bsz, nq, seq])
             }
             AttnLayout::Prefill { lp, .. } => {
                 let q4 = b.reshape(q, vec![*lp, nkv, g, d]);
@@ -1396,12 +1562,13 @@ impl AttnLayout {
     /// See [`layer_mask`].
     fn add_mask(&self, b: &mut Builder, c: &Config, li: usize, scores: &Val) -> Val {
         let (nq, nkv, g) = (c.n_q, c.n_kv, c.group());
+        let seq = c.context_capacity;
         match self {
             AttnLayout::Single {
                 mask, mask_local, ..
             } => {
                 let m = layer_mask(mask, mask_local, c, li);
-                let mb = b.broadcast(m, &[1], vec![nq, MAX_SEQ]);
+                let mb = b.broadcast(m, &[1], vec![nq, seq]);
                 b.add(scores, &mb)
             }
             AttnLayout::Ragged {
@@ -1411,7 +1578,7 @@ impl AttnLayout {
                 ..
             } => {
                 let m = layer_mask(mask, mask_local, c, li);
-                let mb = b.broadcast(m, &[0, 2], vec![*bsz, nq, MAX_SEQ]);
+                let mb = b.broadcast(m, &[0, 2], vec![*bsz, nq, seq]);
                 b.add(scores, &mb)
             }
             AttnLayout::Prefill {
@@ -1440,15 +1607,16 @@ impl AttnLayout {
     fn context(&self, b: &mut Builder, c: &Config, attn: &Val, vslab: &Val) -> Val {
         let d = c.head_dim;
         let (nq, nkv, g) = (c.n_q, c.n_kv, c.group());
+        let seq = c.context_capacity;
         match self {
             AttnLayout::Single { .. } => {
-                let attn_r = b.reshape(attn, vec![nkv, g, MAX_SEQ]);
+                let attn_r = b.reshape(attn, vec![nkv, g, seq]);
                 let o = b.dot_general(&attn_r, vslab, &[0], &[1], &[2], &[0], vec![nkv, g, d]);
                 let o = b.reshape(&o, vec![nq, d]);
                 b.reshape(&o, vec![nq * d])
             }
             AttnLayout::Ragged { bsz, .. } => {
-                let attn_r = b.reshape(attn, vec![*bsz, nkv, g, MAX_SEQ]);
+                let attn_r = b.reshape(attn, vec![*bsz, nkv, g, seq]);
                 let o = b.dot_general(
                     &attn_r,
                     vslab,
@@ -1673,6 +1841,7 @@ pub fn emit_decode_with(c: &Config, sample: bool, precision: Precision) -> Strin
     let k = emit_consts(&mut b, c);
 
     let h = c.hidden;
+    let seq = c.context_capacity;
     // RoPE cos/sin vectors span the rotary width (`head_dim` for a full-rope arch,
     // the smaller `rotary_dim` for partial RoPE; equal for the Llama family).
     let rot = c.rotary_width();
@@ -1682,40 +1851,52 @@ pub fn emit_decode_with(c: &Config, sample: bool, precision: Precision) -> Strin
     let emb = b.reshape(&emb_row, vec![h]);
     let mut x = scale_embedding(&mut b, c, emb, vec![h]);
 
-    let cos_row = b.dynamic_slice(&k.cos_table, &[&a.pos, &k.c0], vec![1, rot]);
-    let cos_vec = b.reshape(&cos_row, vec![rot]);
-    let sin_row = b.dynamic_slice(&k.sin_table, &[&a.pos, &k.c0], vec![1, rot]);
-    let sin_vec = b.reshape(&sin_row, vec![rot]);
-    // Dual-RoPE (Gemma3 / OLMo3): the local-base [rot] vectors for the sliding layers.
-    let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
-        (Some(ct), Some(st)) => {
-            let cr = b.dynamic_slice(ct, &[&a.pos, &k.c0], vec![1, rot]);
-            let cl = b.reshape(&cr, vec![rot]);
-            let sr = b.dynamic_slice(st, &[&a.pos, &k.c0], vec![1, rot]);
-            let sl = b.reshape(&sr, vec![rot]);
-            (Some(cl), Some(sl))
-        }
-        _ => (None, None),
+    let (cos_vec, sin_vec, cos_local, sin_local) = if c.uses_mrope() {
+        let positions = b.reshape(&a.pos, vec![3, 1]);
+        let (cos, sin) = mrope_cos_sin(&mut b, c, &positions, 1);
+        (
+            b.reshape(&cos, vec![rot]),
+            b.reshape(&sin, vec![rot]),
+            None,
+            None,
+        )
+    } else {
+        let cos_row = b.dynamic_slice(&k.cos_table, &[&a.pos, &k.c0], vec![1, rot]);
+        let cos_vec = b.reshape(&cos_row, vec![rot]);
+        let sin_row = b.dynamic_slice(&k.sin_table, &[&a.pos, &k.c0], vec![1, rot]);
+        let sin_vec = b.reshape(&sin_row, vec![rot]);
+        // Dual-RoPE (Gemma3 / OLMo3): the local-base [rot] vectors for the sliding layers.
+        let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
+            (Some(ct), Some(st)) => {
+                let cr = b.dynamic_slice(ct, &[&a.pos, &k.c0], vec![1, rot]);
+                let cl = b.reshape(&cr, vec![rot]);
+                let sr = b.dynamic_slice(st, &[&a.pos, &k.c0], vec![1, rot]);
+                let sl = b.reshape(&sr, vec![rot]);
+                (Some(cl), Some(sl))
+            }
+            _ => (None, None),
+        };
+        (cos_vec, sin_vec, cos_local, sin_local)
     };
 
     // mask: keys s valid iff s <= cache_len -> additive 0 / -1e30, shape [S]
-    let ii = b.iota(MAX_SEQ);
-    let clen_b = b.broadcast(&a.cache_len, &[], vec![MAX_SEQ]);
+    let ii = b.iota(seq);
+    let clen_b = b.broadcast(&a.cache_len, &[], vec![seq]);
     let valid = b.compare("LE", &ii, &clen_b, "SIGNED");
-    let zeros_s = b.broadcast(&k.zero, &[], vec![MAX_SEQ]);
-    let negs_s = b.broadcast(&k.neg_big, &[], vec![MAX_SEQ]);
+    let zeros_s = b.broadcast(&k.zero, &[], vec![seq]);
+    let negs_s = b.broadcast(&k.neg_big, &[], vec![seq]);
     let kmask = b.select(&valid, &zeros_s, &negs_s);
     // Gemma2 local (sliding-window) mask (issue #495): a local layer additionally
     // drops keys older than the window, keeping key s iff `cache_len - s < W`. The
     // global `kmask` already encodes causality, so anding the window in is one more
     // `select`: within-window -> keep `kmask`, else force -1e30. Built once and
     // reused by every local layer; emitted only for a config with a window
-    // (Gemma2), so Llama / Qwen2 stay byte-identical. When `W >= MAX_SEQ` the
-    // predicate is always true (`cache_len - s <= MAX_SEQ-1 < W`), so it is a value
+    // (Gemma2), so Llama / Qwen2 stay byte-identical. When `W >= context_capacity`
+    // the predicate is always true, so it is a value
     // no-op, which is why short-context Gemma2 output is unchanged.
     let kmask_local = c.sliding_window.map(|w| {
         let wc = b.const_i32(w as i32);
-        let wb = b.broadcast(&wc, &[], vec![MAX_SEQ]);
+        let wb = b.broadcast(&wc, &[], vec![seq]);
         let age = b.subtract(&clen_b, &ii); // cache_len - s
         let within = b.compare("LT", &age, &wb, "SIGNED");
         b.select(&within, &kmask, &negs_s)
@@ -1756,7 +1937,7 @@ pub fn emit_decode_with(c: &Config, sample: bool, precision: Precision) -> Strin
     };
 
     let sig = render_signature(&decls);
-    let cache_ty = Ty::f32(vec![c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]).render();
+    let cache_ty = Ty::f32(vec![c.n_layers, seq, c.n_kv, c.head_dim]).render();
     format!(
         "module @decode_step {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
         sig = sig,
@@ -1792,7 +1973,7 @@ struct BatchedArgs {
     token: Val,     // [B] i32
     pos: Val,       // scalar i32 (shared across the batch)
     cache_len: Val, // scalar i32 (shared across the batch)
-    kcache: Val,    // [B, L, MAX_SEQ, nkv, d]
+    kcache: Val,    // [B, L, context_capacity, nkv, d]
     vcache: Val,
 }
 
@@ -1833,18 +2014,35 @@ fn build_batched_arg_schema(
         Ty::new(vec![bsz], "i32"),
         "token".into(),
     );
-    let pos = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "pos".into());
+    let pos = take_arg(
+        &mut decls,
+        &mut idx,
+        Ty::new(if c.uses_mrope() { vec![3] } else { vec![] }, "i32"),
+        "pos".into(),
+    );
     let cache_len = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "cache_len".into());
     let kcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![
+            bsz,
+            c.n_layers,
+            c.context_capacity,
+            c.n_kv,
+            c.head_dim,
+        ]),
         "kcache".into(),
     );
     let vcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![
+            bsz,
+            c.n_layers,
+            c.context_capacity,
+            c.n_kv,
+            c.head_dim,
+        ]),
         "vcache".into(),
     );
 
@@ -1910,23 +2108,31 @@ pub fn emit_decode_batched_with(
     let nq = c.n_q;
     let nkv = c.n_kv;
     let g = c.group();
+    let seq = c.context_capacity;
 
     // --- head: per-row embed gather, shared rope vectors, shared key mask ---
     let tok_idx = b.reshape(&a.token, vec![bsz, 1]);
     let mut x = b.gather(&a.embed, &tok_idx); // [B, H]
 
     // pos is shared (lockstep), so cos/sin are one [d] vector for every row.
-    let cos_row = b.dynamic_slice(&k.cos_table, &[&a.pos, &k.c0], vec![1, d]);
-    let cos_vec = b.reshape(&cos_row, vec![d]);
-    let sin_row = b.dynamic_slice(&k.sin_table, &[&a.pos, &k.c0], vec![1, d]);
-    let sin_vec = b.reshape(&sin_row, vec![d]);
+    let (cos_vec, sin_vec) = if c.uses_mrope() {
+        let positions = b.reshape(&a.pos, vec![3, 1]);
+        let (cos, sin) = mrope_cos_sin(&mut b, c, &positions, 1);
+        (b.reshape(&cos, vec![d]), b.reshape(&sin, vec![d]))
+    } else {
+        let cos_row = b.dynamic_slice(&k.cos_table, &[&a.pos, &k.c0], vec![1, d]);
+        let cos_vec = b.reshape(&cos_row, vec![d]);
+        let sin_row = b.dynamic_slice(&k.sin_table, &[&a.pos, &k.c0], vec![1, d]);
+        let sin_vec = b.reshape(&sin_row, vec![d]);
+        (cos_vec, sin_vec)
+    };
 
     // shared key mask [S]: key s valid iff s <= cache_len -> additive 0 / -1e30
-    let ii = b.iota(MAX_SEQ);
-    let clen_b = b.broadcast(&a.cache_len, &[], vec![MAX_SEQ]);
+    let ii = b.iota(seq);
+    let clen_b = b.broadcast(&a.cache_len, &[], vec![seq]);
     let valid = b.compare("LE", &ii, &clen_b, "SIGNED");
-    let zeros_s = b.broadcast(&k.zero, &[], vec![MAX_SEQ]);
-    let negs_s = b.broadcast(&k.neg_big, &[], vec![MAX_SEQ]);
+    let zeros_s = b.broadcast(&k.zero, &[], vec![seq]);
+    let negs_s = b.broadcast(&k.neg_big, &[], vec![seq]);
     let kmask = b.select(&valid, &zeros_s, &negs_s);
 
     let mut kcache = a.kcache.clone();
@@ -1973,14 +2179,14 @@ pub fn emit_decode_batched_with(
         // read this layer's cache slabs [B, S, nkv, d]
         let kl = b.slice(
             &kcache,
-            &[(0, bsz), (li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)],
+            &[(0, bsz), (li, li + 1), (0, seq), (0, nkv), (0, d)],
         );
-        let kl = b.reshape(&kl, vec![bsz, MAX_SEQ, nkv, d]);
+        let kl = b.reshape(&kl, vec![bsz, seq, nkv, d]);
         let vl = b.slice(
             &vcache,
-            &[(0, bsz), (li, li + 1), (0, MAX_SEQ), (0, nkv), (0, d)],
+            &[(0, bsz), (li, li + 1), (0, seq), (0, nkv), (0, d)],
         );
-        let vl = b.reshape(&vl, vec![bsz, MAX_SEQ, nkv, d]);
+        let vl = b.reshape(&vl, vec![bsz, seq, nkv, d]);
 
         // GQA scores: batch over (B, kv head). q head kv*g+grp attends kv head
         // kv. Output [B, nkv, g, S] reshapes to [B, nq, S] (head = kv*g+grp).
@@ -1992,25 +2198,25 @@ pub fn emit_decode_batched_with(
             &[0, 2],
             &[3],
             &[3],
-            vec![bsz, nkv, g, MAX_SEQ],
+            vec![bsz, nkv, g, seq],
         );
-        let scores = b.reshape(&scores, vec![bsz, nq, MAX_SEQ]);
-        let scale_b = b.broadcast(&k.scale, &[], vec![bsz, nq, MAX_SEQ]);
+        let scores = b.reshape(&scores, vec![bsz, nq, seq]);
+        let scale_b = b.broadcast(&k.scale, &[], vec![bsz, nq, seq]);
         let scores = b.multiply(&scores, &scale_b);
-        let kmask_b = b.broadcast(&kmask, &[2], vec![bsz, nq, MAX_SEQ]);
+        let kmask_b = b.broadcast(&kmask, &[2], vec![bsz, nq, seq]);
         let scores = b.add(&scores, &kmask_b);
 
         // softmax over the key axis (dim 2)
         let m = b.reduce_max(&scores, 2, &k.neg_inf); // [B, nq]
-        let m_b = b.broadcast(&m, &[0, 1], vec![bsz, nq, MAX_SEQ]);
+        let m_b = b.broadcast(&m, &[0, 1], vec![bsz, nq, seq]);
         let sh = b.subtract(&scores, &m_b);
         let e = b.exponential(&sh);
         let s = b.reduce_add(&e, 2, &k.zero); // [B, nq]
-        let s_b = b.broadcast(&s, &[0, 1], vec![bsz, nq, MAX_SEQ]);
+        let s_b = b.broadcast(&s, &[0, 1], vec![bsz, nq, seq]);
         let attn = b.divide(&e, &s_b); // [B, nq, S]
 
         // context: o[b,h,d] = sum_s attn[b,h,s] * vl[b,s,h/g,d]
-        let attn_r = b.reshape(&attn, vec![bsz, nkv, g, MAX_SEQ]);
+        let attn_r = b.reshape(&attn, vec![bsz, nkv, g, seq]);
         let o = b.dot_general(
             &attn_r,
             &vl,
@@ -2079,7 +2285,7 @@ pub fn emit_decode_batched_with(
     };
 
     let sig = render_signature(&decls);
-    let cache_ty = Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]).render();
+    let cache_ty = Ty::f32(vec![bsz, c.n_layers, seq, c.n_kv, c.head_dim]).render();
     format!(
         "module @decode_step {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
         sig = sig,
@@ -2115,7 +2321,7 @@ struct RaggedArgs {
     token: Val,     // [B] i32
     pos: Val,       // [B] i32 (per row)
     cache_len: Val, // [B] i32 (per row)
-    kcache: Val,    // [B, L, MAX_SEQ, nkv, d]
+    kcache: Val,    // [B, L, context_capacity, nkv, d]
     vcache: Val,
 }
 
@@ -2155,7 +2361,14 @@ fn build_ragged_arg_schema(b: &mut Builder, c: &Config, bsz: usize) -> (Vec<ArgD
     let pos = take_arg(
         &mut decls,
         &mut idx,
-        Ty::new(vec![bsz], "i32"),
+        Ty::new(
+            if c.uses_mrope() {
+                vec![bsz, 3]
+            } else {
+                vec![bsz]
+            },
+            "i32",
+        ),
         "pos".into(),
     );
     let cache_len = take_arg(
@@ -2167,13 +2380,25 @@ fn build_ragged_arg_schema(b: &mut Builder, c: &Config, bsz: usize) -> (Vec<ArgD
     let kcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![
+            bsz,
+            c.n_layers,
+            c.context_capacity,
+            c.n_kv,
+            c.head_dim,
+        ]),
         "kcache".into(),
     );
     let vcache = take_arg(
         &mut decls,
         &mut idx,
-        Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]),
+        Ty::f32(vec![
+            bsz,
+            c.n_layers,
+            c.context_capacity,
+            c.n_kv,
+            c.head_dim,
+        ]),
         "vcache".into(),
     );
 
@@ -2214,6 +2439,7 @@ pub fn emit_decode_ragged_with(
     let row_idx: Vec<Val> = (0..bsz).map(|i| b.const_i32(i as i32)).collect();
 
     let h = c.hidden;
+    let seq = c.context_capacity;
 
     // --- head: per-row embed gather, per-row rope gather, per-row key mask ---
     let tok_idx = b.reshape(&a.token, vec![bsz, 1]);
@@ -2221,30 +2447,37 @@ pub fn emit_decode_ragged_with(
     let mut x = scale_embedding(&mut b, c, emb, vec![bsz, h]);
 
     // each row's rope vectors come from its own position: gather [B,d] by pos[B]
-    let pos_idx = b.reshape(&a.pos, vec![bsz, 1]);
-    let cos = b.gather(&k.cos_table, &pos_idx); // [B, d]
-    let sin = b.gather(&k.sin_table, &pos_idx); // [B, d]
-    // Dual-RoPE (Gemma3 / OLMo3): per-row local-base gathers for the sliding layers.
-    let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
-        (Some(ct), Some(st)) => (Some(b.gather(ct, &pos_idx)), Some(b.gather(st, &pos_idx))),
-        _ => (None, None),
+    let (cos, sin, cos_local, sin_local) = if c.uses_mrope() {
+        let positions = b.transpose(&a.pos, &[1, 0]);
+        let (cos, sin) = mrope_cos_sin(&mut b, c, &positions, bsz);
+        (cos, sin, None, None)
+    } else {
+        let pos_idx = b.reshape(&a.pos, vec![bsz, 1]);
+        let cos = b.gather(&k.cos_table, &pos_idx); // [B, d]
+        let sin = b.gather(&k.sin_table, &pos_idx); // [B, d]
+        // Dual-RoPE (Gemma3 / OLMo3): per-row local-base gathers for the sliding layers.
+        let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
+            (Some(ct), Some(st)) => (Some(b.gather(ct, &pos_idx)), Some(b.gather(st, &pos_idx))),
+            _ => (None, None),
+        };
+        (cos, sin, cos_local, sin_local)
     };
 
     // per-row key mask [B,S]: key s valid for row b iff s <= cache_len[b]
-    let ii = b.iota(MAX_SEQ); // [S]
-    let ii_b = b.broadcast(&ii, &[1], vec![bsz, MAX_SEQ]); // entry[b,s] = s
-    let clen_b = b.broadcast(&a.cache_len, &[0], vec![bsz, MAX_SEQ]); // entry[b,s] = cache_len[b]
+    let ii = b.iota(seq); // [S]
+    let ii_b = b.broadcast(&ii, &[1], vec![bsz, seq]); // entry[b,s] = s
+    let clen_b = b.broadcast(&a.cache_len, &[0], vec![bsz, seq]); // entry[b,s] = cache_len[b]
     let valid = b.compare("LE", &ii_b, &clen_b, "SIGNED");
-    let zeros = b.broadcast(&k.zero, &[], vec![bsz, MAX_SEQ]);
-    let negs = b.broadcast(&k.neg_big, &[], vec![bsz, MAX_SEQ]);
+    let zeros = b.broadcast(&k.zero, &[], vec![bsz, seq]);
+    let negs = b.broadcast(&k.neg_big, &[], vec![bsz, seq]);
     let kmask = b.select(&valid, &zeros, &negs); // [B, S]
     // Gemma2 local (sliding-window) mask (issue #495), per row: keep key s for row
     // b iff `cache_len[b] - s < W`. And it into the causal `kmask` with one more
     // `select`. Emitted only for a windowed config (Gemma2); reused by every local
-    // layer. No-op on the value when `W >= MAX_SEQ` (short-context parity).
+    // layer. No-op on the value when `W >= context_capacity` (short-context parity).
     let kmask_local = c.sliding_window.map(|w| {
         let wc = b.const_i32(w as i32);
-        let wb = b.broadcast(&wc, &[], vec![bsz, MAX_SEQ]);
+        let wb = b.broadcast(&wc, &[], vec![bsz, seq]);
         let age = b.subtract(&clen_b, &ii_b); // cache_len[b] - s
         let within = b.compare("LT", &age, &wb, "SIGNED");
         b.select(&within, &kmask, &negs)
@@ -2258,7 +2491,14 @@ pub fn emit_decode_ragged_with(
         sin_local,
         mask: kmask,
         mask_local: kmask_local,
-        pos: a.pos.clone(),
+        // M-RoPE KV writes are indexed by physical cache length while the
+        // distinct position input may include a signed per-slot delta. Preserve
+        // the byte-exact legacy 1D graph, whose ABI validates pos == cache_len.
+        pos: if c.uses_mrope() {
+            a.cache_len.clone()
+        } else {
+            a.pos.clone()
+        },
         row_idx,
     };
 
@@ -2294,7 +2534,7 @@ pub fn emit_decode_ragged_with(
     };
 
     let sig = render_signature(&decls);
-    let cache_ty = Ty::f32(vec![bsz, c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]).render();
+    let cache_ty = Ty::f32(vec![bsz, c.n_layers, seq, c.n_kv, c.head_dim]).render();
     format!(
         "module @decode_step {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
         sig = sig,
@@ -2319,20 +2559,55 @@ pub fn emit_decode_ragged_with(
 // processed at once over an [Lp] sequence axis with an [Lp,Lp] causal mask, and
 // the returned logit is the row at real_len-1 (the last real prompt token).
 
-/// Prefill arg handles. Weights are identical to decode (same order/locs); the
-/// trailing inputs are tokens/positions/real_len with no caches.
+/// Which stable prefill entry schema to build. The token entry remains unchanged;
+/// the embeddings entry replaces `tokens` with post-scale hidden states and adds
+/// an explicit additive attention bias.
+#[derive(Clone, Copy)]
+enum PrefillInputKind {
+    Tokens,
+    Embeddings,
+    DeepStack,
+}
+
+enum PrefillInput {
+    Tokens(Val),
+    Embeddings { hidden: Val, attention_bias: Val },
+    DeepStack(Box<DeepStackPrefillInput>),
+}
+
+struct DeepStackPrefillInput {
+    hidden: Val,
+    attention_bias: Val,
+    visual_positions: Val,
+    layer_features: Val,
+    layer_indices: Val,
+    actual_layer_count: Val,
+    actual_visual_count: Val,
+}
+
+/// Prefill arg handles. Weights are identical to decode (same order/locs), which
+/// intentionally retains `params['embed']`: token prefill gathers from it and a
+/// tied embeddings prefill reuses it as the LM head. The trailing schema is:
+///
+/// - token: `tokens`, `positions`, `real_len`;
+/// - embeddings: `embeddings`, `positions`, `real_len`, `attention_bias`.
 struct PrefillArgs {
     embed: Val,
     final_norm: Val,
     final_norm_bias: Option<Val>,
     lm_head: Option<Val>,
     layers: Vec<LayerW>,
-    tokens: Val,
+    input: PrefillInput,
     positions: Val,
     real_len: Val,
 }
 
-fn build_prefill_arg_schema(b: &mut Builder, c: &Config, lp: usize) -> (Vec<ArgDecl>, PrefillArgs) {
+fn build_prefill_arg_schema(
+    b: &mut Builder,
+    c: &Config,
+    lp: usize,
+    input_kind: PrefillInputKind,
+) -> (Vec<ArgDecl>, PrefillArgs) {
     let h = c.hidden;
     let v = c.vocab;
 
@@ -2359,19 +2634,100 @@ fn build_prefill_arg_schema(b: &mut Builder, c: &Config, lp: usize) -> (Vec<ArgD
         layers.push(take_layer_weights(b, &mut decls, &mut idx, c, li));
     }
 
-    let tokens = take_arg(
-        &mut decls,
-        &mut idx,
-        Ty::new(vec![lp], "i32"),
-        "tokens".into(),
-    );
+    let (tokens, embeddings) = match input_kind {
+        PrefillInputKind::Tokens => (
+            Some(take_arg(
+                &mut decls,
+                &mut idx,
+                Ty::new(vec![lp], "i32"),
+                "tokens".into(),
+            )),
+            None,
+        ),
+        PrefillInputKind::Embeddings | PrefillInputKind::DeepStack => (
+            None,
+            Some(take_arg(
+                &mut decls,
+                &mut idx,
+                Ty::f32(vec![lp, h]),
+                "embeddings".into(),
+            )),
+        ),
+    };
     let positions = take_arg(
         &mut decls,
         &mut idx,
-        Ty::new(vec![lp], "i32"),
+        Ty::new(
+            if c.uses_mrope() {
+                vec![3, lp]
+            } else {
+                vec![lp]
+            },
+            "i32",
+        ),
         "positions".into(),
     );
     let real_len = take_arg(&mut decls, &mut idx, Ty::scalar("i32"), "real_len".into());
+    let input = match (tokens, embeddings, input_kind) {
+        (None, Some(hidden), PrefillInputKind::Embeddings) => PrefillInput::Embeddings {
+            hidden,
+            attention_bias: take_arg(
+                &mut decls,
+                &mut idx,
+                Ty::f32(vec![lp, lp]),
+                "attention_bias".into(),
+            ),
+        },
+        (None, Some(hidden), PrefillInputKind::DeepStack) => {
+            let schema = c
+                .deepstack
+                .as_ref()
+                .expect("DeepStack prefill requires a declared schema");
+            let layer_count = schema.target_layer_indices.len();
+            let max_visual = schema.max_visual_positions;
+            PrefillInput::DeepStack(Box::new(DeepStackPrefillInput {
+                hidden,
+                attention_bias: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::f32(vec![lp, lp]),
+                    "attention_bias".into(),
+                ),
+                visual_positions: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::new(vec![max_visual], "i32"),
+                    "deepstack.visual_positions".into(),
+                ),
+                layer_features: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::f32(vec![layer_count, max_visual, c.hidden]),
+                    "deepstack.layer_features".into(),
+                ),
+                layer_indices: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::new(vec![layer_count], "i32"),
+                    "deepstack.layer_indices".into(),
+                ),
+                actual_layer_count: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::scalar("i32"),
+                    "deepstack.actual_layer_count".into(),
+                ),
+                actual_visual_count: take_arg(
+                    &mut decls,
+                    &mut idx,
+                    Ty::scalar("i32"),
+                    "deepstack.actual_visual_count".into(),
+                ),
+            }))
+        }
+        (Some(tokens), None, PrefillInputKind::Tokens) => PrefillInput::Tokens(tokens),
+        _ => unreachable!("each prefill schema has exactly one input representation"),
+    };
 
     (
         decls,
@@ -2381,7 +2737,7 @@ fn build_prefill_arg_schema(b: &mut Builder, c: &Config, lp: usize) -> (Vec<ArgD
             final_norm_bias,
             lm_head,
             layers,
-            tokens,
+            input,
             positions,
             real_len,
         },
@@ -2428,6 +2784,87 @@ fn apply_rope_seq(
     b.concatenate(&rotated, &x_pass, 2)
 }
 
+/// The MLX Qwen axis source for each half-rotary frequency column.
+pub(crate) fn mrope_axis_selector(c: &Config) -> Result<Vec<usize>, String> {
+    let mrope = c
+        .mrope
+        .as_ref()
+        .ok_or_else(|| "M-RoPE axis selection requires an M-RoPE config".to_string())?;
+    let half = c.rotary_width() / 2;
+    let selector = match mrope.layout {
+        MropeLayout::Chunked => {
+            let mut selector = Vec::with_capacity(half);
+            for (axis, &width) in mrope.sections.iter().enumerate() {
+                selector.extend(std::iter::repeat_n(axis, width));
+            }
+            selector
+        }
+        MropeLayout::Interleaved => {
+            // Match `InterleavedMRoPE::apply_interleaved_mrope` in the MLX Qwen3
+            // implementation: temporal is the default, and H/W overwrite the
+            // step-3 columns within their configured windows.
+            let mut selector = vec![0usize; half];
+            for (offset, &section_len) in mrope.sections[1..].iter().enumerate() {
+                let axis = offset + 1;
+                let mut index = axis;
+                while index < section_len * 3 {
+                    if index < selector.len() {
+                        selector[index] = axis;
+                    }
+                    index += 3;
+                }
+            }
+            selector
+        }
+    };
+    if selector.len() != half {
+        return Err(format!(
+            "M-RoPE axis selector has {} columns, expected {half}",
+            selector.len()
+        ));
+    }
+    Ok(selector)
+}
+
+/// Build dynamic M-RoPE cos/sin values for explicit signed coordinates.
+///
+/// `positions` is `[3, N]` ordered temporal/height/width. Unlike the ordinary
+/// one-dimensional path, this intentionally computes trig in the graph instead
+/// of indexing a context-sized table: decode coordinates are physical KV length
+/// plus a signed per-sequence delta and therefore are not bounded by the KV
+/// table's index range.
+fn mrope_cos_sin(b: &mut Builder, c: &Config, positions: &Val, n: usize) -> (Val, Val) {
+    assert_eq!(positions.ty.elt, "i32");
+    assert_eq!(positions.ty.shape, vec![3, n]);
+    let selector =
+        mrope_axis_selector(c).unwrap_or_else(|error| panic!("invalid M-RoPE config: {error}"));
+    let axes: Vec<Val> = (0..3)
+        .map(|axis| {
+            let row = b.slice(positions, &[(axis, axis + 1), (0, n)]);
+            b.reshape(&row, vec![n])
+        })
+        .collect();
+    let columns: Vec<Val> = selector
+        .into_iter()
+        .map(|axis| b.broadcast(&axes[axis], &[0], vec![n, 1]))
+        .collect();
+    let mut columns = columns.into_iter();
+    let mut selected = columns.next().expect("positive M-RoPE rotary width");
+    for column in columns {
+        selected = b.concatenate(&selected, &column, 1);
+    }
+    let selected = b.convert(&selected, "f32");
+    let inv = rope::inv_freq(c)
+        .into_iter()
+        .map(|value| value as f32)
+        .collect::<Vec<_>>();
+    let inv = b.const_tensor_f32(&inv, vec![c.rotary_width() / 2]);
+    let inv = b.broadcast(&inv, &[1], vec![n, c.rotary_width() / 2]);
+    let freqs = b.multiply(&selected, &inv);
+    let angles = b.concatenate(&freqs, &freqs, 1);
+    (b.cosine(&angles), b.sine(&angles))
+}
+
 /// The core RoPE rotation on x:[N, heads, rd] with per-row cos/sin [N, rd].
 /// Half-split or interleaved (issue #498). Byte-identical to the inlined
 /// half-split for the Llama family.
@@ -2471,51 +2908,239 @@ pub fn emit_prefill(c: &Config, sample: bool) -> String {
 }
 
 pub fn emit_prefill_with(c: &Config, sample: bool, precision: Precision) -> String {
-    let lp = PREFILL_LP;
+    emit_prefill_module(c, sample, precision, PrefillInputKind::Tokens, false)
+}
+
+/// Emit the distinct prefill-from-embeddings StableHLO module at the ambient
+/// precision. The input hidden states are already post-token-embedding-scale;
+/// this entry performs neither a token gather nor [`scale_embedding`].
+pub(crate) fn emit_prefill_embeddings(c: &Config, sample: bool) -> String {
+    emit_prefill_embeddings_with(c, sample, precision_from_env())
+}
+
+/// Emit `prefill_embeddings.main` at an explicit contraction precision.
+pub(crate) fn emit_prefill_embeddings_with(
+    c: &Config,
+    sample: bool,
+    precision: Precision,
+) -> String {
+    emit_prefill_module(c, sample, precision, PrefillInputKind::Embeddings, false)
+}
+
+/// Emit the optional sparse DeepStack embeddings-prefill entry.
+///
+/// DeepStack additions occur immediately after each selected language layer,
+/// matching the MLX Qwen3-VL reference path. The ordinary embeddings entry
+/// remains a distinct module with its original schema.
+pub(crate) fn emit_prefill_embeddings_deepstack_with(
+    c: &Config,
+    sample: bool,
+    precision: Precision,
+) -> String {
+    c.deepstack
+        .as_ref()
+        .expect("DeepStack prefill requires a declared schema")
+        .validate(c.n_layers, c.context_capacity)
+        .expect("invalid DeepStack schema");
+    emit_prefill_module(c, sample, precision, PrefillInputKind::DeepStack, false)
+}
+
+/// Emit the full DeepStack prefill plus post-hook hidden states for oracle tests.
+///
+/// This uses the production layer loop and residual hook but remains a diagnostic
+/// module that is never loaded into a serving session.
+pub(crate) fn emit_prefill_embeddings_deepstack_diagnostics_with(
+    c: &Config,
+    precision: Precision,
+) -> String {
+    c.deepstack
+        .as_ref()
+        .expect("DeepStack diagnostics require a declared schema")
+        .validate(c.n_layers, c.context_capacity)
+        .expect("invalid DeepStack schema");
+    emit_prefill_module(c, false, precision, PrefillInputKind::DeepStack, true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_deepstack_after_layer(
+    b: &mut Builder,
+    schema: &DeepStackConfig,
+    layer_index: usize,
+    hidden: &Val,
+    visual_positions: &Val,
+    layer_features: &Val,
+    layer_indices: &Val,
+    actual_layer_count: &Val,
+    actual_visual_count: &Val,
+) -> Val {
+    let Some(payload_index) = schema
+        .target_layer_indices
+        .iter()
+        .position(|&configured_layer| configured_layer == layer_index)
+    else {
+        return hidden.clone();
+    };
+    let lp = hidden.ty.shape[0];
+    let hidden_size = hidden.ty.shape[1];
+    let max_visual = schema.max_visual_positions;
+
+    let row_indices = b.iota(lp);
+    let row_matrix = b.broadcast(&row_indices, &[0], vec![lp, max_visual]);
+    let positions_matrix = b.broadcast(visual_positions, &[1], vec![lp, max_visual]);
+    let position_matches = b.compare("EQ", &row_matrix, &positions_matrix, "SIGNED");
+
+    let visual_indices = b.iota(max_visual);
+    let visual_limit = b.broadcast(actual_visual_count, &[], vec![max_visual]);
+    let visual_active = b.compare("LT", &visual_indices, &visual_limit, "SIGNED");
+    let visual_active = b.broadcast(&visual_active, &[1], vec![lp, max_visual]);
+    let position_matches = b.and(&position_matches, &visual_active);
+
+    let zero = b.const_f32(0.0);
+    let zero_rows = b.broadcast(&zero, &[], vec![lp, max_visual, hidden_size]);
+    let payload_layer = b.slice(layer_indices, &[(payload_index, payload_index + 1)]);
+    let payload_layer = b.reshape(&payload_layer, vec![]);
+    let expected_layer = b.const_i32(layer_index as i32);
+    let layer_matches = b.compare("EQ", &payload_layer, &expected_layer, "SIGNED");
+    let payload_slot = b.const_i32(payload_index as i32);
+    let slot_active = b.compare("LT", &payload_slot, actual_layer_count, "SIGNED");
+    let layer_active = b.and(&layer_matches, &slot_active);
+    let layer_active = b.broadcast(&layer_active, &[], vec![lp, max_visual]);
+    let active_positions = b.and(&position_matches, &layer_active);
+    let active_positions = b.broadcast(
+        &active_positions,
+        &[0, 1],
+        vec![lp, max_visual, hidden_size],
+    );
+
+    let features = b.slice(
+        layer_features,
+        &[
+            (payload_index, payload_index + 1),
+            (0, max_visual),
+            (0, hidden_size),
+        ],
+    );
+    let features = b.reshape(&features, vec![max_visual, hidden_size]);
+    let features = b.broadcast(&features, &[1, 2], vec![lp, max_visual, hidden_size]);
+    let selected = b.select(&active_positions, &features, &zero_rows);
+    let delta = b.reduce_add(&selected, 1, &zero);
+    b.add(hidden, &delta)
+}
+
+fn emit_prefill_module(
+    c: &Config,
+    sample: bool,
+    precision: Precision,
+    input_kind: PrefillInputKind,
+    capture_deepstack_states: bool,
+) -> String {
+    assert!(
+        !capture_deepstack_states || matches!(input_kind, PrefillInputKind::DeepStack),
+        "post-hook state capture is only valid for DeepStack prefill"
+    );
+    let lp = c.context_capacity;
     let mut b = Builder::new().with_precision(precision);
-    let (decls, a) = build_prefill_arg_schema(&mut b, c, lp);
+    let (decls, a) = build_prefill_arg_schema(&mut b, c, lp, input_kind);
     let k = emit_consts(&mut b, c);
 
     let h = c.hidden;
     let d = c.head_dim;
     let nkv = c.n_kv;
 
-    // --- head: embed gather, per-position rope vectors, [Lp,Lp] causal mask ---
-    let tok_idx = b.reshape(&a.tokens, vec![lp, 1]);
-    let emb = b.gather(&a.embed, &tok_idx); // [Lp, H]
-    let mut x = scale_embedding(&mut b, c, emb, vec![lp, h]);
-
-    let pos_idx = b.reshape(&a.positions, vec![lp, 1]);
-    let cos = b.gather(&k.cos_table, &pos_idx); // [Lp, d]
-    let sin = b.gather(&k.sin_table, &pos_idx); // [Lp, d]
-    // Dual-RoPE (Gemma3 / OLMo3): per-position local-base gathers for sliding layers.
-    let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
-        (Some(ct), Some(st)) => (Some(b.gather(ct, &pos_idx)), Some(b.gather(st, &pos_idx))),
-        _ => (None, None),
+    // --- input head ---
+    // Token prefill gathers + applies the architecture's embedding scale. The
+    // embeddings entry consumes already-merged, post-scale hidden states as-is.
+    let mut x = match &a.input {
+        PrefillInput::Tokens(tokens) => {
+            let tok_idx = b.reshape(tokens, vec![lp, 1]);
+            let emb = b.gather(&a.embed, &tok_idx); // [Lp, H]
+            scale_embedding(&mut b, c, emb, vec![lp, h])
+        }
+        PrefillInput::Embeddings { hidden, .. } => hidden.clone(),
+        PrefillInput::DeepStack(deepstack) => deepstack.hidden.clone(),
     };
 
-    // causal mask [Lp, Lp]: query i attends key j iff j <= i -> additive 0/-1e30
-    let irow = b.iota(lp);
-    let row = b.broadcast(&irow, &[0], vec![lp, lp]); // entry[i,j] = i
-    let jcol = b.iota(lp);
-    let col = b.broadcast(&jcol, &[1], vec![lp, lp]); // entry[i,j] = j
-    let le = b.compare("LE", &col, &row, "SIGNED"); // j <= i
-    let zeros = b.broadcast(&k.zero, &[], vec![lp, lp]);
-    let negs = b.broadcast(&k.neg_big, &[], vec![lp, lp]);
-    let cmask = b.select(&le, &zeros, &negs); // [Lp, Lp]
-    // Gemma2 local (sliding-window) mask (issue #495): a local layer keeps key j
-    // for query i iff `i - j < W` (prefill positions are 0..Lp, so the buffer
-    // index equals the position). And it into the causal `cmask` with one more
-    // `select`. Emitted only for a windowed config (Gemma2); reused by every local
-    // layer. No-op on the value when `W >= Lp` (`i - j <= Lp-1 < W`), so a
-    // short-prompt Gemma2 prefill is unchanged.
-    let cmask_local = c.sliding_window.map(|w| {
-        let wc = b.const_i32(w as i32);
-        let wb = b.broadcast(&wc, &[], vec![lp, lp]);
-        let age = b.subtract(&row, &col); // i - j
-        let within = b.compare("LT", &age, &wb, "SIGNED");
-        b.select(&within, &cmask, &negs)
-    });
+    // --- shared position preparation ---
+    let (cos, sin, cos_local, sin_local) = if c.uses_mrope() {
+        let (cos, sin) = mrope_cos_sin(&mut b, c, &a.positions, lp);
+        (cos, sin, None, None)
+    } else {
+        let pos_idx = b.reshape(&a.positions, vec![lp, 1]);
+        let cos = b.gather(&k.cos_table, &pos_idx); // [Lp, d]
+        let sin = b.gather(&k.sin_table, &pos_idx); // [Lp, d]
+        // Dual-RoPE (Gemma3 / OLMo3): per-position local-base gathers for sliding layers.
+        let (cos_local, sin_local) = match (&k.cos_local, &k.sin_local) {
+            (Some(ct), Some(st)) => (Some(b.gather(ct, &pos_idx)), Some(b.gather(st, &pos_idx))),
+            _ => (None, None),
+        };
+        (cos, sin, cos_local, sin_local)
+    };
+
+    // --- attention-bias preparation ---
+    // Token prefill retains the exact internal causal-mask construction. The
+    // embeddings entry uses the caller's canonical f32 additive bias directly.
+    // For a sliding architecture, the local-layer window is intersected with
+    // either base mask, preserving the architecture invariant without changing
+    // multimodal/global visibility.
+    let (cmask, cmask_local) = match &a.input {
+        PrefillInput::Tokens(_) => {
+            // causal mask [Lp, Lp]: query i attends key j iff j <= i -> additive 0/-1e30
+            let irow = b.iota(lp);
+            let row = b.broadcast(&irow, &[0], vec![lp, lp]); // entry[i,j] = i
+            let jcol = b.iota(lp);
+            let col = b.broadcast(&jcol, &[1], vec![lp, lp]); // entry[i,j] = j
+            let le = b.compare("LE", &col, &row, "SIGNED"); // j <= i
+            let zeros = b.broadcast(&k.zero, &[], vec![lp, lp]);
+            let negs = b.broadcast(&k.neg_big, &[], vec![lp, lp]);
+            let cmask = b.select(&le, &zeros, &negs); // [Lp, Lp]
+            // Gemma2 local (sliding-window) mask (issue #495): a local layer keeps key j
+            // for query i iff `i - j < W` (prefill positions are 0..Lp, so the buffer
+            // index equals the position). And it into the causal `cmask` with one more
+            // `select`. Emitted only for a windowed config (Gemma2); reused by every local
+            // layer. No-op on the value when `W >= Lp` (`i - j <= Lp-1 < W`), so a
+            // short-prompt Gemma2 prefill is unchanged.
+            let cmask_local = c.sliding_window.map(|w| {
+                let wc = b.const_i32(w as i32);
+                let wb = b.broadcast(&wc, &[], vec![lp, lp]);
+                let age = b.subtract(&row, &col); // i - j
+                let within = b.compare("LT", &age, &wb, "SIGNED");
+                b.select(&within, &cmask, &negs)
+            });
+            (cmask, cmask_local)
+        }
+        PrefillInput::Embeddings { attention_bias, .. } => {
+            let cmask = attention_bias.clone();
+            let cmask_local = c.sliding_window.map(|w| {
+                let irow = b.iota(lp);
+                let row = b.broadcast(&irow, &[0], vec![lp, lp]);
+                let jcol = b.iota(lp);
+                let col = b.broadcast(&jcol, &[1], vec![lp, lp]);
+                let wc = b.const_i32(w as i32);
+                let wb = b.broadcast(&wc, &[], vec![lp, lp]);
+                let age = b.subtract(&row, &col);
+                let within = b.compare("LT", &age, &wb, "SIGNED");
+                let negs = b.broadcast(&k.neg_big, &[], vec![lp, lp]);
+                b.select(&within, &cmask, &negs)
+            });
+            (cmask, cmask_local)
+        }
+        PrefillInput::DeepStack(deepstack) => {
+            let cmask = deepstack.attention_bias.clone();
+            let cmask_local = c.sliding_window.map(|w| {
+                let irow = b.iota(lp);
+                let row = b.broadcast(&irow, &[0], vec![lp, lp]);
+                let jcol = b.iota(lp);
+                let col = b.broadcast(&jcol, &[1], vec![lp, lp]);
+                let wc = b.const_i32(w as i32);
+                let wb = b.broadcast(&wc, &[], vec![lp, lp]);
+                let age = b.subtract(&row, &col);
+                let within = b.compare("LT", &age, &wb, "SIGNED");
+                let negs = b.broadcast(&k.neg_big, &[], vec![lp, lp]);
+                b.select(&within, &cmask, &negs)
+            });
+            (cmask, cmask_local)
+        }
+    };
 
     let layout = AttnLayout::Prefill {
         lp,
@@ -2528,13 +3153,34 @@ pub fn emit_prefill_with(c: &Config, sample: bool, precision: Precision) -> Stri
     };
 
     // caches start as zeros; prefill writes the [0:Lp] block and returns them
-    let mut kcache = b.broadcast(&k.zero, &[], vec![c.n_layers, MAX_SEQ, nkv, d]);
-    let mut vcache = b.broadcast(&k.zero, &[], vec![c.n_layers, MAX_SEQ, nkv, d]);
+    let mut kcache = b.broadcast(&k.zero, &[], vec![c.n_layers, lp, nkv, d]);
+    let mut vcache = b.broadcast(&k.zero, &[], vec![c.n_layers, lp, nkv, d]);
+    let mut deepstack_states: Option<Val> = None;
 
     for li in 0..c.n_layers {
         let lw = &a.layers[li];
         // Full transformer layer, shared with the single / ragged graphs.
         x = emit_transformer_layer(&mut b, c, &k, lw, li, &x, &layout, &mut kcache, &mut vcache);
+        if let (Some(schema), PrefillInput::DeepStack(deepstack)) = (&c.deepstack, &a.input) {
+            x = apply_deepstack_after_layer(
+                &mut b,
+                schema,
+                li,
+                &x,
+                &deepstack.visual_positions,
+                &deepstack.layer_features,
+                &deepstack.layer_indices,
+                &deepstack.actual_layer_count,
+                &deepstack.actual_visual_count,
+            );
+            if capture_deepstack_states && schema.target_layer_indices.contains(&li) {
+                let state = b.reshape(&x, vec![1, lp, h]);
+                deepstack_states = Some(match deepstack_states {
+                    Some(previous) => b.concatenate(&previous, &state, 0),
+                    None => state,
+                });
+            }
+        }
     }
 
     // --- tail: final norm (+ LayerNorm bias), take the row at real_len-1, LM head
@@ -2564,17 +3210,33 @@ pub fn emit_prefill_with(c: &Config, sample: bool, precision: Precision) -> Stri
     };
 
     let sig = render_signature(&decls);
-    let cache_ty = Ty::f32(vec![c.n_layers, MAX_SEQ, c.n_kv, c.head_dim]).render();
-    format!(
-        "module @prefill {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
-        sig = sig,
-        out_ty = out_ty,
-        cache_ty = cache_ty,
-        body = b.body(),
-        l = out_val,
-        kc = kcache.name,
-        vc = vcache.name,
-    )
+    let cache_ty = Ty::f32(vec![c.n_layers, lp, c.n_kv, c.head_dim]).render();
+    let module_name = match (input_kind, capture_deepstack_states) {
+        (PrefillInputKind::DeepStack, true) => "prefill_embeddings_deepstack_diagnostics",
+        (PrefillInputKind::Tokens, false) => "prefill",
+        (PrefillInputKind::Embeddings, false) => "prefill_embeddings",
+        (PrefillInputKind::DeepStack, false) => "prefill_embeddings_deepstack",
+        _ => unreachable!("diagnostic capture requires DeepStack"),
+    };
+    if let Some(states) = deepstack_states {
+        let state_ty = states.ty.render();
+        format!(
+            "module @{module_name} {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}, {state_ty}) {{\n{body}    return {l}, {kc}, {vc}, {states} : {out_ty}, {cache_ty}, {cache_ty}, {state_ty}\n  }}\n}}\n",
+            body = b.body(),
+            l = out_val,
+            kc = kcache.name,
+            vc = vcache.name,
+            states = states.name,
+        )
+    } else {
+        format!(
+            "module @{module_name} {{\n  func.func public @main({sig}) -> ({out_ty}, {cache_ty}, {cache_ty}) {{\n{body}    return {l}, {kc}, {vc} : {out_ty}, {cache_ty}, {cache_ty}\n  }}\n}}\n",
+            body = b.body(),
+            l = out_val,
+            kc = kcache.name,
+            vc = vcache.name,
+        )
+    }
 }
 
 // ===========================================================================

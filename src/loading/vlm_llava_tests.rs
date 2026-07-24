@@ -12,11 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::validate_iree_processor_metadata;
 use super::{
     LlavaTextBackend, detect_bunny_text_backend, infer_llama_config_from_weights,
-    inherit_text_quantization_if_missing, llava_text_backend, parse_bunny_vision_config,
-    rewrite_bunny_weight_key,
+    inherit_text_quantization_if_missing, is_llava_host_preprocessor_weight, llava_text_backend,
+    parse_bunny_vision_config, require_llava_host_family, rewrite_bunny_weight_key,
 };
+use crate::multimodal::host_preprocessor::HostPreprocessorError;
+use crate::vision::config::VLMConfig;
 use mlxcel_core::dtype;
 use mlxcel_core::weights::WeightMap;
 use serde_json::json;
@@ -168,4 +171,100 @@ fn parse_bunny_vision_config_preserves_full_configs() {
     assert_eq!(config.intermediate_size, 1536);
     assert_eq!(config.patch_size, 16);
     assert_eq!(config.image_size, 224);
+}
+
+#[test]
+fn host_weight_filter_keeps_no_decoder_layer_or_lm_head() {
+    for key in [
+        "vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "multi_modal_projector.linear_1.weight",
+        "model.embed_tokens.weight",
+        "model.embed_tokens.scales",
+        "language_model.model.embed_tokens.biases",
+    ] {
+        assert!(is_llava_host_preprocessor_weight(key), "{key}");
+    }
+    for key in [
+        "model.layers.0.self_attn.q_proj.weight",
+        "language_model.model.layers.31.mlp.down_proj.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ] {
+        assert!(!is_llava_host_preprocessor_weight(key), "{key}");
+    }
+}
+
+#[test]
+fn host_family_validation_rejects_incompatible_processor_family() {
+    let config: VLMConfig = serde_json::from_value(json!({
+        "model_type": "qwen2_vl",
+        "text_config": {"model_type": "qwen2", "hidden_size": 8},
+        "vision_config": {
+            "model_type": "qwen2_vl",
+            "num_hidden_layers": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_attention_heads": 1,
+            "patch_size": 2,
+            "image_size": 4,
+            "num_channels": 3
+        }
+    }))
+    .unwrap();
+
+    let error = require_llava_host_family(&config).unwrap_err();
+    assert!(matches!(
+        error,
+        HostPreprocessorError::FamilyMismatch { .. }
+    ));
+}
+
+#[test]
+fn host_family_validation_accepts_floor_patch_grid_used_by_llava_interleave() {
+    let config: VLMConfig = serde_json::from_value(json!({
+        "model_type": "llava",
+        "text_config": {"model_type": "qwen2", "hidden_size": 8},
+        "vision_config": {
+            "model_type": "siglip_vision_model",
+            "num_hidden_layers": 1,
+            "hidden_size": 8,
+            "intermediate_size": 16,
+            "num_attention_heads": 1,
+            "patch_size": 14,
+            "image_size": 384,
+            "num_channels": 3
+        }
+    }))
+    .unwrap();
+
+    require_llava_host_family(&config).unwrap();
+}
+
+#[test]
+fn iree_vision_contract_processor_metadata_must_match_host_pixel_producer() {
+    let model = tempfile::tempdir().unwrap();
+    let path = model.path().join("preprocessor_config.json");
+    std::fs::write(
+        &path,
+        serde_json::to_vec(&json!({
+            "do_resize": true,
+            "do_rescale": true,
+            "do_normalize": true,
+            "rescale_factor": 1.0 / 255.0,
+            "size": {"height": 384, "width": 384},
+            "image_mean": [0.5, 0.5, 0.5],
+            "image_std": [0.5, 0.5, 0.5]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let processor = crate::vision::processors::siglip::SigLipProcessor::new(384);
+    validate_iree_processor_metadata(model.path(), &processor).unwrap();
+
+    let mut drifted: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    drifted["image_mean"] = json!([0.4, 0.5, 0.5]);
+    std::fs::write(&path, serde_json::to_vec(&drifted).unwrap()).unwrap();
+    let error = validate_iree_processor_metadata(model.path(), &processor).unwrap_err();
+    assert!(error.to_string().contains("image_mean[0]"));
 }

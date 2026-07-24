@@ -79,6 +79,24 @@ pub struct QkNorm {
     pub one_plus: bool,
 }
 
+/// How the three temporal/height/width frequency sources are assigned to the
+/// rotary-frequency columns.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MropeLayout {
+    /// Qwen2/Qwen2.5-VL: contiguous temporal, height, and width sections.
+    Chunked,
+    /// Qwen3-VL: the existing MLX step-3 axis-selection layout.
+    Interleaved,
+}
+
+/// Validated multimodal three-axis RoPE configuration.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct MropeConfig {
+    /// Section widths over the half-rotary frequency dimension, ordered T/H/W.
+    pub sections: [usize; 3],
+    pub layout: MropeLayout,
+}
+
 /// The checkpoint tensor-naming scheme (issue #499). Almost every Llama-family
 /// checkpoint uses the standard HF layout
 /// (`model.layers.{i}.self_attn.q_proj.weight`, `model.embed_tokens.weight`,
@@ -158,8 +176,66 @@ pub struct MoeConfig {
     pub weight_prefix: &'static str,
 }
 
+/// Static DeepStack schema declared by an architecture.
+///
+/// The target language-layer indices are part of the compiled artifact identity.
+/// `max_visual_positions` is the compact side-input bucket; it is deliberately
+/// independent from `context_capacity`, so the host never allocates a dense
+/// `[layers, sequence, hidden]` tensor.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DeepStackConfig {
+    pub target_layer_indices: Vec<usize>,
+    pub max_visual_positions: usize,
+}
+
+impl DeepStackConfig {
+    fn validate_structure(&self, n_layers: usize) -> Result<(), String> {
+        if self.target_layer_indices.is_empty() {
+            return Err("DeepStack requires at least one target language layer".to_string());
+        }
+        if self.max_visual_positions == 0 {
+            return Err("DeepStack max_visual_positions must be positive".to_string());
+        }
+        if self
+            .target_layer_indices
+            .windows(2)
+            .any(|pair| pair[0] >= pair[1])
+        {
+            return Err("DeepStack target language layers must be sorted and unique".to_string());
+        }
+        if let Some(&layer) = self
+            .target_layer_indices
+            .iter()
+            .find(|&&layer| layer >= n_layers)
+        {
+            return Err(format!(
+                "DeepStack target language layer {layer} is outside [0,{n_layers})"
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_capacity(&self, context_capacity: usize) -> Result<(), String> {
+        if self.max_visual_positions > context_capacity {
+            return Err(format!(
+                "DeepStack max_visual_positions={} exceeds selected context capacity {context_capacity}",
+                self.max_visual_positions
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(&self, n_layers: usize, context_capacity: usize) -> Result<(), String> {
+        self.validate_structure(n_layers)?;
+        self.validate_capacity(context_capacity)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
+    /// Static sequence dimension shared by prefill, decode, and every KV cache.
+    /// StableHLO shapes remain static; changing this value emits a distinct graph.
+    pub context_capacity: usize,
     pub hidden: usize,
     pub inter: usize,
     pub n_layers: usize,
@@ -224,6 +300,13 @@ pub struct Config {
     /// Per-layer NoPE mask (SmolLM3): `use_rope_layers[li] == false` skips RoPE on
     /// that layer (`no_rope_layers`). `None` applies RoPE on every layer.
     pub use_rope_layers: Option<Vec<bool>>,
+    /// Three-axis multimodal RoPE. `None` preserves the exact one-dimensional
+    /// prefill/decode schemas and emitted modules.
+    pub mrope: Option<MropeConfig>,
+    /// Optional sparse, prefill-only residual additions injected immediately
+    /// after selected transformer layers. Ordinary embeddings prefill and decode
+    /// ignore this declaration and keep their existing schemas.
+    pub deepstack: Option<DeepStackConfig>,
     /// Mixture-of-Experts FFN parameters (issues #500 / #501). `Some` for a MoE
     /// architecture (Mixtral, Qwen2-MoE, Qwen3-MoE, OLMoE); the FFN then routes the
     /// top-k of N experts instead of a dense MLP. `None` for a dense model, whose
@@ -307,6 +390,7 @@ impl Config {
     /// Hard-coded Llama-3.2-1B-Instruct values (config.json of the spike model).
     pub fn llama_3_2_1b() -> Self {
         Config {
+            context_capacity: crate::DEFAULT_CONTEXT_CAPACITY,
             hidden: 2048,
             inter: 8192,
             n_layers: 16,
@@ -337,6 +421,8 @@ impl Config {
             sliding_window: None,
             sliding_pattern: 2,
             use_rope_layers: None,
+            mrope: None,
+            deepstack: None,
             moe: None,
             weight_scheme: WeightScheme::Llama,
             layernorm: false,
@@ -372,8 +458,32 @@ impl Config {
     /// a `rope_scaling` whose `rope_type` is not `llama3` (e.g. yarn), or MiniCPM3's
     /// MLA attention.
     pub fn from_json_str(s: &str) -> Result<Self, String> {
-        let v: serde_json::Value =
+        let root: serde_json::Value =
             serde_json::from_str(s).map_err(|e| format!("parse config.json: {e}"))?;
+        let v = if matches!(
+            root.get("model_type").and_then(serde_json::Value::as_str),
+            Some("llava" | "llava_next")
+        ) {
+            let mut text = root
+                .get("text_config")
+                .and_then(serde_json::Value::as_object)
+                .cloned()
+                .ok_or_else(|| {
+                    "LLaVA config.json missing object `text_config` for the XLA text graph"
+                        .to_string()
+                })?;
+            // mlx-community quantized VLMs commonly keep the affine scheme at
+            // the wrapper level even though the tensors belong to the nested
+            // language model.
+            if !text.contains_key("quantization")
+                && let Some(quantization) = root.get("quantization")
+            {
+                text.insert("quantization".to_string(), quantization.clone());
+            }
+            serde_json::Value::Object(text)
+        } else {
+            root
+        };
 
         let model_type = v.get("model_type").and_then(serde_json::Value::as_str);
 
@@ -451,6 +561,50 @@ impl Config {
         let head_dim = ou("head_dim").unwrap_or(hidden / n_q.max(1));
         // ExaOne 3.x uses `num_layers` in place of `num_hidden_layers`.
         let n_layers = u_any(&["num_hidden_layers", "num_layers"])?;
+        let deepstack = match (
+            v.get("deepstack_language_layer_indices"),
+            v.get("deepstack_max_visual_positions"),
+        ) {
+            (None | Some(serde_json::Value::Null), None | Some(serde_json::Value::Null)) => None,
+            (Some(value), Some(max_visual_positions))
+                if !value.is_null() && !max_visual_positions.is_null() =>
+            {
+                let layers = value
+                    .as_array()
+                    .ok_or_else(|| {
+                        "config.json deepstack_language_layer_indices must be an integer array"
+                            .to_string()
+                    })?
+                    .iter()
+                    .map(|value| {
+                        value.as_u64().map(|layer| layer as usize).ok_or_else(|| {
+                            "config.json deepstack_language_layer_indices must contain non-negative integers"
+                                .to_string()
+                        })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                let max_visual_positions = max_visual_positions.as_u64().ok_or_else(|| {
+                    "config.json deepstack_max_visual_positions must be a positive integer"
+                        .to_string()
+                })? as usize;
+                let config = DeepStackConfig {
+                    target_layer_indices: layers,
+                    max_visual_positions,
+                };
+                // Capacity is selected by RuntimeConfig after parsing. Validate
+                // only intrinsic schema facts here so a 512-token graph may
+                // legitimately declare a compact visual maximum above the
+                // historical 256-token default.
+                config.validate_structure(n_layers)?;
+                Some(config)
+            }
+            _ => {
+                return Err(
+                    "config.json must declare DeepStack layer indices and max visual positions together"
+                        .to_string(),
+                );
+            }
+        };
 
         // Norm epsilon: `rms_norm_eps` (RMSNorm archs), else `layer_norm_eps`
         // (Cohere / StableLM LayerNorm), else `layer_norm_epsilon` (ExaOne), else
@@ -873,20 +1027,30 @@ impl Config {
         // When present, the supported schemes are llama3 (scaled) and, served as
         // plain RoPE, the `default` (identity) and in-context `dynamic` types;
         // anything else (e.g. yarn, which OLMo3 uses at full size) is a follow-up.
-        let rope = match v.get("rope_scaling") {
+        let rope_scaling = v.get("rope_scaling");
+        let rope = match rope_scaling {
             None | Some(serde_json::Value::Null) => RopeScaling::Plain,
             Some(scaling) => {
                 let rope_type = scaling
                     .get("rope_type")
                     .or_else(|| scaling.get("type"))
                     .and_then(serde_json::Value::as_str);
+                let has_mrope_section = scaling.get("mrope_section").is_some();
+                if rope_type == Some("mrope") && !has_mrope_section {
+                    return Err("config.json rope_scaling.rope_type = \"mrope\" requires \
+                         rope_scaling.mrope_section"
+                        .to_string());
+                }
                 match rope_type {
                     // `default` is HF's identity rope (Seed-OSS). `dynamic` NTK
                     // (InternLM2/3) is identity within the original context and only
                     // rescales beyond it, so short / in-context generation is served
                     // as plain RoPE here (both use `rope_theta`); the long-context
-                    // NTK rescale is a follow-up.
-                    Some("default") | Some("dynamic") => RopeScaling::Plain,
+                    // NTK rescale is a follow-up. Some Qwen/GLM configs omit the
+                    // type while carrying the M-RoPE section table; the table is
+                    // the explicit schema signal in that representation.
+                    Some("default") | Some("dynamic") | Some("mrope") => RopeScaling::Plain,
+                    None if has_mrope_section => RopeScaling::Plain,
                     Some("llama3") => {
                         let sf = |k: &str| -> Result<f64, String> {
                             scaling
@@ -920,6 +1084,71 @@ impl Config {
                         ));
                     }
                 }
+            }
+        };
+
+        let mrope = match rope_scaling.and_then(|scaling| scaling.get("mrope_section")) {
+            None => None,
+            Some(section) => {
+                let values = section.as_array().ok_or_else(|| {
+                    "config.json rope_scaling.mrope_section must be an integer array".to_string()
+                })?;
+                if values.len() != 3 {
+                    return Err(format!(
+                        "config.json rope_scaling.mrope_section must contain exactly 3 T/H/W axes, got {}",
+                        values.len()
+                    ));
+                }
+                let mut sections = [0usize; 3];
+                for (axis, value) in values.iter().enumerate() {
+                    let width = value.as_u64().ok_or_else(|| {
+                        format!(
+                            "config.json rope_scaling.mrope_section[{axis}] must be a positive integer"
+                        )
+                    })?;
+                    sections[axis] = usize::try_from(width).map_err(|_| {
+                        format!("config.json rope_scaling.mrope_section[{axis}] does not fit usize")
+                    })?;
+                    if sections[axis] == 0 {
+                        return Err(format!(
+                            "config.json rope_scaling.mrope_section[{axis}] must be positive"
+                        ));
+                    }
+                }
+                let rotary_width = rotary_dim.unwrap_or(head_dim);
+                if rotary_width == 0 || !rotary_width.is_multiple_of(2) {
+                    return Err(format!(
+                        "M-RoPE rotary width {rotary_width} must be a positive even value"
+                    ));
+                }
+                let section_sum = sections.iter().try_fold(0usize, |sum, &width| {
+                    sum.checked_add(width)
+                        .ok_or_else(|| "M-RoPE section sum overflowed".to_string())
+                })?;
+                if section_sum != rotary_width / 2 {
+                    return Err(format!(
+                        "M-RoPE T/H/W sections {sections:?} sum to {section_sum}, expected rotary_width/2 = {}",
+                        rotary_width / 2
+                    ));
+                }
+                let supported_family = matches!(model_type, Some("qwen2") | Some("qwen3"));
+                if !supported_family {
+                    return Err(format!(
+                        "M-RoPE sections are only supported by the Qwen2/Qwen3 language backbone, got model_type={model_type:?}"
+                    ));
+                }
+                let interleaved = rope_scaling
+                    .and_then(|scaling| scaling.get("mrope_interleaved"))
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(model_type == Some("qwen3"));
+                Some(MropeConfig {
+                    sections,
+                    layout: if interleaved {
+                        MropeLayout::Interleaved
+                    } else {
+                        MropeLayout::Chunked
+                    },
+                })
             }
         };
 
@@ -1016,6 +1245,7 @@ impl Config {
         let tie_word_embeddings = ob("tie_word_embeddings").unwrap_or(tie_default);
 
         Ok(Config {
+            context_capacity: crate::DEFAULT_CONTEXT_CAPACITY,
             hidden,
             inter: u("intermediate_size")?,
             n_layers,
@@ -1041,6 +1271,8 @@ impl Config {
             sliding_window,
             sliding_pattern,
             use_rope_layers,
+            mrope,
+            deepstack,
             moe,
             weight_scheme,
             layernorm,
@@ -1067,6 +1299,15 @@ impl Config {
         let p = model_dir.join("config.json");
         let s = std::fs::read_to_string(&p).map_err(|e| format!("read {}: {e}", p.display()))?;
         Self::from_json_str(&s).map_err(|e| format!("{}: {e}", p.display()))
+    }
+
+    /// Select the static sequence shape used by all emitted graphs and caches.
+    pub fn with_context_capacity(mut self, context_capacity: usize) -> Result<Self, String> {
+        self.context_capacity = crate::context::validate_context_capacity_value(context_capacity)?;
+        if let Some(deepstack) = &self.deepstack {
+            deepstack.validate(self.n_layers, self.context_capacity)?;
+        }
+        Ok(self)
     }
 
     pub fn group(&self) -> usize {
@@ -1121,6 +1362,12 @@ impl Config {
     /// else the full `head_dim` (Llama family). Always even.
     pub fn rotary_width(&self) -> usize {
         self.rotary_dim.unwrap_or(self.head_dim)
+    }
+
+    /// Whether this runtime uses an explicit T/H/W position schema.
+    #[must_use]
+    pub fn uses_mrope(&self) -> bool {
+        self.mrope.is_some()
     }
 
     /// Gemma input-embedding normalizer `sqrt(hidden)` (computed in f64 then
@@ -1331,6 +1578,109 @@ mod tests {
                 .unwrap_err()
                 .contains("model_type"),
             "unsupported model_type rejected"
+        );
+    }
+
+    #[test]
+    fn parses_and_validates_explicit_mrope_sections() {
+        let config = |model_type: &str, scaling: &str| {
+            format!(
+                r#"{{"model_type":"{model_type}","hidden_size":12,"intermediate_size":24,
+                "num_hidden_layers":2,"num_attention_heads":2,"num_key_value_heads":1,
+                "head_dim":6,"rms_norm_eps":1e-6,"rope_theta":1e6,"vocab_size":16,
+                "tie_word_embeddings":true,"hidden_act":"silu",
+                "rope_scaling":{{{scaling}}}}}"#
+            )
+        };
+        let base = |model_type: &str, section: &str, extra: &str| {
+            config(
+                model_type,
+                &format!(r#""rope_type":"mrope","mrope_section":{section}{extra}"#),
+            )
+        };
+
+        let qwen2 =
+            Config::from_json_str(&base("qwen2", "[1,1,1]", "")).expect("Qwen2 M-RoPE parses");
+        assert_eq!(
+            qwen2.mrope,
+            Some(MropeConfig {
+                sections: [1, 1, 1],
+                layout: MropeLayout::Chunked,
+            })
+        );
+        let qwen3 = Config::from_json_str(&base("qwen3", "[1,1,1]", "")).expect("Qwen3 parses");
+        assert_eq!(
+            qwen3.mrope.unwrap().layout,
+            MropeLayout::Interleaved,
+            "Qwen3 defaults to its interleaved layout"
+        );
+        let forced =
+            Config::from_json_str(&base("qwen3", "[1,1,1]", ",\"mrope_interleaved\":false"))
+                .expect("explicit layout override parses");
+        assert_eq!(forced.mrope.unwrap().layout, MropeLayout::Chunked);
+
+        let explicit_without_sections = config("qwen2", r#""rope_type":"mrope""#);
+        let error = Config::from_json_str(&explicit_without_sections)
+            .expect_err("explicit M-RoPE type without sections must fail");
+        assert!(
+            error.contains("requires rope_scaling.mrope_section"),
+            "missing-section error identifies the required schema: {error}"
+        );
+
+        for (model_type, scaling, expected_layout) in [
+            (
+                "qwen2",
+                r#""rope_type":"default","mrope_section":[1,1,1]"#,
+                MropeLayout::Chunked,
+            ),
+            (
+                "qwen3",
+                r#""mrope_section":[1,1,1]"#,
+                MropeLayout::Interleaved,
+            ),
+        ] {
+            let parsed = Config::from_json_str(&config(model_type, scaling))
+                .expect("M-RoPE sections are authoritative when rope type is default or omitted");
+            assert_eq!(parsed.mrope.expect("M-RoPE config").layout, expected_layout);
+        }
+
+        for (json, needle) in [
+            (base("qwen2", "[1,2]", ""), "exactly 3"),
+            (base("qwen2", "[1,1,0]", ""), "positive"),
+            (base("qwen2", "[1,1,2]", ""), "sum to"),
+            (base("llama", "[1,1,1]", ""), "Qwen2/Qwen3"),
+        ] {
+            let error = Config::from_json_str(&json).expect_err("invalid M-RoPE must fail");
+            assert!(
+                error.contains(needle),
+                "expected {needle:?} in validation error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn llava_wrapper_uses_nested_qwen2_text_config() {
+        let j = r#"{
+            "model_type":"llava",
+            "quantization":{"bits":4,"group_size":64},
+            "vision_config":{"model_type":"siglip_vision_model"},
+            "text_config":{
+                "model_type":"qwen2","hidden_size":1024,"intermediate_size":2816,
+                "num_hidden_layers":24,"num_attention_heads":16,"num_key_value_heads":16,
+                "rms_norm_eps":1e-6,"rope_theta":1000000,"vocab_size":152000,
+                "tie_word_embeddings":true
+            }
+        }"#;
+        let config = Config::from_json_str(j).expect("nested LLaVA text config parses");
+        assert_eq!(config.hidden, 1024);
+        assert_eq!(config.n_layers, 24);
+        assert!(config.qkv_bias);
+        assert_eq!(
+            config.quantization,
+            Some(QuantConfig {
+                bits: 4,
+                group_size: 64
+            })
         );
     }
 }

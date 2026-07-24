@@ -14,14 +14,31 @@
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use mlxcel::LoadedModel;
 use mlxcel::video;
 use mlxcel::vision::merge::InputEmbeddings;
+use mlxcel::vision::processors::ImageProcessor;
 use mlxcel::vlm_prompt::ImageTokenBlockAction;
 use mlxcel::vlm_runtime::{VlmPreparationSummary, prepare_and_compute_vlm_embeddings_with_budget};
 
 use crate::MlxcelTokenizer;
+
+fn print_audio_preprocess_summary(batch: &mlxcel::audio::AudioWaveformBatch, started: Instant) {
+    println!(
+        "Audio preprocessing [{}]: clips={}, source_seconds={:.6}, source_samples={}, \
+         normalized_samples={}, feature_frames={}, effective_audio_tokens={}, latency_ms={:.3}",
+        batch.family,
+        batch.clips.len(),
+        batch.total_source_duration_micros as f64 / 1_000_000.0,
+        batch.total_source_samples,
+        batch.total_samples,
+        batch.estimated_frames,
+        batch.effective_audio_tokens,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+}
 
 fn print_preparation_summary(summary: VlmPreparationSummary) {
     match summary {
@@ -79,6 +96,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
             println!(
                 "Gemma4: expanded audio into {} soft tokens ({} total tokens)",
                 audio_tokens, total_tokens
+            );
+        }
+        VlmPreparationSummary::Gemma3nAudio {
+            audio_clips,
+            audio_tokens,
+            total_tokens,
+        } => {
+            println!(
+                "Gemma3n: expanded {audio_clips} audio clip(s) into {audio_tokens} soft tokens ({total_tokens} total tokens)"
             );
         }
         VlmPreparationSummary::Gemma4Video {
@@ -378,6 +404,33 @@ pub(crate) fn compute_vlm_embeddings(
         ));
     }
 
+    // Phi4MM accepts one audio clip, optionally combined with images.
+    if let Some(audio) = audio_path
+        && let LoadedModel::Phi4MMVLM(phi4mm) = model
+    {
+        return compute_phi4mm_audio_embeddings(
+            phi4mm,
+            prompt_tokens,
+            prompt,
+            image_paths,
+            audio,
+            tokenizer,
+        );
+    }
+
+    // Handle audio-only and image+audio modes for Gemma 3n.
+    if let Some(audio) = audio_path
+        && let LoadedModel::Gemma3nVLM(gemma3n) = model
+    {
+        return compute_gemma3n_audio_embeddings(
+            gemma3n,
+            prompt_tokens,
+            image_paths,
+            audio,
+            tokenizer,
+        );
+    }
+
     // Handle audio-only mode for Gemma4
     if image_paths.is_empty()
         && let Some(audio) = audio_path
@@ -442,7 +495,7 @@ pub(crate) fn compute_vlm_embeddings(
     if audio_path.is_some() {
         return Err(anyhow::anyhow!(
             "--audio input is not supported for this model family. Currently audio is wired \
-             through Gemma 4, Nemotron H Nano Omni, and Qwen3-Omni MoE VLMs only."
+             through Phi4MM, Gemma 3n, Gemma 4, Nemotron H Nano Omni, and Qwen3-Omni MoE VLMs only."
         ));
     }
 
@@ -516,6 +569,190 @@ pub(crate) fn compute_vlm_embeddings(
     } else {
         Ok(None)
     }
+}
+
+/// Compute Phi4MM audio-only or mixed image+audio embeddings. The official
+/// request contract uses one numbered placeholder per clip and selects the
+/// speech adapter for audio-only or the vision adapter/projection for mixed
+/// image+audio requests.
+fn compute_phi4mm_audio_embeddings(
+    phi4mm: &mlxcel::vision::Phi4MMVLModel,
+    prompt_tokens: &mut Vec<i32>,
+    prompt: &str,
+    image_paths: &[PathBuf],
+    audio_path: &Path,
+    tokenizer: &MlxcelTokenizer,
+) -> Result<Option<InputEmbeddings>> {
+    let images: Vec<image::DynamicImage> = image_paths
+        .iter()
+        .map(|path| {
+            image::open(path)
+                .map_err(|error| anyhow::anyhow!("Failed to load image {:?}: {}", path, error))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let processed_images = phi4mm.processor.preprocess(&images);
+
+    let preprocess_started = Instant::now();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let waveform =
+        mlxcel::audio::preprocess_wav_file(audio_path, phi4mm.audio_preprocess_policy, &cancelled)
+            .map_err(anyhow::Error::msg)?;
+    print_audio_preprocess_summary(&waveform, preprocess_started);
+    let audios: Vec<_> = waveform
+        .clips
+        .into_iter()
+        .map(|clip| (clip.samples, clip.sample_rate))
+        .collect();
+    let audio_batch = phi4mm.extract_audio(&audios).map_err(anyhow::Error::msg)?;
+    let prepared = mlxcel::phi4mm_prompt::prepare_phi4mm_prompt_tokens(
+        prompt,
+        processed_images.len(),
+        1,
+        |text, add_special| {
+            tokenizer
+                .encode(text, add_special)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|token| token as i32)
+                .collect()
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    let image_sizes: Vec<usize> = processed_images
+        .iter()
+        .map(|image| image.num_img_tokens)
+        .collect();
+    *prompt_tokens = mlxcel::phi4mm_prompt::expand_phi4mm_placeholders(
+        &prepared.tokens,
+        &image_sizes,
+        &audio_batch.embed_sizes,
+    )
+    .map_err(anyhow::Error::msg)?;
+
+    let input_ids = mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings = phi4mm
+        .get_input_embeddings_with_audio(&input_ids, &processed_images, &audio_batch)
+        .map_err(anyhow::Error::msg)?;
+    println!(
+        "Phi4MM: prepared {} image(s) and one audio clip as {} prompt tokens",
+        processed_images.len(),
+        prompt_tokens.len()
+    );
+    Ok(Some(embeddings))
+}
+
+fn compute_gemma3n_audio_embeddings(
+    gemma3n: &mlxcel::vision::Gemma3nVLModel,
+    prompt_tokens: &mut Vec<i32>,
+    image_paths: &[PathBuf],
+    audio_path: &Path,
+    tokenizer: &MlxcelTokenizer,
+) -> Result<Option<InputEmbeddings>> {
+    if !gemma3n.supports_audio() {
+        return Err(anyhow::anyhow!(
+            "This Gemma3n checkpoint was loaded without audio parameters"
+        ));
+    }
+    if !image_paths.is_empty() {
+        let _ = mlxcel::vlm_prompt::apply_image_token_blocks(
+            prompt_tokens,
+            mlxcel::vlm_prompt::ImageTokenBlockInfo {
+                use_boi_eoi: true,
+                image_token_id: gemma3n.image_token_id,
+                mm_tokens_per_image: 256,
+                boi_token_id: gemma3n.boi_token_id,
+                eoi_token_id: gemma3n.eoi_token_id,
+                has_bos: true,
+                separator_token_id: None,
+                suffix_tokens: Vec::new(),
+                block_prefix_tokens: Vec::new(),
+                block_suffix_tokens: Vec::new(),
+            },
+            image_paths.len(),
+        )?;
+    }
+    let preprocess_started = Instant::now();
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
+    let waveform =
+        mlxcel::audio::preprocess_wav_file(audio_path, gemma3n.audio_preprocess_policy, &cancelled)
+            .map_err(anyhow::Error::msg)?;
+    print_audio_preprocess_summary(&waveform, preprocess_started);
+    let samples = waveform
+        .clips
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("Gemma3n audio waveform batch is empty"))?
+        .samples;
+    let batch = mlxcel::audio::gemma3n::Gemma3nAudioFeatureExtractor::new()
+        .extract_batch(&[samples])
+        .map_err(|error| anyhow::anyhow!(error))?;
+    let wrapper_tokens: Vec<i32> = tokenizer
+        .encode("\n\n", false)
+        .map_err(|error| anyhow::anyhow!("Failed to tokenize Gemma3n audio wrapper: {error}"))?
+        .into_iter()
+        .map(|token| token as i32)
+        .collect();
+    if wrapper_tokens.is_empty() {
+        return Err(anyhow::anyhow!(
+            "Gemma3n audio wrapper tokenized to an empty sequence"
+        ));
+    }
+    let end_of_turn = ["<end_of_turn>", "<turn|>"].iter().find_map(|marker| {
+        tokenizer
+            .encode(marker, false)
+            .ok()
+            .filter(|tokens| tokens.len() == 1)
+            .map(|tokens| tokens[0] as i32)
+    });
+    mlxcel::vlm_runtime::expand_gemma3n_audio_tokens(
+        prompt_tokens,
+        gemma3n.audio_token_id,
+        gemma3n.boa_token_id,
+        gemma3n.eoa_token_id,
+        1,
+        gemma3n.audio_soft_tokens_per_clip,
+        &wrapper_tokens,
+        end_of_turn,
+    )?;
+
+    let features = mlxcel_core::from_slice_f32(&batch.features, &[1, batch.frames as i32, 128]);
+    let valid: Vec<i32> = batch
+        .valid_mask
+        .iter()
+        .map(|valid| i32::from(*valid))
+        .collect();
+    let valid = mlxcel_core::astype(
+        &mlxcel_core::from_slice_i32(&valid, &[1, batch.frames as i32]),
+        mlxcel_core::dtype::BOOL,
+    );
+    let invalid = mlxcel_core::logical_not(&valid);
+    let images = image_paths
+        .iter()
+        .map(|path| {
+            image::open(path)
+                .map_err(|error| anyhow::anyhow!("Failed to load image {:?}: {error}", path))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let pixel_values = if images.is_empty() {
+        None
+    } else {
+        Some(gemma3n.processor.preprocess(&images))
+    };
+    let input_ids = mlxcel_core::from_slice_i32(prompt_tokens, &[1, prompt_tokens.len() as i32]);
+    let embeddings = gemma3n
+        .get_input_embeddings_with_media(
+            &input_ids,
+            pixel_values.as_deref(),
+            Some(&features),
+            Some(&invalid),
+        )
+        .map_err(|error| anyhow::anyhow!(error))?;
+    print_preparation_summary(VlmPreparationSummary::Gemma3nAudio {
+        audio_clips: 1,
+        audio_tokens: gemma3n.audio_soft_tokens_per_clip,
+        total_tokens: prompt_tokens.len(),
+    });
+    Ok(Some(embeddings))
 }
 
 /// Compute audio-only embeddings for Gemma4 VLM.

@@ -14,7 +14,7 @@
 
 use super::{
     build_chat_messages, build_raw_json_messages, prepare_chat_request,
-    prepare_chat_request_with_cache, request_has_effective_input,
+    prepare_chat_request_with_cache, request_has_effective_input, template_content,
 };
 use crate::server::chat_template::ChatTemplateProcessor;
 use crate::server::types::request::{InputAudio, ToolCallFunction, ToolCallInMessage, VideoUrl};
@@ -71,6 +71,123 @@ fn build_chat_messages_flattens_text_parts() {
     assert_eq!(messages[0].content, "Hello world");
 }
 
+#[test]
+fn mixed_audio_messages_preserve_global_media_order_across_turns() {
+    let request = request_with_messages(vec![
+        Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::Text {
+                    text: "u1-before".to_string(),
+                },
+                ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: "audio-a".to_string(),
+                        format: "wav".to_string(),
+                    },
+                },
+                ContentPart::Text {
+                    text: "u1-after".to_string(),
+                },
+            ]),
+            name: None,
+            tool_call_id: None,
+            reasoning: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::Assistant,
+            content: MessageContent::Text("assistant-turn".to_string()),
+            name: None,
+            tool_call_id: None,
+            reasoning: None,
+            tool_calls: None,
+        },
+        Message {
+            role: Role::User,
+            content: MessageContent::Parts(vec![
+                ContentPart::ImageUrl {
+                    image_url: ImageUrl::new("image-a"),
+                },
+                ContentPart::Text {
+                    text: "u2-middle".to_string(),
+                },
+                ContentPart::InputAudio {
+                    input_audio: InputAudio {
+                        data: "audio-b".to_string(),
+                        format: "wav".to_string(),
+                    },
+                },
+                ContentPart::Text {
+                    text: "u2-after".to_string(),
+                },
+            ]),
+            name: None,
+            tool_call_id: None,
+            reasoning: None,
+            tool_calls: None,
+        },
+    ]);
+
+    let messages = build_chat_messages(&request);
+    assert_eq!(
+        messages
+            .iter()
+            .map(|message| message.content.as_str())
+            .collect::<Vec<_>>(),
+        vec![
+            "u1-before<|mlxcel_ordered_audio_1|>u1-after",
+            "assistant-turn",
+            "<|mlxcel_ordered_image_1|>u2-middle<|mlxcel_ordered_audio_2|>u2-after",
+        ]
+    );
+    let raw = build_raw_json_messages(&request);
+    assert_eq!(
+        raw[0]["content"],
+        "u1-before<|mlxcel_ordered_audio_1|>u1-after"
+    );
+    assert_eq!(
+        raw[2]["content"],
+        "<|mlxcel_ordered_image_1|>u2-middle<|mlxcel_ordered_audio_2|>u2-after"
+    );
+}
+
+#[tokio::test]
+async fn prepare_chat_request_rejects_combined_audio_and_video_before_resolution() {
+    let request = request_with_messages(vec![Message {
+        role: Role::User,
+        content: MessageContent::Parts(vec![
+            ContentPart::InputAudio {
+                input_audio: InputAudio {
+                    data: "not-resolved".to_string(),
+                    format: "wav".to_string(),
+                },
+            },
+            ContentPart::VideoUrl {
+                video_url: VideoUrl {
+                    url: "/not/resolved.mp4".to_string(),
+                    fps: None,
+                },
+            },
+        ]),
+        name: None,
+        tool_call_id: None,
+        reasoning: None,
+        tool_calls: None,
+    }]);
+    let processor = ChatTemplateProcessor::with_template("unused".to_string());
+
+    let error = prepare_chat_request(&processor, &request, None)
+        .await
+        .err()
+        .expect("combined audio/video input must be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        "Combined video and audio inputs are not supported"
+    );
+}
+
 #[tokio::test]
 async fn prepare_chat_request_uses_template_output_and_extracts_images() {
     let request = request_with_messages(vec![Message {
@@ -88,14 +205,102 @@ async fn prepare_chat_request_uses_template_output_and_extracts_images() {
         reasoning: None,
         tool_calls: None,
     }]);
-    let processor =
-        ChatTemplateProcessor::with_template("Prompt: {{ messages[0].content }}".to_string());
+    let processor = ChatTemplateProcessor::with_template(
+        "{% for item in messages[0].content %}\
+         {% if item.type == 'image' %}<image>{% elif item.type == 'text' %}{{ item.text }}{% endif %}\
+         {% endfor %}"
+            .to_string(),
+    );
 
     let prepared = prepare_chat_request(&processor, &request, None)
         .await
         .unwrap();
-    assert_eq!(prepared.prompt, "Prompt: Look");
+    assert_eq!(prepared.prompt, "Look<image>");
     assert_eq!(prepared.image_data, vec![b"hello".to_vec()]);
+}
+
+#[tokio::test]
+async fn llava_server_render_preserves_image_marker_and_exact_prompt() {
+    let request = request_with_messages(vec![Message {
+        role: Role::User,
+        content: MessageContent::Parts(vec![
+            ContentPart::ImageUrl {
+                image_url: ImageUrl::new(
+                    "data:image/png;base64,aGVsbG8tdGVtcGxhdGUtYm91bmRhcnk=".to_string(),
+                ),
+            },
+            ContentPart::Text {
+                text: "Describe the image briefly.".to_string(),
+            },
+        ]),
+        name: None,
+        tool_call_id: None,
+        reasoning: None,
+        tool_calls: None,
+    }]);
+    let processor = ChatTemplateProcessor::with_template(
+        r#"{% for message in messages %}{{'<|im_start|>' + message['role'] + '
+'}}{% for content in message['content'] | selectattr('type', 'equalto', 'image') %}{{ '<image>' }}{% endfor %}{% if message['role'] != 'assistant' %}{% for content in message['content'] | selectattr('type', 'equalto', 'text') %}{{ '
+' + content['text'] }}{% endfor %}{% endif %}{{'<|im_end|>' + '
+'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant
+' }}{% endif %}"#
+            .to_string(),
+    );
+
+    let prepared = prepare_chat_request(&processor, &request, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        prepared.prompt,
+        "<|im_start|>user\n<image>\nDescribe the image briefly.<|im_end|>\n\
+         <|im_start|>assistant\n"
+    );
+    assert!(
+        !prepared.prompt.contains("base64"),
+        "transport payload must not enter the template prompt"
+    );
+}
+
+#[test]
+fn raw_template_content_normalizes_openai_media_types_without_payloads() {
+    let content = MessageContent::Parts(vec![
+        ContentPart::Text {
+            text: "before".to_string(),
+        },
+        ContentPart::ImageUrl {
+            image_url: ImageUrl::new("https://secret.example/image.png"),
+        },
+        ContentPart::VideoUrl {
+            video_url: VideoUrl {
+                url: "https://secret.example/video.mp4".to_string(),
+                fps: Some(2.0),
+            },
+        },
+        ContentPart::InputAudio {
+            input_audio: InputAudio {
+                data: "private-audio-data".to_string(),
+                format: "wav".to_string(),
+            },
+        },
+        ContentPart::Text {
+            text: "after".to_string(),
+        },
+    ]);
+
+    let normalized = template_content(&content, None);
+    assert_eq!(
+        normalized,
+        serde_json::json!([
+            {"type": "text", "text": "before"},
+            {"type": "image"},
+            {"type": "video"},
+            {"type": "audio"},
+            {"type": "text", "text": "after"},
+        ])
+    );
+    let serialized = normalized.to_string();
+    assert!(!serialized.contains("secret.example"));
+    assert!(!serialized.contains("private-audio-data"));
 }
 
 #[tokio::test]

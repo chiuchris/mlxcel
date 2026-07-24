@@ -80,6 +80,8 @@ mlxcel run
 
 `generate`, `serve`, and `inspect` take the same model argument via `-m`, a HuggingFace `owner/name` repo-id (auto-downloaded into the store and reused after), a bare name (resolved as `mlx-community/<name>`), or an existing local path. `mlxcel run` is a thin wrapper over `mlxcel generate` and shares its sampling and generation flags.
 
+The default model, and other thinking-capable checkpoints such as Qwen-style `<think>` models, write a chain-of-thought before the final answer. `generate` and `run` hide it from the terminal by default so only the answer prints; pass `--show-reasoning` to also print the reasoning, dimmed on a terminal. The raw `<|channel>thought` / `<channel|>` or `<think>` / `</think>` markers never print either way.
+
 Output length follows llama.cpp: with no `-n/--max-tokens` (default `-1`), `generate` / `run` keep generating until the model emits an end-of-sequence token or fills its context window. The server's `--n-predict` default (`-1`) behaves the same per request. Pass an explicit `-n N` (or `--n-predict N`) to cap output at exactly `N` tokens.
 
 ```bash
@@ -305,6 +307,7 @@ Install with `pip install ./python`. See [Python client](docs/python-client.md) 
 - [Tensor and pipeline parallelism](docs/distributed.md)
 - [TurboQuant KV cache](docs/turbo-kv-cache.md)
 - [OpenAI Responses API](docs/responses-api.md)
+- [Audio input preprocessing](docs/audio-preprocessing.md)
 - [Python client](docs/python-client.md)
 - [Adding a new model](docs/adding-models.md)
 
@@ -324,3 +327,4 @@ Apache License 2.0 unless otherwise noted, see [LICENSE](LICENSE). Third-party a
 - [mlx-lm](https://github.com/ml-explore/mlx-lm) (MIT, Copyright 2023 Apple Inc.), [mlx-vlm](https://github.com/Blaizzy/mlx-vlm) (MIT, Copyright 2025 Prince Canuma), and [mlx-audio](https://github.com/Blaizzy/mlx-audio) (MIT, Copyright 2024 Prince Canuma): Python projects whose model coverage and behavior mlxcel ports and mirrors. See [NOTICE](NOTICE).
 - [MLX Community](https://huggingface.co/mlx-community), pre-converted MLX model checkpoints
 - [turboquant_plus](https://github.com/TheTom/turboquant_plus): TurboQuant KV cache compression algorithms ported in `src/lib/mlxcel-core/src/cache/turbo/` (Apache-2.0, Copyright 2026 Tom Turney). See [NOTICE](NOTICE).
+- [FlashInfer](https://github.com/flashinfer-ai/flashinfer) (Apache-2.0, Copyright 2023-2026 FlashInfer community, Copyright 2025-2026 NVIDIA): LLM serving kernel library whose paged-attention, split-KV and cascade state-merge, and sampling algorithm designs inform mlxcel's serving-performance kernels.

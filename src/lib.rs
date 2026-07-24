@@ -27,6 +27,7 @@ pub mod lang_bias;
 pub mod lora;
 pub mod models;
 pub mod multimodal;
+pub mod reasoning_stream;
 pub mod server;
 #[cfg(feature = "surgery")]
 pub mod surgery;
@@ -74,6 +75,14 @@ pub use mlxcel_core::generate::{
     SamplingConfig,
 };
 pub use mlxcel_core::speculative::SpeculativeGenerator;
+#[cfg(feature = "xla-diagnostics")]
+pub use multimodal::host_preprocessor::LlavaHostReferenceCapture;
+#[cfg(feature = "xla-iree")]
+pub use multimodal::host_preprocessor::LlavaIreeHostPreprocessor;
+pub use multimodal::host_preprocessor::{
+    FakeHostMultimodalPreprocessor, HostMultimodalPreprocessor, HostPreprocessorError,
+    LlavaHostPreprocessor, XlaVisionBackend, load_xla_image_preprocessor,
+};
 pub use multimodal::{
     internvl_prompt, kimi_vl_prompt, minicpmo_prompt, moondream2_prompt, moondream3_prompt,
     phi3v_prompt, phi4_siglip_prompt, phi4mm_prompt, pixtral_prompt, qwen_vl, smolvlm_prompt,
@@ -88,7 +97,26 @@ pub use multimodal::{
 // the server batched path keeps using `load_model`. Under default features both
 // fold to the single MLX variant with no runtime dispatch.
 pub use backend::{Backend, ComputeBackend, MlxBackend, Session, select_backend};
-pub use mlxcel_core::session::{InferenceSession, MlxInferenceSession, SessionCapabilities};
+pub use mlxcel_core::session::{
+    InferenceSession, MlxInferenceSession, OwnedTensor, PreparedAttentionBias, PreparedModality,
+    PreparedPositions, PreparedPrefill, PreparedPrefillError, PreparedTensorDType,
+    SessionCapabilities,
+};
+pub use server::ImageInputLimits;
+
+/// Return the image admission limits shared by CLI and server requests.
+#[must_use]
+pub fn current_image_input_limits() -> ImageInputLimits {
+    server::current_image_input_limits()
+}
+
+/// Decode already-bounded image payloads with the same limits as the server.
+pub fn decode_image_payloads_with_limits(
+    images: &[Vec<u8>],
+    limits: ImageInputLimits,
+) -> anyhow::Result<Vec<image::DynamicImage>> {
+    server::model_provider::model_worker::decode_request_images_with_limits(images, limits)
+}
 
 // Re-export split modules
 pub use loaded_model::LoadedModel;

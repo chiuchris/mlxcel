@@ -181,8 +181,13 @@ fn resolve_max_batch_prefill_tokens(
 /// function lets the safety conditions be pinned by a unit test so a future
 /// edit cannot silently enable-by-default or allow video sharing.
 #[inline]
-fn vlm_prefix_sharing_allowed(enabled: bool, is_multimodal: bool, has_videos: bool) -> bool {
-    enabled && is_multimodal && !has_videos
+fn vlm_prefix_sharing_allowed(
+    enabled: bool,
+    is_multimodal: bool,
+    has_videos: bool,
+    requires_mode_restore: bool,
+) -> bool {
+    enabled && is_multimodal && !has_videos && !requires_mode_restore
 }
 
 fn effective_decode_storage_backend(
@@ -2843,6 +2848,7 @@ impl BatchScheduler {
                 images,
                 audio,
                 videos,
+                media: _,
                 response_tx,
                 cancelled,
             } => {
@@ -2882,10 +2888,18 @@ impl BatchScheduler {
         // `add_special` convention so both paths are byte-identical.
         let mut prompt_tokens: Vec<i32> = match prompt_token_ids {
             Some(ids) => ids,
-            None => match crate::server::model_provider::tokenize_prompt_for_generation(
-                &self.tokenizer,
-                &prompt,
-            ) {
+            None => match if audio.is_empty() {
+                crate::server::model_provider::tokenize_prompt_for_generation(
+                    &self.tokenizer,
+                    &prompt,
+                )
+            } else {
+                crate::server::model_provider::tokenize_prompt_for_generation_with_ordered_media(
+                    &self.tokenizer,
+                    &prompt,
+                    true,
+                )
+            } {
                 Ok(ids) => ids,
                 Err(err) => {
                     let _ = response_tx
@@ -2963,12 +2977,14 @@ impl BatchScheduler {
         // Experimental VLM prompt-prefix cache sharing (#124 step c). Off by
         // default; the operator opts in with `--enable-vlm-prefix-cache`. Video
         // payloads are excluded because video frame bytes are not folded into
-        // the request's multimodal digest yet, so a video prefix could collide
-        // with a different one in the same bucket.
+        // the request's multimodal digest yet. Phi4MM is also excluded because
+        // cache adoption cannot yet restore its per-sequence speech/vision
+        // adapter mode alongside the detached KV payload.
         let vlm_sharing_ok = vlm_prefix_sharing_allowed(
             self.enable_vlm_prefix_cache,
             is_multimodal,
             !videos.is_empty(),
+            matches!(self.model, LoadedModel::Phi4MMVLM(_)),
         );
 
         // For VLM sharing the image/audio placeholder tokens must be expanded
@@ -2990,6 +3006,8 @@ impl BatchScheduler {
                 &videos,
                 Some(self.vision_caches.as_ref()),
                 options.image_soft_tokens,
+                cancelled.as_ref(),
+                self.batch_observability.as_ref(),
             ) {
                 Ok(emb) => Some(emb),
                 Err(err) => {
@@ -3073,6 +3091,8 @@ impl BatchScheduler {
                 &videos,
                 Some(self.vision_caches.as_ref()),
                 options.image_soft_tokens,
+                cancelled.as_ref(),
+                self.batch_observability.as_ref(),
             ) {
                 Ok(emb) => emb,
                 Err(err) => {

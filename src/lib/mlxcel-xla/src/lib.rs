@@ -47,10 +47,25 @@
 
 use std::path::{Path, PathBuf};
 
-use mlxcel_core::session::{InferenceSession, SessionCapabilities};
+use mlxcel_core::session::{InferenceSession, PreparedPrefill, SessionCapabilities};
+
+mod context;
+#[cfg(any(feature = "iree", test))]
+#[cfg_attr(not(feature = "iree"), allow(dead_code))]
+mod prepared;
+mod prepared_deepstack;
+mod prepared_gemma3n;
 
 #[cfg(feature = "iree")]
+mod aux;
+#[cfg(feature = "iree")]
+mod aux_manifest;
+#[cfg(feature = "iree")]
+mod aux_smoke;
+#[cfg(feature = "iree")]
 mod iree;
+#[cfg(feature = "iree")]
+mod vision_runtime;
 
 // The continuous-batching engine (#449 M3 Stage 2b). Present under `iree` (real
 // execution) and under `test` (so its backend-neutral Scheduler bookkeeping is
@@ -99,7 +114,62 @@ mod emitter;
 mod validation;
 
 #[cfg(feature = "iree")]
-pub use batch::{EngineEvent, FinishReason, XlaBatchEngine, XlaReferenceEngine};
+pub use aux_smoke::{AuxiliaryAbiSmokeReport, run_auxiliary_abi_smoke};
+#[cfg(feature = "iree")]
+pub use batch::{EngineEvent, FinishReason, XlaAdmissionError, XlaBatchEngine, XlaReferenceEngine};
+#[cfg(feature = "diagnostics")]
+pub use batch::{
+    Gemma3nAllLayerDiagnosticRun, Gemma3nCanonicalDiagnosticRun, Gemma3nPrefixDecodeDiagnosticRun,
+    LlavaReferenceDiagnosticEngine, LlavaReferenceDiagnosticRun, run_gemma3n_all_layer_diagnostics,
+    run_gemma3n_canonical_diagnostics, run_gemma3n_prefix_decode_diagnostic,
+};
+pub use context::{
+    CONTEXT_CAPACITY_ENV, ContextCapacityError, DEFAULT_CONTEXT_CAPACITY,
+    context_capacity_from_env, validate_request_capacity,
+};
+#[cfg(all(feature = "diagnostics", xla_iree_cuda))]
+pub use emitter::{
+    run_gemma3n_altup_correct_diagnostic_probe, run_gemma3n_altup_predict_diagnostic_probe,
+    run_gemma3n_attention_diagnostic_probe, run_gemma3n_decode_attention_diagnostic_probe,
+    run_gemma3n_dense_mlp_diagnostic_probe, run_gemma3n_initial_altup_diagnostic_probe,
+    run_gemma3n_ple_diagnostic_probe, run_gemma3n_ple_injection_all_planes_diagnostic_probe,
+    run_gemma3n_ple_injection_diagnostic_probe, run_gemma3n_post_attention_diagnostic_probe,
+    run_gemma3n_qmv_diagnostic_probe, run_gemma3n_rms_diagnostic_probe,
+    run_gemma3n_sdpa_vector_context_diagnostic_probe,
+};
+#[cfg(feature = "diagnostics")]
+pub use iree::PreparedPrefillDiagnostics;
+#[cfg(feature = "diagnostics")]
+pub use vision_runtime::{IreeVisionDiagnosticProjector, VisionDiagnosticProjection};
+#[cfg(feature = "iree")]
+pub use vision_runtime::{IreeVisionProjector, VisionExecutionMetrics, VisionProjection};
+#[cfg(any(test, feature = "diagnostics"))]
+#[must_use]
+pub fn llava_diagnostic_device_memory_note(device: &str) -> &'static str {
+    if device == "cuda" {
+        "IREE CUDA reports N/A for dedicated memory on GB10 unified memory"
+    } else {
+        "the IREE C runtime integration exposes no portable device-allocation counter"
+    }
+}
+#[cfg(feature = "diagnostics")]
+pub fn dequantize_gemma3n_affine_diagnostic(
+    packed: &[u8],
+    scales: &[u8],
+    biases: &[u8],
+    out: usize,
+    in_packed: usize,
+    bits: usize,
+    group_size: usize,
+) -> Result<Vec<f32>, String> {
+    weights::dequantize_affine_bf16_fused(packed, scales, biases, out, in_packed, bits, group_size)
+}
+#[cfg(feature = "diagnostics")]
+pub use emitter::{Gemma3nDiagnosticLayout, Gemma3nDiagnosticSegment};
+#[cfg(feature = "iree")]
+pub use prepared::PreparedInputError;
+pub use prepared_deepstack::{DeepStackFeatures, DeepStackInputError, DeepStackPreparedPrefill};
+pub use prepared_gemma3n::{Gemma3nDensePle, Gemma3nDensePleError, Gemma3nPreparedPrefill};
 #[cfg(feature = "iree")]
 pub use sampler::SampleParams;
 
@@ -149,6 +219,7 @@ fn read_eos(_model_path: &Path) -> Vec<i32> {
 pub struct XlaInferenceSession {
     model_path: PathBuf,
     num_layers: usize,
+    context_capacity: usize,
     eos_token_ids: Vec<i32>,
     #[cfg(feature = "iree")]
     engine: iree::IreeLlama,
@@ -192,15 +263,27 @@ impl XlaInferenceSession {
     /// unsupported model architecture, a missing IREE distribution, an
     /// `iree-compile` failure, or a weight-loading failure.
     pub fn load(model_path: &Path, num_layers: usize) -> Result<Self, String> {
+        let context_capacity = context_capacity_from_env()?;
+        Self::load_with_context_capacity(model_path, num_layers, context_capacity)
+    }
+
+    /// Prepare a session with an explicitly selected static context capacity.
+    pub fn load_with_context_capacity(
+        model_path: &Path,
+        num_layers: usize,
+        context_capacity: usize,
+    ) -> Result<Self, String> {
+        let context_capacity = context::validate_context_capacity_value(context_capacity)?;
         let eos_token_ids = read_eos(model_path);
         #[cfg(feature = "iree")]
         {
             let device =
                 std::env::var("MLXCEL_XLA_DEVICE").unwrap_or_else(|_| default_device().to_string());
-            let engine = iree::IreeLlama::load(model_path, &device)?;
+            let engine = iree::IreeLlama::load(model_path, &device, context_capacity)?;
             Ok(Self {
                 model_path: model_path.to_path_buf(),
                 num_layers,
+                context_capacity,
                 eos_token_ids,
                 engine,
                 cache_len: 0,
@@ -211,6 +294,7 @@ impl XlaInferenceSession {
             Ok(Self {
                 model_path: model_path.to_path_buf(),
                 num_layers,
+                context_capacity,
                 eos_token_ids,
             })
         }
@@ -226,6 +310,12 @@ impl XlaInferenceSession {
     #[must_use]
     pub fn model_path(&self) -> &Path {
         &self.model_path
+    }
+
+    /// Static sequence capacity compiled into this session's graph and KV cache.
+    #[must_use]
+    pub fn context_capacity(&self) -> usize {
+        self.context_capacity
     }
 
     /// The model's EOS token ids (from `generation_config.json`), so the drive
@@ -274,6 +364,8 @@ impl XlaInferenceSession {
         if prompt_tokens.is_empty() {
             return Err("XLA generation requires a non-empty prompt".to_string());
         }
+        validate_request_capacity(prompt_tokens.len(), max_new_tokens, self.context_capacity)
+            .map_err(|err| err.to_string())?;
         // Seed KV with all but the last prompt token; the last token is the first
         // input to decode_step, which returns the first generated token. This
         // keeps decode_step's "given the previously emitted token" contract exact
@@ -293,15 +385,194 @@ impl XlaInferenceSession {
         }
         Ok(out)
     }
+
+    /// Seed KV from a complete token prompt and return the prefill argmax.
+    ///
+    /// This mirrors the batched slot-seed convention and is distinct from the
+    /// prefix-prefill-plus-decode generation loop.
+    pub fn prefill_first_token(&mut self, prompt_tokens: &[i32]) -> Result<i32, String> {
+        if prompt_tokens.is_empty() {
+            return Err("prefill_first_token requires a non-empty prompt".to_string());
+        }
+        if prompt_tokens.len() > self.context_capacity {
+            return Err(format!(
+                "prefill length {} exceeds context_capacity={}",
+                prompt_tokens.len(),
+                self.context_capacity
+            ));
+        }
+        #[cfg(feature = "iree")]
+        {
+            let first = self.engine.prefill_first(prompt_tokens)?;
+            self.cache_len = i32::try_from(prompt_tokens.len())
+                .map_err(|_| "prefill length does not fit i32".to_string())?;
+            Ok(first)
+        }
+        #[cfg(not(feature = "iree"))]
+        {
+            Err(NOT_WIRED.to_string())
+        }
+    }
+
+    /// Greedy generation seeded by an owned prepared-embeddings payload.
+    pub fn generate_prepared_greedy(
+        &mut self,
+        prepared: &PreparedPrefill,
+        max_new_tokens: usize,
+        eos_token_ids: &[i32],
+    ) -> Result<Vec<i32>, String> {
+        self.generate_prepared_streaming_greedy(prepared, max_new_tokens, eos_token_ids, |_| true)
+    }
+
+    /// Seed a Gemma3n session through its distinct embeddings-plus-dense-PLE
+    /// entry and return the first generated token.
+    pub fn prefill_gemma3n_prepared(
+        &mut self,
+        request: &Gemma3nPreparedPrefill,
+    ) -> Result<i32, String> {
+        #[cfg(feature = "iree")]
+        {
+            let first = self.engine.prefill_gemma3n_prepared_first(request)?;
+            self.cache_len = i32::try_from(request.prepared().sequence_len)
+                .map_err(|_| "prepared sequence length does not fit i32".to_string())?;
+            Ok(first)
+        }
+        #[cfg(not(feature = "iree"))]
+        {
+            let _ = request;
+            Err(NOT_WIRED.to_string())
+        }
+    }
+
+    /// Seed a session through the distinct sparse DeepStack embeddings entry.
+    pub fn prefill_deepstack_prepared(
+        &mut self,
+        request: &DeepStackPreparedPrefill,
+    ) -> Result<i32, String> {
+        #[cfg(feature = "iree")]
+        {
+            let first = self.engine.prefill_deepstack_prepared_first(request)?;
+            self.cache_len = i32::try_from(request.prepared().sequence_len)
+                .map_err(|_| "prepared sequence length does not fit i32".to_string())?;
+            Ok(first)
+        }
+        #[cfg(not(feature = "iree"))]
+        {
+            let _ = request;
+            Err(NOT_WIRED.to_string())
+        }
+    }
+
+    /// Greedy generation seeded by compact prefill-only DeepStack additions.
+    pub fn generate_deepstack_prepared_greedy(
+        &mut self,
+        request: &DeepStackPreparedPrefill,
+        max_new_tokens: usize,
+        eos_token_ids: &[i32],
+    ) -> Result<Vec<i32>, String> {
+        if max_new_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        validate_request_capacity(
+            request.prepared().sequence_len,
+            max_new_tokens,
+            self.context_capacity,
+        )
+        .map_err(|error| error.to_string())?;
+        let first = self.prefill_deepstack_prepared(request)?;
+        let mut out = Vec::with_capacity(max_new_tokens);
+        out.push(first);
+        let mut current = first;
+        while out.len() < max_new_tokens && !eos_token_ids.contains(&current) {
+            current = self.decode_step(current)?;
+            out.push(current);
+        }
+        Ok(out)
+    }
+
+    /// Greedy generation seeded by Gemma3n post-scale embeddings and dense PLE.
+    pub fn generate_gemma3n_prepared_greedy(
+        &mut self,
+        request: &Gemma3nPreparedPrefill,
+        max_new_tokens: usize,
+        eos_token_ids: &[i32],
+    ) -> Result<Vec<i32>, String> {
+        if max_new_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        validate_request_capacity(
+            request.prepared().sequence_len,
+            max_new_tokens,
+            self.context_capacity,
+        )
+        .map_err(|error| error.to_string())?;
+        let first = self.prefill_gemma3n_prepared(request)?;
+        let mut out = Vec::with_capacity(max_new_tokens);
+        out.push(first);
+        let mut current = first;
+        while out.len() < max_new_tokens && !eos_token_ids.contains(&current) {
+            current = self.decode_step(current)?;
+            out.push(current);
+        }
+        Ok(out)
+    }
+
+    /// Streaming greedy generation from prepared embeddings. The embeddings
+    /// entry seeds all `sequence_len` positions and returns the first generated
+    /// token, so decode starts at the expanded length without replaying a
+    /// placeholder or logical token.
+    pub fn generate_prepared_streaming_greedy<F: FnMut(i32) -> bool>(
+        &mut self,
+        prepared: &PreparedPrefill,
+        max_new_tokens: usize,
+        eos_token_ids: &[i32],
+        mut on_token: F,
+    ) -> Result<Vec<i32>, String> {
+        if max_new_tokens == 0 {
+            return Ok(Vec::new());
+        }
+        validate_request_capacity(prepared.sequence_len, max_new_tokens, self.context_capacity)
+            .map_err(|error| error.to_string())?;
+        let first = self.prefill_prepared(prepared)?;
+        let mut out = Vec::with_capacity(max_new_tokens);
+        out.push(first);
+        if !on_token(first) || eos_token_ids.contains(&first) {
+            return Ok(out);
+        }
+        let mut current = first;
+        while out.len() < max_new_tokens {
+            let next = self.decode_step(current)?;
+            out.push(next);
+            if !on_token(next) || eos_token_ids.contains(&next) {
+                break;
+            }
+            current = next;
+        }
+        Ok(out)
+    }
 }
 
 impl InferenceSession for XlaInferenceSession {
     fn capabilities(&self) -> SessionCapabilities {
-        SessionCapabilities::single_sequence()
+        #[cfg(feature = "iree")]
+        {
+            SessionCapabilities::single_sequence().with_multimodal()
+        }
+        #[cfg(not(feature = "iree"))]
+        {
+            SessionCapabilities::single_sequence()
+        }
     }
 
     #[cfg(feature = "iree")]
     fn prefill(&mut self, token_ids: &[i32]) -> Result<(), String> {
+        if token_ids.len() > self.context_capacity {
+            return Err(format!(
+                "prefill length {} exceeds context_capacity={}",
+                token_ids.len(),
+                self.context_capacity
+            ));
+        }
         self.engine.prefill_seed(token_ids)?;
         self.cache_len = token_ids.len() as i32;
         Ok(())
@@ -313,7 +584,26 @@ impl InferenceSession for XlaInferenceSession {
     }
 
     #[cfg(feature = "iree")]
+    fn prefill_prepared(&mut self, prepared: &PreparedPrefill) -> Result<i32, String> {
+        let first = self.engine.prefill_prepared_first(prepared)?;
+        self.cache_len = i32::try_from(prepared.sequence_len)
+            .map_err(|_| "prepared sequence length does not fit i32".to_string())?;
+        Ok(first)
+    }
+
+    #[cfg(not(feature = "iree"))]
+    fn prefill_prepared(&mut self, _prepared: &PreparedPrefill) -> Result<i32, String> {
+        Err(NOT_WIRED.to_string())
+    }
+
+    #[cfg(feature = "iree")]
     fn decode_step(&mut self, token: i32) -> Result<i32, String> {
+        if self.cache_len < 0 || self.cache_len as usize >= self.context_capacity {
+            return Err(format!(
+                "decode position {} is outside context_capacity={}",
+                self.cache_len, self.context_capacity
+            ));
+        }
         let next = self.engine.decode(token, self.cache_len)?;
         self.cache_len += 1;
         Ok(next)
@@ -332,9 +622,34 @@ impl InferenceSession for XlaInferenceSession {
 #[cfg(all(test, not(feature = "iree")))]
 mod tests {
     use super::*;
+    use mlxcel_core::session::{
+        OwnedTensor, PreparedAttentionBias, PreparedPositions, PreparedTensorDType,
+    };
 
     fn session() -> XlaInferenceSession {
         XlaInferenceSession::load(Path::new("/tmp/xla-model"), 16).unwrap()
+    }
+
+    fn prepared() -> PreparedPrefill {
+        PreparedPrefill::new(
+            vec![1],
+            OwnedTensor::new(vec![0; 4], PreparedTensorDType::Float32, vec![1, 1, 1]).unwrap(),
+            PreparedPositions::Sequential {
+                start: 0,
+                length: 1,
+            },
+            PreparedAttentionBias {
+                tensor: OwnedTensor::new(
+                    vec![0; 4],
+                    PreparedTensorDType::Float32,
+                    vec![1, 1, 1, 1],
+                )
+                .unwrap(),
+                causal: true,
+            },
+            Vec::new(),
+        )
+        .unwrap()
     }
 
     #[test]
@@ -351,12 +666,26 @@ mod tests {
         let s = session();
         assert_eq!(s.num_layers(), 16);
         assert_eq!(s.model_path(), Path::new("/tmp/xla-model"));
+        assert_eq!(s.context_capacity(), DEFAULT_CONTEXT_CAPACITY);
+    }
+
+    #[test]
+    fn explicit_context_capacity_is_recorded_and_validated() {
+        let s =
+            XlaInferenceSession::load_with_context_capacity(Path::new("/tmp/xla-model"), 16, 1024)
+                .unwrap();
+        assert_eq!(s.context_capacity(), 1024);
+        assert!(
+            XlaInferenceSession::load_with_context_capacity(Path::new("/tmp/xla-model"), 16, 0,)
+                .is_err()
+        );
     }
 
     #[test]
     fn token_primitives_report_not_wired() {
         let mut s = session();
         assert_eq!(s.prefill(&[1, 2, 3]).unwrap_err(), NOT_WIRED);
+        assert_eq!(s.prefill_prepared(&prepared()).unwrap_err(), NOT_WIRED);
         assert_eq!(s.decode_step(1).unwrap_err(), NOT_WIRED);
     }
 
@@ -367,6 +696,22 @@ mod tests {
             s.generate_greedy(&[1, 2, 3], 8, &[2]).unwrap_err(),
             NOT_WIRED
         );
+        assert_eq!(
+            s.generate_prepared_greedy(&prepared(), 8, &[2])
+                .unwrap_err(),
+            NOT_WIRED
+        );
+    }
+
+    #[test]
+    fn greedy_rejects_context_overflow_before_the_unwired_backend() {
+        let mut s =
+            XlaInferenceSession::load_with_context_capacity(Path::new("/tmp/xla-model"), 16, 8)
+                .unwrap();
+        let err = s.generate_greedy(&[1, 2, 3, 4, 5], 4, &[2]).unwrap_err();
+        assert!(err.contains("effective_prompt_len=5"));
+        assert!(err.contains("max_new_tokens=4"));
+        assert!(err.contains("context_capacity=8"));
     }
 
     #[test]
@@ -382,5 +727,39 @@ mod tests {
         assert_eq!(d, "metal");
         #[cfg(not(target_os = "macos"))]
         assert_eq!(d, "local-task");
+    }
+
+    #[test]
+    fn llava_diagnostics_share_the_production_embeddings_prefill() {
+        let c = include_str!("../csrc/xla_iree.c");
+        let diagnostic = c
+            .split("int xla_llama_prefill_embeddings_slot_diagnostics(")
+            .nth(1)
+            .expect("diagnostic C ABI")
+            .split("int xla_llama_prefill_embeddings_ple(")
+            .next()
+            .expect("bounded diagnostic C ABI");
+        assert!(diagnostic.contains("xla_llama_prefill_embeddings_impl("));
+        assert!(!diagnostic.contains("iree_runtime_call_invoke"));
+
+        let rust = include_str!("iree.rs");
+        let ffi = rust
+            .split("fn xla_llama_prefill_embeddings_slot_diagnostics(")
+            .next()
+            .expect("diagnostic Rust FFI");
+        assert!(
+            ffi.lines()
+                .rev()
+                .take(2)
+                .any(|line| line.contains("cfg(feature = \"diagnostics\")")),
+            "the diagnostic ABI must remain feature-gated"
+        );
+    }
+
+    #[test]
+    fn llava_device_memory_note_does_not_label_cpu_as_cuda() {
+        assert!(super::llava_diagnostic_device_memory_note("cuda").contains("GB10"));
+        assert!(!super::llava_diagnostic_device_memory_note("local-sync").contains("CUDA"));
+        assert!(!super::llava_diagnostic_device_memory_note("local-task").contains("GB10"));
     }
 }
