@@ -6854,25 +6854,25 @@ impl BatchScheduler {
             let mut whole_output_structured_done = false;
             if let Some(seq) = self.active_batch.get_mut(seq_id) {
                 if seq.structured.is_none() {
-                    if let Some(ref trigger_cfg) = seq.tool_trigger {
-                        if sampled_token == trigger_cfg.trigger_token_id as i32 {
-                            tracing::debug!(
-                                "tool-call trigger detected (token={sampled_token}), \
-                                 engaging constrained decoding"
-                            );
-                            match crate::server::structured::build_json_schema_constraint(
-                                &self.tokenizer,
-                                trigger_cfg.schema.clone(),
-                            ) {
-                                Ok(constraint) => {
-                                    seq.structured = Some(constraint);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "tool-call constraint build failed: {e}; \
-                                         generation will be unconstrained"
-                                    );
-                                }
+                    if let Some(ref trigger_cfg) = seq.tool_trigger
+                        && sampled_token == trigger_cfg.trigger_token_id as i32
+                    {
+                        tracing::debug!(
+                            "tool-call trigger detected (token={sampled_token}), \
+                             engaging constrained decoding"
+                        );
+                        match crate::server::structured::build_json_schema_constraint(
+                            &self.tokenizer,
+                            trigger_cfg.schema.clone(),
+                        ) {
+                            Ok(constraint) => {
+                                seq.structured = Some(constraint);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "tool-call constraint build failed: {e}; \
+                                     generation will be unconstrained"
+                                );
                             }
                         }
                     }

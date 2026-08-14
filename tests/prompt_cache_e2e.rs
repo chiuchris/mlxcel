@@ -199,9 +199,6 @@ fn resolve_drafter_path(name: &str) -> PathBuf {
 struct TurnSummary {
     /// Assistant content returned in `choices[0].message.content`.
     content: String,
-    /// Reasoning / thinking content (`choices[0].message.reasoning_content`).
-    /// `None` when absent (non-thinking models or empty thinking output).
-    reasoning_content: Option<String>,
     /// `usage.prompt_tokens`.
     prompt_tokens: u64,
     /// `usage.completion_tokens`.
@@ -287,7 +284,6 @@ async fn one_turn(
 
     TurnSummary {
         content,
-        reasoning_content: reasoning,
         prompt_tokens,
         completion_tokens,
         cached_tokens,

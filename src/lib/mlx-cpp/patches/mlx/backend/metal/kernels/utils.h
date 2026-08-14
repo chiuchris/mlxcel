@@ -76,14 +76,20 @@ struct Limits<bool> {
   static constexpr constant bool min = false;
 };
 
-template <typename T>
-struct Limits<complex_t<T>> {
-  inline static constexpr constant complex_t<T> max = complex_t<T>(
-      metal::numeric_limits<T>::infinity(),
-      metal::numeric_limits<T>::infinity());
-  inline static constexpr constant complex_t<T> min = complex_t<T>(
-      -metal::numeric_limits<T>::infinity(),
-      -metal::numeric_limits<T>::infinity());
+template <>
+struct Limits<complex64_t> {
+  static constexpr constant complex64_t max = complex64_t(
+      metal::numeric_limits<float>::infinity(),
+      metal::numeric_limits<float>::infinity());
+  static constexpr constant complex64_t min = complex64_t(
+      -metal::numeric_limits<float>::infinity(),
+      -metal::numeric_limits<float>::infinity());
+  static constexpr constant complex64_t finite_max = complex64_t(
+      metal::numeric_limits<float>::max(),
+      metal::numeric_limits<float>::max());
+  static constexpr constant complex64_t finite_min = complex64_t(
+      -metal::numeric_limits<float>::max(),
+      -metal::numeric_limits<float>::max());
 };
 
 ///////////////////////////////////////////////////////////////////////////////
