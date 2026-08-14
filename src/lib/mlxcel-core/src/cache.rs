@@ -2187,12 +2187,18 @@ impl KVCache {
             return 0;
         }
         // Pool-backed caches keep no dense `keys`/`values` buffers (#121); the
-        // block table is the authoritative store and is trimmed through the
-        // pool API (`CachePool::trim_paged_tokens` / `rewind_paged_tokens`),
-        // never the dense buffer slicing below (which would `unwrap` a `None`
-        // buffer). Treat a dense-side trim as a no-op for them.
-        if self.paged_backing.is_some() {
-            return 0;
+        // block table is the authoritative store, so trim it through the pool
+        // API before updating the cache's visible offset.
+        if let Some(backing) = self.paged_backing.clone() {
+            let trimmed = {
+                let mut pool = backing.pool.borrow_mut();
+                let mut state = backing.state.borrow_mut();
+                pool.trim_tokens(&mut state, backing.layer_idx, n as usize)
+                    .expect("PagedBlockPool::trim_tokens failed during cache trim")
+                    as i32
+            };
+            self.offset -= trimmed;
+            return trimmed;
         }
         // Turbo4Delegated: hot-first trim. Tokens to remove from cold = max(0, n - hot_len).
         // We adjust cold_offset and offset, then fall through to the per-mode buffer slicing
@@ -6756,6 +6762,31 @@ mod tests {
         assert_eq!(cache.trim(5), 2);
         assert_eq!(cache.seq_len(), 0);
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn paged_kv_cache_trim_updates_visible_length() {
+        let layout = PagedKvLayout::uniform(1, 4, 8).expect("valid paged layout");
+        let pool = std::rc::Rc::new(std::cell::RefCell::new(PagedBlockPool::new(layout.clone())));
+        let state = std::rc::Rc::new(std::cell::RefCell::new(PagedSequenceState::new(&layout)));
+        let mut cache = KVCache::new_paged(pool.clone(), state.clone(), 0);
+        let keys = ffi::from_slice_f32(&[1.0; 6], &[1, 1, 6, 1]);
+        let values = ffi::from_slice_f32(&[2.0; 6], &[1, 1, 6, 1]);
+
+        let _ = cache.update_and_fetch(keys, values);
+        assert_eq!(cache.seq_len(), 6);
+        assert_eq!(state.borrow().layer(0).unwrap().visible_len(), 6);
+        assert_eq!(pool.borrow().live_block_count(), 2);
+
+        assert_eq!(cache.trim(3), 3);
+        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(state.borrow().layer(0).unwrap().visible_len(), 3);
+        assert_eq!(pool.borrow().live_block_count(), 1);
+
+        assert_eq!(cache.trim(0), 0);
+        assert_eq!(cache.seq_len(), 3);
+        assert_eq!(state.borrow().layer(0).unwrap().visible_len(), 3);
+        assert_eq!(pool.borrow().live_block_count(), 1);
     }
 
     /// #678 repro at the cache layer: every suspect prefill shape (single-pass

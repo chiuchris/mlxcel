@@ -1972,8 +1972,7 @@ fn finalize_burst_success(
 ) -> FinalizeOutcome {
     let mut stream = begin_burst_stream(ctx.model.eos_token_ids(), &seq);
     stream_burst_tokens(ctx.tokenizer, &mut seq, &mut stream, &tokens, &logprobs);
-    let outcome = finalize_burst_stream(ctx.tokenizer, seq, &stream);
-    outcome
+    finalize_burst_stream(ctx.tokenizer, seq, &stream)
 }
 
 /// Cross-slice streaming state of a burst-produced token stream

@@ -820,12 +820,25 @@ impl DFlashGenerator {
                 }
             }
 
-            // ---- Rollback (only on partial acceptance) ----
+            // ---- Rollback (only for an uncommitted verify tail) ----
             //
             // The verify forward advanced the target's caches by `bs`
-            // tokens. We accepted `accepted` drafter proposals plus one
-            // bonus → keep `accepted + 1` positions; the remaining
+            // tokens. Normally, `accepted` drafter proposals plus one
+            // bonus are committed, so the remaining
             // `bs - (accepted + 1)` cache positions must be rolled back.
+            // If EOS stops emission inside an otherwise accepted prefix,
+            // only the emitted prefix is committed; recompute the effective
+            // accepted count from the tokens actually emitted in this round.
+            let emitted_this_round = emitted - emitted_before;
+            let rollback_accepted = if hit_eos && emitted_this_round < accepted + 1 {
+                emitted_this_round
+            } else {
+                accepted
+            };
+            debug_assert!(
+                rollback_accepted < bs,
+                "rollback prefix must stay inside the verified block"
+            );
             //
             // For Qwen 3.5 (hybrid Mamba+Transformer), rollback is
             // dual: KV trim for attention layers + GDN state replay for
@@ -833,9 +846,9 @@ impl DFlashGenerator {
             // both. This must happen before either terminal exit check below;
             // otherwise a final partial block leaves rejected positions
             // in the target cache.
-            if accepted < bs - 1 {
+            if rollback_accepted < bs - 1 {
                 let phase_start = Instant::now();
-                target.rollback_partial(caches, &verify_out, accepted as i32, bs as i32);
+                target.rollback_partial(caches, &verify_out, rollback_accepted as i32, bs as i32);
                 diagnostics.rollback_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
             }
 
@@ -1937,6 +1950,10 @@ mod tests {
         // Single round, accepted = 7 (full match prefix; the EOS at
         // index 3 of new_tokens is inside the accepted-prefix vector).
         assert_eq!(out.accept_lens, vec![7]);
+        assert_eq!(
+            caches[0].offset, 5,
+            "EOS must rewind the uncommitted verify tail"
+        );
     }
 
     /// max_tokens=1: round loop emits nothing (the caller has already
