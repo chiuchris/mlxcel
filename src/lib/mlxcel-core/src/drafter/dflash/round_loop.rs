@@ -1654,11 +1654,7 @@ mod tests {
             vec![1, 8, 15, 22, 29],
             5 * 8,
             |_position: i32, previous: i32| {
-                if previous == 103 {
-                    7
-                } else {
-                    previous + 1
-                }
+                if previous == 103 { 7 } else { previous + 1 }
             },
         );
         let mut caches: Vec<SyntheticCache> = (0..3).map(|_| SyntheticCache::default()).collect();
@@ -1694,7 +1690,10 @@ mod tests {
 
         assert_eq!(out.tokens, vec![101, 102, 103, 7]);
         assert_eq!(target.rollback_events(), vec![(3, 8)]);
-        assert_eq!(caches[0].offset, 4, "rejected EOS-block tail must be trimmed");
+        assert_eq!(
+            caches[0].offset, 4,
+            "rejected EOS-block tail must be trimmed"
+        );
     }
 
     /// Pins the expected accept-len progression for 3 rounds at
@@ -2016,11 +2015,10 @@ mod tests {
         // Run with default interval (256) — long enough to cross one
         // cadence boundary.
         let (out_with_trim, _, _) = run_synthetic_round_loop(
-            8,           // block_size
-            300,         // max_tokens — crosses the 256 boundary
-            100,         // first_bonus
-            argmax_fn,
-            propose_fn,
+            8,   // block_size
+            300, // max_tokens — crosses the 256 boundary
+            100, // first_bonus
+            argmax_fn, propose_fn,
         );
 
         // Re-run with interval effectively disabled — the round loop
@@ -2031,11 +2029,10 @@ mod tests {
         // the code under test; verify the token output is the same
         // as the fully-decoded sequence.
         let (out_no_trim, _, _) = run_synthetic_round_loop(
-            8,           // block_size
-            300,         // max_tokens
-            100,         // first_bonus
-            argmax_fn,
-            propose_fn,
+            8,   // block_size
+            300, // max_tokens
+            100, // first_bonus
+            argmax_fn, propose_fn,
         );
 
         assert_eq!(

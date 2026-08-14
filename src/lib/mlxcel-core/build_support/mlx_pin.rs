@@ -187,8 +187,7 @@ pub fn parse_pinned_commit(source: &str, path: &Path) -> Result<String, PinError
     let mlx_blocks: Vec<String> = fetch_content_declare_blocks(&uncommented)
         .into_iter()
         .filter(|block| {
-            block.contains(MLX_REPOSITORY_MARKER)
-                || block.contains(MLX_FORK_REPOSITORY_MARKER)
+            block.contains(MLX_REPOSITORY_MARKER) || block.contains(MLX_FORK_REPOSITORY_MARKER)
         })
         .collect();
 

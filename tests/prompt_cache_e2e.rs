@@ -855,7 +855,8 @@ async fn multi_turn_chat_with_drafter_reports_cached_tokens_and_no_decline() {
         "--prompt-cache-enabled=false",
     ]);
 
-    let cold_healthy = wait_for_health_soft(&client, &cold_base_url, Duration::from_secs(300)).await;
+    let cold_healthy =
+        wait_for_health_soft(&client, &cold_base_url, Duration::from_secs(300)).await;
     if !cold_healthy {
         eprintln!(
             "Skipping byte-equality phase: cold server did not become healthy at {cold_base_url}."
@@ -900,7 +901,8 @@ async fn multi_turn_chat_with_drafter_reports_cached_tokens_and_no_decline() {
         let warm_content = &warm_turns[turn_idx].content;
 
         assert_eq!(
-            cold_content, *warm_content,
+            cold_content,
+            *warm_content,
             "cold/warm byte-equality mismatch at turn {}: \
              the drafter+prompt-cache warm path diverged from the cold reference. \
              This is a speculative-decoding or prompt-cache correctness bug.\n\

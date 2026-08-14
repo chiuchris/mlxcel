@@ -1593,43 +1593,42 @@ where
     //
     // On `prefill_start_offset == 0` (cold path) keep building fresh —
     // that path must stay byte-identical to the pre-PR-B behavior.
-    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> =
-        if prefill_start_offset > 0 {
-            match qwen.take_sequence_state(seq_id) {
-                Some(caches) => {
-                    // Verify the length precondition before we touch
-                    // the caches.
-                    let all_match = caches.iter().all(|c| match c {
-                        crate::models::qwen3_next::Qwen3NextCache::Attention(kv) => {
-                            kv.seq_len().max(0) as usize == prefill_start_offset
-                        }
-                        crate::models::qwen3_next::Qwen3NextCache::Linear(gd) => {
-                            gd.offset.max(0) as usize == prefill_start_offset
-                        }
-                    });
-                    if !all_match {
-                        // Identical-replay / length-mismatch: put the
-                        // vector back and decline so the classic path
-                        // handles the edge correctly. Do not attempt to
-                        // trim — the scheduler's back-off is pre-existing
-                        // behavior.
-                        qwen.install_speculative_caches(seq_id, caches);
-                        drafter_slot.drafter = Some(owned_drafter);
-                        return Err(BurstOutcome::DeclineToClassic);
+    let mut caches: Vec<crate::models::qwen3_next::Qwen3NextCache> = if prefill_start_offset > 0 {
+        match qwen.take_sequence_state(seq_id) {
+            Some(caches) => {
+                // Verify the length precondition before we touch
+                // the caches.
+                let all_match = caches.iter().all(|c| match c {
+                    crate::models::qwen3_next::Qwen3NextCache::Attention(kv) => {
+                        kv.seq_len().max(0) as usize == prefill_start_offset
                     }
-                    caches
-                }
-                None => {
-                    // No restored state in the slot — an unexpected
-                    // condition, but decline defensively so the
-                    // classic path can recover.
+                    crate::models::qwen3_next::Qwen3NextCache::Linear(gd) => {
+                        gd.offset.max(0) as usize == prefill_start_offset
+                    }
+                });
+                if !all_match {
+                    // Identical-replay / length-mismatch: put the
+                    // vector back and decline so the classic path
+                    // handles the edge correctly. Do not attempt to
+                    // trim — the scheduler's back-off is pre-existing
+                    // behavior.
+                    qwen.install_speculative_caches(seq_id, caches);
                     drafter_slot.drafter = Some(owned_drafter);
                     return Err(BurstOutcome::DeclineToClassic);
                 }
+                caches
             }
-        } else {
-            qwen.make_dflash_caches()
-        };
+            None => {
+                // No restored state in the slot — an unexpected
+                // condition, but decline defensively so the
+                // classic path can recover.
+                drafter_slot.drafter = Some(owned_drafter);
+                return Err(BurstOutcome::DeclineToClassic);
+            }
+        }
+    } else {
+        qwen.make_dflash_caches()
+    };
 
     // Prefill the prompt through the target's speculative verify hook,
     // capturing the same per-layer hidden states the DFlash round loop
@@ -3097,7 +3096,10 @@ mod tests {
         // The model-owned cache and prompt-cache donation key both include
         // the client-visible first bonus token.
         assert_eq!(dflash_expected_cache_len(prompt_len, emitted_tokens), 2331);
-        assert_ne!(dflash_expected_cache_len(prompt_len, round_loop_tokens), 2331);
+        assert_ne!(
+            dflash_expected_cache_len(prompt_len, round_loop_tokens),
+            2331
+        );
     }
 
     #[test]

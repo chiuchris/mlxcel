@@ -72,8 +72,7 @@ fn stream_chat(request: &ChatCompletionRequest, chunks: Vec<String>) -> ChatStre
 
     let mut finish_reason = "stop".to_string();
     if tool_calls::should_parse_tool_calls(request) {
-        let parsed =
-            tool_calls::parse_tool_calls(&accumulated, request.tools.as_deref(), false);
+        let parsed = tool_calls::parse_tool_calls(&accumulated, request.tools.as_deref(), false);
         if parsed.has_tool_calls() {
             let specific = request
                 .tool_choice
@@ -153,8 +152,7 @@ fn reconstruct(chunks: Vec<ChatCompletionChunk>) -> ChatStreamResult {
 fn chat_streaming_atem_parallel_calls_match_non_streaming_and_replay() {
     let mut request = support::chat_request();
     let streamed = stream_chat(&request, support::one_byte_chunks(support::RAW_ATEM));
-    let parsed =
-        tool_calls::parse_tool_calls(support::RAW_ATEM, request.tools.as_deref(), false);
+    let parsed = tool_calls::parse_tool_calls(support::RAW_ATEM, request.tools.as_deref(), false);
     assert_eq!(parsed.format, Some(ToolCallFormat::Atem));
     let non_streaming = ChatCompletionResponse::new_with_tool_calls(
         "chatcmpl_nonstream".to_string(),

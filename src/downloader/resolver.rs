@@ -76,7 +76,6 @@
 //! revision-aware, read-only HuggingFace cache probe; mlxcel never writes into
 //! that externally-managed layout.
 
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, anyhow};

@@ -206,11 +206,8 @@ fn chat_completions_atem_non_streaming_round_trip() {
     });
     assert_rendered_replay(&render_chat_request(&request));
 
-    let final_parsed = tool_calls::parse_tool_calls(
-        "It is 29 C and lunch is scheduled.",
-        None,
-        false,
-    );
+    let final_parsed =
+        tool_calls::parse_tool_calls("It is 29 C and lunch is scheduled.", None, false);
     let final_response = ChatCompletionResponse::new(
         "chatcmpl_final".to_string(),
         MODEL.to_string(),
@@ -340,8 +337,7 @@ fn anthropic_api_atem_non_streaming_round_trip() {
     assert!(render_chat_request(&translated.chat_request).contains("Check weather"));
 
     let parsed = parse_with_tools(&translated.chat_request, RAW_ATEM);
-    let (visible, reasoning) =
-        anthropic::split_visible_reasoning(RAW_ATEM, Some(&parsed), false);
+    let (visible, reasoning) = anthropic::split_visible_reasoning(RAW_ATEM, Some(&parsed), false);
     let blocks = build_content_blocks(
         &visible,
         reasoning.as_deref(),
