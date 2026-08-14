@@ -53,6 +53,11 @@ pub(crate) struct WorkerSchedulerConfig {
     pub max_batch_size: usize,
     pub max_queue_depth: usize,
     pub prefill_chunk_size: usize,
+    /// #1011: explicit `--prefill-grant-interval` value bounding how long a
+    /// parked chunked prefill yields to a live decode batch. `None` keeps the
+    /// `MLXCEL_PREFILL_GRANT_INTERVAL` override or the shipped default;
+    /// `Some(0)` disables the grant (pre-#1011 unbounded parked wait).
+    pub prefill_grant_interval: Option<usize>,
     pub enable_preemption: bool,
     pub preemption_policy: crate::server::config::PreemptionPolicy,
     /// Maximum number of requests to batch together for prefill (default: 1).
@@ -194,6 +199,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
     sched_config: WorkerSchedulerConfig,
     batch_metrics: Arc<BatchMetrics>,
     batch_observability: Arc<BatchObservability>,
+    single_stream_queue_admission: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Re-impose fail-fast on this core generation thread under release
@@ -291,6 +297,7 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             // scheduler-specific setup below is skipped.
             let model = match model {
                 LoadedModel::DiffusionGemma(diffusion) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
                     let sampler = crate::server::diffusion_worker::parse_diffusion_sampler(
                         &sched_config.diffusion_sampler,
                     )
@@ -318,12 +325,27 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 // serve-level `--max-denoising-steps` flag maps to the LLaDA-2
                 // per-block step count.
                 LoadedModel::Llada2Moe(llada2) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
                     crate::server::diffusion_worker::run_llada2_worker_loop(
                         &llada2,
                         &tokenizer,
                         request_rx,
                         sched_config.max_denoising_steps,
                         &config_eos,
+                    );
+                    return;
+                }
+                // Florence-2 (issue #1073): encoder-decoder (seq2seq) VLM
+                // whose decode cross-attends to a per-request encoder pass;
+                // it cannot join the BatchScheduler (`supports_batching() ==
+                // false`) and is served on its dedicated batch-1 seq2seq
+                // loop off the same request channel. This branch (and its
+                // legacy-worker twin below) is what guarantees a Florence-2
+                // checkpoint never reaches a decoder-only worker loop.
+                LoadedModel::Florence2VLM(florence2) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
+                    crate::server::florence2_worker::run_florence2_worker_loop(
+                        &florence2, request_rx,
                     );
                     return;
                 }
@@ -521,6 +543,26 @@ pub(crate) fn spawn_model_worker_with_batch_config(
                 sched_config.kv_cache_budget,
             );
 
+            // #899: size the paged pool's slab so a layer's rows stay in one
+            // contiguous buffer, which is what the fused decode kernels
+            // require. Derived from the same configuration the KV budget was,
+            // and clamped by it. `None` leaves the pool default alone.
+            let paged_slab_blocks = crate::memory_estimate::resolve_paged_slab_blocks(
+                &model_path,
+                model.num_layers(),
+                crate::server::batch::scheduler::DEFAULT_PAGED_BLOCK_SIZE,
+                effective_max_batch_size.max(1) as u64,
+                sched_config.max_kv_size.unwrap_or(0) as u64,
+                false,
+                paged_block_budget,
+            );
+            if let Some(blocks) = paged_slab_blocks {
+                tracing::info!(
+                    "Paged KV slab size: {blocks} blocks per layer \
+                     (fused decode serves a layer only while its rows fit one slab)"
+                );
+            }
+
             let mut scheduler = super::super::batch::BatchScheduler::with_config(
                 model,
                 tokenizer,
@@ -539,6 +581,9 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             .with_vision_cache_size(sched_config.vision_cache_size)
             // cap the batched-prefill transient to --max-batch-prefill-tokens (#715).
             .with_max_batch_prefill_tokens(sched_config.max_batch_prefill_tokens)
+            // bound a parked chunked prefill's wait behind a live decode batch
+            // with --prefill-grant-interval (#1011).
+            .with_prefill_grant_interval(sched_config.prefill_grant_interval)
             .with_token_bias(token_bias)
             .with_xtc_newline_token_ids(xtc_newline_token_ids)
             .with_reasoning_budget(sched_config.reasoning_budget, thinking_ids)
@@ -549,6 +594,8 @@ pub(crate) fn spawn_model_worker_with_batch_config(
             .with_max_kv_size(sched_config.max_kv_size)
             // install the resolved paged KV block budget (epic #116 #122 b3).
             .with_paged_block_budget(paged_block_budget)
+            // install the resolved paged KV slab size (#899).
+            .with_paged_slab_blocks(paged_slab_blocks)
             // experimental VLM prompt-prefix cache sharing (#124 step c).
             .with_vlm_prefix_cache(sched_config.enable_vlm_prefix_cache)
             // attach the resolved speculative dispatch so the
@@ -714,11 +761,58 @@ fn resolve_worker_paged_block_budget(
             Some(n)
         }
         Some(_) => {
-            tracing::warn!(
-                "--kv-cache-budget resolves to 0 KV blocks at this configuration \
-                 (model too large for a meaningful paged budget at this batch / \
-                 available memory); leaving the paged pool unbounded"
-            );
+            // #1091: the two directives reach zero blocks for different reasons
+            // and only one of them is actionable per message, so they get
+            // separate diagnoses. `Auto` lands here when the model leaves no
+            // room for KV at all, which is a sizing problem measured in tens of
+            // gigabytes; naming the workspace reserve there would point at a few
+            // megabytes and send the operator after the wrong knob. An explicit
+            // byte budget usually lands here because of the reserve itself,
+            // which is charged to the budget before the remainder is divided
+            // into blocks (#899) and is device-derived: roughly 16 MiB for a
+            // typical geometry on every non-Metal host, so a
+            // `--kv-cache-budget 8MiB` is swallowed whole regardless of how
+            // large the model is.
+            match directive {
+                crate::memory_estimate::PagedBudgetDirective::Bytes(requested) => {
+                    let reserve = crate::memory_estimate::paged_v2_workspace_reserve_bytes(
+                        model_path,
+                        num_layers,
+                        batch.max(1) as u64,
+                    );
+                    let per_block = crate::memory_estimate::paged_block_bytes(
+                        model_path, num_layers, block_size, false,
+                    );
+                    // Unreachable in practice: `resolve_paged_block_budget`
+                    // returns `None`, not `Some(0)`, when the per-block cost is
+                    // underivable, so reaching this arm means it was `Some`.
+                    // Kept total rather than unwrapped so a future change to
+                    // that contract degrades the message instead of panicking.
+                    let threshold = match per_block {
+                        Some(bytes) => {
+                            crate::memory_estimate::format_bytes(reserve.saturating_add(bytes))
+                        }
+                        None => "an underivable amount".to_string(),
+                    };
+                    tracing::warn!(
+                        "--kv-cache-budget {} resolves to 0 KV blocks: it does not cover the \
+                         {} paged decode v2 workspace reserve plus one {block_size}-token \
+                         block, which needs at least {threshold}; leaving the paged pool \
+                         unbounded",
+                        crate::memory_estimate::format_bytes(requested),
+                        crate::memory_estimate::format_bytes(reserve),
+                    );
+                }
+                // `Disabled` returned early above and never reaches this arm.
+                crate::memory_estimate::PagedBudgetDirective::Auto
+                | crate::memory_estimate::PagedBudgetDirective::Disabled => {
+                    tracing::warn!(
+                        "--kv-cache-budget resolves to 0 KV blocks at this configuration \
+                         (model too large for a meaningful paged budget at this batch / \
+                         available memory); leaving the paged pool unbounded"
+                    );
+                }
+            }
             None
         }
         None => {
@@ -806,6 +900,7 @@ pub(crate) fn spawn_legacy_model_worker(
     worker_model_id: String,
     batch_metrics: Arc<BatchMetrics>,
     batch_observability: Arc<BatchObservability>,
+    single_stream_queue_admission: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         // Same fail-fast posture as the batched worker above (issue #375): the
@@ -875,6 +970,7 @@ pub(crate) fn spawn_legacy_model_worker(
             // the default batched worker.
             let model = match model {
                 LoadedModel::DiffusionGemma(diffusion) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
                     crate::server::diffusion_worker::run_diffusion_worker_loop(
                         &diffusion,
                         &tokenizer,
@@ -889,12 +985,23 @@ pub(crate) fn spawn_legacy_model_worker(
                 // loop. The legacy worker has no serve-level diffusion flags, so
                 // the engine step default applies (steps_override = None).
                 LoadedModel::Llada2Moe(llada2) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
                     crate::server::diffusion_worker::run_llada2_worker_loop(
                         &llada2,
                         &tokenizer,
                         request_rx,
                         None,
                         &config_eos,
+                    );
+                    return;
+                }
+                // Florence-2 (issue #1073): served on its dedicated batch-1
+                // seq2seq loop; see the batched-worker branch above. The
+                // seq2seq path has no serve-level flags to wire.
+                LoadedModel::Florence2VLM(florence2) => {
+                    single_stream_queue_admission.store(true, Ordering::Release);
+                    crate::server::florence2_worker::run_florence2_worker_loop(
+                        &florence2, request_rx,
                     );
                     return;
                 }
@@ -1126,6 +1233,13 @@ pub(crate) fn prepare_request_vlm_embeddings(
         ));
     }
     if !has_media || !model.is_vlm() {
+        if !has_media && let LoadedModel::MuseGlimmerVLM(muse) = model {
+            crate::multimodal::muse_glimmer_runtime::reject_muse_glimmer_text_fallback(
+                muse,
+                prompt_tokens,
+                0,
+            )?;
+        }
         // Moondream3 needs special prompt formatting even for text-only
         if images.is_empty() && matches!(model, LoadedModel::Moondream3VLM(_)) {
             let prepared = crate::moondream3_prompt::prepare_moondream3_prompt_tokens(
@@ -2648,6 +2762,9 @@ pub(crate) fn build_generation_result_with_cache(
         finish_reason: finish_reason.to_string(),
         logprobs: None,
         cached_tokens,
+        // Structured coordinate output is produced only by the Florence-2
+        // seq2seq worker, which builds its result directly (issue #1073).
+        structured_output: None,
     }
 }
 

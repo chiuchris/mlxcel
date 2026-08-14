@@ -22,7 +22,7 @@ use axum::{
     Json,
     extract::State,
     http::HeaderMap,
-    response::{IntoResponse, Response, sse::Sse},
+    response::{IntoResponse, Response},
 };
 
 use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
@@ -31,11 +31,15 @@ use crate::server::batch::RequestPriority;
 use crate::server::chat_request::{prepare_chat_request_with_cache, request_has_effective_input};
 use crate::server::chat_template_kwargs::{extract_request_kwargs, merge_server_and_request};
 use crate::server::config::{PromptCacheRequestContext, ReasoningBudgetOverride};
+use crate::server::model_provider::QueueFullError;
 use crate::server::prompt_cache::key::{
     multimodal_digest_from_vecs, resolve_session_key, template_sig,
 };
-use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
-use crate::server::streaming::sse_channel;
+use crate::server::request_options::{
+    RequestOptionOverrides, build_server_generate_options, chat_carries_loop_amplifier,
+    resolve_server_max_tokens,
+};
+use crate::server::streaming::{sse_channel, sse_response};
 use crate::server::structured::{StructuredOutputError, build_constraint_from_response_format};
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::tool_calls;
@@ -67,6 +71,14 @@ pub(crate) fn structured_error_to_response(err: StructuredOutputError) -> ErrorR
         StructuredOutputError::UnsupportedTokenizer(_) | StructuredOutputError::Matcher(_) => {
             ErrorResponse::new(err.to_string(), "server_error")
         }
+    }
+}
+
+fn generation_error_to_response(err: anyhow::Error) -> ErrorResponse {
+    if err.downcast_ref::<QueueFullError>().is_some() {
+        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+    } else {
+        ErrorResponse::new(format!("Generation error: {err}"), "server_error")
     }
 }
 
@@ -254,42 +266,15 @@ pub async fn chat_completions(
         .into_response();
     }
 
-    // Validate tool_choice values
-    if let Some(ref tc) = request.tool_choice {
-        match tc {
-            crate::server::types::request::ToolChoice::Mode(mode) => {
-                if !["auto", "none", "required"].contains(&mode.as_str()) {
-                    return ErrorResponse::new(
-                        format!("Invalid tool_choice value: '{mode}'. Must be 'auto', 'none', 'required', or a function object."),
-                        "invalid_request_error",
-                    )
-                    .into_response();
-                }
-            }
-            crate::server::types::request::ToolChoice::Specific(_) => {}
-        }
-    }
-
-    // Enforce tools array size limit to prevent DoS via template rendering
-    if let Some(ref tools) = request.tools
-        && tools.len() > MAX_TOOLS
-    {
-        return ErrorResponse::new(
-            format!(
-                "Too many tools: {}. Maximum allowed is {MAX_TOOLS}.",
-                tools.len()
-            ),
-            "invalid_request_error",
-        )
-        .into_response();
+    // Keep tool validation shared with the disaggregated router front so both
+    // paths reject invalid and oversized requests before template rendering.
+    if let Err(message) = validate_chat_tool_inputs(&request) {
+        return ErrorResponse::new(message, "invalid_request_error").into_response();
     }
 
     // validate thinking_budget_tokens early so malformed values
     // surface as 400 before any generation work begins.
-    let effective_max_tokens = request
-        .params
-        .max_tokens
-        .unwrap_or(state.config.default_max_tokens);
+    let effective_max_tokens = resolve_server_max_tokens(&state.config, request.params.max_tokens);
     let raw_budget = pick_budget_alias(
         request.params.thinking_budget_tokens,
         request.params.thinking_token_budget,
@@ -399,7 +384,10 @@ async fn non_stream_chat_completion(
         &prepared.audio_data,
     );
     let primed_open_thinking = is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&request.params, &state.config);
+    // Loop-detection amplifier signal (issues #967 and #977): only tool-shaped
+    // prompts arm the family default. Grammar-only requests stay disabled.
+    let amplified = chat_carries_loop_amplifier(&request);
+    let mut options = build_generate_options(&request.params, &state.config, amplified);
     options.priority = priority;
     options.reasoning_budget = budget_override;
     options.prompt_cache_ctx = prompt_cache_ctx;
@@ -464,7 +452,7 @@ async fn non_stream_chat_completion(
     // For non-video models the route guard above already rejected the
     // request, so `prepared.videos` is always empty here unless the
     // model supports video.
-    let result = state
+    let mut result = state
         .model_provider
         .generate_with_media_and_videos_declared(
             prepared.prompt,
@@ -474,7 +462,13 @@ async fn non_stream_chat_completion(
             prepared.videos,
             prepared.media,
         )
-        .map_err(|e| ErrorResponse::new(format!("Generation error: {e}"), "server_error"))?;
+        .map_err(generation_error_to_response)?;
+
+    // Structured Florence-2 task output (issue #1073): produced only by the
+    // seq2seq worker, `None` for every other family. Attached below as the
+    // assistant message's `florence2_result` extension field, next to the
+    // human-readable `content` that carries the same answer as text.
+    let florence2_result = result.structured_output.take();
 
     state.metrics.record_request(
         result.prompt_tokens,
@@ -573,7 +567,8 @@ async fn non_stream_chat_completion(
                 logprobs,
             )
             .with_cached_tokens(cached_tokens, prompt_cache_enabled)
-            .with_reasoning_content(reasoning.clone()),
+            .with_reasoning_content(reasoning.clone())
+            .with_florence2_result(florence2_result),
         ));
     }
 
@@ -597,7 +592,8 @@ async fn non_stream_chat_completion(
             logprobs,
         )
         .with_cached_tokens(cached_tokens, prompt_cache_enabled)
-        .with_reasoning_content(reasoning),
+        .with_reasoning_content(reasoning)
+        .with_florence2_result(florence2_result),
     ))
 }
 
@@ -664,7 +660,10 @@ async fn stream_chat_completion(
         &prepared.audio_data,
     );
     let primed_open_thinking = is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&request.params, &state.config);
+    // Loop-detection amplifier signal (issue #967): same derivation as the
+    // non-streaming path, so both chat surfaces resolve identically.
+    let amplified = chat_carries_loop_amplifier(&request);
+    let mut options = build_generate_options(&request.params, &state.config, amplified);
     options.priority = priority;
     options.reasoning_budget = budget_override;
     options.prompt_cache_ctx = prompt_cache_ctx;
@@ -723,6 +722,11 @@ async fn stream_chat_completion(
             top_k,
         };
     }
+
+    let queue_reservation = match state.model_provider.reserve_single_stream_queue_slot() {
+        Ok(reservation) => reservation,
+        Err(err) => return generation_error_to_response(err).into_response(),
+    };
 
     let parse_tools = tool_calls::should_parse_tool_calls(&request);
     let tools_for_parser = if parse_tools {
@@ -796,13 +800,14 @@ async fn stream_chat_completion(
 
         let result = state
             .model_provider
-            .generate_streaming_with_logprobs_cancellable_videos_declared(
+            .generate_streaming_with_logprobs_cancellable_videos_declared_reserved(
                 prepared.prompt,
                 options,
                 prepared.image_data,
                 prepared.audio_data,
                 prepared.videos,
                 prepared.media,
+                queue_reservation,
                 cancelled,
                 |token, lp_data| {
                     // Single lock per token (issue #633): accumulate raw text,
@@ -1014,9 +1019,7 @@ async fn stream_chat_completion(
         finish_events.done();
     });
 
-    Sse::new(stream)
-        .keep_alive(keepalive.into_inner())
-        .into_response()
+    sse_response(stream, keepalive)
 }
 
 /// Returns `true` when the request body carries at least one `video_url`
@@ -1052,10 +1055,33 @@ pub(crate) fn validate_xtc_params(
 }
 
 /// Maximum number of tools allowed in a single request.
-///
-/// Enforced in `chat_completions()` to prevent DoS via large tool definitions
-/// being rendered through the Jinja2 chat template.
 pub(crate) const MAX_TOOLS: usize = 128;
+
+/// Validate the chat tool fields shared by single-node and router fronts.
+///
+/// Both callers run this before chat-template rendering so an invalid
+/// `tool_choice` or oversized tool list cannot reach Jinja2. Error strings are
+/// intentionally kept byte-identical to the original single-node guards.
+pub(crate) fn validate_chat_tool_inputs(request: &ChatCompletionRequest) -> Result<(), String> {
+    if let Some(crate::server::types::request::ToolChoice::Mode(mode)) = &request.tool_choice
+        && !["auto", "none", "required"].contains(&mode.as_str())
+    {
+        return Err(format!(
+            "Invalid tool_choice value: '{mode}'. Must be 'auto', 'none', 'required', or a function object."
+        ));
+    }
+
+    if let Some(tools) = &request.tools
+        && tools.len() > MAX_TOOLS
+    {
+        return Err(format!(
+            "Too many tools: {}. Maximum allowed is {MAX_TOOLS}.",
+            tools.len()
+        ));
+    }
+
+    Ok(())
+}
 
 /// Suffixes that a rendered chat prompt uses to leave the model inside an
 /// open thinking block. Each corresponds to a family-specific reasoning
@@ -1160,7 +1186,10 @@ fn strip_unclosed_primed_thinking(content: String, raw_output: &str, primed: boo
 /// otherwise (so the response omits `reasoning_content` for non-thinking
 /// models). Tool-call blocks are suppressed by the filter and never leak into
 /// reasoning; they are materialized by the parser path instead.
-fn extract_reasoning_content(raw_text: &str, primed_open_thinking: bool) -> Option<String> {
+pub(crate) fn extract_reasoning_content(
+    raw_text: &str,
+    primed_open_thinking: bool,
+) -> Option<String> {
     let mut filter = if primed_open_thinking {
         StreamFilter::new_primed_open_thinking()
     } else {
@@ -1186,11 +1215,17 @@ fn extract_reasoning_content(raw_text: &str, primed_open_thinking: bool) -> Opti
 /// vLLM `max_pattern_size` / `min_pattern_size` / `min_count` fields, issue
 /// #432). The Gemma 4 family default-on is applied engine-side from the loaded
 /// model type in
-/// [`crate::server::request_options::build_server_generate_options`], so callers
-/// pass no amplifier signal.
+/// [`crate::server::request_options::build_server_generate_options`], but since
+/// issue #967 it also requires the request to carry an amplifier. `params`
+/// carries no tools and no `response_format`, so that signal cannot be derived
+/// here and every caller must pass it explicitly as
+/// `request_carries_loop_amplifier`. Chat-shaped callers compute it with
+/// [`crate::server::request_options::chat_carries_loop_amplifier`]; raw-prompt
+/// endpoints that accept neither tools nor a schema pass `false`.
 pub(crate) fn build_generate_options(
     params: &SamplingParams,
     config: &ServerConfig,
+    request_carries_loop_amplifier: bool,
 ) -> ServerGenerateOptions {
     build_server_generate_options(
         config,
@@ -1229,6 +1264,7 @@ pub(crate) fn build_generate_options(
                 params.min_pattern_size,
                 params.min_count,
             ),
+            request_carries_loop_amplifier,
         },
     )
 }
@@ -1475,7 +1511,7 @@ mod tests {
         let raw = "<|channel>thought\ndeliberating<channel|>the answer";
         assert_eq!(
             extract_reasoning_content(raw, false),
-            Some("thought\ndeliberating".to_string())
+            Some("\ndeliberating".to_string())
         );
     }
 

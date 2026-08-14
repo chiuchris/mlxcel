@@ -129,6 +129,9 @@ pub struct ServerStartupConfig {
     /// [`super::ServerStartupInput::into_startup_config`] and forwarded to
     /// [`super::config::ServerConfig`].
     pub cors_allowed_origins: Option<Vec<axum::http::HeaderValue>>,
+    /// #1011: `--prefill-grant-interval`. `None` keeps the env override /
+    /// shipped default; `Some(0)` disables the fairness grant.
+    pub prefill_grant_interval: Option<usize>,
     /// Preemption policy string from CLI (parsed into enum at build_server_config).
     pub preemption_policy: String,
     /// Force the legacy sequential worker, bypassing the batch scheduler.
@@ -147,8 +150,11 @@ pub struct ServerStartupConfig {
 
     // Default sampling
     pub temperature: f32,
+    pub temperature_was_set: bool,
     pub top_k: i32,
+    pub top_k_was_set: bool,
     pub top_p: f32,
+    pub top_p_was_set: bool,
     pub min_p: f32,
     pub seed: Option<u64>,
     pub repeat_last_n: usize,
@@ -412,6 +418,8 @@ impl Default for ServerStartupConfig {
             enable_preemption: false,
             enable_vlm_prefix_cache: false,
             cors_allowed_origins: None,
+            // #1011: unset -> scheduler resolves the env override / default.
+            prefill_grant_interval: None,
             preemption_policy: "longest-first".to_string(),
             no_batch: false,
             // Serving-throughput default: batched prefill up to 4 requests (#628).
@@ -426,8 +434,11 @@ impl Default for ServerStartupConfig {
             enable_metrics: false,
             warmup: true,
             temperature: 0.8,
+            temperature_was_set: false,
             top_k: 40,
+            top_k_was_set: false,
             top_p: 0.9,
+            top_p_was_set: false,
             min_p: 0.1,
             seed: None,
             repeat_last_n: 64,
@@ -751,6 +762,77 @@ fn detect_model_media_support(model_path: &Path) -> ModelMediaSupport {
     ModelMediaSupport { video }
 }
 
+fn is_muse_glimmer_model_path(model_path: &Path) -> bool {
+    matches!(
+        crate::models::get_model_type(model_path),
+        Ok(crate::models::ModelType::MuseGlimmerVLM)
+    )
+}
+
+fn xla_backend_requested_from_env() -> bool {
+    std::env::var("MLXCEL_BACKEND")
+        .ok()
+        .is_some_and(|backend| backend.eq_ignore_ascii_case("xla"))
+}
+
+fn muse_glimmer_distributed_requested(startup: &ServerStartupConfig) -> bool {
+    startup.distributed_config.is_some()
+        || startup.node_role.is_some()
+        || !startup.peers.is_empty()
+        || !startup.prefill_peers.is_empty()
+        || !startup.decode_peers.is_empty()
+        || startup.serving_bind.is_some()
+}
+
+fn validate_muse_glimmer_unsupported_startup(startup: &ServerStartupConfig) -> Result<()> {
+    if !is_muse_glimmer_model_path(&startup.model_path) {
+        return Ok(());
+    }
+
+    anyhow::ensure!(
+        startup.adapter_path.is_none(),
+        "Muse Glimmer VLM does not support LoRA/adapters; remove --adapter/--lora"
+    );
+    anyhow::ensure!(
+        startup.draft_model_path.is_none()
+            && startup.draft_kind.is_none()
+            && startup.draft_block_size.is_none(),
+        "Muse Glimmer VLM does not support speculative decoding or DFlash; remove \
+         --draft-model/--model-draft, --draft-kind, and --draft-block-size"
+    );
+    anyhow::ensure!(
+        startup.kv_cache_mode == mlxcel_core::cache::KVCacheMode::Fp16
+            && !startup.batch_kv_quant.is_enabled(),
+        "Muse Glimmer VLM does not support INT8/Turbo KV cache modes or batch KV \
+         quantization because it owns mixed sliding/full caches; use fp16 KV cache \
+         mode and leave --kv-bits 0"
+    );
+    anyhow::ensure!(
+        startup.tp_size == 1,
+        "Muse Glimmer VLM does not support tensor-parallel inference yet; use --tp-size 1"
+    );
+    anyhow::ensure!(
+        startup.pp_layers.is_none()
+            && startup.pp_auto.is_none()
+            && !startup.pp_peer
+            && !startup.enable_elastic_pp,
+        "Muse Glimmer VLM does not support pipeline-parallel inference yet; remove \
+         --pp-* and elastic-PP flags"
+    );
+    anyhow::ensure!(
+        !muse_glimmer_distributed_requested(startup),
+        "Muse Glimmer VLM does not support distributed or disaggregated serving yet; \
+         run a single-process MLX server"
+    );
+    anyhow::ensure!(
+        !xla_backend_requested_from_env(),
+        "Muse Glimmer VLM does not support XLA/IREE/OpenXLA execution yet; unset \
+         MLXCEL_BACKEND=xla"
+    );
+
+    Ok(())
+}
+
 /// Resolve chat template from override string, file, or model's tokenizer metadata.
 pub(super) fn resolve_chat_template(
     template_override: Option<&str>,
@@ -812,6 +894,7 @@ pub(super) fn build_server_config(
         startup.no_batch,
     );
     let max_kv_size = resolve_context_kv_cap(context_size, startup.max_kv_size);
+    let sampling_defaults = resolve_generation_sampling_defaults(startup);
     // Derive the disaggregated serving role from `--node-role` (#126 B2). The
     // role string was already validated in `resolve_distributed_startup`, so a
     // parse failure here falls back to the single-node `Hybrid` default rather
@@ -844,9 +927,9 @@ pub(super) fn build_server_config(
         enable_slots_endpoint: startup.enable_slots,
         enable_props_endpoint: startup.enable_props,
         enable_metrics_endpoint: startup.enable_metrics,
-        default_temperature: startup.temperature,
-        default_top_p: startup.top_p,
-        default_top_k: startup.top_k,
+        default_temperature: sampling_defaults.temperature,
+        default_top_p: sampling_defaults.top_p,
+        default_top_k: sampling_defaults.top_k,
         default_min_p: startup.min_p,
         default_repetition_penalty: startup.repeat_penalty,
         default_repetition_context_size: startup.repeat_last_n,
@@ -862,6 +945,12 @@ pub(super) fn build_server_config(
         default_dry_base: startup.dry_base,
         default_dry_allowed_length: startup.dry_allowed_length,
         default_dry_penalty_last_n: resolve_dry_penalty_last_n(startup.dry_penalty_last_n),
+        // Left empty here on purpose: `--dry-sequence-breaker` takes token
+        // strings and the sampler takes token IDs, so resolving it needs the
+        // tokenizer, which `start_server` loads after this function returns. It
+        // fills the field there and fails startup on a breaker it cannot
+        // represent (#1103).
+        default_dry_sequence_breakers: Vec::new(),
         draft_model_path: startup.draft_model_path.clone(),
         num_draft_tokens: startup.draft_max,
         // forward the speculative-decoding selector flags
@@ -877,6 +966,9 @@ pub(super) fn build_server_config(
         audio_queue_depth: startup.audio_queue_depth,
         audio_request_timeout_secs: startup.audio_request_timeout_secs,
         prefill_chunk_size: startup.prefill_chunk_size,
+        // #1011: pass the explicit --prefill-grant-interval through untouched
+        // (the scheduler resolves env / shipped default when this is None).
+        prefill_grant_interval: startup.prefill_grant_interval,
         enable_preemption: startup.enable_preemption,
         preemption_policy: parse_preemption_policy(&startup.preemption_policy),
         no_batch: startup.no_batch,
@@ -937,10 +1029,41 @@ pub(super) fn build_server_config(
         // Global loop-detection override (issue #432) from `MLXCEL_LOOP_DETECTION`.
         // `None` means the per-family auto-enable policy applies.
         loop_detection: resolve_loop_detection_env(),
-        // Whether the loaded model is in the Gemma 4 family, used to turn on
-        // the loop-detection default-on for the family unconditionally (not
-        // gated on tools or a `json_schema` response_format).
+        // Whether the loaded model is in the Gemma 4 family. Combined with the
+        // per-request tool-shaped prompt flag (issues #967 and #977), this turns
+        // on the loop-detection default for protected traffic; plain and
+        // grammar-only requests stay disabled.
         model_is_gemma4_family: detect_gemma4_family(&startup.model_path),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ResolvedGenerationSamplingDefaults {
+    pub temperature: f32,
+    pub top_p: f32,
+    pub top_k: i32,
+}
+
+pub(super) fn resolve_generation_sampling_defaults(
+    startup: &ServerStartupConfig,
+) -> ResolvedGenerationSamplingDefaults {
+    let config_defaults = crate::read_generation_config_defaults(&startup.model_path);
+    ResolvedGenerationSamplingDefaults {
+        temperature: if startup.temperature_was_set {
+            startup.temperature
+        } else {
+            config_defaults.temperature.unwrap_or(startup.temperature)
+        },
+        top_p: if startup.top_p_was_set {
+            startup.top_p
+        } else {
+            config_defaults.top_p.unwrap_or(startup.top_p)
+        },
+        top_k: if startup.top_k_was_set {
+            startup.top_k
+        } else {
+            config_defaults.top_k.unwrap_or(startup.top_k)
+        },
     }
 }
 
@@ -962,8 +1085,8 @@ fn detect_gemma4_family(model_path: &Path) -> bool {
 /// - `off` / `0` / `none` / `false` / `disabled`: force-disable for every
 ///   request (`Some(disabled)`), still overridable per request.
 /// - `on` / `default` / `true` / `enabled`: force the recommended threshold
-///   (`min=1, max=20, count=4`).
-/// - `MIN,MAX,COUNT` or `MIN:MAX:COUNT`: an explicit triple, e.g. `1,20,4`.
+///   (`min=1, max=20, count=12`).
+/// - `MIN,MAX,COUNT` or `MIN:MAX:COUNT`: an explicit triple, e.g. `1,20,12`.
 ///
 /// A malformed value warns and returns `None` so a typo does not silently
 /// change generation behavior.
@@ -994,7 +1117,7 @@ fn resolve_loop_detection_env() -> Option<mlxcel_core::LoopDetectionConfig> {
     }
     tracing::warn!(
         "MLXCEL_LOOP_DETECTION=\"{raw}\" is not valid; expected off/on or MIN,MAX,COUNT \
-         (e.g. 1,20,4). Ignoring."
+         (e.g. 1,20,12). Ignoring."
     );
     None
 }
@@ -1565,19 +1688,33 @@ fn install_surgery_pipeline_for_server(startup: &ServerStartupConfig) -> Result<
 pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     initialize_server_logging(&startup)?;
 
-    // Issue #688 (M1/M2 hardening), extended to DeepSeek-V2 by issue #824: disable
-    // CUDA graph capture for hazard-family models (Gemma 4, DeepSeek-V2) here, on
-    // the main startup thread, before any generation or pipeline worker is spawned
-    // and before the first GPU eval latches MLX's process-wide `use_cuda_graphs`
-    // static. Performing the env write on this thread (rather than only at the
-    // per-load-site calls, which run inside the spawned worker) keeps it sound
-    // under Rust 2024's concurrent-getenv rule. This single chokepoint covers every
-    // serve path that flows through `start_server`: the batched, legacy,
-    // tensor-parallel and XLA workers, the in-process pipeline-parallel worker, and
-    // the remote pipeline stage worker (the `serve_remote_pipeline_stage` branch
-    // below) — all load `startup.model_path`. Unaffected model families and an
-    // explicit `MLX_USE_CUDA_GRAPHS` operator override are left untouched.
+    // Florence-2 (issue #1073): the encoder-decoder (seq2seq) family is
+    // served on its dedicated worker loop (`server/florence2_worker.rs`),
+    // which the model worker thread branches into after loading the
+    // checkpoint, before any decoder-only scheduler starts. The #856-era
+    // startup refusal is gone; the flag below only gates the text-only
+    // warmup, which cannot run against an image-task model.
+    let is_florence2 = matches!(
+        crate::models::get_model_type(&startup.model_path),
+        Ok(crate::models::ModelType::Florence2VLM)
+    );
+
+    // Issue #688 (M1/M2 hardening): disable CUDA graph capture for hazard-family
+    // models (Gemma 4) here, on the main startup thread, before any generation or
+    // pipeline worker is spawned and before the first GPU eval latches MLX's
+    // process-wide `use_cuda_graphs` static. (DeepSeek-V2 was on this lever from
+    // #829 to #831; its collapse turned out to be the broken RMSNorm overlay, not
+    // graph capture, so the family was removed.) Performing the env write on this
+    // thread (rather than only at the per-load-site calls, which run inside the
+    // spawned worker) keeps it sound under Rust 2024's concurrent-getenv rule. This
+    // single chokepoint covers every serve path that flows through `start_server`:
+    // the batched, legacy, tensor-parallel and XLA workers, the in-process
+    // pipeline-parallel worker, and the remote pipeline stage worker (the
+    // `serve_remote_pipeline_stage` branch below) all load `startup.model_path`.
+    // Unaffected model families and an explicit `MLX_USE_CUDA_GRAPHS` operator
+    // override are left untouched.
     crate::loading::maybe_disable_cuda_graphs_for_model_for_path(&startup.model_path);
+    validate_muse_glimmer_unsupported_startup(&startup)?;
 
     super::media::configure_image_input_limits(super::media::ImageInputLimits {
         max_payload_bytes: startup.max_image_payload_size,
@@ -1736,6 +1873,32 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
     )?;
     let tokenizer = crate::tokenizer::load_tokenizer(&startup.model_path)?;
 
+    // `--dry-sequence-breaker` takes token strings and the sampler takes token
+    // IDs, so this is the first point in startup where the flag can be
+    // resolved. Failing here rather than dropping an unrepresentable breaker
+    // is deliberate: an inert breaker makes the DRY penalty stronger than the
+    // operator configured, with nothing in the logs or `/props` to say so
+    // (#1103).
+    config.default_dry_sequence_breakers = super::dry_breakers::resolve_dry_sequence_breakers(
+        &tokenizer,
+        &startup.dry_sequence_breakers,
+    )?;
+    if !config.default_dry_sequence_breakers.is_empty() {
+        // The decoded pieces are logged alongside the ids because an id on its
+        // own cannot be checked. A tokenizer that prepends a word-boundary
+        // marker can resolve a plausible-looking id for the wrong token, and
+        // the piece is the only place that shows it.
+        tracing::info!(
+            breakers = ?startup.dry_sequence_breakers,
+            token_ids = ?config.default_dry_sequence_breakers,
+            pieces = %super::dry_breakers::describe_resolved_breakers(
+                &tokenizer,
+                &config.default_dry_sequence_breakers,
+            ),
+            "DRY sequence breakers resolved to token IDs"
+        );
+    }
+
     // align the chat-template `enable_thinking` Jinja kwarg
     // default with upstream `TokenizerWrapper.apply_chat_template`'s
     // `enable_thinking=self.has_thinking` behavior. When the underlying
@@ -1877,7 +2040,13 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
         batch_observability.clone(),
     )?);
 
-    if startup.warmup {
+    if startup.warmup && is_florence2 {
+        // The warmup prompt is the text literal "Hello"; the Florence-2
+        // seq2seq worker rejects any request that is not a task marker with
+        // exactly one image, so a warmup attempt would only log a spurious
+        // failure. The worker warms on its first real request instead.
+        tracing::info!("Skipping text warmup for Florence-2 (image-task seq2seq model)");
+    } else if startup.warmup {
         tracing::info!("Warming up model...");
         match warmup_model(model_provider.as_ref()) {
             Ok(()) => tracing::info!("Warmup complete"),
@@ -2044,3 +2213,7 @@ pub async fn start_server(mut startup: ServerStartupConfig) -> Result<()> {
 #[cfg(test)]
 #[path = "startup_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "muse_glimmer_startup_guard_tests.rs"]
+mod muse_glimmer_startup_guard_tests;

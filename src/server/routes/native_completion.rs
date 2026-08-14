@@ -24,18 +24,30 @@ use axum::{
     Json,
     extract::State,
     http::HeaderMap,
-    response::{IntoResponse, Response, sse::Sse},
+    response::{IntoResponse, Response},
 };
 
 use crate::server::batch::RequestPriority;
 use crate::server::config::ReasoningBudgetOverride;
-use crate::server::request_options::{RequestOptionOverrides, build_server_generate_options};
-use crate::server::streaming::sse_channel;
+use crate::server::media::MediaRequestMetadata;
+use crate::server::model_provider::QueueFullError;
+use crate::server::request_options::{
+    RequestOptionOverrides, build_server_generate_options, resolve_server_max_tokens,
+};
+use crate::server::streaming::{sse_channel, sse_response};
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::types::{
     ErrorResponse, NativeCompletionRequest, NativeCompletionResponse, TimingInfo,
 };
 use crate::server::{AppState, ServerConfig, ServerGenerateOptions};
+
+fn generation_error_to_response(err: anyhow::Error) -> ErrorResponse {
+    if err.downcast_ref::<QueueFullError>().is_some() {
+        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+    } else {
+        ErrorResponse::new(format!("Generation error: {err}"), "server_error")
+    }
+}
 
 /// POST /completion
 pub async fn native_completion(
@@ -68,7 +80,7 @@ pub async fn native_completion(
 
     // validate thinking_budget_tokens early (semantics match
     // /v1/chat/completions but the cap is checked against n_predict).
-    let effective_n_predict = request.n_predict.unwrap_or(state.config.default_max_tokens);
+    let effective_n_predict = resolve_server_max_tokens(&state.config, request.n_predict);
     let raw_budget = pick_budget_alias(
         request.thinking_budget_tokens,
         request.thinking_token_budget,
@@ -128,7 +140,7 @@ async fn non_stream_native_completion(
     let result = state
         .model_provider
         .generate(request.prompt.clone(), options)
-        .map_err(|e| ErrorResponse::new(format!("Generation error: {}", e), "server_error"))?;
+        .map_err(generation_error_to_response)?;
 
     let prompt_ms = result.prompt_eval_ms as f64;
     let gen_ms = result.generation_only_ms as f64;
@@ -192,6 +204,11 @@ async fn stream_native_completion(
     options.reasoning_budget = budget_override;
     let prompt = request.prompt.clone();
 
+    let queue_reservation = match state.model_provider.reserve_single_stream_queue_slot() {
+        Ok(reservation) => reservation,
+        Err(err) => return generation_error_to_response(err).into_response(),
+    };
+
     // sse_channel also returns an SseKeepAlive for proxy
     // idle-timeout prevention during long prefill phases.
     let (events, stream, cancelled, keepalive) = sse_channel(100);
@@ -200,18 +217,25 @@ async fn stream_native_completion(
     tokio::task::spawn_blocking(move || {
         let token_events = finish_events.clone();
 
-        let result = state.model_provider.generate_streaming_cancellable(
-            prompt,
-            options,
-            cancelled,
-            |token| {
-                let chunk = serde_json::json!({
-                    "content": token,
-                    "stop": false,
-                });
-                let _ = token_events.json(&chunk);
-            },
-        );
+        let result = state
+            .model_provider
+            .generate_streaming_with_logprobs_cancellable_videos_declared_reserved(
+                prompt,
+                options,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                MediaRequestMetadata::default(),
+                queue_reservation,
+                cancelled,
+                |token, _lp| {
+                    let chunk = serde_json::json!({
+                        "content": token,
+                        "stop": false,
+                    });
+                    let _ = token_events.json(&chunk);
+                },
+            );
 
         // Send final chunk
         let stop = match &result {
@@ -226,9 +250,7 @@ async fn stream_native_completion(
         let _ = finish_events.json(&final_chunk);
     });
 
-    Sse::new(stream)
-        .keep_alive(keepalive.into_inner())
-        .into_response()
+    sse_response(stream, keepalive)
 }
 
 fn build_native_options(
@@ -274,10 +296,18 @@ fn build_native_generate_options(
             // in-block counting to start at the first decoded token.
             thinking_enter_block_on_start: false,
             // The native `/completion` endpoint has no per-request
-            // loop-detection field. The Gemma 4 family default-on and the
-            // global `MLXCEL_LOOP_DETECTION` override still apply engine-side
-            // via `resolve_loop_detection`.
+            // loop-detection field, so the policy is resolved engine-side by
+            // `resolve_loop_detection`.
             loop_detection_request: None,
+            // The endpoint takes a raw prompt with no `tools`, and while it
+            // does accept `response_format`, the guard at the top of this
+            // module rejects anything other than `{"type": "text"}` with a 400,
+            // so no grammar constraint can ever be active here. Neither half of
+            // the amplifier signal is reachable. Since issue #967 the Gemma 4
+            // family default-on is gated on that signal and therefore no longer
+            // applies here; a global `MLXCEL_LOOP_DETECTION` override still
+            // does, and remains the way to enable detection on this endpoint.
+            request_carries_loop_amplifier: false,
         },
     )
 }

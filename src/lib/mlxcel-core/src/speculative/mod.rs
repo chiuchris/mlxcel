@@ -28,6 +28,25 @@
 //!    c. Accept matching prefix, rewind caches for rejected tokens
 //!    d. Continue from the divergence point
 //!
+//! Step 3c is the acceptance rule. At `temperature == 0` it is the argmax
+//! comparison described above. At `temperature > 0` it is modified rejection
+//! sampling, which preserves the target model's distribution exactly; see
+//! [`stochastic_accept`].
+//!
+//! ## Cache invariant
+//!
+//! Both models must condition on the same prefix, or the drafter proposes
+//! against a context the target has already moved past and acceptance decays.
+//! At every round boundary the main and draft KV caches therefore hold the
+//! prompt plus every emitted token except the pending `current_token`, which
+//! the next round forwards itself. The two caches rewind by different amounts
+//! to get there: the verify pass forwards one token more than the draft loop
+//! does, so on a round that rejects, the draft trim is one *less* than the main
+//! trim. The one entry that cannot be reached by trimming at all is the last
+//! proposal on a fully-accepted round, which the draft loop never forwarded;
+//! it is carried in [`SpeculativeGenerator::pending_draft_context`] and
+//! replayed at the head of the next round's first draft forward.
+//!
 //! ## Sibling modules
 //!
 //! - [`mtp`] — Multi-Token Prediction (MTP) round-loop generator for the
@@ -36,22 +55,30 @@
 //!   (drafter has no own KV cache; verify is a single forward over the
 //!   whole draft block; rollback uses per-row tail-zero rather than
 //!   `trim_caches`). See [`mtp::MtpGenerator`].
+//! - [`stochastic_accept`] — the distribution-preserving acceptance rule and
+//!   its residual resample, shared by every speculative verify path.
 
 pub mod mtp;
+pub mod stochastic_accept;
 
 use crate::cache::can_trim_prompt_cache;
 use crate::ffi;
+use crate::ffi::MlxArray;
 use crate::ffi::MlxThreadLocalStream;
 use crate::generate::{GenerationStats, LanguageModel, SamplingConfig};
 use crate::generation_policy::{initial_token_history, merged_eos_token_ids};
 use crate::hardware;
 use crate::layers::KVCache;
-use crate::sampling::{TokenBiasMap, sample_token_optimized};
+use crate::sampling::{
+    TokenBiasMap, effective_token_distribution, sample_token_optimized,
+    sample_token_with_distribution,
+};
 use crate::streams::{install_thread_local_default_stream, new_thread_local_generation_stream};
 use crate::utils::{align_to_na_tile, create_padded_prefill_mask};
 use cxx::UniquePtr;
 use std::borrow::Cow;
 use std::time::Instant;
+use stochastic_accept::{AcceptanceRule, DraftVerdict};
 
 /// Default chunk size for chunked prefill in speculative decoding.
 ///
@@ -69,6 +96,123 @@ fn should_align_verification() -> bool {
     hw.has_neural_accelerator && hw.macos_supports_na
 }
 
+/// Acceptance accounting for one [`SpeculativeGenerator::generate`] call.
+///
+/// The two ratios are the quantities the acceptance change is supposed to
+/// move: [`Self::acceptance_rate`] should rise from about `sum_x p(x) q(x)`
+/// under the old rule to about `sum_x min(p(x), q(x))` under modified
+/// rejection sampling, and [`Self::mean_accepted_len`] is the per-round
+/// version that drives end-to-end throughput.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SpeculativeAcceptanceStats {
+    /// Verify rounds executed (one batched target forward each).
+    pub rounds: usize,
+    /// Draft tokens proposed across all rounds.
+    pub proposed_draft_tokens: usize,
+    /// Draft tokens the verify rule accepted.
+    pub accepted_draft_tokens: usize,
+    /// The acceptance rule the run actually used.
+    pub rule: Option<AcceptanceRule>,
+    /// Verify positions the accept test actually ran on. Differs from
+    /// `proposed_draft_tokens` because a chain stops at its first rejection, so
+    /// positions after it are proposed but never tested.
+    pub positions_tested: usize,
+    /// Running sum of `sum_x min(p(x), q(x))` over tested positions, the
+    /// closed-form probability modified rejection sampling accepts. Zero unless
+    /// [`stochastic_accept::accept_diagnostics_enabled`].
+    pub closed_form_sum_min: f64,
+    /// Running sum of `sum_x p(x) q(x)` over tested positions, the closed-form
+    /// probability the pre-#902 rule accepts. Zero unless diagnostics are on.
+    pub closed_form_sum_prod: f64,
+}
+
+impl SpeculativeAcceptanceStats {
+    /// Accepted draft tokens per *proposed* draft token.
+    ///
+    /// Not the per-position acceptance probability, and not comparable to
+    /// `sum_x min(p(x), q(x))`: a chain stops at its first rejection, so the
+    /// block positions behind it are counted as proposed but never tested. Use
+    /// [`Self::per_position_acceptance`] to compare against theory or across an
+    /// A/B; this one is the "how much of each drafted block survived" figure,
+    /// which also moves with the block length.
+    pub fn acceptance_rate(&self) -> f64 {
+        if self.proposed_draft_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f64 / self.proposed_draft_tokens as f64
+        }
+    }
+
+    /// Accepted draft tokens per verify position the accept test actually ran
+    /// on.
+    ///
+    /// This is the quantity the theory predicts: modified rejection sampling
+    /// converges to `sum_x min(p(x), q(x))` and the pre-#902 rule to
+    /// `sum_x p(x) q(x)`, both per position. Counted identically on both
+    /// acceptance rules.
+    pub fn per_position_acceptance(&self) -> f64 {
+        if self.positions_tested == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f64 / self.positions_tested as f64
+        }
+    }
+
+    /// Mean accepted draft tokens per verify round. This is the figure the
+    /// issue's performance gate names ("mean accepted draft length").
+    pub fn mean_accepted_len(&self) -> f64 {
+        if self.rounds == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f64 / self.rounds as f64
+        }
+    }
+
+    /// One-line summary for the CLI, printed on **stdout** after a speculative
+    /// run.
+    ///
+    /// This exists because the `mlxcel` CLI installs no `tracing` subscriber,
+    /// so the info-level instrumentation in this module is unreachable on the
+    /// only binary that runs [`SpeculativeGenerator`]. An acceptance-rate A/B
+    /// that cannot name the rule it measured is not a measurement, so the two
+    /// facts a reviewer needs (which rule ran, and the mean accepted draft
+    /// length) are printed unconditionally rather than behind a log level.
+    ///
+    /// The `rule=` token is [`AcceptanceRule::id`], which is stable and
+    /// greppable. `rule=unknown` means [`SpeculativeGenerator::generate`] never
+    /// reached its decode loop.
+    ///
+    /// Used by: `commands::generate` (offline `mlxcel generate --draft-model`)
+    pub fn summary_line(&self) -> String {
+        let rule = self.rule.map_or("unknown", |r| r.id());
+        let label = self.rule.map_or("no speculative round ran", |r| r.label());
+        let mut line = format!(
+            "[Speculative acceptance] rule={rule} rounds={} proposed={} positions_tested={} \
+             accepted={} per_position_acceptance={:.4} acceptance_rate={:.4} \
+             mean_accepted_len={:.4} ({label})",
+            self.rounds,
+            self.proposed_draft_tokens,
+            self.positions_tested,
+            self.accepted_draft_tokens,
+            self.per_position_acceptance(),
+            self.acceptance_rate(),
+            self.mean_accepted_len(),
+        );
+        if self.positions_tested > 0 && self.closed_form_sum_min > 0.0 {
+            let n = self.positions_tested as f64;
+            line.push_str(&format!(
+                "\n[Speculative acceptance diagnostic] closed_form_sum_min={:.4} \
+                 closed_form_sum_prod={:.4} (the measured per-position acceptance sits at \
+                 sum_prod under the default sampler-match rule and at sum_min under the \
+                 opt-in acceptance-optimal rule; sum_min >= sum_prod always)",
+                self.closed_form_sum_min / n,
+                self.closed_form_sum_prod / n,
+            ));
+        }
+        line
+    }
+}
+
 /// Speculative decoding generator
 ///
 /// Uses a draft model to propose candidate tokens and a main model to verify them.
@@ -84,6 +228,16 @@ pub struct SpeculativeGenerator {
     /// synchronization stay paired even when the generator is moved
     /// across threads after construction.
     generation_stream: Option<UniquePtr<MlxThreadLocalStream>>,
+    /// Acceptance accounting for the most recent [`Self::generate`] call.
+    ///
+    /// Reset at the top of every call by [`Self::reset`]. Read through
+    /// [`Self::acceptance_stats`] and summarized once per call at info level,
+    /// which is what makes an acceptance-rate A/B measurable from a log rather
+    /// than only from a stopwatch.
+    acceptance: SpeculativeAcceptanceStats,
+    /// Per-generator override of the `MLXCEL_SPECULATIVE_STOCHASTIC_ACCEPT`
+    /// default. `None` follows the env; `Some(v)` forces it.
+    stochastic_acceptance: Option<bool>,
     /// Cached per-generator `TokenBiasMap` resolved from a `LangBiasConfig`.
     ///
     /// **Axis B invariant**: the bias is applied **only** to the target
@@ -94,6 +248,23 @@ pub struct SpeculativeGenerator {
     /// collapses. See [`Self::compose_target_sampling`] and
     /// [`Self::draft_sampling`] — only the former injects the cached bias.
     token_bias: TokenBiasMap,
+    /// The one emitted token the draft model's KV cache does not hold yet.
+    ///
+    /// A round's draft loop forwards `current_token, d_0, ..., d_{k-2}` for
+    /// `k` proposals: the last proposal `d_{k-1}` is *sampled from* the
+    /// forward of `d_{k-2}` and is never itself forwarded. When verification
+    /// accepts and emits it, it joins the sequence while the draft cache has
+    /// no entry for it, and no amount of trimming can put it there. It is
+    /// parked here and replayed at the head of the next round's first draft
+    /// forward, which costs no extra forward pass because that forward simply
+    /// becomes two tokens wide.
+    ///
+    /// `None` at every other round boundary. Reset by [`Self::reset`].
+    ///
+    /// Mirrors the `draft_y` concatenation in upstream mlx-lm
+    /// `speculative_generate_step`
+    /// (<https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/generate.py>).
+    pending_draft_context: Option<i32>,
 }
 
 impl SpeculativeGenerator {
@@ -104,8 +275,32 @@ impl SpeculativeGenerator {
             draft_caches: (0..draft_num_layers).map(|_| KVCache::new()).collect(),
             generated_tokens: Vec::new(),
             generation_stream: new_thread_local_generation_stream(),
+            acceptance: SpeculativeAcceptanceStats::default(),
+            stochastic_acceptance: None,
             token_bias: TokenBiasMap::default(),
+            pending_draft_context: None,
         }
+    }
+
+    /// Acceptance accounting for the most recent [`Self::generate`] call.
+    pub fn acceptance_stats(&self) -> SpeculativeAcceptanceStats {
+        self.acceptance
+    }
+
+    /// Force the acceptance-optimal (modified rejection sampling) rule on or
+    /// off for this generator, overriding the
+    /// `MLXCEL_SPECULATIVE_STOCHASTIC_ACCEPT` process default.
+    ///
+    /// The feature is opt-in because the rule it replaces was already
+    /// distribution-preserving on this path (see
+    /// [`stochastic_accept`]), so it trades measurable per-position cost for an
+    /// acceptance gain that is near zero against a confident drafter. This
+    /// setter is how a caller that has established the gain is worth taking,
+    /// or a test that must exercise the rule regardless of the process
+    /// default, turns it on.
+    pub fn with_stochastic_acceptance(mut self, enabled: bool) -> Self {
+        self.stochastic_acceptance = Some(enabled);
+        self
     }
 
     /// Attach a pre-resolved `TokenBiasMap` to this speculative generator.
@@ -164,6 +359,8 @@ impl SpeculativeGenerator {
             *cache = KVCache::new();
         }
         self.generated_tokens.clear();
+        self.acceptance = SpeculativeAcceptanceStats::default();
+        self.pending_draft_context = None;
     }
 
     /// Get the generated tokens
@@ -333,6 +530,30 @@ impl SpeculativeGenerator {
         }
 
         // DECODE PHASE.
+        //
+        // Acceptance policy for this call (issue #902). This generator owns
+        // the draft sampler, so it can always report the distribution each
+        // proposal was drawn from; `has_proposal_distribution` is
+        // unconditionally true here. The remaining gates are the target
+        // sampler being stochastic and the env kill switch. The chosen rule is
+        // logged once per process per kind at info level, so a server log
+        // proves which rule a run used.
+        let rule = stochastic_accept::acceptance_rule_with_override(
+            target_sampling,
+            true,
+            self.stochastic_acceptance,
+        );
+        stochastic_accept::note_rule(rule);
+        let stochastic = rule == AcceptanceRule::Stochastic;
+        self.acceptance.rule = Some(rule);
+
+        // The closed-form diagnostic needs `q` on *both* arms, otherwise the
+        // two halves of an A/B report different quantities and cannot be
+        // compared. Off by default, so the argmax arm captures nothing and
+        // stays exactly as it was.
+        let diagnostics = stochastic_accept::accept_diagnostics_enabled();
+        let capture_proposal_probs = stochastic || diagnostics;
+
         let decode_start = Instant::now();
         let mut current_token = first_token;
         let mut done = false;
@@ -340,15 +561,49 @@ impl SpeculativeGenerator {
         while self.generated_tokens.len() < max_tokens && !done {
             // Step 1: Generate draft tokens
             let mut draft_tokens = Vec::with_capacity(num_draft);
+            // `q` per drafted position, in proposal order. Populated only on
+            // the stochastic path; the argmax path allocates nothing and runs
+            // exactly the pre-#902 code.
+            let mut draft_probs: Vec<UniquePtr<MlxArray>> = Vec::new();
             let mut draft_token = current_token;
 
             for _ in 0..num_draft {
-                let draft_input = ffi::from_slice_i32(&[draft_token], &[1, 1]);
+                // A previous round that accepted its last proposal left the
+                // draft model one token behind the sequence (see
+                // `pending_draft_context`). Replay that token at the head of
+                // this round's first draft forward rather than spending a
+                // separate pass on it: the sampler's `slice_last_logits`
+                // pre-step already reads the final position, so the proposal
+                // sampled here is the one conditioned on the full replayed
+                // prefix, and the round still costs `num_draft` forwards. The
+                // draft model sees a 2-token block with no explicit mask,
+                // exactly as it does during chunked prefill and as the target
+                // does during verification, so the same causal-prefill
+                // contract covers it. `take` empties the slot, so only the
+                // first iteration of the round can replay.
+                let draft_input = match self.pending_draft_context.take() {
+                    Some(owed) => ffi::from_slice_i32(&[owed, draft_token], &[1, 2]),
+                    None => ffi::from_slice_i32(&[draft_token], &[1, 1]),
+                };
                 let draft_logits = draft_model.forward(&draft_input, &mut self.draft_caches, None);
                 // Axis B: draft sampler MUST NOT see the bias. See
                 // `draft_sampling` for the rationale.
-                let (tok_arr, _) =
-                    sample_token_optimized(&draft_logits, draft_sampling, &token_history);
+                let tok_arr = if capture_proposal_probs {
+                    // The token and `q` come out of one pre-step, which is what
+                    // guarantees `q` is the distribution this very token was
+                    // drawn from rather than a later reconstruction. `q` is
+                    // left unevaluated: a chain that gets rejected at an
+                    // earlier position never materializes the tail.
+                    let (tok_arr, probs) = sample_token_with_distribution(
+                        &draft_logits,
+                        draft_sampling,
+                        &token_history,
+                    );
+                    draft_probs.push(probs);
+                    tok_arr
+                } else {
+                    sample_token_optimized(&draft_logits, draft_sampling, &token_history).0
+                };
                 ffi::eval(&tok_arr);
                 draft_token = ffi::item_i32(&tok_arr);
                 draft_tokens.push(draft_token);
@@ -454,13 +709,51 @@ impl SpeculativeGenerator {
                 // Reshape to [1, 1, vocab] for sample_token_optimized
                 let pos_logits = ffi::reshape(&pos_logits, &[1, 1, main_shape[2]]);
 
-                // Axis B: target verification uses the bias-augmented sampling.
-                let (main_tok_arr, _) =
-                    sample_token_optimized(&pos_logits, target_sampling, &token_history);
-                ffi::eval(&main_tok_arr);
-                let main_token = ffi::item_i32(&main_tok_arr);
+                // Axis B: target verification uses the bias-augmented sampling
+                // on both arms.
+                //
+                // `accept_token` is the token kept when the draft is accepted;
+                // `replacement` is the token emitted when it is not. Both arms
+                // produce the same pair so the bookkeeping below is shared.
+                // Counted on both arms: this is the denominator the per-position
+                // acceptance probability is measured against, and the two arms
+                // must report the same quantity for an A/B to mean anything.
+                // `proposed_draft_tokens` is *not* that denominator, because a
+                // chain stops at its first rejection and never tests the block
+                // positions behind it.
+                self.acceptance.positions_tested += 1;
+                if diagnostics {
+                    let target_probs =
+                        effective_token_distribution(&pos_logits, target_sampling, &token_history);
+                    let (sum_min, sum_prod) =
+                        stochastic_accept::closed_form_acceptance(&target_probs, &draft_probs[i]);
+                    self.acceptance.closed_form_sum_min += sum_min;
+                    self.acceptance.closed_form_sum_prod += sum_prod;
+                }
 
-                if main_token == draft_token {
+                let (accept_draft, replacement) = if stochastic {
+                    // `p` at this position, conditioned on the tokens accepted
+                    // so far in this round (`token_history` grows as we
+                    // accept), which is the correct target conditional.
+                    let target_probs =
+                        effective_token_distribution(&pos_logits, target_sampling, &token_history);
+                    match stochastic_accept::verify_draft_token(
+                        &target_probs,
+                        &draft_probs[i],
+                        draft_token,
+                    ) {
+                        DraftVerdict::Accept => (true, draft_token),
+                        DraftVerdict::Reject { replacement } => (false, replacement),
+                    }
+                } else {
+                    let (main_tok_arr, _) =
+                        sample_token_optimized(&pos_logits, target_sampling, &token_history);
+                    ffi::eval(&main_tok_arr);
+                    let main_token = ffi::item_i32(&main_tok_arr);
+                    (main_token == draft_token, main_token)
+                };
+
+                if accept_draft {
                     // Accept draft token
                     accepted += 1;
 
@@ -474,18 +767,34 @@ impl SpeculativeGenerator {
                         token_history.push(draft_token);
                     }
 
+                    // `d_{k-1}` is the only proposal the draft loop never
+                    // forwards, so emitting it leaves the draft cache one entry
+                    // short of the sequence. Park it for the next round's first
+                    // draft forward. Recorded here rather than beside the bonus
+                    // token below so it is also right on the round that stops on
+                    // `max_tokens`, and so an accepted-EOS proposal (which
+                    // breaks above, before this push) never records a debt for a
+                    // token that was never emitted.
+                    if i + 1 == draft_tokens.len() {
+                        self.pending_draft_context = Some(draft_token);
+                    }
+
                     if self.generated_tokens.len() >= max_tokens {
                         done = true;
                         break;
                     }
                 } else {
-                    // Reject: use main model's token instead
-                    if eos_tokens.contains(&main_token) {
+                    // Reject: emit the target-side replacement instead. On the
+                    // argmax rule that is the target sampler's own draw; on
+                    // the stochastic rule it is a draw from the normalized
+                    // residual `relu(p - q)`, which is what makes the emitted
+                    // stream distributed as `p`.
+                    if eos_tokens.contains(&replacement) {
                         done = true;
                     } else {
-                        self.generated_tokens.push(main_token);
+                        self.generated_tokens.push(replacement);
                         if needs_history {
-                            token_history.push(main_token);
+                            token_history.push(replacement);
                         }
                     }
                     break;
@@ -522,24 +831,35 @@ impl SpeculativeGenerator {
                 current_token = *self.generated_tokens.last().unwrap();
             }
 
-            // Step 4: Rewind caches for rejected tokens
+            self.acceptance.rounds += 1;
+            self.acceptance.proposed_draft_tokens += draft_tokens.len();
+            self.acceptance.accepted_draft_tokens += accepted;
+
+            // Step 4: rewind whatever this round forwarded past the tokens it
+            // actually kept.
+            //
+            // Write `k` for `draft_tokens.len()` and `a` for `accepted`. Both
+            // caches must end the round holding the prompt plus every emitted
+            // token except the next round's `current_token`, which the next
+            // round forwards itself.
             let rejected = draft_tokens.len() - accepted;
             if rejected > 0 {
-                // Rewind main model caches: we forwarded all verify_tokens but
-                // only accepted `accepted` draft tokens + 1 (the divergence token from main)
-                // Main model cache has current_token + all draft tokens = verify_tokens.len() positions
-                // We need to keep: accepted + 1 (for the token we're continuing from)
-                // So trim: draft_tokens.len() - accepted
-                let main_trim = rejected as i32;
-                trim_caches(&mut self.main_caches, main_trim);
+                // Main: the verify forward appended `current_token, d_0..d_{k-1}`.
+                // The round keeps `d_0..d_{a-1}` and emits one replacement that
+                // becomes the next `current_token`, so the cache must end at
+                // `d_{a-1}`. Trim the rejected tail, `k - a == rejected`.
+                trim_caches(&mut self.main_caches, rejected as i32);
 
-                // Rewind draft model caches: drafted all draft_tokens
-                // Need to trim all rejected + 1 (because draft went past accepted)
-                let draft_trim = (rejected + 1) as i32;
-                trim_caches(
-                    &mut self.draft_caches,
-                    draft_trim.min(draft_tokens.len() as i32),
-                );
+                // Draft: after its loop the draft cache holds the prompt, every
+                // emitted token, and `d_0..d_{k-2}`: the loop feeds
+                // `current_token` and then every proposal except the last, plus
+                // any replayed `pending_draft_context`. It must also end at
+                // `d_{a-1}`, so the trim is `(k - 1) - a == rejected - 1`, one
+                // less than the main cache's and never negative here because
+                // `rejected >= 1`. Trimming `rejected + 1` instead, as this did
+                // before, left the drafter conditioning on a prefix that fell
+                // one to two tokens further behind on every single round.
+                trim_caches(&mut self.draft_caches, (rejected - 1) as i32);
             }
 
             // Periodic cache clearing, backend-aware cadence (#627): disabled by
@@ -554,6 +874,23 @@ impl SpeculativeGenerator {
         }
 
         let decode_time = decode_start.elapsed();
+
+        // One summary line per call at info level. Together with the one-shot
+        // rule line from `note_rule`, this is what lets an acceptance-rate A/B
+        // be read off a log instead of inferred from wall-clock alone, and it
+        // names the rule so a run can never be attributed to the wrong arm.
+        tracing::info!(
+            rule = rule.id(),
+            rounds = self.acceptance.rounds,
+            proposed_draft_tokens = self.acceptance.proposed_draft_tokens,
+            positions_tested = self.acceptance.positions_tested,
+            accepted_draft_tokens = self.acceptance.accepted_draft_tokens,
+            per_position_acceptance = self.acceptance.per_position_acceptance(),
+            acceptance_rate = self.acceptance.acceptance_rate(),
+            mean_accepted_len = self.acceptance.mean_accepted_len(),
+            generated_tokens = self.generated_tokens.len(),
+            "speculative decode finished"
+        );
 
         let stats = Self::build_stats(
             prompt_tokens.len(),
@@ -605,6 +942,10 @@ fn trim_caches(caches: &mut [KVCache], n: i32) -> i32 {
     }
     trimmed
 }
+
+#[cfg(test)]
+#[path = "distribution_tests.rs"]
+mod distribution_tests;
 
 #[cfg(test)]
 mod tests {

@@ -298,8 +298,41 @@ fn sample_token_optimized_core(
     logits: &MlxArray,
     config: &SamplingConfig,
     token_history: &[i32],
-    mut state: Option<&mut SamplerState>,
+    state: Option<&mut SamplerState>,
 ) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let last_logits = preprocess_logits_for_sampling(logits, config, token_history, state);
+
+    let token = ffi::fused_sample(
+        &last_logits,
+        config.temperature,
+        config.top_k,
+        config.top_p,
+        config.min_p,
+    );
+    // Announce a newly-seen dispatch outcome at INFO. Costs one `u32` load per
+    // step in steady state; see `sampling_dispatch` for why this is not `debug`.
+    crate::sampling_dispatch::report_sampling_dispatch();
+    (token, last_logits)
+}
+
+/// Everything [`sample_token_optimized`] does to the logits *before* the fused
+/// temperature / top-k / top-p / min-p sampler: last-position slice, token
+/// bias, repetition penalty, DRY, frequency/presence penalty, XTC.
+///
+/// Split out so the speculative acceptance path (issue #902) can obtain the
+/// exact same pre-sampler logits and hand them to [`ffi::fused_sample_probs`],
+/// which then applies the identical filter chain the sampler itself runs. The
+/// effective categorical distribution is therefore derived from the sampler's
+/// own code rather than reconstructed alongside it.
+///
+/// Used by: [`sample_token_optimized_core`], [`effective_token_distribution`],
+/// [`sample_token_with_distribution`]
+fn preprocess_logits_for_sampling(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+    mut state: Option<&mut SamplerState>,
+) -> UniquePtr<MlxArray> {
     // Use optimized slice_last_logits: [batch, seq, vocab] -> [batch, vocab].
     let last_logits = ffi::slice_last_logits(logits);
 
@@ -385,20 +418,81 @@ fn sample_token_optimized_core(
     // default disabled state and skips this entirely — no array ops, and no
     // draw from the per-request RNG stream, which keeps every existing
     // request's token stream byte-identical to before this feature existed.
-    let last_logits = if config.xtc_probability > 0.0 {
+    if config.xtc_probability > 0.0 {
         apply_xtc_step(&last_logits, config)
     } else {
         last_logits
-    };
+    }
+}
 
+/// The exact categorical distribution [`sample_token_optimized`] would draw
+/// from for `logits` under `config`, as a float32 `[batch, vocab]`
+/// row-normalized probability tensor.
+///
+/// This is the `p` and `q` of modified rejection sampling (issue #902). It is
+/// built from the sampler's own pre-steps ([`preprocess_logits_for_sampling`])
+/// and the sampler's own filter chain ([`ffi::fused_sample_probs`]), so a
+/// change to either automatically moves the distribution with it.
+///
+/// A greedy config (`temperature == 0.0` or `top_k == 1`) yields the one-hot
+/// indicator at the argmax, which is the correct degenerate proposal
+/// distribution for a greedily-proposing drafter.
+///
+/// Consumes no randomness: safe to call without perturbing the token stream of
+/// any other sampler on the same RNG key sequence.
+///
+/// Used by: `speculative::stochastic_accept`
+pub fn effective_token_distribution(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+) -> UniquePtr<MlxArray> {
+    let processed = preprocess_logits_for_sampling(logits, config, token_history, None);
+    ffi::fused_sample_probs(
+        &processed,
+        config.temperature,
+        config.top_k,
+        config.top_p,
+        config.min_p,
+    )
+}
+
+/// Sample one token *and* return the distribution it was drawn from.
+///
+/// Equivalent to [`sample_token_optimized`] followed by
+/// [`effective_token_distribution`], but the (potentially expensive) bias and
+/// penalty pre-steps run once instead of twice. The returned token is the same
+/// array [`sample_token_optimized`] returns for the same inputs and RNG state:
+/// the extra distribution tensor is a pure function of the pre-sampler logits
+/// and draws nothing from the RNG stream.
+///
+/// Returns `(token, probs)` where `probs` is float32 `[batch, vocab]`.
+///
+/// Used by: `SpeculativeGenerator` draft loop (issue #902)
+pub fn sample_token_with_distribution(
+    logits: &MlxArray,
+    config: &SamplingConfig,
+    token_history: &[i32],
+) -> (UniquePtr<MlxArray>, UniquePtr<MlxArray>) {
+    let processed = preprocess_logits_for_sampling(logits, config, token_history, None);
     let token = ffi::fused_sample(
-        &last_logits,
+        &processed,
         config.temperature,
         config.top_k,
         config.top_p,
         config.min_p,
     );
-    (token, last_logits)
+    // Announce a newly-seen dispatch outcome at INFO. Costs one `u32` load per
+    // step in steady state; see `sampling_dispatch` for why this is not `debug`.
+    crate::sampling_dispatch::report_sampling_dispatch();
+    let probs = ffi::fused_sample_probs(
+        &processed,
+        config.temperature,
+        config.top_k,
+        config.top_p,
+        config.min_p,
+    );
+    (token, probs)
 }
 
 /// Batch-parallel sampling: sample one token per sequence from batched logits.
@@ -411,6 +505,13 @@ fn sample_token_optimized_core(
 /// Available for callers that need standalone batched sampling without
 /// per-sequence state interleaving. The BatchScheduler currently inlines
 /// equivalent logic to interleave sampling with EOS/state/streaming updates.
+///
+/// When every row shares one fused-eligible scalar config (see
+/// [`uniform_fused_batch_params`]) the whole batch is sampled in a single
+/// [`batched_fused_sample`] dispatch instead of the per-row loop. On the
+/// no-filter stochastic path that dispatch is the batch-wide Gumbel-max kernel
+/// (issue #900), which covers all `B` rows in one launch (grid.z = B); greedy
+/// stays on the row-independent `argmax` and is byte-identical either way.
 pub fn batched_sample(
     logits: &MlxArray,
     configs: &[&SamplingConfig],
@@ -418,6 +519,12 @@ pub fn batched_sample(
 ) -> Vec<i32> {
     let b = configs.len();
     debug_assert_eq!(b, token_histories.len());
+
+    // Batch-wide single dispatch when the whole batch is uniform and needs no
+    // per-row logit edits.
+    if let Some(params) = uniform_fused_batch_params(configs) {
+        return batched_fused_sample(logits, &params);
+    }
 
     let mut tokens = Vec::with_capacity(b);
     for i in 0..b {
@@ -429,6 +536,35 @@ pub fn batched_sample(
         tokens.push(ffi::item_i32(&token_arr));
     }
     tokens
+}
+
+/// Shared scalar params for a batch, or `None` when the batch cannot take the
+/// single-dispatch fused path.
+///
+/// Every row must be fused-eligible ([`config_supports_fused_batch`]: no
+/// history-based penalty, no token bias, no XTC) and carry bit-identical
+/// [`FusedSampleParams`]. Any divergence sends the whole batch back to the
+/// per-row loop, which is the only place per-row logit edits can happen.
+///
+/// An empty batch returns `None` so the caller's loop returns an empty vector
+/// instead of dispatching a zero-row kernel.
+///
+/// Used by: [`batched_sample`]
+fn uniform_fused_batch_params(configs: &[&SamplingConfig]) -> Option<FusedSampleParams> {
+    let first = configs.first()?;
+    if !config_supports_fused_batch(first) {
+        return None;
+    }
+    let params = FusedSampleParams::from_config(first);
+    for config in &configs[1..] {
+        if !config_supports_fused_batch(config) {
+            return None;
+        }
+        if !params.matches(&FusedSampleParams::from_config(config)) {
+            return None;
+        }
+    }
+    Some(params)
 }
 
 /// Scalar sampling parameters consumed by [`ffi::fused_sample`].
@@ -549,6 +685,7 @@ pub fn batched_fused_sample(logits: &MlxArray, params: &FusedSampleParams) -> Ve
         params.top_p,
         params.min_p,
     );
+    crate::sampling_dispatch::report_sampling_dispatch();
     token_ids_to_host(&tokens)
 }
 
@@ -1126,9 +1263,12 @@ pub(crate) fn top_k_filter(logits: &MlxArray, k: i32) -> UniquePtr<MlxArray> {
 ///   7. argsort(sorted_indices, axis=-1) → indices to undo the sort per row
 ///   8. take_along_axis(filtered_sorted_logits, unsort_indices, axis=-1) → result
 ///
-/// Note: production generation routes through the C++ `fused_sample` → C++ `top_p_filter`
-/// at `cpp/mlx_cxx_bridge.cpp`. This Rust implementation is a reference/test-parity
-/// copy used to validate the algorithm and in unit tests for batched correctness.
+/// Note: production generation routes through the C++ `fused_sample`, which
+/// since issue #901 resolves top-p inside the dual-pivot rejection kernel and
+/// reaches the C++ `top_p_filter` at `cpp/mlx_cxx_bridge.cpp` only under
+/// `MLXCEL_SAMPLING_REJECTION=0` or after a convergence-cap fallback. This Rust
+/// implementation is a reference/test-parity copy used to validate the
+/// algorithm and in unit tests for batched correctness.
 ///
 /// Used by: unit tests (`top_p_filter_*` in `sampling::tests`)
 #[allow(dead_code)]

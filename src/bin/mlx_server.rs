@@ -190,6 +190,17 @@ struct ServerArgs {
     #[arg(long, value_name = "PATH")]
     models_dir: Option<PathBuf>,
 
+    /// Repository revision (branch, tag, or commit hash). Defaults to `main`.
+    ///
+    /// Resolves the HuggingFace cache snapshot for that revision, and fetches
+    /// that revision on a miss. The mlxcel store is not revision-namespaced, so
+    /// a repo already present there is not reused for a revision-qualified
+    /// request and the request is refused rather than answered with an unknown
+    /// revision; use `--models-dir` to give each revision its own root. Not
+    /// valid when `-m/--model` is an existing local path.
+    #[arg(long, value_name = "REV")]
+    revision: Option<String>,
+
     /// Model alias (shown in API responses instead of directory name)
     #[arg(
         short = 'a',
@@ -200,7 +211,7 @@ struct ServerArgs {
     alias: Option<String>,
 
     /// Path to LoRA adapter directory
-    #[arg(long = "lora", value_name = "PATH")]
+    #[arg(long = "lora", visible_alias = "adapter", value_name = "PATH")]
     lora: Option<PathBuf>,
 
     /// Host address to bind to (or Unix socket path when --port 0)
@@ -239,8 +250,15 @@ struct ServerArgs {
     /// of up to 7 rows (issue #725); keep this at 7 or below there (see
     /// docs/CONTINUOUS_BATCHING.md). The scheduler clamps this to 1 for model
     /// families that cannot batch (SSM / hybrid / mixed-cache). Use `--parallel
-    /// 1` (or `--no-batch`) to restore single-slot sequential serving.
-    #[arg(long = "parallel", env = "LLAMA_ARG_N_PARALLEL", default_value_t = 4)]
+    /// 1` (or `--no-batch`) to restore single-slot sequential serving. Both
+    /// `--parallel` and `--n-parallel` are accepted on `mlxcel serve` and on
+    /// `mlxcel-server`, so this flag parses on either binary.
+    #[arg(
+        long = "parallel",
+        visible_alias = "n-parallel",
+        env = "LLAMA_ARG_N_PARALLEL",
+        default_value_t = 4
+    )]
     parallel: usize,
 
     /// API key for authentication
@@ -328,6 +346,24 @@ struct ServerArgs {
     /// Prefill chunk size in tokens (0 = disabled, default: 512)
     #[arg(long = "prefill-chunk-size", default_value_t = 512)]
     prefill_chunk_size: usize,
+
+    /// Decode ticks a parked chunked prefill yields before it is granted one
+    /// (#1011).
+    ///
+    /// A prompt longer than `--prefill-chunk-size` admitted next to a busy
+    /// decode batch runs one chunk and is then parked. This bounds how long it
+    /// stays parked: after N consecutive decode ticks the next tick is granted
+    /// to the prefill, so a C-chunk prompt reaches its first token within
+    /// `C * (N + 1)` ticks however long the batch keeps decoding. The price is
+    /// paid by the decoding streams, whose mean inter-token latency during that
+    /// window rises by roughly one chunk forward per N decode steps, so this is
+    /// the TTFT-versus-ITL dial: lower is faster to first token and noisier for
+    /// everyone else. `0` disables the grant and restores the pre-#1011
+    /// behaviour, in which a parked prefill waits for the batch to drain and
+    /// its time to first token has no bound. Env:
+    /// `MLXCEL_PREFILL_GRANT_INTERVAL` (the flag wins).
+    #[arg(long = "prefill-grant-interval", value_name = "N")]
+    prefill_grant_interval: Option<usize>,
 
     /// Prefill batch size [llama-server alias for --prefill-chunk-size] [default: 512]
     #[arg(
@@ -597,7 +633,29 @@ struct ServerArgs {
     dry_penalty_last_n: i32,
 
     /// DRY sequence breaker token strings (e.g. "\n", "\t")
-    #[arg(long = "dry-sequence-breaker", value_delimiter = ',')]
+    ///
+    /// Sets the server-wide default that a request without its own
+    /// `dry_sequence_breakers` field inherits; a request that sends the field
+    /// overrides it, including sending an empty list to run DRY with no
+    /// breakers. The resolved token IDs are reported by `/props`.
+    ///
+    /// Each value must encode to exactly ONE token for the loaded model,
+    /// because the sampler matches breakers by token id. A value that does not
+    /// fails startup and names itself, rather than being dropped silently. The
+    /// escapes `\n`, `\t`, `\r` and `\\` are interpreted, since a shell does
+    /// not expand them inside quotes; any other backslash sequence is taken
+    /// literally. The value is comma-separated, so a comma cannot itself be a
+    /// breaker.
+    ///
+    /// The singular `--dry-sequence-breaker` is the primary spelling on both
+    /// server binaries, matching llama-server. The plural
+    /// `--dry-sequence-breakers` is accepted as an alias on both, so no
+    /// command line that worked before stops working.
+    #[arg(
+        long = "dry-sequence-breaker",
+        visible_alias = "dry-sequence-breakers",
+        value_delimiter = ','
+    )]
     dry_sequence_breakers: Vec<String>,
 
     // Logging.
@@ -1181,6 +1239,16 @@ async fn main() -> anyhow::Result<()> {
     // any MLX op.
     mlxcel_core::hardware::apply_cuda_graph_cache_default();
 
+    // Publish autotuned CUDA kernel knobs (qmm CTA tile, multirow-qmv row
+    // window) into the environment the patched MLX kernels read (#906). Inert
+    // unless MLXCEL_AUTOTUNE is set and a tuned entry exists, never overwrites
+    // an operator-set variable, and must run before any MLX op or worker thread.
+    for (var, value) in mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
+        mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
+    ) {
+        tracing::info!("autotune: applied {var}={value} from the tactic cache");
+    }
+
     match cli.command {
         // Subcommand-driven dispatch. Currently only `download`
         // exists; future operational subcommands (e.g. cache inspection) can
@@ -1283,7 +1351,11 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
              (set the LLAMA_ARG_MODEL env var or pass -m <PATH_OR_REPO_ID>)"
         )
     })?;
-    let model_path = resolve_model_source_with_override(&model_path, args.models_dir.as_deref())?;
+    let model_path = resolve_model_source_with_override(
+        &model_path,
+        args.models_dir.as_deref(),
+        args.revision.as_deref(),
+    )?;
 
     Ok(ServerStartupInput {
         model_path,
@@ -1310,6 +1382,7 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         audio_queue_depth: args.audio_queue_depth,
         audio_request_timeout_secs: args.audio_request_timeout_secs,
         prefill_chunk_size: args.prefill_chunk_size,
+        prefill_grant_interval: args.prefill_grant_interval,
         batch_size: args.batch_size,
         ubatch_size: args.ubatch_size,
         enable_preemption: args.enable_preemption,
@@ -1326,8 +1399,12 @@ fn build_startup_input(mut args: ServerArgs) -> anyhow::Result<ServerStartupInpu
         warmup: args.warmup,
         no_warmup: args._no_warmup,
         temperature: args.temp,
+        temperature_was_set: long_cli_flag_was_set("temp"),
         top_k: args.top_k,
+        top_k_was_set: long_cli_flag_was_set("top-k")
+            || std::env::var_os("LLAMA_ARG_TOP_K").is_some(),
         top_p: args.top_p,
+        top_p_was_set: long_cli_flag_was_set("top-p"),
         min_p: args.min_p,
         seed: args.seed,
         repeat_last_n: args.repeat_last_n,
@@ -1648,5 +1725,115 @@ mod tests {
             "--draft and its --draft-max alias must resolve to the same token budget"
         );
         assert_eq!(primary.draft, 24);
+    }
+
+    // ── Server flag spelling parity (issue #1109) ───────────────
+    //
+    // Four flag spellings had drifted between this binary and `mlxcel
+    // serve`. `--parallel` / `--n-parallel` was the worst case: neither
+    // spelling worked on both binaries, so a command line copied between
+    // them failed to parse even though both flags read the same
+    // `LLAMA_ARG_N_PARALLEL` env var. These tests pin that each spelling
+    // now resolves to the identical `ServerArgs` field value here;
+    // `src/main_tests.rs` carries the matching assertions for `mlxcel
+    // serve`, and `tests/cli_help_consistency.rs` asserts the two
+    // binaries accept the same set of spellings so a fifth divergence
+    // cannot land silently.
+
+    /// Every long name, alias, and short form on `mlxcel-server` must be
+    /// distinct. clap detects a duplicate itself, but only behind a
+    /// `debug_assert` in `Command::_build_self`, and `[profile.test-fast]`
+    /// inherits `release`, so `debug-assertions` is off in the profile this
+    /// repository verifies with. A `visible_alias` that collided with an
+    /// existing flag would be silently last-wins rather than a panic, and
+    /// issue #1109 added two of them here.
+    #[test]
+    fn server_flag_names_and_aliases_are_unique() {
+        use clap::CommandFactory;
+
+        let command = Cli::command();
+
+        let mut longs: Vec<String> = Vec::new();
+        let mut shorts: Vec<char> = Vec::new();
+        for arg in command.get_arguments() {
+            if let Some(long) = arg.get_long() {
+                longs.push(long.to_string());
+            }
+            if let Some(aliases) = arg.get_all_aliases() {
+                longs.extend(aliases.into_iter().map(str::to_string));
+            }
+            if let Some(short) = arg.get_short() {
+                shorts.push(short);
+            }
+            if let Some(aliases) = arg.get_all_short_aliases() {
+                shorts.extend(aliases);
+            }
+        }
+
+        let duplicate_longs = duplicates(&longs);
+        assert!(
+            duplicate_longs.is_empty(),
+            "`mlxcel-server` declares these long names more than once: \
+             {duplicate_longs:?}. clap resolves a duplicate silently in this profile, so \
+             the second definition would shadow the first with no error."
+        );
+
+        let duplicate_shorts = duplicates(&shorts);
+        assert!(
+            duplicate_shorts.is_empty(),
+            "`mlxcel-server` declares these short forms more than once: {duplicate_shorts:?}"
+        );
+    }
+
+    /// Values appearing more than once in `items`, sorted and deduplicated.
+    fn duplicates<T: Clone + Ord>(items: &[T]) -> Vec<T> {
+        let mut sorted = items.to_vec();
+        sorted.sort();
+        let mut repeated: Vec<T> = sorted
+            .windows(2)
+            .filter(|w| w[0] == w[1])
+            .map(|w| w[0].clone())
+            .collect();
+        repeated.dedup();
+        repeated
+    }
+
+    #[test]
+    fn parallel_and_n_parallel_aliases_resolve_identically() {
+        let primary = parse_server_args(&["mlxcel-server", "--parallel", "2"]);
+        let aliased = parse_server_args(&["mlxcel-server", "--n-parallel", "2"]);
+
+        assert_eq!(
+            primary.parallel, aliased.parallel,
+            "--parallel and its --n-parallel alias must resolve to the same slot count"
+        );
+        assert_eq!(primary.parallel, 2);
+    }
+
+    #[test]
+    fn lora_and_adapter_aliases_resolve_identically() {
+        let primary = parse_server_args(&["mlxcel-server", "--lora", "adapters/foo"]);
+        let aliased = parse_server_args(&["mlxcel-server", "--adapter", "adapters/foo"]);
+
+        assert_eq!(
+            primary.lora, aliased.lora,
+            "--lora and its --adapter alias must resolve to the same adapter path"
+        );
+        assert_eq!(primary.lora, Some(PathBuf::from("adapters/foo")));
+    }
+
+    #[test]
+    fn dry_sequence_breaker_singular_and_plural_aliases_resolve_identically() {
+        let primary = parse_server_args(&["mlxcel-server", "--dry-sequence-breaker", "a,b"]);
+        let aliased = parse_server_args(&["mlxcel-server", "--dry-sequence-breakers", "a,b"]);
+
+        assert_eq!(
+            primary.dry_sequence_breakers, aliased.dry_sequence_breakers,
+            "both DRY breaker spellings must resolve to the same breaker list"
+        );
+        assert_eq!(
+            primary.dry_sequence_breakers,
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 }

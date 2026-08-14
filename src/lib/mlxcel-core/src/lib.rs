@@ -1118,6 +1118,11 @@ mod ffi {
 
         /// Dequantize quantized weights to full precision
         /// biases: nullable for mxfp4/nvfp4/mxfp8 modes
+        ///
+        /// `biases` is normalized to row-contiguous before the call. MLX's
+        /// Metal dequantize path miscomputes silently on a strided `biases`,
+        /// so callers may pass a sliced or otherwise strided view safely; see
+        /// the comment on the `dequantize` shim in `cpp/mlx_cxx_bridge.cpp`.
         unsafe fn dequantize(
             w: &MlxArray,
             scales: &MlxArray,
@@ -1306,6 +1311,12 @@ mod ffi {
         /// block-table order, `row_offsets` (`[B + 1]`) the start of each
         /// sequence's rows, and `logical_starts` / `visible_lens` (`[B]`) bound
         /// each sequence's visible window. Returns `[B, Hq, 1, D]` f32.
+        ///
+        /// `num_splits_override` selects the `NumSplits` launch shape chosen by
+        /// the autotuner (issue #906). `0` keeps the threadgroup-memory budget
+        /// ceiling, which is exactly the pre-#906 behavior; out-of-range values
+        /// clamp back to the ceiling, so a stale cached tactic can never
+        /// produce an infeasible launch.
         fn paged_attention_decode(
             q: &MlxArray,
             k_pool: &MlxArray,
@@ -1315,7 +1326,132 @@ mod ffi {
             logical_starts: &MlxArray,
             visible_lens: &MlxArray,
             scale: f32,
+            num_splits_override: i32,
         ) -> UniquePtr<MlxArray>;
+
+        /// Largest feasible `NumSplits` for a head dimension (issue #906).
+        ///
+        /// The autotuner enumerates its candidate set from this so the C++
+        /// launcher stays the single source of truth for the threadgroup-memory
+        /// and thread-count budgets.
+        fn paged_attention_num_splits_cap(dim: i32) -> i32;
+
+        /// Paged-attention decode v2 partial kernel (issue #898).
+        ///
+        /// Cross-CTA split-KV over a CSR page table: one CTA per `(chunk, kv
+        /// head, q-head group)` computes an online-softmax partial over its
+        /// chunk. `q` is `[B, Hq, 1, D]` f32 and the pools are `[num_blocks,
+        /// page_size, Hkv, D]` f16, as in v1. `indices` / `indptr` /
+        /// `last_page_len` / `first_page_offset` are the CSR view of the batch;
+        /// `request_indices` / `kv_tile_indices` / `params` (`params[0] =
+        /// pages_per_chunk`) come from [`crate::paged_v2::PagedDecodePlan`].
+        ///
+        /// Writes `partial_v_out` `[num_chunks, Hq, D]` f32 and `lse_out`
+        /// `[num_chunks, Hq]` f32. The LSE is in **log2 units**. When the plan
+        /// emitted one chunk per request, `partial_v_out` is already the final
+        /// answer and reshapes to `[B, Hq, 1, D]`.
+        fn paged_attention_decode_v2_partial(
+            q: &MlxArray,
+            k_pool: &MlxArray,
+            v_pool: &MlxArray,
+            indices: &MlxArray,
+            indptr: &MlxArray,
+            last_page_len: &MlxArray,
+            first_page_offset: &MlxArray,
+            request_indices: &MlxArray,
+            kv_tile_indices: &MlxArray,
+            params: &MlxArray,
+            scale: f32,
+            partial_v_out: &mut UniquePtr<MlxArray>,
+            lse_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Variable-length attention-state merge kernel (issue #898).
+        ///
+        /// Merges `v_in` `[N, H, D]` f32 (each partial already normalized by
+        /// its own softmax denominator) and `lse_in` `[N, H]` f32 (log2 units)
+        /// into `[M, H, D]` / `[M, H]`, where output row `o` covers partial
+        /// rows `[o_indptr[o], o_indptr[o + 1])`. Deliberately paging-agnostic:
+        /// the cascade-attention issue #903 reuses it unchanged.
+        fn paged_attention_merge_states(
+            v_in: &MlxArray,
+            lse_in: &MlxArray,
+            o_indptr: &MlxArray,
+            v_out: &mut UniquePtr<MlxArray>,
+            lse_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Query heads one v2 CTA processes together (issue #898). Always
+        /// divides `n_rep`, so the plan's CTA count and the launcher's grid
+        /// cannot drift.
+        fn paged_attention_v2_q_heads_per_cta(dim: i32, n_rep: i32) -> i32;
+
+        /// SIMD groups per v2 CTA (issue #898).
+        fn paged_attention_v2_num_warps(dim: i32, q_heads_per_cta: i32) -> i32;
+
+        /// Fused residual-add + RMSNorm kernel (issue #905).
+        ///
+        /// Computes `new_residual = x + residual` and
+        /// `normed = rms_norm(new_residual) * (weight_bias + weight)` in one
+        /// dispatch, replacing the elementwise `add` plus `fast_rms_norm` pair
+        /// that a pre-norm block pays at every residual join.
+        ///
+        /// `weight_bias` is `0.0` for a standard RMSNorm and `1.0` for the
+        /// Gemma `(1 + w)` convention; the bias is folded in the weight's own
+        /// dtype, so `1.0` reproduces `GemmaRMSNorm`'s precomputed `(1 + w)`
+        /// tensor rather than approximating it.
+        ///
+        /// `x` and `residual` must share shape and dtype, and `weight` must be
+        /// `[D]` where `D` is their trailing dimension; the launcher throws
+        /// otherwise. Two out-params because MLX arrays are immutable from the
+        /// graph's perspective, so the residual update is a value, not a
+        /// mutation.
+        fn fused_add_rms_norm(
+            x: &MlxArray,
+            residual: &MlxArray,
+            weight: &MlxArray,
+            eps: f32,
+            weight_bias: f32,
+            normed_out: &mut UniquePtr<MlxArray>,
+            new_residual_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Whether the current backend has a fused-add-RMSNorm kernel at all
+        /// (issue #905). False on a CPU-only build, where the custom-kernel JIT
+        /// throws.
+        fn fused_add_rms_norm_available() -> bool;
+
+        /// Fused q/k RoPE + KV-append-layout kernel (issue #905).
+        ///
+        /// Takes the whole row-contiguous fused-QKV projection output
+        /// `[B, L, (Hq + 2*Hkv) * D]`, applies rotary embedding to the q and k
+        /// blocks, and writes q, k and v out already in their consumers'
+        /// layouts: `q_out` is `[B, Hq, L, D]`, and `k_out` / `v_out` follow
+        /// `dest_layout` (`0` = dense `KVCache` slab order `[B, Hkv, L, D]`,
+        /// `1` = paged pool row order `[B, L, Hkv, D]`). V is relayout-only.
+        ///
+        /// `positions_base` is the absolute position of the first token in the
+        /// window: token `t` rotates with position `positions_base + t`.
+        #[allow(clippy::too_many_arguments)]
+        fn fused_rope_qk_append(
+            qkv: &MlxArray,
+            num_heads: i32,
+            num_kv_heads: i32,
+            head_dim: i32,
+            rope_dims: i32,
+            rope_base: f32,
+            rope_scale: f32,
+            traditional: bool,
+            positions_base: i32,
+            dest_layout: i32,
+            q_out: &mut UniquePtr<MlxArray>,
+            k_out: &mut UniquePtr<MlxArray>,
+            v_out: &mut UniquePtr<MlxArray>,
+        );
+
+        /// Whether the current backend has a fused RoPE + append kernel at all
+        /// (issue #905). False on a CPU-only build.
+        fn fused_rope_qk_append_available() -> bool;
 
         fn sdpa_supports_fast_path(
             q: &MlxArray,
@@ -1908,6 +2044,153 @@ mod ffi {
             top_p: f32,
             min_p: f32,
         ) -> UniquePtr<MlxArray>;
+
+        /// Pre-#900 reference sampler: identical to [`fused_sample`] except
+        /// that the no-filter stochastic path always uses
+        /// `random::categorical` instead of the Gumbel-max kernel. Kept so the
+        /// A/B microbenchmark and the parity tests can exercise both arms in
+        /// one process without restarting under a different env.
+        fn fused_sample_categorical(
+            logits: &MlxArray,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// The exact categorical distribution [`fused_sample`] draws from
+        /// (#902), as a float32 `[batch, vocab]` row-normalized probability
+        /// tensor. Shares the filter chain with [`fused_sample`] in C++, so
+        /// its support and relative masses cannot drift from the sampler.
+        ///
+        /// A greedy configuration (`temperature == 0.0` or `top_k == 1`)
+        /// returns the one-hot indicator at the argmax, which is the
+        /// degenerate proposal distribution of a greedily-proposing drafter.
+        ///
+        /// The softmax runs in float32 regardless of the logit dtype: entries
+        /// are read back to the host and compared against a uniform draw,
+        /// where an f16 probability would underflow below ~6e-8 and turn a
+        /// legitimately small acceptance ratio into an unconditional accept.
+        fn fused_sample_probs(
+            logits: &MlxArray,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Softmax-free Gumbel-max categorical sampling (#900), called
+        /// directly. `logits` is 2-D `[batch, vocab]`; returns a `[batch]`
+        /// uint32 token-id array drawn from `softmax(logits / temperature)`.
+        /// Requires `temperature > 0` and a backend for which
+        /// [`sampling_gumbel_available`] reports support.
+        fn gumbel_max_sample(logits: &MlxArray, temperature: f32) -> UniquePtr<MlxArray>;
+
+        /// True when [`fused_sample`]'s no-filter stochastic path takes the
+        /// Gumbel-max kernel: the backend supports it (GPU default device with
+        /// Metal or CUDA available) and `MLXCEL_SAMPLING_GUMBEL` is not falsy.
+        /// The env value is read once per process.
+        fn sampling_gumbel_available() -> bool;
+
+        /// Threadgroups the Gumbel-max kernel cooperates on one row with, for a
+        /// `[batch, vocab]` launch. Always a power of two in `[1, 64]`. Exposed
+        /// so tests can pin that the sampled id does not depend on it.
+        fn gumbel_sample_num_splits(batch: i32, vocab: i32) -> i32;
+
+        /// Dual-pivot rejection sampling for top-k / top-p / min-p (#901),
+        /// forced. Bypasses the `MLXCEL_SAMPLING_REJECTION` gate and takes an
+        /// explicit round cap so a test can drive the cap-overflow fallback.
+        /// Returns `[batch]` uint32 token ids.
+        fn fused_sample_rejection(
+            logits: &MlxArray,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+            max_rounds: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// The production rejection launch with an explicit round cap (#901),
+        /// landed and checked in place. Shares the overflow counting rule with
+        /// the deferred drain, so a test can pin that rule and its report
+        /// without depending on the best-effort ring that delivers the flags in
+        /// production.
+        fn fused_sample_rejection_deferred(
+            logits: &MlxArray,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+            max_rounds: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// Raw rejection kernel outputs stacked as `[3, batch]` uint32: row 0
+        /// sampled ids, row 1 the per-row converged flag, row 2 rounds
+        /// consumed. No host readback and no fallback, so a test observes the
+        /// kernel's own verdict.
+        fn sampling_rejection_probe(
+            logits: &MlxArray,
+            temperature: f32,
+            top_k: i32,
+            top_p: f32,
+            min_p: f32,
+            max_rounds: i32,
+        ) -> UniquePtr<MlxArray>;
+
+        /// True when [`fused_sample`]'s filtered path (any of top-k, top-p,
+        /// min-p active) takes the rejection kernel: the backend supports it
+        /// and `MLXCEL_SAMPLING_REJECTION` is not falsy. Read once per process.
+        fn sampling_rejection_available() -> bool;
+
+        /// Pure routing policy (#901): would `fused_sample` send this
+        /// configuration to the rejection kernel, ignoring backend support and
+        /// the env switch? The kernel replaces a sort, so it is routed only
+        /// where the stock chain sorts (top-p active), and the top-k + top-p
+        /// combination is capped at the vocabulary where it measured a win.
+        /// Pure host arithmetic, so it answers on a CPU-only build too.
+        fn sampling_rejection_routes(vocab: i32, top_k: i32, top_p: f32, min_p: f32) -> bool;
+
+        /// Threads per threadgroup the rejection kernel launches with. The
+        /// determinism argument rests on this being fixed, so it is exposed.
+        fn sampling_rejection_threadgroup_size() -> i32;
+
+        /// Rejection rounds the production path allows before falling back to
+        /// the `argpartition` chain.
+        fn sampling_rejection_max_rounds() -> i32;
+
+        /// Rows that exhausted the rejection round cap since process start (or
+        /// since the last [`sampling_dispatch_reset`]).
+        fn sampling_rejection_cap_overflow_rows() -> u64;
+
+        /// Launches in which at least one row exhausted the cap and the whole
+        /// launch therefore fell back.
+        fn sampling_rejection_cap_overflow_launches() -> u64;
+
+        /// Bitmask of sampling dispatch outcome kinds recorded but not yet
+        /// drained. Zero on nearly every sampling step, so the hot-path check
+        /// costs one load.
+        fn sampling_dispatch_pending_kinds() -> u32;
+
+        /// Pop one pending dispatch outcome description, or `""` when nothing
+        /// is pending.
+        fn sampling_dispatch_drain_report() -> String;
+
+        /// Every dispatch outcome description recorded since the last reset,
+        /// newline-joined, in kind order. NON-DESTRUCTIVE, unlike
+        /// [`sampling_dispatch_drain_report`], which the INFO logger consumes.
+        /// A test or a benchmark sharing a process with other samplers must use
+        /// this one: whichever caller drains first consumes the record.
+        fn sampling_dispatch_recorded_report() -> String;
+
+        /// Inspect every deferred rejection launch that has landed, now.
+        /// Still non-blocking: a launch that has not landed is left for later.
+        /// For tests, which would otherwise depend on a subsequent sampler call
+        /// to trigger the deferred check.
+        fn sampling_dispatch_drain_pending();
+
+        /// Clear every recorded dispatch outcome and both cap-overflow
+        /// counters. The state is process-wide; tests need a clean slate.
+        fn sampling_dispatch_reset();
 
         // SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H.
         /// Cumulative sum along axis
@@ -2610,6 +2893,13 @@ pub use sampling::{
     lang_bias_applied_total, lang_bias_byte_fragment_suppressions_total,
     lang_bias_tokens_suppressed_total,
 };
+// Re-export the sampling dispatch reporter and the rejection cap-overflow
+// counters (#901) so callers outside this crate can prove which sampling path
+// a run took without reaching into the module path.
+pub use sampling_dispatch::{
+    rejection_cap_overflow_launches, rejection_cap_overflow_rows, report_sampling_dispatch,
+    reset_sampling_dispatch,
+};
 
 // Re-export Axis B language-steering types so downstream consumers (CLI, server, B6–B8)
 // can use them without referencing the internal module path.
@@ -2795,8 +3085,9 @@ pub fn fast_rope_batched(
 /// prefill would strand the earliest query rows with an all-`-inf` row -> NaN
 /// (issue #401/#408); the windowed correctness instead comes from the mask.
 ///
-/// Used by: Llama, Qwen, Mixtral, Gemma, Cohere, Phi, OLMo, Exaone, GLM4,
-/// MiniCPM, DeepSeek, Hunyuan, StarCoder2 and other causal prefill call sites
+/// Used by: Llama, Qwen, Mixtral, Gemma, Gemma 2, Cohere, Phi, OLMo, Exaone,
+/// GLM4, MiniCPM, DeepSeek, Hunyuan, InternLM3, StarCoder2 and other causal
+/// prefill call sites
 pub fn causal_attention(
     q: &MlxArray,
     k: &MlxArray,
@@ -2961,6 +3252,11 @@ pub mod loop_detection;
 // Public so that the server batch scheduler can perform step-level sampling.
 pub mod sampling;
 
+// Which sampling path a decode step actually took, announced at INFO (#901).
+// Public so every `fused_sample` call site can drain the report, and so the
+// microbenchmark and the server can read the cap-overflow counters.
+pub mod sampling_dispatch;
+
 // Speculative decoding
 pub mod speculative;
 
@@ -2996,6 +3292,31 @@ pub mod rope_proportional;
 // can consume it without further structural changes.
 pub mod lang_analyzer;
 
+// Shape-bucketed kernel autotuner (issue #906): the TunableOp contract, the
+// median-of-N profiling harness, the persistent tactic cache, and the first
+// consumers. Default off; see the module docs for the precedence chain.
+// Public so that the `mlxcel tune` CLI subcommand can drive it offline.
+pub mod autotune;
+
+// Last-level-cache-aware rotating buffers for microbenchmarks (issue #906).
+// Public so that the harnesses under `examples/` can defeat cache warming.
+pub mod bench_rotation;
+
+// Paged-attention decode v2: CSR page table, cross-CTA split-KV, and the
+// variable-length merge kernel (issue #898). Default off; selected by
+// `MLXCEL_PAGED_ATTENTION_V2=1` inside `PagedBlockPool::paged_decode_fused`.
+// Public so that the correctness harness under `examples/` and the follow-up
+// production wiring (#899) can drive the plan and the launch directly.
+pub mod paged_v2;
+
+// Matrix-absorbed MLA decode over a compressed-latent KV cache (issue #907).
+// Default off; selected by `MLXCEL_MLA_ABSORBED=1` at family load time. Public
+// so the DeepSeek-family model code in the `mlxcel` crate and the benchmark
+// harness under `examples/` can build the fold, wrap the latent cache, and
+// drive both decode paths directly. Stage 2 reuses issue #898's merge kernel
+// unchanged; see `mla::split_kv`.
+pub mod mla;
+
 // Crate-wide helpers for `#[cfg(test)]` paths. Provides the single shared
 // `ENV_LOCK` that every env-mutating test in this crate must acquire; see `test_support::env_lock` for the rationale. `pub(crate)` so
 // that test modules at any depth (e.g. `crate::lang_analyzer::cache::tests`)
@@ -3013,3 +3334,60 @@ mod ffi_tests;
 #[cfg(test)]
 #[path = "fused_moe_parity_tests.rs"]
 mod fused_moe_parity_tests;
+
+// Statistical-correctness, determinism, and routing tests for the Gumbel-max
+// sampling kernel (#900). The kernel replaces `random::categorical` with a
+// distributionally equivalent draw, so correctness is a goodness-of-fit
+// property rather than a bitwise one. GPU-only; they skip on CPU-only builds.
+#[cfg(test)]
+#[path = "sampling_gumbel_tests.rs"]
+mod sampling_gumbel_tests;
+
+// Support-equality, chi-square goodness-of-fit, determinism, subnormal
+// hardening, cap-overflow and routing tests for the dual-pivot rejection
+// sampling kernels (#901). GPU-only; they skip on CPU-only builds.
+#[cfg(test)]
+#[path = "sampling_rejection_tests.rs"]
+mod sampling_rejection_tests;
+
+// Numeric-parity, Gemma `(1 + w)` convention, kill-switch and greedy-argmax
+// tests for the fused residual-add RMSNorm kernel (#905). GPU-only; they skip
+// on CPU-only builds.
+// Guard against a second `mlxcel-core` test binary sharing the GPU (issue
+// #1008). Concurrent suites on one Metal device abort or, worse, complete while
+// reporting failures that do not exist.
+#[cfg(test)]
+#[path = "gpu_exclusivity_tests.rs"]
+mod gpu_exclusivity_tests;
+
+// Guard against running this suite multi-threaded on the CUDA backend (issue
+// #1048). The libtest default of one thread per core drives MLX concurrently and
+// takes the process down with SIGABRT partway through, at a different test and
+// with a different CUDA error each run, so the abort reads as "whichever test
+// was running is broken". Disabling graph capture does not help; only
+// serializing does. CUDA-only: the Metal hazard is the cross-process one in
+// #1008, which `gpu_exclusivity_tests` above covers.
+#[cfg(all(test, feature = "cuda"))]
+#[path = "cuda_test_serialization_tests.rs"]
+mod cuda_test_serialization_tests;
+
+#[cfg(test)]
+#[path = "fused_norm_parity_tests.rs"]
+mod fused_norm_parity_tests;
+
+// Numeric regression tests for `fast::rms_norm` on the small-axis CUDA dispatch
+// band (#830/#831): the deleted pre-#3792 overlay read past its shared scratch
+// for 16-bit axes in (256, 512] (f32: (128, 256]), which is exactly the
+// DeepSeek-V2 `kv_a_layernorm` axis and was misattributed as a graph-capture
+// hazard. GPU-only; they skip on CPU-only builds.
+#[cfg(test)]
+#[path = "rms_norm_small_axis_tests.rs"]
+mod rms_norm_small_axis_tests;
+
+// RoPE-parity tests for the fused q/k RoPE + KV-append-layout kernel (#905):
+// position offsets including the absolute positions rotated/ring caches use,
+// both rotation conventions, partial rope dims, and both destination layouts.
+// GPU-only; they skip on CPU-only builds.
+#[cfg(test)]
+#[path = "fused_rope_parity_tests.rs"]
+mod fused_rope_parity_tests;

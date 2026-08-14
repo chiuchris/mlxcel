@@ -4,45 +4,29 @@
 [![Latest Release](https://img.shields.io/github/v/release/lablup/mlxcel)](https://github.com/lablup/mlxcel/releases/latest)
 [![CI](https://github.com/lablup/mlxcel/actions/workflows/ci.yml/badge.svg)](https://github.com/lablup/mlxcel/actions/workflows/ci.yml)
 
-High-performance LLM/VLM inference runtime and server for Apple Silicon. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
-
-## New in v0.4.3
-
-- **Deterministic 4-bit decode on CUDA.** Every 4-bit model produced different output run to run at temperature 0 on CUDA, and occasionally a garbage token, because the quantized-matmul kernel (`qmm_sm80`) reused shared memory that was still being written by in-flight async copies. The kernel now drains those copies before the epilogue, so greedy decode is byte-identical across runs on every 4-bit model (#910).
-- **Gemma 4 output correctness.** Three fixes: the fused decode-MoE kernel accumulates the per-expert partials in f32 instead of rounding each to bf16 before summing, which had corrupted long multi-turn output (#886); chunked prefill sizes the sliding-window attention mask to the keys the cache returns instead of dropping it, which had collapsed output to reserved `<unused>` tokens under concurrent load (#891); and the CLI hides the Gemma 4 `<|channel>thought` reasoning channel by default, with `--show-reasoning` to print it (#889).
-- **Four more text models.** GPT-2 (#924), GPT-BigCode (#926), GPT-NeoX (#928), and Kyutai Helium (#930).
-- **OpenXLA multimodal expansion (opt-in).** On the `xla-iree` backend: Gemma3n text runtime and audio (#892, #883), Phi4MM audio with per-slot adapters (#887, #914), LLaVA vision through IREE (#913), the Qwen2-VL vision path (#915), sparse DeepStack prefill (#893), multimodal RoPE position state (#894), and image requests admitted in the CLI and continuous-batch serving (#895). Default builds still do not compile the XLA path.
-- **IREE toolchain pinned and hardened.** The IREE compiler and runtime are unified at 3.12.0rc20260721 across CUDA and macOS, with wheels fetched from the official GitHub release and verified by sha256 (#882).
-
-## New in v0.4.2
-
-- **Three more model families.** MiniMax-M3, a hybrid dense/MoE text model with block-sparse attention (#799); MiniMax-M3-VL multimodal (#800); and Unlimited-OCR, whose decode runs against a ring sliding KV cache so a long document does not grow the cache unbounded past the window (#801).
-- **XTC sampling.** Exclude Top Choices sampling (`xtc_probability`, `xtc_threshold`) is read and applied end to end on the OpenAI-compatible chat, completions, and responses routes; out-of-range values return a 400 (#802).
-- **DeepSeek-V2 is correct on CUDA again.** An upstream MLX 0.32.1 RMSNorm kernel regression turned DeepSeek-V2-Lite generation into repeated tokens on GB10. The affected kernel is overlaid with its last-good version and CUDA graph capture is disabled for the family (as it already is for Gemma 4), so output is coherent again (#829).
-- **Empty-input requests are rejected up front.** A request whose effective input is empty or whitespace-only returns a 400 before model dispatch, on `/v1/chat/completions`, `/v1/completions`, and `/v1/messages` (#803, #813, #814).
-- **The server survives more backend faults.** An MLX evaluation throw in the decode loop fails the affected request instead of aborting the worker (#825), and CUDA builds raise the MLX graph-cache default so long-lived speculative serving no longer hits the fatal "Cache thrashing" abort (#818).
-- **Gemma 4 audio transcription fix.** The CLI renders the audio placeholder after the prompt text, so the 12B unified model transcribes acoustically hard clips instead of answering their perceived content (#798).
-
-## New in v0.4
-
-- **Experimental OpenXLA / IREE backend (opt-in).** A second forward-execution engine built on a Rust-native StableHLO emitter and the IREE runtime, selectable with `MLXCEL_BACKEND=xla` behind the `xla-backend` / `xla-iree` build features. It runs on Metal and CUDA and serves through a continuous-batching engine. Default builds do not compile it, and the MLX path is unchanged.
-- **Over 20 new vision-language and OCR families.** Qwen3-Omni (with talker speech output), Llama 3.2 Vision, GLM-4V and GLM-4V MoE, Hunyuan-VL, ERNIE-4.5 MoE VL, DeepSeek-VL2, Kimi-VL, FastVLM, Moondream2, Idefics2, SmolVLM, LFM2-VL, and Granite Vision, plus the OCR set DeepSeek-OCR and DeepSeek-OCR 2, dots.ocr, GLM-OCR, and PaddleOCR-VL. The set kept growing after 0.4.0: Kimi-VL video, Step-3, and Command MoE (Cohere2 MoE) in 0.4.1, then MiniMax-M3, MiniMax-M3-VL, and Unlimited-OCR in 0.4.2.
-- **Tool calling across model families.** Server tool-call parsers cover Kimi K2, the pythonic `[func(arg=value)]` form, function-calling Gemma, MiniMax-M3, GLM-4.7, LongCat, and the bracketed Mistral format, added in 0.4.1.
-- **Batching on by default.** `mlxcel-server` and `mlxcel serve` default to batched decode (`--parallel 4`), batched prefill (`--max-batch-prefill 4`), and the prompt-prefix cache, guarded by an automatic KV-cache budget. On M1 Ultra, 4 concurrent clients reach 1.90x the single-client aggregate throughput and about 17x lower time-to-first-token, with single-client speed unchanged. Restore the old behavior with `--parallel 1 --no-batch --no-prompt-cache`.
-- **CUDA / GB10 kernel parity.** Native paged-attention decode, fused SSM decode, and MoE prefill (sorted grouped GEMM) kernels are ported to CUDA, alongside a Blackwell (sm_120/121) quantized-matmul tile and a single-dtype decode graph.
-- **Speculative decoding overhaul.** Tick-cooperative scheduling removes the burst head-of-line block, and the MTP accept/decline policy is set from measured round cost.
-- **NVFP4 (Blackwell).** ModelOpt NVFP4 checkpoints transcode directly to the native MLX layout, with Metal defaulting to the native path.
-- **New attention paths.** DeepSeek-V3.2 / GLM-MoE DSA lightning indexer, phi3-small blocksparse attention, and qwen3-next pipeline-parallel stages.
-- **Server hardening.** In 0.4.2, requests with no effective input are rejected before dispatch, a decode-loop MLX throw fails the request instead of the worker, and long-lived CUDA speculative serving no longer aborts on the MLX graph-cache limit.
-- **Interrupted downloads recover.** A partial model snapshot is detected against its own weight index and re-fetched at load instead of failing with a bare `Weight not found`.
-
-See the [changelog](CHANGELOG.md) for the full list.
+High-performance LLM/VLM inference runtime and server for Apple Silicon / NVIDIA CUDA-compatible / (experimental) OpenXLA-compatible devices. The CLI and server are implemented in Rust and execute models through native MLX C++ bindings. Linux/CUDA builds are supported as a secondary target.
 
 ## Overview
 
 `mlxcel` provides a Rust command-line runtime and an OpenAI-compatible model server for MLX-format checkpoints. Loading, scheduling, and inference stay in one native process while model execution goes through MLX C++ bindings. It runs a broad range of text and vision-language model families directly from [mlx-community](https://huggingface.co/mlx-community) checkpoints, with no conversion step.
 
 The project started as work on structural model fine-tuning and has grown into a general-purpose serving runtime for local and small-cluster inference.
+
+## New in v0.5.0
+
+- **Meta Muse Glimmer support.** The 52-layer mixed-cache decoder and the 50-layer vision and fusion path run single-image and multi-image prompts through both the CLI and the continuous-batching server, with ATEM reasoning channels parsed across the Chat Completions, Responses, and Anthropic-compatible routes. Both the bf16 checkpoint and `mlx-community/Muse-Glimmer-30B-4bit` are supported; the 4-bit decodes at about 3.1x the bf16 rate on NVIDIA GB10.
+- **Florence-2 end to end.** DaViT vision tower plus BART seq2seq decoder, fifteen task markers, 3/4/6/8-bit checkpoints, and HTTP serving through a dedicated seq2seq worker. Parsed coordinates ride the response as `message.florence2_result`.
+- **3 more new vision-language families:** LocateAnything grounding, Falcon-OCR early fusion, and Jina VLM.
+- **8 new text model families**, including Ling/Bailing, OpenELM, TeleChat3, DBRX, Phixtral, AFMoE, and Klear.
+- **Paged-attention decode v2 is now the production path.** Multi-CTA CSR-page-table decode scales with context length; batched decode is up to 1.47x faster on M1 Ultra. Set `MLXCEL_PAGED_ATTENTION_NATIVE=0` to restore the gather path.
+- **Unified sparse/shared-prefix decode.** Sparse decode uses page tables without gathering; MiniMax-M3 sees up to 2.06x speedup. Shared-prefix (cascade) decode is available but disabled by default.
+- **Faster sampling.** Sort-free top-p and Gumbel-max sampling improve performance, but may change fixed-seed outputs.
+- **CUDA JIT kernels are keyed on their input dtypes.** Running one geometry at two dtypes in a single process no longer reuses the first compiled kernel and returns numbers unrelated to its inputs.
+- **Chunked GLA prefill is the `bailing_moe_linear` default:** 2.1x to 2.4x faster prefill and lower perplexity at every window measured.
+- **Generation-mask fix** for `deepseek_v2`, `internlm3`, `hunyuan`, and `gemma2`, plus earlier quantization validation at load time and Jamba MoE checkpoint fixes.
+- **Workspace-wide verification:** `make verify` runs all workspace tests with a faster test profile, and gates crate versions and CUDA kernel dtype keys.
+
+See the [changelog](CHANGELOG.md) for the full list.
 
 ## Why mlxcel
 
@@ -53,7 +37,7 @@ The project started as work on structural model fine-tuning and has grown into a
 - **Serving features for real deployments.** Continuous batching, prompt-prefix caching, and automatic prefix caching are on by default; speculative decoding and KV-cache compression are available for supported model/runtime combinations.
 - **Differentiated runtime controls.** Default builds expose first-class YAML load-time model surgery through `--surgery` / `MLXCEL_SURGERY`, with operations such as `scale`, `add`, `prune`, `replace`, and `interpolate` for reproducible weight-space changes without retraining or writing converted checkpoints.
 - **Multi-device and distributed modes.** Tensor parallelism and pipeline parallelism are implemented for selected model families, including zero-config pipeline startup with static or mDNS-based discovery.
-- **Broad model-family coverage.** The runtime includes loaders for Llama, Qwen, Gemma, Phi, Mistral/Mixtral, DeepSeek, Cohere, InternLM, GLM, ExaOne, OLMo, ERNIE, Hunyuan, Mamba/RWKV/Jamba, Nemotron, MiniMax, Step, and Kimi, plus a broad vision-language and OCR set (Qwen3-Omni, GLM-4V, Llama 3.2 Vision, Hunyuan-VL, ERNIE-4.5 VL, DeepSeek-VL2, DeepSeek-OCR, PaddleOCR-VL, and more). See [Supported models](docs/supported-models.md) for the maintained list.
+- **Broad model-family coverage.** The runtime includes loaders for Llama, Qwen, Gemma, Phi, Mistral/Mixtral, DeepSeek, Cohere, InternLM, GLM, ExaOne, OLMo, ERNIE, Hunyuan, Mamba/RWKV/Jamba, Nemotron, MiniMax, Step, and Kimi, plus a broad vision-language and OCR set (Qwen3-Omni, Muse Glimmer, GLM-4V, Llama 3.2 Vision, Hunyuan-VL, ERNIE-4.5 VL, DeepSeek-VL2, DeepSeek-OCR, PaddleOCR-VL, and more). See [Supported models](docs/supported-models.md) for the maintained list.
 
 ## Quick start
 
@@ -90,7 +74,7 @@ mlxcel run
 
 The default model, and other thinking-capable checkpoints such as Qwen-style `<think>` models, write a chain-of-thought before the final answer. `generate` and `run` hide it from the terminal by default so only the answer prints; pass `--show-reasoning` to also print the reasoning, dimmed on a terminal. The raw `<|channel>thought` / `<channel|>` or `<think>` / `</think>` markers never print either way.
 
-Output length follows llama.cpp: with no `-n/--max-tokens` (default `-1`), `generate` / `run` keep generating until the model emits an end-of-sequence token or fills its context window. The server's `--n-predict` default (`-1`) behaves the same per request. Pass an explicit `-n N` (or `--n-predict N`) to cap output at exactly `N` tokens.
+Output length follows llama.cpp: with no `-n/--max-tokens` (default `-1`), `generate` / `run` keep generating until the model emits an end-of-sequence token or fills its context window. The server's `--n-predict` default (`-1`) behaves the same per request. Pass an explicit `-n N` (or `--n-predict N`) to cap output at exactly `N` tokens. HTTP `max_tokens` and native `/completion` `n_predict` overrides are silently clamped to the effective per-slot context window; when `--ctx-size` is unset, the resolved server default is the cap. With the default `--n-predict -1`, that value comes from the checkpoint context window, or 4096 when unavailable.
 
 ```bash
 # One-off generation (omit -n to run until EOS / context window; -n N caps it).
@@ -284,7 +268,7 @@ Model support is architecture- and checkpoint-dependent. Run:
 mlxcel arch
 ```
 
-for the CLI summary, and see [Supported models](docs/supported-models.md) for the maintained architecture table, known limitations, and VLM coverage notes.
+for the CLI summary, and see [Supported models](docs/supported-models.md) for the maintained architecture table, known limitations, real-checkpoint qualification status, and VLM coverage notes.
 
 ## Python
 
@@ -314,6 +298,7 @@ Install with `pip install ./python`. See [Python client](docs/python-client.md) 
 - [Architecture overview](docs/architecture.md)
 - [Tensor and pipeline parallelism](docs/distributed.md)
 - [TurboQuant KV cache](docs/turbo-kv-cache.md)
+- [Speculative-decoding acceptance](docs/speculative-acceptance.md)
 - [OpenAI Responses API](docs/responses-api.md)
 - [Audio input preprocessing](docs/audio-preprocessing.md)
 - [Python client](docs/python-client.md)

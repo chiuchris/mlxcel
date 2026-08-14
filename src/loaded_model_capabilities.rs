@@ -49,12 +49,18 @@ pub enum VlmRuntimeRef<'a> {
     /// Step-3.7 runtime (perception_encoder ViT + Step-3.5 MoE text).
     Step3p7(&'a vision::Step3p7VlModel),
     DotsOcr(&'a vision::DotsOcrVlModel),
+    /// Falcon-OCR runtime (early-fusion patch projector, no vision tower).
+    FalconOcr(&'a vision::FalconOcrVlModel),
+    /// Jina VLM runtime (SigLIP-class ViT + Molmo-style connector + Qwen2 text).
+    JinaVlm(&'a vision::JinaVlmModel),
     /// Youtu-VL runtime.
     YoutuVL(&'a vision::YoutuVLModel),
     /// InternVL (internvl_chat) runtime.
     InternVL(&'a vision::InternVLChatVLM),
     /// Kimi-VL / Kimi-VL 2.5 (MoonViT) runtime.
     KimiVL(&'a vision::KimiVLModel),
+    /// LocateAnything (MoonViT + Qwen2 grounding) runtime.
+    LocateAnything(&'a vision::LocateAnythingVLM),
     /// Llama 3.2 Vision (mllama) cross-attention runtime.
     Mllama(&'a vision::MllamaVLModel),
     /// SmolVLM / SmolVLM2 (smolvlm) runtime.
@@ -75,6 +81,9 @@ pub enum VlmRuntimeRef<'a> {
     HunyuanVl(&'a vision::hunyuan_vl::HunyuanVlModel),
     /// MiniMax-M3-VL runtime (CLIP ViT + MiniMax-M3 hybrid dense/MoE text).
     MiniMaxM3Vl(&'a vision::MiniMaxM3VlModel),
+    /// Muse Glimmer runtime with dedicated placeholder expansion and ordered
+    /// multi-image feature scatter.
+    MuseGlimmer(&'a vision::MuseGlimmerVlmModel),
     /// Pixtral / Mistral3 dynamic aspect-ratio runtime. Shares the generic
     /// `VisionModule` storage but preserves each image's aspect ratio and emits
     /// `[IMG] / [IMG_BREAK] / [IMG_END]` row structure (see `pixtral_layout`).
@@ -171,6 +180,8 @@ impl LoadedModel {
             Self::PaddleOcrVL(model) => Some(VlmRuntimeRef::PaddleOcr(model)),
             Self::Step3p7VL(model) => Some(VlmRuntimeRef::Step3p7(model)),
             Self::DotsOcrVL(model) => Some(VlmRuntimeRef::DotsOcr(model)),
+            Self::FalconOcrVL(model) => Some(VlmRuntimeRef::FalconOcr(model)),
+            Self::JinaVLM(model) => Some(VlmRuntimeRef::JinaVlm(model)),
             Self::MiniCPMOVLM(model) => Some(VlmRuntimeRef::MiniCPMO(model)),
             Self::MiniCPMV46VLM(model) => Some(VlmRuntimeRef::MiniCPMV46(model)),
             Self::Moondream3VLM(model) => Some(VlmRuntimeRef::Moondream3(model)),
@@ -188,6 +199,7 @@ impl LoadedModel {
             Self::YoutuVL(model) => Some(VlmRuntimeRef::YoutuVL(model)),
             Self::InternVLChatVLM(model) => Some(VlmRuntimeRef::InternVL(model)),
             Self::KimiVL(model) => Some(VlmRuntimeRef::KimiVL(model)),
+            Self::LocateAnythingVLM(model) => Some(VlmRuntimeRef::LocateAnything(model)),
             Self::MllamaVLM(model) => Some(VlmRuntimeRef::Mllama(model)),
             Self::SmolVLM(model) => Some(VlmRuntimeRef::SmolVLM(model)),
             Self::Idefics2(model) => Some(VlmRuntimeRef::Idefics2(model)),
@@ -211,6 +223,7 @@ impl LoadedModel {
             Self::Ernie45MoeVLM(model) => Some(VlmRuntimeRef::Ernie45MoeVl(model)),
             Self::HunyuanVLM(model) => Some(VlmRuntimeRef::HunyuanVl(model)),
             Self::MiniMaxM3VL(model) => Some(VlmRuntimeRef::MiniMaxM3Vl(model)),
+            Self::MuseGlimmerVLM(model) => Some(VlmRuntimeRef::MuseGlimmer(model)),
             _ => None,
         }
     }
@@ -241,6 +254,19 @@ impl LoadedModel {
             && let Some(qwen) = qwen_runtime(runtime)
         {
             qwen.bind_mrope_state_to_sequence(seq_id);
+        }
+    }
+
+    /// Bind the pending Falcon-OCR prefill state (temporal positions, spatial
+    /// coordinates and the rope delta just written by `input_embeddings`) to a
+    /// specific server sequence id.
+    ///
+    /// Falcon-OCR's rope delta is negative and image-size dependent, so an
+    /// unbound fallback slot would let one request's image geometry drive
+    /// another request's decode positions. No-op for every other model.
+    pub fn bind_falcon_ocr_state_to_sequence(&self, seq_id: mlxcel_core::cache::SequenceId) {
+        if let Some(VlmRuntimeRef::FalconOcr(falcon)) = self.vlm_runtime() {
+            falcon.bind_state_to_sequence(seq_id);
         }
     }
 

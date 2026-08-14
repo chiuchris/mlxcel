@@ -83,6 +83,21 @@ template, Transformers may define the tensor/module contract, and vLLM may show
 the serving-time cache layout. Keep those responsibilities separate while
 porting.
 
+### Set `MLXCEL_FUSED_MOE=0` when reference-diffing a MoE port
+
+The fused single-token decode-MoE kernel (#268) is on by default and engages
+only at `l == 1`, so a prefill comparison is unaffected while a greedy decode
+comparison is not. It is not a defect: measured against an all-f32
+dequantize-and-matmul ground truth it is roughly 6x closer than `gather_qmm`
+on both Klear and `qwen3-30b-a3b` (#1045). But `gather_qmm` is the path mlx-lm
+mirrors, so diffing against mlx-lm with the kernel on compares two paths that
+were never meant to agree bit for bit.
+
+Whether the difference flips a greedy argmax is checkpoint-dependent:
+`qwen3-30b-a3b` is byte-identical either way, Klear is not. A port that looks
+exact at prefill and diverges at decode is very likely hitting this rather than
+a porting bug, so rule it out first by rerunning with the kernel off.
+
 Do not copy reference-code boundaries blindly:
 
 - Keep route selection in `src/model_metadata.rs` and `src/loading/`.
@@ -135,6 +150,86 @@ be possible at first, but the implementation should still prove that:
 If later a reference implementation appears, add a follow-up comparison against
 that implementation and tighten the tests or benchmark notes accordingly.
 
+### Large VLM Baselines
+
+Large VLM ports need explicit operational documentation before they are exposed
+as supported. In addition to the loader/runtime tests, update
+`docs/supported-models.md`, `mlxcel arch`, and any top-level help text that
+summarizes runtime capabilities with:
+
+- checkpoint identity: repository, pinned revision, local fixture/checkpoint
+  path when relevant, dtype, and approximate weight size
+- memory expectation: the smallest realistic hardware class and whether other
+  large jobs should be serialized during validation
+- context and cache semantics: actual maximum context and whether the family
+  uses standard growing KV, rotating/sliding KV, or a model-owned mixed cache
+- multimodal limits: image/video/audio support, visual-token caps, placeholder
+  expansion rules, and prompt-token accounting
+- serving surfaces: CLI, OpenAI Chat Completions, Responses, Anthropic
+  compatibility, streaming, batching, and tool-call format
+- generation defaults: EOS ids and sampling defaults read from
+  `generation_config.json`
+- unsupported paths: quantization, speculative/DFlash, adapters, TP, PP, XLA,
+  distributed/disaggregated serving, and any modality that is intentionally
+  rejected
+
+Muse Glimmer is the current example of this rule. Its first baseline targets
+`meta-models/Muse-Glimmer-30B` revision
+`97c77dff50b2797bcc558fa2d909761dbc575c59`, dense BF16 weights of about
+59.55 GB, and its quantized contract targets
+`mlx-community/Muse-Glimmer-30B-4bit` revision
+`3e7677d7a40d348a3daba263a2b1c0aa41910710`, MLX affine-Q4 text and fusion
+weights with a dense vision tower, and about 19.41 GB of tensors. Both expose
+131072 context, 2048-token sliding layers plus growing full layers, 4096 visual
+tokens per image, ATEM tool calls, and `reasoning_strength`
+`low`/`medium`/`high`/`xhigh` with `high` by default. Do not mark a large VLM
+as real-checkpoint qualified until the hardware gate records load, memory,
+throughput, text/image/multi-image, tool-call, long-context, and scheduler
+evidence against the actual checkpoint.
+
+## Labelling a Model Issue
+
+Model-support issues carry three orthogonal labels beyond the usual
+`type:` / `priority:` / `area:` set. They exist so that "what do we support, and
+what can we actually test here?" is a label query rather than an archaeology
+exercise.
+
+**`modelsize:`** is measured on the **smallest publicly available checkpoint at
+the lowest published quantization**, by on-disk size, which for MLX is close to
+resident memory. It describes the model, not the machine, so it does not need
+revisiting when the development hardware changes.
+
+| Label | Size | Meaning |
+|-------|------|---------|
+| `modelsize:small` | ≤ 10 GB | Fast iteration; safe to use in a smoke test |
+| `modelsize:medium` | 10 to 50 GB | Comfortable on a 128 GB box |
+| `modelsize:large` | 50 to 100 GB | Runs, but dominates the machine; serialize other work |
+| `modelsize:xlarge` | > 100 GB | Exceeds a 128 GB box; needs bigger hardware |
+
+`modelsize:large` is deliberately not a blocker: DBRX is 70 GB and was validated
+token-exact on the 128 GB development machine. When a model genuinely cannot be
+validated on available hardware, say so with `status:blocked` and record the
+reason in the issue body. Keeping the two apart means a hardware upgrade
+re-opens work by clearing `status:blocked`, without relabelling every model.
+
+**`modeltype:`** is the modality: `text`, `vlm`, `audio`, `omni`.
+
+**`arch:`** is the structural family, which is what actually predicts porting
+effort and code reuse:
+
+| Label | Covers |
+|-------|--------|
+| `arch:dense` | Dense transformer decoder |
+| `arch:moe` | Sparse mixture-of-experts decoder |
+| `arch:hybrid` | Mixed attention stack: linear/sliding/full interleave, or attention + SSM |
+| `arch:ssm` | State-space or recurrent (Mamba, RWKV) |
+
+`arch:hybrid` wins over `arch:moe` when a model is both, because the hybrid
+cache is the harder half of the port: it forces the
+`ModelOwnedSequenceState<Cache>` path rather than the simple `LanguageModel`
+cache path. AFMoE and MiMo v2 Flash are MoE models labelled `arch:hybrid` for
+exactly this reason.
+
 ## Text Model Checklist
 
 1. Add the implementation file under `src/models/`.
@@ -156,6 +251,13 @@ that implementation and tighten the tests or benchmark notes accordingly.
      parallel entry list in `src/loading/config_backed.rs`.
 7. If LoRA/adapters are supported, verify `load_model_from_weights()` in `src/loading/mod.rs`.
    - Non-standard adapter paths should extend `src/loading/special.rs` instead of growing `load_model_from_weights()` directly.
+8. If the family carries a **quantized MoE expert type of its own** rather than
+   using `switch_layers::SwitchLinear`, bound the declared quantization pair at
+   the point the loader stores it:
+   `switch_layers::validate_expert_quantization_params(prefix, group_size, bits)?`.
+   The shared loader does this for you; a family-local `SwitchLinear` /
+   `SwitchGLU` / `ExpertLinear` does not inherit it. See
+   [Quantization Parameter Bounds](#quantization-parameter-bounds).
 
 ## VLM Checklist
 
@@ -201,6 +303,80 @@ Keep the model in an existing module when:
 
 If you are unsure, extend the existing family module first and split only when
 the test file or router starts to lose a clear boundary.
+
+## Quantization Parameter Bounds
+
+`config.json` is untrusted input: it arrives with a downloaded HuggingFace
+repository. A `group_size` or `bits` that no tensor layout can describe passes
+every Rust-side check and then violates an undocumented MLX precondition. MLX
+reconstructs a quantized matrix's unpacked width as `w.shape(-1) * 32 / bits`,
+so a declared `"bits": 0` is a division by zero and anything above 32 collapses
+the quotient. Because `gather_qmm`, `quantized_matmul`, `quantized_embedding`
+and `dequantize` all cross the cxx bridge as `UniquePtr<MlxArray>` rather than
+`Result`, the resulting C++ throw is an uncatchable `std::terminate` at the
+**first forward pass**, not a load error, and `catch_unwind` does not contain it
+(see [`docs/adr/0003-release-panic-unwind-with-core-thread-abort.md`](adr/0003-release-panic-unwind-with-core-thread-abort.md)).
+In `mlxcel-server` that is a remote denial of service triggered by loading a
+model.
+
+The rule is therefore: **bound the pair wherever it is stored, before anything
+derived from it is kept.** Not at the model's load boundary. The boundary does
+not dominate, because pipeline stage executors, `*StageModel::from_filtered_weights`
+entry points, VLM text wrappers and config-bridging helpers all build layers
+without ever calling the family's own model constructor, and several families
+build the quantized variant as a bare struct literal from another module.
+
+What already carries the bound, so you inherit it for free:
+
+| Loader | Covers |
+|--------|--------|
+| `reconcile_quantization_layout` | every `UnifiedLinear` / `UnifiedEmbedding` |
+| `SwitchLinear::from_stacked_parts` | MoE experts via the shared `switch_layers` loader |
+| `QuantizedMultiLinear::{new, from_weights}` | MLA `embed_q` / `unembed_out` |
+| `FusedQKVLinear::from_weights_separate_with_mode` | fused QKV projections |
+| `infer_mla_quantization_params` | the MLA `kv_b_proj` decomposition in `sanitize_weights` |
+
+There is deliberately no hand-built `QuantizedEmbedding` constructor on that
+list any more. One existed for Mamba / Mamba2, which resolve their table under
+two possible prefixes and so looked unable to address the single-prefix map
+loader. It hardcoded `mode: "affine"` and required a `biases` argument, and that
+is exactly how those two families came to treat a block-float embedding
+(`.scales`, no `.biases`) as non-quantized (issue #976). If your checkpoint
+spells the embedding prefix more than one way, resolve the prefix with a
+`contains_key` probe and pass it to `UnifiedEmbedding::from_weights`; do not
+hand-build the layer.
+
+`QuantizedMultiLinear::new` is still on the list, and the difference is worth
+being precise about, because the two constructors looked alike. The embedding
+one was removed for a signature that forced the defect: requiring a `biases`
+argument meant a block-float caller could not describe its own checkpoint. The
+MLA one takes `Option<biases>` and derives the mode from it with the same
+`infer_quantization_mode` call the loader uses (issue #1028), so it can describe
+every plane layout the loader can and cannot store a mode that contradicts them.
+Both entry points also bound the declared `group_size` / `bits` pair, which
+matters more here than elsewhere because this is the one shared quantized loader
+that stores the declared pair verbatim rather than reconciling it against the
+tensor shapes.
+
+What you must do yourself:
+
+- A **family-local quantized expert type**: call
+  `switch_layers::validate_expert_quantization_params(prefix, group_size, bits)?`
+  in the branch that builds the quantized variant. Gate only that branch: a bf16
+  expert plane carries no packing and must stay loadable at any declared pair.
+- A **per-prefix quantization block** (gpt-oss style, a map of overrides rather
+  than one triple): walk every entry during config validation as well, because
+  a bound on the top-level defaults says nothing about an individual override,
+  and vice versa.
+- Any **new by-hand constructor** that stores a pair and hands it to an MLX
+  quantized op: make it fallible and bound it, rather than trusting the caller.
+
+Add a regression test that drives the bad values through your real loader rather
+than through `validate_quantization_params` directly, and pair every hostile case
+with a positive control so a guard cannot pass by rejecting everything quantized.
+`switch_layers::insert_stacked_quantized_expert_plane` and
+`switch_layers::HOSTILE_QUANT_PARAMS` are the shared test fixtures; see any
+`src/models/*_tests.rs` guard test for the shape.
 
 ## Where Regressions Usually Happen
 

@@ -51,6 +51,21 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 image_blocks, total_image_tokens
             );
         }
+        VlmPreparationSummary::FalconOcr {
+            image_blocks,
+            total_image_tokens,
+            appended_task_token,
+        } => {
+            let task = if appended_task_token {
+                ", OCR task token appended"
+            } else {
+                ""
+            };
+            println!(
+                "Falcon-OCR: inserted {} image block(s) ({} patch tokens{})",
+                image_blocks, total_image_tokens, task
+            );
+        }
         VlmPreparationSummary::MiniCPMO {
             image_slots,
             total_tokens,
@@ -117,6 +132,16 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
                 video_count, frame_slots, total_tokens
             );
         }
+        VlmPreparationSummary::MuseGlimmer {
+            image_blocks,
+            image_tokens,
+            total_tokens,
+        } => {
+            println!(
+                "Muse Glimmer: expanded {} image placeholder(s) into {} patch token(s) ({} total tokens)",
+                image_blocks, image_tokens, total_tokens
+            );
+        }
         VlmPreparationSummary::Phi4MM {
             image_slots,
             total_tokens,
@@ -124,6 +149,16 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
             println!(
                 "Phi4MM: tokenized with {} image slots ({} total tokens)",
                 image_slots, total_tokens
+            );
+        }
+        VlmPreparationSummary::JinaVlm {
+            image_blocks,
+            image_tokens,
+            total_tokens,
+        } => {
+            println!(
+                "Jina VLM: inserted {} image block(s) ({} image tokens, {} total tokens)",
+                image_blocks, image_tokens, total_tokens
             );
         }
         VlmPreparationSummary::Molmo { total_tokens } => {
@@ -196,6 +231,15 @@ fn print_preparation_summary(summary: VlmPreparationSummary) {
         } => {
             println!(
                 "InternVL: inserted {} image block(s) ({} total image tokens)",
+                image_blocks, total_image_tokens
+            );
+        }
+        VlmPreparationSummary::LocateAnything {
+            image_blocks,
+            total_image_tokens,
+        } => {
+            println!(
+                "LocateAnything: inserted {} image block(s) ({} total image tokens)",
                 image_blocks, total_image_tokens
             );
         }

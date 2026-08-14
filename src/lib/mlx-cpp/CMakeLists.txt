@@ -89,12 +89,20 @@ if(DEFINED ENV{MLXCEL_MLX_SOURCE_DIR} AND
   if(EXISTS "${_mlx_override_deps_dir}/metal_cpp-src/CMakeLists.txt")
     set(FETCHCONTENT_BASE_DIR "${_mlx_override_deps_dir}")
   endif()
+  if(DEFINED ENV{MLXCEL_METAL_CPP_SOURCE_DIR} AND
+     EXISTS "$ENV{MLXCEL_METAL_CPP_SOURCE_DIR}/Metal/Metal.hpp")
+    set(FETCHCONTENT_SOURCE_DIR_METAL_CPP
+        "$ENV{MLXCEL_METAL_CPP_SOURCE_DIR}")
+    message(STATUS "Using Metal C++ source override from $ENV{MLXCEL_METAL_CPP_SOURCE_DIR}")
+  endif()
   message(STATUS "Using MLX source override from ${mlx_SOURCE_DIR}")
 # Reuse an already-populated source tree when present so offline rebuilds can
 # proceed without re-running FetchContent. This is especially useful when Cargo
 # changes the build hash but the developer already has a cached MLX checkout.
 # NOTE: Stale-cache validation is handled by build.rs (purge_stale_mlx_cache)
-# which runs *before* CMake, ensuring _deps/ is either valid or absent.
+# which runs *before* CMake, ensuring _deps/ is either valid or absent, and
+# build.rs re-checks the fetched checkout's HEAD afterwards so a tree seeded
+# out of band cannot slip through this reuse branch either.
 elseif(EXISTS "${_mlx_cached_source_dir}/CMakeLists.txt")
   set(mlx_SOURCE_DIR "${_mlx_cached_source_dir}")
   set(mlx_BINARY_DIR "${_mlx_cached_binary_dir}")

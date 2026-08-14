@@ -1,6 +1,6 @@
 <!--
 Thanks for opening a pull request! Please fill out the sections below.
-For the full contributor contract see AGENTS.md and CONTRIBUTING.md.
+For the full contributor contract see CONTRIBUTING.md and docs/code-guidelines.md.
 -->
 
 ## Summary
@@ -34,8 +34,8 @@ For inference changes, real-checkpoint validation is required — synthetic-only
 -->
 
 - [ ] `cargo fmt --all -- --check` (enforced by CI — violations block merge)
-- [ ] `cargo clippy --all-targets -- -D warnings`
-- [ ] `cargo test --release`
+- [ ] `cargo clippy --workspace --all-targets -- -D warnings`
+- [ ] `cargo test --workspace --profile test-fast`
 - [ ] `cargo deny check`
 - [ ] Validated with a real checkpoint (specify which, e.g. `mlx-community/Qwen3.5-0.8B-OptiQ-4bit`): ...
 

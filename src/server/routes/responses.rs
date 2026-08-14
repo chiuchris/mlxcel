@@ -32,18 +32,20 @@ use axum::{
     Json,
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, sse::Sse},
+    response::{IntoResponse, Response},
 };
 
 use crate::server::AppState;
 use crate::server::chat_request::{prepare_chat_request_with_cache, request_has_effective_input};
 use crate::server::config::ReasoningBudgetOverride;
 use crate::server::conversation_store::ConversationItem;
+use crate::server::model_provider::QueueFullError;
 use crate::server::responses_store::StoredResponse;
 use crate::server::responses_translator::{
     OutboundContext, ResponsesTranslateError, build_response_object, responses_request_to_chat,
     short_uuid,
 };
+use crate::server::streaming::sse_response;
 use crate::server::streaming_responses::{ResponseStreamEmitter, responses_sse_channel};
 use crate::server::structured::build_constraint_from_response_format;
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
@@ -58,10 +60,19 @@ use crate::server::types::responses_response::{
 };
 use crate::server::types::responses_stream::ResponseStreamEvent;
 
+fn generation_error_to_response(err: anyhow::Error) -> ErrorResponse {
+    if err.downcast_ref::<QueueFullError>().is_some() {
+        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+    } else {
+        ErrorResponse::new(format!("Generation error: {err}"), "server_error")
+    }
+}
+
 use super::chat::{
     build_generate_options, build_prompt_cache_request_context, parse_priority_header,
     validate_xtc_params,
 };
+use crate::server::request_options::{chat_carries_loop_amplifier, resolve_server_max_tokens};
 
 /// POST /v1/responses
 pub async fn create_response(
@@ -124,11 +135,8 @@ pub async fn create_response(
     };
 
     // Resolve thinking budget the same way the chat path does.
-    let effective_max_tokens = translated
-        .chat_request
-        .params
-        .max_tokens
-        .unwrap_or(state.config.default_max_tokens);
+    let effective_max_tokens =
+        resolve_server_max_tokens(&state.config, translated.chat_request.params.max_tokens);
     let raw_budget = pick_budget_alias(
         translated.chat_request.params.thinking_budget_tokens,
         translated.chat_request.params.thinking_token_budget,
@@ -217,11 +225,12 @@ async fn non_stream_create_response(
     };
     // Whether the rendered prompt left a thinking block open. Captured before
     // `prepared.prompt` is moved into the generate call below. A bare close
-    // marker in the output may only be treated as the close of an implicit open
-    // when this is true — otherwise it is literal text the user asked for.
+    // marker may only close an implicit open when this is true.
     let primed_open_thinking =
         crate::server::routes::chat::is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -253,10 +262,7 @@ async fn non_stream_create_response(
 
     let result = match result {
         Ok(r) => r,
-        Err(e) => {
-            return ErrorResponse::new(format!("Generation error: {e}"), "server_error")
-                .into_response();
-        }
+        Err(e) => return generation_error_to_response(e).into_response(),
     };
 
     state.metrics.record_request(
@@ -339,11 +345,12 @@ async fn stream_create_response(
     };
     // Whether the rendered prompt left a thinking block open. Captured before
     // `prepared.prompt` is moved into the generate call below. A bare close
-    // marker in the output may only be treated as the close of an implicit open
-    // when this is true — otherwise it is literal text the user asked for.
+    // marker may only close an implicit open when this is true.
     let primed_open_thinking =
         crate::server::routes::chat::is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -358,6 +365,11 @@ async fn stream_create_response(
         &prepared.image_data,
         &prepared.audio_data,
     );
+
+    let queue_reservation = match state.model_provider.reserve_single_stream_queue_slot() {
+        Ok(reservation) => reservation,
+        Err(err) => return generation_error_to_response(err).into_response(),
+    };
 
     let (sender, stream, cancelled, keepalive) = responses_sse_channel(128);
 
@@ -440,13 +452,14 @@ async fn stream_create_response(
 
         let result = state_for_task
             .model_provider
-            .generate_streaming_with_logprobs_cancellable_videos_declared(
+            .generate_streaming_with_logprobs_cancellable_videos_declared_reserved(
                 prepared.prompt,
                 options,
                 prepared.image_data,
                 prepared.audio_data,
                 prepared.videos,
                 prepared.media,
+                queue_reservation,
                 cancelled,
                 |token, _lp| {
                     if let Ok(mut acc) = acc_clone.lock() {
@@ -574,10 +587,65 @@ async fn stream_create_response(
             .ok()
             .map(|mut f| f.flush())
             .unwrap_or_default();
+        if let Some(text) = trailing.reasoning.filter(|s| !s.is_empty())
+            && let Ok(mut em) = emitter_for_callback.lock()
+        {
+            let r_id = if let Some(id) = em.active_reasoning_id.clone() {
+                id
+            } else {
+                let new_id = format!("rs_{}", short_uuid());
+                em.open_reasoning(new_id.clone());
+                let placeholder = ResponseOutputItem::Reasoning(ResponseReasoningOutput {
+                    id: new_id.clone(),
+                    status: ResponseItemStatus::InProgress,
+                    content: vec![],
+                });
+                let seq = em.next_seq();
+                let _ = sender.send_event(&ResponseStreamEvent::OutputItemAdded {
+                    sequence_number: seq,
+                    output_index: em.output_index(),
+                    item: placeholder,
+                });
+                new_id
+            };
+            em.reasoning_text_acc.push_str(&text);
+            let seq = em.next_seq();
+            let out_idx = em.output_index();
+            let _ = sender.send_event(&ResponseStreamEvent::ReasoningTextDelta {
+                sequence_number: seq,
+                item_id: r_id,
+                output_index: out_idx,
+                content_index: 0,
+                delta: text,
+            });
+        }
         if let Some(text) = trailing.content.filter(|s| !s.is_empty())
             && let Ok(mut em) = emitter_for_callback.lock()
-            && let Some(msg_id) = em.active_message_id.clone()
         {
+            let msg_id = if let Some(id) = em.active_message_id.clone() {
+                id
+            } else {
+                let new_id = format!("msg_{}", short_uuid());
+                em.open_message(new_id.clone());
+                let placeholder = ResponseOutputItem::Message(
+                    ResponseOutputMessage::new_assistant(new_id.clone(), vec![]),
+                );
+                let seq = em.next_seq();
+                let _ = sender.send_event(&ResponseStreamEvent::OutputItemAdded {
+                    sequence_number: seq,
+                    output_index: em.output_index(),
+                    item: placeholder,
+                });
+                let seq = em.next_seq();
+                let _ = sender.send_event(&ResponseStreamEvent::ContentPartAdded {
+                    sequence_number: seq,
+                    item_id: new_id.clone(),
+                    output_index: em.output_index(),
+                    content_index: 0,
+                    part: ResponseOutputContent::output_text(String::new()),
+                });
+                new_id
+            };
             em.message_text_acc.push_str(&text);
             let seq = em.next_seq();
             let out_idx = em.output_index();
@@ -593,12 +661,21 @@ async fn stream_create_response(
         let result = match result {
             Ok(r) => r,
             Err(err) => {
+                let queue_full = err.downcast_ref::<QueueFullError>().is_some();
                 if let Ok(mut em) = emitter_for_callback.lock() {
                     let seq = em.next_seq();
                     let _ = sender.send_event(&ResponseStreamEvent::Error {
                         sequence_number: seq,
-                        code: "server_error".to_string(),
-                        message: err.to_string(),
+                        code: if queue_full {
+                            "server_overloaded".to_string()
+                        } else {
+                            "server_error".to_string()
+                        },
+                        message: if queue_full {
+                            "All slots are busy. Please try again later.".to_string()
+                        } else {
+                            err.to_string()
+                        },
                     });
                 }
                 if let Some(store) = state_for_task.responses_store.as_ref() {
@@ -691,11 +768,7 @@ async fn stream_create_response(
             em.advance_output_index();
         }
 
-        let reasoning_text_for_response = if em.reasoning_text_acc.is_empty() {
-            None
-        } else {
-            Some(em.reasoning_text_acc.clone())
-        };
+        let reasoning_text_for_response = em.completed_reasoning_text();
 
         if let Some(parsed) = parsed_tools.as_ref() {
             for call in &parsed.tool_calls {
@@ -784,9 +857,7 @@ async fn stream_create_response(
         }
     });
 
-    Sse::new(stream)
-        .keep_alive(keepalive.into_inner())
-        .into_response()
+    sse_response(stream, keepalive)
 }
 
 /// GET /v1/responses/:id
@@ -907,7 +978,7 @@ fn translate_error_to_response(err: ResponsesTranslateError) -> ErrorResponse {
 ///   reply.
 /// - **No `<think>` at all**: visible text is the cleaned raw output;
 ///   no reasoning is emitted.
-fn split_reasoning(
+pub(crate) fn split_reasoning(
     raw: &str,
     parsed: Option<&crate::server::tool_calls::types::ToolCallParseResult>,
     primed: bool,

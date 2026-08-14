@@ -15,11 +15,14 @@
 //! Shared SwitchLinear / SwitchGLU for MoE models
 //!
 //! Used by: KimiLinear, LongcatFlashNgram, DeepSeekV3, DeepSeekV32, GLM4Moe,
-//!          GLM4MoeLite, ExaOneMoe, Mixtral, Qwen2Moe, Qwen3Moe, PhiMoE, OLMoE, etc.
+//!          GLM4MoeLite, ExaOneMoe, Jamba, Mixtral, Qwen2Moe, Qwen3Moe, PhiMoE,
+//!          OLMoE, etc.
 //!
 //! SwitchLinear: per-expert 3D matmul (quantized via gather_qmm, regular via gather_mm)
 //! SwitchGLU: SwiGLU MLP routing through SwitchLinear
 //! group_mask_scores: group-based expert masking for MoE gates with n_group > 1
+
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use mlxcel_core::utils::slice_axis;
 use mlxcel_core::weights::WeightMap;
@@ -27,12 +30,40 @@ use mlxcel_core::{MlxArray, UniquePtr, dtype};
 
 /// Whether the fused single-token decode-MoE kernel (#268) is enabled.
 ///
-/// Default-on as of #282: across the validated MoE set the kernel is
-/// byte-identical or within the documented f16 jitter class, never regresses
-/// decode, and gives a measured speedup on both M1 Ultra and M5 (Neural
-/// Accelerator) hardware. Set `MLXCEL_FUSED_MOE=0` (also `false`/`off`/`no`,
-/// case-insensitive) to force the proven `gather_qmm` / `SwitchGLU` path; any
-/// other value, or leaving it unset, keeps the kernel on.
+/// Default-on as of #282: across the validated MoE set the kernel stays within
+/// the documented f16 jitter class, never regresses decode, and gives a
+/// measured speedup on both M1 Ultra and M5 (Neural Accelerator) hardware. Set
+/// `MLXCEL_FUSED_MOE=0` (also `false`/`off`/`no`, case-insensitive) to force
+/// the `gather_qmm` / `SwitchGLU` path; any other value, or leaving it unset,
+/// keeps the kernel on.
+///
+/// **Byte-identical greedy output is NOT a general property, and never was**
+/// (#1045). It holds on `qwen3-30b-a3b`, re-confirmed at current HEAD: 64
+/// greedy tokens agree exactly with the kernel on and off. It does not hold on
+/// Klear, where the two paths pick different but equally coherent
+/// continuations. That is checkpoint-dependent, not a kernel defect. The
+/// `MLXCEL_FUSED_MOE_PARITY_CHECK=1` probe measured 96 decode MoE calls on each
+/// checkpoint against an all-f32 dequantize-and-matmul ground truth, and the
+/// fused kernel was CLOSER to that truth than `gather_qmm` in 96 of 96 calls on
+/// both:
+///
+/// | checkpoint | fused vs truth | gather_qmm vs truth | fused closer |
+/// |---|---|---|---|
+/// | Klear-46B-A2.5B (256 experts, top-8) | 1.655e-3 | 1.025e-2 | 96/96, 6.21x |
+/// | qwen3-30b-a3b (128 experts, top-8) | 1.650e-3 | 1.022e-2 | 96/96, 6.16x |
+///
+/// (normalized RMS, median over calls; every rerun was bitwise deterministic)
+///
+/// So the kernel is the more accurate of the two paths, and the fused-vs-
+/// `gather_qmm` disagreement is very nearly `gather_qmm`'s own distance from
+/// truth. Whether that difference flips a greedy argmax depends on how
+/// knife-edge the checkpoint's routing is, which is why a 256-expert top-8
+/// router with a learned shared-expert blend diverges where a 128-expert one
+/// does not.
+///
+/// When reference-diffing a new MoE port against mlx-lm, set
+/// `MLXCEL_FUSED_MOE=0` so the comparison is against the path mlx-lm actually
+/// mirrors. See `docs/adding-models.md`.
 ///
 /// #886 hardening: the original kernel rounded each per-expert partial to the
 /// activation dtype before the K-sum, which blew up to 5-13% relative error
@@ -125,6 +156,171 @@ pub(crate) fn fused_moe_max_dff_from(env: Option<&str>, metal_available: bool) -
             FUSED_MOE_MAX_DFF_CUDA
         })
 }
+
+/// Bound a declared `group_size` / `bits` pair before a family-local expert
+/// loader stores it on a quantized expert plane (issue #958).
+///
+/// [`SwitchLinear::from_stacked_parts`] below carries this bound for every
+/// family that routes its experts through the shared loader. Seventeen families
+/// keep their own quantized expert type instead (a local `SwitchLinear` /
+/// `SwitchGLU` / `ExpertLinear` / `QuantizedSwitchLinear`), and those types
+/// store the declared pair verbatim and hand it to `gather_qmm`, which reaches
+/// the same `w.shape(-1) * 32 / bits` division inside
+/// `extract_quantized_matmul_dims`. Because `gather_qmm` crosses the cxx bridge
+/// as `UniquePtr<MlxArray>` rather than `Result`, the resulting C++ throw is an
+/// uncatchable `std::terminate` at the first routed forward pass rather than a
+/// load error. See [`mlxcel_core::layers::validate_quantization_params`] for why
+/// the bound is a range rather than an allowlist of the widths MLX supports.
+///
+/// KimiLinear is the one caller below that is not an expert plane: it keeps a
+/// private `MultiLinear` for MLA rather than using
+/// [`mlxcel_core::layers::MultiLinear`], so it does not inherit the bound that
+/// loader carries, and its stored pair reaches `quantized_matmul` on the same
+/// infallible bridge.
+///
+/// The check belongs here, at the point the pair is stored, rather than once at
+/// each family's model-level `from_weights`. A load-boundary check does not
+/// dominate these constructions: the pipeline stage executors
+/// (`distributed/pipeline/stage_executor/{glm4,deepseek_v3,llama4}.rs`), the
+/// `*StageModel::from_filtered_weights` entry points, the VLM text wrappers
+/// (`glm4v_moe`, `ernie4_5_moe_vl`, `loading/vlm_step3p7.rs`), `glm_moe_dsa` and
+/// `audio/qwen3_omni_moe/talker.rs` all build expert planes without ever calling
+/// the family's own model constructor, and three families build the quantized
+/// variant as a bare struct literal from a different module entirely. The pair
+/// also arrives from more than one config type per expert enum, so bounding the
+/// producer would not cover it either.
+///
+/// `prefix` names the offending tensor so the load error points at the weight
+/// rather than at the config alone.
+///
+/// Used by: Qwen3MoE, Qwen3VLMoE, DeepSeek, DeepSeekV2, DeepSeekV3, DeepSeekV32,
+///          GLM4MoE, GLM4MoELite, Ernie45MoE, Ernie45MoEVL, ExaoneMoE,
+///          HunyuanMoE, Llama4, NemotronH, Qwen3Next (and Qwen3.5 through it),
+///          Step3p5, GptOss, KimiLinear
+pub(crate) fn validate_expert_quantization_params(
+    prefix: &str,
+    group_size: i32,
+    bits: i32,
+) -> Result<(), String> {
+    mlxcel_core::layers::validate_quantization_params(group_size, bits)
+        .map_err(|e| format!("{prefix}: {e}"))
+}
+
+/// Cross-check a declared `group_size` / `bits` pair against the expert plane it
+/// is about to be stored on (issue #975).
+///
+/// [`validate_expert_quantization_params`] above bounds the pair on its own, and
+/// deliberately stays a range rather than an allowlist so mixed-precision
+/// exports keep loading. That leaves the other half open: a pair that is
+/// individually in range can still describe a different tensor than the one on
+/// disk, and nothing on the expert path notices. The dense projections are
+/// covered, because `reconcile_quantization_layout` re-derives an effective pair
+/// from the shapes, but `SwitchLinear::from_stacked_parts` stores what it was
+/// given and hands it to `gather_qmm`.
+///
+/// This is MLX's own precondition, restated where the shapes are still in hand.
+/// `gather_qmm` reaches `extract_quantized_matmul_dims`, which requires
+/// `packed_in * 32 == bits * num_groups * group_size` for a `[experts, out,
+/// packed_in]` weight against `[experts, out, num_groups]` scales, and throws
+/// `The shapes of the weight and scales are incompatible based on bits and
+/// group_size` otherwise. Because `gather_qmm` crosses the cxx bridge as
+/// `UniquePtr<MlxArray>` rather than `Result`, that throw is an uncatchable
+/// `std::terminate` at the first routed forward pass. Checking the same equality
+/// here can only refuse a load that was already going to abort: it cannot reject
+/// a checkpoint that works.
+///
+/// The arithmetic is done in `i64` because `bits * num_groups * group_size`
+/// overflows `i32` well inside the range
+/// [`mlxcel_core::layers::validate_quantization_params`] accepts.
+///
+/// Used by: DeepSeek. The other eighteen families listed on
+///          [`validate_expert_quantization_params`] are the obvious next
+///          adopters and are left alone here so this stays one logical change;
+///          they are unaffected either way, because none of them reads a
+///          declared pair that this crate was previously discarding.
+pub(crate) fn validate_expert_quantization_shapes(
+    prefix: &str,
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    group_size: i32,
+    bits: i32,
+) -> Result<(), String> {
+    let (Some(&packed_in), Some(&num_groups)) = (weight_shape.last(), scales_shape.last()) else {
+        return Ok(());
+    };
+    let declared = i64::from(bits) * i64::from(num_groups) * i64::from(group_size);
+    let actual = i64::from(packed_in) * 32;
+    if declared == actual {
+        return Ok(());
+    }
+    Err(format!(
+        "{prefix}: the declared quantization pair (group_size {group_size}, bits {bits}) does not \
+         describe this expert plane: MLX requires packed_in * 32 == bits * num_groups * \
+         group_size, and the checkpoint ships weight {weight_shape:?} with scales \
+         {scales_shape:?}, giving {actual} against {declared}. Either the config declares a \
+         quantization block these tensors were not produced with, or the expert plane is from a \
+         different export. gather_qmm would otherwise throw at the first routed forward pass, and \
+         that throw crosses the cxx bridge as an uncatchable abort rather than a load error"
+    ))
+}
+
+/// Insert one affine expert plane in the pre-stacked `switch_mlp` layout that
+/// mlx-community conversions ship: a `[experts, out, packed_in]` packed weight
+/// with `[experts, out, num_groups]` scales and zero points.
+///
+/// Shared by the per-family quantization-bound tests (issue #958) so each of
+/// them drives its own real expert loader over the same honest tensor layout,
+/// and the only thing that varies between the hostile case and its positive
+/// control is the declared `group_size` / `bits` pair.
+///
+/// Used by: the guard tests of every family listed on
+///          [`validate_expert_quantization_params`]
+#[cfg(test)]
+pub(crate) fn insert_stacked_quantized_expert_plane(
+    weights: &mut WeightMap,
+    prefix: &str,
+    experts: i32,
+    out: i32,
+    packed_in: i32,
+    num_groups: i32,
+) {
+    let plane = |last: i32, value: f32| {
+        let n = (experts * out * last) as usize;
+        mlxcel_core::from_slice_f32(&vec![value; n], &[experts, out, last])
+    };
+    weights.insert(format!("{prefix}.weight"), plane(packed_in, 0.0));
+    weights.insert(format!("{prefix}.scales"), plane(num_groups, 1.0));
+    weights.insert(format!("{prefix}.biases"), plane(num_groups, 0.0));
+}
+
+/// The `group_size` / `bits` pairs no tensor layout can describe, paired with
+/// the config field each one must be blamed on.
+///
+/// `bits` outside `1..=32` divides by zero or collapses the reconstructed input
+/// width to zero; a non-positive `group_size` makes the right-hand side of MLX's
+/// width comparison unmatchable. Every family's guard test walks this list so
+/// they cannot drift apart on which values count as hostile.
+#[cfg(test)]
+pub(crate) const HOSTILE_QUANT_PARAMS: [(i32, i32, &str); 5] = [
+    (64, 0, "bits"),
+    (64, -4, "bits"),
+    (64, 33, "bits"),
+    (0, 4, "group_size"),
+    (-64, 4, "group_size"),
+];
+
+/// The `mode` strings MLX's `string_to_quantization_mode` refuses to parse.
+///
+/// `optiq` / `gptq` / `int4` are the external formats a mis-exported checkpoint
+/// actually tags itself with. The rest are the near misses: an empty string, a
+/// whitespace-only string, wrong casing, and stray leading whitespace. All four
+/// are rejected because MLX compares exactly and mlxcel deliberately does not
+/// normalize before handing the string over (issue #973).
+/// Every family's guard test walks this list so they cannot drift apart on
+/// which strings count as hostile.
+#[cfg(test)]
+pub(crate) const HOSTILE_QUANT_MODES: [&str; 7] =
+    ["optiq", "gptq", "int4", "", "  ", "Affine", " mxfp4"];
 
 /// Per-expert 3D linear layer (falls back to gather_mm for non-quantized models)
 /// Supports affine, mxfp4, nvfp4, and mxfp8 quantization modes.
@@ -251,9 +447,9 @@ impl SwitchLinear {
             let biases = weights
                 .get(&format!("{}.biases", prefix))
                 .map(|w| mlxcel_core::copy(w));
-            return Ok(Self::from_stacked_parts(
-                weight, scales, biases, group_size, bits, mode,
-            ));
+            return Self::from_stacked_parts(
+                prefix, weight, scales, biases, group_size, bits, mode,
+            );
         }
 
         // Per-expert layout: `{root}.experts.{idx}.{proj}.{weight,scales,biases}`.
@@ -266,9 +462,9 @@ impl SwitchLinear {
         // this generic call site, so the shortfall cross-check is skipped
         // (`None`); callers that do carry one (DeepSeek v1) pass it through.
         if let Some((weight, scales, biases)) = stack_individual_experts(weights, prefix, None)? {
-            return Ok(Self::from_stacked_parts(
-                weight, scales, biases, group_size, bits, mode,
-            ));
+            return Self::from_stacked_parts(
+                prefix, weight, scales, biases, group_size, bits, mode,
+            );
         }
 
         Err(format!("Missing weight: {}", prefix))
@@ -278,16 +474,44 @@ impl SwitchLinear {
     /// optional scales/biases). Present scales select the quantized path and the
     /// per-tensor bit width is inferred from the packed-weight and scales shapes;
     /// absent scales select the non-quantized `Regular` path.
+    ///
+    /// This is the one quantized loader that does **not** go through
+    /// `reconcile_quantization_layout`, so it carries its own guards (issue
+    /// #929). The MoE path reaches MLX through `gather_qmm`, which shares
+    /// `extract_quantized_matmul_dims` (and therefore the `w.shape(-1) * 32 /
+    /// bits` division) with the dense `quantized_matmul` path, so a declared
+    /// `group_size` of 0 or a `bits` outside `1..=32` aborts the process at the
+    /// first routed forward pass exactly as it would for a dense projection.
+    /// Guarding only the reconciler would have left every quantized MoE
+    /// checkpoint exposed. The declared `mode` is bounded here for the same
+    /// reason (issue #973): `SwitchLinear::from_weights` hardcodes `"affine"`,
+    /// but `from_weights_with_mode` is `pub` and takes an unbounded `&str`.
     fn from_stacked_parts(
+        prefix: &str,
         weight: UniquePtr<MlxArray>,
         scales: Option<UniquePtr<MlxArray>>,
         biases: Option<UniquePtr<MlxArray>>,
         group_size: i32,
         bits: i32,
         mode: &str,
-    ) -> Self {
+    ) -> Result<Self, String> {
         match scales {
             Some(scales) => {
+                // Bound the declared pair before anything derived from it is
+                // stored on the layer. `group_size` is never inferred on this
+                // path, so a declared 0 would otherwise zero the denominator
+                // below, skip inference entirely, and be handed to the kernel.
+                mlxcel_core::layers::validate_quantization_params(group_size, bits)
+                    .map_err(|e| format!("{prefix}: {e}"))?;
+
+                // Same for the declared mode, which is stored verbatim below and
+                // handed to `gather_qmm` on every routed forward pass (issue
+                // #973). The bias-presence half of this is MLX's own
+                // `validate_mode_with_type` precondition, so it can only refuse
+                // a load that was already going to abort.
+                mlxcel_core::layers::validate_quantization_biases(mode, biases.is_some())
+                    .map_err(|e| format!("{prefix}: {e}"))?;
+
                 // Infer the actual bit width from the packed weight and scales
                 // shapes (group_size fixed): mixed-precision checkpoints such as
                 // dots.llm1 quantize some expert projections at 6-bit while the
@@ -298,11 +522,31 @@ impl SwitchLinear {
                 let s_shape = mlxcel_core::array_shape(&scales);
                 let packed_in = *w_shape.last().unwrap_or(&0);
                 let num_groups = *s_shape.last().unwrap_or(&0);
-                let denom = num_groups * group_size;
-                let effective_bits = if denom > 0 && (packed_in * 32) % denom == 0 {
-                    let inferred = (packed_in * 32) / denom;
+
+                // A zero or absent last axis on either tensor used to be treated
+                // as "no layout signal, trust the caller", which let a plane of
+                // shape [E, out, 0] satisfy every arithmetic check below (0 == 0)
+                // and then abort inside `extract_quantized_matmul_dims` on the
+                // inner-dimension comparison. Present `.scales` means a real
+                // quantized tensor, so both axes must be real.
+                if packed_in < 1 || num_groups < 1 {
+                    return Err(format!(
+                        "{prefix}: stacked expert weight {w_shape:?} and scales {s_shape:?} must \
+                         both carry a positive last axis; a zero-length packed axis describes no \
+                         input width and aborts inside gather_qmm rather than failing at load"
+                    ));
+                }
+
+                // i64 throughout: `group_size` is bounded above by the guard, but
+                // `num_groups * group_size` is still a config-influenced multiply
+                // in a load path, and an unchecked i32 version wraps in release
+                // and panics in an overflow-checked build.
+                let denom = i64::from(num_groups) * i64::from(group_size);
+                let packed_bits = i64::from(packed_in) * 32;
+                let effective_bits = if denom > 0 && packed_bits % denom == 0 {
+                    let inferred = packed_bits / denom;
                     if (2..=8).contains(&inferred) {
-                        inferred
+                        i32::try_from(inferred).unwrap_or(bits)
                     } else {
                         bits
                     }
@@ -310,16 +554,48 @@ impl SwitchLinear {
                     bits
                 };
 
-                Self::Quantized {
+                // The fallback above keeps the declared `bits` whenever the
+                // shapes solve to something outside the supported widths, which
+                // stores a triple MLX will reject. Refuse it here instead, using
+                // MLX's own predicate from `validate_quantized_input` so this
+                // fires exactly when the kernel would have thrown.
+                let described = packed_bits / i64::from(effective_bits);
+                if described != denom {
+                    return Err(format!(
+                        "{prefix}: stacked expert weight {w_shape:?} and scales {s_shape:?} \
+                         describe an input width of {described} at {effective_bits}-bit, but \
+                         {num_groups} groups at group_size {group_size} describe {denom}. MLX \
+                         checks exactly this in extract_quantized_matmul_dims before gather_qmm \
+                         and throws on a mismatch, and that throw crosses the cxx bridge as an \
+                         uncatchable abort at the first routed forward pass rather than a load \
+                         error."
+                    ));
+                }
+
+                // `validate_quantized_input` throws on a `biases` whose shape
+                // differs from `scales` as well, on the same infallible path.
+                if let Some(biases) = biases.as_ref() {
+                    let b_shape = mlxcel_core::array_shape(biases);
+                    if b_shape != s_shape {
+                        return Err(format!(
+                            "{prefix}: stacked expert biases {b_shape:?} must have the same shape \
+                             as the scales {s_shape:?}; MLX rejects a mismatch by throwing, which \
+                             crosses the cxx bridge as an uncatchable abort at the first routed \
+                             forward pass"
+                        ));
+                    }
+                }
+
+                Ok(Self::Quantized {
                     weight,
                     scales,
                     biases,
                     group_size,
                     bits: effective_bits,
                     mode: mode.to_string(),
-                }
+                })
             }
-            None => Self::Regular { weight },
+            None => Ok(Self::Regular { weight }),
         }
     }
 }
@@ -348,9 +624,24 @@ impl SwitchLinear {
 /// `SwitchGLU::from_weights_with_proj_names`) loads from the matching expert
 /// keys without any name baked in here.
 ///
-/// Used by: Qwen2Moe (Qwen1.5-MoE / Qwen2-MoE individual-expert checkpoints),
-///          Mixtral (`block_sparse_moe.experts.{idx}.{w1,w2,w3}` checkpoints),
-///          DeepSeek v1 (`baidu/Unlimited-OCR` raw per-expert checkpoint)
+/// Used by: every family behind the shared `SwitchGLU` / `SwitchLinear`, which
+///          reaches this through `SwitchLinear::from_weights_with_mode`
+///          whenever its checkpoint ships experts unstacked (BailingMoe,
+///          Cohere2Moe, Dots1, Gemma4, GraniteMoeHybrid, Jamba, KimiLinear,
+///          Lfm2, Llada2Moe, LongcatFlashNgram, Mellum, MiniMax, MiniMaxM3Moe,
+///          Mistral4, Mixtral, Moondream3, OLMoE, PhiMoE, Qwen2Moe,
+///          SolarOpen), plus DeepSeek v1 (`src/models/deepseek.rs`), which
+///          calls it directly for the `baidu/Unlimited-OCR` raw per-expert
+///          checkpoint. The layouts that actually exercise it today are the
+///          Qwen1.5-MoE / Qwen2-MoE individual-expert exports, Mixtral's
+///          `block_sparse_moe.experts.{idx}.{w1,w2,w3}`, and Ling-lite.
+///
+/// PhiMoE and OLMoE are listed for completeness but normally pre-stack in their
+/// own `sanitize_weights`, so the shared loader sees `switch_mlp.{proj}.weight`
+/// and takes the pre-stacked branch. PhiMoE reaches this branch only for a
+/// checkpoint that ships experts unstacked under `gate_proj`/`up_proj`/
+/// `down_proj` names, because its sanitizer probes `experts.0.w1.weight` and
+/// falls through to a plain copy otherwise.
 pub(crate) fn stack_individual_experts(
     weights: &WeightMap,
     prefix: &str,
@@ -405,24 +696,58 @@ fn stack_individual_experts_with_count(
     let has_scales = weights.contains_key(&expert_key(0, "scales"));
     let has_biases = weights.contains_key(&expert_key(0, "biases"));
 
-    let mut stacked_weight = Vec::new();
-    let mut stacked_scales = Vec::new();
-    let mut stacked_biases = Vec::new();
+    // Borrow the per-expert tensors instead of copying them (issue #948). The
+    // copies existed only to produce owned `UniquePtr`s for `stack_owned` and
+    // contributed nothing to the result, so building the stack from borrowed
+    // pointers drops one graph node per tensor: 5376 of them for
+    // `models/ling-lite-1.5`, whose per-expert projections are its entire routed
+    // payload.
+    //
+    // What that saves is graph metadata and eval scheduling, NOT memory traffic.
+    // Issue #948 framed this as ~31 GB of redundant copy traffic at the first
+    // forward, and that framing is wrong: `mlxcel_core::copy` lowers to
+    // `mx::copy`, whose `Copy::eval` is `out.copy_shared_buffer(inputs[0])`
+    // (`mlx/backend/common/common.cpp`, reached from both `Copy::eval_gpu` and
+    // `Copy::eval_cpu`). That aliases the input buffer; it allocates nothing and
+    // writes nothing. The materializing `copy_gpu(..., CopyType::General)` a few
+    // lines above it in the same file belongs to `Contiguous::eval_gpu`, which is
+    // a different primitive. So there was never a 31 GB transfer, and there was
+    // never a per-projection peak-memory transient either. Do not reintroduce
+    // that claim without re-reading the pinned MLX source.
+    //
+    // `ops::stack` already takes `*const MlxArray`, so no new borrowing entry
+    // point is needed. The pointers are collected and consumed inside the live
+    // `&WeightMap` borrow, and the map is only read; do not switch this to
+    // `remove`-based draining the way `src/models/olmoe.rs` does, because this
+    // helper is called from a `&WeightMap` context. The C++ `stack` shim copies
+    // each `a->inner` into its own `std::vector<array>` and `mx::array` is a
+    // refcounted handle, so the stacked node keeps its inputs alive
+    // independently of the map (pinned by
+    // `stacked_experts_outlive_the_weight_map_they_were_borrowed_from`).
+    let as_ptr = |array: &UniquePtr<MlxArray>| {
+        // Same contract as `ops::stack_owned`, which this replaces: a WeightMap
+        // never stores a null handle, and the previous `mlxcel_core::copy` call
+        // panicked identically on one via `UniquePtr`'s `Deref`.
+        array.as_ref().expect("weight map holds no null handles") as *const MlxArray
+    };
+    let mut weight_ptrs: Vec<*const MlxArray> = Vec::new();
+    let mut scales_ptrs: Vec<*const MlxArray> = Vec::new();
+    let mut biases_ptrs: Vec<*const MlxArray> = Vec::new();
     let mut idx = 0;
     while let Some(weight) = weights.get(&expert_key(idx, "weight")) {
-        stacked_weight.push(mlxcel_core::copy(weight));
+        weight_ptrs.push(as_ptr(weight));
         if has_scales {
-            stacked_scales.push(mlxcel_core::copy(weights.get(&expert_key(idx, "scales"))?));
+            scales_ptrs.push(as_ptr(weights.get(&expert_key(idx, "scales"))?));
         }
         if has_biases {
-            stacked_biases.push(mlxcel_core::copy(weights.get(&expert_key(idx, "biases"))?));
+            biases_ptrs.push(as_ptr(weights.get(&expert_key(idx, "biases"))?));
         }
         idx += 1;
     }
 
-    let weight = mlxcel_core::stack_owned(&stacked_weight, 0);
-    let scales = has_scales.then(|| mlxcel_core::stack_owned(&stacked_scales, 0));
-    let biases = has_biases.then(|| mlxcel_core::stack_owned(&stacked_biases, 0));
+    let weight = mlxcel_core::stack(&weight_ptrs, 0);
+    let scales = has_scales.then(|| mlxcel_core::stack(&scales_ptrs, 0));
+    let biases = has_biases.then(|| mlxcel_core::stack(&biases_ptrs, 0));
     Some((weight, scales, biases, idx))
 }
 
@@ -463,8 +788,11 @@ impl SwitchGLU {
     ///
     /// Computes `sum_k scores[k] * down_k(silu(gate_k(x)) * up_k(x))` for the K
     /// selected experts as two all-cores Metal dispatches (gate/up+swiglu, then
-    /// down+score), beating gather_qmm by ~3.5% on qwen3-30b-a3b with
-    /// byte-identical greedy output. gate/up are 4/8-bit; down also handles
+    /// down+score), beating gather_qmm by ~3.5% on qwen3-30b-a3b. Greedy output
+    /// is byte-identical on that checkpoint but not on every family; see
+    /// [`fused_moe_enabled`] for the measured parity picture and for why
+    /// `MLXCEL_FUSED_MOE=0` is the right switch when reference-diffing a port.
+    /// gate/up are 4/8-bit; down also handles
     /// 6-bit, so mixed widths like dots.llm1 (gate/up 4-bit, down 6-bit) are
     /// supported. Returns `None` (caller falls back to `forward` +
     /// `moe_weighted_sum`) for any unsupported config: non-affine, gate/up not
@@ -634,7 +962,12 @@ pub fn gather_sort(
 }
 
 /// Unsort tokens back to original order
-fn scatter_unsort(x: &MlxArray, inv_order: &MlxArray, orig_shape: &[i32]) -> UniquePtr<MlxArray> {
+/// Used by: SwitchGLU, Phixtral
+pub(crate) fn scatter_unsort(
+    x: &MlxArray,
+    inv_order: &MlxArray,
+    orig_shape: &[i32],
+) -> UniquePtr<MlxArray> {
     let unsorted = mlxcel_core::take(x, inv_order, 0);
     let x_shape = mlxcel_core::array_shape(&unsorted);
     let n_tokens = orig_shape[0];
@@ -646,9 +979,9 @@ fn scatter_unsort(x: &MlxArray, inv_order: &MlxArray, orig_shape: &[i32]) -> Uni
 /// Weighted sum over selected expert outputs while preserving the residual dtype.
 ///
 /// Used by: BailingMoe, DeepSeek, DeepSeekV3, DeepSeekV32, ExaOneMoe,
-///          Ernie4_5Moe, GLM4Moe, GLM4MoeLite, GptOss, HunyuanMoe, KimiLinear,
-///          MiniMax, Mistral4, Mixtral, Moondream3, OLMoE, PhiMoE, Qwen2Moe,
-///          Qwen3Moe, Qwen3Next, Qwen3VLMoe, SolarOpen, Step3p5
+///          Ernie4_5Moe, GLM4Moe, GLM4MoeLite, GptOss, HunyuanMoe, Jamba,
+///          KimiLinear, MiniMax, Mistral4, Mixtral, Moondream3, OLMoE, PhiMoE,
+///          Qwen2Moe, Qwen3Moe, Qwen3Next, Qwen3VLMoe, SolarOpen, Step3p5
 ///
 /// The old `nkh,nk->nh` einsum contraction promotes the combine to float32
 /// on M5 for bf16/f16 activations. Match mlx-lm's `y * scores[..., None]`
@@ -670,19 +1003,163 @@ pub fn moe_weighted_sum(
     }
 }
 
+/// Why [`group_mask_scores`] cannot apply a grouped-routing mask to a given
+/// `(score row, n_group, topk_group)` triple.
+///
+/// The first two variants are ordinary configurations that happen to mask
+/// nothing. The rest are out-of-range values; [`group_mask_scores`] documents
+/// what each one used to do once it reached MLX.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupMaskSkip {
+    /// `n_group <= 1`: the model declares no expert groups.
+    NotGrouped,
+    /// `topk_group == n_group`: every group is kept, so the mask is the
+    /// identity. Upstream mlx-lm accepts this and it is what `k == 0` already
+    /// produced through an empty bottom-k slice.
+    KeepsEveryGroup,
+    /// `n_group` is zero or negative.
+    InvalidGroupCount,
+    /// `topk_group` is outside `1..=n_group`.
+    TopkGroupOutOfRange,
+    /// The score row does not split into `n_group` equal groups.
+    UnevenGroups,
+    /// A group holds fewer than two experts.
+    GroupTooSmall,
+    /// The router scores are not a rank-2 `[tokens, n_experts]` array.
+    BadScoreShape,
+}
+
+impl GroupMaskSkip {
+    /// Whether this is a broken config worth reporting, as opposed to a
+    /// configuration that legitimately masks nothing.
+    fn is_config_error(self) -> bool {
+        !matches!(self, Self::NotGrouped | Self::KeepsEveryGroup)
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::NotGrouped => "the model declares no expert groups",
+            Self::KeepsEveryGroup => "topk_group keeps every group",
+            Self::InvalidGroupCount => "n_group must be at least 1",
+            Self::TopkGroupOutOfRange => "topk_group must be between 1 and n_group",
+            Self::UnevenGroups => "num_experts is not divisible by n_group",
+            Self::GroupTooSmall => {
+                "every group must hold at least 2 experts, because a group is scored by the sum \
+                 of its top two"
+            }
+            Self::BadScoreShape => "the router scores are not a rank-2 [tokens, num_experts] array",
+        }
+    }
+}
+
+/// Bounds check for [`group_mask_scores`], returning `experts_per_group` when
+/// the grouped-routing mask is well defined for `shape`.
+///
+/// Pure `i32` arithmetic over values already held in the gate struct: no array
+/// work, no device round-trip, no `eval`. It runs once per MoE layer per
+/// forward and costs nothing measurable.
+fn group_mask_plan(shape: &[i32], n_group: i32, topk_group: i32) -> Result<i32, GroupMaskSkip> {
+    if shape.len() != 2 {
+        return Err(GroupMaskSkip::BadScoreShape);
+    }
+    let n_experts = shape[1];
+    // Before the division below, and so `n_group == 0` cannot divide by zero.
+    if n_group <= 0 {
+        return Err(GroupMaskSkip::InvalidGroupCount);
+    }
+    if n_group == 1 {
+        return Err(GroupMaskSkip::NotGrouped);
+    }
+    if topk_group == n_group {
+        return Err(GroupMaskSkip::KeepsEveryGroup);
+    }
+    // Catches both `topk_group == 0` and the negative value a caller's
+    // `args.topk_group as i32` produces from a `usize` above `i32::MAX`.
+    if !(1..=n_group).contains(&topk_group) {
+        return Err(GroupMaskSkip::TopkGroupOutOfRange);
+    }
+    if n_experts % n_group != 0 {
+        return Err(GroupMaskSkip::UnevenGroups);
+    }
+    // Also rejects an empty score row: `0 % n_group == 0` passes the
+    // divisibility test above and only the group width catches it.
+    let experts_per_group = n_experts / n_group;
+    if experts_per_group < 2 {
+        return Err(GroupMaskSkip::GroupTooSmall);
+    }
+    Ok(experts_per_group)
+}
+
+/// Report an out-of-range grouped-routing config once per process.
+///
+/// `tracing::warn!` is a no-op in the `mlxcel` CLI binary, where nothing
+/// installs a subscriber, so this has to reach stderr directly. Every MoE layer
+/// of a model shares one `(n_group, topk_group)` pair, so one line is the right
+/// granularity: firing per layer per token would bury it.
+fn report_group_mask_skipped(skip: GroupMaskSkip, shape: &[i32], n_group: i32, topk_group: i32) {
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+    if REPORTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "warning: grouped MoE expert routing is disabled because {}. config n_group={n_group}, \
+         topk_group={topk_group}; router scores {shape:?}. Every token now routes as if the \
+         model declared no expert groups, which changes which experts it selects. Correct \
+         n_group / topk_group in the model's config.json.",
+        skip.reason()
+    );
+}
+
 /// Group-based expert masking for MoE gates with n_group > 1.
 ///
 /// Selects the top `topk_group` expert groups (by sum of top-2 scores per group)
 /// and zeros out scores for experts in non-selected groups.
 ///
-/// Used by: BailingMoe, DeepSeekV3, DeepSeekV32, GLM4Moe, GLM4MoeLite, ExaOneMoe
+/// Used by: BailingMoe, DeepSeekV3, DeepSeekV32, Dots1, ExaOneMoe, GLM4Moe,
+///          GLM4MoeLite, SolarOpen
 ///
-/// Reference: mlx-lm deepseek_v3.py group_expert_select()
+/// # Bounds
+///
+/// `n_group` and `topk_group` arrive straight from `config.json` on seven of the
+/// eight call sites, and this function is the floor that keeps a bad pair from
+/// reaching MLX. When the mask is not well defined it returns the scores
+/// unmasked and reports the config once, rather than computing a negative `k`:
+///
+/// - `topk_group == n_group + 1` gives `k == -1`, and [`slice_axis`] reads that
+///   `end` as "to the end of the axis", so the bottom-k slice became the whole
+///   group axis and every group was zeroed. Nothing threw. Callers gather their
+///   combine weights from an untouched copy of the scores, so an all-equal
+///   selection row silently handed routing to `argpartition`'s tie-break order
+///   while the weights stayed plausible: the router was off, the output was not.
+/// - `n_group + 2 <= topk_group <= 2 * n_group - 1` resolved `end` to
+///   `n_group + k` and zeroed the wrong *number* of groups. Also silent.
+/// - `topk_group >= 2 * n_group`, and any negative `topk_group`, drove
+///   `argpartition`'s `kth` out of range. `mlxcel_core::argpartition` is
+///   declared non-`Result`, so the MLX throw was an uncatchable abort at the
+///   first forward pass rather than a load error.
+/// - `topk_group == 0` gives `k == n_group`, zeroing every group.
+/// - `n_experts % n_group != 0` truncated `experts_per_group` and threw in the
+///   reshape; fewer than two experts per group threw in the top-2
+///   `argpartition`, since a group is scored by the sum of its top two.
+///
+/// This is not a substitute for load-time validation. A family that wants a bad
+/// config to be a load error keeps its own check, as Bailing MoE does in
+/// `ModelArgs::validate_routing`.
+///
+/// Reference: https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/deepseek_v3.py (group_expert_select)
 pub fn group_mask_scores(scores: &MlxArray, n_group: i32, topk_group: i32) -> UniquePtr<MlxArray> {
     let shape = mlxcel_core::array_shape(scores);
+    let experts_per_group = match group_mask_plan(&shape, n_group, topk_group) {
+        Ok(experts_per_group) => experts_per_group,
+        Err(skip) => {
+            if skip.is_config_error() {
+                report_group_mask_skipped(skip, &shape, n_group, topk_group);
+            }
+            return mlxcel_core::copy(scores);
+        }
+    };
     let n = shape[0];
     let n_experts = shape[1];
-    let experts_per_group = n_experts / n_group;
 
     // Unflatten: [n, n_experts] -> [n, n_group, experts_per_group]
     let grouped = mlxcel_core::reshape(scores, &[n, n_group, experts_per_group]);
@@ -880,6 +1357,268 @@ mod tests {
         assert_eq!(parts.mode, "affine");
     }
 
+    /// Affine 4-bit expert planes in the pre-stacked `switch_mlp` layout that
+    /// mlx-community conversions ship, as a standalone map. Thin wrapper over
+    /// the module-level [`super::insert_stacked_quantized_expert_plane`], which
+    /// the per-family guard tests share.
+    fn stacked_quantized_experts(
+        prefix: &str,
+        experts: i32,
+        out: i32,
+        packed_in: i32,
+        num_groups: i32,
+    ) -> WeightMap {
+        let mut weights = WeightMap::new();
+        super::insert_stacked_quantized_expert_plane(
+            &mut weights,
+            prefix,
+            experts,
+            out,
+            packed_in,
+            num_groups,
+        );
+        weights
+    }
+
+    #[test]
+    fn stacked_experts_outlive_the_weight_map_they_were_borrowed_from() {
+        // The per-expert stack is now built from pointers borrowed out of the
+        // `WeightMap` rather than from copies (issue #948). That is only sound
+        // because the C++ `stack` shim copies each refcounted `mx::array` handle
+        // into its own vector, so the stacked graph node keeps its inputs alive
+        // on its own. Dropping the map before evaluating anything exercises that
+        // ordering end to end. Treat it as a tripwire rather than a proof: a
+        // stack that held a borrow would be reading freed memory here, and freed
+        // memory often still reads back intact, so a pass is weaker evidence
+        // than the by-value `push_back` in the shim.
+        let root = "model.layers.0.mlp";
+        let prefix = format!("{root}.switch_mlp.gate_proj");
+        let mut weights = WeightMap::new();
+        for e in 0..3 {
+            let base = (e + 1) as f32;
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.weight"),
+                mlxcel_core::from_slice_f32(&[base, base + 0.5, base + 1.0, base + 1.5], &[2, 2]),
+            );
+            weights.insert(
+                format!("{root}.experts.{e}.gate_proj.scales"),
+                mlxcel_core::from_slice_f32(&[base, base], &[2, 1]),
+            );
+        }
+
+        let (weight, scales, biases, found) =
+            stack_individual_experts_with_count(&weights, &prefix).expect("per-expert layout");
+        assert_eq!(found, 3, "the contiguous expert count must be unchanged");
+        let scales = scales.expect("expert 0 carries scales, so scales are stacked");
+        assert!(biases.is_none(), "expert 0 carries no biases");
+
+        // The whole point: the source map is gone before anything is evaluated.
+        drop(weights);
+        mlxcel_core::eval(&weight);
+        mlxcel_core::eval(&scales);
+
+        assert_eq!(mlxcel_core::array_shape(&weight), vec![3, 2, 2]);
+        assert_eq!(mlxcel_core::array_shape(&scales), vec![3, 2, 1]);
+
+        // Values, not just shapes: a stack that silently read the wrong memory
+        // would still have the right shape.
+        for e in 0..3i32 {
+            let first = mlxcel_core::slice(&weight, &[e, 0, 0], &[e + 1, 1, 1]);
+            mlxcel_core::eval(&first);
+            assert_eq!(
+                mlxcel_core::item_f32(&first),
+                (e + 1) as f32,
+                "expert {e} landed at the wrong plane or read freed memory"
+            );
+        }
+    }
+
+    #[test]
+    fn switch_linear_rejects_quantization_params_that_would_abort_gather_qmm() {
+        // The MoE loader never calls `reconcile_quantization_layout`, so the
+        // shared reconciler guard does not cover it. It reaches MLX through
+        // `gather_qmm`, which shares `extract_quantized_matmul_dims` (and its
+        // `w.shape(-1) * 32 / bits` division) with the dense path, so a hostile
+        // pair aborts the process at the first routed forward pass. If this
+        // guard regresses the C++ throw takes this whole test binary down with
+        // SIGABRT rather than failing cleanly.
+        let group = 64i32;
+        let in_dim = 64i32;
+        let packed_in = in_dim / 8; // 4-bit packs 8 weights per uint32 column
+        let num_groups = in_dim / group;
+        let root = "model.layers.0.mlp";
+        let stacked_prefix = format!("{root}.switch_mlp.gate_proj");
+
+        let hostile = [
+            (64, 0, "bits"),
+            (64, -4, "bits"),
+            (64, 33, "bits"),
+            (0, 4, "group_size"),
+            (-64, 4, "group_size"),
+        ];
+
+        // Pre-stacked layout.
+        let stacked = stacked_quantized_experts(&stacked_prefix, 3, 4, packed_in, num_groups);
+        SwitchLinear::from_weights(&stacked, &stacked_prefix, group, 4)
+            .expect("the honest pair must still load");
+        for (group_size, bits, field) in hostile {
+            let err = SwitchLinear::from_weights(&stacked, &stacked_prefix, group_size, bits)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("stacked experts must reject group_size {group_size} / bits {bits}")
+                });
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+
+        // Per-expert layout, which reaches the same constructor through
+        // `stack_individual_experts` instead.
+        let mut per_expert = WeightMap::new();
+        for e in 0..3 {
+            for (leaf, last, value) in [
+                ("weight", packed_in, 0.0),
+                ("scales", num_groups, 1.0),
+                ("biases", num_groups, 0.0),
+            ] {
+                per_expert.insert(
+                    format!("{root}.experts.{e}.gate_proj.{leaf}"),
+                    mlxcel_core::from_slice_f32(&vec![value; (4 * last) as usize], &[4, last]),
+                );
+            }
+        }
+        SwitchLinear::from_weights(&per_expert, &stacked_prefix, group, 4)
+            .expect("the honest pair must still load from the per-expert layout");
+        for (group_size, bits, field) in hostile {
+            let err = SwitchLinear::from_weights(&per_expert, &stacked_prefix, group_size, bits)
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("per-expert stacking must reject group_size {group_size} / bits {bits}")
+                });
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+
+        // A non-quantized expert plane carries no packing at all, so the params
+        // are irrelevant there and must not be enforced.
+        let mut regular = WeightMap::new();
+        regular.insert(
+            format!("{stacked_prefix}.weight"),
+            mlxcel_core::from_slice_f32(&vec![0.0; 3 * 4 * 8], &[3, 4, 8]),
+        );
+        SwitchLinear::from_weights(&regular, &stacked_prefix, 0, 0)
+            .expect("a non-quantized expert plane must not be gated on quantization params");
+    }
+
+    #[test]
+    fn switch_linear_rejects_a_mode_that_would_abort_gather_qmm() {
+        // `SwitchLinear::from_weights` hardcodes `"affine"`, but
+        // `from_weights_with_mode` is `pub` and takes an unbounded `&str`, and
+        // the string it is handed is stored verbatim and passed to `gather_qmm`
+        // on every routed forward pass (issue #973). A regression here takes the
+        // whole test binary down with SIGABRT rather than failing cleanly, which
+        // is why the assertions stop at the load `Result`.
+        let group = 64i32;
+        let in_dim = 64i32;
+        let packed_in = in_dim / 8;
+        let num_groups = in_dim / group;
+        let prefix = "model.layers.0.mlp.switch_mlp.gate_proj";
+        let stacked = stacked_quantized_experts(prefix, 3, 4, packed_in, num_groups);
+
+        // Positive control first, so a guard that rejects everything quantized
+        // cannot pass this test.
+        SwitchLinear::from_weights_with_mode(&stacked, prefix, group, 4, "affine")
+            .expect("an honest affine plane must still load");
+
+        for mode in HOSTILE_QUANT_MODES {
+            let err = SwitchLinear::from_weights_with_mode(&stacked, prefix, group, 4, mode)
+                .err()
+                .unwrap_or_else(|| panic!("stacked experts must reject mode {mode:?}"));
+            assert!(
+                err.contains("mode") && err.contains("gate_proj"),
+                "the message must name the field and the prefix: {err}"
+            );
+        }
+
+        // A parseable mode that contradicts the plane aborts in MLX just as
+        // hard: these experts carry zero points, so block-float is a lie.
+        for mode in ["mxfp4", "mxfp8", "nvfp4"] {
+            let err = SwitchLinear::from_weights_with_mode(&stacked, prefix, group, 4, mode)
+                .err()
+                .unwrap_or_else(|| panic!("block-float over a .biases plane must be rejected"));
+            assert!(err.contains("biases"), "unhelpful error: {err}");
+        }
+
+        // And the mirror: an affine declaration over a plane with no zero points
+        // is the case that reaches `Biases must be provided for affine
+        // quantization`.
+        let mut no_biases = WeightMap::new();
+        for (leaf, last, value) in [("weight", packed_in, 0.0), ("scales", num_groups, 1.0)] {
+            no_biases.insert(
+                format!("{prefix}.{leaf}"),
+                mlxcel_core::from_slice_f32(&vec![value; (3 * 4 * last) as usize], &[3, 4, last]),
+            );
+        }
+        SwitchLinear::from_weights_with_mode(&no_biases, prefix, group, 4, "mxfp4")
+            .expect("an honest block-float plane must still load");
+        let err = SwitchLinear::from_weights_with_mode(&no_biases, prefix, group, 4, "affine")
+            .err()
+            .unwrap_or_else(|| panic!("affine over a plane with no zero points must be rejected"));
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+
+        // A non-quantized expert plane carries no mode at all.
+        let mut regular = WeightMap::new();
+        regular.insert(
+            format!("{prefix}.weight"),
+            mlxcel_core::from_slice_f32(&vec![0.0; 3 * 4 * 8], &[3, 4, 8]),
+        );
+        SwitchLinear::from_weights_with_mode(&regular, prefix, group, 4, "optiq")
+            .expect("a non-quantized expert plane must not be gated on the declared mode");
+    }
+
+    #[test]
+    fn switch_linear_rejects_an_expert_plane_whose_packing_mlx_would_reject() {
+        // The bit-width inference falls back to the declared `bits` whenever the
+        // shapes solve to something outside the supported widths, which stores a
+        // triple MLX rejects in `extract_quantized_matmul_dims`. `packed_in * 32
+        // / bits` describes a 64-wide input here while 3 groups at group_size 64
+        // describe 192, so the checkpoint must fail at load rather than abort at
+        // the first routed forward pass.
+        let prefix = "model.layers.0.mlp.switch_mlp.gate_proj";
+        let weights = stacked_quantized_experts(prefix, 3, 4, 8, 3);
+        let err = SwitchLinear::from_weights(&weights, prefix, 64, 4)
+            .err()
+            .expect("an expert plane MLX would reject must fail at load");
+        assert!(err.contains("input width"), "unhelpful error: {err}");
+
+        // The mixed-precision inference the fallback exists for is untouched: a
+        // genuinely 8-bit plane under a 4-bit config default still reconciles.
+        let mixed = stacked_quantized_experts(prefix, 3, 4, 16, 1);
+        let sl = SwitchLinear::from_weights(&mixed, prefix, 64, 4)
+            .expect("a per-tensor bit override must still load");
+        let parts = sl.quantized_parts().expect("quantized");
+        assert_eq!(parts.bits, 8);
+        assert_eq!(parts.group_size, 64);
+
+        // A zero-length packed axis describes no input width. It used to satisfy
+        // every arithmetic check here (0 == 0) and then abort inside
+        // `extract_quantized_matmul_dims` on the inner-dimension comparison.
+        let empty_axis = stacked_quantized_experts(prefix, 3, 4, 0, 0);
+        let err = SwitchLinear::from_weights(&empty_axis, prefix, 64, 4)
+            .err()
+            .expect("a zero-length packed axis must fail at load");
+        assert!(err.contains("positive last axis"), "unhelpful error: {err}");
+
+        // MLX also throws when the zero points disagree in shape with the scales,
+        // on the same infallible path.
+        let mut bad_biases = stacked_quantized_experts(prefix, 3, 4, 8, 1);
+        bad_biases.insert(
+            format!("{prefix}.biases"),
+            mlxcel_core::from_slice_f32(&[0.0; 3 * 4 * 2], &[3, 4, 2]),
+        );
+        let err = SwitchLinear::from_weights(&bad_biases, prefix, 64, 4)
+            .err()
+            .expect("mis-shaped expert zero points must fail at load");
+        assert!(err.contains("same shape"), "unhelpful error: {err}");
+    }
+
     #[test]
     fn switch_glu_loads_overridden_proj_leaf_names() {
         // Mixtral stores experts under the w1/w2/w3 convention at
@@ -964,5 +1703,262 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("Missing weight"), "unexpected error: {err}");
+    }
+
+    // Grouped-expert routing bounds.
+    //
+    // `group_mask_scores` reads `n_group` and `topk_group` from `config.json` on
+    // seven of its eight call sites. Every out-of-range value below used to
+    // reach MLX: the small ones through `slice_axis`, whose Python slice
+    // semantics turn a negative extent into a *different* selection rather than
+    // an error, and the large ones through `argpartition`, which throws across a
+    // non-`Result` bridge and aborts the process at the first forward pass.
+
+    /// 16 expert scores in 4 groups of 4. The hand-computed sum of each group's
+    /// top two experts is 10, 9, 20, 6, so keeping 2 groups keeps {2, 0} and
+    /// keeping 3 keeps {2, 0, 1}. Shared by the in-range pins and by every
+    /// out-of-range case, which must return this row unchanged.
+    #[rustfmt::skip]
+    const GROUPED_SCORES_16: [f32; 16] = [
+        5.0, 5.0, 0.0, 0.0,
+        9.0, 0.0, 0.0, 0.0,
+        20.0, 0.0, 0.0, 0.0,
+        3.0, 3.0, 3.0, 3.0,
+    ];
+
+    fn grouped_scores_16() -> UniquePtr<MlxArray> {
+        mlxcel_core::from_slice_f32(&GROUPED_SCORES_16, &[1, 16])
+    }
+
+    /// Every element of a single-row rank-2 array, in order.
+    fn row_f32(x: &MlxArray) -> Vec<f32> {
+        let shape = mlxcel_core::array_shape(x);
+        assert_eq!(shape.len(), 2, "expected a rank-2 array, got {shape:?}");
+        assert_eq!(shape[0], 1, "expected a single row, got {shape:?}");
+        (0..shape[1])
+            .map(|i| mlxcel_core::item_f32(&mlxcel_core::slice(x, &[0, i], &[1, i + 1])))
+            .collect()
+    }
+
+    /// The masked row for an in-range `(n_group, topk_group)`. Pinned here as
+    /// well as in `bailing_moe_tests.rs` because the guard must not perturb the
+    /// path it wraps.
+    #[test]
+    fn group_mask_scores_zeroes_only_the_weakest_groups_in_range() {
+        let scores = grouped_scores_16();
+
+        #[rustfmt::skip]
+        let keep_two = vec![
+            5.0, 5.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            20.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(row_f32(&group_mask_scores(&scores, 4, 2)), keep_two);
+
+        #[rustfmt::skip]
+        let keep_three = vec![
+            5.0, 5.0, 0.0, 0.0,
+            9.0, 0.0, 0.0, 0.0,
+            20.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+        ];
+        assert_eq!(row_f32(&group_mask_scores(&scores, 4, 3)), keep_three);
+
+        // The narrowest in-range case: 2 groups of 8, keep 1. Group 0 scores
+        // 5 + 9 = 14 and group 1 scores 20 + 3 = 23, so the second half wins.
+        #[rustfmt::skip]
+        let keep_second_half = vec![
+            0.0, 0.0, 0.0, 0.0,
+            0.0, 0.0, 0.0, 0.0,
+            20.0, 0.0, 0.0, 0.0,
+            3.0, 3.0, 3.0, 3.0,
+        ];
+        assert_eq!(row_f32(&group_mask_scores(&scores, 2, 1)), keep_second_half);
+    }
+
+    /// The bounds check itself, exhaustively, without touching MLX.
+    #[test]
+    fn group_mask_plan_classifies_every_out_of_range_triple() {
+        let row = [1, 16];
+
+        // In range: the mask is applied and the group width comes back.
+        assert_eq!(group_mask_plan(&row, 4, 2), Ok(4));
+        assert_eq!(group_mask_plan(&row, 4, 3), Ok(4));
+        assert_eq!(group_mask_plan(&row, 2, 1), Ok(8));
+        assert_eq!(group_mask_plan(&row, 8, 4), Ok(2));
+
+        // Masks nothing, and says nothing: both are ordinary configurations.
+        assert_eq!(group_mask_plan(&row, 1, 1), Err(GroupMaskSkip::NotGrouped));
+        assert_eq!(
+            group_mask_plan(&row, 4, 4),
+            Err(GroupMaskSkip::KeepsEveryGroup)
+        );
+
+        // Out of range.
+        for n_group in [0, -1, i32::MIN] {
+            assert_eq!(
+                group_mask_plan(&row, n_group, 1),
+                Err(GroupMaskSkip::InvalidGroupCount),
+                "n_group = {n_group}"
+            );
+        }
+        for topk_group in [0, 5, 6, 8, -1, i32::MIN, i32::MAX] {
+            assert_eq!(
+                group_mask_plan(&row, 4, topk_group),
+                Err(GroupMaskSkip::TopkGroupOutOfRange),
+                "topk_group = {topk_group}"
+            );
+        }
+        assert_eq!(
+            group_mask_plan(&row, 3, 2),
+            Err(GroupMaskSkip::UnevenGroups)
+        );
+        assert_eq!(
+            group_mask_plan(&row, 16, 8),
+            Err(GroupMaskSkip::GroupTooSmall)
+        );
+        assert_eq!(
+            group_mask_plan(&[1, 0], 4, 2),
+            Err(GroupMaskSkip::GroupTooSmall),
+            "an empty score row passes divisibility, so only the group width catches it"
+        );
+        assert_eq!(
+            group_mask_plan(&[16], 4, 2),
+            Err(GroupMaskSkip::BadScoreShape)
+        );
+        assert_eq!(
+            group_mask_plan(&[1, 4, 4], 4, 2),
+            Err(GroupMaskSkip::BadScoreShape)
+        );
+
+        // Only the two ordinary reasons stay quiet.
+        assert!(!GroupMaskSkip::NotGrouped.is_config_error());
+        assert!(!GroupMaskSkip::KeepsEveryGroup.is_config_error());
+        for skip in [
+            GroupMaskSkip::InvalidGroupCount,
+            GroupMaskSkip::TopkGroupOutOfRange,
+            GroupMaskSkip::UnevenGroups,
+            GroupMaskSkip::GroupTooSmall,
+            GroupMaskSkip::BadScoreShape,
+        ] {
+            assert!(skip.is_config_error(), "{skip:?} must be reported");
+        }
+    }
+
+    /// `topk_group == n_group + 1` gives `k == -1`, and `slice_axis` reads that
+    /// as "to the end of the axis", so the bottom-k slice became the *whole*
+    /// group axis and every group was zeroed. Nothing threw: the callers gather
+    /// their combine weights from an untouched copy of the scores, so an
+    /// all-equal selection row silently hands routing to `argpartition`'s
+    /// tie-break order while the weights stay plausible.
+    #[test]
+    fn group_mask_scores_leaves_scores_untouched_when_topk_group_exceeds_n_group() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, 5)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// `n_group + 2 <= topk_group <= 2 * n_group - 1` resolves `end` to
+    /// `n_group + k`, zeroing the wrong *number* of groups. Also silent.
+    #[test]
+    fn group_mask_scores_leaves_scores_untouched_when_topk_group_is_well_past_n_group() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, 6)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// `topk_group >= 2 * n_group` drives `argpartition`'s normalized `kth`
+    /// below zero. `fn argpartition` is declared non-`Result` in the bridge, so
+    /// the MLX throw was an uncatchable abort rather than an error. Reaching the
+    /// assertion at all is the point of this test.
+    #[test]
+    fn group_mask_scores_returns_instead_of_aborting_when_topk_group_is_far_out_of_range() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, 8)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// `topk_group == 0` gives `k == n_group`, which zeroed every group. Same
+    /// silent shape as `n_group + 1`.
+    #[test]
+    fn group_mask_scores_leaves_scores_untouched_when_topk_group_is_zero() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, 0)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// Several callers reach the function through `args.topk_group as i32` from
+    /// a `usize` config field, so a `usize` above `i32::MAX` arrives already
+    /// negative. That made `k > n_group` and put `argpartition` in the abort
+    /// regime from the other direction.
+    #[test]
+    fn group_mask_scores_returns_instead_of_aborting_when_topk_group_is_negative() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, -1)),
+            GROUPED_SCORES_16.to_vec()
+        );
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, i32::MIN)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// `topk_group == n_group` keeps every group, which is what upstream mlx-lm
+    /// means by it and what `k == 0` already produced through an empty slice.
+    /// It stays the identity and is not reported as a bad config.
+    #[test]
+    fn group_mask_scores_is_the_identity_when_topk_group_equals_n_group() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 4, 4)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// `n_experts % n_group != 0` truncates `experts_per_group` and the reshape
+    /// threw one step before the `topk_group` arithmetic was ever reached.
+    #[test]
+    fn group_mask_scores_returns_instead_of_aborting_when_experts_do_not_divide_evenly() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 3, 2)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// Group scoring sums each group's top two experts, so `argpartition(kth =
+    /// 1)` on a one-expert group axis is out of range and threw.
+    #[test]
+    fn group_mask_scores_returns_instead_of_aborting_when_a_group_holds_one_expert() {
+        let scores = grouped_scores_16();
+        assert_eq!(
+            row_f32(&group_mask_scores(&scores, 16, 8)),
+            GROUPED_SCORES_16.to_vec()
+        );
+    }
+
+    /// All eight call sites gate the call on `self.n_group > 1`, so this regime
+    /// is covered by convention rather than by the function. `n_group == 0`
+    /// additionally divided by zero in `experts_per_group`.
+    #[test]
+    fn group_mask_scores_leaves_scores_untouched_when_grouping_is_disabled() {
+        let scores = grouped_scores_16();
+        for n_group in [1, 0, -1] {
+            assert_eq!(
+                row_f32(&group_mask_scores(&scores, n_group, 1)),
+                GROUPED_SCORES_16.to_vec(),
+                "n_group = {n_group} must mask nothing"
+            );
+        }
     }
 }

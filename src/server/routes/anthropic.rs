@@ -34,7 +34,7 @@ use axum::{
     Json,
     extract::State,
     http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response, sse::Sse},
+    response::{IntoResponse, Response},
 };
 
 use crate::server::AppState;
@@ -44,6 +44,8 @@ use crate::server::anthropic_translator::{
 };
 use crate::server::chat_request::{prepare_chat_request_with_cache, request_has_effective_input};
 use crate::server::config::ReasoningBudgetOverride;
+use crate::server::model_provider::QueueFullError;
+use crate::server::streaming::sse_response;
 use crate::server::streaming_anthropic::{AnthropicBlockEmitter, anthropic_sse_channel};
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::tool_calls;
@@ -60,6 +62,16 @@ use crate::server::types::anthropic_stream::{
 use super::chat::{
     MAX_TOOLS, build_generate_options, build_prompt_cache_request_context, parse_priority_header,
 };
+
+fn generation_error_to_response(err: anyhow::Error) -> Response {
+    if err.downcast_ref::<QueueFullError>().is_some() {
+        AnthropicErrorResponse::overloaded("All slots are busy. Please try again later.")
+            .into_response()
+    } else {
+        AnthropicErrorResponse::api_error(format!("Generation failed: {err}")).into_response()
+    }
+}
+use crate::server::request_options::{chat_carries_loop_amplifier, resolve_server_max_tokens};
 
 /// POST /v1/messages
 pub async fn anthropic_messages(
@@ -97,11 +109,8 @@ pub async fn anthropic_messages(
     }
 
     // Resolve the thinking budget exactly as the chat / responses routes do.
-    let effective_max_tokens = translated
-        .chat_request
-        .params
-        .max_tokens
-        .unwrap_or(state.config.default_max_tokens);
+    let effective_max_tokens =
+        resolve_server_max_tokens(&state.config, translated.chat_request.params.max_tokens);
     let raw_budget = pick_budget_alias(
         translated.chat_request.params.thinking_budget_tokens,
         translated.chat_request.params.thinking_token_budget,
@@ -177,11 +186,14 @@ async fn non_stream_messages(
 
     // Whether the rendered prompt left a thinking block open. Captured before
     // `prepared.prompt` is moved into the generate call below. A bare close
-    // marker in the output may only be treated as the close of an implicit open
-    // when this is true — otherwise it is literal text the user asked for.
+    // marker may only close an implicit open when this is true.
     let primed_open_thinking =
         crate::server::routes::chat::is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    // Tool declarations and tool-shaped content amplify Gemma 4 loop detection;
+    // `chat_carries_loop_amplifier` also respects `tool_choice: none`.
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -210,10 +222,7 @@ async fn non_stream_messages(
             prepared.media,
         ) {
         Ok(r) => r,
-        Err(e) => {
-            return AnthropicErrorResponse::api_error(format!("Generation failed: {e}"))
-                .into_response();
-        }
+        Err(e) => return generation_error_to_response(e),
     };
 
     state.metrics.record_request(
@@ -308,7 +317,9 @@ async fn stream_messages(
     // non-streaming handler above.
     let primed_open_thinking =
         crate::server::routes::chat::is_prompt_primed_open_thinking(&prepared.prompt);
-    let mut options = build_generate_options(&translated.chat_request.params, &state.config);
+    let amplified = chat_carries_loop_amplifier(&translated.chat_request);
+    let mut options =
+        build_generate_options(&translated.chat_request.params, &state.config, amplified);
     options.priority = priority;
     // per-request Gemma 4 image soft-token budget, resolved and validated from
     // the translated `image_url` content parts. `None` when unset.
@@ -322,6 +333,11 @@ async fn stream_messages(
         &prepared.image_data,
         &prepared.audio_data,
     );
+
+    let queue_reservation = match state.model_provider.reserve_single_stream_queue_slot() {
+        Ok(reservation) => reservation,
+        Err(err) => return generation_error_to_response(err),
+    };
 
     let (sender, stream, cancelled, keepalive) = anthropic_sse_channel(128);
 
@@ -379,13 +395,14 @@ async fn stream_messages(
 
         let result = state
             .model_provider
-            .generate_streaming_with_logprobs_cancellable_videos_declared(
+            .generate_streaming_with_logprobs_cancellable_videos_declared_reserved(
                 prepared.prompt,
                 options,
                 prepared.image_data,
                 prepared.audio_data,
                 prepared.videos,
                 prepared.media,
+                queue_reservation,
                 cancelled,
                 |token, _lp| {
                     if let Ok(mut acc) = acc_clone.lock() {
@@ -425,6 +442,13 @@ async fn stream_messages(
             .ok()
             .map(|mut f| f.flush())
             .unwrap_or_default();
+        if include_thinking
+            && let Some(reasoning) = trailing.reasoning.filter(|s| !s.is_empty())
+            && let Ok(mut em) = emitter.lock()
+        {
+            em.open_thinking(&sender);
+            em.emit_thinking_delta(&sender, reasoning);
+        }
         if let Some(text) = trailing.content.filter(|s| !s.is_empty())
             && let Ok(mut em) = emitter.lock()
         {
@@ -438,13 +462,22 @@ async fn stream_messages(
         let result = match result {
             Ok(r) => r,
             Err(err) => {
+                let queue_full = err.downcast_ref::<QueueFullError>().is_some();
                 if let Ok(mut em) = emitter.lock() {
                     em.close_open_block(&sender);
                 }
                 let _ = sender.send_event(&AnthropicStreamEvent::Error {
                     error: AnthropicStreamError {
-                        error_type: "api_error".to_string(),
-                        message: err.to_string(),
+                        error_type: if queue_full {
+                            "overloaded_error".to_string()
+                        } else {
+                            "api_error".to_string()
+                        },
+                        message: if queue_full {
+                            "All slots are busy. Please try again later.".to_string()
+                        } else {
+                            err.to_string()
+                        },
                     },
                 });
                 return;
@@ -520,9 +553,7 @@ async fn stream_messages(
         let _ = sender.send_event(&AnthropicStreamEvent::MessageStop);
     });
 
-    Sse::new(stream)
-        .keep_alive(keepalive.into_inner())
-        .into_response()
+    sse_response(stream, keepalive)
 }
 
 /// POST /v1/messages/count_tokens
@@ -584,7 +615,7 @@ pub async fn anthropic_count_tokens(
 /// `content` is the visible text; otherwise structural tokens are stripped.
 /// Reasoning is recovered from a `<think>...</think>` block (inline or
 /// open-primed close-only) so it can populate a dedicated `thinking` block.
-fn split_visible_reasoning(
+pub(crate) fn split_visible_reasoning(
     raw: &str,
     parsed: Option<&tool_calls::ToolCallParseResult>,
     primed: bool,

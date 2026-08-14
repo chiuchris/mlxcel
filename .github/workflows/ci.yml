@@ -2,14 +2,30 @@
 # advisory) and cargo-fmt on every touched-Rust change so formatting drift and
 # license issues are caught at PR time.
 #
-# Clippy and cargo-test do NOT run in any workflow. They used to run on the
-# self-hosted Apple Silicon runner — first here at PR time, then briefly in
-# release.yml — and in both cases consumed ~30 min per run, blocking either
-# PRs or releases on a shared resource for failures that `make verify`
-# reliably catches on the developer's machine in a fraction of the time.
+# Neither clippy nor the general unit suite is gated at PR time. Both used to
+# run on the self-hosted Apple Silicon runner, first here and then briefly in
+# release.yml, and in both cases consumed ~30 min per run, blocking either PRs
+# or releases on a shared resource for failures that `make verify` reliably
+# catches on the developer's machine in a fraction of the time (#21, #23).
 #
-# Quality gate lives locally. Pre-push checklist:
-#   make verify         # fmt + clippy(metal,accelerate, -D warnings) + test(release)
+# They are not absent from every workflow, though, so do not read the above as
+# "nothing anywhere runs them":
+#
+#   - pipeline-parallel-ci.yml runs `cargo clippy -p mlxcel --lib --tests
+#     -- -D warnings`, and reaches `cargo test` through scripts/ci/run-pp-*.sh
+#     with `distributed::`-prefixed selectors. It is debug profile on
+#     ubuntu-latest and path-filtered to src/distributed/pipeline/** and its
+#     siblings, so it never runs on a model-port PR and never selects a model
+#     or CLI test module.
+#   - nightly-verify.yml runs the full `make verify` (fmt + clippy + test) once
+#     a day on the self-hosted Apple Silicon runner and files an issue when it
+#     fails. It is a backstop against a red `main`, not a PR gate; see #939 for
+#     the two deterministic failures that sat on `main` before it existed, and
+#     for why it is nightly rather than per-PR.
+#
+# Quality gate still lives locally at PR time. Pre-push checklist:
+#   make verify         # fmt + clippy(workspace, metal,accelerate, -D warnings)
+#                       # + test(workspace, test-fast)
 #   make verify-clean   # same, after `cargo clean` — use when clippy's
 #                       # per-crate cache may be hiding a regression
 #
@@ -38,6 +54,7 @@ jobs:
       pull-requests: read
     outputs:
       rust: ${{ steps.filter.outputs.rust }}
+      mlx_pin: ${{ steps.filter.outputs.mlx_pin }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -51,6 +68,13 @@ jobs:
               - '**/Cargo.toml'
               - 'Cargo.lock'
               - 'deny.toml'
+              - '.github/workflows/ci.yml'
+            mlx_pin:
+              - 'src/lib/mlx-cpp/CMakeLists.txt'
+              - 'src/lib/mlxcel-core/build_support/mlx_pin.rs'
+              - 'src/lib/mlxcel-mlx-pin/**'
+              - 'scripts/ci/mlx_pinned_commit.sh'
+              - 'scripts/ci/mlx_pinned_commit_test.sh'
               - '.github/workflows/ci.yml'
 
   deny:
@@ -79,10 +103,104 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.100.0
+      # The tag on this action IS the toolchain version it installs, so it must
+      # track `rust-toolchain.toml`'s `channel` rather than be bumped on its own.
+      # Dependabot reads the tag as an ordinary version and will try to raise it;
+      # `.github/dependabot.yml` ignores this action for that reason.
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+
+  crate-versions:
+    name: crate versions
+    # Deliberately not behind the `changes` filter. It needs no toolchain and
+    # runs in seconds, and a version-consistency gate that can be skipped is
+    # exactly the gate that gets skipped on the one PR that breaks it.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # Gating, not advisory. From v0.3.3 onward the root `mlxcel` and every
+      # member crate that ships with it carry the same `[package] version`, and
+      # a release has to bump several manifests at once. The list used to live
+      # in prose (CLAUDE.md, the release skill) and went stale the moment a
+      # member was added: `mlxcel-mlx-pin` tracked the root version from the day
+      # it was created without either document saying so. The script inverts the
+      # rule, so a new member fails this job until it is either bumped with the
+      # root or declared independent with a reason. No toolchain needed.
+      - name: Check every version-tracking crate carries the root version
+        run: python3 scripts/ci/check_crate_versions.py
+
+  kernel-dtype-keys:
+    name: kernel dtype keys
+    # Deliberately not behind the `changes` filter, for the same reason as
+    # `crate-versions`: it needs no toolchain, runs in seconds, and the defect it
+    # guards against is silent. MLX's CUDA JIT memoises a compiled kernel under a
+    # name that does not carry the input dtypes, so a launch whose template args
+    # are all ints serves the first dtype's compiled module to every later dtype
+    # at the same geometry, reading buffers through the wrong pointer type.
+    # Issues #1053 and #1054 are two symptoms of exactly that. macOS never sees
+    # it, because Metal's key does carry the dtypes, so this job is the only
+    # place the omission is caught without CUDA hardware.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Check every CUDA JIT launch keys its cache on the input dtypes
+        run: python3 scripts/ci/check_kernel_dtype_keys.py
+
+  mlx-pin:
+    name: MLX pin extraction
+    needs: changes
+    if: needs.changes.outputs.mlx_pin == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      # The pinned MLX commit has one home, GIT_TAG in
+      # src/lib/mlx-cpp/CMakeLists.txt, and two independent parsers read it:
+      # mlxcel-core's build.rs in Rust (build_support/mlx_pin.rs, unit-tested by
+      # mlxcel-mlx-pin) and this script in awk, for release.yml's "Validate MLX
+      # build cache" steps. The shell half accepts strictly less than the Rust
+      # half: it needs GIT_TAG as the first token of its own line, after the
+      # GIT_REPOSITORY line, with no closing parenthesis in between. A CMake
+      # reformat that leaves every local build and `make verify` green can
+      # therefore break every release build, and release.yml is the only other
+      # place this script runs, so without this job the breakage would first
+      # appear when a release is cut. Issue #1047.
+      #
+      # `mlxcel-mlx-pin` compiles in under a second (a leaf crate with no
+      # production role, only `std` plus a `tempfile` dev-dependency), so it
+      # runs first here rather than only in nightly-verify.yml's `make verify`.
+      # Its `tests/cross_parser.rs` shells out to mlx_pinned_commit.sh itself
+      # and asserts that whenever the shell parser accepts an input, the Rust
+      # parser resolves to the identical commit for that same input: the two
+      # unit-test files below each cover one parser in isolation and cannot
+      # catch a same-input value mismatch on their own.
+      - uses: dtolnay/rust-toolchain@1.97.1
+      - name: Run the Rust pin parser's unit and cross-parser tests
+        run: cargo test -p mlxcel-mlx-pin
+
+      - name: Extract the pinned MLX commit
+        run: scripts/ci/mlx_pinned_commit.sh
+
+      # The other half of the contract: the shell parser must also *reject*
+      # everything the Rust parser rejects. A value it accepts and the Rust
+      # parser refuses is not harmless, because release.yml purges every MLX
+      # build cache that does not match what this script prints and the build
+      # then fails on the same file the purge was justified by.
+      - name: Check the pinned MLX commit parser rejects malformed input
+        run: scripts/ci/mlx_pinned_commit_test.sh
 
   cross-repo-refs:
     name: cross-repo refs

@@ -819,6 +819,26 @@ impl DFlashGenerator {
                     break;
                 }
             }
+
+            // ---- Rollback (only on partial acceptance) ----
+            //
+            // The verify forward advanced the target's caches by `bs`
+            // tokens. We accepted `accepted` drafter proposals plus one
+            // bonus → keep `accepted + 1` positions; the remaining
+            // `bs - (accepted + 1)` cache positions must be rolled back.
+            //
+            // For Qwen 3.5 (hybrid Mamba+Transformer), rollback is
+            // dual: KV trim for attention layers + GDN state replay for
+            // linear-attention layers. The target trait method handles
+            // both. This must happen before either terminal exit check below;
+            // otherwise a final partial block leaves rejected positions
+            // in the target cache.
+            if accepted < bs - 1 {
+                let phase_start = Instant::now();
+                target.rollback_partial(caches, &verify_out, accepted as i32, bs as i32);
+                diagnostics.rollback_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
+            }
+
             if hit_eos {
                 break;
             }
@@ -861,23 +881,6 @@ impl DFlashGenerator {
             } else {
                 full_hidden
             };
-
-            // ---- Rollback (only on partial acceptance) ----
-            //
-            // The verify forward advanced the target's caches by `bs`
-            // tokens. We accepted `accepted` drafter proposals plus one
-            // bonus → keep `accepted + 1` positions; the remaining
-            // `bs - (accepted + 1)` cache positions must be rolled back.
-            //
-            // For Qwen 3.5 (hybrid Mamba+Transformer), rollback is
-            // dual: KV trim for attention layers + GDN state replay for
-            // linear-attention layers. The target trait method handles
-            // both.
-            if accepted < bs - 1 {
-                let phase_start = Instant::now();
-                target.rollback_partial(caches, &verify_out, accepted as i32, bs as i32);
-                diagnostics.rollback_time_ms += phase_start.elapsed().as_secs_f64() * 1000.0;
-            }
 
             // Periodic memory cache clear, backend-aware cadence (#627): disabled
             // by default on CUDA, 256 on Metal/CPU, MLXCEL_CACHE_CLEAR_INTERVAL
@@ -1643,6 +1646,56 @@ mod tests {
         }
     }
 
+    /// A partial-accept round that emits EOS must still rewind the rejected
+    /// verify positions before the round loop exits.
+    #[test]
+    fn round_loop_rolls_back_before_eos_exit() {
+        let target = SyntheticTarget::new(
+            vec![1, 8, 15, 22, 29],
+            5 * 8,
+            |_position: i32, previous: i32| {
+                if previous == 103 { 7 } else { previous + 1 }
+            },
+        );
+        let mut caches: Vec<SyntheticCache> = (0..3).map(|_| SyntheticCache::default()).collect();
+        let drafter = SyntheticDrafter::new(|bonus, bs| {
+            (0..bs - 1)
+                .map(|index| {
+                    if index < 3 {
+                        bonus + index as i32 + 1
+                    } else {
+                        999
+                    }
+                })
+                .collect()
+        });
+        let lm = EmbedOnlyLm;
+        let mut r#gen = DFlashGenerator::with_drafter(Box::new(drafter), SamplingConfig::greedy());
+        r#gen.block_size = 8;
+        let first_hidden = ffi::zeros(&[1, 1, 5 * 8], crate::dtype::FLOAT32);
+
+        let out = r#gen
+            .run(
+                &target,
+                &lm,
+                &mut caches,
+                100,
+                first_hidden,
+                &[7],
+                32,
+                &AtomicBool::new(false),
+                &crate::sampling::LogprobsConfig::default(),
+            )
+            .expect("synthetic EOS round must not fail");
+
+        assert_eq!(out.tokens, vec![101, 102, 103, 7]);
+        assert_eq!(target.rollback_events(), vec![(3, 8)]);
+        assert_eq!(
+            caches[0].offset, 4,
+            "rejected EOS-block tail must be trimmed"
+        );
+    }
+
     /// Pins the expected accept-len progression for 3 rounds at
     /// block_size = 8 (the acceptance criterion).
     #[test]
@@ -1962,11 +2015,10 @@ mod tests {
         // Run with default interval (256) — long enough to cross one
         // cadence boundary.
         let (out_with_trim, _, _) = run_synthetic_round_loop(
-            8,           // block_size
-            300,         // max_tokens — crosses the 256 boundary
-            100,         // first_bonus
-            argmax_fn,
-            propose_fn,
+            8,   // block_size
+            300, // max_tokens — crosses the 256 boundary
+            100, // first_bonus
+            argmax_fn, propose_fn,
         );
 
         // Re-run with interval effectively disabled — the round loop
@@ -1977,11 +2029,10 @@ mod tests {
         // the code under test; verify the token output is the same
         // as the fully-decoded sequence.
         let (out_no_trim, _, _) = run_synthetic_round_loop(
-            8,           // block_size
-            300,         // max_tokens
-            100,         // first_bonus
-            argmax_fn,
-            propose_fn,
+            8,   // block_size
+            300, // max_tokens
+            100, // first_bonus
+            argmax_fn, propose_fn,
         );
 
         assert_eq!(

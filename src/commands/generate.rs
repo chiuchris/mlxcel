@@ -359,15 +359,20 @@ fn validate_pipeline_parallel_args(args: &GenerateArgs) -> Result<()> {
         return Ok(());
     }
 
-    // 2D (PP x TP) composition is now supported. See
-    // `docs/en/distributed/pipeline-parallelism.md` and
-    // `docs/en/distributed/tensor-parallelism.md` for the operator guide.
+    // 2D (PP x TP) composition is now supported. The per-axis operator manual
+    // pages are `distributed/tensor-parallelism.md` and
+    // `distributed/pipeline-parallelism.md` under the `docs/en` tree that
+    // `mkdocs.yml` builds from. Those sources live in the separate
+    // documentation tree rather than here, which is deliberate and not drift
+    // (see `docs/README.md`). The in-checkout summary is
+    // `docs/distributed.md`; it covers the PP and TP knobs in separate sections
+    // and does not write up the 2D composition yet.
     let tp_size = args.tensor_parallel.tp_size;
     if tp_size > 1 {
         ensure!(
             pp.pp_size >= 2 || pp.pp_layers.is_some(),
             "2D parallelism requires --pp-size >= 2 (or an explicit --pp-layers spec) \
-             alongside --tensor-parallel-size > 1"
+             alongside --tp-size > 1"
         );
         // Soft guard against obvious topology mistakes. A negative-like sanity
         // check here surfaces a clear error instead of a cryptic routing or
@@ -552,6 +557,60 @@ fn validate_tensor_parallel_args(args: &GenerateArgs) -> Result<()> {
         args.model.adapter.as_deref(),
     )
     .map(|_| ())
+}
+
+fn muse_glimmer_cli_target(model_path: &Path) -> bool {
+    matches!(
+        mlxcel::models::get_model_type(model_path),
+        Ok(mlxcel::models::ModelType::MuseGlimmerVLM)
+    )
+}
+
+fn xla_backend_requested_from_env() -> bool {
+    std::env::var("MLXCEL_BACKEND")
+        .ok()
+        .is_some_and(|backend| backend.eq_ignore_ascii_case("xla"))
+}
+
+pub(super) fn validate_muse_glimmer_cli_unsupported_options(
+    args: &GenerateArgs,
+    kv_cache_mode: KVCacheMode,
+) -> Result<()> {
+    if !muse_glimmer_cli_target(&args.model.model) {
+        return Ok(());
+    }
+
+    ensure!(
+        args.model.adapter.is_none(),
+        "Muse Glimmer VLM does not support LoRA/adapters; remove --adapter"
+    );
+    ensure!(
+        args.model.draft_model.is_none()
+            && args.speculative.draft_kind.is_none()
+            && args.speculative.draft_block_size.is_none(),
+        "Muse Glimmer VLM does not support speculative decoding or DFlash; remove \
+         --draft-model, --draft-kind, and --draft-block-size"
+    );
+    ensure!(
+        args.generation.video.is_empty(),
+        "Muse Glimmer VLM does not support video input yet; use --image for static images"
+    );
+    ensure!(
+        kv_cache_mode == KVCacheMode::Fp16,
+        "Muse Glimmer VLM does not support INT8/Turbo KV cache modes because it owns \
+         mixed sliding/full caches; use fp16 KV cache mode"
+    );
+    ensure!(
+        !cli_pipeline_requested(args),
+        "Muse Glimmer VLM does not support pipeline-parallel inference yet"
+    );
+    ensure!(
+        !xla_backend_requested_from_env(),
+        "Muse Glimmer VLM does not support XLA/IREE/OpenXLA execution yet; unset \
+         MLXCEL_BACKEND=xla"
+    );
+
+    Ok(())
 }
 
 fn apply_user_chat_template(processor: &ChatTemplateProcessor, user_prompt: &str) -> String {
@@ -801,11 +860,53 @@ fn resolve_cli_token_bias(
         .map_err(|e| anyhow::anyhow!("--lang-bias: resolve failed: {e}"))
 }
 
-fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> SamplingConfig {
-    build_sampling_config(ResolvedSamplingParams {
-        temperature: args.sampling.temp,
-        top_k: args.sampling.top_k,
-        top_p: args.sampling.top_p,
+#[derive(Debug, Clone, Copy, Default)]
+struct CliSamplingFlagState {
+    temperature: bool,
+    top_p: bool,
+    top_k: bool,
+}
+
+fn current_cli_sampling_flags() -> CliSamplingFlagState {
+    CliSamplingFlagState {
+        temperature: mlxcel::server::long_cli_flag_was_set("temp") || short_cli_flag_was_set('t'),
+        top_p: mlxcel::server::long_cli_flag_was_set("top-p"),
+        top_k: mlxcel::server::long_cli_flag_was_set("top-k"),
+    }
+}
+
+fn short_cli_flag_was_set(name: char) -> bool {
+    let standalone = format!("-{name}");
+    std::env::args_os().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg == standalone || arg.starts_with(&standalone) && arg.len() > standalone.len()
+    })
+}
+
+fn resolved_cli_sampling_params(
+    args: &GenerateArgs,
+    stop_token_ids: Vec<i32>,
+    flags: CliSamplingFlagState,
+) -> ResolvedSamplingParams {
+    let generation_defaults = mlxcel::read_generation_config_defaults(&args.model.model);
+    ResolvedSamplingParams {
+        temperature: if flags.temperature {
+            args.sampling.temp
+        } else {
+            generation_defaults
+                .temperature
+                .unwrap_or(args.sampling.temp)
+        },
+        top_k: if flags.top_k {
+            args.sampling.top_k
+        } else {
+            generation_defaults.top_k.unwrap_or(args.sampling.top_k)
+        },
+        top_p: if flags.top_p {
+            args.sampling.top_p
+        } else {
+            generation_defaults.top_p.unwrap_or(args.sampling.top_p)
+        },
         min_p: args.sampling.min_p,
         seed: args.sampling.seed,
         repetition_penalty: args.sampling.repetition_penalty,
@@ -813,6 +914,16 @@ fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> S
         dry_base: args.sampling.dry_base,
         dry_allowed_length: args.sampling.dry_allowed_length,
         dry_penalty_last_n: args.sampling.dry_penalty_last_n,
+        // The CLI runs DRY with no sequence breakers. This is a deliberate scope
+        // decision, not an oversight, and it differs in kind from the four
+        // "feature off" defaults below it. Those four are genuinely off because
+        // the CLI has no flag that could turn them on; this one is not, because
+        // the CLI does expose `--dry-multiplier`, so DRY can be switched on and
+        // then the empty vector is an unchangeable configuration rather than a
+        // disabled feature. With no breakers the backward match never stops at a
+        // newline or punctuation boundary, so `match_len` keeps growing and the
+        // penalty is stronger than the same nominal settings produce on the
+        // server, whose `--dry-sequence-breaker` has no CLI equivalent.
         dry_sequence_breakers: Vec::new(),
         frequency_penalty: 0.0,
         presence_penalty: 0.0,
@@ -821,7 +932,28 @@ fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> S
         xtc_probability: 0.0,
         xtc_threshold: 0.1,
         stop_token_ids,
-    })
+    }
+}
+
+fn build_cli_sampling_config(args: &GenerateArgs, stop_token_ids: Vec<i32>) -> SamplingConfig {
+    build_sampling_config(resolved_cli_sampling_params(
+        args,
+        stop_token_ids,
+        current_cli_sampling_flags(),
+    ))
+}
+
+#[allow(dead_code)]
+fn build_cli_sampling_config_with_flags(
+    args: &GenerateArgs,
+    stop_token_ids: Vec<i32>,
+    flags: CliSamplingFlagState,
+) -> SamplingConfig {
+    build_sampling_config(resolved_cli_sampling_params(args, stop_token_ids, flags))
+}
+
+fn build_cli_chat_sampling_params(args: &GenerateArgs) -> ResolvedSamplingParams {
+    resolved_cli_sampling_params(args, Vec::new(), current_cli_sampling_flags())
 }
 
 pub(super) fn print_generation_preamble(user_prompt: &str) -> Result<()> {
@@ -835,7 +967,7 @@ fn generated_suffix<'a>(full_text: &'a str, prompt_text: &str) -> &'a str {
     full_text.strip_prefix(prompt_text).unwrap_or(full_text)
 }
 
-fn decode_generated_text(
+pub(super) fn decode_generated_text(
     tokenizer: &mlxcel::tokenizer::MlxcelTokenizer,
     prompt_tokens: &[i32],
     generated_tokens: &[i32],
@@ -875,6 +1007,15 @@ fn filter_reasoning_for_display(
     generated_text: &str,
     show_reasoning: bool,
 ) -> String {
+    let dim = io::stdout().is_terminal();
+    if let Some(rendered) = mlxcel::server::tool_calls::render_muse_channels_for_display(
+        generated_text,
+        show_reasoning,
+        dim,
+    ) {
+        return rendered;
+    }
+
     let markers = tokenizer.infer_thinking_markers();
     // When the rendered prompt primed an open thinking marker (`<think>\n` for
     // Qwen-style, `<|channel>thought\n` for a thinking-on Gemma-4 channel) the
@@ -882,7 +1023,6 @@ fn filter_reasoning_for_display(
     // start the filter in the reasoning state to keep the primed thought body
     // and its raw close marker off the terminal.
     let primed = mlxcel::reasoning_stream::prompt_primed_open_thinking(&markers, prompt);
-    let dim = io::stdout().is_terminal();
     mlxcel::reasoning_stream::render_full(&markers, generated_text, primed, show_reasoning, dim)
 }
 
@@ -1231,7 +1371,7 @@ fn generate_xla(
 // stays generic over `LanguageModel`; `LoadedModel` implements that trait, so
 // the monomorphized code for the non-MTP paths is identical to the prior generic
 // form. The sole caller already passes `&LoadedModel`.
-fn run_generation_mode(
+pub(super) fn run_generation_mode(
     model: &mlxcel::LoadedModel,
     args: &GenerateArgs,
     prompt_tokens: &[i32],
@@ -1300,6 +1440,12 @@ fn run_generation_mode(
         println!("Loading draft model from {:?}...", draft_model_path);
         let (draft_model, _draft_tokenizer) = select_backend().load_model(draft_model_path)?;
         println!("Draft model loaded.");
+        // This line reports what the drafter's `config.json` *auto-detected*,
+        // which is not the same thing as the path this command will run. With
+        // no explicit `--draft-kind`, an auto-detected `dflash` still falls
+        // through to the classic `SpeculativeGenerator` below. Printing only
+        // the detected kind made a benchmark run indistinguishable from a
+        // DFlash round-loop run, so the path actually taken is now printed too.
         println!(
             "Resolved drafter kind: {} (block_size = {block_size}{})",
             resolved_kind,
@@ -1309,6 +1455,13 @@ fn run_generation_mode(
                 ", default"
             },
         );
+        if !user_requested_explicit_kind {
+            println!(
+                "Drafter kind was auto-detected only; running the classic \
+                 SpeculativeGenerator path (pass --draft-kind explicitly to select a \
+                 kind-specific round loop)."
+            );
+        }
 
         // MTP is handled above (issue #166). The remaining explicit kinds
         // (DFlash, InternalMtp) still need their kind-specific round loops and
@@ -1369,14 +1522,24 @@ fn run_generation_mode(
         let mut spec_generator = SpeculativeGenerator::new(main_num_layers, draft_num_layers)
             .with_token_bias(token_bias);
 
-        spec_generator.generate(
+        let result = spec_generator.generate(
             model,
             &draft_model,
             prompt_tokens,
             args.generation.max_tokens,
             args.model.num_draft_tokens,
             sampling_config,
-        )
+        );
+
+        // The CLI installs no tracing subscriber, so the info-level acceptance
+        // instrumentation inside `SpeculativeGenerator` never reaches a
+        // terminal. Print the summary on stdout unconditionally: it names the
+        // acceptance rule that actually ran and the mean accepted draft length,
+        // which are the two facts an acceptance-rate A/B has to be able to
+        // state about itself.
+        println!("{}", spec_generator.acceptance_stats().summary_line());
+
+        result
     } else if let Some(embeddings) = vlm_embeddings {
         generate_with_embeddings(
             model,
@@ -1682,25 +1845,7 @@ fn chat_options_from_args(args: &GenerateArgs) -> Result<crate::commands::ChatOp
     )
     .map_err(|e| anyhow::anyhow!("{}", e))?;
 
-    let sampling = ResolvedSamplingParams {
-        temperature: args.sampling.temp,
-        top_k: args.sampling.top_k,
-        top_p: args.sampling.top_p,
-        min_p: args.sampling.min_p,
-        seed: args.sampling.seed,
-        repetition_penalty: args.sampling.repetition_penalty,
-        dry_multiplier: args.sampling.dry_multiplier,
-        dry_base: args.sampling.dry_base,
-        dry_allowed_length: args.sampling.dry_allowed_length,
-        dry_penalty_last_n: args.sampling.dry_penalty_last_n,
-        dry_sequence_breakers: Vec::new(),
-        frequency_penalty: 0.0,
-        presence_penalty: 0.0,
-        // XTC is not yet exposed as a CLI flag; the REPL keeps it disabled.
-        xtc_probability: 0.0,
-        xtc_threshold: 0.1,
-        stop_token_ids: Vec::new(),
-    };
+    let sampling = build_cli_chat_sampling_params(args);
 
     let mut opts = crate::commands::ChatOptions::new(
         args.model.model.clone(),
@@ -1708,13 +1853,14 @@ fn chat_options_from_args(args: &GenerateArgs) -> Result<crate::commands::ChatOp
         sampling,
     );
     opts.models_dir = args.model.models_dir.clone();
+    opts.revision = args.model.revision.clone();
     opts.kv_cache_mode = kv_cache_mode;
     opts.no_chat_template = args.generation.no_chat_template;
     opts.show_reasoning = args.generation.show_reasoning;
     Ok(opts)
 }
 
-pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
+pub(crate) fn run_generate(mut args: GenerateArgs) -> Result<()> {
     // Epic #92 / issue #96: no `-p/--prompt` means "interactive chat". Route to
     // the reusable REPL entry point before any one-shot-only setup. The REPL
     // initializes its own runtime, resolves `-m` (repo-id auto-download), loads
@@ -1727,8 +1873,16 @@ pub(crate) fn run_generate(args: GenerateArgs) -> Result<()> {
             args.generation.output_audio.is_none(),
             "--output-audio requires a one-shot -p/--prompt run (not interactive chat)"
         );
-        let opts = chat_options_from_args(&args)?;
-        return crate::commands::run_chat(opts);
+        // `--layout-detections` builds every region's prompt from its layout
+        // class (issue #848), so it is the one one-shot mode with nothing for
+        // `-p` to carry. Give it an empty prompt rather than dropping the run
+        // into the interactive REPL, which would ignore the flag entirely.
+        if args.generation.layout_detections.is_some() {
+            args.generation.prompt = Some(String::new());
+        } else {
+            let opts = chat_options_from_args(&args)?;
+            return crate::commands::run_chat(opts);
+        }
     }
 
     run_generate_once(args)
@@ -1767,11 +1921,21 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
     // tensor/pipeline-parallel validators and the quantization-advice,
     // tokenizer, memory-preflight, and model-load steps, all of which read
     // the model directory and therefore need the resolved path.
-    args.model.model =
-        resolve_model_source_with_override(&args.model.model, args.model.models_dir.as_deref())?;
+    args.model.model = resolve_model_source_with_override(
+        &args.model.model,
+        args.model.models_dir.as_deref(),
+        args.model.revision.as_deref(),
+    )?;
 
     validate_tensor_parallel_args(&args)?;
     validate_pipeline_parallel_args(&args)?;
+    let kv_cache_mode = resolve_kv_cache_mode(
+        args.generation.turbo.cache_type_k.as_deref(),
+        args.generation.turbo.cache_type_v.as_deref(),
+        args.generation.turbo.kv_cache_mode.as_deref(),
+    )
+    .map_err(|e| anyhow::anyhow!("{}", e))?;
+    validate_muse_glimmer_cli_unsupported_options(&args, kv_cache_mode)?;
 
     // Parse and validate language bias arguments early (before model load).
     // Empty/absent CLI flags resolve to `None`, which keeps the generation
@@ -1823,6 +1987,47 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
             "--output-audio currently supports text-only prompts (no --image/--audio/--video)"
         );
     }
+
+    // Layout-aware Falcon-OCR (issue #848): validate the request and parse the
+    // detections file here, before the tokenizer and the model weights are
+    // touched, so a malformed or missing file costs nothing. The per-region
+    // prompts are derived from the layout classes, so the flag combinations
+    // that would silently do nothing are rejected rather than ignored.
+    let layout_detections = match args.generation.layout_detections.as_deref() {
+        Some(path) => {
+            ensure!(
+                !pipeline_requested,
+                "--layout-detections is not supported with pipeline parallelism"
+            );
+            ensure!(
+                args.model.draft_model.is_none(),
+                "--layout-detections does not support speculative decoding; drop --draft-model"
+            );
+            ensure!(
+                args.generation.audio.is_none() && args.generation.video.is_empty(),
+                "--layout-detections is an image-only path; drop --audio / --video"
+            );
+            ensure!(
+                args.generation.image.len() == 1,
+                "--layout-detections OCRs the regions of one page: pass exactly one --image, \
+                 got {}",
+                args.generation.image.len()
+            );
+            if args
+                .generation
+                .prompt
+                .as_deref()
+                .is_some_and(|p| !p.is_empty())
+            {
+                eprintln!(
+                    "NOTE: --layout-detections derives each region's instruction from its \
+                     layout class, so -p/--prompt is not used."
+                );
+            }
+            Some(super::generate_falcon_ocr::load_layout_detections(path)?)
+        }
+        None => None,
+    };
 
     let tokenizer = load_tokenizer(&args.model.model)?;
     let prompt = load_cli_prompt(
@@ -1903,17 +2108,6 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
             );
         }
     }
-
-    // Resolve the effective KV cache mode from the shared TurboQuant flag
-    // group. The helper accepts the same precedence rules as `mlxcel serve`
-    // and `mlxcel-server` (split flags > legacy shorthand > FP16 default),
-    // so all three binaries route through one resolution path.
-    let kv_cache_mode = resolve_kv_cache_mode(
-        args.generation.turbo.cache_type_k.as_deref(),
-        args.generation.turbo.cache_type_v.as_deref(),
-        args.generation.turbo.kv_cache_mode.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("{}", e))?;
 
     // SAFETY: translate `--turbo-boundary-v` into the `MLXCEL_KV_BOUNDARY_V_LAYERS`
     // env var BEFORE any generator or worker thread is spawned. mlxcel-core
@@ -2052,6 +2246,34 @@ fn run_generate_once(mut args: GenerateArgs) -> Result<()> {
                 &tokenizer,
                 &prompt_tokens,
                 &user_prompt,
+            );
+        }
+        // Florence-2 is an encoder-decoder (seq2seq) VLM: the decoder
+        // cross-attends to cached encoder output over the fused image+prompt
+        // sequence, so route it to its task pipeline before the
+        // autoregressive loop (issue #856). The raw `-p` string is the task
+        // prompt; the tokenized chat-template form above does not apply.
+        if let mlxcel::LoadedModel::Florence2VLM(florence2_model) = &model {
+            return super::generate_florence2::run_florence2_generation(
+                florence2_model,
+                &args,
+                &user_prompt,
+            );
+        }
+        // Layout-aware Falcon-OCR (issue #848): one page becomes a sequence of
+        // per-region OCR runs, each with its own crop and category prompt, so
+        // it cannot share the single-prompt loop below. Detections were parsed
+        // before the model load; the driver plans them into regions and prints
+        // each one in file order.
+        if let Some(detections) = layout_detections {
+            return super::generate_falcon_ocr::run_falcon_ocr_layout_generation(
+                &model,
+                &args,
+                &tokenizer,
+                &sampling_config,
+                kv_cache_mode,
+                &token_bias,
+                &detections,
             );
         }
         // Reject an off-ladder `--image-soft-tokens` before loading any image:

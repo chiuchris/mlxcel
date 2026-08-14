@@ -164,6 +164,11 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::Gemma4 | ModelType::Gemma4VLM | ModelType::Gemma4Unified => "gemma4",
         ModelType::Gemma3n | ModelType::Gemma3nVLM => "gemma3n",
         ModelType::Phi => "phi",
+        // Not shardable by the generic transformer plan: attention arrives
+        // fused as `mixer.Wqkv` rather than separate q/k/v, and the experts
+        // live under `moe.switch_mlp`, neither of which the shard rules
+        // name. This arm only keeps the dispatch table total.
+        ModelType::Phixtral => "phixtral",
         ModelType::Phi3 | ModelType::Phi3VLM => "phi3",
         ModelType::Phi4MMVLM | ModelType::Phi4SigLipVLM => "phi4mm",
         ModelType::Phi3Small => "phi3small",
@@ -172,7 +177,17 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::MiniMax => "minimax",
         ModelType::MiniMaxM3 => "minimax_m3",
         ModelType::MiniMaxM3VL => "minimax_m3",
+        ModelType::MuseGlimmerVLM => "muse_glimmer",
         ModelType::Mixtral => "mixtral",
+        // DBRX is not TP-enabled and this arm only keeps the dispatch table
+        // total; the refusal comes from `validate_supported_runtime`, whose
+        // `runtime_kind_for` match has no `ModelType::Dbrx` arm and so returns
+        // `None`. Sharding it would need rules of its own: the fused `Wqkv`
+        // packs 48 query heads and 8 KV heads into one tensor, so a row split at
+        // any offset a generic plan would pick lands inside the Q block instead
+        // of between whole heads, and the `clip_qkv` clamp has to be applied to
+        // the rank-local slice before the split rather than after the gather.
+        ModelType::Dbrx => "dbrx",
         ModelType::Qwen2Moe => "qwen2_moe",
         ModelType::OLMoE => "olmoe",
         ModelType::DeepSeek => "deepseek",
@@ -192,6 +207,12 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::GlmMoeDsa => "glm_moe_dsa",
         ModelType::Ernie45 | ModelType::PaddleOcrVL => "ernie4_5",
         ModelType::DotsOcrVL => "qwen2",
+        // Falcon-OCR has no separate text backbone: the early-fusion decoder is
+        // the model. TP refuses VLM-kind models before this table is read.
+        ModelType::FalconOcrVL => "falcon_ocr",
+        // Jina VLM's text backbone is Qwen2-class; TP refuses VLM-kind models
+        // before this table is read, so this only keeps the dispatch total.
+        ModelType::JinaVLM => "qwen2",
         ModelType::Ernie45Moe => "ernie4_5_moe",
         // ERNIE-4.5-VL text backbone; TP is refused for VLM-kind models earlier,
         // this keeps the dispatch table total.
@@ -210,6 +231,20 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // `runtime_kind_for` match has no arm for `ModelType::BailingMoe` and so
         // returns `None`; this arm only keeps the dispatch table total.
         ModelType::BailingMoe => "bailing_moe",
+        // Same refusal as `BailingMoe`, plus a second reason: the linear layers
+        // carry a recurrent state rather than a KV cache, which the generic
+        // transformer plan has no shard rule for at all.
+        ModelType::BailingMoeLinear => "bailing_moe_linear",
+        // Not shardable by the generic transformer plan: the experts live
+        // under `mlp.experts` and the sliding layers carry a rotating cache,
+        // neither of which the shard rules name. This arm only keeps the
+        // dispatch table total.
+        ModelType::Afmoe => "afmoe",
+        // Not shardable by the generic transformer plan: the experts live
+        // under `mlp.experts` and the shared branch is blended rather than
+        // added, neither of which the shard rules name. This arm only keeps
+        // the dispatch table total.
+        ModelType::Klear => "klear",
         ModelType::Apertus => "apertus",
         ModelType::SeedOss => "seed_oss",
         ModelType::Granite => "granite",
@@ -221,6 +256,14 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::Olmo => "olmo",
         ModelType::Olmo2 => "olmo2",
         ModelType::Olmo3 => "olmo3",
+        // OpenELM is not TP-enabled and this arm only keeps the dispatch table
+        // total; the refusal comes from `validate_supported_runtime`, whose
+        // `runtime_kind_for` match has no `ModelType::OpenElm` arm. Layer-wise
+        // scaling is the obstacle: a generic shard plan assumes one head count
+        // for the whole stack, but OpenELM's query heads run 16 through 32 and
+        // its KV heads 4 through 8 across the layers, so a single tp_size
+        // divisibility check cannot describe the model.
+        ModelType::OpenElm => "openelm",
         // GPT-2's fused `c_attn` and Conv1D key names have no shard rules, so
         // the planner's supported-architecture validation rejects this string
         // before any TP load is attempted. It keeps the dispatch table total.
@@ -250,16 +293,34 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         ModelType::GptNeoX => "gpt_neox",
         // Helium is structurally a shardable dense Llama, but TP is refused for
         // it on purpose and this arm only keeps the dispatch table total. The
-        // tensor-parallel runtime builds its per-rank model by parsing
-        // `config.json` straight into `llama3::ModelArgs`, and
-        // `llama3::ModelArgs::rope_traditional` is deliberately not
-        // deserializable, so a sharded Helium would silently rotate split-half
-        // pairs while the single-process path rotates interleaved pairs. The
         // refusal comes from `validate_supported_runtime`, whose
         // `runtime_kind_for` match has no arm for `ModelType::Helium` and so
-        // returns `None`. Enabling TP here means threading the flag through the
-        // rank-local config first.
+        // returns `None`.
+        //
+        // The original reason (`llama3::ModelArgs::rope_traditional` was not
+        // deserializable) no longer holds: #931 made the field parse from
+        // `config.json`, and `local_llama_args` clones the parsed args into
+        // every rank, which `tensor_parallel_llama_propagates_rope_traditional_
+        // to_every_rank` pins. The refusal survives the change for a different
+        // reason. Helium's convention is fixed in upstream code, not in its
+        // config: upstream builds `nn.RoPE(..., traditional=True)` and the
+        // published `config.json` carries no `rope_traditional` key at all, so
+        // `helium::ModelArgs::to_llama3_args` supplies it. The TP runtime parses
+        // `config.json` straight into `llama3::ModelArgs` and never goes through
+        // that conversion, so a sharded Helium would still parse `false` and
+        // still rotate split-half against a single-process path that rotates
+        // interleaved. Enabling TP for Helium means routing the rank-local
+        // config through `to_llama3_args`, which is a change to how the runtime
+        // builds its config and not something deserializing a key can deliver.
         ModelType::Helium => "helium",
+        // TeleChat3 is not TP-enabled and this arm only keeps the dispatch table
+        // total; the refusal comes from `validate_supported_runtime`, whose
+        // `runtime_kind_for` match has no `ModelType::TeleChat3` arm. The
+        // obstacle is the same one that stops it reusing the llama3 decoder:
+        // the TP runtime parses `config.json` straight into `llama3::ModelArgs`,
+        // which never reads `rope_scaling`, so a sharded TeleChat3 would rotate
+        // at the unscaled base while the single-process path applies YaRN.
+        ModelType::TeleChat3 => "telechat3",
         ModelType::StarCoder2 => "starcoder2",
         ModelType::Mellum => "mellum",
         ModelType::MiniCPM | ModelType::MiniCPMOVLM => "minicpm",
@@ -306,6 +367,9 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // supported for VLM-kind models (the loader refuses it earlier);
         // this keeps the planner dispatch table from panicking.
         | ModelType::InternVLChatVLM
+        // LocateAnything's text backbone is Qwen2 (llama family). TP is refused
+        // for VLM-kind models earlier; this keeps the dispatch table total.
+        | ModelType::LocateAnythingVLM
         // Llama 3.2 Vision's text backbone is Llama-3; TP is not supported for
         // VLM-kind models (the loader refuses it earlier).
         | ModelType::MllamaVLM => "llama",
@@ -346,6 +410,12 @@ fn fallback_architecture(model_type: ModelType) -> &'static str {
         // worker loop, never routed to tensor-parallel text inference; the
         // planner's supported-architecture validation rejects this string.
         ModelType::Llada2Moe => "llada2_moe",
+        // Florence-2 is an encoder-decoder (seq2seq) VLM served through its
+        // own CLI task pipeline and, on the server, its own single-stream
+        // seq2seq worker (issue #1073); never routed to tensor-parallel text
+        // inference, because the planner's supported-architecture validation
+        // rejects this string. Placeholder keeps the dispatch table total.
+        ModelType::Florence2VLM => "florence2",
         // Whisper is an ASR model served through the audio endpoints, never
         // routed to tensor-parallel text inference; the loader rejects it
         // earlier. Return a placeholder so the dispatch table stays total.

@@ -27,6 +27,8 @@ mod config;
 pub mod conversation_store;
 mod cors;
 pub(crate) mod diffusion_worker;
+mod dry_breakers;
+pub(crate) mod florence2_worker;
 pub mod kokoro_tts;
 mod media;
 pub mod model_provider;
@@ -92,3 +94,24 @@ pub use startup::{
     resolve_parallel_context_size, start_server,
 };
 pub use state::{AppState, BatchMetrics, Metrics, ModelMediaSupport};
+
+#[cfg(test)]
+mod max_tokens_route_tests;
+
+#[cfg(test)]
+mod muse_glimmer_template_tests;
+
+#[cfg(test)]
+mod muse_atem_roundtrip_tests;
+
+#[cfg(test)]
+mod muse_atem_stream_support;
+
+#[cfg(test)]
+mod muse_atem_stream_chat_tests;
+
+#[cfg(test)]
+mod muse_atem_stream_responses_tests;
+
+#[cfg(test)]
+mod muse_atem_stream_anthropic_tests;

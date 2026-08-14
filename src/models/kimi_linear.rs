@@ -24,6 +24,7 @@
 
 use crate::models::gated_delta::{gated_delta_update, scaled_fast_rms_norm_no_weight};
 use crate::models::switch_layers::SwitchGLU;
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::dtype;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
@@ -163,6 +164,11 @@ struct MultiLinear {
     group_size: i32,
     bits: i32,
     is_quantized: bool,
+    /// Quantization mode resolved at load from the planes the checkpoint
+    /// actually ships, never hardcoded. `"affine"` for a `.biases`-carrying
+    /// plane, one of the block-float modes otherwise. See
+    /// [`Self::from_weights`] for why this is not read from `config.json`.
+    mode: &'static str,
 }
 
 impl MultiLinear {
@@ -182,7 +188,7 @@ impl MultiLinear {
                     transpose,
                     self.group_size,
                     self.bits,
-                    "affine",
+                    self.mode,
                 )
             }
         } else if transpose {
@@ -193,6 +199,42 @@ impl MultiLinear {
         }
     }
 
+    /// Load a per-head MLA projection, resolving its quantization mode from the
+    /// planes present rather than assuming affine.
+    ///
+    /// The mode is inferred with
+    /// [`mlxcel_core::layers::infer_quantization_mode`] on `.biases` presence,
+    /// the same rule the shared `UnifiedLinear` / `UnifiedEmbedding` loaders
+    /// use, rather than read from `config.json`: KimiLinear's local
+    /// `Quantization` carries only `group_size` and `bits`, and every other
+    /// layer in this family already infers, so reading a declared mode here
+    /// alone would make one projection disagree with the rest of the model.
+    ///
+    /// Storing `"affine"` unconditionally, as this did, is what MLX's
+    /// `validate_mode_with_type` throws `Biases must be provided for affine
+    /// quantization` on when the plane carries no zero points, and
+    /// `quantized_matmul` crosses the cxx bridge as `UniquePtr<MlxArray>`
+    /// rather than `Result`, so that throw is an uncatchable `std::terminate`
+    /// at the first MLA forward rather than a load error (issue #1026).
+    ///
+    /// This path is reachable today, not merely defended against a future
+    /// sanitizer change. `sanitize_weights` only inserts a dense
+    /// `embed_q.weight` / `unembed_out.weight` pair inside the
+    /// `if weights.contains_key(&kv_b_key)` guard, where `kv_b_key` is
+    /// `{attn_prefix}.kv_b_proj.weight`; when a checkpoint carries no
+    /// `kv_b_proj.weight` at all, that whole decomposition block is skipped,
+    /// so any `embed_q` / `unembed_out` planes the checkpoint shipped itself
+    /// pass through sanitization untouched. `MlaAttention::from_weights`
+    /// then calls this loader unconditionally for every non-linear-attention
+    /// layer, so a checkpoint that ships pre-decomposed, quantized
+    /// `embed_q.weight` plus `embed_q.scales` (and the matching pair for
+    /// `unembed_out`) with no `kv_b_proj.weight` to decompose from lands
+    /// here with `is_quantized == true`. Do not delete this branch as dead
+    /// code: it is live for that checkpoint shape, and removing it
+    /// reintroduces the same uncatchable abort described above, just reached
+    /// from a checkpoint layout other than the one issue #1026 was filed
+    /// against. `src/models/gpt_oss.rs` `ExpertLinear::from_weights` is the
+    /// in-tree precedent for the shape of it.
     fn from_weights(
         weights: &WeightMap,
         prefix: &str,
@@ -212,6 +254,29 @@ impl MultiLinear {
             .map(|w| mlxcel_core::copy(w));
 
         let is_quantized = scales.is_some();
+        // Inert on the dense `matmul` path, so it must not be resolved (or
+        // enforced) for a projection that carries no packing at all.
+        let mut mode = "affine";
+        if is_quantized {
+            // KimiLinear keeps a private `MultiLinear` rather than using
+            // `mlxcel_core::layers::MultiLinear`, so it does not inherit the
+            // bound that loader now carries. The stored pair goes straight to
+            // `quantized_matmul` on every MLA forward (issue #958).
+            validate_expert_quantization_params(prefix, group_size, bits)?;
+
+            mode = mlxcel_core::layers::infer_quantization_mode(biases.is_some(), group_size, bits);
+            // Consistent by construction with the line above, which keys the
+            // mode on the same `biases.is_some()` this re-checks, so it cannot
+            // fire as written. It is here because it is the assertion that
+            // couples the two helpers: the day the mode comes from anywhere
+            // else (a declared `quantization.mode`, a per-prefix override),
+            // the contradiction is caught at the point the mode is stored
+            // instead of inside `quantized_matmul`, where it is an uncatchable
+            // abort. The same pairing on a genuinely declared mode is
+            // `gpt_oss.rs` `ExpertLinear::from_weights`.
+            mlxcel_core::layers::validate_quantization_biases(mode, biases.is_some())
+                .map_err(|e| format!("{prefix}: {e}"))?;
+        }
 
         Ok(Self {
             weight,
@@ -220,6 +285,7 @@ impl MultiLinear {
             group_size,
             bits,
             is_quantized,
+            mode,
         })
     }
 }
@@ -1093,7 +1159,7 @@ impl KimiLinearModel {
 
         println!("[KimiLinear] Loading weights...");
         let weights = crate::models::load_text_weights(model_dir, None)?;
-        let weights = Self::sanitize_weights(weights, &config);
+        let weights = Self::sanitize_weights(weights, &config)?;
 
         println!("[KimiLinear] Building model...");
         let model = Self::from_weights(&weights, &config)?;
@@ -1102,7 +1168,10 @@ impl KimiLinearModel {
         Ok((model, config))
     }
 
-    pub fn sanitize_weights(mut weights: WeightMap, config: &KimiLinearConfig) -> WeightMap {
+    pub fn sanitize_weights(
+        mut weights: WeightMap,
+        config: &KimiLinearConfig,
+    ) -> Result<WeightMap, String> {
         // Remove mtp weights
         let mtp_keys: Vec<String> = weights
             .keys()
@@ -1267,14 +1336,37 @@ impl KimiLinearModel {
                     let scales = weights
                         .remove(&format!("{}.kv_b_proj.scales", attn_prefix))
                         .unwrap();
-                    let biases = weights
-                        .remove(&format!("{}.kv_b_proj.biases", attn_prefix))
-                        .unwrap();
-                    let w_shape = mlxcel_core::array_shape(&w);
-                    let dims = config.kv_lora_rank as i32;
-                    let bits = (w_shape[w_shape.len() - 1] * 32) / dims;
-                    let s_shape = mlxcel_core::array_shape(&scales);
-                    let group_size = dims / s_shape[s_shape.len() - 1];
+                    // `is_quantized` gates on `.scales` alone, and the
+                    // block-float modes (mxfp4 / nvfp4 / mxfp8) ship scales
+                    // with no zero points, so a block-float export satisfies
+                    // that gate and arrives here carrying no `.biases` plane.
+                    // The `.unwrap()` this replaces turned that into a panic
+                    // during sanitization, which in the server takes the
+                    // process down rather than rejecting one model load
+                    // (issue #1026). `dequantize` below is hardcoded
+                    // `"affine"` and so could not decompose such a plane in
+                    // any case; what this buys is a load error naming the key
+                    // that is missing.
+                    let biases_key = format!("{}.kv_b_proj.biases", attn_prefix);
+                    let biases = weights.remove(&biases_key).ok_or_else(|| {
+                        format!(
+                            "layer {l}: kv_b_proj has scales but no biases at key \
+                             `{biases_key}`; the checkpoint may be corrupted or only \
+                             partially converted"
+                        )
+                    })?;
+                    // Solve the packed pair from the shapes and bound it
+                    // before it reaches `dequantize`. The shared helper checks
+                    // each divisor before dividing: `kv_lora_rank` is a config
+                    // field and the scales axis is checkpoint data, so the naive
+                    // form panics on a zero divisor and overflows i32 on a large
+                    // packed axis, both before the bound could fire (issue #958).
+                    let (group_size, bits) = mlxcel_core::layers::infer_mla_quantization_params(
+                        &mlxcel_core::array_shape(&w),
+                        &mlxcel_core::array_shape(&scales),
+                        config.kv_lora_rank as i32,
+                        &format!("{attn_prefix}.kv_b_proj"),
+                    )?;
                     unsafe {
                         mlxcel_core::dequantize(
                             &w,
@@ -1309,7 +1401,7 @@ impl KimiLinearModel {
             }
         }
 
-        weights
+        Ok(weights)
     }
 
     pub fn from_weights(weights: &WeightMap, config: &KimiLinearConfig) -> Result<Self, String> {
@@ -1392,3 +1484,7 @@ impl LanguageModel for KimiLinearModel {
         self.forward(input_ids, &mut caches)
     }
 }
+
+#[cfg(test)]
+#[path = "kimi_linear_tests.rs"]
+mod tests;
