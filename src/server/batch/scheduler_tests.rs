@@ -80,22 +80,20 @@ fn make_test_sequence(id_val: u64) -> (SequenceInfo, mpsc::Receiver<GenerateEven
     (seq, rx)
 }
 
-/// Helper: reproduce `decide_action` logic in isolation so tests do not need
-/// a full `BatchScheduler` (which requires a real LoadedModel + tokenizer).
+/// Helper: run the real tick policy against queue/batch state so tests do not
+/// need a full `BatchScheduler` (which requires a real LoadedModel + tokenizer).
 ///
-/// This mirrors the exact decision policy from `BatchScheduler::decide_action`.
-/// Policy: active sequences always decode first to prevent starvation; prefill
-/// only happens when the batch is empty.
+/// Issue #908 replaced the local re-implementation this helper used to be with a
+/// call into [`crate::server::batch::tick_policy::decide_tick`], the same pure function
+/// `BatchScheduler::decide_action` calls. The old copy had drifted from the
+/// policy in its naming and comments, which is how the chunked-prefill
+/// starvation recorded in ADR 0005 stayed hidden. The assertions below are
+/// unchanged; only their source of truth is.
+///
+/// The batch is reported as full and preemption as off, which is the regime
+/// these tests were written for (they predate both branches).
 fn decide_action_from_state(queue: &PrefillQueue, batch: &ActiveBatch) -> BatchSchedulerAction {
-    if batch.is_empty() && queue.is_empty() {
-        return BatchSchedulerAction::Idle;
-    }
-    // Active sequences always get a decode step before admitting new prefills.
-    if !batch.is_empty() {
-        return BatchSchedulerAction::Decode(batch.sequence_ids());
-    }
-    // Batch is empty but queue has work -- prefill next request.
-    BatchSchedulerAction::Prefill(SequenceId::from_raw(0))
+    decide_action_with_chunked(queue, batch, false)
 }
 
 // -------------------------------------------------------------------
@@ -365,30 +363,67 @@ fn request_priority_default_is_normal() {
 // Chunked prefill scheduling tests (without real model)
 // -------------------------------------------------------------------
 
-/// Extended decide_action that accounts for chunked prefill in progress.
-/// This mirrors the scheduler's policy.
+/// Run the real tick policy with a chunked prefill optionally parked.
+///
+/// Delegates to [`crate::server::batch::tick_policy::decide_tick`] (issue #908) instead of
+/// re-implementing the policy. `MLXCEL_MIXED_STEP` is reported as off, so this
+/// helper exercises the shipped default path.
+///
+/// The #1011 fairness ledger is reported as freshly reset (a prefill that just
+/// parked has yielded no decode ticks yet) against the shipped interval, which
+/// is the state these single-tick assertions were written for. The grant's own
+/// behaviour lives in `tick_policy_tests`, which drives the counter across ticks
+/// rather than sampling one.
 fn decide_action_with_chunked(
     queue: &PrefillQueue,
     batch: &ActiveBatch,
     chunked_in_progress: bool,
 ) -> BatchSchedulerAction {
-    // If chunked prefill is in progress, interleave decode
-    if chunked_in_progress {
-        if !batch.is_empty() {
-            return BatchSchedulerAction::Decode(batch.sequence_ids());
-        }
-        return BatchSchedulerAction::Prefill(SequenceId::from_raw(0));
-    }
-
-    if batch.is_empty() && queue.is_empty() {
-        return BatchSchedulerAction::Idle;
-    }
-    if !batch.is_empty() {
-        return BatchSchedulerAction::Decode(batch.sequence_ids());
-    }
-    BatchSchedulerAction::Prefill(SequenceId::from_raw(0))
+    decide_action_with_chunked_wait(queue, batch, chunked_in_progress, 0)
 }
 
+/// As [`decide_action_with_chunked`], with the #1011 fairness ledger set
+/// explicitly: `wait_ticks` is how many consecutive decode ticks the parked
+/// chunked prefill has already yielded.
+fn decide_action_with_chunked_wait(
+    queue: &PrefillQueue,
+    batch: &ActiveBatch,
+    chunked_in_progress: bool,
+    wait_ticks: u32,
+) -> BatchSchedulerAction {
+    let state = crate::server::batch::tick_policy::TickState {
+        speculative_pending: false,
+        speculative_yielded: false,
+        chunked_prefill_in_progress: chunked_in_progress,
+        active_is_empty: batch.is_empty(),
+        active_is_full: true,
+        queue_is_empty: queue.is_empty(),
+        should_preempt: false,
+        mixed_step_enabled: false,
+        decode_ticks_since_prefill_grant: wait_ticks,
+        prefill_grant_interval: crate::server::batch::tick_policy::PREFILL_GRANT_INTERVAL_DEFAULT,
+    };
+    match crate::server::batch::tick_policy::decide_tick(&state).choice {
+        crate::server::batch::tick_policy::TickChoice::Decode => {
+            BatchSchedulerAction::Decode(batch.sequence_ids())
+        }
+        crate::server::batch::tick_policy::TickChoice::MixedStep => {
+            BatchSchedulerAction::MixedStep(batch.sequence_ids())
+        }
+        crate::server::batch::tick_policy::TickChoice::Prefill => {
+            BatchSchedulerAction::Prefill(SequenceId::from_raw(0))
+        }
+        crate::server::batch::tick_policy::TickChoice::SpeculativeRound => {
+            BatchSchedulerAction::SpeculativeRound
+        }
+        crate::server::batch::tick_policy::TickChoice::Idle => BatchSchedulerAction::Idle,
+    }
+}
+
+/// A parked chunked prefill yields the tick to decode while any sequence is
+/// active and its fairness ledger is below `--prefill-grant-interval`. The
+/// yield is bounded rather than unconditional since issue #1011; see
+/// `chunked_prefill_interleaving_pattern` for the whole cycle.
 #[test]
 fn chunked_prefill_interleaves_decode_when_active_sequences_exist() {
     let queue = PrefillQueue::new();
@@ -419,14 +454,22 @@ fn chunked_prefill_continues_when_no_active_sequences() {
     );
 }
 
+/// The test whose name was wrong for so long that ADR 0005 is partly about it.
+///
+/// It was written expecting an interleave, its assertions recorded the absence
+/// of one, and the gap survived because the tests re-implemented the policy
+/// (issue #908 removed the copy; ADR 0005 tells the story). Issue #1011 made
+/// the interleave real, so the name is finally accurate and the assertions are
+/// now the positive statement rather than the negative one: decode wins each
+/// contended tick until the fairness ledger reaches
+/// `--prefill-grant-interval`, and the next tick belongs to the parked chunk.
+///
+/// This checks the `BatchSchedulerAction` the scheduler builds from each
+/// choice, which is this file's job. The ledger's own arithmetic across ticks
+/// is pinned in `tick_policy_tests`.
 #[test]
 fn chunked_prefill_interleaving_pattern() {
-    // Simulate the interleaving pattern:
-    // Tick 1: Prefill chunk 1
-    // Tick 2: Decode (if active)
-    // Tick 3: Prefill chunk 2
-    // Tick 4: Decode (if active)
-    // ...
+    use crate::server::batch::tick_policy::PREFILL_GRANT_INTERVAL_DEFAULT as N;
 
     let queue = PrefillQueue::new();
     let mut batch = ActiveBatch::new(4);
@@ -435,24 +478,31 @@ fn chunked_prefill_interleaving_pattern() {
     active_seq.state = SequenceState::Decoding;
     batch.add(active_seq).unwrap();
 
-    // Tick 1: chunked prefill starts -> first action is Prefill
-    // (no chunked_in_progress yet, batch has active seq, so Decode first)
-    let action1 = decide_action_with_chunked(&queue, &batch, false);
-    assert!(matches!(action1, BatchSchedulerAction::Decode(_)));
+    // No chunked prefill yet, batch has an active seq -> Decode.
+    let action = decide_action_with_chunked(&queue, &batch, false);
+    assert!(matches!(action, BatchSchedulerAction::Decode(_)));
 
-    // Tick 2: chunked prefill now in progress -> Decode interleave
-    let action2 = decide_action_with_chunked(&queue, &batch, true);
-    assert!(matches!(action2, BatchSchedulerAction::Decode(_)));
+    // Chunked prefill now parked. Every tick up to the interval is a decode.
+    for waited in 0..N {
+        let action = decide_action_with_chunked_wait(&queue, &batch, true, waited);
+        assert!(
+            matches!(action, BatchSchedulerAction::Decode(_)),
+            "tick {waited} of {N}: decode should still win"
+        );
+    }
 
-    // Tick 3: after decode, back to prefill continuation
-    let action3 = decide_action_with_chunked(&queue, &batch, true);
-    assert!(matches!(action3, BatchSchedulerAction::Decode(_)));
-    // (still interleaving because batch is non-empty)
+    // The tick after the interval is granted to the parked chunk, with the
+    // batch still fully active. Before #1011 this was `Decode` forever.
+    let granted = decide_action_with_chunked_wait(&queue, &batch, true, N);
+    assert!(
+        matches!(granted, BatchSchedulerAction::Prefill(_)),
+        "the parked prefill must be granted a tick after {N} decodes"
+    );
 
-    // With no active batch: prefill continues
+    // An empty batch still lets the prefill continue regardless of the ledger.
     let empty_batch = ActiveBatch::new(4);
-    let action4 = decide_action_with_chunked(&queue, &empty_batch, true);
-    assert!(matches!(action4, BatchSchedulerAction::Prefill(_)));
+    let action = decide_action_with_chunked(&queue, &empty_batch, true);
+    assert!(matches!(action, BatchSchedulerAction::Prefill(_)));
 }
 
 // -------------------------------------------------------------------

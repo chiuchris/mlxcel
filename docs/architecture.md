@@ -41,8 +41,18 @@ src/
 - `src/lib/mlxcel-core/src/sampling.rs` — penalties and token sampling shared by CLI/server paths.
 - `src/lib/mlxcel-core/src/generate.rs` — `LanguageModel` trait and generation loops.
 - `src/lib/mlxcel-core/src/drafter/` and `src/lib/mlxcel-core/src/speculative/` — speculative decoding support.
+  `speculative/stochastic_accept.rs` holds the acceptance rules and the distribution-preservation
+  guarantee; see [`speculative-acceptance.md`](speculative-acceptance.md) for which rule each path runs.
 - `src/lib/mlxcel-core/src/layers.rs`, `src/lib/mlxcel-core/src/weights.rs`, `src/lib/mlxcel-core/src/utils.rs` — model building blocks,
   SafeTensors loading, masks, and helper operations.
+- `src/lib/mlxcel-core/src/autotune/`: shape-bucketed kernel autotuner (issue #906), covering the
+  `TunableOp` contract, the interleaved median-of-N profiling harness and its flaky-tactic
+  guard (repetitions scale with measured launch cost; a candidate must beat the default by more
+  than the samples' own dispersion), the persistent tactic cache under
+  `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/autotune`, and the per-op consumers. Off by default
+  and fully inert unless `MLXCEL_AUTOTUNE` is set; `mlxcel tune` drives it offline.
+- `src/lib/mlxcel-core/src/bench_rotation.rs`: last-level-cache-aware rotating input buffers for
+  the microbench harnesses under `examples/` (see [benchmarks](benchmarks.md)).
 
 The in-tree MLX source is under `src/lib/mlx-cpp/`; `src/lib/mlxcel-core/build.rs` builds the pinned
 MLX commit and compiles the bridge code.
@@ -114,8 +124,13 @@ Release builds use `panic = "unwind"` (issue #375), so the deliberate audio work
   build under `src/lib/mlx-cpp/` and the feature flags passed to Cargo.
 - Apple Silicon runtime/device helpers live in `src/lib/mlxcel-core/src/hardware.rs`
   and `src/execution/runtime.rs`.
-- Custom TurboQuant Metal kernels live under `src/lib/mlx-cpp/turbo/` and are
-  called through the C++ bridge.
+- Custom fused kernel launchers live under `src/lib/mlx-cpp/turbo/` and are
+  called through the C++ bridge. Each one carries a Metal JIT source and, where
+  ported, a CUDA counterpart selected at runtime by
+  `mlx::core::metal::is_available()`: TurboQuant Sparse-V and delegated SDPA,
+  paged-attention decode (v1, plus the v2 cross-CTA split-KV and merge kernels
+  driven from `src/lib/mlxcel-core/src/paged_v2/` and selected by
+  `MLXCEL_PAGED_ATTENTION_V2=1`), and Gumbel-max sampling.
 - CUDA kernel behavior is mostly inherited from MLX; `mlxcel` passes the CUDA
   architecture list through `MLX_CUDA_ARCHITECTURES` at build time.
 

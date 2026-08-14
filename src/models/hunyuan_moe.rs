@@ -21,6 +21,7 @@
 //! - Per-layer moe_intermediate_size and moe_topk
 //! - Cross-Layer Attention (CLA) support (optional KV sharing)
 
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::weights::WeightMap;
@@ -284,6 +285,11 @@ impl SwitchLinear {
         let weight = get_weight_copy(weights, &format!("{}.weight", prefix))?;
         let scales_key = format!("{}.scales", prefix);
         if weights.contains_key(&scales_key) {
+            // Bound the declared pair here, where it is stored: this
+            // family-local expert type never reaches
+            // `reconcile_quantization_layout` and hands the stored pair to
+            // `gather_qmm` (issue #958).
+            validate_expert_quantization_params(prefix, group_size, bits)?;
             let scales = mlxcel_core::copy(weights.get(&scales_key).unwrap());
             let biases = get_weight_copy(weights, &format!("{}.biases", prefix))?;
             Ok(Self::Quantized {
@@ -677,8 +683,24 @@ impl Attention {
         // Update KV cache
         let (cache_k, cache_v) = cache.update_and_fetch(k, v);
 
-        // Scaled dot-product attention (handles GQA expansion internally)
-        let attn_out = if l > 1 {
+        // Scaled dot-product attention (handles GQA expansion internally).
+        //
+        // A multi-token prefill with no caller-supplied mask MUST take the
+        // causal path. Every generation path (CLI text prefill, the VLM
+        // embeddings prefill, and the chunked prefill) calls the model with
+        // `mask == None` and expects the model to apply its own causal mask,
+        // exactly like `create_attention_mask(h, cache[0])` in the reference
+        // https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/models/hunyuan.py.
+        // Handing that `None` straight to the unmasked SDPA made every prefill
+        // fully bidirectional, so each layer wrote future-contaminated K/V into
+        // the cache and the first sampled token was already wrong (issue #999).
+        // Cross-layer attention shares this leaf: a layer that reuses an
+        // earlier layer's K/V still runs its own SDPA here, so the fix has to
+        // live in the leaf rather than in the CLA plumbing above it.
+        // An explicit mask (the padded-prefill case) still goes to the masked
+        // call, and decode is unchanged: `causal_attention` takes its
+        // single-query maskless fast path at `l == 1`.
+        let attn_out = if l > 1 && mask.is_some() {
             let mask_ptr = mask.map(|m| m as *const _).unwrap_or(std::ptr::null());
             unsafe {
                 mlxcel_core::layers::attention_from_ptr(
@@ -985,3 +1007,7 @@ impl LanguageModel for HunyuanMoeModel {
         vec![127960] // Hunyuan EOS token from config
     }
 }
+
+#[cfg(test)]
+#[path = "hunyuan_moe_tests.rs"]
+mod tests;

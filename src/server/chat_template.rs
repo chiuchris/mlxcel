@@ -24,6 +24,7 @@ use minijinja::{Environment, ErrorKind, Value};
 use serde::{Deserialize, Serialize};
 
 use super::chat_template_kwargs::ChatTemplateKwargs;
+use super::tool_calls::{self, ToolCallFormat};
 use super::types::request::Tool;
 
 /// A message in the conversation
@@ -113,8 +114,15 @@ impl ChatTemplateProcessor {
             .or(jinja_template)
             .or(json_template);
 
-        let Some(template) = template else {
-            return Ok(None);
+        // A conversion can legitimately lose the template. Fall back to a
+        // built-in only after every declared source has come up empty, so this
+        // can never shadow what a checkpoint actually ships.
+        let template = match template {
+            Some(template) => template,
+            None => match builtin_chat_template(model_path) {
+                Some(builtin) => builtin.to_string(),
+                None => return Ok(None),
+            },
         };
 
         // Extract special tokens
@@ -189,6 +197,38 @@ impl ChatTemplateProcessor {
     /// Used by: server/prompt_cache/key::template_sig
     pub fn template_source(&self) -> &str {
         &self.template
+    }
+
+    /// Default tool-call output format implied by this template.
+    ///
+    /// Muse Glimmer's pinned template declares the ATEM grammar directly, so
+    /// template identity is enough to select ATEM without relying on route-
+    /// local parser ordering.
+    pub fn default_tool_call_format(&self) -> Option<ToolCallFormat> {
+        tool_calls::infer_default_tool_call_format(None, None, Some(&self.template))
+    }
+
+    /// Resolve a tool-call format while preserving an explicit operator choice.
+    pub fn resolve_tool_call_format(
+        &self,
+        explicit: Option<ToolCallFormat>,
+    ) -> Option<ToolCallFormat> {
+        tool_calls::resolve_tool_call_format(explicit, None, None, Some(&self.template))
+    }
+
+    /// Name to expose as the active tool-call parser for diagnostics.
+    ///
+    /// An explicit parser name wins. Otherwise, a family-specific format name
+    /// (currently `atem` for Muse Glimmer) is preferred, falling back to the
+    /// generic auto-detecting `mlxcel` parser when the template merely supports
+    /// tools.
+    pub fn tool_call_parser_name(&self, explicit: Option<&str>) -> Option<String> {
+        if let Some(name) = explicit.map(str::trim).filter(|name| !name.is_empty()) {
+            return Some(name.to_string());
+        }
+        self.default_tool_call_format()
+            .map(|format| format.as_str().to_string())
+            .or_else(|| self.supports_tools_hint().then(|| "mlxcel".to_string()))
     }
 
     /// Detect the Gemma-4 "thinking channel" chat template.
@@ -766,6 +806,55 @@ fn preprocess_template(template: String) -> String {
             out = out.replace(&multiline, &escaped);
         }
     }
+    out = preprocess_python_conditional_expressions(out);
+    out
+}
+
+/// Rewrite Python/Jinja2 expression forms used by some HF templates into the
+/// block syntax MiniJinja accepts today.
+///
+/// Muse Glimmer's checkpoint template is a single-line HF Jinja template that
+/// uses Python's `a if cond else b` expression form in `{% set %}` and `{{ }}`
+/// sites. MiniJinja rejects that syntax at parse time, while the equivalent
+/// whitespace-trimmed block form renders identically.
+fn preprocess_python_conditional_expressions(mut out: String) -> String {
+    let replacements: &[(&str, &str)] = &[
+        (
+            "{%- set fn = tool.function if tool.function is defined else tool -%}",
+            "{%- if tool.function is defined -%}{%- set fn = tool.function -%}{%- else -%}{%- set fn = tool -%}{%- endif -%}",
+        ),
+        (
+            "{%- set nd = tool_namespace_descriptions if tool_namespace_descriptions is defined else {} -%}",
+            "{%- if tool_namespace_descriptions is defined -%}{%- set nd = tool_namespace_descriptions -%}{%- else -%}{%- set nd = {} -%}{%- endif -%}",
+        ),
+        (
+            "{%- set rs = reasoning_strength if reasoning_strength is defined and reasoning_strength else 'high' -%}",
+            "{%- if reasoning_strength is defined and reasoning_strength -%}{%- set rs = reasoning_strength -%}{%- else -%}{%- set rs = 'high' -%}{%- endif -%}",
+        ),
+        (
+            "{%- set kc = knowledge_cutoff if knowledge_cutoff is defined and knowledge_cutoff else '2026-01-04' -%}",
+            "{%- if knowledge_cutoff is defined and knowledge_cutoff -%}{%- set kc = knowledge_cutoff -%}{%- else -%}{%- set kc = '2026-01-04' -%}{%- endif -%}",
+        ),
+        (
+            "{%- set end_token = '<|eom|>' if (not loop.last and messages[loop.index0 + 1]['role'] == role) else '<|eot|>' -%}",
+            "{%- if not loop.last and messages[loop.index0 + 1]['role'] == role -%}{%- set end_token = '<|eom|>' -%}{%- else -%}{%- set end_token = '<|eot|>' -%}{%- endif -%}",
+        ),
+        (
+            "{%- set rns = namespace(name=tcid if tcid else '') -%}",
+            "{%- if tcid -%}{%- set rns = namespace(name=tcid) -%}{%- else -%}{%- set rns = namespace(name='') -%}{%- endif -%}",
+        ),
+        (
+            "{{- ('<|eot|>' if end_turn else '<|eom|>') -}}",
+            "{%- if end_turn -%}<|eot|>{%- else -%}<|eom|>{%- endif -%}",
+        ),
+        ("args is not mapping", "not (args is mapping)"),
+        ("v is not string", "not (v is string)"),
+    ];
+    for (from, to) in replacements {
+        if out.contains(from) {
+            out = out.replace(from, to);
+        }
+    }
     out
 }
 
@@ -1111,6 +1200,93 @@ fn extract_token(config: &serde_json::Value, key: &str) -> Option<String> {
     })
 }
 
+/// Jina VLM's own chat template, transcribed from `jinaai/jina-vlm`'s
+/// `chat_template.jinja` for minijinja.
+///
+/// Every turn renders as `" <Role>: <text> "` and the generation prompt is
+/// `"Assistant:"`. The doubled space between turns is upstream's, not a typo:
+/// the template emits a trailing space after each turn's text and a leading one
+/// before the next turn. The checkpoint sets `always_start_with_space`, so the
+/// leading space applies to the first turn too.
+///
+/// `content` arrives either flattened to a string (the text-only path) or as
+/// the list of typed parts the server builds for any request carrying media.
+/// The list branch mirrors upstream's `content['type']` loop and emits the
+/// literal `<|image|>` (upstream's `image_prompt_token`) per image part, which
+/// is the marker the Jina VLM runtime splices the processor-built image blocks
+/// at. Concatenating the list with `+` instead would raise a minijinja type
+/// error and drop every image request onto the generic fallback prompt.
+const JINA_VLM_CHAT_TEMPLATE: &str = concat!(
+    "{%- for message in messages %}",
+    "{{- ' ' + (message['role'] | capitalize) + ': ' }}",
+    "{%- if message['content'] is string %}",
+    "{{- message['content'] + ' ' }}",
+    "{%- else %}",
+    "{%- for part in message['content'] %}",
+    "{%- if part['type'] == 'image' %}{{- '<|image|>' }}",
+    "{%- elif part['type'] == 'text' %}{{- part['text'] + ' ' }}",
+    "{%- endif %}",
+    "{%- endfor %}",
+    "{%- endif %}",
+    "{%- endfor %}",
+    "{%- if add_generation_prompt %}{{- 'Assistant:' }}{%- endif %}"
+);
+
+/// Florence-2's serving template (issue #1073): the messages' text, verbatim.
+///
+/// Florence-2 is not a chat model. Its encoder consumes a task prompt such as
+/// `<CAPTION>` or `<CAPTION_TO_PHRASE_GROUNDING> a green car`, which the
+/// seq2seq worker parses with the same `parse_task_prompt` the CLI `-p` flag
+/// uses; the fifteen task markers are expanded to trained English sentences
+/// by the task processor, never tokenized as-is. Any role prefix or
+/// generation prompt a conventional template adds would break that parse, so
+/// this template emits only the text content: strings verbatim, typed
+/// content lists as their `text` parts (the `image` parts travel out-of-band
+/// as pixels into the encoder; Florence-2 has no image placeholder token).
+/// Multi-message requests concatenate, so anything beyond a single user
+/// message carrying the task prompt is rejected downstream by the task
+/// parser with a message listing the valid markers.
+const FLORENCE2_CHAT_TEMPLATE: &str = concat!(
+    "{%- for message in messages %}",
+    "{%- if message['content'] is string %}",
+    "{{- message['content'] }}",
+    "{%- else %}",
+    "{%- for part in message['content'] %}",
+    "{%- if part['type'] == 'text' %}{{- part['text'] }}{%- endif %}",
+    "{%- endfor %}",
+    "{%- endif %}",
+    "{%- endfor %}"
+);
+
+/// A chat template for a checkpoint that ships none of its own.
+///
+/// Reached only when `tokenizer_config.json`, `chat_template.jinja` and
+/// `chat_template.json` are all silent. `jinaai/jina-vlm-mlx` is the case that
+/// forced this: the MLX conversion dropped upstream's `chat_template.jinja`, and
+/// the generic `User:\n\nAssistant: ` fallback then renders a prompt shape the
+/// model never saw. On that checkpoint the difference is not subtle: asked for
+/// the capital of France it answers "17" under the generic template and "Paris"
+/// under its own. Florence-2 checkpoints ship a plain BART tokenizer config
+/// with no template either, and the generic fallback's `User:` prefix would
+/// break the task-marker parse, so the family carries its own text-verbatim
+/// template here.
+///
+/// Family detection goes through [`crate::models::get_model_type`] rather
+/// than reading `model_type` raw, so the match is definitionally in sync
+/// with the routing decision: the same JSON sanitization and lowercase
+/// normalization that pick the model's worker also pick its template. A raw
+/// string read here would let a checkpoint that routes to a family through
+/// the normalized path (mixed casing, tolerated JSON) silently fall back to
+/// the generic `User:`/`Assistant:` template, which for Florence-2 rejects
+/// every request at the task-marker parse.
+fn builtin_chat_template(model_path: &Path) -> Option<&'static str> {
+    match crate::models::get_model_type(model_path).ok()? {
+        crate::models::ModelType::JinaVLM => Some(JINA_VLM_CHAT_TEMPLATE),
+        crate::models::ModelType::Florence2VLM => Some(FLORENCE2_CHAT_TEMPLATE),
+        _ => None,
+    }
+}
+
 /// Default fallback template for models without chat_template
 pub fn default_chat_template() -> &'static str {
     r#"{% for message in messages %}{% if message.role == 'system' %}System: {{ message.content }}
@@ -1142,6 +1318,211 @@ impl std::fmt::Debug for ChatTemplateProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A checkpoint that ships no template at all still has to render the
+    /// prompt shape its model was trained on.
+    #[test]
+    fn a_template_less_jina_vlm_checkpoint_falls_back_to_its_own_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type": "jvlm"}"#).unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let rendered = processor
+            .apply(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "Describe the image.".to_string(),
+                }],
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, " User: Describe the image. Assistant:");
+    }
+
+    /// Any server request carrying an image renders `content` as a list of
+    /// typed parts, so the built-in template has to walk it the way upstream's
+    /// `chat_template.jinja` does instead of concatenating it as a string.
+    #[test]
+    fn a_typed_image_content_list_renders_the_image_marker_in_place() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type": "jvlm"}"#).unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let rendered = processor
+            .apply_raw(
+                &serde_json::json!([{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "Describe the image."},
+                    ],
+                }]),
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, " User: <|image|>Describe the image. Assistant:");
+    }
+
+    #[test]
+    fn a_system_turn_is_rendered_before_the_user_turn_without_doubling_the_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type": "jvlm"}"#).unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let rendered = processor
+            .apply_raw(
+                &serde_json::json!([
+                    {"role": "system", "content": "Be brief."},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "image"},
+                            {"type": "text", "text": "What is this?"},
+                        ],
+                    },
+                ]),
+                None,
+            )
+            .expect("render");
+        assert_eq!(
+            rendered,
+            " System: Be brief.  User: <|image|>What is this? Assistant:"
+        );
+        assert!(
+            !rendered.contains("Assistant: Assistant:"),
+            "got {rendered:?}"
+        );
+    }
+
+    /// Florence-2's built-in template (issue #1073) must hand the task
+    /// prompt to the seq2seq worker verbatim: no role prefix and no
+    /// generation prompt, because `parse_task_prompt` requires the string to
+    /// begin with a task marker exactly as the CLI `-p` flag receives it.
+    #[test]
+    fn a_florence2_checkpoint_renders_the_task_prompt_verbatim() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "florence2"}"#,
+        )
+        .unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let rendered = processor
+            .apply(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "<CAPTION>".to_string(),
+                }],
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, "<CAPTION>");
+    }
+
+    /// A Florence-2 request always carries an image, so `content` arrives as
+    /// typed parts; only the text part reaches the encoder prompt (the image
+    /// travels out-of-band as pixels, there is no placeholder token), and an
+    /// input-taking task keeps its input text attached.
+    #[test]
+    fn a_florence2_typed_content_list_renders_only_the_text_part() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "florence2"}"#,
+        )
+        .unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("a built-in template is supplied");
+        let rendered = processor
+            .apply_raw(
+                &serde_json::json!([{
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": "<CAPTION_TO_PHRASE_GROUNDING> a green car"},
+                    ],
+                }]),
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, "<CAPTION_TO_PHRASE_GROUNDING> a green car");
+    }
+
+    /// Built-in template selection must ride the same normalization as model
+    /// routing (`get_model_type` lowercases `model_type` and sanitizes the
+    /// JSON), so a checkpoint that routes to Florence-2 through the
+    /// normalized path can never fall back to the generic template, whose
+    /// `User:` prefix would make the task parser reject every request.
+    #[test]
+    fn builtin_template_selection_follows_model_type_normalization() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"model_type": "Florence2"}"#,
+        )
+        .unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .expect("template resolution succeeds")
+            .expect("the mixed-case model_type still selects the built-in template");
+        let rendered = processor
+            .apply(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "<OD>".to_string(),
+                }],
+                None,
+            )
+            .expect("render");
+        assert_eq!(rendered, "<OD>");
+    }
+
+    #[test]
+    fn a_declared_template_is_never_shadowed_by_the_built_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type": "jvlm"}"#).unwrap();
+        std::fs::write(
+            dir.path().join("chat_template.jinja"),
+            "SHIPPED{% for m in messages %}{{ m['content'] }}{% endfor %}",
+        )
+        .unwrap();
+
+        let processor = ChatTemplateProcessor::from_model_path(dir.path())
+            .unwrap()
+            .unwrap();
+        let rendered = processor
+            .apply(
+                &[ChatMessage {
+                    role: "user".to_string(),
+                    content: "hi".to_string(),
+                }],
+                None,
+            )
+            .unwrap();
+        assert!(rendered.starts_with("SHIPPED"), "got {rendered:?}");
+    }
+
+    #[test]
+    fn an_unknown_template_less_model_still_reports_no_template() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("config.json"), r#"{"model_type": "llama"}"#).unwrap();
+        assert!(
+            ChatTemplateProcessor::from_model_path(dir.path())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn standalone_typed_template_overrides_legacy_string_template() {

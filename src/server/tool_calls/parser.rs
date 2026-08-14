@@ -19,8 +19,8 @@
 //!
 //! Used by: routes/chat, tool_calls::mod
 
-use super::formats;
 use super::types::{ParsedToolCall, ToolCallParseResult};
+use super::{atem, formats};
 use crate::server::types::request::Tool;
 
 /// Strip thinking/reasoning blocks from model output before parsing.
@@ -103,6 +103,7 @@ fn strip_thinking(text: &str, primed: bool) -> String {
 ///
 /// Used by: tool_calls::parser
 fn clean_content_markers(text: &str) -> String {
+    let text = atem::strip_atem_markup(text);
     text.replace("<turn|>", "")
         .replace("<|turn>", "")
         .replace("<|think|>", "")
@@ -129,7 +130,9 @@ fn clean_content_markers(text: &str) -> String {
 /// so.
 // Used by: routes/chat (non-streaming path)
 pub fn clean_structural_tokens(raw: &str, primed: bool) -> String {
-    clean_content_markers(&strip_thinking(raw, primed))
+    let without_thinking = strip_thinking(raw, primed);
+    let (content, _) = atem::split_muse_channels(&without_thinking);
+    clean_content_markers(&content)
 }
 
 /// Parse model output for tool calls, trying each known format in order.
@@ -176,6 +179,19 @@ pub fn parse_tool_calls(
             result.tool_calls = filter_by_tools(result.tool_calls, tools);
         }
         return result;
+    }
+
+    // ATEM (Muse/Onyx) is namespaced and must be claimed before generic XML
+    // formats. The Muse template's `<atem:invoke name=...>` shape intentionally
+    // resembles MiniMax-M2's `<invoke name=...>` grammar, so ATEM gets the first
+    // chance to own namespaced Muse output.
+    if let Some(mut result) = atem::try_atem(text) {
+        if let Some(tools) = tools {
+            result.tool_calls = filter_by_tools(result.tool_calls, tools);
+        }
+        if result.has_tool_calls() {
+            return result;
+        }
     }
 
     // MiniMax M3 (namespaced XML). Handled ahead of the marker loop below for two
@@ -263,8 +279,10 @@ pub fn parse_tool_calls(
 
     // No tool calls found: return cleaned content (thinking blocks and
     // model-specific markers stripped) so callers never see raw control tokens.
-    let content = clean_content_markers(text);
-    ToolCallParseResult::none(content)
+    let (content, reasoning_content) = atem::split_muse_channels(text);
+    let mut result = ToolCallParseResult::none(clean_content_markers(&content));
+    result.reasoning_content = reasoning_content;
+    result
 }
 
 /// Filter parsed tool calls to only include functions that exist in the
@@ -653,6 +671,31 @@ mod tests {
         assert_eq!(
             strip_thinking("<think>scratch</think>answer", false),
             "answer"
+        );
+    }
+
+    #[test]
+    fn clean_structural_tokens_splits_muse_recipient_channels() {
+        let raw = concat!(
+            "to=self<|message|>The image is orange.<|eom|>",
+            "<|start|>assistant to=user<|message|>orange<|eot|>"
+        );
+        assert_eq!(clean_structural_tokens(raw, false), "orange");
+    }
+
+    #[test]
+    fn tool_enabled_muse_final_answer_splits_recipient_channels() {
+        let raw = concat!(
+            "to=self<|message|>Use the tool result.<|eom|>",
+            "<|start|>assistant to=user<|message|>Seoul is sunny.<|eot|>"
+        );
+        let tools = vec![make_tool("get_weather")];
+        let parsed = parse_tool_calls(raw, Some(&tools), false);
+        assert!(!parsed.has_tool_calls());
+        assert_eq!(parsed.content, "Seoul is sunny.");
+        assert_eq!(
+            parsed.reasoning_content.as_deref(),
+            Some("Use the tool result.")
         );
     }
 

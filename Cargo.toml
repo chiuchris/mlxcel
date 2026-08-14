@@ -1,10 +1,35 @@
+# There is deliberately no `default-members` here, and adding one is a bigger
+# change than it looks. The workspace root is itself the `mlxcel` package, so a
+# bare `cargo <cmd>` run here resolves to `-p mlxcel`; `default-members` would
+# re-point every such invocation in the repository at once, release.yml's
+# `cargo build --release --target aarch64-apple-darwin --locked` included, which
+# would start compiling the default-off `mlxcel-xla` into every release build.
+#
+# The consequence is that a command must say `--workspace` to see all five
+# members, and until #1007 the quality gate did not: `make verify-test` and
+# `make verify-clippy` covered the root package only, leaving 1754 tests across
+# the others (1354 of them mlxcel-core's) and the whole of their test-target
+# lint surface ungated. Both targets now pass `--workspace` explicitly. If you
+# add a sixth member, they pick it up with no change here.
+#
+# `mlxcel-mlx-pin` is a leaf with no production role: it hosts the unit tests
+# for the MLX-pin logic in `mlxcel-core/build_support/mlx_pin.rs` so that logic
+# can be tested without compiling mlxcel-core (and therefore MLX C++). Nothing
+# depends on it; see its manifest for why it is a path include rather than a
+# build dependency.
 [workspace]
-members = [".", "src/lib/mlxcel-core", "src/lib/mlxcel-surgery", "src/lib/mlxcel-xla"]
+members = [
+    ".",
+    "src/lib/mlxcel-core",
+    "src/lib/mlxcel-mlx-pin",
+    "src/lib/mlxcel-surgery",
+    "src/lib/mlxcel-xla",
+]
 resolver = "2"
 
 [package]
 name = "mlxcel"
-version = "0.4.3"
+version = "0.5.0"
 edition = "2024"
 description = "High-performance LLM/VLM/VLA inference on Apple Silicon and CUDA GPUs"
 repository = "https://github.com/lablup/mlxcel"
@@ -255,7 +280,15 @@ panic = "unwind"
 # DO NOT use this profile for anything that ships or gets measured:
 # performance benchmarks, release binaries, or numbers quoted in a PR as
 # representative throughput/latency. Use `[profile.release]` (via
-# `make release*` / `make verify-test`) for those.
+# `make release*`) for those.
+#
+# As of #1000 this profile also backs `make verify-test`, so it is what the
+# CI-faithful gate and the nightly workflow run tests under. That is a
+# deliberate trade: `opt-level = 3` is what makes the optimised-codegen
+# argument for testing hold, and it is kept, while the fat LTO and single
+# codegen unit that were consuming the nightly's entire budget in linking are
+# not. It does not change what ships; release.yml still builds the shipped
+# binaries under `[profile.release]`.
 [profile.test-fast]
 inherits = "release"
 lto = "thin"           # cross-crate inlining kept; drops the whole-program fat-LTO link

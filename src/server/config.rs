@@ -292,6 +292,18 @@ pub struct ServerConfig {
     pub default_dry_base: f32,
     pub default_dry_allowed_length: usize,
     pub default_dry_penalty_last_n: usize,
+    /// Server-wide DRY sequence breakers, as sampler token IDs, from
+    /// `--dry-sequence-breaker`.
+    ///
+    /// Resolved in `start_server` rather than in `build_server_config`: the flag
+    /// takes token STRINGS and this takes token IDs, so the conversion needs
+    /// the model's tokenizer, which is not loaded yet when the config is
+    /// built. `build_server_config` therefore leaves this empty and
+    /// `start_server` fills it immediately after `load_tokenizer` returns, via
+    /// `server::dry_breakers::resolve_dry_sequence_breakers` (named in prose
+    /// rather than as an intra-doc link, because this field is public while
+    /// that module is private).
+    pub default_dry_sequence_breakers: Vec<i32>,
     pub draft_model_path: Option<PathBuf>,
     pub num_draft_tokens: usize,
     /// raw `--draft-kind` override string from the CLI / env
@@ -330,6 +342,12 @@ pub struct ServerConfig {
     /// Number of tokens per prefill chunk. When 0, chunking is disabled and
     /// the full prompt is prefilled in a single pass.
     pub prefill_chunk_size: usize,
+    /// #1011 prefill fairness interval (`--prefill-grant-interval`): decode
+    /// ticks a parked chunked prefill yields before the scheduler grants it
+    /// one, bounding the admitted request's time to first token. `None` lets
+    /// the scheduler resolve `MLXCEL_PREFILL_GRANT_INTERVAL` or the shipped
+    /// default; `Some(0)` disables the grant (pre-#1011 unbounded wait).
+    pub prefill_grant_interval: Option<usize>,
     /// Whether preemptive eviction is enabled. When true and the batch is
     /// full, a high-priority incoming request may evict a lower-priority
     /// or longer-running active sequence.
@@ -528,10 +546,10 @@ pub struct ServerConfig {
 
     /// Whether the loaded model is in the Gemma 4 family (`Gemma4`,
     /// `Gemma4VLM`, or `Gemma4Unified`), resolved once at startup. Enables the
-    /// engine-level loop-detection default-on for the family, unconditionally:
-    /// it does not require tools or a `json_schema` response_format, so plain
-    /// Gemma 4 chat is covered too. Defaults to `false` so non-Gemma-4 models
-    /// keep the bit-exact baseline.
+    /// engine-level loop-detection default-on for the family, for tool-shaped
+    /// requests (issues #967 and #977). Plain and grammar-only Gemma 4 requests
+    /// are not covered. Defaults to `false` so non-Gemma-4 models keep the
+    /// bit-exact baseline.
     pub model_is_gemma4_family: bool,
 }
 
@@ -563,6 +581,7 @@ impl Default for ServerConfig {
             default_dry_base: 1.75,
             default_dry_allowed_length: 2,
             default_dry_penalty_last_n: 0,
+            default_dry_sequence_breakers: Vec::new(),
             draft_model_path: None,
             num_draft_tokens: 3,
             // default to "auto-detect from drafter config"
@@ -577,6 +596,8 @@ impl Default for ServerConfig {
             audio_queue_depth: DEFAULT_AUDIO_QUEUE_DEPTH,
             audio_request_timeout_secs: DEFAULT_AUDIO_REQUEST_TIMEOUT_SECS,
             prefill_chunk_size: 512,
+            // #1011: unset -> scheduler resolves the env override / default.
+            prefill_grant_interval: None,
             enable_preemption: false,
             preemption_policy: PreemptionPolicy::default(),
             no_batch: false,

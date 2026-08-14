@@ -18,16 +18,39 @@
 use cmake::Config;
 use std::{env, path::PathBuf};
 
+// Single-source-of-truth resolution and verification of the pinned MLX commit.
+// Shared by path (not by dependency) with `mlxcel-mlx-pin`, which unit-tests it
+// without dragging in an MLX build; see that crate's manifest for the reason.
+#[path = "build_support/mlx_pin.rs"]
+mod mlx_pin;
+
 fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+
+    // The pinned MLX commit has exactly one home: GIT_TAG in
+    // ../mlx-cpp/CMakeLists.txt, which is what CMake actually fetches. Resolve
+    // it once, here, before anything compares against it. Everything below
+    // (the _deps/ purge decision, the MLXCEL_MLX_COMMIT export, the post-build
+    // HEAD verification and the cache marker) consumes this one value, so they
+    // cannot disagree with each other or with the tag that was fetched (#1047).
+    let mlx_commit = match mlx_pin::read_pinned_commit(&manifest_dir) {
+        Ok(commit) => commit,
+        Err(err) => panic!("mlxcel-core: {err}"),
+    };
 
     // Expose the pinned MLX commit to the crate so the runtime can scope the
     // persistent CUDA PTX cache directory by it (see ensure_persistent_ptx_cache).
-    println!("cargo:rustc-env=MLXCEL_MLX_COMMIT={MLX_EXPECTED_COMMIT}");
+    println!("cargo:rustc-env=MLXCEL_MLX_COMMIT={mlx_commit}");
 
     // Build MLX using cmake
-    let mlx_dst = build_mlx();
-    mark_mlx_cache_valid(&out_dir);
+    let mlx_dst = build_mlx(&mlx_commit);
+    // Verify what actually landed on disk before blessing it. CMake reuses an
+    // already-populated _deps/mlx-src rather than re-running FetchContent, so a
+    // checkout restored from a CI cache or seeded by hand can disagree with the
+    // pin without anything upstream of here noticing.
+    verify_fetched_mlx_head(&out_dir, &mlx_commit);
+    mark_mlx_cache_valid(&out_dir, &mlx_commit);
     let mlx_include = mlx_dst.join("build/include");
     let mlx_lib = mlx_dst.join("build/lib");
 
@@ -44,7 +67,8 @@ fn main() {
         .file("cpp/mlx_cxx_ext.cpp")
         // Fused Sparse-V SDPA kernel launcher. Lives under
         // `src/lib/mlx-cpp/turbo/` so the MLX-upstream-commit upgrade
-        // checklist (CLAUDE.md) treats this directory as in-scope.
+        // checklist ("Bumping the MLX upstream pin" in CONTRIBUTING.md)
+        // treats this directory as in-scope.
         .file("../mlx-cpp/turbo/sparse_v_sdpa.cpp")
         // Fused Turbo4Delegated cold-V weighted-sum kernel
         // launcher. Reads the packed cold V directly so the dequantised
@@ -56,6 +80,30 @@ fn main() {
         // table with no separate gather copy; the gather-then-SDPA path stays
         // the correctness reference and fallback.
         .file("../mlx-cpp/turbo/paged_attention.cpp")
+        // Paged-attention decode v2 (#898): CSR page table plus cross-CTA
+        // split-KV in `paged_attention_v2.cpp`, and the variable-length
+        // attention-state merge kernel in `paged_attention_v2_merge.cpp`. The
+        // merge half is split out because the cascade issue #903 reuses it
+        // unchanged. v1 above stays intact and remains the default path.
+        .file("../mlx-cpp/turbo/paged_attention_v2.cpp")
+        .file("../mlx-cpp/turbo/paged_attention_v2_merge.cpp")
+        // Softmax-free Gumbel-max categorical sampling kernel launcher (#900).
+        // Replaces the `random::categorical` normalization pass plus the
+        // `argpartition` sort on the no-filter sampling path with one
+        // index-carrying max reduction over the vocabulary.
+        .file("../mlx-cpp/turbo/sampling.cpp")
+        // Sorting-free top-k / top-p / min-p sampling by dual-pivot rejection
+        // (#901). Replaces the `argpartition` + `argsort` + `cumsum` filter
+        // chain with a shrinking probability interval resolved by two pivots
+        // per vocabulary sweep.
+        .file("../mlx-cpp/turbo/sampling_rejection.cpp")
+        // Fused residual-add + RMSNorm and fused q/k RoPE + KV-append-layout
+        // decode kernel launchers (#905). Both are two/three-output custom
+        // kernels: MLX arrays are immutable from the graph's perspective, so
+        // the in-place residual update and the append payload are returned as
+        // values rather than written through.
+        .file("../mlx-cpp/turbo/fused_norm.cpp")
+        .file("../mlx-cpp/turbo/fused_rope_append.cpp")
         .include(&mlx_include)
         .include("cpp")
         .include("../mlx-cpp/turbo")
@@ -169,14 +217,25 @@ fn main() {
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.h");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.cpp");
     println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention.metal");
+
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/paged_attention_v2_merge.cpp");
+    // Gumbel-max categorical sampling kernel launcher (#900).
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling_rejection.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/sampling_rejection.cpp");
+    // Fused residual-add RMSNorm and fused RoPE + KV-append kernel launchers (#905).
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_norm.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_norm.cpp");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.h");
+    println!("cargo:rerun-if-changed=../mlx-cpp/turbo/fused_rope_append.cpp");
     println!("cargo:rerun-if-env-changed=MLX_CUDA_ARCHITECTURES");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_METAL");
     println!("cargo:rerun-if-env-changed=MLXCEL_BUILD_ACCELERATE");
     println!("cargo:rerun-if-env-changed=MLXCEL_CXX_MARCH");
 }
-
-/// Expected MLX git commit — must match GIT_TAG in mlx-cpp/CMakeLists.txt.
-const MLX_EXPECTED_COMMIT: &str = "b7c3dd6d27f45b5365b08a840310187dc503f1db";
 
 /// Purge stale cached MLX build artifacts before CMake runs.
 ///
@@ -188,38 +247,65 @@ const MLX_EXPECTED_COMMIT: &str = "b7c3dd6d27f45b5365b08a840310187dc503f1db";
 /// Instead of fragile git-based validation, we use a simple marker file:
 /// after a successful build, `_deps/.mlx-build-commit` records the commit.
 /// If the marker is missing or doesn't match, we purge the entire `_deps/`.
-fn purge_stale_mlx_cache(out_dir: &std::path::Path) {
+///
+/// `expected_commit` is the value resolved from `../mlx-cpp/CMakeLists.txt` in
+/// `main`, so this decision is made against the tag CMake would actually fetch.
+fn purge_stale_mlx_cache(out_dir: &std::path::Path, expected_commit: &str) {
     let deps_dir = out_dir.join("build/_deps");
     if !deps_dir.exists() {
         return;
     }
 
     let marker = deps_dir.join(".mlx-build-commit");
-    let cached_commit = std::fs::read_to_string(&marker)
-        .ok()
-        .map(|s| s.trim().to_string());
+    let marker_contents = std::fs::read_to_string(&marker).ok();
 
-    if cached_commit.as_deref() == Some(MLX_EXPECTED_COMMIT) {
-        return; // Cache is valid
+    match mlx_pin::cache_state(marker_contents.as_deref(), expected_commit) {
+        mlx_pin::CacheState::Valid => {}
+        mlx_pin::CacheState::Stale { cached } => {
+            eprintln!(
+                "mlxcel-core: MLX build cache stale (cached={}, expected={expected_commit}), purging _deps/",
+                cached.as_deref().unwrap_or("none")
+            );
+            let _ = std::fs::remove_dir_all(&deps_dir);
+        }
     }
+}
 
-    eprintln!(
-        "mlxcel-core: MLX build cache stale (cached={}, expected={}), purging _deps/",
-        cached_commit.as_deref().unwrap_or("none"),
-        MLX_EXPECTED_COMMIT
-    );
-    let _ = std::fs::remove_dir_all(&deps_dir);
+/// Fail the build when the MLX checkout CMake used is not the pinned commit.
+///
+/// Runs after the CMake build returns and before the cache marker is written,
+/// so a tree that fails verification is never blessed as valid. A source tree
+/// with no git metadata, or a host without `git`, warns and skips: vendored and
+/// offline checkouts are legitimate and prove nothing either way. Only a
+/// readable HEAD that disagrees is an error.
+fn verify_fetched_mlx_head(out_dir: &std::path::Path, expected_commit: &str) {
+    let mlx_src = out_dir.join("build/_deps/mlx-src");
+    match mlx_pin::check_fetched_head(&mlx_src, expected_commit) {
+        mlx_pin::HeadCheck::Match => {}
+        mlx_pin::HeadCheck::Unavailable { reason } => {
+            println!(
+                "cargo:warning=mlxcel-core: skipped the fetched-MLX-commit check against \
+                 {expected_commit} ({reason})"
+            );
+        }
+        mlx_pin::HeadCheck::Mismatch { found } => {
+            panic!(
+                "mlxcel-core: {}",
+                mlx_pin::head_mismatch_message(&mlx_src, expected_commit, &found)
+            );
+        }
+    }
 }
 
 /// Write a marker after successful MLX build so future runs can validate the cache.
-fn mark_mlx_cache_valid(out_dir: &std::path::Path) {
+fn mark_mlx_cache_valid(out_dir: &std::path::Path, expected_commit: &str) {
     let marker = out_dir.join("build/_deps/.mlx-build-commit");
-    let _ = std::fs::write(marker, MLX_EXPECTED_COMMIT);
+    let _ = std::fs::write(marker, expected_commit);
 }
 
-fn build_mlx() -> PathBuf {
+fn build_mlx(expected_commit: &str) -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    purge_stale_mlx_cache(&out_dir);
+    purge_stale_mlx_cache(&out_dir, expected_commit);
 
     let mut config = Config::new("../mlx-cpp");
     config.very_verbose(true);

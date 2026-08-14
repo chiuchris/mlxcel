@@ -45,8 +45,12 @@ mod deepseekocr;
 mod dots_ocr;
 #[path = "vlm_ernie4_5_vl.rs"]
 mod ernie4_5_vl;
+#[path = "vlm_falcon_ocr.rs"]
+mod falcon_ocr;
 #[path = "vlm_fastvlm.rs"]
 mod fastvlm;
+#[path = "vlm_florence2.rs"]
+mod florence2;
 #[path = "vlm_gemma.rs"]
 mod gemma;
 #[path = "vlm_gemma_unified.rs"]
@@ -61,16 +65,22 @@ mod hunyuan_vl;
 mod idefics2;
 #[path = "vlm_internvl.rs"]
 mod internvl;
+#[path = "vlm_jina_vlm.rs"]
+mod jina_vlm;
 #[path = "vlm_kimi_vl.rs"]
 mod kimi_vl_loader;
 #[path = "vlm_lfm2_vl.rs"]
 mod lfm2_vl;
 #[path = "vlm_llava.rs"]
 mod llava;
+#[path = "vlm_locateanything.rs"]
+mod locateanything;
 #[path = "vlm_minimax_m3_vl.rs"]
 mod minimax_m3_vl;
 #[path = "vlm_mllama.rs"]
 mod mllama;
+#[path = "vlm_muse_glimmer.rs"]
+mod muse_glimmer;
 #[path = "vlm_nemotron_h_nano_omni.rs"]
 mod nemotron_h_nano_omni;
 #[path = "vlm_paddleocr.rs"]
@@ -96,7 +106,9 @@ pub(crate) use deepseekocr::{
 };
 pub(crate) use dots_ocr::load_dots_ocr_vl;
 pub(crate) use ernie4_5_vl::load_ernie4_5_moe_vlm;
+pub(crate) use falcon_ocr::load_falcon_ocr_vl;
 pub(crate) use fastvlm::load_fastvlm_vlm;
+pub(crate) use florence2::load_florence2_vlm;
 pub(crate) use gemma::{load_gemma3_vlm, load_gemma3n_vlm, load_gemma4_vlm};
 pub(crate) use gemma_unified::load_gemma4_unified;
 pub(crate) use granite_vision::load_granite_vision_vlm;
@@ -104,13 +116,18 @@ pub(crate) use granite4_vision::load_granite4_vision_vlm;
 pub(crate) use hunyuan_vl::load_hunyuan_vlm;
 pub(crate) use idefics2::load_idefics2_vlm;
 pub(crate) use internvl::load_internvl_vlm;
+pub(crate) use jina_vlm::load_jina_vlm;
 pub(crate) use kimi_vl_loader::load_kimi_vl_vlm;
 pub(crate) use lfm2_vl::load_lfm2_vl;
 #[cfg(feature = "xla-iree")]
 pub(crate) use llava::load_llava_iree_host_preprocessor;
 pub(crate) use llava::{load_llava_bunny_vlm, load_llava_host_preprocessor, load_llava_vlm};
+pub(crate) use locateanything::load_locateanything_vlm;
 pub(crate) use minimax_m3_vl::load_minimax_m3_vl;
 pub(crate) use mllama::load_mllama_vlm;
+pub(crate) use muse_glimmer::{
+    ensure_supported_muse_weight_map, load_muse_glimmer_vlm, normalize_muse_glimmer_weights,
+};
 pub(crate) use nemotron_h_nano_omni::load_nemotron_h_nano_omni_vlm;
 pub(crate) use paddleocr::load_paddleocr_vl;
 pub(crate) use pixtral::{load_mistral3_vlm, load_pixtral_vlm};

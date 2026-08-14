@@ -25,6 +25,7 @@
 //!
 //! Reference: mlx-lm gpt_oss.py
 
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::layers::{KVCache, RMSNorm, RotatingKVCache, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, create_sliding_window_prefill_mask};
 use mlxcel_core::weights::WeightMap;
@@ -116,6 +117,48 @@ impl Quantization {
         self.defaults()
     }
 
+    /// Reject any `quantization` entry that would abort an MLX kernel.
+    ///
+    /// gpt-oss is the one family whose `quantization` block is a map of
+    /// per-weight-prefix overrides rather than a single triple, so a bound on
+    /// the top-level defaults alone says nothing about what an individual
+    /// projection will load with, and vice versa. This walks the top-level pair
+    /// and every override in one pass, so a hostile pair scoped to a single
+    /// prefix is refused during config validation even when the defaults are
+    /// valid, before any tensor is touched (issue #958).
+    ///
+    /// Entries whose value is not an object are the top-level scalars
+    /// themselves (`group_size`, `bits`, `mode`) and are covered by the
+    /// `defaults()` check rather than iterated as overrides.
+    ///
+    /// The declared `mode` is walked the same way (issue #973). gpt-oss is the
+    /// only family that reads `quantization.mode` out of `config.json` and
+    /// threads it into a loader, so this is the only place a hostile mode can be
+    /// blamed on the prefix that declared it. A mode-less override keeps
+    /// resolving to `"affine"` through `params_for` rather than inheriting the
+    /// top-level mode, which is what the 24 router overrides in the canonical
+    /// mxfp4 checkpoint rely on.
+    fn validate(&self) -> Result<(), String> {
+        let Quantization::Full(map) = self;
+        let (gs, bits, mode) = self.defaults();
+        mlxcel_core::layers::validate_quantization_params(gs, bits)
+            .map_err(|e| format!("GptOss config.json quantization: {e}"))?;
+        mlxcel_core::layers::validate_quantization_mode(&mode)
+            .map_err(|e| format!("GptOss config.json quantization: {e}"))?;
+        for key in map.keys() {
+            let Some(value) = map.get(key) else { continue };
+            if !value.is_object() {
+                continue;
+            }
+            let (gs, bits, mode) = self.params_for(key);
+            mlxcel_core::layers::validate_quantization_params(gs, bits)
+                .map_err(|e| format!("GptOss config.json quantization.{key}: {e}"))?;
+            mlxcel_core::layers::validate_quantization_mode(&mode)
+                .map_err(|e| format!("GptOss config.json quantization.{key}: {e}"))?;
+        }
+        Ok(())
+    }
+
     /// Top-level defaults
     fn defaults(&self) -> (i32, i32, String) {
         let Quantization::Full(map) = self;
@@ -131,6 +174,23 @@ impl Quantization {
 }
 
 impl ModelArgs {
+    /// Reject a `quantization` block that would abort an MLX kernel.
+    ///
+    /// Family-level early diagnostic, in the same shape as the BailingMoe,
+    /// GptNeoX and Helium ones added by #929: it names gpt-oss and fires during
+    /// config validation, before any tensor is touched. The authoritative bound
+    /// still lives at each storage point (`ExpertLinear::from_weights` and the
+    /// shared reconciler behind `UnifiedLinear` / `UnifiedEmbedding`); this
+    /// exists because gpt-oss is the only family whose per-prefix overrides can
+    /// each carry their own hostile pair (issue #958) or their own hostile
+    /// `mode` (issue #973).
+    pub fn validate_quantization(&self) -> Result<(), String> {
+        let Some(quantization) = self.quantization.as_ref() else {
+            return Ok(());
+        };
+        quantization.validate()
+    }
+
     /// Default group_size (top-level)
     pub fn group_size(&self) -> i32 {
         self.quantization
@@ -366,6 +426,17 @@ impl ExpertLinear {
 
         let scales_key = format!("{}.scales", prefix);
         if weights.contains_key(&scales_key) {
+            // Bound the declared pair here, where it is stored: `ExpertLinear`
+            // never reaches `reconcile_quantization_layout` and hands the stored
+            // pair to `gather_qmm` (issue #958). Unlike every sibling projection
+            // in this family, the expert pair comes from `Quantization::defaults`
+            // rather than from `quant_for`, so the per-prefix overrides that the
+            // guarded `UnifiedLinear` / `UnifiedEmbedding` loaders see do not
+            // describe it, and a valid override on `model.embed_tokens` (the
+            // shape every real gpt-oss checkpoint ships) leaves a hostile
+            // top-level pair reaching the experts alone.
+            validate_expert_quantization_params(prefix, group_size, bits)?;
+
             let scales = weights
                 .get(&scales_key)
                 .map(|w| mlxcel_core::copy(w))
@@ -375,6 +446,22 @@ impl ExpertLinear {
             let quant_biases = weights
                 .get(&format!("{}.biases", prefix))
                 .map(|w| mlxcel_core::copy(w));
+
+            // Bound the declared mode on the same terms as the pair, and on the
+            // same reasoning: it is stored below and handed to `gather_qmm`
+            // verbatim (issue #973). The bias-presence half matters here in a way
+            // it does not for the shared loaders: this branch selects the
+            // quantized path on `.scales` alone and makes `.biases` an `Option`
+            // that becomes a null pointer when absent, so a plane with scales and
+            // no zero points under a declared `affine` mode used to be built
+            // without complaint and abort in `gather_qmm` with "Biases must be
+            // provided for affine quantization". This is MLX's own precondition,
+            // so it refuses only a load that was already going to abort; the
+            // canonical mxfp4 checkpoint pairs its 72 mode-less expert planes with
+            // block-float and its 122 `.biases`-carrying planes with affine, and
+            // is unaffected.
+            mlxcel_core::layers::validate_quantization_biases(mode, quant_biases.is_some())
+                .map_err(|e| format!("{prefix}: {e}"))?;
 
             Ok(Self::Quantized {
                 weight,
@@ -967,6 +1054,8 @@ impl GptOssModel {
     }
 
     pub fn from_weights(weights: &WeightMap, args: &ModelArgs) -> Result<Self, String> {
+        args.validate_quantization()?;
+
         // Embedding may have different quantization than the top-level default
         let (embed_gs, embed_bits, _embed_mode) = args.quant_for("model.embed_tokens");
         let embed_tokens =
@@ -1110,6 +1199,8 @@ impl GptOssStageModel {
         filter: &LayerFilter,
         stage_index: usize,
     ) -> Result<Self, String> {
+        args.validate_quantization()?;
+
         let (embed_gs, embed_bits, _embed_mode) = args.quant_for("model.embed_tokens");
         let embed_tokens = if filter.has_embedding {
             Some(UnifiedEmbedding::from_weights(
@@ -1308,6 +1399,305 @@ mod tests {
 
             assert_eq!(mlxcel_core::array_shape(&out), vec![1, 4]);
             assert_eq!(mlxcel_core::array_dtype(&out), dtype);
+        }
+    }
+
+    /// `ExpertLinear` stores the declared pair and hands it to `gather_qmm`
+    /// without ever reaching `reconcile_quantization_layout`, so a hostile pair
+    /// used to abort the process at the first routed forward pass rather than
+    /// failing at load (issue #958). This drives the real loader rather than the
+    /// pure bounds helper, so the guard is exercised where a checkpoint actually
+    /// reaches it. The assertions are on the load result and no forward pass is
+    /// run, so a regression fails cleanly here rather than aborting the test
+    /// binary.
+    #[test]
+    fn gpt_oss_expert_linear_rejects_params_that_would_abort_gather_qmm() {
+        let prefix = "model.layers.0.mlp.experts.gate_up_proj";
+        let mut weights = WeightMap::new();
+        crate::models::switch_layers::insert_stacked_quantized_expert_plane(
+            &mut weights,
+            prefix,
+            3,
+            4,
+            8,
+            1,
+        );
+
+        // Positive control first, so a guard that rejects everything quantized
+        // cannot pass this test.
+        ExpertLinear::from_weights(&weights, prefix, 64, 4, "affine")
+            .expect("an honest affine pair must still load");
+
+        for (group_size, bits, field) in crate::models::switch_layers::HOSTILE_QUANT_PARAMS {
+            let err = ExpertLinear::from_weights(&weights, prefix, group_size, bits, "affine")
+                .err()
+                .unwrap_or_else(|| {
+                    panic!("ExpertLinear must reject group_size {group_size} / bits {bits}")
+                });
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+
+        // A bf16 expert plane carries no packing at all, so the params are
+        // irrelevant there and must not be enforced.
+        let mut regular = WeightMap::new();
+        regular.insert(
+            format!("{prefix}.weight"),
+            mlxcel_core::from_slice_f32(&vec![0.0; 3 * 4 * 8], &[3, 4, 8]),
+        );
+        ExpertLinear::from_weights(&regular, prefix, 0, 0, "affine")
+            .expect("a non-quantized expert plane must not be gated on quantization params");
+    }
+
+    /// The third value in the same `quantization` block. `ExpertLinear` stores
+    /// the declared mode and hands it to `gather_qmm`, and gpt-oss is the only
+    /// family that puts a `config.json` string there at all, so this is where a
+    /// hostile mode actually reaches a kernel (issue #973). No forward pass is
+    /// run, because MLX's throw would abort the test binary rather than fail it.
+    #[test]
+    fn gpt_oss_expert_linear_rejects_a_mode_that_would_abort_gather_qmm() {
+        let prefix = "model.layers.0.mlp.experts.gate_up_proj";
+        let mut affine = WeightMap::new();
+        crate::models::switch_layers::insert_stacked_quantized_expert_plane(
+            &mut affine,
+            prefix,
+            3,
+            4,
+            8,
+            1,
+        );
+
+        // Positive control first, so a guard that rejects everything quantized
+        // cannot pass this test.
+        ExpertLinear::from_weights(&affine, prefix, 64, 4, "affine")
+            .expect("an honest affine plane must still load");
+
+        for mode in crate::models::switch_layers::HOSTILE_QUANT_MODES {
+            let err = ExpertLinear::from_weights(&affine, prefix, 64, 4, mode)
+                .err()
+                .unwrap_or_else(|| panic!("ExpertLinear must reject mode {mode:?}"));
+            assert!(
+                err.contains("mode") && err.contains("gate_up_proj"),
+                "the message must name the field and the prefix: {err}"
+            );
+        }
+
+        // `from_weights` enters the quantized branch on `.scales` presence alone
+        // and makes `.biases` an `Option` that becomes a null pointer when
+        // absent, so a plane with scales and no zero points under a declared
+        // `affine` mode used to be built without complaint and abort in
+        // `gather_qmm`. This is MLX's own precondition, so it can only refuse a
+        // load that was already going to abort.
+        let mut no_biases = WeightMap::new();
+        for (leaf, last, value) in [("weight", 8, 0.0), ("scales", 1, 1.0)] {
+            no_biases.insert(
+                format!("{prefix}.{leaf}"),
+                mlxcel_core::from_slice_f32(&vec![value; (3 * 4 * last) as usize], &[3, 4, last]),
+            );
+        }
+        // The shape the canonical mxfp4 checkpoint actually ships: 72 expert
+        // planes with scales, no zero points, on the top-level block-float mode.
+        ExpertLinear::from_weights(&no_biases, prefix, 32, 4, "mxfp4")
+            .expect("the canonical mxfp4 expert plane must still load");
+        let err = ExpertLinear::from_weights(&no_biases, prefix, 64, 4, "affine")
+            .err()
+            .unwrap_or_else(|| panic!("affine over a plane with no zero points must be rejected"));
+        assert!(
+            err.contains("biases") && err.contains("gate_up_proj"),
+            "unhelpful error: {err}"
+        );
+
+        // And the mirror, which MLX rejects just as hard.
+        let err = ExpertLinear::from_weights(&affine, prefix, 32, 4, "mxfp4")
+            .err()
+            .unwrap_or_else(|| panic!("block-float over a .biases plane must be rejected"));
+        assert!(err.contains("biases"), "unhelpful error: {err}");
+
+        // A non-quantized expert plane carries no mode at all.
+        let mut regular = WeightMap::new();
+        regular.insert(
+            format!("{prefix}.weight"),
+            mlxcel_core::from_slice_f32(&vec![0.0; 3 * 4 * 8], &[3, 4, 8]),
+        );
+        ExpertLinear::from_weights(&regular, prefix, 0, 0, "optiq")
+            .expect("a non-quantized expert plane must not be gated on the declared mode");
+    }
+
+    /// gpt-oss is the one family whose `quantization` block is a map of
+    /// per-weight-prefix overrides, so a bound on the top-level defaults says
+    /// nothing about what an individual projection loads with, and vice versa.
+    /// The canonical mxfp4 checkpoint carries a valid `model.embed_tokens`
+    /// override, which is exactly what let a hostile top-level pair reach the
+    /// experts alone while every reconciler-guarded loader saw a good one.
+    #[test]
+    fn gpt_oss_config_validation_walks_every_per_prefix_override() {
+        let args_from = |quantization: serde_json::Value| -> ModelArgs {
+            serde_json::from_value(serde_json::json!({
+                "model_type": "gpt_oss",
+                "vocab_size": 32,
+                "hidden_size": 8,
+                "intermediate_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 1,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 150000.0,
+                "sliding_window": 8,
+                "quantization": quantization,
+            }))
+            .expect("test config must parse")
+        };
+
+        // Positive control: the real gpt-oss-20b-mxfp4 shape, mxfp4 experts on
+        // the top-level defaults with affine overrides for everything else.
+        args_from(serde_json::json!({
+            "group_size": 32,
+            "bits": 4,
+            "mode": "mxfp4",
+            "model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+            "model.layers.0.mlp.router": { "group_size": 64, "bits": 8 },
+        }))
+        .validate_quantization()
+        .expect("the canonical gpt-oss quantization block must still validate");
+
+        // A hostile pair scoped to a single prefix must be refused even though
+        // the top-level defaults are perfectly valid.
+        for (group_size, bits, field) in crate::models::switch_layers::HOSTILE_QUANT_PARAMS {
+            let err = args_from(serde_json::json!({
+                "group_size": 32,
+                "bits": 4,
+                "mode": "mxfp4",
+                "model.layers.0.mlp.experts.gate_up_proj": {
+                    "group_size": group_size,
+                    "bits": bits,
+                },
+            }))
+            .validate_quantization()
+            .expect_err("a hostile per-prefix override must be rejected");
+            assert!(
+                err.contains(field) && err.contains("gate_up_proj"),
+                "the message must name both the field and the override, got: {err}"
+            );
+
+            // And the mirror case: valid overrides, hostile top-level defaults.
+            // This is the shape that actually reaches the experts, because they
+            // read `Quantization::defaults` rather than `quant_for`.
+            let err = args_from(serde_json::json!({
+                "group_size": group_size,
+                "bits": bits,
+                "model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+            }))
+            .validate_quantization()
+            .expect_err("hostile top-level defaults must be rejected");
+            assert!(err.contains(field), "unhelpful error: {err}");
+        }
+
+        // A config with no `quantization` block at all is not gated.
+        let args: ModelArgs = serde_json::from_value(serde_json::json!({
+            "model_type": "gpt_oss",
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "head_dim": 4,
+            "num_local_experts": 2,
+            "num_experts_per_tok": 1,
+            "rms_norm_eps": 1e-5,
+            "rope_theta": 150000.0,
+            "sliding_window": 8,
+        }))
+        .expect("test config must parse");
+        args.validate_quantization()
+            .expect("a bf16 checkpoint declares no quantization and must not be gated");
+    }
+
+    /// The declared `mode` has to be walked in both directions for the same
+    /// reason the pair does. The live gap is the top-level one: `MLPBlock`
+    /// reads `Quantization::defaults` for the experts rather than `quant_for`,
+    /// so a hostile top-level mode reaches `gather_qmm` while every guarded
+    /// sibling loader sees a good per-prefix mode, which is the shape every real
+    /// gpt-oss checkpoint ships (issue #973).
+    #[test]
+    fn gpt_oss_config_validation_walks_every_declared_mode() {
+        let args_from = |quantization: serde_json::Value| -> ModelArgs {
+            serde_json::from_value(serde_json::json!({
+                "model_type": "gpt_oss",
+                "vocab_size": 32,
+                "hidden_size": 8,
+                "intermediate_size": 8,
+                "num_hidden_layers": 1,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 4,
+                "num_local_experts": 2,
+                "num_experts_per_tok": 1,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 150000.0,
+                "sliding_window": 8,
+                "quantization": quantization,
+            }))
+            .expect("test config must parse")
+        };
+
+        // Positive control: the exact shape `models/gpt-oss-20b-mxfp4` ships, a
+        // non-affine top-level mode with affine per-prefix overrides and a
+        // mode-less override that must keep resolving to affine rather than
+        // inheriting the top-level mxfp4.
+        let canonical = args_from(serde_json::json!({
+            "group_size": 32,
+            "bits": 4,
+            "mode": "mxfp4",
+            "model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+            "model.layers.0.mlp.router": { "group_size": 64, "bits": 8 },
+        }));
+        canonical
+            .validate_quantization()
+            .expect("the canonical gpt-oss quantization block must still validate");
+        assert_eq!(canonical.quant_for("model.layers.0.mlp.router").2, "affine");
+        assert_eq!(canonical.quant_for("model.layers.0.mlp.experts").2, "mxfp4");
+
+        // Every mode MLX accepts still validates at the top level.
+        for mode in mlxcel_core::layers::SUPPORTED_QUANTIZATION_MODES {
+            args_from(serde_json::json!({ "group_size": 32, "bits": 4, "mode": mode }))
+                .validate_quantization()
+                .unwrap_or_else(|e| panic!("MLX accepts {mode}, so the config must too: {e}"));
+        }
+
+        for mode in crate::models::switch_layers::HOSTILE_QUANT_MODES {
+            // The live gap: a hostile top-level mode with a valid per-prefix
+            // override, which is what actually reaches the experts.
+            let err = args_from(serde_json::json!({
+                "group_size": 32,
+                "bits": 4,
+                "mode": mode,
+                "model.embed_tokens": { "group_size": 64, "bits": 4, "mode": "affine" },
+            }))
+            .validate_quantization()
+            .expect_err("a hostile top-level mode must be rejected");
+            assert!(err.contains("mode"), "unhelpful error: {err}");
+
+            // And the mirror: a hostile per-prefix mode under valid top-level
+            // defaults, which reaches the `UnifiedLinear` surface instead.
+            let err = args_from(serde_json::json!({
+                "group_size": 32,
+                "bits": 4,
+                "mode": "mxfp4",
+                "model.layers.0.self_attn.q_proj": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "mode": mode,
+                },
+            }))
+            .validate_quantization()
+            .expect_err("a hostile per-prefix mode must be rejected");
+            assert!(
+                err.contains("mode") && err.contains("q_proj"),
+                "the message must name both the field and the override, got: {err}"
+            );
         }
     }
 }

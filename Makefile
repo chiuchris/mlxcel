@@ -99,6 +99,8 @@ help: ## Show this help message
 	@echo "  make run-generate MODEL=./models/llama PROMPT=\"Tell me a joke\""
 	@echo "  make serve MODEL=./models/qwen PORT=8000"
 	@echo "  make test                            # Run all tests"
+	@echo "  make verify                          # macOS merge gate (fmt + clippy + test)"
+	@echo "  make verify-test-cuda                # Linux/NVIDIA merge gate (workspace, single threaded)"
 	@echo "  make test-fast-cuda FILTER=server::chat_request  # Fast filtered test-fast-profile run"
 	@echo ""
 
@@ -220,15 +222,29 @@ test-doc: ## Run documentation tests
 # ----------------------------------------------------------------------------
 # Fast dev-iteration test targets (issue #809)
 #
-# `test` / `verify-test` above build under [profile.release] (fat LTO,
-# codegen-units = 1), which is the right choice for CI-faithful and shipping
-# validation but measured at 4 to 6 minutes per incremental rebuild on the
-# ~390k-line main crate, which is expensive for the edit-test-edit loop of local and
-# agent development. These targets build under [profile.test-fast] instead
-# (thin LTO, parallel codegen, incremental compilation); see the profile's
-# Cargo.toml comment and docs/installation.md ("Fast iteration builds") for
-# the measured speedup. Set FILTER to narrow the run, e.g.
+# `release*` and a hand-run `cargo test --release` build under
+# [profile.release] (fat LTO, codegen-units = 1), which is the right choice for
+# shipping validation but measured at 4 to 6 minutes per incremental rebuild on
+# the ~390k-line main crate, which is expensive for the edit-test-edit loop of
+# local and agent development. These targets build under [profile.test-fast]
+# instead (thin LTO, parallel codegen, incremental compilation); see the
+# profile's Cargo.toml comment and docs/installation.md ("Fast iteration
+# builds") for the measured speedup. Set FILTER to narrow the run, e.g.
 # `make test-fast-cuda FILTER=server::chat_request`.
+#
+# `verify-test` below also builds under [profile.test-fast] as of #1000, so
+# these targets and the CI-faithful gate no longer differ in codegen. What they
+# do still differ in is scope and reporting: the gate adds `--workspace` and
+# `--no-fail-fast` (#1007) and pins the feature set, while these stay on the
+# root package with `--test-threads=1` and a FILTER hook, which is what makes
+# them fast enough for an edit-test loop.
+#
+# Neither of these is a gate, on either platform, and the scope difference is
+# the reason. Without `--workspace` a bare `cargo test` here resolves to
+# `-p mlxcel`, so `test-fast-cuda` cannot run a single one of mlxcel-core's 1410
+# tests, which is the crate holding the MLX bridge, layers.rs, the KV cache and
+# the quantization loaders. Use `verify-test` (macOS) or `verify-test-cuda`
+# (Linux/NVIDIA) below before you push; these two are for the edit-test loop.
 # ----------------------------------------------------------------------------
 
 .PHONY: test-fast
@@ -433,11 +449,15 @@ ci: fmt-check check clippy test ## CI workflow: format check, check, lint, test
 pre-commit: fmt clippy test ## Pre-commit checks
 
 # ----------------------------------------------------------------------------
-# CI-faithful local gate (matches .github/workflows/ci.yml exactly)
+# CI-faithful local gate (matches .github/workflows/nightly-verify.yml)
 #
-# The `verify*` targets reproduce the GitHub Actions `clippy + test (macOS
-# ARM64)` job step-for-step. They differ from the looser `clippy` / `test`
-# targets above in three ways that have repeatedly bitten us:
+# The `verify*` targets ARE what the nightly workflow runs: nightly-verify.yml
+# invokes these same Makefile targets so the local gate and the scheduled
+# backstop cannot drift apart. Note that ci.yml gates only fmt and cargo-deny
+# at PR time, so running this before you push is the real gate, not a
+# formality; the nightly is only a net that catches a red `main` within a day.
+# They differ from the looser `clippy` / `test` targets above in three ways
+# that have repeatedly bitten us:
 #
 #   1. `--features metal,accelerate` — the CI feature set. Without it, large
 #      gated regions of mlxcel-core (parts of cache/turbo/quant, the
@@ -446,9 +466,87 @@ pre-commit: fmt clippy test ## Pre-commit checks
 #   2. `-D warnings` — promotes every clippy warning to an error, matching
 #      `-- -D warnings` in CI. The default `clippy` target uses `-W warnings`
 #      and silently hides regressions.
-#   3. `cargo test --release` — CI runs tests in release mode for realistic
-#      MLX/Metal codegen. Debug-mode tests can pass while release-mode tests
-#      hit different optimisation paths.
+#   3. `--profile test-fast`: CI runs tests optimised, not in debug, for
+#      realistic MLX/Metal codegen. Debug-mode tests can pass while optimised
+#      tests hit different paths. `test-fast` keeps `opt-level = 3`, which is
+#      what that argument actually rests on, and drops the fat LTO and
+#      `codegen-units = 1` of `[profile.release]`, which exist to tune a
+#      shipped binary and were costing the nightly its whole budget in
+#      codegen and linking (#1000). release.yml still builds and links what
+#      ships under `[profile.release]`. The residual gap is a defect that
+#      reproduces only under fat LTO or single-unit codegen; use
+#      `cargo test --release --features metal,accelerate` by hand when you
+#      are chasing one.
+#   4. `--workspace`: all five members, not just the root package. The
+#      workspace root IS the `mlxcel` package, so a bare `cargo test` or
+#      `cargo clippy` resolves to `-p mlxcel` and never builds mlxcel-core,
+#      mlxcel-mlx-pin, mlxcel-surgery or mlxcel-xla, let alone their test
+#      targets. 1754 tests
+#      were invisible on that basis, mlxcel-core's 1354 of them, and so was
+#      test-only lint debt: six clippy errors sat in mlxcel-xla's lib-test
+#      target while the root gate passed clean, and during #973 five
+#      `Debug`-bound compile errors in new mlxcel-core tests passed both of the
+#      commands above, only `cargo test -p mlxcel-core` finding them (#1007).
+#      `verify-fmt` never had the hole because `cargo fmt --all` was already
+#      workspace-wide.
+#
+#      This is a flag here rather than `default-members` in Cargo.toml on
+#      purpose. `default-members` would silently re-scope every bare cargo
+#      invocation in the repository, release.yml's
+#      `cargo build --release --target aarch64-apple-darwin --locked` included,
+#      which would then compile the default-off `mlxcel-xla` into every release
+#      build. It would also move the gate's scope into a manifest field that
+#      the gate's own command line does not mention, and a scope you cannot
+#      read off the command is the defect this item exists to fix.
+#
+#      What `--workspace` covers is each member at the feature set the root
+#      selects: mlxcel-core resolves to metal + accelerate through the root's
+#      forwarding, while mlxcel-mlx-pin, mlxcel-surgery and mlxcel-xla resolve
+#      to their (empty) defaults. mlxcel-mlx-pin is a leaf with no production
+#      role: it hosts the unit tests for the MLX-pin logic in
+#      mlxcel-core/build_support/mlx_pin.rs, and it costs the gate almost
+#      nothing because it does not depend on mlxcel-core and so never triggers
+#      an MLX build. mlxcel-xla's `iree` feature stays off, so its build script
+#      skips the C shim and the gate needs no IREE distribution; the code
+#      behind `iree`, `diagnostics` and `micro-oracle` is still ungated here.
+#
+#      Cargo builds all the test binaries and then runs them one at a time, so
+#      the mlxcel-core suite never overlaps the root suite on the Metal device.
+#      That is what keeps `--workspace` clear of #1008, where two concurrent
+#      mlxcel-core suites aborted 7 of 12 runs. Anything that starts running
+#      test binaries in parallel here (cargo-nextest, say) has to re-establish
+#      that; the `no_other_mlxcel_core_test_binary_is_sharing_the_gpu` guard
+#      only sees a second mlxcel-core binary, not a root-suite one.
+#   5. `--no-fail-fast` on the test target. Without it the first failing test
+#      binary ends the run, which was harmless when the run was one package and
+#      is not now: a single red root-suite test would hide all of mlxcel-core,
+#      mlxcel-surgery and mlxcel-xla behind it. A nightly that costs the better
+#      part of an hour should report everything that is red in one pass. It
+#      does not weaken the gate, since cargo still exits non-zero, and it does
+#      not skip compile errors, which stop the run either way.
+#
+# `verify-test-cuda` is the Linux/NVIDIA counterpart of `verify-test`: same
+# scope, same profile, same `--no-fail-fast`, `--features cuda` instead of
+# `metal,accelerate`, plus `--test-threads=1`. Two things about it:
+#
+#   * Until #1048 there was no CUDA target that ran mlxcel-core's tests at all.
+#     `verify-test` is the macOS feature set and `test-fast-cuda` is root-package
+#     only, so the crate with the MLX bridge and the KV cache had no gate on this
+#     platform. That is #1007's blindness a second time, on the other backend.
+#   * `--test-threads=1` is load-bearing, not tidiness. Measured on GB10 at MLX
+#     pin 2c46b953: the 20-thread run dies with SIGABRT from
+#     `cudaStreamEndCapture ... previous error during capture`, at a different
+#     test each time; the same binary serialized finishes 1410 tests in 88s.
+#     Turning graph capture off does not rescue the parallel run, it only
+#     re-reports the abort as `cuLaunchKernelEx ... invalid argument`, so
+#     MLX_USE_CUDA_GRAPHS=0 is not the workaround it looks like. Capture stays
+#     fully on under this target. mlxcel-core carries a
+#     `the_cuda_test_suite_must_run_single_threaded` guard so a hand-run
+#     `cargo test --workspace --features cuda` names the problem instead of
+#     aborting anonymously.
+#
+# There is deliberately no `verify-clippy-cuda` here yet: the CUDA lint half is
+# a separate hole from the CUDA test half, and #1048 is about the test gate.
 #
 # Run `make verify` before opening or updating a PR. Run `make verify-clean`
 # (which prepends `cargo clean`) when you suspect clippy's per-crate result
@@ -462,18 +560,40 @@ verify-fmt: ## CI-faithful: cargo fmt --all -- --check
 	$(CARGO) fmt --all -- --check
 
 .PHONY: verify-clippy
-verify-clippy: ## CI-faithful: clippy --all-targets --features metal,accelerate -- -D warnings
-	@echo "$(CYAN)[verify] clippy (features=metal,accelerate, -D warnings)...$(RESET)"
-	$(CARGO) clippy --all-targets --features metal,accelerate -- -D warnings
+verify-clippy: ## CI-faithful: clippy --workspace --all-targets --features metal,accelerate -- -D warnings
+	@echo "$(CYAN)[verify] clippy (workspace, features=metal,accelerate, -D warnings)...$(RESET)"
+	$(CARGO) clippy --workspace --all-targets --features metal,accelerate -- -D warnings
 
 .PHONY: verify-test
-verify-test: ## CI-faithful: cargo test --release --features metal,accelerate
-	@echo "$(CYAN)[verify] test (release, features=metal,accelerate)...$(RESET)"
-	$(CARGO) test --release --features metal,accelerate
+verify-test: ## CI-faithful: cargo test --workspace --profile test-fast --features metal,accelerate --no-fail-fast
+	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=metal,accelerate)...$(RESET)"
+	$(CARGO) test --workspace --profile test-fast --features metal,accelerate --no-fail-fast
+
+.PHONY: verify-test-cuda
+verify-test-cuda: ## CUDA gate: cargo test --workspace --profile test-fast --features cuda --no-fail-fast -- --test-threads=1 (issue #1048)
+	@echo "$(CYAN)[verify] test (workspace, test-fast profile, features=cuda, single threaded)...$(RESET)"
+	$(CARGO) test --workspace --profile test-fast --features cuda --no-fail-fast -- --test-threads=1
+
+.PHONY: verify-versions
+verify-versions: ## Assert every version-tracking workspace crate carries the root `mlxcel` version
+	@echo "$(CYAN)[verify] workspace crate versions...$(RESET)"
+	@python3 scripts/ci/check_crate_versions.py
+
+.PHONY: verify-kernel-dtype-keys
+verify-kernel-dtype-keys: ## Assert every CUDA JIT kernel launch keys its cache on the input dtypes (issues #1053, #1054)
+	@echo "$(CYAN)[verify] kernel dtype cache keys...$(RESET)"
+	@python3 scripts/ci/check_kernel_dtype_keys.py
+
+.PHONY: bump-version
+bump-version: ## Release: set every version-tracking crate to VERSION and sync Cargo.lock (make bump-version VERSION=0.5.0)
+	@test -n "$(VERSION)" || { echo "$(RED)usage: make bump-version VERSION=0.5.0$(RESET)"; exit 1; }
+	@python3 scripts/ci/check_crate_versions.py --set "$(VERSION)"
+	@$(CARGO) update $$(python3 scripts/ci/check_crate_versions.py --print-update-args)
+	@$(MAKE) --no-print-directory verify-versions
 
 .PHONY: verify
-verify: verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
-	@echo "$(GREEN)[verify] OK — matches GitHub Actions clippy+test job$(RESET)"
+verify: verify-versions verify-kernel-dtype-keys verify-fmt verify-clippy verify-test ## Run the full CI-faithful gate locally (recommended before push)
+	@echo "$(GREEN)[verify] OK: matches the nightly-verify GitHub Actions job$(RESET)"
 
 .PHONY: verify-clean
 verify-clean: ## Run `verify` after a `cargo clean` (use when clippy's cache may be hiding a regression)
@@ -704,9 +824,38 @@ webpage-deploy: ## Deploy download webpage to GitHub Pages
 # ============================================================================
 # Documentation (Zensical / MkDocs-compatible)
 # ============================================================================
+#
+# The docs-* targets below build the MkDocs manual. Its sources (docs/en,
+# docs/ko, docs/shared, docs/requirements.txt, docs/scripts) are maintained in a
+# separate documentation tree and are not part of this repository, so every one
+# of these targets depends on docs-guard. The guard is a presence check, not an
+# unconditional refusal: where the sources exist the targets run exactly as
+# before, and where they do not the build stops with an explanation instead of
+# an opaque uv, ln, or zensical failure. See docs/README.md for the split.
+
+DOCS_MANUAL_DIR := docs/en
+DOCS_MANUAL_URL := https://mlxcel.lablup.ai/en/manual/
+
+.PHONY: docs-guard
+docs-guard:
+	@test -d "$(DOCS_MANUAL_DIR)" || { \
+		echo "The MkDocs manual sources are not present in this checkout."; \
+		echo ""; \
+		echo "  '$(DOCS_MANUAL_DIR)' is missing, and so are docs/ko, docs/shared,"; \
+		echo "  docs/requirements.txt and docs/scripts. They are maintained in a"; \
+		echo "  separate documentation tree, along with its own copies of mkdocs.yml,"; \
+		echo "  mkdocs.ko.yml and the two PDF configs. The docs_dir, custom_dir and"; \
+		echo "  nav: entries in the configs kept here name paths in that tree, not the"; \
+		echo "  docs/*.md files in this repository, so no docs-* target can build"; \
+		echo "  anything from this checkout."; \
+		echo ""; \
+		echo "  Read the published manual instead: $(DOCS_MANUAL_URL)"; \
+		echo "  The documents that do live here are indexed in docs/README.md."; \
+		exit 1; \
+	}
 
 .PHONY: docs-install
-docs-install: ## Install documentation dependencies and create shared symlinks
+docs-install: docs-guard ## Install documentation dependencies and create shared symlinks (manual sources not in this checkout)
 	@command -v uv >/dev/null 2>&1 || { \
 		echo "Error: uv is not installed. Install it from https://docs.astral.sh/uv/"; \
 		exit 1; \
@@ -718,30 +867,30 @@ docs-install: ## Install documentation dependencies and create shared symlinks
 	@echo "Documentation dependencies installed and symlinks created. Run 'make docs-serve' to start the server."
 
 .PHONY: docs-serve
-docs-serve: ## Serve all docs locally (builds KO first, then serves EN)
+docs-serve: docs-guard ## Serve all docs locally, builds KO first then serves EN (manual sources not in this checkout)
 	@echo "Building Korean docs..."
 	uv run zensical build -f mkdocs.ko.yml
 	@echo "Serving English docs..."
 	uv run zensical serve -f mkdocs.yml
 
 .PHONY: docs-serve-en
-docs-serve-en: ## Serve English docs with live reload
+docs-serve-en: docs-guard ## Serve English docs with live reload (manual sources not in this checkout)
 	uv run zensical serve -f mkdocs.yml
 
 .PHONY: docs-serve-ko
-docs-serve-ko: ## Serve Korean docs with live reload
+docs-serve-ko: docs-guard ## Serve Korean docs with live reload (manual sources not in this checkout)
 	uv run zensical serve -f mkdocs.ko.yml
 
 .PHONY: docs-build
-docs-build: ## Build English docs
+docs-build: docs-guard ## Build English docs (manual sources not in this checkout)
 	uv run zensical build -f mkdocs.yml
 
 .PHONY: docs-build-ko
-docs-build-ko: ## Build Korean docs
+docs-build-ko: docs-guard ## Build Korean docs (manual sources not in this checkout)
 	uv run zensical build -f mkdocs.ko.yml
 
 .PHONY: docs-build-all
-docs-build-all: ## Build all docs (EN + KO)
+docs-build-all: docs-guard ## Build all docs, EN and KO (manual sources not in this checkout)
 	@echo "Building English docs..."
 	uv run zensical build -f mkdocs.yml
 	@echo "Building Korean docs..."
@@ -749,19 +898,19 @@ docs-build-all: ## Build all docs (EN + KO)
 	@echo "All docs built in site/"
 
 .PHONY: docs-build-strict
-docs-build-strict: ## Build all docs with strict mode (for CI)
+docs-build-strict: docs-guard ## Build all docs in strict mode for CI (manual sources not in this checkout)
 	uv run zensical build -f mkdocs.yml
 	uv run zensical build -f mkdocs.ko.yml
 
 .PHONY: docs-pdf-setup
-docs-pdf-setup: ## Install Playwright browser for PDF export (one-time setup)
+docs-pdf-setup: docs-guard ## Install Playwright browser for PDF export, one-time (manual sources not in this checkout)
 	uv venv --python 3.13
 	uv pip install -r docs/requirements.txt
 	uv run python -m playwright install chromium
 	@echo "PDF export dependencies ready."
 
 .PHONY: docs-pdf-en
-docs-pdf-en: ## Export English documentation as PDF
+docs-pdf-en: docs-guard ## Export English documentation as PDF (manual sources not in this checkout)
 	@echo "Building English documentation as PDF..."
 	uv run mkdocs build --config-file mkdocs.pdf.yml -d site/en/manual
 	@echo "Fixing PDF internal links..."
@@ -769,7 +918,7 @@ docs-pdf-en: ## Export English documentation as PDF
 	@echo "PDF generated: site/en/manual/mlxcel-Manual-en.pdf"
 
 .PHONY: docs-pdf-ko
-docs-pdf-ko: ## Export Korean documentation as PDF
+docs-pdf-ko: docs-guard ## Export Korean documentation as PDF (manual sources not in this checkout)
 	@echo "Building Korean documentation as PDF..."
 	uv run mkdocs build --config-file mkdocs.ko.pdf.yml -d site/ko/manual
 	@echo "Fixing PDF internal links..."
@@ -777,12 +926,12 @@ docs-pdf-ko: ## Export Korean documentation as PDF
 	@echo "PDF generated: site/ko/manual/mlxcel-Manual-ko.pdf"
 
 .PHONY: docs-pdf
-docs-pdf: docs-pdf-en docs-pdf-ko ## Export all documentation as PDF
+docs-pdf: docs-guard docs-pdf-en docs-pdf-ko ## Export all documentation as PDF (manual sources not in this checkout)
 	@echo "All PDFs generated:"
 	@echo "  - site/en/manual/mlxcel-Manual-en.pdf"
 	@echo "  - site/ko/manual/mlxcel-Manual-ko.pdf"
 
 .PHONY: docs-clean
-docs-clean: ## Remove built docs
+docs-clean: docs-guard ## Remove built docs (manual sources not in this checkout)
 	rm -rf site/
 	@echo "Built docs removed."

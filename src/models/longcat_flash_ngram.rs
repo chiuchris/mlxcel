@@ -912,7 +912,7 @@ impl LongcatFlashNgramModel {
             .map_err(|e| format!("Failed to parse config: {e}"))?;
 
         let mut weights = crate::models::load_text_weights(path, None)?;
-        weights = sanitize_weights(weights, &args);
+        weights = sanitize_weights(weights, &args)?;
 
         let model = Self::from_weights(&weights, &args)?;
         Ok((model, args.vocab_size))
@@ -1036,7 +1036,10 @@ impl LanguageModel for LongcatFlashNgramModel {
 }
 
 // Weight sanitization.
-pub fn sanitize_weights(mut weights: WeightMap, args: &LongcatFlashNgramConfig) -> WeightMap {
+pub fn sanitize_weights(
+    mut weights: WeightMap,
+    args: &LongcatFlashNgramConfig,
+) -> Result<WeightMap, String> {
     // Stack MoE expert weights into SwitchGLU format
     for l in 0..args.num_layers {
         let prefix = format!("model.layers.{l}");
@@ -1091,14 +1094,38 @@ pub fn sanitize_weights(mut weights: WeightMap, args: &LongcatFlashNgramConfig) 
                 let s = weights
                     .remove(&format!("{prefix}.kv_b_proj.scales"))
                     .unwrap();
-                let b = weights
-                    .remove(&format!("{prefix}.kv_b_proj.biases"))
-                    .unwrap();
-                let w_shape = mlxcel_core::array_shape(&w);
-                let s_shape = mlxcel_core::array_shape(&s);
-                let kv_lora_rank = args.kv_lora_rank as i32;
-                let inferred_bits = (w_shape[w_shape.len() - 1] * 32) / kv_lora_rank;
-                let inferred_gs = kv_lora_rank / s_shape[s_shape.len() - 1];
+                // `is_quantized` gates on `.scales` alone, and the block-float
+                // modes (mxfp4 / nvfp4 / mxfp8) ship scales with no zero
+                // points, so a block-float export satisfies that gate and
+                // arrives here carrying no `.biases` plane. The `.unwrap()`
+                // this replaces turned that into a panic during sanitization,
+                // which in the server takes the process down rather than
+                // rejecting one model load (issue #1026). `dequantize` below is
+                // hardcoded `"affine"` and so could not decompose such a plane
+                // in any case; what this buys is a load error naming the key
+                // that is missing.
+                let b_key = format!("{prefix}.kv_b_proj.biases");
+                let b = weights.remove(&b_key).ok_or_else(|| {
+                    format!(
+                        "layer {l}: kv_b_proj has scales but no biases at key `{b_key}`; \
+                         the checkpoint may be corrupted or only partially converted"
+                    )
+                })?;
+                // Solve the packed pair from the shapes and bound it before it
+                // reaches `dequantize`. The shared helper also checks each
+                // divisor before dividing: `kv_lora_rank` is a config field and
+                // the scales axis is checkpoint data, so the naive form panics
+                // on a zero divisor and overflows i32 on a large packed axis,
+                // both before the bound could fire. This is why the function is
+                // fallible (issue #958).
+                let (inferred_gs, inferred_bits) =
+                    mlxcel_core::layers::infer_mla_quantization_params(
+                        &mlxcel_core::array_shape(&w),
+                        &mlxcel_core::array_shape(&s),
+                        args.kv_lora_rank as i32,
+                        &format!("{prefix}.kv_b_proj"),
+                    )?;
+
                 unsafe {
                     mlxcel_core::dequantize(
                         &w,
@@ -1143,5 +1170,190 @@ pub fn sanitize_weights(mut weights: WeightMap, args: &LongcatFlashNgramConfig) 
         );
     }
 
-    weights
+    Ok(weights)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal config that exercises only the `kv_b_proj` MLA decomposition:
+    /// `n_routed_experts` is set but never triggers the MoE stacking branch,
+    /// which is gated on the presence of `mlp.experts.0.*` keys that this
+    /// fixture never inserts.
+    fn mla_config(kv_lora_rank: usize) -> LongcatFlashNgramConfig {
+        let json = format!(
+            r#"{{
+            "model_type": "longcat_flash",
+            "hidden_size": 8,
+            "ffn_hidden_size": 8,
+            "moe_topk": 1,
+            "expert_ffn_hidden_size": 8,
+            "n_routed_experts": 1,
+            "zero_expert_num": 0,
+            "num_layers": 1,
+            "vocab_size": 16,
+            "max_position_embeddings": 64,
+            "num_attention_heads": 2,
+            "kv_lora_rank": {kv_lora_rank},
+            "q_lora_rank": 8,
+            "qk_rope_head_dim": 2,
+            "qk_nope_head_dim": 4,
+            "v_head_dim": 4,
+            "routed_scaling_factor": 1.0,
+            "rms_norm_eps": 1e-6,
+            "rope_theta": 10000.0
+        }}"#
+        );
+        serde_json::from_str(&json).expect("parse tiny longcat_flash config")
+    }
+
+    /// An affine 4-bit `kv_b_proj` on sub-attention 0 of every layer in `args`.
+    ///
+    /// Honest geometry at `mla_config(16)`: packed_in * 32 == bits *
+    /// num_groups * group_size (2 * 32 == 4 * 1 * 16), with
+    /// num_attention_heads 2 and qk_nope_head_dim = v_head_dim = 4, so rows =
+    /// 2 * 8 = 16.
+    ///
+    /// The packed plane is UINT32, not a float dtype: `dequantize` rejects any
+    /// other packed dtype by throwing, and that throw is the uncatchable abort
+    /// these guards exist to keep out of the forward path. A float fixture
+    /// here takes the test binary down on the positive control.
+    fn affine_kv_b_proj_weights(args: &LongcatFlashNgramConfig) -> WeightMap {
+        let heads = args.num_attention_heads as i32;
+        let head_dim = (args.qk_nope_head_dim + args.v_head_dim) as i32;
+        let rows = heads * head_dim;
+        let mut weights = WeightMap::new();
+        for l in 0..args.num_layers {
+            let prefix = format!("model.layers.{l}.self_attn.0.kv_b_proj");
+            weights.insert(
+                format!("{prefix}.weight"),
+                mlxcel_core::zeros(&[rows, 2], mlxcel_core::dtype::UINT32),
+            );
+            weights.insert(
+                format!("{prefix}.scales"),
+                mlxcel_core::zeros(&[rows, 1], mlxcel_core::dtype::FLOAT32),
+            );
+            weights.insert(
+                format!("{prefix}.biases"),
+                mlxcel_core::zeros(&[rows, 1], mlxcel_core::dtype::FLOAT32),
+            );
+        }
+        weights
+    }
+
+    /// The same plane an mxfp4 / nvfp4 / mxfp8 export ships: `.scales`
+    /// present, `.biases` absent, because the block-float modes carry no zero
+    /// points.
+    fn block_float_kv_b_proj_weights(args: &LongcatFlashNgramConfig) -> WeightMap {
+        let mut weights = affine_kv_b_proj_weights(args);
+        for l in 0..args.num_layers {
+            weights.remove(&format!("model.layers.{l}.self_attn.0.kv_b_proj.biases"));
+        }
+        weights
+    }
+
+    /// The MLA `kv_b_proj` pair `sanitize_weights` decomposes is solved from
+    /// `kv_lora_rank` and two tensor axes rather than declared, and every
+    /// input is untrusted: `kv_lora_rank` comes from `config.json` and the
+    /// axes from the checkpoint. Before issue #958 the naive arithmetic
+    /// divided by both without checking them, so a `kv_lora_rank` of 0
+    /// panicked on integer division and a solved pair outside anything MLX
+    /// can describe reached `dequantize`, which crosses the cxx bridge as
+    /// `UniquePtr<MlxArray>` rather than `Result` and therefore aborts during
+    /// weight sanitization rather than failing the load.
+    ///
+    /// `sanitize_weights` decomposes both dual sub-attentions (`self_attn.0`
+    /// and `self_attn.1`) per layer; the fixtures above only build
+    /// `self_attn.0`, and `self_attn.1` is skipped by the loader's own "no
+    /// `kv_b_proj` present" check, which is not what this test targets.
+    #[test]
+    fn sanitize_rejects_a_kv_lora_rank_no_packing_can_describe() {
+        // Positive control first, so a guard that rejected every quantized
+        // kv_b_proj could not pass this test.
+        let honest = mla_config(16);
+        let sanitized = sanitize_weights(affine_kv_b_proj_weights(&honest), &honest)
+            .expect("an honest quantized kv_b_proj must still sanitize");
+        assert!(sanitized.contains_key("model.layers.0.self_attn.0.embed_q.weight"));
+
+        // A zero `kv_lora_rank` is Rust integer division by zero on the very
+        // first solve, so it has to be refused before the division rather
+        // than after.
+        let zero_rank = mla_config(0);
+        let err = sanitize_weights(affine_kv_b_proj_weights(&zero_rank), &zero_rank)
+            .err()
+            .unwrap_or_else(|| panic!("kv_lora_rank 0 must be refused, not divided by"));
+        assert!(err.contains("kv_lora_rank"), "unhelpful error: {err}");
+
+        // A large `kv_lora_rank` truncates the solved bit width to 0, which
+        // is the divisor MLX would then divide by.
+        let wide_rank = mla_config(4096);
+        let err = sanitize_weights(affine_kv_b_proj_weights(&wide_rank), &wide_rank)
+            .err()
+            .unwrap_or_else(|| panic!("a solved bit width of 0 must be refused"));
+        assert!(err.contains("bits"), "unhelpful error: {err}");
+
+        // A non-quantized kv_b_proj carries no packing, so the pair is never
+        // solved and a `kv_lora_rank` that no packing could describe must not gate
+        // it. The tensor is built at `wide_rank`'s own width so it still satisfies
+        // the separate shape cross-check below the solve, which would otherwise
+        // reject this for an unrelated reason.
+        let mut float_only = WeightMap::new();
+        let rows = wide_rank.num_attention_heads as i32
+            * (wide_rank.qk_nope_head_dim + wide_rank.v_head_dim) as i32;
+        float_only.insert(
+            "model.layers.0.self_attn.0.kv_b_proj.weight".to_string(),
+            mlxcel_core::zeros(
+                &[rows, wide_rank.kv_lora_rank as i32],
+                mlxcel_core::dtype::FLOAT32,
+            ),
+        );
+        sanitize_weights(float_only, &wide_rank)
+            .expect("a float kv_b_proj must not be gated on quantization params");
+    }
+
+    /// Issue #1026: `sanitize_weights` decides `kv_b_proj` is quantized on
+    /// `.scales` alone, then used to take `.biases` with `.unwrap()`.
+    ///
+    /// Affine stores zero points; the block-float modes (mxfp4 / nvfp4 /
+    /// mxfp8) do not, which is exactly what `infer_quantization_mode` keys on.
+    /// A block-float `kv_b_proj` therefore satisfies the `.scales` gate and
+    /// arrives at the `.biases` removal with nothing to take, and the
+    /// `.unwrap()` made that a panic during weight sanitization. In the server
+    /// that takes the process down rather than rejecting one model load, which
+    /// is strictly worse than the load error it should be.
+    ///
+    /// This family is the one of the four whose prefix carries a sub-attention
+    /// index (`self_attn.0` / `self_attn.1`) rather than ending at
+    /// `self_attn`, so the key the error names is worth pinning here
+    /// specifically: it is the site where a copy of the fix could most easily
+    /// blame the wrong tensor.
+    ///
+    /// The decomposition still dequantizes as `"affine"`, so a genuine
+    /// block-float `kv_b_proj` is not supported either way: what this pins is
+    /// that it is refused by name instead of unwinding. The assertion is on
+    /// the returned `Result` and no forward pass runs, so a regression fails
+    /// cleanly here.
+    #[test]
+    fn sanitize_rejects_scales_with_no_biases() {
+        let args = mla_config(16);
+
+        // Positive control first, so a check that rejected every quantized
+        // kv_b_proj could not pass this test.
+        let sanitized = sanitize_weights(affine_kv_b_proj_weights(&args), &args)
+            .expect("a kv_b_proj carrying both planes must still sanitize");
+        assert!(sanitized.contains_key("model.layers.0.self_attn.0.embed_q.weight"));
+
+        let err = sanitize_weights(block_float_kv_b_proj_weights(&args), &args)
+            .err()
+            .expect("scales with no biases must be refused at load, not unwrapped");
+        assert!(
+            err.contains("model.layers.0.self_attn.0.kv_b_proj.biases"),
+            "the error must name the key that is missing, got: {err}"
+        );
+        assert!(
+            err.contains("scales but no biases"),
+            "the wording must match the other four MLA sanitizers, got: {err}"
+        );
+    }
 }

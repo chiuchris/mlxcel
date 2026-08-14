@@ -66,6 +66,7 @@ pub use self::vlm::load_qwen3_omni_speech;
 pub(crate) use self::vlm::{
     Phi4MMXlaVisionComponents, load_phi4mm_xla_media_components, load_phi4mm_xla_text_embeddings,
 };
+pub(crate) use self::vlm::{ensure_supported_muse_weight_map, normalize_muse_glimmer_weights};
 
 /// Resolve model path: if a file is given, use its parent directory.
 ///
@@ -94,6 +95,42 @@ fn parse_eos_token_ids(config: &serde_json::Value) -> Vec<i32> {
             .collect(),
         _ => Vec::new(),
     }
+}
+
+/// Sampling and stop-token defaults read from `generation_config.json`.
+///
+/// Fields are optional because many checkpoints omit some or all sampling
+/// knobs. Callers should overlay these onto their historical defaults only
+/// when the user did not explicitly provide that knob.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GenerationConfigDefaults {
+    pub eos_token_ids: Vec<i32>,
+    pub temperature: Option<f32>,
+    pub top_p: Option<f32>,
+    pub top_k: Option<i32>,
+}
+
+fn parse_generation_config_defaults(config: &serde_json::Value) -> GenerationConfigDefaults {
+    GenerationConfigDefaults {
+        eos_token_ids: parse_eos_token_ids(config),
+        temperature: parse_finite_f32_field(config, "temperature"),
+        top_p: parse_finite_f32_field(config, "top_p"),
+        top_k: parse_i32_field(config, "top_k"),
+    }
+}
+
+fn parse_finite_f32_field(config: &serde_json::Value, key: &str) -> Option<f32> {
+    let value = config.get(key)?.as_f64()?;
+    if value.is_finite() {
+        Some(value as f32)
+    } else {
+        None
+    }
+}
+
+fn parse_i32_field(config: &serde_json::Value, key: &str) -> Option<i32> {
+    let value = config.get(key)?.as_i64()?;
+    i32::try_from(value).ok()
 }
 
 pub(super) fn parse_model_config<T: DeserializeOwned>(config_str: &str) -> Result<T> {
@@ -197,6 +234,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::Ernie45MoeVLM => Some(load_ernie4_5_moe_vlm(model_path)?),
         ModelType::HunyuanVLM => Some(load_hunyuan_vlm(model_path)?),
         ModelType::MiniMaxM3VL => Some(load_minimax_m3_vl(model_path)?),
+        ModelType::MuseGlimmerVLM => Some(load_muse_glimmer_vlm(model_path)?),
         ModelType::LlavaBunnyVLM => Some(load_llava_bunny_vlm(model_path)?),
         ModelType::AyaVisionVLM => Some(load_aya_vision_vlm(model_path)?),
         ModelType::PaliGemmaVLM => Some(load_paligemma_vlm(model_path)?),
@@ -210,6 +248,8 @@ fn try_load_vlm_model_from_dir(
         ModelType::PaddleOcrVL => Some(load_paddleocr_vl(model_path)?),
         ModelType::Step3p7 => Some(load_step3p7_vl(model_path)?),
         ModelType::DotsOcrVL => Some(load_dots_ocr_vl(model_path)?),
+        ModelType::FalconOcrVL => Some(load_falcon_ocr_vl(model_path)?),
+        ModelType::JinaVLM => Some(load_jina_vlm(model_path)?),
         ModelType::Glm4v => Some(load_glm4v(model_path)?),
         ModelType::Glm4vMoe => Some(load_glm4v_moe(model_path)?),
         ModelType::GlmOcr => Some(load_glm_ocr(model_path)?),
@@ -217,6 +257,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::MiniCPMV46VLM => Some(load_minicpmv4_6_vlm(model_path)?),
         ModelType::Moondream3VLM => Some(load_moondream3_vlm(model_path)?),
         ModelType::Moondream2VLM => Some(load_moondream2_vlm(model_path)?),
+        ModelType::Florence2VLM => Some(load_florence2_vlm(model_path)?),
         ModelType::Gemma3nVLM => Some(load_gemma3n_vlm(model_path)?),
         ModelType::Phi4MMVLM => Some(load_phi4mm_vlm(model_path)?),
         ModelType::Phi4SigLipVLM => Some(load_phi4_siglip_vlm(model_path)?),
@@ -228,6 +269,7 @@ fn try_load_vlm_model_from_dir(
         ModelType::YoutuVLM => Some(load_youtu_vl_vlm(model_path)?),
         ModelType::InternVLChatVLM => Some(load_internvl_vlm(model_path)?),
         ModelType::KimiVL | ModelType::KimiK25 => Some(load_kimi_vl_vlm(model_path)?),
+        ModelType::LocateAnythingVLM => Some(load_locateanything_vlm(model_path)?),
         ModelType::SmolVLM => Some(load_smolvlm_vlm(model_path)?),
         ModelType::Idefics2 => Some(load_idefics2_vlm(model_path)?),
         ModelType::Lfm2VL => Some(load_lfm2_vl(model_path)?),
@@ -307,19 +349,27 @@ fn load_llama_family_from_weights(
     Ok(LoadedModel::Llama(model))
 }
 
+/// Read generation defaults from generation_config.json.
+///
+/// Returns an empty default set when the file is missing, unreadable, or
+/// malformed so legacy callers keep their built-in sampling defaults.
+pub fn read_generation_config_defaults(model_dir: &Path) -> GenerationConfigDefaults {
+    let config_path = model_dir.join("generation_config.json");
+    let Ok(content) = std::fs::read_to_string(&config_path) else {
+        return GenerationConfigDefaults::default();
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return GenerationConfigDefaults::default();
+    };
+    parse_generation_config_defaults(&config)
+}
+
 /// Read EOS token IDs from generation_config.json
 ///
 /// Returns the token IDs from the `eos_token_id` field, which can be either
 /// a single integer or an array of integers. Returns empty vec if not found.
 pub fn read_eos_token_ids(model_dir: &Path) -> Vec<i32> {
-    let config_path = model_dir.join("generation_config.json");
-    let Ok(content) = std::fs::read_to_string(&config_path) else {
-        return Vec::new();
-    };
-    let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
-        return Vec::new();
-    };
-    parse_eos_token_ids(&config)
+    read_generation_config_defaults(model_dir).eos_token_ids
 }
 
 /// Read the model's context window from `config.json`.
@@ -368,12 +418,25 @@ pub fn context_window_from_config(config: &serde_json::Value) -> Option<usize> {
 }
 
 /// Force CUDA graph capture off for model families whose captured decode
-/// collapses on this hardware: Gemma 4 (issue #688) and DeepSeek-V2 (issue
-/// #824). The DeepSeek-V2 case is the same class of hazard: with graph capture
-/// on, the naive-MLA incremental decode degenerates into repeated tokens even
-/// though the identical forward is deterministically coherent with capture off
-/// (verified via `MLX_USE_CUDA_GRAPHS=0`). The Gemma 4 analysis below applies to
-/// that family; DeepSeek-V2 is added to the same lever for the same reason.
+/// collapses on this hardware: Gemma 4 (issue #688).
+///
+/// DeepSeek-V2 (and DeepSeek-VL2, whose language tower is the same MLA
+/// backbone) sat on this lever from #829 to #831, attributed to the same class
+/// of hazard. That attribution was wrong: the collapse was the broken RMSNorm
+/// overlay mlxcel carried at `patches/mlx/backend/cuda/rms_norm.cu`, whose
+/// two-stage reduction read past its shared scratch on the `kv_a_layernorm`
+/// axis (`kv_lora_rank == 512` at bf16), making the applied normalizer depend
+/// on residual shared memory at single-row decode. Deleting the overlay (#831)
+/// made greedy decode on deepseek-v2-lite-4bit deterministically coherent AND
+/// byte-identical with capture on versus off (12/12 runs each, two prompt
+/// lengths), while the overlay build reproduced the recorded flakiness with
+/// capture on (4/12 coherent) and full determinism with capture off. There is
+/// no graph-capture hazard for DeepSeek-V2; the family runs with CUDA graphs.
+/// Full analysis: docs/upstream/mlx-cuda-rmsnorm-small-axis-regression.md.
+///
+/// Gemma 4 stays: its norm axes (head_dim 256, hidden 2816/3840/5376 at bf16)
+/// never select the overlay's broken dispatch geometry, so the #688 collapse
+/// has a different, still-unidentified root cause.
 ///
 /// mlxcel's Gemma 4 incremental (single-query, KV-cache) decode has a CUDA-graph
 /// read-before-write hazard: greedy (temperature 0) decode is nondeterministic
@@ -403,22 +466,21 @@ pub fn context_window_from_config(config: &serde_json::Value) -> Option<usize> {
 /// Invariant: this env-based lever assumes one model per process. The server is
 /// single-model-per-process today (no in-process hot-swap in `start_server`), so a
 /// non-hazard-family eval never latches `use_cuda_graphs = true` before a later
-/// hazard-family (Gemma 4 or DeepSeek-V2) load. If in-process model hot-swap is
+/// hazard-family (Gemma 4) load. If in-process model hot-swap is
 /// ever added, a non-hazard-family model loaded first would make a subsequent
 /// hazard-family `set_var` a silent no-op (the static is already latched) and this
 /// approach would need revisiting.
 fn maybe_disable_cuda_graphs_for_model(model_type: ModelType) {
     // Families whose CUDA-graph-captured decode collapses on this hardware and
-    // must run with graph capture off. Gemma 4 (issue #688) and DeepSeek-V2
-    // (issue #824: the naive-MLA decode path degenerates into repeated tokens
-    // under graph capture even though the same forward is coherent with capture
-    // off). Other families (Gemma 3, Qwen 3.5, etc.) are unaffected and keep
-    // capture on.
+    // must run with graph capture off. Gemma 4 (issue #688) only. DeepSeek-V2
+    // and DeepSeek-VL2 were removed in #831: their collapse was the broken
+    // RMSNorm overlay, not graph capture, and with the overlay deleted their
+    // captured decode is deterministic and coherent. Other families (Gemma 3,
+    // Qwen 3.5, etc.) are unaffected and keep capture on.
     let hazard = match model_type {
         ModelType::Gemma4 | ModelType::Gemma4VLM | ModelType::Gemma4Unified => {
             Some(("Gemma 4", "#688"))
         }
-        ModelType::DeepSeekV2 | ModelType::DeepSeekVL2 => Some(("DeepSeek-V2", "#824")),
         _ => None,
     };
     let Some((family, issue)) = hazard else {
@@ -680,6 +742,10 @@ fn load_model_from_weights(model_path: &Path, weights: &mut WeightMap) -> Result
 
     Ok(model)
 }
+
+#[cfg(test)]
+#[path = "generation_config_tests.rs"]
+mod generation_config_tests;
 
 #[cfg(test)]
 #[path = "tests.rs"]

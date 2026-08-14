@@ -20,6 +20,7 @@
 //! - Shared experts + routed experts
 //! - First k layers are dense (no MoE)
 
+use crate::models::switch_layers::validate_expert_quantization_params;
 use mlxcel_core::generate::LanguageModel;
 use mlxcel_core::layers::{KVCache, MultiLinear, RMSNorm, UnifiedEmbedding, UnifiedLinear};
 use mlxcel_core::utils::{create_causal_mask, slice_axis, stack_arrays};
@@ -733,6 +734,12 @@ impl SwitchGLU {
         let group_size = args.group_size();
         let bits = args.bits();
 
+        // This SwitchGLU is unconditionally quantized (it requires scales and
+        // biases for all three projections below) and hands the stored pair to
+        // three `gather_qmm` calls without ever reaching
+        // `reconcile_quantization_layout`, so the bound lives here (issue #958).
+        validate_expert_quantization_params(prefix, group_size, bits)?;
+
         // Load stacked expert weights
         let gate_weight = get_weight_copy(weights, &format!("{}.gate_proj.weight", prefix))?;
         let gate_scales = get_weight_copy(weights, &format!("{}.gate_proj.scales", prefix))?;
@@ -979,7 +986,7 @@ impl DeepSeekV3Model {
         let weights = crate::models::load_text_weights(model_dir, None)?;
 
         // Sanitize weights (stack expert weights if needed)
-        let weights = Self::sanitize_weights(weights, &config);
+        let weights = Self::sanitize_weights(weights, &config)?;
 
         // Create model
         let model = Self::from_weights(&weights, &config)?;
@@ -993,11 +1000,17 @@ impl DeepSeekV3Model {
     /// filters out layers from other stages).
     ///
     /// Used by: DeepSeek V3 pipeline stage executor
-    pub fn sanitize_weights_with_args(weights: WeightMap, config: &DeepSeekV3Config) -> WeightMap {
+    pub fn sanitize_weights_with_args(
+        weights: WeightMap,
+        config: &DeepSeekV3Config,
+    ) -> Result<WeightMap, String> {
         Self::sanitize_weights(weights, config)
     }
 
-    fn sanitize_weights(mut weights: WeightMap, config: &DeepSeekV3Config) -> WeightMap {
+    fn sanitize_weights(
+        mut weights: WeightMap,
+        config: &DeepSeekV3Config,
+    ) -> Result<WeightMap, String> {
         // Remap pre-stacked weight names that omit the `.mlp.` segment.
         //
         // Some HuggingFace MLX shards for DeepSeek-V3 store pre-stacked MoE expert
@@ -1123,15 +1136,37 @@ impl DeepSeekV3Model {
                 let s = weights
                     .remove(&format!("{}.kv_b_proj.scales", prefix))
                     .unwrap();
-                let b = weights
-                    .remove(&format!("{}.kv_b_proj.biases", prefix))
-                    .unwrap();
+                // `is_quantized` gates on `.scales` alone, and the block-float
+                // modes (mxfp4 / nvfp4 / mxfp8) ship scales with no zero
+                // points, so a block-float export satisfies that gate and
+                // arrives here carrying no `.biases` plane. The `.unwrap()`
+                // this replaces turned that into a panic during sanitization,
+                // which in the server takes the process down rather than
+                // rejecting one model load (issue #1026). `dequantize` below is
+                // hardcoded `"affine"` and so could not decompose such a plane
+                // in any case; what this buys is a load error naming the key
+                // that is missing.
+                let b_key = format!("{}.kv_b_proj.biases", prefix);
+                let b = weights.remove(&b_key).ok_or_else(|| {
+                    format!(
+                        "layer {l}: kv_b_proj has scales but no biases at key `{b_key}`; \
+                         the checkpoint may be corrupted or only partially converted"
+                    )
+                })?;
 
-                let w_shape = mlxcel_core::array_shape(&w);
-                let s_shape = mlxcel_core::array_shape(&s);
-                let kv_lora_rank = config.kv_lora_rank as i32;
-                let inferred_bits = (w_shape[w_shape.len() - 1] * 32) / kv_lora_rank;
-                let inferred_gs = kv_lora_rank / s_shape[s_shape.len() - 1];
+                // Solve the packed pair from the shapes and bound it before it
+                // reaches `dequantize`. The shared helper checks each divisor
+                // before dividing: `kv_lora_rank` is a config field and the
+                // scales axis is checkpoint data, so the naive form panics on a
+                // zero divisor and overflows i32 on a large packed axis, both
+                // before the bound could fire (issue #958).
+                let (inferred_gs, inferred_bits) =
+                    mlxcel_core::layers::infer_mla_quantization_params(
+                        &mlxcel_core::array_shape(&w),
+                        &mlxcel_core::array_shape(&s),
+                        config.kv_lora_rank as i32,
+                        &format!("{prefix}.kv_b_proj"),
+                    )?;
 
                 unsafe {
                     mlxcel_core::dequantize(
@@ -1186,7 +1221,7 @@ impl DeepSeekV3Model {
             weights.remove(&key);
         }
 
-        weights
+        Ok(weights)
     }
 
     pub fn from_weights(weights: &WeightMap, args: &DeepSeekV3Config) -> Result<Self, String> {
@@ -1523,7 +1558,8 @@ mod tests {
             }
         }
 
-        let out = DeepSeekV3Model::sanitize_weights(weights, &config);
+        let out =
+            DeepSeekV3Model::sanitize_weights(weights, &config).expect("sanitize must succeed");
 
         // After sanitization, keys must have the `.mlp.` segment
         for l in 0..2usize {
@@ -1565,7 +1601,8 @@ mod tests {
             }
         }
 
-        let out = DeepSeekV3Model::sanitize_weights(weights, &config);
+        let out =
+            DeepSeekV3Model::sanitize_weights(weights, &config).expect("sanitize must succeed");
 
         // Canonical key must still be present
         for l in 0..2usize {
@@ -1715,7 +1752,7 @@ mod tests {
         // MTP trailer at the out-of-range index `num_hidden_layers` (= 2).
         insert_dense_layer_weights(&mut weights, &cfg, cfg.num_hidden_layers);
 
-        let out = DeepSeekV3Model::sanitize_weights(weights, &cfg);
+        let out = DeepSeekV3Model::sanitize_weights(weights, &cfg).expect("sanitize must succeed");
 
         for l in 0..cfg.num_hidden_layers {
             let embed_q = format!("model.layers.{l}.self_attn.embed_q.weight");
@@ -1739,7 +1776,8 @@ mod tests {
     fn from_weights_builds_all_num_hidden_layers() {
         let cfg = test_config_dense_direct_q();
         let weights = tiny_dense_model_weights(&cfg);
-        let weights = DeepSeekV3Model::sanitize_weights(weights, &cfg);
+        let weights =
+            DeepSeekV3Model::sanitize_weights(weights, &cfg).expect("sanitize must succeed");
         let model = DeepSeekV3Model::from_weights(&weights, &cfg)
             .expect("tiny dense direct-q model must load");
         assert_eq!(
@@ -1775,7 +1813,8 @@ mod tests {
         let cfg = test_config_dense_direct_q();
         let mut weights = WeightMap::new();
         insert_dense_layer_weights(&mut weights, &cfg, 0);
-        let weights = DeepSeekV3Model::sanitize_weights(weights, &cfg);
+        let weights =
+            DeepSeekV3Model::sanitize_weights(weights, &cfg).expect("sanitize must succeed");
         let attn = DeepSeekV3Attention::from_weights(&weights, &cfg, "model.layers.0.self_attn")
             .expect("tiny attention must load");
 
@@ -1876,5 +1915,221 @@ mod tests {
         let mx = mlxcel_core::max_all(&mlxcel_core::abs(&scores));
         mlxcel_core::eval(&mx);
         assert!(mlxcel_core::item_f32(&mx).is_finite());
+    }
+
+    /// Smallest DeepSeek-V3 config that parses, varying only the declared
+    /// quantization pair. Built through serde rather than a struct literal so
+    /// the `#[serde(default)]` fields fill themselves in.
+    fn quant_config(group_size: i32, bits: i32) -> DeepSeekV3Config {
+        serde_json::from_value(serde_json::json!({
+            "vocab_size": 32,
+            "hidden_size": 8,
+            "intermediate_size": 8,
+            "moe_intermediate_size": 8,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+            "kv_lora_rank": 4,
+            "qk_rope_head_dim": 2,
+            "v_head_dim": 4,
+            "qk_nope_head_dim": 2,
+            "quantization": { "group_size": group_size, "bits": bits },
+        }))
+        .expect("test config must parse")
+    }
+
+    /// This `SwitchGLU` is unconditionally quantized: it stores the declared
+    /// pair and hands it to three `gather_qmm` calls, which cross the cxx
+    /// bridge as `UniquePtr<MlxArray>` rather than `Result`. A C++ throw there
+    /// is an uncatchable `std::terminate`,
+    /// so losing the bound turns a rejected load into an uncatchable abort at
+    /// the first routed forward pass in production. This test asserts on the
+    /// load result rather than running a forward pass, so a regression fails
+    /// cleanly here instead of aborting the test binary.
+    #[test]
+    fn deepseek_v3_switch_glu_rejects_quantization_params_that_would_abort_gather_qmm() {
+        // Honest 4-bit expert geometry: `packed_in * 32 == bits * num_groups *
+        // group_size` (8 * 32 == 4 * 1 * 64), so the positive control below is
+        // a plane MLX can actually describe.
+        const EXPERTS: i32 = 3;
+        const OUT: i32 = 4;
+        const PACKED_IN: i32 = 8;
+        const NUM_GROUPS: i32 = 1;
+        const GROUP_SIZE: i32 = 64;
+        const BITS: i32 = 4;
+        const PREFIX: &str = "model.layers.0.mlp.switch_mlp";
+
+        let mut weights = WeightMap::new();
+        for proj in ["gate_proj", "up_proj", "down_proj"] {
+            crate::models::switch_layers::insert_stacked_quantized_expert_plane(
+                &mut weights,
+                &format!("{PREFIX}.{proj}"),
+                EXPERTS,
+                OUT,
+                PACKED_IN,
+                NUM_GROUPS,
+            );
+        }
+
+        // Positive control first, so a guard that rejected every quantized
+        // plane could not pass this test.
+        SwitchGLU::from_weights(&weights, &quant_config(GROUP_SIZE, BITS), PREFIX)
+            .expect("honest 4-bit expert planes must load");
+
+        for (group_size, bits, field) in crate::models::switch_layers::HOSTILE_QUANT_PARAMS {
+            let err =
+                match SwitchGLU::from_weights(&weights, &quant_config(group_size, bits), PREFIX) {
+                    Ok(_) => panic!(
+                        "(group_size {group_size}, bits {bits}) must be refused at load, \
+                         not stored for gather_qmm"
+                    ),
+                    Err(e) => e,
+                };
+            assert!(
+                err.contains(field),
+                "(group_size {group_size}, bits {bits}) must be blamed on {field}, got: {err}"
+            );
+        }
+    }
+
+    /// An affine 4-bit `kv_b_proj` for every layer in `cfg`.
+    ///
+    /// Honest geometry at `kv_lora_rank` 16: packed_in * 32 == bits *
+    /// num_groups * group_size (2 * 32 == 4 * 1 * 16). `test_config_dense_direct_q`
+    /// gives num_attention_heads 2, qk_nope_head_dim 4, v_head_dim 4, so
+    /// rows = 2 * 8 = 16.
+    ///
+    /// The packed plane is UINT32, not a float ramp: `dequantize` rejects any
+    /// other packed dtype by throwing, and that throw is the uncatchable abort
+    /// these guards exist to keep out of the forward path.
+    fn affine_kv_b_proj_weights(cfg: &DeepSeekV3Config) -> WeightMap {
+        let heads = cfg.num_attention_heads as i32;
+        let head_dim = (cfg.qk_nope_head_dim + cfg.v_head_dim) as i32;
+        let rows = heads * head_dim;
+        let mut weights = WeightMap::new();
+        for l in 0..cfg.num_hidden_layers {
+            let prefix = format!("model.layers.{l}.self_attn.kv_b_proj");
+            weights.insert(
+                format!("{prefix}.weight"),
+                mlxcel_core::zeros(&[rows, 2], mlxcel_core::dtype::UINT32),
+            );
+            insert_ramp(&mut weights, &format!("{prefix}.scales"), &[rows, 1]);
+            insert_ramp(&mut weights, &format!("{prefix}.biases"), &[rows, 1]);
+        }
+        weights
+    }
+
+    /// The same plane an mxfp4 / nvfp4 / mxfp8 export ships: `.scales`
+    /// present, `.biases` absent, because the block-float modes carry no zero
+    /// points.
+    fn block_float_kv_b_proj_weights(cfg: &DeepSeekV3Config) -> WeightMap {
+        let mut weights = affine_kv_b_proj_weights(cfg);
+        for l in 0..cfg.num_hidden_layers {
+            weights.remove(&format!("model.layers.{l}.self_attn.kv_b_proj.biases"));
+        }
+        weights
+    }
+
+    /// The MLA `kv_b_proj` pair `DeepSeekV3Model::sanitize_weights` decomposes
+    /// is solved from `kv_lora_rank` and two tensor axes rather than declared,
+    /// and every input is untrusted: `kv_lora_rank` comes from `config.json`
+    /// and the axes from the checkpoint. Before issue #958 the naive
+    /// arithmetic divided by both without checking them, so a `kv_lora_rank`
+    /// of 0 panicked on integer division and a solved pair outside anything
+    /// MLX can describe reached `dequantize`, which crosses the cxx bridge as
+    /// `UniquePtr<MlxArray>` rather than `Result` and therefore aborts during
+    /// weight sanitization rather than failing the load.
+    ///
+    /// This drives the real `DeepSeekV3Model::sanitize_weights` rather than
+    /// the shared helper directly, so the guard is exercised where a
+    /// checkpoint reaches it. The assertions are on the returned `Result`, so
+    /// a regression fails cleanly here instead of aborting the test binary.
+    #[test]
+    fn quantized_kv_b_proj_rejects_a_kv_lora_rank_no_packing_can_describe() {
+        // Positive control first, so a guard that rejected every quantized
+        // kv_b_proj could not pass this test.
+        let mut honest = test_config_dense_direct_q();
+        honest.kv_lora_rank = 16;
+        let sanitized =
+            DeepSeekV3Model::sanitize_weights(affine_kv_b_proj_weights(&honest), &honest)
+                .expect("an honest quantized kv_b_proj must still sanitize");
+        assert!(sanitized.contains_key("model.layers.0.self_attn.embed_q.weight"));
+
+        // A zero `kv_lora_rank` is Rust integer division by zero on the very
+        // first solve, so it has to be refused before the division rather
+        // than after.
+        let mut zero_rank = honest.clone();
+        zero_rank.kv_lora_rank = 0;
+        let err =
+            DeepSeekV3Model::sanitize_weights(affine_kv_b_proj_weights(&zero_rank), &zero_rank)
+                .err()
+                .unwrap_or_else(|| panic!("kv_lora_rank 0 must be refused, not divided by"));
+        assert!(err.contains("kv_lora_rank"), "unhelpful error: {err}");
+
+        // A large `kv_lora_rank` truncates the solved bit width to 0, which
+        // is the divisor MLX would then divide by.
+        let mut wide_rank = honest.clone();
+        wide_rank.kv_lora_rank = 4096;
+        let err =
+            DeepSeekV3Model::sanitize_weights(affine_kv_b_proj_weights(&wide_rank), &wide_rank)
+                .err()
+                .unwrap_or_else(|| panic!("a solved bit width of 0 must be refused"));
+        assert!(err.contains("bits"), "unhelpful error: {err}");
+
+        // A non-quantized kv_b_proj carries no packing, so the pair is never
+        // solved and a `kv_lora_rank` that no packing could describe must not gate
+        // it. The tensor is built at `wide_rank`'s own width so it still satisfies
+        // the separate shape cross-check below the solve, which would otherwise
+        // reject this for an unrelated reason.
+        let mut float_only = WeightMap::new();
+        let rows = wide_rank.num_attention_heads as i32
+            * (wide_rank.qk_nope_head_dim + wide_rank.v_head_dim) as i32;
+        insert_ramp(
+            &mut float_only,
+            "model.layers.0.self_attn.kv_b_proj.weight",
+            &[rows, wide_rank.kv_lora_rank as i32],
+        );
+        DeepSeekV3Model::sanitize_weights(float_only, &wide_rank)
+            .expect("a float kv_b_proj must not be gated on quantization params");
+    }
+
+    /// Issue #1026: `sanitize_weights` decides `kv_b_proj` is quantized on
+    /// `.scales` alone, then used to take `.biases` with `.unwrap()`.
+    ///
+    /// Affine stores zero points; the block-float modes (mxfp4 / nvfp4 /
+    /// mxfp8) do not, which is exactly what `infer_quantization_mode` keys on.
+    /// A block-float `kv_b_proj` therefore satisfies the `.scales` gate and
+    /// arrives at the `.biases` removal with nothing to take, and the
+    /// `.unwrap()` made that a panic during weight sanitization. In the server
+    /// that takes the process down rather than rejecting one model load, which
+    /// is strictly worse than the load error it should be.
+    ///
+    /// The decomposition still dequantizes as `"affine"`, so a genuine
+    /// block-float `kv_b_proj` is not supported either way: what this pins is
+    /// that it is refused by name instead of unwinding. The assertion is on
+    /// the returned `Result` and no forward pass runs, so a regression fails
+    /// cleanly here.
+    #[test]
+    fn quantized_kv_b_proj_rejects_scales_with_no_biases() {
+        let mut cfg = test_config_dense_direct_q();
+        cfg.kv_lora_rank = 16;
+
+        // Positive control first, so a check that rejected every quantized
+        // kv_b_proj could not pass this test.
+        let sanitized = DeepSeekV3Model::sanitize_weights(affine_kv_b_proj_weights(&cfg), &cfg)
+            .expect("a kv_b_proj carrying both planes must still sanitize");
+        assert!(sanitized.contains_key("model.layers.0.self_attn.embed_q.weight"));
+
+        let err = DeepSeekV3Model::sanitize_weights(block_float_kv_b_proj_weights(&cfg), &cfg)
+            .err()
+            .expect("scales with no biases must be refused at load, not unwrapped");
+        assert!(
+            err.contains("model.layers.0.self_attn.kv_b_proj.biases"),
+            "the error must name the key that is missing, got: {err}"
+        );
+        assert!(
+            err.contains("scales but no biases"),
+            "the wording must match the other four MLA sanitizers, got: {err}"
+        );
     }
 }

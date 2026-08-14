@@ -81,7 +81,7 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::extract::State;
-use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::sse::Event;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -101,6 +101,7 @@ use crate::distributed::tcp_transport::TcpTransport;
 use crate::distributed::transport::{Transport, TransportBackend};
 use crate::server::ChatTemplateProcessor;
 use crate::server::config::{ServerConfig, ServerGenerateOptions};
+use crate::server::streaming::{SseKeepAlive, sse_response};
 use crate::server::tool_calls::stream_filter::{FilterOutput, StreamFilter};
 use crate::server::types::request::ChatCompletionRequest;
 use crate::server::types::{CompletionChunk, CompletionRequest, CompletionResponse, ErrorResponse};
@@ -634,6 +635,23 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
         return Ok(resp);
     }
 
+    // The router and single-node chat fronts share these guards so invalid
+    // tool choices and oversized tool arrays cannot reach template rendering.
+    if let Err(message) = super::routes::chat::validate_chat_tool_inputs(&request) {
+        return Ok(ErrorResponse::new(message, "invalid_request_error").into_response());
+    }
+
+    // PrefillRequestFrame cannot carry a compiled structured-output
+    // constraint to the decode node. Reject rather than return unconstrained
+    // output for a request that explicitly asked for structured output.
+    if request.response_format.is_some() {
+        return Ok(ErrorResponse::new(
+            "the disaggregated router does not support response_format (structured output) on /v1/chat/completions",
+            "invalid_request_error",
+        )
+        .into_response());
+    }
+
     // Render the chat template and reject multimodal requests (the
     // disaggregated path is text-only for pool-backed Fp16 families).
     let prepared = super::chat_request::prepare_chat_request_with_cache(
@@ -664,7 +682,18 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
 
     // Resolve sampling and token budget using the same defaults as the
     // model worker.
-    let opts = super::routes::chat::build_generate_options(&request.params, &state.config);
+    //
+    // Loop-detection amplifier signal (issues #967 and #977): the same
+    // tool-shaped prompt derivation as the single-node chat route.
+    //
+    // This value is currently inert on this path: `sampling_to_serializable`
+    // does not put `loop_detection` on the wire and
+    // `serving_protocol::sampling_from_serializable` hardcodes the disabled
+    // baseline, so the decode node never runs the detector. It is computed
+    // anyway so the front is correct the day the field is serialized.
+    let amplified = crate::server::request_options::chat_carries_loop_amplifier(&request);
+    let opts =
+        super::routes::chat::build_generate_options(&request.params, &state.config, amplified);
 
     // Assign a request id and dispatch the prefill request through the shared
     // tokenize -> select_prefill -> send body (issue #200). The chat id scheme
@@ -782,9 +811,17 @@ async fn route_chat(state: Arc<RouterState>, request: ChatCompletionRequest) -> 
             state2.finalize_request(&request_id_str2, completed);
         });
 
-        Ok(Sse::new(UnboundedReceiverStream::new(chunk_rx))
-            .keep_alive(KeepAlive::default())
-            .into_response())
+        // Go through the shared constructor rather than assembling
+        // `Sse::new(..).keep_alive(..)` here (#1107). These streams do not come
+        // from `sse_channel`, so the newtype is built directly, but the attach
+        // itself is the one every route uses. The interval is the shared
+        // `SSE_KEEPALIVE_INTERVAL_SECS` rather than the `KeepAlive::default()`
+        // these sites used to take (#1105); both are 15s under axum 0.7.9, so
+        // neither change moves behaviour today.
+        Ok(sse_response(
+            UnboundedReceiverStream::new(chunk_rx),
+            SseKeepAlive::default_for_long_prefill(),
+        ))
     } else {
         // Non-streaming: collect all tokens (filtered) then return a single
         // JSON object with `content`, `reasoning_content` when present, and a
@@ -940,7 +977,11 @@ async fn route_completion(state: Arc<RouterState>, request: CompletionRequest) -
 
     let prompt = request.prompt.clone();
     // Same default/override resolution as the single-node completion route.
-    let opts = super::routes::chat::build_generate_options(&request.params, &state.config);
+    //
+    // Loop-detection amplifier signal (issue #967): `CompletionRequest` has no
+    // `tools` field and the `response_format` guard above already rejected any
+    // structured-output request with a 400, so neither amplifier can be present.
+    let opts = super::routes::chat::build_generate_options(&request.params, &state.config, false);
 
     // Assign a request id and dispatch the prefill request through the shared
     // tokenize -> select_prefill -> send body. The completion id format
@@ -1042,9 +1083,17 @@ async fn route_completion(state: Arc<RouterState>, request: CompletionRequest) -
             state2.finalize_request(&response_id2, result.is_ok());
         });
 
-        Ok(Sse::new(UnboundedReceiverStream::new(chunk_rx))
-            .keep_alive(KeepAlive::default())
-            .into_response())
+        // Go through the shared constructor rather than assembling
+        // `Sse::new(..).keep_alive(..)` here (#1107). These streams do not come
+        // from `sse_channel`, so the newtype is built directly, but the attach
+        // itself is the one every route uses. The interval is the shared
+        // `SSE_KEEPALIVE_INTERVAL_SECS` rather than the `KeepAlive::default()`
+        // these sites used to take (#1105); both are 15s under axum 0.7.9, so
+        // neither change moves behaviour today.
+        Ok(sse_response(
+            UnboundedReceiverStream::new(chunk_rx),
+            SseKeepAlive::default_for_long_prefill(),
+        ))
     } else {
         // Non-streaming: collect all tokens, then return a single
         // `CompletionResponse` JSON object identical in shape to single-node.

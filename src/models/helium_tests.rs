@@ -294,24 +294,24 @@ fn to_llama3_args_asks_the_shared_decoder_for_traditional_rope() {
 }
 
 #[test]
-fn a_llama_config_cannot_turn_on_traditional_rope_through_json() {
-    // `rope_traditional` is `#[serde(skip)]` on purpose. Every family that
-    // already uses this decoder rotates split-half, and a checkpoint author must
-    // not be able to change how an existing checkpoint decodes by adding a key.
-    let args: crate::models::llama3::ModelArgs = serde_json::from_str(
-        r#"{
-            "model_type": "llama",
-            "hidden_size": 64,
-            "num_hidden_layers": 1,
-            "intermediate_size": 128,
-            "num_attention_heads": 2,
-            "rms_norm_eps": 1e-5,
-            "vocab_size": 32,
-            "rope_traditional": true
-        }"#,
-    )
-    .unwrap();
-    assert!(!args.rope_traditional);
+fn helium_still_needs_the_conversion_because_its_config_omits_the_key() {
+    // #931 made `llama3::ModelArgs::rope_traditional` deserializable, which
+    // could look like it makes `to_llama3_args` redundant. It does not: Helium's
+    // convention is fixed in upstream code, so the published `config.json`
+    // carries no `rope_traditional` key and parsing it directly yields `false`.
+    // The conversion is what supplies the flag, and this pins that the two are
+    // not interchangeable. The parse itself is covered in `llama3_tests.rs`.
+    assert!(
+        !HELIUM_1_PREVIEW_2B_CONFIG.contains("rope_traditional"),
+        "the pinned upstream config must not declare the key, or this test proves nothing"
+    );
+    let direct: crate::models::llama3::ModelArgs =
+        serde_json::from_str(HELIUM_1_PREVIEW_2B_CONFIG).unwrap();
+    assert!(
+        !direct.rope_traditional,
+        "parsing a Helium config straight into the shared args cannot recover the convention"
+    );
+    assert!(helium_1_preview_2b().to_llama3_args().rope_traditional);
 }
 
 #[test]
@@ -334,7 +334,7 @@ fn traditional_and_split_half_rope_are_different_rotations() {
 }
 
 #[test]
-fn attention_carries_the_traditional_flag_only_for_helium() {
+fn attention_carries_the_traditional_flag_from_its_args() {
     let args = tiny_args();
     let weights = tiny_weights(&args);
 
@@ -348,7 +348,7 @@ fn attention_carries_the_traditional_flag_only_for_helium() {
     let llama = Attention::from_weights(&weights, &llama_args, "model.layers.0.self_attn").unwrap();
     assert!(
         !llama.rope_traditional,
-        "every pre-Helium family must keep the split-half rotation"
+        "args that do not ask for the interleaved rotation must get the split-half one"
     );
 }
 
@@ -638,6 +638,43 @@ fn a_consistently_quantized_attention_block_is_accepted() {
     let mut weights = tiny_weights(&args);
     quantize_attention_block(&args, &mut weights, 0, scale_cols(&args, args.hidden_size));
     validate_weights(&weights, &args).unwrap();
+}
+
+#[test]
+fn a_mixed_bit_width_attention_block_is_accepted() {
+    // `mlx_lm`'s `mixed_4_8` predicate stores some layers' `v_proj` at 8 bits
+    // while `q_proj` / `k_proj` stay at 4. `FusedQKVLinear` loads that by
+    // keeping the three planes separate rather than concatenating them (issue
+    // #1090), so this validator must not reject it first. It used to: the
+    // second axis of a packed `.weight` is the packed width, which doubles from
+    // 4 to 8 bits, and an equality check across q/k/v therefore blocked exactly
+    // the layout the shared loader learned to handle.
+    //
+    // What still has to agree is the logical input width, which is invariant to
+    // the bit width: all three scales carry `hidden_size / group_size` groups,
+    // and the test below this one proves a violation of that is still caught.
+    let args = tiny_args();
+    let mut weights = tiny_weights(&args);
+    let cols = scale_cols(&args, args.hidden_size);
+    quantize_attention_block(&args, &mut weights, 0, cols);
+
+    // Real packed widths: `hidden * bits / 32` columns of uint32.
+    let hidden = args.hidden_size as i32;
+    let q_rows = (args.num_attention_heads * args.head_dim()) as i32;
+    let kv_rows = (args.num_kv_heads() * args.head_dim()) as i32;
+    for (name, rows, bits) in [
+        ("q_proj", q_rows, 4),
+        ("k_proj", kv_rows, 4),
+        ("v_proj", kv_rows, 8),
+        ("o_proj", hidden, 4),
+    ] {
+        weights.insert(
+            format!("model.layers.0.self_attn.{name}.weight"),
+            filled(&[rows, hidden * bits / 32]),
+        );
+    }
+
+    validate_weights(&weights, &args).expect("a mixed_4_8 attention block must load");
 }
 
 #[test]

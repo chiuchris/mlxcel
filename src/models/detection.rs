@@ -64,6 +64,26 @@ pub(crate) fn detect_text_or_vlm(
     }
 }
 
+/// Split the `phi` / `phi-msft` arm between the dense Phi decoder and Phixtral.
+///
+/// No phixtral checkpoint declares `model_type: "phixtral"`.
+/// `mlabonne/phixtral-4x2_8` declares `phi-msft`, and upstream mlx-lm reaches
+/// its phixtral implementation through `MODEL_REMAPPING` rather than the config
+/// value, so an arm keyed on the string `"phixtral"` could never fire. The
+/// discriminator is `num_local_experts`, which the sparse config carries and
+/// the dense Phi-2 config does not.
+///
+/// A value of 1 is treated as dense: it describes one expert, which is a dense
+/// MLP, and the phixtral block would be a needless indirection over it.
+pub(crate) fn detect_phi_model_type(config: &serde_json::Value) -> ModelType {
+    let num_local_experts = config["num_local_experts"].as_i64().unwrap_or(0);
+    if num_local_experts > 1 {
+        ModelType::Phixtral
+    } else {
+        ModelType::Phi
+    }
+}
+
 pub(crate) fn detect_hunyuan_model_type(config: &serde_json::Value) -> ModelType {
     let num_experts = config["num_experts"].as_i64().unwrap_or(1);
     if num_experts > 1 {
@@ -151,7 +171,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
             ModelType::Gemma3n,
             ModelType::Gemma3nVLM,
         )),
-        "phi" | "phi-msft" => Ok(ModelType::Phi),
+        "phi" | "phi-msft" => Ok(detect_phi_model_type(&v)),
         "phi3" => Ok(ModelType::Phi3),
         "phi4mm" => Ok(ModelType::Phi4MMVLM),
         "phi4-siglip" => Ok(ModelType::Phi4SigLipVLM),
@@ -161,8 +181,10 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "minimax" => Ok(ModelType::MiniMax),
         "minimax_m3" => Ok(ModelType::MiniMaxM3),
         "minimax_m3_vl" => Ok(ModelType::MiniMaxM3VL),
+        "muse_glimmer" => Ok(ModelType::MuseGlimmerVLM),
         "gpt_oss" => Ok(ModelType::GptOss),
         "mixtral" => Ok(ModelType::Mixtral),
+        "dbrx" => Ok(ModelType::Dbrx),
         "olmoe" => Ok(ModelType::OLMoE),
         "deepseek" => Ok(ModelType::DeepSeek),
         "deepseek_v2" => Ok(ModelType::DeepSeekV2),
@@ -189,6 +211,15 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "hunyuan" => Ok(detect_hunyuan_model_type(&v)),
         "mimo" => Ok(ModelType::MiMo),
         "bailing_moe" => Ok(ModelType::BailingMoe),
+        "bailing_moe_linear" => Ok(ModelType::BailingMoeLinear),
+        "afmoe" => Ok(ModelType::Afmoe),
+        // `Kwai-Klear/Klear-46B-A2.5B-Instruct` declares the CAPITALIZED
+        // `"Klear"`. It matches this lowercase arm only because
+        // `model_type_raw` is lowercased above; mlx-lm, which does not
+        // normalize, has to ship `Klear.py` and a byte-identical `klear.py` to
+        // cover both spellings. Without that normalization this arm would miss
+        // every published checkpoint.
+        "klear" => Ok(ModelType::Klear),
         "apertus" => Ok(ModelType::Apertus),
         "seed_oss" => Ok(ModelType::SeedOss),
         "granite" => Ok(ModelType::Granite),
@@ -198,10 +229,12 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "olmo" => Ok(ModelType::Olmo),
         "olmo2" => Ok(ModelType::Olmo2),
         "olmo3" => Ok(ModelType::Olmo3),
+        "openelm" => Ok(ModelType::OpenElm),
         "gpt2" => Ok(ModelType::Gpt2),
         "gpt_bigcode" => Ok(ModelType::GptBigCode),
         "gpt_neox" => Ok(ModelType::GptNeoX),
         "helium" => Ok(ModelType::Helium),
+        "telechat3" => Ok(ModelType::TeleChat3),
         "starcoder2" => Ok(ModelType::StarCoder2),
         "mellum" => Ok(ModelType::Mellum),
         "minicpm" => Ok(ModelType::MiniCPM),
@@ -234,6 +267,10 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "kimi_linear" => Ok(ModelType::KimiLinear),
         "kimi_vl" => Ok(ModelType::KimiVL),
         "kimi_k25" => Ok(ModelType::KimiK25),
+        // LocateAnything: MoonViT tower + MLP connector + Qwen2 text decoder.
+        // The text sub-config also says "qwen2", so this arm must win at the
+        // top level or the grounding VLM would load as a text-only Qwen2.
+        "locateanything" => Ok(ModelType::LocateAnythingVLM),
         "longcat_flash" => Ok(ModelType::LongcatFlash),
         "longcat_flash_ngram" => Ok(ModelType::LongcatFlashNgram),
         "step3p5" => Ok(ModelType::Step3p5),
@@ -246,6 +283,7 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "qwen3_omni_moe" => Ok(ModelType::Qwen3OmniMoe),
         "paddleocr_vl" => Ok(ModelType::PaddleOcrVL),
         "dots_ocr" => Ok(ModelType::DotsOcrVL),
+        "falcon_ocr" => Ok(ModelType::FalconOcrVL),
         "glm4v" => Ok(ModelType::Glm4v),
         "glm4v_moe" => Ok(ModelType::Glm4vMoe),
         "glm_ocr" => Ok(ModelType::GlmOcr),
@@ -288,9 +326,15 @@ pub fn get_model_type(model_path: &Path) -> Result<ModelType> {
         "aya_vision" => Ok(ModelType::AyaVisionVLM),
         "paligemma" => Ok(ModelType::PaliGemmaVLM),
         "pixtral" => Ok(ModelType::PixtralVLM),
+        // The released checkpoints (and both sub-configs) spell this `jvlm`;
+        // `jina_vlm` is only the upstream mlx-vlm module name and is accepted
+        // as an alias so a hand-edited config still routes.
+        "jvlm" | "jina_vlm" => Ok(ModelType::JinaVLM),
         "molmo" => Ok(ModelType::MolmoVLM),
         "molmo2" => Ok(ModelType::Molmo2VLM),
         "molmo_point" => Ok(ModelType::MolmoPointVLM),
+        // Florence-2 (DaViT tower + BART encoder-decoder text stack).
+        "florence2" => Ok(ModelType::Florence2VLM),
         // Speech-to-text (encoder-decoder ASR).
         "whisper" => Ok(ModelType::Whisper),
         _ => Err(anyhow::anyhow!(

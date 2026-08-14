@@ -12,10 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Unit tests for the DeepSeek Sparse Attention (DSA) lightning indexer.
+//! Unit tests for the DeepSeek Sparse Attention (DSA) lightning indexer and for
+//! the bound on declared quantization params that `load_switch_linear` applies
+//! before it stacks a quantized expert plane (issue #958).
 
-use super::ModelArgs;
 use super::indexer::{Indexer, indexer_top_indices};
+use super::{ModelArgs, load_switch_linear};
+use crate::models::switch_layers::HOSTILE_QUANT_PARAMS;
 use mlxcel_core::weights::WeightMap;
 use mlxcel_core::{MlxArray, UniquePtr};
 
@@ -288,7 +291,8 @@ fn synthetic_mla_weights(args: &ModelArgs, prefix: &str, with_indexer: bool) -> 
 fn tiny_mla_attention(args: &ModelArgs, with_indexer: bool) -> super::MLAAttention {
     let prefix = "model.layers.0.self_attn";
     let weights = synthetic_mla_weights(args, prefix, with_indexer);
-    let weights = super::DeepSeekV32Model::sanitize_weights(weights, args);
+    let weights =
+        super::DeepSeekV32Model::sanitize_weights(weights, args).expect("sanitize must succeed");
     super::load_mla_attention(&weights, args, prefix).expect("tiny MLA attention must load")
 }
 
@@ -417,7 +421,8 @@ fn sanitize_strips_only_the_mtp_trailer_layer() {
     );
     weights.insert("model.norm.weight".to_string(), f32_weight(&[6]));
 
-    let sanitized = super::DeepSeekV32Model::sanitize_weights(weights, &args);
+    let sanitized =
+        super::DeepSeekV32Model::sanitize_weights(weights, &args).expect("sanitize must succeed");
     assert!(
         sanitized.contains_key("model.layers.0.input_layernorm.weight"),
         "real decoder layer 0 must be kept"
@@ -429,5 +434,245 @@ fn sanitize_strips_only_the_mtp_trailer_layer() {
     assert!(
         sanitized.contains_key("model.norm.weight"),
         "non-layer keys must pass through"
+    );
+}
+
+/// Honest 4-bit expert geometry: `packed_in * 32 == bits * num_groups *
+/// group_size` (8 * 32 == 4 * 1 * 64), so the positive control below is a plane
+/// MLX can actually describe.
+const QUANT_EXPERTS: usize = 3;
+const QUANT_OUT: i32 = 4;
+const QUANT_PACKED_IN: i32 = 8;
+const QUANT_NUM_GROUPS: i32 = 1;
+const QUANT_GROUP_SIZE: i32 = 64;
+const QUANT_BITS: i32 = 4;
+
+const QUANT_PREFIX: &str = "model.layers.0.mlp.experts";
+const QUANT_WEIGHT_NAME: &str = "gate_proj";
+
+/// deepseek_v32 keeps the per-expert checkpoint layout
+/// (`{prefix}.{i}.{weight_name}.*`, stacked at load) rather than the pre-stacked
+/// `switch_mlp` plane, so the fixture is built expert by expert. Pass
+/// `quantized = false` to drop the `.scales` / `.biases` tensors and take the
+/// dense `gather_mm` path.
+fn deepseek_v32_expert_weights(quantized: bool) -> WeightMap {
+    let mut weights = WeightMap::new();
+    for expert_idx in 0..QUANT_EXPERTS {
+        let base = format!("{QUANT_PREFIX}.{expert_idx}.{QUANT_WEIGHT_NAME}");
+        weights.insert(
+            format!("{base}.weight"),
+            f32_weight(&[QUANT_OUT, QUANT_PACKED_IN]),
+        );
+        if quantized {
+            weights.insert(
+                format!("{base}.scales"),
+                f32_weight(&[QUANT_OUT, QUANT_NUM_GROUPS]),
+            );
+            weights.insert(
+                format!("{base}.biases"),
+                f32_weight(&[QUANT_OUT, QUANT_NUM_GROUPS]),
+            );
+        }
+    }
+    weights
+}
+
+/// The pair this loader stores is handed straight to `gather_qmm`, which crosses
+/// the cxx bridge as `UniquePtr<MlxArray>` rather than `Result`. A C++ throw
+/// there is an uncatchable `std::terminate`,
+/// so losing the bound turns a rejected load into an uncatchable abort at the
+/// first routed forward pass in production. This test asserts on the load
+/// result rather than running a forward pass, so a regression fails cleanly
+/// here instead of aborting the test binary.
+#[test]
+fn deepseek_v32_switch_linear_rejects_quantization_params_that_would_abort_gather_qmm() {
+    let weights = deepseek_v32_expert_weights(true);
+    let plane_prefix = format!("{QUANT_PREFIX}.{QUANT_WEIGHT_NAME}");
+
+    // Positive control first, so a guard that rejected every quantized plane
+    // could not pass this test.
+    let control = load_switch_linear(
+        &weights,
+        QUANT_EXPERTS,
+        QUANT_PREFIX,
+        QUANT_WEIGHT_NAME,
+        QUANT_GROUP_SIZE,
+        QUANT_BITS,
+    );
+    match control {
+        Ok(_) => {}
+        Err(e) => panic!("honest 4-bit expert plane must load: {e}"),
+    }
+
+    for (group_size, bits, field) in HOSTILE_QUANT_PARAMS {
+        let result = load_switch_linear(
+            &weights,
+            QUANT_EXPERTS,
+            QUANT_PREFIX,
+            QUANT_WEIGHT_NAME,
+            group_size,
+            bits,
+        );
+        let err = match result {
+            Ok(_) => panic!(
+                "(group_size {group_size}, bits {bits}) must be refused at load, \
+                 not stored for gather_qmm"
+            ),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains(field),
+            "(group_size {group_size}, bits {bits}) must be blamed on {field}, got: {err}"
+        );
+        assert!(
+            err.contains(&plane_prefix),
+            "the load error must name the offending tensor {plane_prefix}, got: {err}"
+        );
+    }
+
+    // A bf16 expert plane carries no packing and no `.scales`, so the declared
+    // pair is inert on the `gather_mm` path and must not gate the load.
+    let dense = deepseek_v32_expert_weights(false);
+    match load_switch_linear(&dense, QUANT_EXPERTS, QUANT_PREFIX, QUANT_WEIGHT_NAME, 0, 0) {
+        Ok(_) => {}
+        Err(e) => panic!("a non-quantized expert plane must load with an unset pair: {e}"),
+    }
+}
+
+/// An affine 4-bit `kv_b_proj` for every layer in `args`.
+///
+/// Honest geometry at `kv_lora_rank` 16: packed_in * 32 == bits * num_groups *
+/// group_size (2 * 32 == 4 * 1 * 16).
+///
+/// The packed plane is UINT32, not a float weight: `dequantize` rejects any
+/// other packed dtype by throwing, and that throw is the uncatchable abort
+/// these guards exist to keep out of the forward path.
+fn affine_kv_b_proj_weights(args: &ModelArgs) -> WeightMap {
+    let num_heads = args.num_attention_heads as i32;
+    let head_dim = (args.qk_nope_head_dim + args.v_head_dim) as i32;
+    let rows = num_heads * head_dim;
+    let mut weights = WeightMap::new();
+    for l in 0..args.num_hidden_layers {
+        let prefix = format!("model.layers.{l}.self_attn.kv_b_proj");
+        weights.insert(
+            format!("{prefix}.weight"),
+            mlxcel_core::zeros(&[rows, 2], mlxcel_core::dtype::UINT32),
+        );
+        weights.insert(format!("{prefix}.scales"), f32_weight(&[rows, 1]));
+        weights.insert(format!("{prefix}.biases"), f32_weight(&[rows, 1]));
+    }
+    weights
+}
+
+/// The same plane an mxfp4 / nvfp4 / mxfp8 export ships: `.scales` present,
+/// `.biases` absent, because the block-float modes carry no zero points.
+fn block_float_kv_b_proj_weights(args: &ModelArgs) -> WeightMap {
+    let mut weights = affine_kv_b_proj_weights(args);
+    for l in 0..args.num_hidden_layers {
+        weights.remove(&format!("model.layers.{l}.self_attn.kv_b_proj.biases"));
+    }
+    weights
+}
+
+/// The MLA `kv_b_proj` pair `DeepSeekV32Model::sanitize_weights` decomposes is
+/// solved from `kv_lora_rank` and two tensor axes rather than declared, and
+/// every input is untrusted: `kv_lora_rank` comes from `config.json` and the
+/// axes from the checkpoint. Before issue #958 the naive arithmetic divided by
+/// both without checking them, so a `kv_lora_rank` of 0 panicked on integer
+/// division and a solved pair outside anything MLX can describe reached
+/// `dequantize`, which crosses the cxx bridge as `UniquePtr<MlxArray>` rather
+/// than `Result` and therefore aborts during weight sanitization rather than
+/// failing the load.
+///
+/// This drives the real `DeepSeekV32Model::sanitize_weights` rather than the
+/// shared helper directly, so the guard is exercised where a checkpoint
+/// reaches it. The assertions are on the returned `Result`, so a regression
+/// fails cleanly here instead of aborting the test binary.
+#[test]
+fn quantized_kv_b_proj_rejects_a_kv_lora_rank_no_packing_can_describe() {
+    // Positive control first, so a guard that rejected every quantized
+    // kv_b_proj could not pass this test.
+    let mut honest = tiny_mla_config(2048);
+    honest.kv_lora_rank = 16;
+    let sanitized =
+        super::DeepSeekV32Model::sanitize_weights(affine_kv_b_proj_weights(&honest), &honest)
+            .expect("an honest quantized kv_b_proj must still sanitize");
+    assert!(sanitized.contains_key("model.layers.0.self_attn.embed_q.weight"));
+
+    // A zero `kv_lora_rank` is Rust integer division by zero on the very
+    // first solve, so it has to be refused before the division rather than
+    // after.
+    let mut zero_rank = honest.clone();
+    zero_rank.kv_lora_rank = 0;
+    let err =
+        super::DeepSeekV32Model::sanitize_weights(affine_kv_b_proj_weights(&zero_rank), &zero_rank)
+            .err()
+            .unwrap_or_else(|| panic!("kv_lora_rank 0 must be refused, not divided by"));
+    assert!(err.contains("kv_lora_rank"), "unhelpful error: {err}");
+
+    // A large `kv_lora_rank` truncates the solved bit width to 0, which is
+    // the divisor MLX would then divide by.
+    let mut wide_rank = honest.clone();
+    wide_rank.kv_lora_rank = 4096;
+    let err =
+        super::DeepSeekV32Model::sanitize_weights(affine_kv_b_proj_weights(&wide_rank), &wide_rank)
+            .err()
+            .unwrap_or_else(|| panic!("a solved bit width of 0 must be refused"));
+    assert!(err.contains("bits"), "unhelpful error: {err}");
+
+    // A non-quantized kv_b_proj carries no packing, so the pair is never
+    // solved and a `kv_lora_rank` that no packing could describe must not gate
+    // it. The tensor is built at `wide_rank`'s own width so it still satisfies
+    // the separate shape cross-check below the solve, which would otherwise
+    // reject this for an unrelated reason.
+    let mut float_only = WeightMap::new();
+    let rows = wide_rank.num_attention_heads as i32
+        * (wide_rank.qk_nope_head_dim + wide_rank.v_head_dim) as i32;
+    float_only.insert(
+        "model.layers.0.self_attn.kv_b_proj.weight".to_string(),
+        f32_weight(&[rows, wide_rank.kv_lora_rank as i32]),
+    );
+    super::DeepSeekV32Model::sanitize_weights(float_only, &wide_rank)
+        .expect("a float kv_b_proj must not be gated on quantization params");
+}
+
+/// Issue #1026: `sanitize_weights` decides `kv_b_proj` is quantized on
+/// `.scales` alone, then used to take `.biases` with `.unwrap()`.
+///
+/// Affine stores zero points; the block-float modes (mxfp4 / nvfp4 / mxfp8) do
+/// not, which is exactly what `infer_quantization_mode` keys on. A block-float
+/// `kv_b_proj` therefore satisfies the `.scales` gate and arrives at the
+/// `.biases` removal with nothing to take, and the `.unwrap()` made that a
+/// panic during weight sanitization. In the server that takes the process down
+/// rather than rejecting one model load, which is strictly worse than the load
+/// error it should be.
+///
+/// The decomposition below still dequantizes as `"affine"`, so a genuine
+/// block-float `kv_b_proj` is not supported either way: what this pins is that
+/// it is refused by name instead of unwinding. The assertion is on the returned
+/// `Result` and no forward pass runs, so a regression fails cleanly here.
+#[test]
+fn quantized_kv_b_proj_rejects_scales_with_no_biases() {
+    let mut args = tiny_mla_config(2048);
+    args.kv_lora_rank = 16;
+
+    // Positive control first, so a check that rejected every quantized
+    // kv_b_proj could not pass this test.
+    let sanitized =
+        super::DeepSeekV32Model::sanitize_weights(affine_kv_b_proj_weights(&args), &args)
+            .expect("a kv_b_proj carrying both planes must still sanitize");
+    assert!(sanitized.contains_key("model.layers.0.self_attn.embed_q.weight"));
+
+    let err =
+        super::DeepSeekV32Model::sanitize_weights(block_float_kv_b_proj_weights(&args), &args)
+            .err()
+            .expect("scales with no biases must be refused at load, not unwrapped");
+    assert!(
+        err.contains("model.layers.0.self_attn.kv_b_proj.biases"),
+        "the error must name the key that is missing, got: {err}"
+    );
+    assert!(
+        err.contains("scales but no biases"),
+        "the wording must match the other four MLA sanitizers, got: {err}"
     );
 }

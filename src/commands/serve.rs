@@ -46,7 +46,11 @@ pub(crate) async fn run_serve(mut args: crate::ServeArgs) -> anyhow::Result<()> 
     // / mlxcel store, or auto-downloaded into the mlxcel store on a miss. Done
     // here (not in `build_startup_input`) so the preflight estimate also sees
     // the resolved path.
-    args.model = resolve_model_source_with_override(&args.model, args.models_dir.as_deref())?;
+    args.model = resolve_model_source_with_override(
+        &args.model,
+        args.models_dir.as_deref(),
+        args.revision.as_deref(),
+    )?;
 
     // Issue #56: preflight memory check before the server begins
     // accepting connections. Refuses to start when total > available
@@ -232,6 +236,7 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         audio_queue_depth: args.audio_queue_depth,
         audio_request_timeout_secs: args.audio_request_timeout_secs,
         prefill_chunk_size: args.prefill_chunk_size,
+        prefill_grant_interval: args.prefill_grant_interval,
         batch_size: args.batch_size,
         ubatch_size: args.ubatch_size,
         enable_preemption: args.enable_preemption,
@@ -248,8 +253,12 @@ fn build_startup_input(mut args: crate::ServeArgs) -> anyhow::Result<ServerStart
         warmup: args.warmup,
         no_warmup: args._no_warmup,
         temperature: args.temp,
+        temperature_was_set: long_cli_flag_was_set("temp"),
         top_k: args.top_k,
+        top_k_was_set: long_cli_flag_was_set("top-k")
+            || std::env::var_os("LLAMA_ARG_TOP_K").is_some(),
         top_p: args.top_p,
+        top_p_was_set: long_cli_flag_was_set("top-p"),
         min_p: args.min_p,
         seed: args.seed,
         repeat_last_n: args.repeat_last_n,

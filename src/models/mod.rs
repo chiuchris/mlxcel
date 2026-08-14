@@ -26,18 +26,28 @@ mod recurrent_snapshot;
 mod sanitize;
 
 // Shared modules
+// `config` holds shared serde defaults and the common `QuantizationArgs`. It
+// was never declared here, so the file was orphaned: not compiled, not linted,
+// not tested. That is why its `get_mode` could hand out an unvalidated
+// quantization mode with nothing catching it (issue #973). Declaring it makes
+// the bound it now carries real rather than notional, so the next family that
+// reaches for the helper cannot inherit the hole.
+pub mod config;
 pub(crate) mod conv_decode;
 pub mod gated_delta;
 pub mod switch_layers;
 
 // Model implementations (mlxcel-core based)
+pub mod afmoe;
 pub mod apertus;
 pub mod baichuan;
 pub mod bailing_moe;
+pub mod bailing_moe_linear;
 pub mod bitnet;
 pub mod cohere;
 pub mod cohere2;
 pub mod cohere2_moe;
+pub mod dbrx;
 pub mod deepseek;
 pub mod deepseek_v2;
 pub mod deepseek_v3;
@@ -51,6 +61,9 @@ pub mod exaone;
 pub mod exaone4;
 pub mod exaone_moe;
 pub mod falcon_h1;
+pub mod falcon_ocr;
+pub mod falcon_ocr_rope;
+pub mod florence2;
 pub mod gemma;
 pub mod gemma2;
 pub mod gemma3;
@@ -76,7 +89,9 @@ pub mod hunyuan_vl;
 pub mod internlm2;
 pub mod internlm3;
 pub mod jamba;
+pub mod jina_vlm;
 pub mod kimi_linear;
+pub mod klear;
 pub mod lfm2;
 pub mod llada2_moe;
 pub mod llama3;
@@ -99,6 +114,10 @@ pub mod molmo2;
 pub mod molmo_point;
 pub mod moondream2;
 pub mod moondream3;
+pub mod muse_glimmer;
+pub(crate) mod muse_glimmer_cache;
+pub mod muse_glimmer_config;
+pub(crate) mod muse_glimmer_layers;
 pub mod nemotron;
 pub mod nemotron_h;
 pub mod nemotron_nas;
@@ -106,12 +125,14 @@ pub mod olmo;
 pub mod olmo2;
 pub mod olmo3;
 pub mod olmoe;
+pub mod openelm;
 pub mod paddleocr_vl;
 pub mod phi;
 pub mod phi3;
 pub mod phi3small;
 pub mod phi4mm;
 pub mod phimoe;
+pub mod phixtral;
 pub mod plamo2;
 pub mod qwen2;
 pub mod qwen2_moe;
@@ -130,6 +151,7 @@ pub mod solar_open;
 pub mod stablelm;
 pub mod starcoder2;
 pub mod step3p5;
+pub mod telechat3;
 pub mod whisper;
 pub mod youtu_vl_lm;
 
@@ -138,13 +160,16 @@ pub mod g2p;
 pub mod kokoro;
 
 // Re-export model types
+pub use afmoe::AfmoeModel;
 pub use apertus::ApertusModel;
 pub use baichuan::BaichuanModel;
 pub use bailing_moe::BailingMoeModel;
+pub use bailing_moe_linear::BailingMoeLinearModel;
 pub use bitnet::BitNetModel;
 pub use cohere::CohereModel;
 pub use cohere2::Cohere2Model;
 pub use cohere2_moe::Cohere2MoeModel;
+pub use dbrx::DbrxModel;
 pub use deepseek::DeepSeekModel;
 pub use deepseek_v2::DeepSeekV2Model;
 pub use deepseek_v3::DeepSeekV3Model;
@@ -158,6 +183,15 @@ pub use exaone::ExaOneModel;
 pub use exaone_moe::ExaoneMoeModel;
 pub use exaone4::{ExaOne4Model, ExaOne4Wrapper};
 pub use falcon_h1::FalconH1Model;
+pub use falcon_ocr::{FalconOcrConfig, FalconOcrTextModel};
+pub use falcon_ocr_rope::FalconOcrTokenIds;
+pub use florence2::{
+    FLORENCE2_LOC_TOKEN_BASE, FLORENCE2_VISION_PREFIX, Florence2BoundingBox, Florence2Config,
+    Florence2DaViT, Florence2ImageSize, Florence2Model, Florence2Output, Florence2Polygon,
+    Florence2PostProcessingType, Florence2Processor, Florence2QuadBox, Florence2Quantization,
+    Florence2RunOutput, Florence2SeqCache, Florence2Task, Florence2TaskResult, Florence2TextConfig,
+    Florence2TextModel, Florence2VisionConfig, Florence2VlmModel, florence2_loc_token_id,
+};
 pub use gemma::GemmaModel;
 pub use gemma2::Gemma2Model;
 pub use gemma3::{Gemma3Model, Gemma3Wrapper};
@@ -181,7 +215,9 @@ pub use hunyuan_v1_dense::HunyuanV1DenseModel;
 pub use internlm2::InternLM2Model;
 pub use internlm3::InternLM3Model;
 pub use jamba::JambaModel;
+pub use jina_vlm::{JinaVlmTextConfig, JinaVlmTextModel};
 pub use kimi_linear::KimiLinearModel;
+pub use klear::KlearModel;
 pub use lfm2::Lfm2Model;
 pub use llada2_moe::Llada2MoeModel;
 pub use llama3::Llama3Model;
@@ -203,6 +239,11 @@ pub use molmo2::Molmo2Model;
 pub use moondream2::Moondream2Model;
 pub use moondream3::Moondream3Model;
 pub use multimodal_placeholders::MultimodalPlaceholderTokens;
+pub use muse_glimmer::{
+    DEFAULT_IMAGE_END_TOKEN_ID, DEFAULT_IMAGE_PLACEHOLDER_TOKEN_ID, DEFAULT_IMAGE_START_TOKEN_ID,
+    DEFAULT_IMAGE_TOKEN_ID, MuseGlimmerConfig, MuseGlimmerTextConfig, MuseGlimmerTextModel,
+    MuseGlimmerTextWrapper, MuseGlimmerVisionConfig,
+};
 pub use nemotron::NemotronModel;
 pub use nemotron_h::NemotronHModel;
 pub use nemotron_nas::NemotronNASModel;
@@ -210,12 +251,14 @@ pub use olmo::OlmoModel;
 pub use olmo2::OLMo2Model;
 pub use olmo3::OLMo3Model;
 pub use olmoe::OlmoeModel;
+pub use openelm::OpenElmModel;
 pub use paddleocr_vl::{PaddleOcrTextConfig, PaddleOcrTextModel};
 pub use phi::PhiModel;
 pub use phi3::Phi3Model;
 pub use phi3small::Phi3SmallModel;
 pub use phi4mm::Phi4MMModel;
 pub use phimoe::PhiMoeModel;
+pub use phixtral::PhixtralModel;
 pub use plamo2::Plamo2Model;
 pub use qwen2::Qwen2Model;
 pub use qwen2_moe::Qwen2MoeModel;
@@ -244,6 +287,7 @@ pub use solar_open::SolarOpenModel;
 pub use stablelm::StableLMModel;
 pub use starcoder2::StarCoder2Model;
 pub use step3p5::Step3p5Model;
+pub use telechat3::TeleChat3Model;
 pub use whisper::WhisperModel;
 
 pub use kokoro::KokoroModel;
@@ -295,38 +339,52 @@ pub enum ModelType {
     Qwen3OmniMoe,      // Qwen3-Omni MoE thinker (Qwen3-VL-MoE + audio tower)
     PaddleOcrVL,       // PaddleOCR-VL (NaViT vision + ERNIE-4.5 w/ MRoPE)
     DotsOcrVL,         // dots.ocr (dots_vit ViT + Qwen2 text decoder)
+    FalconOcrVL,       // Falcon-OCR (early-fusion patch projector, no vision tower)
+    JinaVLM,           // Jina VLM (SigLIP-class ViT + Molmo-style connector + Qwen2 text)
     Glm4v,             // GLM-4V (GLM-4V ViT + GLM-4 text w/ sectioned MRoPE)
     Glm4vMoe,          // GLM-4V MoE (GLM-4V ViT + GLM-4 MoE text w/ MRoPE)
     GlmOcr,            // GLM-OCR (GLM-OCR ViT + GLM-4 text w/ full-width MRoPE)
     YoutuVLM,          // Youtu-VL (SigLIP2 windowed-attn + DeepSeek-V3-style MLA)
     InternVLChatVLM,   // InternVL (internvl_chat): InternViT + pixel-shuffle mlp1 + Qwen2 text
+    LocateAnythingVLM, // LocateAnything: MoonViT + MLP connector + Qwen2 text (grounding)
     SmolVLM,  // SmolVLM/SmolVLM2 (smolvlm): SigLIP + pixel-shuffle connector + SmolLM2 text
     Idefics2, // Idefics2 (idefics2): SigLIP + perceiver-resampler connector + Mistral text
     MiniCPMOVLM, // MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)
     MiniCPMV46VLM, // MiniCPM-V 4.6 (SigLIP + VitMerger + Merger + Qwen3.5 text)
     Moondream3VLM, // Moondream3 (custom ViT + custom text decoder, query/caption image path)
     Moondream2VLM, // Moondream2 (SigLIP-style ViT + Phi text decoder + crop tiling)
-    Gemma3n,  // Gemma 3n (text-only)
+    /// Florence-2 (`florence2`): DaViT vision tower + BART encoder-decoder
+    /// text stack. Encoder-decoder (seq2seq), so it is served through its own
+    /// task pipeline (CLI early exit), not the autoregressive decode loop.
+    Florence2VLM,
+    Gemma3n,    // Gemma 3n (text-only)
     Gemma3nVLM, // Gemma 3n VLM (MobileNetV5 + Gemma3n)
-    Phi,      // Phi 1/2
-    Phi3,     // Phi 3
-    Phi4MMVLM, // Phi-4 Multimodal (SigLIP2 NaFlex + Conformer audio + Phi4 text)
+    Phi,        // Phi 1/2
+    /// Phixtral (`phi-msft` with `num_local_experts`): a Mixtral-style
+    /// sparse MoE on the Phi-2 parallel-residual backbone. Shares the
+    /// `phi-msft` model_type with dense Phi and is told apart by
+    /// `num_local_experts`; see `detection::detect_phi_model_type`.
+    Phixtral,
+    Phi3,          // Phi 3
+    Phi4MMVLM,     // Phi-4 Multimodal (SigLIP2 NaFlex + Conformer audio + Phi4 text)
     Phi4SigLipVLM, // Phi-4 reasoning vision (SigLIP2 NaFlex + Phi3-style text)
-    Phi3VLM,  // Phi 3.5 Vision (CLIP + Phi3)
-    MolmoVLM, // Molmo v1 (CLIP ViT + attention pooling + OLMo-style text)
-    Molmo2VLM, // Molmo2 (custom ViT + attention pooling + Molmo2 text)
+    Phi3VLM,       // Phi 3.5 Vision (CLIP + Phi3)
+    MolmoVLM,      // Molmo v1 (CLIP ViT + attention pooling + OLMo-style text)
+    Molmo2VLM,     // Molmo2 (custom ViT + attention pooling + Molmo2 text)
     MolmoPointVLM, // Molmo-Point (custom ViT + point prediction + Molmo2 text)
-    Phi3Small, // Phi 3 Small
-    PhiMoe,   // Phi MoE
+    Phi3Small,     // Phi 3 Small
+    PhiMoe,        // Phi MoE
 
     // MoE models
     GptOss,
     MiniMax,
     MiniMaxM3,
-    MiniMaxM3VL, // MiniMax-M3-VL (CLIP ViT + M3 hybrid dense/MoE text)
+    MiniMaxM3VL,    // MiniMax-M3-VL (CLIP ViT + M3 hybrid dense/MoE text)
+    MuseGlimmerVLM, // Muse Glimmer (Meta VLM, Muse text decoder + vision tower)
     Mixtral,
     Qwen2Moe,
     OLMoE,
+    Dbrx, // Databricks DBRX (fused clipped QKV, norm-attn-norm, w1/v1/w2 experts)
 
     // DeepSeek family
     DeepSeek,
@@ -359,6 +417,19 @@ pub enum ModelType {
     /// decoder with a fused GQA `query_key_value` and a single wide shared
     /// expert.
     BailingMoe,
+    /// Ant Group Ling / Ring linear-attention MoE (`bailing_moe_linear`): the
+    /// same MoE block interleaved with gated-linear-attention layers whose decay
+    /// is a fixed ALiBi schedule.
+    BailingMoeLinear,
+
+    /// Arcee AFMoE (`afmoe`, the Trinity family): hybrid sliding/full
+    /// attention with NoPE global layers, a sigmoid attention gate,
+    /// sandwich norms, muP embedding scale and a sparse MoE FFN.
+    Afmoe,
+    /// Kuaishou Klear (`Klear`): a Qwen3-shaped sparse MoE whose shared
+    /// expert is blended with the routed mixture through a learned 2-way
+    /// softmax rather than added.
+    Klear,
 
     // Apertus (Swiss AI)
     Apertus,
@@ -382,6 +453,7 @@ pub enum ModelType {
     Olmo,
     Olmo2,
     Olmo3,
+    OpenElm, // Apple OpenELM (layer-wise scaling: per-layer head counts and FFN widths)
 
     // GPT-2 lineage
     Gpt2,       // GPT-2 (learned absolute position embeddings, Conv1D weight layout)
@@ -393,7 +465,8 @@ pub enum ModelType {
     Mellum, // Mellum 2 (JetBrains hybrid-attention MoE code model)
 
     // Other Transformer models
-    Helium, // Kyutai Helium (Llama-shaped dense decoder with traditional RoPE)
+    Helium,    // Kyutai Helium (Llama-shaped dense decoder with traditional RoPE)
+    TeleChat3, // TeleAI TeleChat3 (Llama-shaped dense decoder with YaRN RoPE scaling)
     MiniCPM,
     MiniCPM3,
     StableLM,
@@ -502,20 +575,25 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Qwen3OmniMoe,
     ModelType::PaddleOcrVL,
     ModelType::DotsOcrVL,
+    ModelType::FalconOcrVL,
+    ModelType::JinaVLM,
     ModelType::Glm4v,
     ModelType::Glm4vMoe,
     ModelType::GlmOcr,
     ModelType::YoutuVLM,
     ModelType::InternVLChatVLM,
+    ModelType::LocateAnythingVLM,
     ModelType::SmolVLM,
     ModelType::Idefics2,
     ModelType::MiniCPMOVLM,
     ModelType::MiniCPMV46VLM,
     ModelType::Moondream3VLM,
     ModelType::Moondream2VLM,
+    ModelType::Florence2VLM,
     ModelType::Gemma3n,
     ModelType::Gemma3nVLM,
     ModelType::Phi,
+    ModelType::Phixtral,
     ModelType::Phi3,
     ModelType::Phi4MMVLM,
     ModelType::Phi4SigLipVLM,
@@ -530,9 +608,11 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::MiniMax,
     ModelType::MiniMaxM3,
     ModelType::MiniMaxM3VL,
+    ModelType::MuseGlimmerVLM,
     ModelType::Mixtral,
     ModelType::Qwen2Moe,
     ModelType::OLMoE,
+    ModelType::Dbrx,
     // DeepSeek family
     ModelType::DeepSeek,
     ModelType::DeepSeekV2,
@@ -557,6 +637,9 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::HunyuanV1Dense,
     ModelType::MiMo,
     ModelType::BailingMoe,
+    ModelType::BailingMoeLinear,
+    ModelType::Afmoe,
+    ModelType::Klear,
     // Apertus (Swiss AI)
     ModelType::Apertus,
     // ByteDance Seed-OSS
@@ -574,6 +657,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Olmo,
     ModelType::Olmo2,
     ModelType::Olmo3,
+    ModelType::OpenElm,
     // GPT-2 lineage
     ModelType::Gpt2,
     ModelType::GptBigCode,
@@ -583,6 +667,7 @@ pub const ALL_MODEL_TYPES: &[ModelType] = &[
     ModelType::Mellum,
     // Other Transformer models
     ModelType::Helium,
+    ModelType::TeleChat3,
     ModelType::MiniCPM,
     ModelType::MiniCPM3,
     ModelType::StableLM,
@@ -670,6 +755,11 @@ impl ModelType {
             ModelType::Qwen3OmniMoe => ("Qwen3-Omni MoE (thinker)", "Qwen VLM"),
             ModelType::PaddleOcrVL => ("PaddleOCR-VL", "PaddleOCR VLM"),
             ModelType::DotsOcrVL => ("dots.ocr (dots_vit + Qwen2)", "Other VLM"),
+            ModelType::FalconOcrVL => ("Falcon-OCR (early fusion)", "Other VLM"),
+            ModelType::JinaVLM => (
+                "Jina VLM (SigLIP-so400m + 2x2 attention pooling + Qwen2 text)",
+                "Other VLM",
+            ),
             ModelType::Glm4v => ("GLM-4V", "GLM VLM"),
             ModelType::Glm4vMoe => ("GLM-4V MoE", "GLM VLM"),
             ModelType::GlmOcr => ("GLM-OCR", "GLM VLM"),
@@ -713,6 +803,7 @@ impl ModelType {
 
             // ----- Phi (text) -----
             ModelType::Phi => ("Phi 1 / 2", "Phi"),
+            ModelType::Phixtral => ("Phixtral (Phi-2 backbone + sparse MoE)", "Phi"),
             ModelType::Phi3 => ("Phi 3", "Phi"),
             ModelType::Phi3Small => ("Phi 3 Small", "Phi"),
             ModelType::PhiMoe => ("Phi MoE", "Phi"),
@@ -755,6 +846,12 @@ impl ModelType {
             ModelType::HunyuanV1Dense => ("Hunyuan v1 Dense", "Hunyuan"),
             ModelType::HunyuanMoe => ("Hunyuan MoE", "Hunyuan"),
             ModelType::BailingMoe => ("Ling / Bailing MoE (shared + routed experts)", "Bailing"),
+            ModelType::Afmoe => ("Arcee AFMoE / Trinity (sliding + full hybrid MoE)", "Arcee"),
+            ModelType::Klear => ("Klear MoE (coefficient-blended shared expert)", "Klear"),
+            ModelType::BailingMoeLinear => (
+                "Ling / Ring linear-attention MoE (GLA + full attention hybrid)",
+                "Bailing",
+            ),
 
             // ----- IBM Granite -----
             ModelType::Granite => ("Granite (dense)", "Granite"),
@@ -773,6 +870,7 @@ impl ModelType {
             ModelType::Olmo => ("OLMo 1", "OLMo"),
             ModelType::Olmo2 => ("OLMo 2", "OLMo"),
             ModelType::Olmo3 => ("OLMo 3", "OLMo"),
+            ModelType::OpenElm => ("Apple OpenELM (layer-wise scaling)", "Specialized"),
             ModelType::OLMoE => ("OLMoE (MoE)", "OLMo"),
 
             // ----- Nemotron -----
@@ -795,7 +893,12 @@ impl ModelType {
                 "MiniMax-M3-VL (CLIP ViT + M3 hybrid dense/MoE)",
                 "MiniMax VLM",
             ),
+            ModelType::MuseGlimmerVLM => (
+                "Muse Glimmer 30B VLM (BF16/MLX 4-bit, mixed 2048 sliding/full cache, ATEM)",
+                "Muse VLM",
+            ),
             ModelType::Mixtral => ("Mixtral (MoE)", "MoE (other)"),
+            ModelType::Dbrx => ("Databricks DBRX (MoE)", "MoE (other)"),
             ModelType::KimiLinear => ("Kimi Linear (MLA + GatedDeltaNet hybrid)", "MoE (other)"),
             ModelType::KimiVL => ("Kimi-VL (MoonViT + DeepSeek-V3 MoE)", "Kimi VLM"),
             ModelType::KimiK25 => ("Kimi-VL 2.5 (MoonViT + DeepSeek-V3 MoE)", "Kimi VLM"),
@@ -849,6 +952,10 @@ impl ModelType {
                 "Kyutai Helium (dense Llama shape, traditional RoPE)",
                 "Specialized",
             ),
+            ModelType::TeleChat3 => (
+                "TeleAI TeleChat3 (dense Llama shape, YaRN RoPE)",
+                "Specialized",
+            ),
             ModelType::StarCoder2 => ("StarCoder 2", "Specialized"),
             ModelType::Mellum => ("Mellum 2 (JetBrains code)", "Specialized"),
             ModelType::StableLM => ("StableLM", "Specialized"),
@@ -887,6 +994,10 @@ impl ModelType {
             ModelType::InternVLChatVLM => {
                 ("InternVL (InternViT + pixel-shuffle + Qwen2)", "Other VLM")
             }
+            ModelType::LocateAnythingVLM => (
+                "LocateAnything (MoonViT + MLP connector + Qwen2, grounding)",
+                "Other VLM",
+            ),
             ModelType::SmolVLM => ("SmolVLM (SigLIP + pixel-shuffle + SmolLM2)", "Other VLM"),
             ModelType::Idefics2 => (
                 "Idefics2 (SigLIP + perceiver resampler + Mistral)",
@@ -899,6 +1010,10 @@ impl ModelType {
             }
             ModelType::Moondream3VLM => ("Moondream 3 (custom ViT + custom decoder)", "Other VLM"),
             ModelType::Moondream2VLM => ("Moondream 2 (SigLIP-style ViT + Phi text)", "Other VLM"),
+            ModelType::Florence2VLM => (
+                "Florence-2 (DaViT + BART seq2seq, task prompts)",
+                "Other VLM",
+            ),
             ModelType::MiniCPMOVLM => (
                 "MiniCPM-o (dynamic SigLIP + resampler + Qwen3-VL text)",
                 "Other VLM",
@@ -1001,20 +1116,25 @@ mod metadata_tests {
             Qwen3OmniMoe,
             PaddleOcrVL,
             DotsOcrVL,
+            FalconOcrVL,
+            JinaVLM,
             Glm4v,
             Glm4vMoe,
             GlmOcr,
             YoutuVLM,
             InternVLChatVLM,
+            LocateAnythingVLM,
             SmolVLM,
             Idefics2,
             MiniCPMOVLM,
             MiniCPMV46VLM,
             Moondream3VLM,
             Moondream2VLM,
+            Florence2VLM,
             Gemma3n,
             Gemma3nVLM,
             Phi,
+            Phixtral,
             Phi3,
             Phi4MMVLM,
             Phi4SigLipVLM,
@@ -1028,9 +1148,11 @@ mod metadata_tests {
             MiniMax,
             MiniMaxM3,
             MiniMaxM3VL,
+            MuseGlimmerVLM,
             Mixtral,
             Qwen2Moe,
             OLMoE,
+            Dbrx,
             DeepSeek,
             DeepSeekV2,
             DeepSeekV3,
@@ -1052,6 +1174,9 @@ mod metadata_tests {
             HunyuanV1Dense,
             MiMo,
             BailingMoe,
+            BailingMoeLinear,
+            Afmoe,
+            Klear,
             Apertus,
             SeedOss,
             Granite,
@@ -1063,12 +1188,14 @@ mod metadata_tests {
             Olmo,
             Olmo2,
             Olmo3,
+            OpenElm,
             Gpt2,
             GptBigCode,
             GptNeoX,
             StarCoder2,
             Mellum,
             Helium,
+            TeleChat3,
             MiniCPM,
             MiniCPM3,
             StableLM,

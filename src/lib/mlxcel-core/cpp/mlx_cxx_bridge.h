@@ -1283,6 +1283,130 @@ std::unique_ptr<MlxArray> fused_sample(
     float min_p
 );
 
+// Pre-#900 reference sampler: identical to `fused_sample` except that the
+// no-filter stochastic path always uses `random::categorical` instead of the
+// Gumbel-max kernel. Kept for the A/B microbenchmark and the parity tests.
+std::unique_ptr<MlxArray> fused_sample_categorical(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p
+);
+
+// The exact categorical distribution `fused_sample` draws from (#902), as a
+// float32 [batch, vocab] row-normalized probability tensor. Shares the filter
+// chain with `fused_sample` so support and masses cannot drift. A greedy
+// configuration (temperature == 0 or top_k == 1) returns the one-hot argmax
+// indicator.
+std::unique_ptr<MlxArray> fused_sample_probs(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p
+);
+
+// Softmax-free Gumbel-max categorical sampling (#900), called directly.
+// `logits` is 2D [batch, vocab]; returns [batch] uint32 token ids.
+std::unique_ptr<MlxArray> gumbel_max_sample(
+    const MlxArray& logits,
+    float temperature
+);
+
+// True when `fused_sample`'s no-filter path takes the Gumbel-max kernel:
+// backend support plus a non-falsy `MLXCEL_SAMPLING_GUMBEL`.
+bool sampling_gumbel_available();
+
+// Threadgroups the Gumbel-max kernel puts on one row for this launch shape.
+// Exposed so tests can pin that the sampled id does not depend on it.
+int32_t gumbel_sample_num_splits(int32_t batch, int32_t vocab);
+
+// Dual-pivot rejection sampling for top-k / top-p / min-p (#901), forced.
+// Bypasses the `MLXCEL_SAMPLING_REJECTION` gate and takes an explicit round cap
+// so a test can drive the cap-overflow fallback. Falls back to the
+// `argpartition` chain exactly as the production path does when a row fails to
+// converge, and counts the event.
+std::unique_ptr<MlxArray> fused_sample_rejection(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p,
+    int32_t max_rounds
+);
+
+// The production rejection launch with an explicit round cap, landed and
+// checked in place. Shares `count_and_report_overflow` with the deferred drain,
+// so a test can pin the overflow counting rule and its report without depending
+// on the best-effort ring that delivers flags in production.
+std::unique_ptr<MlxArray> fused_sample_rejection_deferred(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p,
+    int32_t max_rounds
+);
+
+// Raw rejection kernel outputs, stacked as `[3, batch]` uint32:
+// row 0 sampled ids, row 1 the per-row converged flag, row 2 rounds consumed.
+// No host readback and no fallback, so a test can observe the kernel's own
+// verdict rather than the caller's reaction to it.
+std::unique_ptr<MlxArray> sampling_rejection_probe(
+    const MlxArray& logits,
+    float temperature,
+    int32_t top_k,
+    float top_p,
+    float min_p,
+    int32_t max_rounds
+);
+
+// True when `fused_sample`'s filtered path takes the rejection kernel: backend
+// support plus a non-falsy `MLXCEL_SAMPLING_REJECTION`.
+bool sampling_rejection_available();
+
+// Pure routing policy: would this configuration go to the rejection kernel,
+// ignoring backend support and the env switch? The kernel replaces a sort, so
+// it is routed only where the stock chain sorts (top-p active), and the
+// top-k + top-p combination is capped at the vocabulary where it measured a
+// win. See the measurement table above the definition.
+bool sampling_rejection_routes(
+    int32_t vocab,
+    int32_t top_k,
+    float top_p,
+    float min_p
+);
+
+// Threads per threadgroup the rejection kernel launches with.
+int32_t sampling_rejection_threadgroup_size();
+
+// Rejection rounds the production path allows before falling back.
+int32_t sampling_rejection_max_rounds();
+
+// Rows that exhausted the rejection round cap, cumulative.
+uint64_t sampling_rejection_cap_overflow_rows();
+
+// Launches in which at least one row exhausted the cap.
+uint64_t sampling_rejection_cap_overflow_launches();
+
+// Bitmask of sampling dispatch outcome kinds recorded but not yet drained.
+uint32_t sampling_dispatch_pending_kinds();
+
+// Pop one pending dispatch outcome description, or "" when none is pending.
+rust::String sampling_dispatch_drain_report();
+
+// Every dispatch outcome description recorded since the last reset,
+// newline-joined. Non-destructive, unlike the drain above.
+rust::String sampling_dispatch_recorded_report();
+
+// Inspect every deferred rejection launch that has landed, now. Non-blocking:
+// a launch still in flight is left for later. For tests.
+void sampling_dispatch_drain_pending();
+
+// Clear every recorded dispatch outcome and both cap-overflow counters.
+void sampling_dispatch_reset();
+
 // SSM (State Space Model) primitives for Mamba/Jamba/Nemotron-H.
 // Cumulative sum along axis
 std::unique_ptr<MlxArray> cumsum(const MlxArray& a, int32_t axis, bool reverse, bool inclusive);
@@ -1975,6 +2099,10 @@ std::unique_ptr<MlxArray> steel_outputs_take_hot(Turbo4DelegatedSteelOutputs& o)
 // `[B, Hq, 1, D]` f32; `k_pool` / `v_pool` are `[num_blocks, block_size, Hkv,
 // D]` f16; `rows` / `row_offsets` / `logical_starts` / `visible_lens` are i32
 // block-table metadata. Returns `[B, Hq, 1, D]` f32.
+//
+// `num_splits_override` selects the `NumSplits` launch shape (issue #906
+// autotuner); `0` keeps the memory-budget ceiling, which is the pre-#906
+// behavior. Out-of-range values fall back to the ceiling.
 std::unique_ptr<MlxArray> paged_attention_decode(
     const MlxArray& q,
     const MlxArray& k_pool,
@@ -1983,7 +2111,125 @@ std::unique_ptr<MlxArray> paged_attention_decode(
     const MlxArray& row_offsets,
     const MlxArray& logical_starts,
     const MlxArray& visible_lens,
-    float scale);
+    float scale,
+    int32_t num_splits_override);
+
+// Largest feasible `NumSplits` for a head dimension, forwarded from
+// `mlxcel::turbo::paged_attention_num_splits_cap`. The autotuner enumerates its
+// candidate set from this so the launcher stays the single source of truth for
+// the threadgroup-memory budget (issue #906).
+int32_t paged_attention_num_splits_cap(int32_t dim);
+
+// Paged-attention decode v2 partial kernel (issue #898). Wraps
+// `mlxcel::turbo::paged_attention_decode_v2_partial`: cross-CTA split-KV over a
+// CSR page table, one CTA per `(chunk, kv head, q-head group)`. `q` is
+// `[B, Hq, 1, D]` f32; `k_pool` / `v_pool` are `[num_blocks, page_size, Hkv,
+// D]` f16; `indices` / `indptr` / `last_page_len` / `first_page_offset` are the
+// CSR view; `request_indices` / `kv_tile_indices` / `params` come from the
+// host-side plan. Both outputs come back through out-params because cxx cannot
+// return a tuple of `unique_ptr`: `partial_v_out` is
+// `[num_chunks, Hq, D]` f32 and `lse_out` is `[num_chunks, Hq]` f32 in log2
+// units.
+void paged_attention_decode_v2_partial(
+    const MlxArray& q,
+    const MlxArray& k_pool,
+    const MlxArray& v_pool,
+    const MlxArray& indices,
+    const MlxArray& indptr,
+    const MlxArray& last_page_len,
+    const MlxArray& first_page_offset,
+    const MlxArray& request_indices,
+    const MlxArray& kv_tile_indices,
+    const MlxArray& params,
+    float scale,
+    std::unique_ptr<MlxArray>& partial_v_out,
+    std::unique_ptr<MlxArray>& lse_out);
+
+// Variable-length attention-state merge kernel (issue #898). Wraps
+// `mlxcel::turbo::paged_attention_merge_states`. `v_in` is `[N, H, D]` f32
+// (each partial already softmax-normalized), `lse_in` is `[N, H]` f32 in log2
+// units, and `o_indptr` is `[M + 1]` i32 grouping partial rows into output
+// rows. Returns `[M, H, D]` f32 and `[M, H]` f32 through the out-params. The
+// cascade-attention issue #903 reuses this kernel unchanged.
+void paged_attention_merge_states(
+    const MlxArray& v_in,
+    const MlxArray& lse_in,
+    const MlxArray& o_indptr,
+    std::unique_ptr<MlxArray>& v_out,
+    std::unique_ptr<MlxArray>& lse_out);
+
+// Query heads one v2 CTA processes together, forwarded from
+// `mlxcel::turbo::paged_attention_v2_q_heads_per_cta` (issue #898). Always
+// divides `n_rep`. The Rust plan derives its CTA count from this so the plan
+// and the launcher cannot drift.
+int32_t paged_attention_v2_q_heads_per_cta(int32_t dim, int32_t n_rep);
+
+// SIMD groups per v2 CTA, forwarded from
+// `mlxcel::turbo::paged_attention_v2_num_warps` (issue #898).
+int32_t paged_attention_v2_num_warps(int32_t dim, int32_t q_heads_per_cta);
+
+// Fused residual-add + RMSNorm kernel launcher (issue #905).
+//
+// Wraps `mlxcel::turbo::fused_add_rms_norm`. Computes `new_residual = x +
+// residual` and `normed = rms_norm(new_residual) * (weight_bias + weight)` in a
+// single dispatch. `weight_bias` is `0.0` for a standard RMSNorm and `1.0` for
+// the Gemma `(1 + w)` convention. `x` and `residual` must share shape and
+// dtype; `weight` is `[D]` where `D` is the trailing dim.
+//
+// MLX arrays are immutable from the graph's perspective, so the in-place
+// residual update is expressed as two outputs rather than a mutation: both
+// come back through out-params because cxx cannot return a tuple of
+// `unique_ptr`.
+void fused_add_rms_norm(
+    const MlxArray& x,
+    const MlxArray& residual,
+    const MlxArray& weight,
+    float eps,
+    float weight_bias,
+    std::unique_ptr<MlxArray>& normed_out,
+    std::unique_ptr<MlxArray>& new_residual_out);
+
+// Whether the current backend has a fused-add-RMSNorm kernel at all (issue
+// #905). False on a CPU-only build, where both `metal_kernel` and `cuda_kernel`
+// throw; the Rust helper consults this before committing to the fused path.
+bool fused_add_rms_norm_available();
+
+// Fused q/k RoPE + KV-append-layout kernel launcher (issue #905).
+//
+// Wraps `mlxcel::turbo::fused_rope_qk_append`. Reads the row-contiguous fused
+// QKV projection output `[B, L, (Hq + 2*Hkv) * D]` whole, applies rotary
+// embedding to the q and k blocks, and emits all three already laid out for the
+// consumer that follows: `q_out` in attention order `[B, Hq, L, D]`, and
+// `k_out` / `v_out` in the layout selected by `dest_layout` (`0` = dense
+// `KVCache` slab order `[B, Hkv, L, D]`, `1` = paged pool block row order
+// `[B, L, Hkv, D]`). V is relayout-only, not rotated.
+//
+// Taking the whole `qkv` rather than three trailing-axis slices is deliberate:
+// a slice of the last axis is not row-contiguous, and the custom kernel's
+// `ensure_row_contiguous` would insert exactly the materializing copies this
+// kernel exists to remove.
+//
+// `positions_base` is the absolute position of the first token in the window,
+// which is what `KVCache::offset` and `RingSlidingKVCache`'s absolute positions
+// both provide.
+void fused_rope_qk_append(
+    const MlxArray& qkv,
+    int32_t num_heads,
+    int32_t num_kv_heads,
+    int32_t head_dim,
+    int32_t rope_dims,
+    float rope_base,
+    float rope_scale,
+    bool traditional,
+    int32_t positions_base,
+    int32_t dest_layout,
+    std::unique_ptr<MlxArray>& q_out,
+    std::unique_ptr<MlxArray>& k_out,
+    std::unique_ptr<MlxArray>& v_out);
+
+// Whether the current backend has a fused RoPE + KV-append kernel at all
+// (issue #905). False on a CPU-only build.
+bool fused_rope_qk_append_available();
 
 // Opaque holder for weights loaded via MLX's native load_safetensors().
 // Arrays are lazy — MLX manages the mmap internally, no eager copy needed.

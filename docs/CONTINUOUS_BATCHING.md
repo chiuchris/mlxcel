@@ -21,6 +21,7 @@ token, then streams the new tokens out. Relevant flags:
 | `--max-batch-prefill-tokens N` | (derived) | Padded-token budget bounding one batched prefill's transient memory. Unset derives `2 * max_batch_prefill * prefill_chunk_size`; `0` disables the cap. |
 | `--max-queue-depth N` | 32 | Maximum queued (not yet admitted) requests. |
 | `--prefill-chunk-size N` | 512 | Token chunk size for prefill; bounds prefill's effect on decode latency. |
+| `--prefill-grant-interval N` | 16 | Decode ticks a parked chunked prefill yields before it is granted one; bounds an admitted long prompt's time to first token. `0` disables the grant (unbounded wait). |
 | `--enable-preemption` | off | Allow evicting a lower-priority sequence to admit a waiting one. |
 | `--no-batch` | off | Disable batching and serve sequentially (the legacy single worker). |
 | `--no-prompt-cache` | off | Disable the prompt-prefix KV cache (it is on by default). |
@@ -58,8 +59,8 @@ Escape hatches restore the previous single-client behavior: `--parallel 1`
 > (vs 40.5 / 49.8 / 49.6 with the kill switch off). Scaling stays sublinear
 > versus Metal because attention KV reads still grow with B; the small-M
 > `qmm_sm80` tile shape (`M*B >= 8`) remains upstream MLX territory. For the
-> same reason, keep `--n-parallel` (mlxcel-server: `--parallel`) at 7 or below
-> on CUDA: the multirow window covers 2-7 rows, and a full batch of 8+ decode
+> same reason, keep `--parallel` at 7 or below on CUDA (both server binaries
+> also accept `--n-parallel`): the multirow window covers 2-7 rows, and a full batch of 8+ decode
 > rows crosses into the under-tiled `qmm_sm80` shape, which measures worse
 > than per-row decode until the upstream small-M tile lands. The shipped
 > default of 4 sits comfortably inside the window. See
@@ -104,6 +105,67 @@ full-context sequences run into an OOM abort. On the dense decode backend the
 budget is inert. Disable the guard with `--kv-cache-budget none`. Memory-
 constrained hosts can also lower `--parallel` or cap `--ctx-size` (see the
 context-sizing note in [environment-variables.md](environment-variables.md)).
+
+### How a chunked prefill shares ticks with decode (`--prefill-grant-interval`)
+
+The flag table above says `--prefill-chunk-size` "bounds prefill's effect on
+decode latency". That is true, and it is worth stating what the tick policy
+actually does, because the shape is not what a chunk size usually implies.
+
+A prompt longer than `--prefill-chunk-size` is admitted, runs chunk 0, and is
+then parked. From that point the tick policy resolves in favour of decode for as
+long as any sequence is active. Before issue #1011 it resolved that way
+*forever*: the policy is a pure function of scheduler state, and running a decode
+changes none of the state it reads, so the parked prompt made no progress at all
+until the last decoding sequence finished. Measured on an M1 Ultra, the prefill
+held at chunk 1 of 19 for 20 s while decode advanced 162 to 344 steps. With
+requests arriving continuously that wait has no ceiling, so neither does the
+admitted request's time to first token.
+
+`--prefill-grant-interval N` (default 16) bounds it. After `N` consecutive
+decode ticks the next tick is GRANTED to the parked prefill, which runs one
+chunk and resets the count. So:
+
+- **The bound.** The parked prompt advances at least one chunk per `N + 1`
+  ticks, so a `C`-chunk prompt reaches its first token within `C * (N + 1)`
+  ticks of admission, however long the batch keeps decoding.
+- **The price.** Over one grant cycle the decoding streams get `N` tokens per
+  `N * D + P` of wall clock, for a decode step `D` and a chunk forward `P`, so
+  their mean inter-token latency during the admission window is `D + P / N`.
+  Their p95 is a different shape: one gap in `N + 1` carries the chunk, so the
+  chunk shows up in p95 whenever `N < 19` and hides above p95 otherwise. The
+  hiccup is the same size either way; only its frequency changes, so tuning `N`
+  to keep a percentile clean is not the same as making the streams faster.
+
+`N` is therefore the TTFT-versus-ITL dial, on the same frontier
+`--prefill-chunk-size` moves from the other direction: a smaller chunk makes
+each hiccup smaller, a smaller interval makes them more frequent and the
+admitted request faster. `--prefill-grant-interval 0` disables the grant and
+restores the pre-#1011 arbitration, unbounded wait included. Measured frontier:
+[`docs/benchmark_results/prefill-fairness-m1ultra-2026-08-03.md`](benchmark_results/prefill-fairness-m1ultra-2026-08-03.md).
+
+Two further things worth knowing when reading latency numbers:
+
+- With the batch already at `--parallel`, a queued request is not admitted at
+  all, so it contributes no prefill and none of the above arises. The scenario
+  "a long prompt prefills while others decode" needs `--parallel` strictly above
+  the number of active streams.
+- At most one chunked prefill is ever parked. The scheduler holds it in a single
+  slot and the chunked branch short-circuits above the admission branch, so
+  while one prompt is parked no further request is admitted whatever the batch's
+  occupancy. Shortening the parked prompt's stay therefore also shortens the
+  head-of-line wait of everything queued behind it.
+
+Issue #908 analysed the same branch and decided against fixing it with a fused
+ragged forward; see
+[ADR 0005](adr/0005-mixed-prefill-decode-step-execution.md). The experimental
+`MLXCEL_MIXED_STEP=1` remains as the extreme end of the frontier: every tick
+advances both workloads, which minimizes the parked prompt's TTFT and maximizes
+what the decoding streams pay. It is a measurement instrument, not a supported
+operator knob. `scripts/bench_mixed_step_admission.py` drives the scenario and
+attributes each run through `mlxcel_batch_mixed_steps_total` (the #908
+prototype) and `mlxcel_batch_prefill_grants_total` (the #1011 grant);
+`scripts/bench/starvation_probe.sh` samples the same counters over time.
 
 ### Bounding the batched-prefill transient (`--max-batch-prefill-tokens`)
 
@@ -180,6 +242,79 @@ savings, the decode throughput, and `--kv-cache-budget` are documented in
 [turbo-kv-cache.md](turbo-kv-cache.md#unified-paged-kv-cache). Paged decode is
 byte-identical to the dense backend; it is the storage backend the disaggregated
 roles below build on.
+
+#### The fused decode kernel
+
+Since v0.4.4 a batched paged decode step runs as **one fused attention launch
+over the whole batch** (issue #899) rather than as a per-sequence loop that
+copied each sequence's visible KV out of the pool before attending. The kernel
+reads the pool's scattered pages in place through a CSR page table and splits
+the KV range across thread blocks, so its parallelism grows with context
+instead of saturating. Measured against the previous path on an Apple M1 Ultra:
+1.4x to 3.1x at batch 4 across 1K to 32K of context, and 1.3x to 1.5x for a
+single sequence at 16K and 32K
+(`docs/benchmark_results/paged-decode-v2-m1ultra-2026-07-31.md`).
+
+What it does *not* serve falls back to the previous gather-then-SDPA path, per
+launch, with identical output:
+
+| case | why |
+|---|---|
+| a lone request under 4096 visible KV tokens | measured slower there (0.91x at batch 1 with 1K of context) |
+| a multi-request launch under 512 visible tokens per request | below the measured evidence, and gather is trivially cheap at that size |
+| a layer whose pool rows span more than one slab | the kernel reads one contiguous buffer per side |
+| multi-token steps: batched prefill, speculative / MTP verify | the kernel serves a single query token per sequence |
+| logit-softcap families, explicit attention masks | no soft-cap or mask term in the kernel |
+| Int8 / Turbo KV modes | those sequences keep dense caches and are never pool-backed |
+
+The floor is two-regime because the measured loss is a property of batch 1, not
+of total work: at 1024 tokens of context per request the kernel runs 0.91x at
+batch 1 but 1.41x at batch 4 and 1.47x at batch 8, since a batched launch
+spreads the same chunk count over more requests and amortizes the merge pass.
+
+#### Seeing which path ran
+
+The server announces the first occurrence of each distinct dispatch outcome at
+**info**, with no `RUST_LOG` needed:
+
+```text
+INFO ...: paged decode v2: fused v2 launch (batch 4, 3828 visible KV tokens, 16 chunks, merge on)
+INFO ...: paged decode v2: gather: the layer spans 3 K / 3 V pool slabs and the fused kernels read one buffer per side (slab_blocks=32); raise --ctx-size or MLXCEL_PAGED_SLAB_BLOCKS so a layer's rows fit one slab
+INFO ...: paged decode v2: gather: 1024 visible KV tokens across 1 request(s) is below the 4096-token dispatch floor
+INFO ...: paged decode v2: gather: pinned by MLXCEL_PAGED_ATTENTION_NATIVE
+INFO ...: paged decode v2: fused v2 cascade launch (batch 4, 4 of them sharing 256 pages / 8192 KV tokens read once; 8 shared-span chunks, 4 suffix chunks)
+```
+
+A run that never prints `fused v2 launch` never used the fused kernel, whatever
+its throughput looks like. Check for that line before drawing any conclusion
+from a before/after comparison.
+
+Two knobs, neither normally needed:
+
+- `MLXCEL_PAGED_ATTENTION_NATIVE=0` is the kill switch. It restores the
+  pre-#899 gather behaviour end to end, for bisecting a suspected kernel
+  regression. `=1` forces the fused path for every servable shape, bypassing
+  the token floor; that is the supported way to benchmark the declined corner.
+  The floors themselves move with `MLXCEL_PAGED_V2_MIN_KV_TOKENS` (lone
+  request, default 4096) and `MLXCEL_PAGED_V2_MIN_KV_TOKENS_PER_REQUEST`
+  (multi-request, default 512).
+- `MLXCEL_CASCADE_ATTENTION=1` enables two-level cascade decode (issue #903):
+  a whole-page prompt prefix shared by several sequences in the batch is
+  attended once for the subgroup and merged into each member's per-request
+  suffix state, instead of being re-read once per sequence. Off by default,
+  pending a serving measurement. Its own outcome line says when it ran, and
+  `/metrics` carries `mlxcel_paged_decode_launches_total{path="cascade"}`
+  alongside the flat and gather counts. See
+  [Cascade attention](cascade-attention.md).
+- `MLXCEL_PAGED_SLAB_BLOCKS` overrides the pool's slab size in blocks. The
+  server derives it from `--ctx-size` and `--parallel`, clamped by the KV
+  budget, and logs the resolved value at startup (`Paged KV slab size: N blocks
+  per layer`). A layer's first write allocates its whole slab, so this
+  front-loads exactly the KV bytes the startup memory estimate already reports
+  for that batch and context. **Serving contexts longer than `--ctx-size`
+  implies makes layers outgrow the slab and silently returns them to the gather
+  path**; raise `--ctx-size` or set this variable if the startup line looks too
+  small. `0` pins the historical 32-block default.
 
 Recurrent and hybrid SSM / linear-attention families cannot safely reuse
 arbitrary KV blocks, so they keep the hybrid-SSM/APC exclusion. Families that

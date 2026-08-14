@@ -60,6 +60,12 @@ Tensor Parallel Runtime:
                        LoRA unsupported, server batching supported for listed dense runtimes
                        except Gemma 4 E2B-style conservative fallback checkpoints
 
+Muse Glimmer 30B checkpoints:
+  dense BF16 (~59.55 GB) and pinned mlx-community affine 4-bit (~19.41 GB)
+  text, single-image, multi-image CLI/server routes, reasoning strengths, and ATEM tools
+  unsupported: video, quantized vision tower/Turbo KV, speculative/DFlash, LoRA/adapters, TP/PP, XLA/distributed
+  qualified checkpoints and GB10 metrics are recorded in supported-models.md
+
 For more information, visit: https://github.com/lablup/mlxcel"
 )]
 struct Cli {
@@ -151,6 +157,26 @@ enum Commands {
     ///     mlxcel rm mlx-community/Qwen3-4B-4bit --yes
     #[command(verbatim_doc_comment)]
     Rm(RmArgs),
+
+    /// Profile kernel launch configurations and cache the winners (issue #906).
+    ///
+    /// Times each candidate launch shape for the tunable ops on this machine
+    /// and writes the min-latency choice to
+    /// `${MLXCEL_CACHE_DIR:-$HOME/.cache/mlxcel}/autotune`. Nothing consumes
+    /// those entries until you also set `MLXCEL_AUTOTUNE`, so tuning is safe to
+    /// run on a production host.
+    ///
+    /// Examples:
+    ///
+    ///     mlxcel tune                                   # every op the backend supports
+    ///     mlxcel tune --op paged-decode-splits          # one op
+    ///     mlxcel tune -m models/llama-3.2-1b-4bit       # head geometry from a checkpoint
+    ///     mlxcel tune --dry-run                         # print the matrix, profile nothing
+    ///
+    /// Then run with `MLXCEL_AUTOTUNE=cache` to consume the tuned tactics, or
+    /// `MLXCEL_AUTOTUNE=1` to additionally tune unseen shapes on first use.
+    #[command(verbatim_doc_comment)]
+    Tune(commands::TuneArgs),
 }
 
 /// Arguments for `mlxcel list`.
@@ -305,6 +331,17 @@ pub(crate) struct ModelOptions {
     #[arg(long, value_name = "PATH")]
     pub(crate) models_dir: Option<PathBuf>,
 
+    /// Repository revision (branch, tag, or commit hash). Defaults to `main`.
+    ///
+    /// Resolves the HuggingFace cache snapshot for that revision, and fetches
+    /// that revision on a miss. The mlxcel store is not revision-namespaced, so
+    /// a repo already present there is not reused for a revision-qualified
+    /// request and the request is refused rather than answered with an unknown
+    /// revision; use `--models-dir` to give each revision its own root. Not
+    /// valid when the model argument is an existing local path.
+    #[arg(long, value_name = "REV")]
+    pub(crate) revision: Option<String>,
+
     /// Path to LoRA adapter directory (optional)
     #[arg(long, value_name = "PATH")]
     pub(crate) adapter: Option<PathBuf>,
@@ -344,6 +381,29 @@ pub(crate) struct GenerationOptions {
     /// checkpoints). Ignored by every other model family.
     #[arg(long, value_name = "N", value_parser = parse_image_soft_tokens)]
     pub(crate) image_soft_tokens: Option<usize>,
+
+    /// Layout detections for region-wise OCR (Falcon-OCR only).
+    ///
+    /// Path to a JSON file of already-detected page regions. Each region is
+    /// cropped from `--image`, OCRed with the instruction its layout class maps
+    /// to, and printed in the order the file lists it, so supply the detections
+    /// in reading order. Boxes mostly contained in a larger box are dropped, and
+    /// classes that carry no text (`picture`, `chart`, `figure`, `seal`) are
+    /// skipped. `-p/--prompt` is not used on this path: every region's prompt
+    /// comes from its class.
+    ///
+    /// mlxcel ships no document-layout DETECTOR, so the detections must come
+    /// from elsewhere. The accepted shape is the one `mlxcel detect --format
+    /// json` prints:
+    ///
+    ///     {"detections": [{"label": "title", "confidence": 0.95,
+    ///                      "box": {"l": 60, "t": 55, "r": 940, "b": 140}}]}
+    ///
+    /// A bare top-level array works too, as does the `{"category": ...,
+    /// "bbox": [l, t, r, b], "score": ...}` spelling that mlx-vlm's
+    /// `falcon_ocr/layout.py` emits.
+    #[arg(long, value_name = "PATH")]
+    pub(crate) layout_detections: Option<PathBuf>,
 
     /// Audio file path for audio-language models (e.g. Gemma4 with audio)
     #[arg(long, value_name = "PATH")]
@@ -490,6 +550,17 @@ pub(crate) struct InspectArgs {
     #[arg(long, value_name = "PATH")]
     pub(crate) models_dir: Option<PathBuf>,
 
+    /// Repository revision (branch, tag, or commit hash). Defaults to `main`.
+    ///
+    /// Resolves the HuggingFace cache snapshot for that revision, and fetches
+    /// that revision on a miss. The mlxcel store is not revision-namespaced, so
+    /// a repo already present there is not reused for a revision-qualified
+    /// request and the request is refused rather than answered with an unknown
+    /// revision; use `--models-dir` to give each revision its own root. Not
+    /// valid when the model argument is an existing local path.
+    #[arg(long, value_name = "REV")]
+    pub(crate) revision: Option<String>,
+
     /// Maximum number of tokens to estimate KV cache for.
     ///
     /// Treated as the context length input to the KV cache estimator.
@@ -560,7 +631,9 @@ pub(crate) struct SamplingOptions {
     #[arg(long, default_value_t = 1.0, value_name = "FLOAT")]
     pub(crate) repetition_penalty: f32,
 
-    /// DRY (Don't Repeat Yourself) penalty multiplier (0.0 = disabled)
+    /// DRY (Don't Repeat Yourself) penalty multiplier (0.0 = disabled).
+    /// CLI DRY matches across all boundaries; the server's
+    /// `--dry-sequence-breaker` has no CLI equivalent.
     #[arg(long, default_value_t = 0.0, value_name = "FLOAT")]
     pub(crate) dry_multiplier: f32,
 
@@ -823,6 +896,17 @@ pub(crate) struct ServeArgs {
     #[arg(long, value_name = "PATH")]
     models_dir: Option<PathBuf>,
 
+    /// Repository revision (branch, tag, or commit hash). Defaults to `main`.
+    ///
+    /// Resolves the HuggingFace cache snapshot for that revision, and fetches
+    /// that revision on a miss. The mlxcel store is not revision-namespaced, so
+    /// a repo already present there is not reused for a revision-qualified
+    /// request and the request is refused rather than answered with an unknown
+    /// revision; use `--models-dir` to give each revision its own root. Not
+    /// valid when the model argument is an existing local path.
+    #[arg(long, value_name = "REV")]
+    revision: Option<String>,
+
     /// Path to LoRA adapter directory
     #[arg(long, visible_alias = "lora", value_name = "PATH")]
     adapter: Option<PathBuf>,
@@ -849,15 +933,22 @@ pub(crate) struct ServeArgs {
 
     /// Number of parallel request slots that share --ctx-size (default: 4)
     ///
-    /// Sets the maximum concurrent decode batch for multi-client serving.
-    /// Batched decode amortizes the per-step weight reads across the batch,
+    /// Sets the maximum concurrent decode batch for multi-client serving:
+    /// batched decode amortizes the per-step weight reads across the batch,
     /// raising aggregate throughput and keeping time-to-first-token low under
     /// concurrent load. On CUDA the amortizing kernel covers decode batches
     /// of up to 7 rows (issue #725); keep this at 7 or below there (see
-    /// docs/CONTINUOUS_BATCHING.md). Clamped to 1 for model families that
-    /// cannot batch. Use `--n-parallel 1` (or `--no-batch`) for single-slot
-    /// serving.
-    #[arg(long, env = "LLAMA_ARG_N_PARALLEL", default_value_t = 4)]
+    /// docs/CONTINUOUS_BATCHING.md). The scheduler clamps this to 1 for model
+    /// families that cannot batch (SSM / hybrid / mixed-cache). Use `--parallel
+    /// 1` (or `--no-batch`) to restore single-slot sequential serving. Both
+    /// `--parallel` and `--n-parallel` are accepted on `mlxcel serve` and on
+    /// `mlxcel-server`, so this flag parses on either binary.
+    #[arg(
+        long,
+        visible_alias = "parallel",
+        env = "LLAMA_ARG_N_PARALLEL",
+        default_value_t = 4
+    )]
     n_parallel: usize,
 
     /// Total context budget shared across parallel slots (0 = use model default)
@@ -865,7 +956,12 @@ pub(crate) struct ServeArgs {
     ctx_size: usize,
 
     /// Maximum tokens to predict (-1 = unlimited)
-    #[arg(long = "n-predict", env = "LLAMA_ARG_N_PREDICT", default_value_t = -1)]
+    #[arg(
+        long = "n-predict",
+        visible_alias = "predict",
+        env = "LLAMA_ARG_N_PREDICT",
+        default_value_t = -1
+    )]
     n_predict: i32,
 
     /// Path to drafter checkpoint for server speculative decoding
@@ -933,6 +1029,24 @@ pub(crate) struct ServeArgs {
     /// spikes for active sequences.
     #[arg(long, default_value_t = 512)]
     prefill_chunk_size: usize,
+
+    /// Decode ticks a parked chunked prefill yields before it is granted one
+    /// (#1011).
+    ///
+    /// A prompt longer than `--prefill-chunk-size` admitted next to a busy
+    /// decode batch runs one chunk and is then parked. This bounds how long it
+    /// stays parked: after N consecutive decode ticks the next tick is granted
+    /// to the prefill, so a C-chunk prompt reaches its first token within
+    /// `C * (N + 1)` ticks however long the batch keeps decoding. The price is
+    /// paid by the decoding streams, whose mean inter-token latency during that
+    /// window rises by roughly one chunk forward per N decode steps, so this is
+    /// the TTFT-versus-ITL dial: lower is faster to first token and noisier for
+    /// everyone else. `0` disables the grant and restores the pre-#1011
+    /// behaviour, in which a parked prefill waits for the batch to drain and
+    /// its time to first token has no bound. Env:
+    /// `MLXCEL_PREFILL_GRANT_INTERVAL` (the flag wins).
+    #[arg(long, value_name = "N")]
+    prefill_grant_interval: Option<usize>,
 
     /// Prefill batch size [llama-server alias for --prefill-chunk-size] [default: 512]
     #[arg(
@@ -1190,7 +1304,29 @@ pub(crate) struct ServeArgs {
     dry_penalty_last_n: i32,
 
     /// DRY sequence breaker token strings (e.g. "\n", "\t")
-    #[arg(long, value_delimiter = ',')]
+    ///
+    /// Sets the server-wide default that a request without its own
+    /// `dry_sequence_breakers` field inherits; a request that sends the field
+    /// overrides it, including sending an empty list to run DRY with no
+    /// breakers. The resolved token IDs are reported by `/props`.
+    ///
+    /// Each value must encode to exactly ONE token for the loaded model,
+    /// because the sampler matches breakers by token id. A value that does not
+    /// fails startup and names itself, rather than being dropped silently. The
+    /// escapes `\n`, `\t`, `\r` and `\\` are interpreted, since a shell does
+    /// not expand them inside quotes; any other backslash sequence is taken
+    /// literally. The value is comma-separated, so a comma cannot itself be a
+    /// breaker.
+    ///
+    /// The singular `--dry-sequence-breaker` is the primary spelling on both
+    /// server binaries, matching llama-server. The plural
+    /// `--dry-sequence-breakers` is accepted as an alias on both, so no
+    /// command line that worked before stops working.
+    #[arg(
+        long = "dry-sequence-breaker",
+        visible_alias = "dry-sequence-breakers",
+        value_delimiter = ','
+    )]
     dry_sequence_breakers: Vec<String>,
 
     // Logging.
@@ -1760,8 +1896,42 @@ impl Default for DiffusionServeOptions {
     }
 }
 
+/// Install a `tracing` subscriber for the offline CLI commands when `RUST_LOG`
+/// is set.
+///
+/// The CLI shipped without any global subscriber, so every `tracing::*` call
+/// reached by `mlxcel generate`, `inspect`, `tune` and friends was silently
+/// discarded no matter what `RUST_LOG` said. That is exactly backwards: the
+/// instrumentation is unreachable precisely when someone has set `RUST_LOG`
+/// because they are trying to diagnose something. Notably it hid the drafter
+/// auto-detection line, which is the difference between a benchmark that ran
+/// the classic `SpeculativeGenerator` and one that ran a kind-specific round
+/// loop.
+///
+/// Two deliberate constraints:
+///
+/// * **Opt-in.** Nothing is installed unless `RUST_LOG` is set, so default
+///   command output is unchanged byte for byte.
+/// * **stderr.** Diagnostics must not contaminate the generated text on stdout,
+///   which callers pipe.
+///
+/// `Serve` is skipped because `server::startup` installs its own subscriber and
+/// would panic on the double `init()`. `try_init` is used anyway so a future
+/// second initializer degrades to a no-op rather than aborting the process.
+fn init_cli_tracing(command: &Commands) {
+    if matches!(command, Commands::Serve(_)) || std::env::var_os("RUST_LOG").is_none() {
+        return;
+    }
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_writer(std::io::stderr)
+        .try_init();
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    init_cli_tracing(&cli.command);
 
     // Default the CUDA kernel JIT cache to a persistent, MLX-pin-scoped dir so
     // the first-run kernel compilation is paid once per machine, not every boot.
@@ -1778,6 +1948,16 @@ fn main() -> anyhow::Result<()> {
     // off CUDA, a no-op when the variable is already set, and must run before
     // any MLX op.
     mlxcel_core::hardware::apply_cuda_graph_cache_default();
+
+    // Publish autotuned CUDA kernel knobs (qmm CTA tile, multirow-qmv row
+    // window) into the environment the patched MLX kernels read (#906). Inert
+    // unless MLXCEL_AUTOTUNE is set and a tuned entry exists, never overwrites
+    // an operator-set variable, and must run before any MLX op.
+    for (var, value) in mlxcel_core::autotune::ops::apply_tuned_cuda_kernel_env(
+        mlxcel_core::autotune::ops::cuda_kernel_knobs::TILE_M_CAP_BLACKWELL,
+    ) {
+        tracing::info!("autotune: applied {var}={value} from the tactic cache");
+    }
 
     match cli.command {
         Commands::Run(args) => commands::run_run(args),
@@ -1797,6 +1977,7 @@ fn main() -> anyhow::Result<()> {
             args.revision.as_deref(),
             args.models_dir.as_deref(),
         ),
+        Commands::Tune(args) => commands::run_tune(args),
     }
 }
 
@@ -1821,6 +2002,8 @@ const FAMILY_ORDER: &[&str] = &[
     "ERNIE",
     "Hunyuan",
     "Bailing",
+    "Arcee",
+    "Klear",
     "Granite",
     "ExaOne",
     "Solar",
@@ -1850,6 +2033,7 @@ const FAMILY_ORDER: &[&str] = &[
     "Kimi VLM",
     "PaddleOCR VLM",
     "MiniMax VLM",
+    "Muse VLM",
     "Step VLM",
     "Other VLM",
 ];

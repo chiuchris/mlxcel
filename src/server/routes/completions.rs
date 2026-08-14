@@ -23,7 +23,7 @@ use axum::{
     Json,
     extract::State,
     http::HeaderMap,
-    response::{IntoResponse, Response, sse::Sse},
+    response::{IntoResponse, Response},
 };
 
 use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
@@ -31,7 +31,10 @@ use mlxcel_core::sampling::{LogprobsConfig, TokenLogprobData};
 use crate::server::AppState;
 use crate::server::batch::RequestPriority;
 use crate::server::config::ReasoningBudgetOverride;
-use crate::server::streaming::sse_channel;
+use crate::server::media::MediaRequestMetadata;
+use crate::server::model_provider::QueueFullError;
+use crate::server::request_options::resolve_server_max_tokens;
+use crate::server::streaming::{sse_channel, sse_response};
 use crate::server::structured::build_constraint_from_response_format;
 use crate::server::thinking_budget::{pick_budget_alias, resolve_request_budget};
 use crate::server::types::response::CompletionLogprobs;
@@ -42,6 +45,14 @@ use super::chat::{
     build_generate_options, decode_token, parse_priority_header, structured_error_to_response,
     validate_xtc_params,
 };
+
+fn generation_error_to_response(err: anyhow::Error) -> ErrorResponse {
+    if err.downcast_ref::<QueueFullError>().is_some() {
+        ErrorResponse::service_unavailable("All slots are busy. Please try again later.")
+    } else {
+        ErrorResponse::new(format!("Generation error: {err}"), "server_error")
+    }
+}
 
 /// Build a `CompletionLogprobs` from a list of `TokenLogprobData` (legacy format).
 fn build_completion_logprobs(
@@ -161,10 +172,7 @@ pub async fn completions(
     }
 
     // validate thinking_budget_tokens early.
-    let effective_max_tokens = request
-        .params
-        .max_tokens
-        .unwrap_or(state.config.default_max_tokens);
+    let effective_max_tokens = resolve_server_max_tokens(&state.config, request.params.max_tokens);
     let raw_budget = pick_budget_alias(
         request.params.thinking_budget_tokens,
         request.params.thinking_token_budget,
@@ -240,7 +248,9 @@ async fn non_stream_completion(
     let model_id = state.display_model_id().to_string();
 
     let prompt = request.prompt.clone();
-    let mut options = build_generate_options(&request.params, &state.config);
+    // `/v1/completions` has no tool-shaped prompt signal. Since issue #977 a
+    // grammar constraint alone does not arm the Gemma 4 family default.
+    let mut options = build_generate_options(&request.params, &state.config, false);
     options.priority = priority;
     options.reasoning_budget = budget_override;
     // `/v1/completions` takes a raw prompt just like `/completion`;
@@ -267,7 +277,7 @@ async fn non_stream_completion(
     let result = state
         .model_provider
         .generate(prompt, options)
-        .map_err(|e| ErrorResponse::new(format!("Generation error: {}", e), "server_error"))?;
+        .map_err(generation_error_to_response)?;
 
     state.metrics.record_request(
         result.prompt_tokens,
@@ -313,7 +323,9 @@ async fn stream_completion(
     let request_id = format!("cmpl-{}", uuid::Uuid::new_v4());
     let model_id = state.display_model_id().to_string();
     let prompt = request.prompt.clone();
-    let mut options = build_generate_options(&request.params, &state.config);
+    // `/v1/completions` has no tool-shaped prompt signal. Since issue #977 a
+    // grammar constraint alone does not arm the Gemma 4 family default.
+    let mut options = build_generate_options(&request.params, &state.config, false);
     options.priority = priority;
     options.reasoning_budget = budget_override;
     // see non_stream_completion — raw-text endpoint, no
@@ -341,6 +353,11 @@ async fn stream_completion(
         };
     }
 
+    let queue_reservation = match state.model_provider.reserve_single_stream_queue_slot() {
+        Ok(reservation) => reservation,
+        Err(err) => return generation_error_to_response(err).into_response(),
+    };
+
     // sse_channel also returns an SseKeepAlive that sends periodic
     // SSE comment events to prevent proxy/client idle-timeout disconnects
     // during long prefill phases.
@@ -362,11 +379,14 @@ async fn stream_completion(
 
         let result = state
             .model_provider
-            .generate_streaming_with_logprobs_cancellable(
+            .generate_streaming_with_logprobs_cancellable_videos_declared_reserved(
                 prompt,
                 options,
                 Vec::new(),
                 Vec::new(),
+                Vec::new(),
+                MediaRequestMetadata::default(),
+                queue_reservation,
                 cancelled,
                 |token, lp_data| {
                     let logprobs = if logprobs_enabled {
@@ -419,9 +439,7 @@ async fn stream_completion(
         finish_events.done();
     });
 
-    Sse::new(stream)
-        .keep_alive(keepalive.into_inner())
-        .into_response()
+    sse_response(stream, keepalive)
 }
 
 #[cfg(test)]

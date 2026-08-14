@@ -15,10 +15,7 @@
 use serde::{Serialize, Serializer};
 use serde_json::Value;
 
-use super::{
-    CancellationToken, DONE_MARKER, SSE_KEEPALIVE_INTERVAL_SECS, payload_channel,
-    serialize_json_data,
-};
+use super::{CancellationToken, DONE_MARKER, payload_channel, serialize_json_data};
 use crate::server::types::{ChatCompletionChunk, CompletionChunk};
 
 #[derive(Serialize)]
@@ -298,17 +295,11 @@ fn sender_without_cancellation_token_does_not_panic_on_dropped_receiver() {
 
 // ── Long-prefill keepalive regression tests ────────────────────
 
-/// The SSE keepalive interval must be less than typical proxy idle timeouts
-/// (nginx 60 s, HAProxy 60 s, AWS ALB 60 s) so that long-prefill requests
-/// keep the connection alive.
-///
-/// This is enforced as a `const` assertion so a regression is caught at
-/// compile time rather than test time. (Using `assert!` on a constant
-/// expression triggers `clippy::assertions_on_constants`.)
-const _: () = assert!(
-    SSE_KEEPALIVE_INTERVAL_SECS < 60,
-    "SSE keepalive interval must be less than the 60s default used by most reverse proxies"
-);
+// The proxy-timeout invariant (`SSE_KEEPALIVE_INTERVAL_SECS < 60`) used to be
+// asserted here. It moved next to the constant in `streaming.rs` (#1105) so it
+// covers every SSE surface by construction: the Responses and Anthropic
+// keepalives now read the same constant instead of carrying file-private copies
+// that this assertion could not see.
 
 /// During a long prefill phase (no events from the model worker), the SSE
 /// channel must remain open and operational. This test exercises the token
@@ -355,10 +346,12 @@ fn long_prefill_channel_stays_open_before_first_token() {
     worker.join().expect("worker thread must not panic");
 }
 
-// TODO: add a test that verifies the SSE keepalive comment frame is emitted
-// before the first event arrives (LOW #2). This requires an axum
-// integration test harness to drive `Sse::new(stream).keep_alive(...)` end-to-end
-// and read raw SSE frames from the response body. The existing unit-level
-// `payload_channel` tests cannot reach the axum `KeepAlive` layer. A suitable
-// approach would be `axum_test::TestClient` or `tower::ServiceExt::oneshot`
-// with `hyper::body::to_bytes`; skipped here to avoid the additional test infra.
+// This is where a deferred note used to ask for an axum integration harness to
+// check that every route attaches the keepalive. It was removed with #1107: the
+// hazard is gone structurally rather than covered by a test. Every SSE response
+// in the server is built by `streaming::sse_response`, which takes the keepalive
+// by value, so a route cannot forget it. A test per route would have been five
+// tests guarding five copy-paste sites, and would still have missed the sixth
+// route nobody remembered to write a test for. The other half of that note,
+// whether axum emits a comment frame while the stream is idle, tests axum's
+// `KeepAlive` rather than mlxcel, and upstream already covers it.
