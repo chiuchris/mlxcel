@@ -36,7 +36,56 @@ use std::path::Path;
 use super::config::DFlashConfig;
 use super::model::DFlashDraftModel;
 
-/// Boxed [`Drafter`] implementation for the Qwen 3.5 DFlash drafter.
+fn validate_dflash_contract(
+    config: &DFlashConfig,
+    target_layers: usize,
+    target_hidden: usize,
+    target_vocab: usize,
+    projection_input: usize,
+) -> Result<(), String> {
+    if config.block_size < 2 {
+        return Err(format!(
+            "DFlash config block_size must be at least 2 (got {})",
+            config.block_size
+        ));
+    }
+    if config.num_target_layers != target_layers {
+        return Err(format!(
+            "DFlash target layer count mismatch: drafter expects {} layers, target has {}",
+            config.num_target_layers, target_layers
+        ));
+    }
+    if config.target_layer_ids.is_empty()
+        || config
+            .target_layer_ids
+            .iter()
+            .any(|&layer| layer >= target_layers)
+    {
+        return Err(format!(
+            "DFlash target_layer_ids {:?} contain an out-of-range layer for target with {} layers",
+            config.target_layer_ids, target_layers
+        ));
+    }
+    let expected_projection_input = config.target_layer_ids.len() * target_hidden;
+    if projection_input != expected_projection_input {
+        return Err(format!(
+            "DFlash projection input mismatch: projection accepts {}, but {} captured layers at target hidden size {} require {}",
+            projection_input,
+            config.target_layer_ids.len(),
+            target_hidden,
+            expected_projection_input
+        ));
+    }
+    if config.vocab_size != target_vocab {
+        return Err(format!(
+            "DFlash vocabulary mismatch: drafter has {}, target has {}",
+            config.vocab_size, target_vocab
+        ));
+    }
+    Ok(())
+}
+
+/// Boxed [`Drafter`] implementation for Qwen 3.5/3.6 DFlash drafters.
 ///
 /// Wraps a [`DFlashDraftModel`] plus the per-layer K/V cache list that
 /// the round-loop driver passes through `draft_block`. The wrapper owns
@@ -187,6 +236,41 @@ fn convert_bf16_to_f16_non_quantized(weights: &mut WeightMap) {
 }
 
 impl Drafter for DFlashDrafter {
+    fn validate_target_compat(&self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
+        let sentinel = ffi::from_slice_i32(&[0_i32], &[1, 1]);
+        let embedded =
+            target
+                .embed_tokens(&sentinel)
+                .ok_or(DrafterError::TargetMissingFeature {
+                    feature: "embed_tokens",
+                })?;
+        let embed_shape = ffi::array_shape(&embedded);
+        let target_hidden = embed_shape.last().copied().unwrap_or(0) as usize;
+
+        let embed_module =
+            target
+                .embed_tokens_module()
+                .ok_or(DrafterError::TargetMissingFeature {
+                    feature: "embed_tokens_module",
+                })?;
+        let zero_hidden = ffi::zeros(&[1, 1, target_hidden as i32], crate::dtype::FLOAT32);
+        let target_vocab = ffi::array_shape(&embed_module.as_linear(&zero_hidden))
+            .last()
+            .copied()
+            .unwrap_or(0) as usize;
+        let projection_shape = ffi::array_shape(&self.model.fc.weight);
+        let projection_input = projection_shape.last().copied().unwrap_or(0) as usize;
+
+        validate_dflash_contract(
+            &self.model.config,
+            target.num_layers(),
+            target_hidden,
+            target_vocab,
+            projection_input,
+        )
+        .map_err(|reason| DrafterError::BindFailed { reason })
+    }
+
     fn bind(&mut self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
         // Two embedding cases, mirroring upstream Python's lazy-bind shape
         // (https://github.com/Blaizzy/mlx-vlm/blob/main/mlx_vlm/speculative/drafters/qwen3_dflash/dflash.py
@@ -656,6 +740,63 @@ mod tests {
             dtype::FLOAT32,
             "f32 must remain f32"
         );
+    }
+
+    fn qwen36_config() -> DFlashConfig {
+        let mut config = DFlashConfig::default();
+        config.vocab_size = 248320;
+        config.block_size = 4;
+        config.target_layer_ids = vec![1, 6, 11, 16, 22, 27, 32, 37];
+        config.num_target_layers = 40;
+        config
+    }
+
+    #[test]
+    fn qwen36_dflash_contract_accepts_matching_dimensions() {
+        let config = qwen36_config();
+        validate_dflash_contract(&config, 40, 2048, 248320, 8 * 2048).expect("compatible");
+    }
+
+    #[test]
+    fn dflash_contract_rejects_target_layer_mismatch() {
+        let config = qwen36_config();
+        let error = validate_dflash_contract(&config, 32, 2048, 248320, 8 * 2048)
+            .expect_err("layer mismatch must fail");
+        assert!(error.contains("target layer count mismatch"));
+    }
+
+    #[test]
+    fn dflash_contract_rejects_capture_layer_out_of_range() {
+        let mut config = qwen36_config();
+        config.target_layer_ids.push(40);
+        let error = validate_dflash_contract(&config, 40, 2048, 248320, 9 * 2048)
+            .expect_err("capture layer mismatch must fail");
+        assert!(error.contains("out-of-range"));
+    }
+
+    #[test]
+    fn dflash_contract_rejects_projection_width_mismatch() {
+        let config = qwen36_config();
+        let error = validate_dflash_contract(&config, 40, 2048, 248320, 8 * 2047)
+            .expect_err("projection mismatch must fail");
+        assert!(error.contains("projection input mismatch"));
+    }
+
+    #[test]
+    fn dflash_contract_rejects_vocabulary_mismatch() {
+        let config = qwen36_config();
+        let error = validate_dflash_contract(&config, 40, 2048, 151936, 8 * 2048)
+            .expect_err("vocabulary mismatch must fail");
+        assert!(error.contains("vocabulary mismatch"));
+    }
+
+    #[test]
+    fn dflash_contract_rejects_block_size_one() {
+        let mut config = qwen36_config();
+        config.block_size = 1;
+        let error = validate_dflash_contract(&config, 40, 2048, 248320, 8 * 2048)
+            .expect_err("block size one must fail");
+        assert!(error.contains("block_size must be at least 2"));
     }
 
     /// The trait conformance check: a `DFlashDrafter` must be

@@ -553,10 +553,10 @@ pub trait Drafter {
     /// silently wrong drafts. Catching it here yields a clear, actionable
     /// operator error at dispatch time instead.
     ///
-    /// The default implementation is a no-op (`Ok(())`); shapes that do not
-    /// require a strict dimension match (DFlash, InternalMtp) keep the
-    /// default. Concrete MTP drafters override this to compare
-    /// `backbone_hidden_size` / vocab against the bound target.
+    /// The default implementation is a no-op (`Ok(())`). InternalMtp keeps
+    /// this default, while DFlash and concrete MTP drafters override it to
+    /// compare their contract dimensions / vocabulary against the bound
+    /// target.
     #[allow(unused_variables)]
     fn validate_target_compat(&self, target: &dyn LanguageModel) -> Result<(), DrafterError> {
         Ok(())

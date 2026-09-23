@@ -57,6 +57,10 @@ path = "src/bin/mlx_server.rs"
 name = "speculative_bench"
 path = "src/bin/speculative_bench.rs"
 
+[[bin]]
+name = "dflash_sidecar"
+path = "src/bin/dflash_sidecar.rs"
+
 # Same-process decode benchmark harness used by `scripts/bench_decode.sh`.
 # It loads a model once, runs the warmup generation, resets model/cache state,
 # then runs the measured pass in the same process. This mirrors the Python
